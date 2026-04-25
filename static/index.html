@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VLLM Controller</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<script defer src="/static/app.js"></script>
+</head>
+<body x-data="app()" x-init="init()">
+
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="logo">
+      <span class="logo-mark"></span>
+      <span class="logo-text">VLLM<span>Controller</span></span>
+    </div>
+  </div>
+  <div class="topbar-stats" x-show="state">
+    <template x-if="state">
+      <div class="stat-row">
+        <!-- CPU -->
+        <div class="stat" :title="`CPU usage`">
+          <span class="stat-label">CPU</span>
+          <span class="stat-value" x-text="fmtPct(state.stats.cpu_pct)"></span>
+          <div class="bar"><span :style="`width:${state.stats.cpu_pct ?? 0}%`"></span></div>
+        </div>
+        <!-- GPU util -->
+        <div class="stat">
+          <span class="stat-label">GPU</span>
+          <span class="stat-value" x-text="fmtPct(gpu()?.util)"></span>
+          <div class="bar"><span :style="`width:${gpu()?.util ?? 0}%; background: var(--accent-green)`"></span></div>
+        </div>
+        <!-- RAM -->
+        <div class="stat">
+          <span class="stat-label">RAM</span>
+          <span class="stat-value" x-text="fmtBytes(state.stats.mem.used) + ' / ' + fmtBytes(state.stats.mem.total)"></span>
+          <div class="bar"><span :style="`width:${state.stats.mem.pct ?? 0}%; background: var(--accent-blue)`"></span></div>
+        </div>
+        <!-- CPU temp -->
+        <div class="stat">
+          <span class="stat-label">CPU temp</span>
+          <span class="stat-value" x-text="fmtTemp(state.stats.cpu_temp_c)"></span>
+        </div>
+        <!-- GPU temp -->
+        <div class="stat">
+          <span class="stat-label">GPU temp</span>
+          <span class="stat-value" x-text="fmtTemp(gpu()?.temp)"></span>
+        </div>
+        <!-- Power -->
+        <div class="stat">
+          <span class="stat-label">Power</span>
+          <span class="stat-value" x-text="fmtWatts(gpu()?.power_draw_w, gpu()?.power_limit_w)"></span>
+        </div>
+      </div>
+    </template>
+  </div>
+  <div class="topbar-right">
+    <span class="capacity" x-show="state">
+      <span x-text="state?.summary.running_models"></span> / <span x-text="state?.summary.max_concurrent_models"></span>
+      <span class="muted">running</span>
+    </span>
+    <span class="dot" :class="connected ? 'dot-ok' : 'dot-bad'"></span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button :class="{active: tab==='containers'}" @click="tab='containers'">Models</button>
+  <button :class="{active: tab==='inference'}" @click="tab='inference'">Inference</button>
+  <button :class="{active: tab==='queue'}" @click="tab='queue'">
+    Queue
+    <span class="badge" x-show="pendingCount() > 0" x-text="pendingCount()"></span>
+  </button>
+  <button :class="{active: tab==='images'}" @click="tab='images'">Images</button>
+  <button :class="{active: tab==='settings'}" @click="tab='settings'">Settings</button>
+</nav>
+
+<main>
+
+<!-- ============== CONTAINERS ============== -->
+<section x-show="tab==='containers'" class="page">
+  <div class="page-head">
+    <h2>Models</h2>
+    <button class="btn btn-primary" @click="showCreate = !showCreate">
+      <span x-show="!showCreate">+ Pull new LLM</span>
+      <span x-show="showCreate">Cancel</span>
+    </button>
+  </div>
+
+  <div class="card create-card" x-show="showCreate" x-transition>
+    <h3>Pull &amp; launch an LLM</h3>
+    <p class="card-desc">Each model runs in its own container. Pulling installs the weights from Hugging Face into a new container; you'll see live progress on its card below.</p>
+    <div class="grid">
+      <label>
+        <span>Model (HF repo id)</span>
+        <input type="text" x-model="form.model" placeholder="Qwen/Qwen2.5-Coder-7B-Instruct">
+      </label>
+      <label>
+        <span>Host port <em class="muted">(blank = auto)</em></span>
+        <input type="number" x-model.number="form.port" placeholder="auto">
+      </label>
+      <label>
+        <span>GPU memory util</span>
+        <input type="number" step="0.05" min="0.1" max="0.98" x-model.number="form.gpu_mem">
+      </label>
+      <label class="full">
+        <span>Extra vllm args <em class="muted">(space-separated)</em></span>
+        <input type="text" x-model="form.extra" placeholder="--max-model-len 8192 --dtype auto">
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" @click="createContainer()" :disabled="creating">
+        <span x-show="!creating">Launch</span>
+        <span x-show="creating">Launching…</span>
+      </button>
+    </div>
+  </div>
+
+  <div x-show="!state?.containers.length" class="empty">
+    No vLLM containers found.
+  </div>
+
+  <div class="card-grid">
+    <template x-for="c in state?.containers || []" :key="c.id">
+      <div class="card container-card" :class="`status-${c.status} phase-${c.phase?.phase || c.status}`">
+        <div class="card-head">
+          <div>
+            <div class="card-title" x-text="c.model || c.name"></div>
+            <div class="card-sub" x-text="c.name"></div>
+          </div>
+          <div class="status-pill" :class="`pill-${c.phase?.phase || c.status}`" x-text="c.phase?.phase || c.status"></div>
+        </div>
+
+        <!-- setup progress: shown when the container exists but isn't ready yet -->
+        <div class="phase"
+             x-show="c.phase && !['ready','exited'].includes(c.phase.phase)">
+          <div class="phase-row">
+            <span class="phase-label" x-text="c.phase?.message || ''"></span>
+            <span class="phase-pct" x-show="c.phase?.progress != null"
+                  x-text="Math.round((c.phase?.progress || 0) * 100) + '%'"></span>
+          </div>
+          <div class="phase-bar" :class="{indeterminate: c.phase?.progress == null}">
+            <span :style="`width: ${c.phase?.progress != null ? (c.phase.progress * 100) : 30}%`"></span>
+          </div>
+        </div>
+
+        <dl class="kv">
+          <dt>Port</dt><dd x-text="c.port || '—'"></dd>
+          <dt>Image</dt><dd class="mono ellipsis" x-text="c.image"></dd>
+          <dt>Managed</dt><dd x-text="c.managed ? 'yes' : 'external'"></dd>
+        </dl>
+        <div class="card-actions">
+          <button class="btn" @click="startContainer(c.name)" :disabled="c.status==='running'">Start</button>
+          <button class="btn" @click="stopContainer(c.name)" :disabled="c.status!=='running'">Stop</button>
+          <button class="btn btn-ghost" @click="openLogs(c.name)">Logs</button>
+          <button class="btn btn-danger" @click="removeContainer(c.name)">Remove</button>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>
+
+<!-- ============== INFERENCE ============== -->
+<section x-show="tab==='inference'" class="page">
+  <div class="page-head"><h2>Send a prompt</h2></div>
+  <div class="card">
+    <div class="grid">
+      <label>
+        <span>Target</span>
+        <select x-model="infer.target">
+          <option value="">Auto (route to model)</option>
+          <template x-for="c in (state?.containers || [])" :key="c.name">
+            <option :value="`container:${c.name}`" x-text="`${c.name} → ${c.model || '?'}`"></option>
+          </template>
+        </select>
+      </label>
+      <label>
+        <span>Model <em class="muted">(used if target = auto, or as the request's model field)</em></span>
+        <input type="text" x-model="infer.model" placeholder="Qwen/Qwen2.5-Coder-7B-Instruct">
+      </label>
+      <label>
+        <span>Temperature</span>
+        <input type="number" min="0" max="2" step="0.05" x-model.number="infer.temperature">
+      </label>
+      <label>
+        <span>Max tokens</span>
+        <input type="number" min="1" x-model.number="infer.max_tokens">
+      </label>
+      <label class="full">
+        <span>System prompt <em class="muted">(optional)</em></span>
+        <textarea rows="2" x-model="infer.system" placeholder="You are a helpful assistant."></textarea>
+      </label>
+      <label class="full">
+        <span>User prompt</span>
+        <textarea rows="6" x-model="infer.prompt" placeholder="Ask anything…"></textarea>
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" @click="sendInference()" :disabled="!infer.prompt">Submit</button>
+      <span class="muted" x-show="lastSubmitted">
+        Submitted <code x-text="lastSubmitted"></code> — check the Queue tab.
+      </span>
+    </div>
+  </div>
+</section>
+
+<!-- ============== QUEUE ============== -->
+<section x-show="tab==='queue'" class="page">
+  <div class="page-head">
+    <h2>Queue</h2>
+    <button class="btn btn-ghost" @click="clearFinished()">Clear finished</button>
+  </div>
+
+  <div x-show="!sortedQueue().length" class="empty">No jobs yet.</div>
+
+  <div class="queue-list">
+    <template x-for="j in sortedQueue()" :key="j.id">
+      <div class="queue-item" :class="`q-${j.status}`">
+        <div class="q-icon">
+          <span x-show="j.status==='pending'">●</span>
+          <span x-show="j.status==='dispatching'">◐</span>
+          <span x-show="j.status==='running'">▶</span>
+          <span x-show="j.status==='done'">✓</span>
+          <span x-show="j.status==='error'">!</span>
+          <span x-show="j.status==='canceled'">×</span>
+        </div>
+        <div class="q-body">
+          <div class="q-row">
+            <span class="q-model" x-text="j.model || j.container || 'auto'"></span>
+            <span class="q-status" x-text="j.status"></span>
+            <span class="q-time" x-text="relTime(j.requested_at)"></span>
+          </div>
+          <div class="q-preview" x-text="j.preview || '(no prompt preview)'"></div>
+          <div class="q-result" x-show="j.result_text" x-text="j.result_text"></div>
+          <div class="q-error" x-show="j.error" x-text="j.error"></div>
+        </div>
+        <div class="q-actions">
+          <button class="btn btn-play" title="Override max-concurrent and run now"
+                  x-show="j.status==='pending' && !j.override"
+                  @click="forceRun(j.id)">▶ Run now</button>
+          <span class="muted" x-show="j.override && j.status==='pending'">override queued</span>
+          <button class="btn btn-ghost" x-show="['pending','dispatching'].includes(j.status)" @click="cancelJob(j.id)">Cancel</button>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>
+
+<!-- ============== IMAGES ============== -->
+<section x-show="tab==='images'" class="page">
+  <div class="page-head">
+    <h2>Images</h2>
+  </div>
+  <div class="card">
+    <div class="grid">
+      <label class="full">
+        <span>Pull image</span>
+        <div class="row">
+          <input type="text" x-model="pullForm.image" placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3">
+          <button class="btn btn-primary" @click="pullImage()" :disabled="pullForm.busy">Pull</button>
+        </div>
+      </label>
+      <div class="full" x-show="pullForm.lines.length">
+        <pre class="logbox" x-ref="pullLog"><template x-for="(l,i) in pullForm.lines.slice(-200)" :key="i"><span x-text="l + '\n'"></span></template></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="card-grid">
+    <template x-for="img in state?.images || []" :key="img.id">
+      <div class="card image-card" :class="{'is-vllm': img.is_vllm}">
+        <div class="card-head">
+          <div>
+            <div class="card-title mono" x-text="img.tags[0] || img.id"></div>
+            <div class="card-sub" x-text="img.id"></div>
+          </div>
+          <div class="status-pill" x-show="img.is_vllm">vllm</div>
+        </div>
+        <dl class="kv">
+          <dt>Size</dt><dd x-text="fmtBytes(img.size)"></dd>
+          <dt>Tags</dt><dd class="mono ellipsis" x-text="(img.tags||[]).join(', ') || '—'"></dd>
+        </dl>
+        <div class="card-actions">
+          <button class="btn btn-danger" @click="removeImage(img.id)">Remove</button>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>
+
+<!-- ============== SETTINGS ============== -->
+<section x-show="tab==='settings'" class="page">
+  <div class="page-head"><h2>Settings</h2></div>
+  <div class="card" x-show="state">
+    <div class="grid">
+      <label>
+        <span>Max concurrent models</span>
+        <input type="number" min="1" x-model.number="settingsForm.max_concurrent_models">
+      </label>
+      <label>
+        <span>Default GPU memory utilization</span>
+        <input type="number" step="0.05" min="0.1" max="0.98" x-model.number="settingsForm.default_gpu_memory_utilization">
+      </label>
+      <label>
+        <span>vLLM image</span>
+        <input type="text" x-model="settingsForm.vllm_image">
+      </label>
+      <label>
+        <span>HF cache (host)</span>
+        <input type="text" x-model="settingsForm.hf_cache">
+      </label>
+      <label>
+        <span>Shared memory size</span>
+        <input type="text" x-model="settingsForm.shm_size">
+      </label>
+      <label>
+        <span>Port range start</span>
+        <input type="number" x-model.number="settingsForm.port_range_start">
+      </label>
+      <label>
+        <span>Port range end</span>
+        <input type="number" x-model.number="settingsForm.port_range_end">
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" @click="saveSettings()">Save</button>
+      <span class="muted" x-show="settingsSaved">Saved.</span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ============== LOGS MODAL ============== -->
+<div class="modal" x-show="logsModal.open" @click.self="logsModal.open = false">
+  <div class="modal-body">
+    <div class="modal-head">
+      <h3 x-text="`Logs · ${logsModal.name}`"></h3>
+      <div>
+        <button class="btn btn-ghost" @click="refreshLogs()">Refresh</button>
+        <button class="btn" @click="logsModal.open = false">Close</button>
+      </div>
+    </div>
+    <pre class="logbox tall" x-text="logsModal.text"></pre>
+  </div>
+</div>
+
+</body>
+</html>

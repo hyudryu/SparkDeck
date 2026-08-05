@@ -897,6 +897,14 @@
                      x-model.number="dockerSettingsFor(c).gpu_memory_utilization"
                      placeholder="engine default">
             </label>
+            <label>
+              <span>Thinking / reasoning <span class="tip" tabindex="0" data-tip="Controls the thinking or enable_thinking value in --default-chat-template-kwargs while preserving other template settings. Model default removes the explicit override."></span></span>
+              <select x-model="dockerSettingsFor(c).thinking_mode">
+                <option value="default">Model default</option>
+                <option value="enabled">Enabled</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </label>
             <label class="docker-flags-field">
               <span>Command flags <span class="tip" tabindex="0" data-tip="All server flags, including image-specific options. Host and port remain fixed so Docker networking and controller routing keep working."></span></span>
               <textarea rows="7" class="mono" x-model="dockerSettingsFor(c).command_flags"

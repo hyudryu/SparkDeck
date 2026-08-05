@@ -614,6 +614,23 @@ class Manager:
             re.DOTALL,
         )
 
+    @classmethod
+    def _thinking_config(cls, args: list[str]) -> tuple[str, dict, str | None]:
+        """Return mode, full chat-template kwargs, and its thinking key."""
+        raw = cls._cli_option(args, {"--default-chat-template-kwargs"})
+        if raw is None:
+            return "default", {}, None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "default", {}, None
+        if not isinstance(payload, dict):
+            return "default", {}, None
+        for key in ("enable_thinking", "thinking"):
+            if isinstance(payload.get(key), bool):
+                return ("enabled" if payload[key] else "disabled"), payload, key
+        return "default", payload, None
+
     def _container_load_settings(self, cmd: list[str], engine: str, model: str) -> dict:
         """Extract editable launch settings from a Docker command.
 
@@ -675,6 +692,7 @@ class Manager:
                     editable.append(token)
                     i += 1
                 command_flags = shlex.join(editable)
+            thinking_mode, _, _ = self._thinking_config(analysis_cmd)
             return {
                 "editable": "--model-path" in analysis_cmd,
                 "engine": engine,
@@ -691,6 +709,7 @@ class Manager:
                 "tensor_parallel_size": self._cli_option(
                     analysis_cmd, {"--tp-size"}, int
                 ),
+                "thinking_mode": thinking_mode,
                 "extra_args": extra_args,
                 "command_flags": command_flags,
             }
@@ -722,6 +741,7 @@ class Manager:
                 continue
             extra_args.append(token)
             i += 1
+        thinking_mode, _, _ = self._thinking_config(analysis_cmd)
         return {
             "editable": "serve" in analysis_cmd,
             "engine": engine,
@@ -742,6 +762,7 @@ class Manager:
             "tensor_parallel_size": self._cli_option(
                 analysis_cmd, {"--tensor-parallel-size", "-tp"}, int
             ),
+            "thinking_mode": thinking_mode,
             "extra_args": extra_args,
             "command_flags": command_flags,
         }
@@ -3238,6 +3259,29 @@ class Manager:
         canonical = sorted(names, key=lambda name: (len(name), name))[0]
         return f"{updated} {canonical} {value}".strip()
 
+    def _replace_thinking_config(self, flags: str, mode: str) -> str:
+        """Update thinking without discarding unrelated chat-template kwargs."""
+        if mode not in {"default", "enabled", "disabled"}:
+            raise ValueError("thinking_mode must be default, enabled, or disabled")
+        try:
+            tokens = shlex.split(flags)
+        except ValueError as exc:
+            raise ValueError("command flags have invalid shell quoting") from exc
+        _, payload, key = self._thinking_config(tokens)
+        if mode == "default":
+            if key is None:
+                return flags
+            payload.pop(key, None)
+        else:
+            key = key or "enable_thinking"
+            payload[key] = mode == "enabled"
+        value = None
+        if payload:
+            value = shlex.quote(json.dumps(payload, separators=(",", ":")))
+        return self._replace_command_option(
+            flags, {"--default-chat-template-kwargs"}, value
+        )
+
     def _updated_container_command(
         self, cmd: list[str], engine: str, model: str, settings: dict
     ) -> list[str]:
@@ -3275,6 +3319,9 @@ class Manager:
         context_window = positive_int("context_window")
         kv_dtype = settings.get("kv_cache_dtype", existing.get("kv_cache_dtype"))
         kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
+        thinking_mode = settings.get(
+            "thinking_mode", existing.get("thinking_mode", "default")
+        )
 
         if engine == "sglang":
             flags = self._replace_command_option(
@@ -3299,6 +3346,7 @@ class Manager:
                 flags, {"--max-model-len", "--max-model-length"}, context_window
             )
         flags = self._replace_command_option(flags, {"--kv-cache-dtype"}, kv_dtype)
+        flags = self._replace_thinking_config(flags, str(thinking_mode))
 
         original = [str(value) for value in (cmd or [])]
         # Preserve host/port because Docker's network bindings and controller

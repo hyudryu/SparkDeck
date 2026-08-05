@@ -170,6 +170,7 @@ async def agent_create_container(req: Request):
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
             cluster_member=body.get("cluster_member"),
+            hf_token=body.get("hf_token"),
         )
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
@@ -391,7 +392,7 @@ async def update_fan_settings(req: Request):
 # ---------- settings ----------
 @app.get("/api/settings")
 async def get_settings():
-    return manager.settings
+    return manager.public_settings()
 
 
 @app.post("/api/settings")

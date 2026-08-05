@@ -204,6 +204,11 @@ class Manager:
         # Ephemeral launch phase for Saved Models.  This is returned with
         # /api/state so an image pull remains visible after a browser refresh.
         self.recipe_launches: dict[str, dict] = {}
+        # Ephemeral per-container launch history used by cluster agents. Docker
+        # has no container logs while an image is still downloading, so this
+        # fills the otherwise silent gap between the launch request and the
+        # container being created.
+        self.cluster_member_launches: dict[str, dict] = {}
         self.unsloth_settings_path = self.data_dir / "unsloth_models.json"
         self.unsloth_settings: dict[str, dict] = self._load_unsloth_settings()
         # Saved SparkRun targets are references understood by the SparkRun CLI
@@ -346,6 +351,7 @@ class Manager:
     async def agent_status(self, stats: dict | None = None) -> dict:
         if stats is None:
             stats = await self.get_stats()
+        disk = await self.get_disk()
         try:
             docker_ready = bool(await asyncio.to_thread(self.client.ping))
         except Exception:
@@ -366,6 +372,26 @@ class Manager:
             ]
         except Exception:
             containers = []
+        existing_names = {c.get("name") for c in containers}
+        # Launch updates can arrive from a Docker worker thread while the
+        # status endpoint is being serialized.
+        for name, launch in list(self.cluster_member_launches.items()):
+            if name in existing_names:
+                continue
+            phase = launch.get("phase") or "queued"
+            containers.append({
+                "name": name,
+                "model": launch.get("model"),
+                "status": "error" if phase == "error" else "creating",
+                "port": None,
+                "deployment_id": launch.get("deployment_id"),
+                "rank": launch.get("rank"),
+                "phase": {
+                    "phase": phase,
+                    "message": launch.get("message"),
+                    "updated_at": launch.get("updated_at"),
+                },
+            })
         interfaces = self._network_interfaces()
         configured_iface = self.settings.get("cluster_fabric_interface") or ""
         fabric_ready = any(
@@ -385,8 +411,56 @@ class Manager:
             "fabric_ready": fabric_ready,
             "interfaces": interfaces,
             "stats": stats,
+            "disk": disk,
             "containers": containers,
         }
+
+    def _cluster_launch_update(
+        self,
+        name: str | None,
+        phase: str,
+        message: str,
+        *,
+        model: str | None = None,
+        cluster_member: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Record controller-side progress before Docker logs are available."""
+        if not name or not cluster_member:
+            return
+        now = time.time()
+        launches = getattr(self, "cluster_member_launches", None)
+        if launches is None:
+            launches = self.cluster_member_launches = {}
+        launch = launches.setdefault(name, {
+            "name": name,
+            "model": model,
+            "deployment_id": cluster_member.get("deployment_id"),
+            "node_id": cluster_member.get("node_id"),
+            "rank": cluster_member.get("rank"),
+            "created_at": now,
+            "events": [],
+        })
+        launch.update({
+            "phase": phase,
+            "message": message,
+            "updated_at": now,
+            "error": error,
+        })
+        events = launch.setdefault("events", [])
+        if not events or events[-1].get("message") != message:
+            events.append({"at": now, "phase": phase, "message": message})
+            del events[:-100]
+
+    def _cluster_launch_text(self, name: str) -> str:
+        launch = getattr(self, "cluster_member_launches", {}).get(name)
+        if not launch:
+            return ""
+        lines = ["=== Controller launch progress ==="]
+        for event in launch.get("events", []):
+            stamp = datetime.fromtimestamp(event.get("at", time.time())).strftime("%H:%M:%S")
+            lines.append(f"[{stamp}] {event.get('message') or event.get('phase') or 'Working'}")
+        return "\n".join(lines)
 
     @staticmethod
     def _inferred_fabric(status: dict, configured_ip: str | None = None,
@@ -412,7 +486,23 @@ class Manager:
             self.settings.get("cluster_fabric_ip"),
             self.settings.get("cluster_fabric_interface"),
         )
-        return await self.node_registry.public_nodes(local)
+        nodes = await self.node_registry.public_nodes(local)
+
+        async def add_legacy_disk(node: dict) -> None:
+            # Agents from before disk telemetry was added still expose the
+            # regular /api/disk endpoint. This compatibility request makes the
+            # selector useful before every node has pulled the latest build.
+            if node.get("local") or not node.get("online") or node.get("disk"):
+                return
+            try:
+                node["disk"] = await self.node_registry.request(
+                    node["id"], "GET", "/api/disk", timeout=3
+                )
+            except Exception:
+                pass
+
+        await asyncio.gather(*(add_legacy_disk(node) for node in nodes))
+        return nodes
 
     async def pair_node(self, body: dict) -> dict:
         return await self.node_registry.pair_remote(
@@ -642,8 +732,20 @@ class Manager:
                 "rank": rank,
                 "container_name": name,
                 "fabric_ip": fabric_ip,
+                "status": "queued",
+                "phase": {
+                    "phase": "queued",
+                    "message": "Waiting for the node agent to begin launch",
+                },
             })
             tasks.append(self._create_member(node_id, payload))
+
+        # Save member identities before awaiting image pulls. Those requests
+        # can take many minutes, and the logs UI needs the names immediately
+        # so it can ask every node for controller-side launch progress.
+        deployment["members"] = member_specs
+        deployment["api_port"] = requested_port
+        self._save_deployments()
 
         created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []
@@ -655,8 +757,6 @@ class Manager:
             else:
                 spec["status"] = result.get("status", "starting")
                 spec["container_id"] = result.get("id")
-        deployment["members"] = member_specs
-        deployment["api_port"] = requested_port
         deployment["status"] = "error" if errors else "starting"
         if errors:
             deployment["error"] = "; ".join(errors)
@@ -682,9 +782,9 @@ class Manager:
             if action == "stop":
                 return await self.stop_container(name)
             if action == "remove":
-                return await self.remove_container(name)
+                return await self.remove_cluster_member(name)
             if action == "logs":
-                return {"logs": await self.get_logs(name, 300)}
+                return {"logs": await self.get_cluster_member_logs(name, 300)}
         method = "GET" if action == "logs" else ("DELETE" if action == "remove" else "POST")
         suffix = "/logs" if action == "logs" else ("" if action == "remove" else f"/{action}")
         return await self.node_registry.request(
@@ -720,16 +820,60 @@ class Manager:
             *[self._member_action(m, "logs") for m in deployment.get("members", [])],
             return_exceptions=True,
         )
+        def member_logs(member: dict, value: Any) -> str:
+            if isinstance(value, dict) and value.get("logs"):
+                return value["logs"]
+            phase = member.get("phase") or {}
+            message = phase.get("message") or (
+                "Waiting for the node agent to begin launch"
+                if member.get("status") in {"queued", "creating"}
+                else "No output has been reported yet"
+            )
+            fallback = f"=== Coordinator launch status ===\n{message}"
+            # An older remote agent returns 404 until Docker has created the
+            # container. The coordinator status is the useful signal in that
+            # case, so keep the transport detail below it instead of replacing
+            # the entire member panel with an error.
+            if isinstance(value, Exception):
+                fallback += f"\n\nAgent log request: {value}"
+            return fallback
+
         return {
             "members": [
                 {
                     **member,
-                    "logs": value.get("logs", "") if isinstance(value, dict) else "",
-                    "error": str(value) if isinstance(value, Exception) else None,
+                    "logs": member_logs(member, value),
+                    "error": None,
                 }
                 for member, value in zip(deployment.get("members", []), values)
             ]
         }
+
+    async def get_cluster_member_logs(self, name: str, tail: int = 300) -> str:
+        """Combine pre-container launch progress with Docker output."""
+        launch_text = self._cluster_launch_text(name)
+        managed = await self.is_managed_container(name)
+        if not launch_text and not managed:
+            raise ValueError("cluster member not found")
+        sections = [launch_text] if launch_text else []
+        if managed:
+            try:
+                container_logs = await self.get_logs(name, tail)
+            except Exception as exc:
+                container_logs = f"Could not read container logs: {exc}"
+            sections.append("=== Container logs ===\n" + (container_logs or "(no output yet)"))
+        elif launch_text:
+            sections.append("=== Container logs ===\nContainer has not been created yet.")
+        return "\n\n".join(sections)
+
+    async def remove_cluster_member(self, name: str) -> dict:
+        if await self.is_managed_container(name):
+            return await self.remove_container(name)
+        launches = getattr(self, "cluster_member_launches", {})
+        if name in launches:
+            launches.pop(name, None)
+            return {"ok": True}
+        raise ValueError("cluster member not found")
 
     # ---------- memory bandwidth (Grace/GB10 SCF PMU) ----------
     # Grace exposes memory traffic on the Coresight SCF PMU
@@ -2560,6 +2704,10 @@ class Manager:
             if name is None:
                 safe = model.replace("/", "-").replace("_", "-").lower()
                 name = f"sglang-{safe}-{port}"
+            self._cluster_launch_update(
+                name, "preparing", "Preparing SGLang launch",
+                model=model, cluster_member=cluster_member,
+            )
             extra = list(extra_args or [])
             sg_cmd = ["-m", "sglang.launch_server", "--model-path", model]
             sg_cmd += ["--host", "0.0.0.0"]
@@ -2591,18 +2739,31 @@ class Manager:
                 # containers.run().  SGLang recipes use a separate default
                 # image, so make the first launch self-contained.
                 try:
+                    self._cluster_launch_update(
+                        name, "checking_image", f"Checking Docker image {image}",
+                        model=model, cluster_member=cluster_member,
+                    )
                     if recipe_id:
                         self.recipe_launches[recipe_id].update({
                             "phase": "Checking SGLang image", "image": image,
                         })
                     self.client.images.get(image)
                 except docker.errors.ImageNotFound:
+                    self._cluster_launch_update(
+                        name, "pulling_image",
+                        f"Downloading Docker image {image}; this can take several minutes",
+                        model=model, cluster_member=cluster_member,
+                    )
                     if recipe_id:
                         self.recipe_launches[recipe_id].update({
                             "phase": "Downloading SGLang image", "image": image,
                         })
                     print(f"[sglang] pulling missing image: {image}")
                     self.client.images.pull(image)
+                self._cluster_launch_update(
+                    name, "creating_container", "Creating Docker container",
+                    model=model, cluster_member=cluster_member,
+                )
                 if recipe_id:
                     self.recipe_launches[recipe_id].update({
                         "phase": "Creating container", "image": image,
@@ -2658,10 +2819,21 @@ class Manager:
                     **run_options,
                 )
                 container.reload()
+                self._cluster_launch_update(
+                    name, "starting", "Container created; starting the model server",
+                    model=model, cluster_member=cluster_member,
+                )
                 if recipe_id:
                     self.recipe_launches[recipe_id].update({"phase": "Starting model"})
                 return self._container_summary(container)
-            return await asyncio.to_thread(_create)
+            try:
+                return await asyncio.to_thread(_create)
+            except Exception as exc:
+                self._cluster_launch_update(
+                    name, "error", f"Launch failed: {exc}",
+                    model=model, cluster_member=cluster_member, error=str(exc),
+                )
+                raise
         else:
             # vLLM path — VRAM-aware multi-model
             image = image or self.settings["vllm_image"]
@@ -2676,6 +2848,10 @@ class Manager:
             if name is None:
                 safe = model.replace("/", "-").replace("_", "-").lower()
                 name = f"vllm-{safe}-{port}"
+            self._cluster_launch_update(
+                name, "preparing", "Preparing vLLM launch",
+                model=model, cluster_member=cluster_member,
+            )
             extra = list(extra_args or [])
 
             serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
@@ -2713,10 +2889,23 @@ class Manager:
 
             def _create():
                 try:
+                    self._cluster_launch_update(
+                        name, "checking_image", f"Checking Docker image {image}",
+                        model=model, cluster_member=cluster_member,
+                    )
                     self.client.images.get(image)
                 except docker.errors.ImageNotFound:
+                    self._cluster_launch_update(
+                        name, "pulling_image",
+                        f"Downloading Docker image {image}; this can take several minutes",
+                        model=model, cluster_member=cluster_member,
+                    )
                     print(f"[vllm] pulling missing image: {image}")
                     self.client.images.pull(image)
+                self._cluster_launch_update(
+                    name, "creating_container", "Creating Docker container",
+                    model=model, cluster_member=cluster_member,
+                )
                 labels = {CONTROLLER_LABEL: "1", MODEL_LABEL: model}
                 if cluster_member:
                     labels.update({
@@ -2769,8 +2958,19 @@ class Manager:
                     **run_options,
                 )
                 container.reload()
+                self._cluster_launch_update(
+                    name, "starting", "Container created; starting the model server",
+                    model=model, cluster_member=cluster_member,
+                )
                 return self._container_summary(container)
-            return await asyncio.to_thread(_create)
+            try:
+                return await asyncio.to_thread(_create)
+            except Exception as exc:
+                self._cluster_launch_update(
+                    name, "error", f"Launch failed: {exc}",
+                    model=model, cluster_member=cluster_member, error=str(exc),
+                )
+                raise
 
     async def start_container(self, name: str) -> dict:
         # VRAM-aware: evict only if the GPU is full.
@@ -2833,6 +3033,7 @@ class Manager:
         def _do():
             self.client.containers.get(name).remove(force=True)
         await asyncio.to_thread(_do)
+        getattr(self, "cluster_member_launches", {}).pop(name, None)
         return {"ok": True}
 
     async def get_logs(self, name: str, tail: int = 200) -> str:
@@ -4838,11 +5039,11 @@ class Manager:
             LOCAL_NODE_ID: {c.get("name"): c for c in containers},
         }
         for node in nodes:
-            if node.get("id") == LOCAL_NODE_ID:
-                continue
-            containers_by_node[node["id"]] = {
-                c.get("name"): c for c in (node.get("containers") or [])
-            }
+            node_containers = containers_by_node.setdefault(node["id"], {})
+            # Real local Docker summaries win over the synthetic launch rows;
+            # remote nodes only have their advertised summaries here.
+            for container in node.get("containers") or []:
+                node_containers.setdefault(container.get("name"), container)
         node_by_id = {n["id"]: n for n in nodes}
         public_deployments = []
         for saved in self.deployments:
@@ -4860,7 +5061,7 @@ class Manager:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")
                     member["container_id"] = container.get("id", member.get("container_id"))
-                elif saved.get("status") != "error":
+                elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
                 member["node_status"] = node.get("status", "unknown")
                 deployment["members"].append(member)

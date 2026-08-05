@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=48">
-<script src="/static/app.js?v=48"></script>
+<link rel="stylesheet" href="/static/styles.css?v=51">
+<script src="/static/app.js?v=51"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -308,7 +308,7 @@
         </dl>
         <div class="node-message" x-show="node.status_message" x-text="node.status_message"></div>
         <div class="card-actions">
-          <button class="btn btn-ghost" @click="refreshClusterNode(node.id)" :disabled="clusterBusy[node.id]">Test connection</button>
+          <button class="btn btn-ghost" @click="refreshClusterNode(node.id)" :disabled="clusterBusy[node.id] === true">Test connection</button>
           <button class="btn btn-ghost" x-show="!node.local" @click="toggleClusterNode(node)"
                   x-text="node.enabled === false ? 'Enable' : 'Disable'"></button>
           <button class="btn btn-danger" x-show="!node.local" @click="removeClusterNode(node)">Remove</button>
@@ -499,10 +499,10 @@
             <dt>API</dt><dd class="mono" x-text="d.api_port ? (deploymentApiUrls(d).join(', ') || '—') : '—'"></dd>
           </dl>
           <div class="card-actions">
-            <button class="btn btn-primary" x-show="d.status === 'stopped'" @click="deploymentAction(d, 'start')" :disabled="clusterBusy[d.id]">Start cluster</button>
-            <button class="btn btn-ghost" x-show="d.status !== 'stopped'" @click="deploymentAction(d, 'stop')" :disabled="clusterBusy[d.id]">Stop cluster</button>
+            <button class="btn btn-primary" x-show="d.status === 'stopped'" @click="deploymentAction(d, 'start')" :disabled="clusterBusy[d.id] === true">Start cluster</button>
+            <button class="btn btn-ghost" x-show="d.status !== 'stopped'" @click="deploymentAction(d, 'stop')" :disabled="clusterBusy[d.id] === true">Stop cluster</button>
             <button class="btn btn-ghost" @click="openDeploymentLogs(d)">Combined logs</button>
-            <button class="btn btn-danger" @click="deploymentAction(d, 'remove')" :disabled="clusterBusy[d.id]">Remove</button>
+            <button class="btn btn-danger" @click="deploymentAction(d, 'remove')" :disabled="clusterBusy[d.id] === true">Remove</button>
           </div>
         </div>
       </template>
@@ -1625,6 +1625,12 @@ for chunk in stream:
         <input type="text" x-model="settingsForm.hf_cache">
       </label>
       <label>
+        <span>HF token <span class="tip" tabindex="0" data-tip="Hugging Face access token exported to vLLM and SGLang containers on every selected cluster node. The saved value is never returned by the API; leave blank to keep the existing credential."></span></span>
+        <input type="password" x-model="settingsForm.hf_token" autocomplete="new-password"
+               :placeholder="settingsForm.hf_token_configured ? 'Configured — leave blank to keep' : 'hf_…'">
+        <small class="muted" x-show="settingsForm.hf_token_configured">Credential configured</small>
+      </label>
+      <label>
         <span>Shared memory size <span class="tip" tabindex="0" data-tip="Container --shm-size. vLLM uses /dev/shm for inter-process tensor passing. 16g is a comfortable default for most models."></span></span>
         <input type="text" x-model="settingsForm.shm_size">
       </label>
@@ -1685,7 +1691,7 @@ for chunk in stream:
 
 <!-- ============== LOGS MODAL ============== -->
 <div class="modal" x-show="logsModal.open" @click.self="logsModal.open = false">
-  <div class="modal-body">
+  <div class="modal-body" :class="{'cluster-logs-modal': logsModal.deploymentId}">
     <div class="modal-head">
       <h3 x-text="`Logs · ${logsModal.name}`"></h3>
       <div>
@@ -1693,7 +1699,26 @@ for chunk in stream:
         <button class="btn" @click="logsModal.open = false">Close</button>
       </div>
     </div>
-    <pre class="logbox tall" x-text="logsModal.text"></pre>
+    <div class="cluster-log-grid" x-show="logsModal.deploymentId && logsModal.members?.length">
+      <template x-for="member in logsModal.members || []"
+                :key="`${member.node_id}-${member.rank}-${member.container_name}`">
+        <section class="cluster-log-panel">
+          <div class="cluster-log-head">
+            <div>
+              <strong x-text="member.node_name || member.node_id"></strong>
+              <span class="muted mono" x-text="`rank ${member.rank}`"></span>
+            </div>
+            <span class="status-pill"
+                  :class="member.error ? 'pill-error' : 'pill-ready'"
+                  x-text="member.error ? 'log error' : (member.status || 'connected')"></span>
+          </div>
+          <div class="cluster-log-container mono" x-text="member.container_name"></div>
+          <pre class="logbox cluster-log-output" x-text="member.error || member.logs || '(no logs yet)'"></pre>
+        </section>
+      </template>
+    </div>
+    <pre class="logbox tall" x-show="!logsModal.deploymentId || !logsModal.members?.length"
+         x-text="logsModal.text"></pre>
   </div>
 </div>
 

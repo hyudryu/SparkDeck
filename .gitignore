@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+.DS_Store
+.claude/
+.idea/
+.vscode/
+.codex
+*.log
+*.log.old
+*.bak.*
+static/update_form.py
+\!

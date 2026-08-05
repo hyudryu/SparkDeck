@@ -4,11 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/styles.css?v=47">
+<script src="/static/app.js?v=47"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
-<script defer src="/static/app.js"></script>
 </head>
-<body x-data="app()" x-init="init()">
+<body x-data="app()" x-init="init()" x-cloak>
 
 <header class="topbar">
   <div class="topbar-left">
@@ -18,47 +20,220 @@
     </div>
   </div>
   <div class="topbar-stats" x-show="state">
+    <button class="topbar-stats-toggle" @click="topbarStatsCollapsed = !topbarStatsCollapsed"
+            :title="topbarStatsCollapsed ? 'Show stats' : 'Hide stats'">
+      <span class="stat-label">Stats</span>
+      <span class="stats-chevron" :class="{open: !topbarStatsCollapsed}">⌄</span>
+    </button>
+    <div class="topbar-stats-content" x-show="!topbarStatsCollapsed" x-transition>
     <template x-if="state">
       <div class="stat-row">
         <!-- CPU -->
         <div class="stat" :title="`CPU usage`">
           <span class="stat-label">CPU</span>
           <span class="stat-value" x-text="fmtPct(state.stats.cpu_pct)"></span>
-          <div class="bar"><span :style="`width:${state.stats.cpu_pct ?? 0}%`"></span></div>
+          <div class="bar"><span :style="`width:${Math.round(state.stats.cpu_pct ?? 0)}%`"></span></div>
+        </div>
+        <!-- CPU clock -->
+        <div class="stat" :title="`CPU ${fmtClock(state.stats.cpu_clock_mhz, state.stats.cpu_clock_max_mhz)} · base ${state.stats.cpu_clock_base_mhz ?? '—'} MHz`">
+          <span class="stat-label">CPU clock</span>
+          <span class="stat-value" x-text="fmtClockDelta(state.stats.cpu_clock_mhz, state.stats.cpu_clock_base_mhz, state.stats.cpu_clock_max_mhz)"></span>
+          <div class="bar"><span :style="`width:${clockPct(state.stats.cpu_clock_mhz, state.stats.cpu_clock_base_mhz, state.stats.cpu_clock_max_mhz)}%; background:${clockColor(state.stats.cpu_temp_c)}`"></span></div>
         </div>
         <!-- GPU util -->
         <div class="stat">
           <span class="stat-label">GPU</span>
           <span class="stat-value" x-text="fmtPct(gpu()?.util)"></span>
-          <div class="bar"><span :style="`width:${gpu()?.util ?? 0}%; background: var(--accent-green)`"></span></div>
+          <div class="bar"><span :style="`width:${Math.round(gpu()?.util ?? 0)}%; background: var(--accent-green)`"></span></div>
+        </div>
+        <!-- GPU clock -->
+        <div class="stat" :title="`GPU ${fmtClock(gpu()?.clock_mhz, gpu()?.clock_max_mhz)} · base ${gpu()?.clock_base_mhz ?? '—'} MHz`">
+          <span class="stat-label">GPU clock</span>
+          <span class="stat-value" x-text="fmtClockDelta(gpu()?.clock_mhz, gpu()?.clock_base_mhz, gpu()?.clock_max_mhz)"></span>
+          <div class="bar"><span :style="`width:${clockPct(gpu()?.clock_mhz, gpu()?.clock_base_mhz, gpu()?.clock_max_mhz)}%; background:${clockColor(gpu()?.temp)}`"></span></div>
         </div>
         <!-- RAM -->
         <div class="stat">
           <span class="stat-label">RAM</span>
           <span class="stat-value" x-text="fmtBytes(state.stats.mem.used) + ' / ' + fmtBytes(state.stats.mem.total)"></span>
-          <div class="bar"><span :style="`width:${state.stats.mem.pct ?? 0}%; background: var(--accent-blue)`"></span></div>
+          <div class="bar"><span :style="`width:${Math.round(state.stats.mem.pct ?? 0)}%; background: var(--accent-blue)`"></span></div>
+        </div>
+        <!-- Disk -->
+        <div class="stat">
+          <div class="stat-label-row">
+            <span class="stat-label">Disk</span>
+            <span class="stat-label-actions">
+              <button class="stat-manage-btn" @click="openDiskManager()" title="Open disk manager in a new tab">Manage</button>
+              <button class="icon-btn" :class="{'spin': diskLoading}" @click="refreshDisk()" :disabled="diskLoading" title="Refresh disk">↻</button>
+            </span>
+          </div>
+          <span class="stat-value" x-text="disk?.used != null ? fmtBytes(disk.used) + ' / ' + fmtBytes(disk.total) : '— / —'"></span>
+          <div class="bar"><span :style="`width:${Math.round(disk?.pct ?? 0)}%; background: var(--accent-purple)`"></span></div>
+          <span class="muted" style="font-size:11px; margin-top:2px" x-text="disk?.free != null ? fmtGb1(disk.free) + ' free' : ''"></span>
         </div>
         <!-- CPU temp -->
         <div class="stat">
           <span class="stat-label">CPU temp</span>
           <span class="stat-value" x-text="fmtTemp(state.stats.cpu_temp_c)"></span>
+          <div class="bar"><span :style="`width:${tempPct(state.stats.cpu_temp_c)}%; background:${tempColor(state.stats.cpu_temp_c)}`"></span></div>
         </div>
         <!-- GPU temp -->
         <div class="stat">
           <span class="stat-label">GPU temp</span>
           <span class="stat-value" x-text="fmtTemp(gpu()?.temp)"></span>
+          <div class="bar"><span :style="`width:${tempPct(gpu()?.temp)}%; background:${tempColor(gpu()?.temp)}`"></span></div>
         </div>
         <!-- Power -->
         <div class="stat">
           <span class="stat-label">Power</span>
           <span class="stat-value" x-text="fmtWatts(gpu()?.power_draw_w, gpu()?.power_limit_w)"></span>
+          <div class="bar"><span :style="`width:${powerPct(gpu()?.power_draw_w, gpu()?.power_limit_w)}%; background:${powerColor(gpu()?.power_draw_w, gpu()?.power_limit_w)}`"></span></div>
+        </div>
+        <!-- Interactive local and SSH users -->
+        <div class="stat stat-users"
+             :title="state.stats.online_users?.count == null
+               ? 'Could not read login sessions'
+               : `${state.stats.online_users.sessions} login session${state.stats.online_users.sessions === 1 ? '' : 's'} · ${state.stats.online_users.names.join(', ') || 'no users online'}`">
+          <span class="stat-label">Online users</span>
+          <span class="stat-value"
+                x-text="state.stats.online_users?.count == null
+                  ? '—'
+                  : `${state.stats.online_users.count} · ${state.stats.online_users.names.join(', ') || 'none'}`"></span>
+          <span class="online-users-status" :class="{'active': state.stats.online_users?.count > 0}"
+                x-text="state.stats.online_users?.count > 0 ? '● Active login' : 'No active logins'"></span>
+        </div>
+        <!-- Session tokens -->
+        <div class="stat stat-tokens" title="Session input/output tokens served since the controller started (or last reset), per model + quant variant. Speed counts decode time only (first to last output token; prefill excluded): while requests are streaming it is the live aggregate across all active streams, otherwise the session average. Reset clears only this session; lifetime counters are in the Usage tab.">
+          <div class="stat-label-row">
+            <span class="stat-label">Tokens</span>
+            <button class="icon-btn" @click="resetSessionTokenStats()" title="Reset session token counters">↺</button>
+          </div>
+          <select class="token-select" x-model="tokenModel">
+            <option value="" disabled x-show="!tokenModelOptions().length">no traffic yet</option>
+            <template x-for="m in tokenModelOptions()" :key="m">
+              <option :value="m" x-text="tokenModelLabel(m)"></option>
+            </template>
+          </select>
+          <span class="stat-value" x-show="tokenModel"><span class="tok-dir">↓ In</span><span x-text="fmtTokens(tokenStatsFor(tokenModel)?.input)"></span></span>
+          <span class="stat-value" x-show="tokenModel"><span class="tok-dir">↑ Out</span><span x-text="fmtTokens(tokenStatsFor(tokenModel)?.output) + '  ·  ' + fmtSpeed(tokenModel)"></span></span>
+          <span class="stat-value" x-show="tokenModel"><span class="tok-dir" style="color:var(--accent-green)">Cost</span><span x-text="tokenCostDisplay(tokenModel)"></span></span>
+          <span class="stat-value" x-show="!tokenModel">—</span>
+          <span class="stat-value live-reqs" x-show="liveReqs(tokenModel)"
+                x-text="'● ' + liveReqs(tokenModel)?.connections + ' conn · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
+          <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
       </div>
     </template>
+    </div>
   </div>
   <div class="topbar-right">
+    <div class="fan-stat" x-show="state?.stats?.fan" @click.outside="fanSettingsOpen = false">
+      <div class="fan-stat-head">
+        <button class="fan-settings-toggle" @click="toggleFanSettings()"
+                :title="`Edit ${state?.stats?.fan?.mode ?? 'fan'} settings · ${state?.stats?.fan?.status ?? ''}`">
+          <span class="stat-label">Fan</span>
+          <span class="fan-chevron" :class="{'open': fanSettingsOpen}">⌄</span>
+        </button>
+        <label class="toggle-sm">
+          <input type="checkbox" x-model="fanMaxSpeed" @change="toggleFanMaxSpeed()">
+          <span class="toggle-slider"></span>
+          <span class="toggle-label" x-text="fanMaxSpeed ? 'MAX' : 'Auto'"></span>
+        </label>
+      </div>
+      <span class="stat-value" x-text="`${state?.stats?.fan?.rpm ?? '—'} RPM · ${state?.stats?.fan?.duty_pct != null ? state.stats.fan.duty_pct.toFixed(0) : '—'}%`"></span>
+      <div class="bar"><span :style="`width:${Math.round(state?.stats?.fan?.duty_pct ?? 0)}%; background: ${fanMaxSpeed ? 'var(--accent-red)' : 'var(--accent-blue)'}`"></span></div>
+
+      <div class="fan-settings-panel" x-show="fanSettingsOpen" x-transition>
+        <div class="fan-settings-title">
+          <span>Fan control</span>
+          <span class="fan-active-mode" x-text="`Active: ${fanSettingsLiveMode || '—'}`"></span>
+        </div>
+        <div class="fan-mode-tabs" role="tablist" aria-label="Fan control mode">
+          <button @click="selectFanSettingsMode('curve')" :class="{'active': fanSettingsMode === 'curve'}" :disabled="fanSettingsLoading || fanSettingsSaving">Curve</button>
+          <button @click="selectFanSettingsMode('pid')" :class="{'active': fanSettingsMode === 'pid'}" :disabled="fanSettingsLoading || fanSettingsSaving">PID</button>
+          <button @click="selectFanSettingsMode('hysteresis')" :class="{'active': fanSettingsMode === 'hysteresis'}" :disabled="fanSettingsLoading || fanSettingsSaving">Hysteresis</button>
+          <button @click="selectFanSettingsMode('manual')" :class="{'active': fanSettingsMode === 'manual'}" :disabled="fanSettingsLoading || fanSettingsSaving">Manual</button>
+        </div>
+        <div class="fan-settings-empty" x-show="fanSettingsLoading">Loading FanController settings…</div>
+        <div class="fan-settings-empty" x-show="!fanSettingsLoading && !Object.keys(fanSettingsDraft).length">
+          FanController settings are unavailable.
+        </div>
+
+        <template x-if="fanSettingsMode === 'curve'">
+          <div>
+            <div class="fan-curve-toolbar">
+              <span>Fan curve</span>
+              <button @click="resetFanCurve()" :disabled="fanSettingsSaving">Reset to default</button>
+            </div>
+            <svg class="fan-curve-chart" viewBox="0 0 340 155" role="img" aria-label="Fan duty curve preview">
+              <line x1="30" y1="15" x2="30" y2="135" class="fan-chart-axis"></line>
+              <line x1="30" y1="135" x2="325" y2="135" class="fan-chart-axis"></line>
+              <line x1="30" y1="75" x2="325" y2="75" class="fan-chart-grid"></line>
+              <text x="4" y="19">100%</text><text x="10" y="79">50%</text><text x="16" y="139">0</text>
+              <text x="30" y="151" x-text="`${fanSettingsDraft.curve_min_temp ?? '—'}°`"></text>
+              <text x="325" y="151" text-anchor="end" x-text="`${fanSettingsDraft.curve_max_temp ?? '—'}°C`"></text>
+              <polyline :points="fanCurvePolyline()" class="fan-chart-fill-line"></polyline>
+              <template x-for="(point, index) in (fanSettingsDraft.curve_points || [])" :key="`chart-${index}`">
+                <circle :cx="fanCurveX(point[0])" :cy="fanCurveY(point[1])" r="4" class="fan-chart-point"></circle>
+              </template>
+              <circle x-show="state?.stats?.fan?.temp != null" :cx="fanCurveX(state?.stats?.fan?.temp)"
+                      :cy="fanCurveY(state?.stats?.fan?.duty_pct)" r="5" class="fan-chart-live"></circle>
+            </svg>
+            <div class="fan-curve-head"><span>Temperature °C</span><span>Duty %</span><span></span></div>
+            <template x-for="(point, index) in (fanSettingsDraft.curve_points || [])" :key="index">
+              <div class="fan-curve-row">
+                <input type="number" step="0.5" x-model.number="point[0]" :disabled="fanSettingsSaving">
+                <input type="number" min="0" max="100" step="0.5" x-model.number="point[1]" :disabled="fanSettingsSaving">
+                <button class="fan-point-remove" @click="removeFanCurvePoint(index)"
+                        :disabled="fanSettingsSaving || fanSettingsDraft.curve_points.length <= 2" title="Remove point">×</button>
+              </div>
+            </template>
+            <button class="fan-add-point" @click="addFanCurvePoint()" :disabled="fanSettingsSaving">＋ Add curve point</button>
+            <div class="fan-settings-grid">
+              <label title="Minimum temperature displayed on the curve editor"><span>X-axis minimum °C</span><input type="number" min="0" max="90" step="1" x-model.number="fanSettingsDraft.curve_min_temp"></label>
+              <label title="Maximum temperature displayed on the curve editor"><span>X-axis maximum °C</span><input type="number" min="40" max="120" step="1" x-model.number="fanSettingsDraft.curve_max_temp"></label>
+              <label title="The fan never goes below this duty"><span>Minimum duty floor %</span><input type="number" min="0" max="100" step="1" x-model.number="fanSettingsDraft.min_floor_pct"></label>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="fanSettingsMode === 'pid'">
+          <div class="fan-settings-grid">
+            <label title="Target temperature for the PID controller"><span>Setpoint °C</span><input type="number" min="30" max="100" step="1" x-model.number="fanSettingsDraft.setpoint"></label>
+            <label title="Proportional gain — responds to current error"><span>Kp · proportional</span><input type="number" min="0" max="50" step="0.1" x-model.number="fanSettingsDraft.kp"></label>
+            <label title="Integral gain — eliminates steady-state error"><span>Ki · integral</span><input type="number" min="0" max="10" step="0.05" x-model.number="fanSettingsDraft.ki"></label>
+            <label title="Derivative gain — dampens response to error changes"><span>Kd · derivative</span><input type="number" min="0" max="20" step="0.05" x-model.number="fanSettingsDraft.kd"></label>
+            <label title="The fan never goes below this duty"><span>Minimum duty floor %</span><input type="number" min="0" max="100" step="1" x-model.number="fanSettingsDraft.min_floor_pct"></label>
+          </div>
+        </template>
+
+        <template x-if="fanSettingsMode === 'hysteresis'">
+          <div class="fan-settings-grid">
+            <label title="Temperature at which the fan turns on"><span>Turn-on temperature °C</span><input type="number" min="30" max="110" step="1" x-model.number="fanSettingsDraft.hyst_on_temp"></label>
+            <label title="Temperature at which the fan turns off"><span>Turn-off temperature °C</span><input type="number" min="20" max="100" step="1" x-model.number="fanSettingsDraft.hyst_off_temp"></label>
+            <p class="fan-mode-tip">Keep turn-off 5–10 °C below turn-on to avoid rapid cycling.</p>
+          </div>
+        </template>
+
+        <template x-if="fanSettingsMode === 'manual'">
+          <div class="fan-manual-control">
+            <div><span>Fan duty</span><strong x-text="`${fanSettingsDraft.manual_duty_pct ?? 0}%`"></strong></div>
+            <input type="range" min="0" max="100" step="1" x-model.number="fanSettingsDraft.manual_duty_pct" :disabled="fanSettingsSaving">
+            <p class="fan-mode-tip">Sets a fixed fan output instead of reacting to temperature.</p>
+          </div>
+        </template>
+
+        <div class="fan-settings-actions">
+          <button class="btn btn-primary" @click="saveFanSettings()"
+                  :disabled="fanSettingsSaving || !fanSettingsMode || !Object.keys(fanSettingsDraft).length"
+                  x-text="fanSettingsSaving ? 'Applying…' : (fanSettingsMode === fanSettingsLiveMode ? 'Save settings' : `Save & activate ${fanSettingsMode}`)"></button>
+          <span class="fan-settings-ok" x-show="fanSettingsSaved">Applied.</span>
+        </div>
+        <div class="fan-settings-error" x-show="fanSettingsError" x-text="fanSettingsError"></div>
+      </div>
+    </div>
     <span class="capacity" x-show="state">
-      <span x-text="state?.summary.running_models"></span> / <span x-text="state?.summary.max_concurrent_models"></span>
+      <span x-text="state?.summary?.running_models ?? '—'"></span>
       <span class="muted">running</span>
     </span>
     <span class="dot" :class="connected ? 'dot-ok' : 'dot-bad'"></span>
@@ -67,16 +242,86 @@
 
 <nav class="tabs">
   <button :class="{active: tab==='containers'}" @click="tab='containers'">Models</button>
-  <button :class="{active: tab==='inference'}" @click="tab='inference'">Inference</button>
-  <button :class="{active: tab==='queue'}" @click="tab='queue'">
-    Queue
-    <span class="badge" x-show="pendingCount() > 0" x-text="pendingCount()"></span>
+  <button :class="{active: tab==='cluster'}" @click="tab='cluster'">
+    Cluster
+    <span class="badge" x-show="(state?.summary?.cluster_nodes ?? 1) > 1"
+          x-text="`${state?.summary?.cluster_nodes_online ?? 1}/${state?.summary?.cluster_nodes ?? 1}`"></span>
   </button>
+  <button :class="{active: tab==='inference'}" @click="tab='inference'">Chat</button>
+  <button :class="{active: tab==='ab'}" @click="tab='ab'">A/B</button>
+  <button :class="{active: tab==='api'}" @click="tab='api'">API</button>
   <button :class="{active: tab==='images'}" @click="tab='images'">Images</button>
+  <button :class="{active: tab==='ollama'}" @click="tab='ollama'">
+    Ollama
+    <span class="badge" x-show="state?.summary?.ollama_models > 0" x-text="state?.summary?.ollama_models"></span>
+  </button>
+  <button :class="{active: tab==='usage'}" @click="tab='usage'">Usage</button>
   <button :class="{active: tab==='settings'}" @click="tab='settings'">Settings</button>
+  <button :class="{active: tab==='logs'}" @click="tab='logs'">Logs</button>
 </nav>
 
-<main>
+<main :class="{'full-width': tab === 'ab' || tab === 'inference'}">
+
+<!-- ============== CLUSTER ============== -->
+<section x-show="tab==='cluster'" class="page">
+  <div class="page-head">
+    <div>
+      <h2>Cluster</h2>
+      <p class="card-desc">Node 1 coordinates model deployments. Management uses the agent URL; distributed inference uses each node's ConnectX fabric address.</p>
+    </div>
+  </div>
+
+  <div class="cluster-summary">
+    <span class="dot" :class="(state?.nodes || []).every(n => n.online || n.enabled === false) ? 'dot-ok' : 'dot-bad'"></span>
+    <strong x-text="`${state?.summary?.cluster_nodes_online ?? 1} of ${state?.summary?.cluster_nodes ?? 1} nodes online`"></strong>
+  </div>
+
+  <div class="card-grid cluster-node-grid">
+    <template x-for="node in state?.nodes || []" :key="node.id">
+      <div class="card node-card" :class="`node-${node.status || 'unknown'}`">
+        <div class="card-head">
+          <div>
+            <div class="card-title" x-text="node.name || node.hostname || node.id"></div>
+            <div class="card-sub mono" x-text="node.local ? 'Coordinator · local' : node.agent_url"></div>
+          </div>
+          <span class="status-pill" :class="node.status === 'online' ? 'pill-ready' : (node.status === 'degraded' ? 'pill-degraded' : (node.status === 'disabled' ? 'pill-exited' : 'pill-error'))"
+                x-text="node.status || 'unknown'"></span>
+        </div>
+        <dl class="kv">
+          <dt>Hostname</dt><dd x-text="node.hostname || '—'"></dd>
+          <dt>Memory</dt><dd x-text="node.stats?.mem ? `${fmtBytes(node.stats.mem.used)} / ${fmtBytes(node.stats.mem.total)}` : '—'"></dd>
+          <dt>GPU</dt><dd x-text="node.stats?.gpus?.length ? `${fmtPct(node.stats.gpus[0].util)} · ${fmtTemp(node.stats.gpus[0].temp)}` : '—'"></dd>
+          <dt>Docker</dt><dd x-text="node.docker_ready ? 'Ready' : 'Unavailable'"></dd>
+          <dt>Fabric</dt><dd class="mono" x-text="node.fabric_ip ? `${node.fabric_ip}${node.fabric_interface ? ' · ' + node.fabric_interface : ''}` : (node.fabric_ready ? 'RDMA detected' : 'Not configured')"></dd>
+          <dt>Last seen</dt><dd x-text="node.last_seen ? relTime(node.last_seen) : 'never'"></dd>
+        </dl>
+        <div class="node-message" x-show="node.status_message" x-text="node.status_message"></div>
+        <div class="card-actions">
+          <button class="btn btn-ghost" @click="refreshClusterNode(node.id)" :disabled="clusterBusy[node.id]">Test connection</button>
+          <button class="btn btn-ghost" x-show="!node.local" @click="toggleClusterNode(node)"
+                  x-text="node.enabled === false ? 'Enable' : 'Disable'"></button>
+          <button class="btn btn-danger" x-show="!node.local" @click="removeClusterNode(node)">Remove</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <div class="card cluster-pair-card">
+    <h3>Pair another node</h3>
+    <p class="card-desc">Start VLLMController on node 2, then read its one-time code from <code>data/agent.json</code>. Agent tokens remain server-side and are never returned to this browser.</p>
+    <div class="grid grid-form">
+      <label><span>Name <em class="muted">(optional)</em></span><input x-model="clusterForm.name" placeholder="Spark 2"></label>
+      <label><span>Agent URL</span><input x-model="clusterForm.agent_url" placeholder="http://spark-2:7878"></label>
+      <label><span>Pairing code</span><input x-model="clusterForm.pairing_code" inputmode="numeric" maxlength="6" placeholder="123456"></label>
+      <label><span>ConnectX IP <em class="muted">(blank = detect)</em></span><input x-model="clusterForm.fabric_ip" placeholder="169.254.10.2"></label>
+      <label><span>ConnectX interface <em class="muted">(blank = detect)</em></span><input x-model="clusterForm.fabric_interface" placeholder="enp1s0f0np0"></label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" @click="pairClusterNode()" :disabled="clusterPairing || !clusterForm.agent_url || !clusterForm.pairing_code"
+              x-text="clusterPairing ? 'Pairing…' : 'Pair node'"></button>
+    </div>
+  </div>
+</section>
 
 <!-- ============== CONTAINERS ============== -->
 <section x-show="tab==='containers'" class="page">
@@ -90,46 +335,495 @@
 
   <div class="card create-card" x-show="showCreate" x-transition>
     <h3>Pull &amp; launch an LLM</h3>
-    <p class="card-desc">Each model runs in its own container. Pulling installs the weights from Hugging Face into a new container; you'll see live progress on its card below.</p>
+    <p class="card-desc">Each model runs in its own container. Pulling installs the weights from Hugging Face into a new container; you'll see live progress on its card below. Paste a <code>vllm serve …</code> or <code>python -m sglang.launch_server …</code> command to auto-fill, or fill the fields manually.</p>
+    <div class="deployment-picker">
+      <label class="full">
+        <span>Deployment mode <span class="tip" tabindex="0" data-tip="Single node runs one complete model. Sharded combines memory across nodes for one model. Replicated launches a complete independent model on every selected node."></span></span>
+        <select x-model="form.deployment_mode" @change="deploymentModeChanged()">
+          <option value="single">Single node</option>
+          <option value="sharded" :disabled="onlineClusterNodes().length < 2">Sharded across nodes</option>
+          <option value="replicated" :disabled="onlineClusterNodes().length < 2">Replicated on selected nodes</option>
+        </select>
+      </label>
+      <div class="node-choice-list">
+        <template x-for="node in state?.nodes || []" :key="`launch-${node.id}`">
+          <button type="button" class="node-choice"
+                  :class="{selected: launchNodeSelected(node.id), offline: !node.online}"
+                  :disabled="!node.online || (form.deployment_mode === 'sharded' && node.id === 'local' && launchNodeSelected(node.id))"
+                  @click="toggleLaunchNode(node)">
+            <span class="dot" :class="node.online ? 'dot-ok' : 'dot-bad'"></span>
+            <span><strong x-text="node.name"></strong><small x-text="node.online ? (node.local ? 'Coordinator' : 'Online') : (node.status || 'Offline')"></small></span>
+            <span class="node-check" x-text="launchNodeSelected(node.id) ? '✓' : ''"></span>
+          </button>
+        </template>
+      </div>
+      <p class="form-warning" x-show="form.deployment_mode !== 'single' && form.node_ids.length < 2">Select at least two online nodes.</p>
+    </div>
+    <label class="full">
+      <span>Paste command <em class="muted">(optional)</em> <span class="tip" tabindex="0" data-tip="Paste a multi-line `vllm serve <model> --flag value …` or `python -m sglang.launch_server --model-path …` command. The model and flags will be parsed into the fields below. Quoted values like --speculative-config '{...}' are respected."></span></span>
+      <textarea rows="3" x-model="form.pasteCmd" @input.debounce.150ms="parsePasteCmd()" placeholder="vllm serve Qwen/Qwen3.5-27B --trust-remote-code --tensor-parallel-size 1 ..."></textarea>
+    </label>
     <div class="grid">
+      <label class="full">
+        <span>Engine</span>
+        <select x-model="form.engine">
+          <option value="vllm">vLLM</option>
+          <option value="sglang">SGLang</option>
+        </select>
+      </label>
+    </div>
+    <div class="grid grid-form">
       <label>
-        <span>Model (HF repo id)</span>
+        <span>Model (HF repo id) <span class="tip" tabindex="0" data-tip="Hugging Face repo path, e.g. Qwen/Qwen2.5-Coder-7B-Instruct or meta-llama/Llama-3.1-8B-Instruct. Weights download into ~/.cache/huggingface on first launch. Gated models require `huggingface-cli login` on the host first."></span></span>
         <input type="text" x-model="form.model" placeholder="Qwen/Qwen2.5-Coder-7B-Instruct">
       </label>
       <label>
-        <span>Host port <em class="muted">(blank = auto)</em></span>
+        <span>Host port <em class="muted">(blank = auto)</em> <span class="tip" tabindex="0" data-tip="TCP port on the host that maps to the container's vLLM server (port 8000 inside). Blank = next free port in the configured range (default 8000–8099). The OpenAI-compatible API is then reachable at http://<host>:<port>/v1/."></span></span>
         <input type="number" x-model.number="form.port" placeholder="auto">
       </label>
-      <label>
-        <span>GPU memory util</span>
-        <input type="number" step="0.05" min="0.1" max="0.98" x-model.number="form.gpu_mem">
+      <template x-if="form.engine === 'vllm'">
+        <label>
+          <span>GPU memory mode</span>
+          <select x-model="form.gpu_mem_mode">
+            <option value="fraction">Fraction of GPU memory</option>
+            <option value="gb">Absolute GB</option>
+          </select>
+        </label>
+      </template>
+      <template x-if="form.engine === 'sglang'">
+        <label>
+          <span>TP size <span class="tip" tabindex="0" data-tip="Tensor parallelism size (number of GPUs). Usually 1 for single-GPU setups."></span></span>
+          <input type="number" min="1" max="16" x-model.number="form.sg_tp_size" placeholder="1">
+        </label>
+      </template>
+      <template x-if="form.engine === 'sglang'">
+        <label>
+          <span>Context length <span class="tip" tabindex="0" data-tip="Maximum context length (input + output). E.g. 32768 or 131072. This also determines the calculated --max-total-tokens value."></span></span>
+          <input type="number" min="1024" step="1024" x-model.number="form.sg_context_length" placeholder="32768">
+        </label>
+      </template>
+      <template x-if="form.engine === 'sglang'">
+        <label>
+          <span>Max running requests <span class="tip" tabindex="0" data-tip="Maximum concurrent requests (--max-running-requests). The controller calculates --max-total-tokens as max_running_requests x context_length x 2. Leave blank to let the controller calculate it."></span></span>
+          <input type="number" min="1" x-model.number="form.sg_max_running_requests" placeholder="auto (uses context)">
+        </label>
+      </template>
+      <template x-if="form.engine === 'sglang'">
+        <label>
+          <span>Mem fraction <span class="tip" tabindex="0" data-tip="Fraction of GPU memory to use (--mem-fraction-static). Default 0.92. Lower if running multiple models."></span></span>
+          <input type="number" step="0.01" min="0.1" max="0.98" x-model.number="form.sg_mem_fraction" placeholder="0.92">
+        </label>
+      </template>
+      <template x-if="form.engine === 'vllm' && form.gpu_mem_mode === 'fraction'">
+        <label>
+          <span>GPU memory util <span class="tip" tabindex="0" data-tip="Fraction (0.1–0.98) of GPU memory vLLM is allowed to allocate for the model weights and KV cache. Higher = fits longer contexts but starves other workloads. One model: 0.9 is fine. Two models on one GPU: set each ≤0.45. On Grace+Blackwell this applies to the unified memory pool."></span></span>
+          <input type="number" step="0.05" min="0.1" max="0.98" x-model.number="form.gpu_mem">
+        </label>
+      </template>
+      <template x-if="form.engine === 'vllm' && form.gpu_mem_mode === 'gb'">
+        <label>
+          <span>Reserve GB <span class="tip" tabindex="0" data-tip="Absolute gigabytes of GPU memory to reserve for this model. The controller converts this to a vLLM memory fraction using the first GPU's total memory. Useful when running two models side-by-side on the same GPU."></span></span>
+          <input type="range" min="1" :max="gpuTotalGb()" step="1" x-model.number="form.gpu_mem_gb">
+          <div class="muted" x-text="`${form.gpu_mem_gb} GB / ${gpuTotalGb()} GB`"></div>
+        </label>
+      </template>
+      <label class="full" x-show="form.engine === 'vllm'">
+        <span>Image <em class="muted">(blank = use Settings default)</em> <span class="tip" tabindex="0" data-tip="Override the docker image used for this one launch. Leave blank to use the global default in Settings → vLLM image. Useful when trying a community-pinned vLLM build (e.g. vllm/vllm-openai:gemma4-cu130) without changing the global default."></span></span>
+        <input type="text" x-model="form.image" :placeholder="state?.settings?.vllm_image || 'image:tag'">
       </label>
+      <template x-if="form.engine === 'sglang'">
+        <label class="full">
+          <span>SGLang image <em class="muted">(blank = auto)</em> <span class="tip" tabindex="0" data-tip="Docker image for SGLang. Leave blank for the official sglang:latest. Override with something like lmsysorg/sglang:latest for a specific build."></span></span>
+          <input type="text" x-model="form.sg_image" placeholder="lmsysorg/sglang:latest">
+        </label>
+      </template>
       <label class="full">
-        <span>Extra vllm args <em class="muted">(space-separated)</em></span>
-        <input type="text" x-model="form.extra" placeholder="--max-model-len 8192 --dtype auto">
+        <span>Extra args <em class="muted">(space-separated)</em> <span class="tip" x-show="form.engine === 'vllm'" data-tip="Extra flags appended to `vllm serve`. Common: --max-model-len 8192 (cap context), --dtype bfloat16, --quantization awq (for AWQ-quantized weights), --enforce-eager (skip CUDA graph capture), --max-num-seqs 32 (concurrent requests). See vLLM CLI docs."></span><span class="tip" x-show="form.engine === 'sglang'" data-tip="Extra flags appended to `python -m sglang.launch_server`. Common: --tool-call-parser qwen3_coder, --reasoning-parser qwen3, --enable-cache-report. See SGLang CLI docs."></span></span>
+        <input type="text" x-model="form.extra" :placeholder="form.engine === 'vllm' ? '--max-model-len 8192 --dtype auto' : '--tool-call-parser qwen3_coder --reasoning-parser qwen3'">
       </label>
     </div>
     <div class="actions">
-      <button class="btn btn-primary" @click="createContainer()" :disabled="creating">
+      <button class="btn btn-primary" @click="createContainer()" :disabled="creating || !form.model || !launchSelectionValid()">
         <span x-show="!creating">Launch</span>
         <span x-show="creating">Launching…</span>
       </button>
+      <button class="btn" @click="saveRecipe()" :disabled="!form.model"
+              title="Save model + flags as a reusable recipe (no container is started)">
+        Save recipe
+      </button>
+      <span class="muted" x-show="recipeSaved">Saved.</span>
     </div>
   </div>
 
-  <div x-show="!state?.containers.length" class="empty">
-    No vLLM containers found.
+  <!-- Cluster deployments are presented as one logical model, even though
+       each member is a separate container on its node. -->
+  <details class="section-collapsible" x-show="(state?.deployments?.length ?? 0) > 0" open>
+    <summary><h3>Cluster deployments <span class="muted">— coordinated across nodes</span></h3></summary>
+    <div class="card-grid">
+      <template x-for="d in state?.deployments || []" :key="d.id">
+        <div class="card deployment-card" :class="`deployment-${d.status}`">
+          <div class="card-head">
+            <div>
+              <div class="card-title" x-text="d.name"></div>
+              <div class="card-sub mono" x-text="d.model"></div>
+            </div>
+            <div class="card-pills">
+              <span class="status-pill pill-spark" x-text="`${d.mode} · ${d.members?.length || 0} nodes`"></span>
+              <span class="status-pill" :class="d.status === 'ready' ? 'pill-ready' : (d.status === 'error' || d.status === 'degraded' ? 'pill-error' : 'pill-starting')" x-text="d.status"></span>
+            </div>
+          </div>
+          <div class="deployment-members">
+            <template x-for="m in d.members || []" :key="`${d.id}-${m.node_id}`">
+              <div class="deployment-member">
+                <span class="dot" :class="m.node_status === 'online' ? 'dot-ok' : 'dot-bad'"></span>
+                <strong x-text="m.node_name"></strong>
+                <span class="muted" x-text="`rank ${m.rank}`"></span>
+                <span class="member-phase" x-text="m.phase?.message || m.status"></span>
+              </div>
+            </template>
+          </div>
+          <div class="node-message" x-show="d.error" x-text="d.error"></div>
+          <dl class="kv">
+            <dt>Engine</dt><dd x-text="d.engine"></dd>
+            <dt>API</dt><dd class="mono" x-text="d.api_port ? (deploymentApiUrls(d).join(', ') || '—') : '—'"></dd>
+          </dl>
+          <div class="card-actions">
+            <button class="btn btn-primary" x-show="d.status === 'stopped'" @click="deploymentAction(d, 'start')" :disabled="clusterBusy[d.id]">Start cluster</button>
+            <button class="btn btn-ghost" x-show="d.status !== 'stopped'" @click="deploymentAction(d, 'stop')" :disabled="clusterBusy[d.id]">Stop cluster</button>
+            <button class="btn btn-ghost" @click="openDeploymentLogs(d)">Combined logs</button>
+            <button class="btn btn-danger" @click="deploymentAction(d, 'remove')" :disabled="clusterBusy[d.id]">Remove</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </details>
+
+  <!-- ============== SAVED SPARK RUNS ============== -->
+  <details class="section-collapsible spark-subhead"
+           x-data="{get open(){return localStorage.getItem('sec:spark')==='1'}, set open(v){localStorage.setItem('sec:spark', v?'1':'0')}}"
+           :open="open" @toggle="open = $event.target.open">
+    <summary><h3>SparkRuns
+      <span class="muted" x-show="(state?.spark_runs || []).some(r => r.status === 'running')">
+        · <span x-text="(state?.spark_runs || []).filter(r => r.status === 'running').length"></span> running
+      </span>
+      <button class="btn btn-primary spark-add-btn" @click.prevent="openSparkLaunchEditor(null)" x-show="open">+ Save SparkRun</button>
+    </h3></summary>
+    <div x-show="open">
+    <div class="empty" x-show="(state?.spark_launches?.length ?? 0) === 0">
+      No saved SparkRuns yet. Save a runnable reference such as <code>@spark-arena/1199b578-cfa4-47cd-b1fa-374fd4815565</code>.
+    </div>
+
+    <div class="card-grid">
+      <template x-for="r in state?.spark_launches || []" :key="r.id">
+        <div class="card spark-card">
+          <div class="card-head">
+            <div>
+              <div class="card-title" x-text="r.name"></div>
+              <div class="card-sub mono" x-text="r.metadata?.model || '—'"></div>
+              <div class="card-sub mono ellipsis" x-text="r.reference"></div>
+            </div>
+            <div class="card-pills">
+              <span class="status-pill pill-spark">sparkrun</span>
+              <span class="status-pill" x-show="r.metadata?.runtime" x-text="r.metadata?.runtime"></span>
+              <span class="status-pill" x-show="r.metadata?.min_nodes || r.metadata?.max_nodes"
+                    x-text="(r.metadata?.min_nodes || 1) + '–' + (r.metadata?.max_nodes || r.metadata?.min_nodes || 1) + ' nodes'"></span>
+            </div>
+          </div>
+          <dl class="kv">
+            <dt>Description</dt><dd x-text="r.metadata?.description || '—'"></dd>
+            <dt>Author</dt><dd x-text="r.metadata?.author || '—'"></dd>
+            <dt>Tags</dt><dd class="mono ellipsis" x-text="(r.metadata?.tags || []).join(', ') || '—'"></dd>
+          </dl>
+          <div class="card-actions">
+            <button class="btn btn-primary" @click="openSparkLaunchRun(r)" :disabled="sparkRun.busy">Run</button>
+            <button class="btn btn-ghost" @click="openSparkRecipeRuns(r)">Runs</button>
+            <button class="btn btn-ghost" @click="refreshSparkLaunch(r.id)">Refresh details</button>
+            <button class="btn btn-ghost" @click="copySparkReference(r)">Copy command</button>
+            <button class="btn btn-danger" @click="deleteSparkLaunch(r.id)">Delete</button>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Recent Spark Runs -->
+    <div class="spark-runs-list" x-show="(state?.spark_runs?.length ?? 0) > 0">
+      <div class="subhead"><h3>Recent runs</h3></div>
+      <div class="queue-list">
+        <template x-for="run in state?.spark_runs || []" :key="run.id">
+          <div class="queue-item" :class="'q-' + (run.status || 'done')">
+            <div class="q-icon">
+              <span x-text="run.status === 'running' || run.status === 'starting' ? '▶' : (run.status === 'error' || run.status === 'canceled' ? '✕' : '✓')"></span>
+            </div>
+            <div class="q-row-wrap">
+              <div class="q-row">
+                <span class="q-model" x-text="run.recipe_name || run.id"></span>
+                <span class="q-status" x-text="run.status || 'done'"></span>
+                <span class="q-time" x-show="run.elapsed_s != null" x-text="run.elapsed_s + 's'"></span>
+              </div>
+              <div class="q-preview" x-text="run.last_line || ''"></div>
+            </div>
+            <div class="q-actions">
+              <button class="btn btn-ghost" @click="viewSparkRunLog(run)">View log</button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+    </div><!-- /x-show=open -->
+  </details>
+
+  <!-- Saved recipes (HF model + flags) -->
+  <details class="section-collapsible" x-show="(state?.recipes?.length ?? 0) > 0"
+           x-data="{get open(){return localStorage.getItem('sec:recipes')==='1'}, set open(v){localStorage.setItem('sec:recipes', v?'1':'0')}}"
+           :open="open" @toggle="open = $event.target.open">
+    <summary><h3>Saved models <span class="muted">— recipes you can re-launch</span></h3></summary>
+    <div class="card-grid" x-show="open">
+    <template x-for="r in state?.recipes || []" :key="r.id">
+      <div class="card recipe-card">
+        <div class="card-head">
+          <div>
+            <div class="card-title" x-text="r.name"></div>
+            <div class="card-sub mono" x-text="r.model"></div>
+          </div>
+          <div style="display:flex;gap:4px;align-items:center;">
+            <span class="status-pill" :class="r.engine === 'sglang' ? 'pill-sglang' : 'pill-vllm'" x-text="r.engine === 'sglang' ? 'SGLang' : 'vLLM'"></span>
+            <span class="status-pill pill-recipe">recipe</span>
+            <span class="status-pill pill-vram" x-show="estimateVram(r.model, r.extra_args)" x-text="estimateVram(r.model, r.extra_args) + ' GB'"></span>
+          </div>
+        </div>
+        <dl class="kv">
+          <dt>Image</dt><dd class="mono ellipsis" x-text="r.sg_image || r.image || '(default)'"></dd>
+          <dt>Deployment</dt><dd x-text="`${r.deployment_mode || 'single'} · ${(r.node_ids || ['local']).length} node(s)`"></dd>
+          <template x-if="r.engine === 'sglang'">
+            <dt>TP size</dt>
+            <dd x-text="r.sg_tp_size ?? '—'"></dd>
+          </template>
+          <template x-if="r.engine === 'sglang'">
+            <dt>Context len</dt>
+            <dd x-text="r.sg_context_length != null ? r.sg_context_length : '—'"></dd>
+          </template>
+          <template x-if="r.engine === 'sglang'">
+            <dt>Max running reqs</dt>
+            <dd x-text="r.sg_max_running_requests != null ? r.sg_max_running_requests : 'auto'"></dd>
+          </template>
+          <template x-if="r.engine === 'sglang'">
+            <dt>Mem fraction</dt>
+            <dd x-text="r.sg_mem_fraction != null ? r.sg_mem_fraction : '—'"></dd>
+          </template>
+          <template x-if="r.engine !== 'sglang'">
+            <dt>GPU mem</dt>
+            <dd x-text="r.gpu_memory_gb != null ? r.gpu_memory_gb + ' GB' : (r.gpu_memory_utilization != null ? r.gpu_memory_utilization : '—')"></dd>
+          </template>
+          <dt>Args</dt><dd class="mono ellipsis" :title="(r.extra_args || []).join(' ')" x-text="(r.extra_args || []).join(' ') || '—'"></dd>
+        </dl>
+        <div class="card-actions">
+          <button class="btn btn-primary" @click="launchRecipe(r.id)" :aria-busy="recipeLaunching[r.id] ? 'true' : 'false'">
+            <span x-show="!recipeLaunching[r.id]">Launch</span>
+            <span x-show="recipeLaunching[r.id]">Launching...</span>
+          </button>
+          <span class="muted" x-show="state?.recipe_launches?.[r.id]"
+                x-text="state?.recipe_launches?.[r.id]?.phase"></span>
+          <button class="btn btn-ghost" @click="editRecipe(r)">Edit</button>
+          <button class="btn btn-danger" @click="deleteRecipe(r.id)">Delete</button>
+        </div>
+      </div>
+    </template>
+    </div>
+  </details>
+
+  <!-- Pulled vLLM images that have no instance running yet -->
+  <details class="section-collapsible" x-show="availableImages().length"
+           x-data="{get open(){return localStorage.getItem('sec:images')==='1'}, set open(v){localStorage.setItem('sec:images', v?'1':'0')}}"
+           :open="open" @toggle="open = $event.target.open">
+    <summary><h3>Available LLM images <span class="muted">— pulled, ready to launch</span></h3></summary>
+    <div class="card-grid" x-show="open">
+    <template x-for="img in availableImages()" :key="img.id">
+      <div class="card image-card is-vllm">
+        <div class="card-head">
+          <div>
+            <div class="card-title mono" x-text="img.tags[0] || img.id"></div>
+            <div class="card-sub" x-text="`${fmtBytes(img.size)} · ${img.id}`"></div>
+          </div>
+          <div class="status-pill">image</div>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-primary" @click="launchFromImage(img.tags[0] || img.id)">Launch…</button>
+          <button class="btn btn-danger" @click="removeImage(img.id)">Remove</button>
+        </div>
+      </div>
+    </template>
+    </div>
+  </details>
+
+  <!-- ============== LLAMA SERVER MODELS ============== -->
+  <details class="section-collapsible unsloth-subhead"
+           x-data="{get open(){return localStorage.getItem('sec:unsloth')==='1'}, set open(v){localStorage.setItem('sec:unsloth', v?'1':'0')}}"
+           :open="open" @toggle="open = $event.target.open">
+    <summary><h3>Llama Server models
+      <span class="muted" x-show="state?.unsloth?.reachable">
+        · <span x-text="state?.unsloth?.models?.length || 0"></span> GGUF model(s) in cache
+      </span>
+      <span class="muted" style="color:#e57373" x-show="state?.unsloth && !state?.unsloth?.reachable">
+        · <span x-text="state?.unsloth?.error || 'llama-server unavailable'"></span>
+      </span>
+    </h3></summary>
+    <div x-show="open">
+    <div class="empty" x-show="state?.unsloth?.reachable && (state?.unsloth?.models?.length ?? 0) === 0">
+      No GGUF models found in the HuggingFace cache.
+      Download a <code>*-GGUF</code> repo with <code>hf download</code>, then refresh.
+    </div>
+    <div class="empty" x-show="state?.unsloth && !state?.unsloth?.reachable">
+      <span x-text="state?.unsloth?.error || 'llama-server binary not found'"></span>.
+      Set the binary path in Settings.
+    </div>
+
+    <div class="card-grid" x-show="state?.unsloth?.reachable && (state?.unsloth?.models?.length ?? 0) > 0">
+    <template x-for="m in unslothModels()" :key="m.id">
+      <div class="card unsloth-card" :class="{'is-loaded': isUnslothLoaded(m.id)}">
+        <div class="card-head">
+          <div>
+            <div class="card-title" x-text="m.name"></div>
+            <div class="card-sub mono" x-text="m.id"></div>
+          </div>
+          <div class="card-pills">
+            <span class="status-pill pill-unsloth">llama.cpp</span>
+            <span class="status-pill" x-show="m.is_vision">vision</span>
+            <span class="status-pill pill-starting" x-show="state?.unsloth?.launching?.model === m.id">Loading</span>
+            <span class="status-pill pill-ready" x-show="isUnslothLoaded(m.id)">loaded</span>
+            <span class="status-pill pill-vram" x-show="estimateVram(m.id, null, unslothSettingsFor(m.id).cache_type_kv)" x-text="estimateVram(m.id, null, unslothSettingsFor(m.id).cache_type_kv) + ' GB'"></span>
+          </div>
+        </div>
+
+        <dl class="kv">
+          <dt>Size</dt><dd x-text="fmtBytes(m.size_bytes)"></dd>
+          <dt>Cache</dt><dd class="mono ellipsis" :title="m.cache_path || ''" x-text="(m.cache_path || '').split('/').pop() || '—'"></dd>
+          <dt>Modified</dt><dd x-text="relTime(m.last_modified) || '—'"></dd>
+          <dt>KV cache</dt><dd x-text="unslothSettingsFor(m.id).cache_type_kv"></dd>
+          <dt>Context</dt><dd x-text="unslothSettingsFor(m.id).max_seq_length === 0 ? 'auto' : unslothSettingsFor(m.id).max_seq_length"></dd>
+          <dt>GGUF variant</dt><dd class="mono ellipsis" x-text="unslothSettingsFor(m.id).gguf_variant || '—'"></dd>
+          <dt>Pricing</dt><dd x-text="unslothPricingDisplay(m.id)"></dd>
+        </dl>
+
+        <!-- collapsible per-model load settings -->
+        <details class="unsloth-settings" :open="unslothSettingsOpen[m.id] === true" @toggle="onUnslothSettingsToggle(m.id, $event.target.open)">
+          <summary>Load settings</summary>
+          <div class="grid unsloth-grid" x-show="unslothSettingsOpen[m.id]">
+            <label>
+              <span>KV cache type <span class="tip" tabindex="0" data-tip="--cache-type-k/v passed to llama-server. Lower-precision KV (q8_0, q4_0, iq4_nl) cuts VRAM for long contexts at a small quality cost. bf16/f16 keep full precision."></span></span>
+              <select x-model="unslothFormFor(m.id).cache_type_kv">
+                <template x-for="o in UNSLOTH_KV_OPTIONS" :key="o">
+                  <option :value="o" x-text="o"></option>
+                </template>
+              </select>
+            </label>
+            <label>
+              <span>Context window (tokens) <span class="tip" tabindex="0" data-tip="llama-server -c. 0 = use the model's native context. Lower values reduce KV-cache memory; useful when running long-context GGUF models on limited VRAM."></span></span>
+              <input type="number" min="0" step="1024" x-model.number="unslothFormFor(m.id).max_seq_length">
+              <span class="muted" style="font-size:11px">0 = auto</span>
+            </label>
+            <label>
+              <span>Parallel slots <span class="tip" tabindex="0" data-tip="llama-server --parallel: how many requests decode concurrently. KV-cache memory scales with slots × context. 1–16."></span></span>
+              <input type="number" min="1" max="16" x-model.number="unslothFormFor(m.id).parallel">
+            </label>
+            <label>
+              <span>Unified KV cache <span class="tip" tabindex="0" data-tip="llama-server --kv-unified: one KV pool shared by all slots, so a single request can use the full context window regardless of Parallel slots. Off = each slot is capped at context ÷ slots tokens."></span></span>
+              <input type="checkbox" x-model="unslothFormFor(m.id).kv_unified">
+            </label>
+            <label>
+              <span>Enable MTP <span class="tip" tabindex="0" data-tip="Use llama.cpp's built-in multi-token prediction head (--spec-type draft-mtp). Requires an MTP-capable GGUF; leave off for ordinary models."></span></span>
+              <input type="checkbox" x-model="unslothFormFor(m.id).mtp_enabled">
+            </label>
+            <label>
+              <span>MTP draft tokens <span class="tip" tabindex="0" data-tip="Maximum tokens predicted per MTP draft step (--spec-draft-n-max). Higher values can improve speed when predictions are accepted, but use more compute. 1–64."></span></span>
+              <input type="number" min="1" max="64" step="1"
+                     :disabled="!unslothFormFor(m.id).mtp_enabled"
+                     x-model.number="unslothFormFor(m.id).mtp_predict_tokens">
+            </label>
+            <label>
+              <span>GGUF quant variant <span class="tip" tabindex="0" data-tip="Which .gguf file llama-server loads. Lists variants found in the local HF cache."></span></span>
+              <select x-model="unslothFormFor(m.id).gguf_variant">
+                <template x-for="v in unslothVariantOptions(m.id)" :key="v.quant">
+                  <option :value="v.quant" x-text="v.quant + (v.size_bytes ? ' (' + fmtBytes(v.size_bytes) + ')' : '')"></option>
+                </template>
+              </select>
+              <span class="muted" style="font-size:11px" x-show="unslothVariantsBusy[m.id]">loading variants…</span>
+            </label>
+          </div>
+          <div class="grid unsloth-grid" style="margin-top:12px" x-show="unslothSettingsOpen[m.id]">
+            <span class="section-label" style="grid-column:1/-1;font-weight:600;font-size:13px;color:var(--text-muted)">Pricing (USD per 1M tokens)</span>
+            <label>
+              <span>Input cost <span class="tip" tabindex="0" data-tip="Cost in USD per 1 million input (prompt) tokens. Set 0 to disable cost tracking."></span></span>
+              <input type="number" step="0.01" min="0" x-model.number="unslothFormFor(m.id).input_cost_per_1m" placeholder="0.00">
+            </label>
+            <label>
+              <span>Output cost <span class="tip" tabindex="0" data-tip="Cost in USD per 1 million output (completion) tokens. Set 0 to disable cost tracking."></span></span>
+              <input type="number" step="0.01" min="0" x-model.number="unslothFormFor(m.id).output_cost_per_1m" placeholder="0.00">
+            </label>
+            <label>
+              <span>Cache cost <span class="tip" tabindex="0" data-tip="Cost in USD per 1 million cached (KV-prefix-hit) input tokens. These are prompt tokens served from cache — typically cheaper. Defaults to 0 (free)."></span></span>
+              <input type="number" step="0.01" min="0" x-model.number="unslothFormFor(m.id).cache_cost_per_1m" placeholder="0.00">
+            </label>
+          </div>
+          <div class="actions" x-show="unslothSettingsOpen[m.id]">
+            <button class="btn btn-ghost" @click="saveUnslothSettings(m.id)">Save settings</button>
+            <span class="muted" x-show="unslothSettingsSaved[m.id]">Saved.</span>
+          </div>
+        </details>
+
+        <div class="card-actions">
+          <button class="btn btn-primary" @click="loadUnsloth(m.id)"
+                  :disabled="isUnslothLoaded(m.id) || unslothBusy[m.id] || state?.unsloth?.launching?.model === m.id"
+                  x-text="isUnslothLoaded(m.id) ? 'Running' : ((unslothBusy[m.id] || state?.unsloth?.launching?.model === m.id) ? 'Launching…' : 'Launch')"></button>
+          <button class="btn btn-danger" x-show="state?.unsloth?.launching?.model === m.id"
+                  @click="cancelUnslothLoad()">Cancel load</button>
+          <button class="btn btn-danger" @click="unloadUnsloth(m.id)"
+                  x-show="!state?.unsloth?.launching || state.unsloth.launching.model !== m.id"
+                  :disabled="!isUnslothLoaded(m.id) || unslothStopping[m.id]"
+                  x-text="unslothStopping[m.id] ? 'Stopping…' : 'Stop'"></button>
+          <button class="btn btn-ghost" @click="toggleUnslothSettings(m.id)"
+                  x-text="unslothSettingsOpen[m.id] ? 'Hide settings' : 'Settings'"></button>
+        </div>
+
+        <!-- launch progress (server-driven; visible in every tab) -->
+        <div class="phase launch-progress" x-show="state?.unsloth?.launching?.model === m.id">
+          <div class="phase-row">
+            <span class="phase-label" x-text="(state?.unsloth?.launching?.phase || 'Starting') + (state?.unsloth?.launching?.variant ? ' — ' + state.unsloth.launching.variant : '')"></span>
+            <span class="phase-pct" x-text="elapsedSince(state?.unsloth?.launching?.started_at)"></span>
+          </div>
+          <div class="phase-bar indeterminate"><span></span></div>
+          <div class="phase-label mono" style="margin-top:6px" x-text="state?.unsloth?.launching?.log_line || ''"></div>
+        </div>
+      </div>
+    </template>
   </div>
+    </div><!-- /x-show=open -->
+  </details>
+
+  <!-- ============== DOCKER MODELS (containers) ============== -->
+  <details class="section-collapsible"
+           x-data="{get open(){return localStorage.getItem('sec:vllm')==='1'}, set open(v){localStorage.setItem('sec:vllm', v?'1':'0')}}"
+           :open="open" @toggle="open = $event.target.open">
+    <summary><h3>Docker models <span class="muted">— running &amp; stopped containers</span></h3></summary>
+    <div x-show="open">
+    <div x-show="!(state?.containers?.length ?? 0) && !availableImages().length" class="empty">
+      No Docker images pulled yet — click "+ Pull new LLM" to fetch one.
+    </div>
+    <div x-show="!(state?.containers?.length ?? 0) && availableImages().length" class="empty">
+      No containers running. Pick an image above and click <strong>Launch…</strong>.
+    </div>
 
   <div class="card-grid">
-    <template x-for="c in state?.containers || []" :key="c.id">
+    <template x-for="c in (state?.containers || []).filter(c => !c.deployment_id)" :key="c.id">
       <div class="card container-card" :class="`status-${c.status} phase-${c.phase?.phase || c.status}`">
         <div class="card-head">
           <div>
             <div class="card-title" x-text="c.model || c.name"></div>
             <div class="card-sub" x-text="c.name"></div>
           </div>
-          <div class="status-pill" :class="`pill-${c.phase?.phase || c.status}`" x-text="c.phase?.phase || c.status"></div>
+          <div class="card-pills">
+            <span class="status-pill" :class="`pill-${c.phase?.phase || c.status}`" x-text="c.phase?.phase || c.status"></span>
+            <span class="status-pill pill-spark" x-show="c.source === 'atlas-serving'">Atlas Serving</span>
+          </div>
         </div>
 
         <!-- setup progress: shown when the container exists but isn't ready yet -->
@@ -149,101 +843,422 @@
           <dt>Port</dt><dd x-text="c.port || '—'"></dd>
           <dt>Image</dt><dd class="mono ellipsis" x-text="c.image"></dd>
           <dt>Managed</dt><dd x-text="c.managed ? 'yes' : 'external'"></dd>
+          <dt>VRAM</dt><dd x-text="c.vram_gb != null ? c.vram_gb + ' GB (est.)' : '—'"></dd>
         </dl>
         <div class="card-actions">
           <button class="btn" @click="startContainer(c.name)" :disabled="c.status==='running'">Start</button>
-          <button class="btn" @click="stopContainer(c.name)" :disabled="c.status!=='running'">Stop</button>
+          <button class="btn" @click="stopContainer(c.name)"
+                  :disabled="!['running','restarting'].includes(c.status) || containerStopping[c.name]">
+            <span x-show="!containerStopping[c.name]">Stop</span>
+            <span x-show="containerStopping[c.name]">Stopping…</span>
+          </button>
           <button class="btn btn-ghost" @click="openLogs(c.name)">Logs</button>
+          <button class="btn" @click="copyToRecipe(c.name)" :disabled="!c.model" title="Save this container's config as a recipe you can re-launch">Copy to Recipes</button>
           <button class="btn btn-danger" @click="removeContainer(c.name)">Remove</button>
         </div>
       </div>
     </template>
   </div>
+    </div><!-- /x-show=open -->
+  </details>
 </section>
 
-<!-- ============== INFERENCE ============== -->
+<!-- ============== CHAT ============== -->
 <section x-show="tab==='inference'" class="page">
-  <div class="page-head"><h2>Send a prompt</h2></div>
-  <div class="card">
-    <div class="grid">
-      <label>
-        <span>Target</span>
-        <select x-model="infer.target">
-          <option value="">Auto (route to model)</option>
-          <template x-for="c in (state?.containers || [])" :key="c.name">
-            <option :value="`container:${c.name}`" x-text="`${c.name} → ${c.model || '?'}`"></option>
-          </template>
-        </select>
-      </label>
-      <label>
-        <span>Model <em class="muted">(used if target = auto, or as the request's model field)</em></span>
-        <input type="text" x-model="infer.model" placeholder="Qwen/Qwen2.5-Coder-7B-Instruct">
-      </label>
-      <label>
-        <span>Temperature</span>
-        <input type="number" min="0" max="2" step="0.05" x-model.number="infer.temperature">
-      </label>
-      <label>
-        <span>Max tokens</span>
-        <input type="number" min="1" x-model.number="infer.max_tokens">
-      </label>
-      <label class="full">
-        <span>System prompt <em class="muted">(optional)</em></span>
-        <textarea rows="2" x-model="infer.system" placeholder="You are a helpful assistant."></textarea>
-      </label>
-      <label class="full">
-        <span>User prompt</span>
-        <textarea rows="6" x-model="infer.prompt" placeholder="Ask anything…"></textarea>
-      </label>
+  <div class="page-head">
+    <h2>Chat</h2>
+    <div style="display:flex; gap:8px">
+      <button class="btn btn-danger" @click="forceKillRunning()" x-show="runningManaged().length"
+              title="docker stop the running vLLM container — frees GPU instantly. Next request reloads cold.">
+        Force kill GPU
+      </button>
+      <button class="btn btn-ghost" @click="clearChat()" :disabled="chat.busy || !chat.messages.length">Clear chat</button>
     </div>
-    <div class="actions">
-      <button class="btn btn-primary" @click="sendInference()" :disabled="!infer.prompt">Submit</button>
-      <span class="muted" x-show="lastSubmitted">
-        Submitted <code x-text="lastSubmitted"></code> — check the Queue tab.
-      </span>
+  </div>
+
+  <div class="ab-settings-row">
+    <label class="ab-settings-row-model">
+      <select x-model="chat.model">
+        <option value="">— pick a model —</option>
+        <template x-for="m in localModels()" :key="'chat-local:'+m">
+          <option :value="m" x-text="`[LOCAL] ${m}`"></option>
+        </template>
+        <template x-for="m in cloudModels()" :key="'chat-cloud:'+m">
+          <option :value="m" x-text="m"></option>
+        </template>
+      </select>
+    </label>
+    <details class="ab-settings-toggle ab-settings-toggle-inline">
+      <summary>Settings</summary>
+      <div class="ab-settings">
+        <label class="full">
+          <span>System prompt</span>
+          <input type="text" x-model="chat.system" placeholder="You are a helpful assistant.">
+        </label>
+        <label>
+          <span>Temperature</span>
+          <input type="number" min="0" max="2" step="0.05" x-model.number="chat.temperature">
+        </label>
+        <label>
+          <span>Max tokens</span>
+          <input type="number" min="1" x-model.number="chat.max_tokens">
+        </label>
+      </div>
+    </details>
+  </div>
+
+  <div class="chat-container">
+    <div class="chat-window" x-ref="chatWindow">
+      <div x-show="!chat.messages.length" class="empty">
+        Send a message to start. Full history is sent on every turn; the model has no memory between turns.
+      </div>
+      <template x-for="(msg, i) in chat.messages" :key="i">
+        <div class="chat-msg" :class="`chat-msg-${msg.role}`">
+          <template x-if="msg.role === 'user'">
+            <div class="chat-bubble-user" x-text="msg.content"></div>
+          </template>
+          <template x-if="msg.role === 'assistant'">
+            <div class="chat-assistant">
+              <div class="chat-role-label">
+                <span x-show="msg.status && msg.status !== 'done'" x-text="msg.status"></span>
+                <span x-show="msg.totalTokens"
+                      x-text="`${msg.status && msg.status !== 'done' ? ' · ' : ''}${msg.totalTokens} tok · ${fmtMessageRate(msg.totalTokens, msg.generationMs)}`"></span>
+                <span x-show="msg.ttftMs" x-text="` · ${(msg.ttftMs/1000).toFixed(1)}s TTFT`"></span>
+              </div>
+              <details class="chat-reasoning" x-show="msg.reasoning" :open="msg.status && msg.status !== 'done'">
+                <summary>Thinking</summary>
+                <div class="chat-md" x-html="renderMarkdown(msg.reasoning)"></div>
+              </details>
+              <div class="chat-md" x-html="renderMarkdown(msg.content) || (msg.status && msg.status !== 'done' ? '<span class=&quot;muted&quot;>…</span>' : '')"></div>
+              <div class="muted" style="font-size:11px; margin-top:8px"
+                   x-show="msg.thinkingTokens || msg.tokens">
+                <span x-text="`Thinking: ${msg.thinkingTokens || 0} tok · ${fmtMessageRate(msg.thinkingTokens, msg.thinkingMs)}`"></span>
+                <span> · </span>
+                <span x-text="`Output: ${msg.tokens || 0} tok · ${fmtMessageRate(msg.tokens, msg.streamMs)}`"></span>
+              </div>
+              <div x-show="msg.error" class="chat-error" x-text="'ERROR: ' + msg.error"></div>
+            </div>
+          </template>
+        </div>
+      </template>
+    </div>
+
+    <div class="chat-composer">
+      <textarea x-model="chat.input"
+                rows="2"
+                placeholder="Message the model… (Enter to send, Shift+Enter for newline)"
+                :disabled="chat.busy"
+                @keydown.enter.prevent="if (!$event.shiftKey) sendChat()"></textarea>
+      <template x-if="!chat.busy">
+        <button class="btn btn-primary"
+                @click="sendChat()"
+                :disabled="!chat.input.trim() || !chat.model">Send</button>
+      </template>
+      <template x-if="chat.busy">
+        <button class="btn btn-danger" @click="stopChat()">Stop</button>
+      </template>
     </div>
   </div>
 </section>
 
-<!-- ============== QUEUE ============== -->
-<section x-show="tab==='queue'" class="page">
+<!-- ============== A/B ============== -->
+<section x-show="tab==='ab'" class="page">
   <div class="page-head">
-    <h2>Queue</h2>
-    <button class="btn btn-ghost" @click="clearFinished()">Clear finished</button>
+    <h2>A/B compare</h2>
+    <div style="display:flex; align-items:center; gap:12px">
+      <span class="muted">One prompt, two models, side-by-side.</span>
+      <button class="btn btn-danger" @click="forceKillRunning()" x-show="runningManaged().length"
+              title="docker stop the running vLLM container — frees GPU instantly. Next request reloads cold.">
+        Force kill GPU
+      </button>
+    </div>
   </div>
 
-  <div x-show="!sortedQueue().length" class="empty">No jobs yet.</div>
-
-  <div class="queue-list">
-    <template x-for="j in sortedQueue()" :key="j.id">
-      <div class="queue-item" :class="`q-${j.status}`">
-        <div class="q-icon">
-          <span x-show="j.status==='pending'">●</span>
-          <span x-show="j.status==='dispatching'">◐</span>
-          <span x-show="j.status==='running'">▶</span>
-          <span x-show="j.status==='done'">✓</span>
-          <span x-show="j.status==='error'">!</span>
-          <span x-show="j.status==='canceled'">×</span>
-        </div>
-        <div class="q-body">
-          <div class="q-row">
-            <span class="q-model" x-text="j.model || j.container || 'auto'"></span>
-            <span class="q-status" x-text="j.status"></span>
-            <span class="q-time" x-text="relTime(j.requested_at)"></span>
-          </div>
-          <div class="q-preview" x-text="j.preview || '(no prompt preview)'"></div>
-          <div class="q-result" x-show="j.result_text" x-text="j.result_text"></div>
-          <div class="q-error" x-show="j.error" x-text="j.error"></div>
-        </div>
-        <div class="q-actions">
-          <button class="btn btn-play" title="Override max-concurrent and run now"
-                  x-show="j.status==='pending' && !j.override"
-                  @click="forceRun(j.id)">▶ Run now</button>
-          <span class="muted" x-show="j.override && j.status==='pending'">override queued</span>
-          <button class="btn btn-ghost" x-show="['pending','dispatching'].includes(j.status)" @click="cancelJob(j.id)">Cancel</button>
-        </div>
+  <div class="ab-container">
+    <!-- collapsible settings -->
+    <details class="ab-settings-toggle">
+      <summary>Settings · temperature, top p, seed, max tokens, system prompt</summary>
+      <div class="ab-settings">
+        <label class="full">
+          <span>System prompt</span>
+          <input type="text" x-model="ab.system" placeholder="You are a helpful assistant.">
+        </label>
+        <label>
+          <span>Temperature</span>
+          <input type="number" min="0" max="2" step="0.05" x-model.number="ab.temperature">
+        </label>
+        <label>
+          <span>Top P</span>
+          <input type="number" min="0" max="1" step="0.05" x-model.number="ab.top_p">
+        </label>
+        <label>
+          <span>Seed <em class="muted">(optional)</em></span>
+          <input type="number" step="1" x-model="ab.seed" placeholder="random">
+        </label>
+        <label>
+          <span>Max tokens</span>
+          <input type="number" min="1" x-model.number="ab.max_tokens">
+        </label>
       </div>
-    </template>
+    </details>
+
+    <!-- output panels -->
+    <div class="ab-panels">
+      <div class="ab-panel">
+        <div class="ab-panel-head">
+          <select x-model="ab.modelA" :disabled="ab.busy" class="ab-model-select">
+            <option value="">— pick a model —</option>
+            <template x-for="m in localModels()" :key="'a-local:'+m">
+              <option :value="m" :disabled="isLocal(ab.modelB) && maxConcurrentLocalModels() < 2" x-text="`[LOCAL] ${m}`"></option>
+            </template>
+            <template x-for="m in cloudModels()" :key="'a-cloud:'+m">
+              <option :value="m" x-text="m"></option>
+            </template>
+          </select>
+          <div class="ab-stats">
+            <span x-text="ab.panelA.status || 'idle'"></span>
+            <span x-show="ab.panelA.tokens" x-text="`· ${ab.panelA.tokens} tok`"></span>
+            <span x-show="ab.panelA.elapsedMs && ab.panelA.streamMs"
+                  x-text="`· ${((ab.panelA.elapsedMs - ab.panelA.streamMs)/1000).toFixed(1)}s TTFT`"></span>
+            <span x-show="ab.panelA.tokens && ab.panelA.streamMs"
+                  x-text="`· ${(ab.panelA.tokens / (ab.panelA.streamMs/1000)).toFixed(1)} tok/s`"></span>
+          </div>
+        </div>
+        <details class="ab-reasoning" x-show="ab.panelA.reasoning" :open="ab.panelA.status && ab.panelA.status !== 'done'">
+          <summary>Thinking</summary>
+          <div class="chat-md" x-html="renderMarkdown(ab.panelA.reasoning)"></div>
+        </details>
+        <div class="ab-panel-body chat-md"
+             x-html="renderMarkdown(ab.panelA.text) || (ab.panelA.error ? '<span class=&quot;chat-error&quot;>ERROR: ' + escapeHtml(ab.panelA.error) + '</span>' : '')"></div>
+      </div>
+
+      <div class="ab-panel">
+        <div class="ab-panel-head">
+          <select x-model="ab.modelB" :disabled="ab.busy" class="ab-model-select">
+            <option value="">— pick a model —</option>
+            <template x-for="m in localModels()" :key="'b-local:'+m">
+              <option :value="m" :disabled="isLocal(ab.modelA) && maxConcurrentLocalModels() < 2" x-text="`[LOCAL] ${m}`"></option>
+            </template>
+            <template x-for="m in cloudModels()" :key="'b-cloud:'+m">
+              <option :value="m" x-text="m"></option>
+            </template>
+          </select>
+          <div class="ab-stats">
+            <span x-text="ab.panelB.status || 'idle'"></span>
+            <span x-show="ab.panelB.tokens" x-text="`· ${ab.panelB.tokens} tok`"></span>
+            <span x-show="ab.panelB.elapsedMs && ab.panelB.streamMs"
+                  x-text="`· ${((ab.panelB.elapsedMs - ab.panelB.streamMs)/1000).toFixed(1)}s TTFT`"></span>
+            <span x-show="ab.panelB.tokens && ab.panelB.streamMs"
+                  x-text="`· ${(ab.panelB.tokens / (ab.panelB.streamMs/1000)).toFixed(1)} tok/s`"></span>
+          </div>
+        </div>
+        <details class="ab-reasoning" x-show="ab.panelB.reasoning" :open="ab.panelB.status && ab.panelB.status !== 'done'">
+          <summary>Thinking</summary>
+          <div class="chat-md" x-html="renderMarkdown(ab.panelB.reasoning)"></div>
+        </details>
+        <div class="ab-panel-body chat-md"
+             x-html="renderMarkdown(ab.panelB.text) || (ab.panelB.error ? '<span class=&quot;chat-error&quot;>ERROR: ' + escapeHtml(ab.panelB.error) + '</span>' : '')"></div>
+      </div>
+    </div>
+
+    <!-- prompt composer -->
+    <div class="ab-composer">
+      <textarea x-model="ab.prompt"
+                rows="2"
+                placeholder="Ask the same thing of two models… (Enter to run, Shift+Enter for newline)"
+                :disabled="ab.busy"
+                @keydown.enter.prevent="if (!$event.shiftKey) runAB()"></textarea>
+      <template x-if="!ab.busy">
+        <button class="btn btn-primary"
+                @click="runAB()"
+                :disabled="!ab.prompt || !ab.modelA || !ab.modelB">Run both</button>
+      </template>
+      <template x-if="ab.busy">
+        <button class="btn btn-danger" @click="stopABBoth()">Stop</button>
+      </template>
+    </div>
+    <div class="muted" style="text-align:center; padding:6px 16px; font-size:12px" x-show="ab.warning" x-text="ab.warning"></div>
+  </div>
+</section>
+
+<!-- ============== API DOCS ============== -->
+<section x-show="tab==='api'" class="page">
+  <div class="page-head">
+    <h2>API &amp; client examples</h2>
+    <span class="muted">Point any OpenAI client at <code>http://&lt;host&gt;:7878/v1</code>.</span>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">How routing works</h3>
+    <p class="card-desc">
+      The controller exposes an OpenAI-compatible API on port 7878. <code>GET /v1/models</code> returns
+      every model the controller knows about — both vLLM containers (running or stopped) and Ollama
+      models. The <code>model</code> field you send in <code>/v1/chat/completions</code> determines
+      which backend handles it:
+    </p>
+    <ul class="card-desc">
+      <li><strong>vLLM model</strong> (HF repo id, e.g. <code>RedHatAI/Qwen3.6-35B-A3B-NVFP4</code>)
+        → controller finds the matching managed container. If the GPU is full it evicts the least
+        recently used running model, starts the target if it's stopped, waits for <code>/health</code>,
+        then streams the request through. Subject to a 5-minute load timeout.</li>
+      <li><strong>Ollama model</strong> (prefixed with <code>CLOUD&nbsp;</code>, e.g. <code>CLOUD llama3.1:8b</code>)
+        → controller strips the prefix and forwards directly to the Ollama daemon. Ollama loads on demand
+        internally; no container swap.</li>
+    </ul>
+    <p class="card-desc">
+      By default up to two vLLM containers may run concurrently (configurable in Settings). Requests
+      for the same model run in parallel; requests for different models are queued and dispatched as
+      GPU memory allows. Two cloud requests always run in parallel.
+    </p>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">List models</h3>
+    <div class="codebox-wrap">
+      <pre class="codebox">curl -s http://&lt;host&gt;:7878/v1/models | jq
+# {
+#   "object": "list",
+#   "data": [
+#     {"id": "RedHatAI/Qwen3.6-35B-A3B-NVFP4", "object": "model",
+#      "owned_by": "vllm-controller", "_status": "running"},
+#     {"id": "CLOUD llama3.1:8b", "object": "model",
+#      "owned_by": "ollama", "_status": "ready"}
+#   ]
+# }</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">Chat completions</h3>
+
+    <p class="card-desc"><strong>curl · vLLM</strong></p>
+    <div class="codebox-wrap">
+      <pre class="codebox">curl -N http://&lt;host&gt;:7878/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+    "messages": [{"role":"user","content":"Hello"}],
+    "max_tokens": 64,
+    "stream": true
+  }'</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+
+    <p class="card-desc"><strong>curl · Ollama (CLOUD prefix is required)</strong></p>
+    <div class="codebox-wrap">
+      <pre class="codebox">curl -N http://&lt;host&gt;:7878/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "CLOUD llama3.1:8b",
+    "messages": [{"role":"user","content":"Hello"}],
+    "stream": true
+  }'</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+
+    <p class="card-desc"><strong>Python · openai SDK</strong> (<code>pip install openai</code>)</p>
+    <div class="codebox-wrap">
+      <pre class="codebox">from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://&lt;host&gt;:7878/v1",
+    api_key="sk-noauth",   # any non-empty string; the controller ignores it
+)
+
+# vLLM model
+resp = client.chat.completions.create(
+    model="RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=64,
+)
+print(resp.choices[0].message.content)
+
+# Ollama model — note the CLOUD prefix
+resp = client.chat.completions.create(
+    model="CLOUD llama3.1:8b",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+
+    <p class="card-desc"><strong>Python · streaming</strong></p>
+    <div class="codebox-wrap">
+      <pre class="codebox">stream = client.chat.completions.create(
+    model="RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+    messages=[{"role": "user", "content": "Tell me a joke."}],
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content or ""
+    print(delta, end="", flush=True)</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">Direct → vLLM container (advanced)</h3>
+    <p class="card-desc">
+      Each running vLLM container also exposes its own OpenAI-compatible API on a host port in the
+      8000–8099 range — visible in the <a href="#" @click.prevent="tab='containers'">Models</a> tab
+      or via <code>GET /api/state</code> → <code>containers[].port</code>. Use this if you want to
+      bypass the controller's eviction/load logic and talk straight to vLLM. Skips swap handling,
+      so the model must already be running.
+    </p>
+    <div class="codebox-wrap">
+      <pre class="codebox">curl -s http://&lt;host&gt;:&lt;container-port&gt;/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"&lt;HF id&gt;","messages":[{"role":"user","content":"Hello"}]}'</pre>
+      <button class="copy-btn" @click="copyCode($el.previousElementSibling)" x-text="copyLabel($el)">Copy</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">Endpoint reference</h3>
+    <table class="api-table">
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td>    <td><code>/v1/models</code></td>             <td>List vLLM + Ollama models (Ollama prefixed with <code>CLOUD&nbsp;</code>)</td></tr>
+        <tr><td>POST</td>   <td><code>/v1/chat/completions</code></td>   <td>OpenAI-compatible chat. Routes by <code>model</code> field; auto-loads/evicts vLLM containers.</td></tr>
+        <tr><td>POST</td>   <td><code>/v1/completions</code></td>        <td>OpenAI-compatible legacy completions (same routing).</td></tr>
+        <tr><td>POST</td>   <td><code>/v1/embeddings</code></td>         <td>Forwarded to whichever backend serves <code>model</code>.</td></tr>
+        <tr><td colspan="3" style="opacity:0.7; padding-top:12px"><strong>Controller management</strong></td></tr>
+        <tr><td>GET</td>    <td><code>/api/state</code></td>             <td>Aggregate state: containers, ollama, settings, stats</td></tr>
+        <tr><td>GET</td>    <td><code>/api/stats</code></td>             <td>Host telemetry (CPU/GPU/RAM/temps/power/network)</td></tr>
+        <tr><td>GET/POST</td><td><code>/api/settings</code></td>         <td>Read/update controller settings</td></tr>
+        <tr><td>GET/POST/DELETE</td><td><code>/api/containers[/...]</code></td><td>List/create/start/stop/remove vLLM containers, fetch logs</td></tr>
+        <tr><td>POST</td>   <td><code>/api/images/pull</code></td>       <td>Pull a docker image (SSE progress stream)</td></tr>
+        <tr><td colspan="3" style="opacity:0.7; padding-top:12px"><strong>Ollama management</strong></td></tr>
+        <tr><td>GET</td>    <td><code>/api/ollama/models</code></td>     <td>List installed Ollama models + reachability</td></tr>
+        <tr><td>POST</td>   <td><code>/api/ollama/pull</code></td>       <td>Pull an Ollama model (SSE progress stream)</td></tr>
+        <tr><td>DELETE</td> <td><code>/api/ollama/models/{name}</code></td><td>Delete an installed Ollama model</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3 class="card-h">Model lifecycle (vLLM only)</h3>
+    <ul class="card-desc">
+      <li>By default up to two vLLM containers can share the GPU concurrently (configurable via
+        <strong>Max concurrent models</strong>). A request for another model only stops the least
+        recently used running model when the GPU is full.</li>
+      <li>Cold-load timeout: <strong>5 minutes</strong>. If the model takes longer (large MoE / NVFP4
+        rebuilding CUDA graphs), the request returns <code>504</code> while the load continues
+        in the background — retry once it's ready.</li>
+      <li>Idle auto-stop: after
+        <code x-text="`${state?.settings?.idle_timeout_seconds ?? 30}s`"></code>
+        of no inference traffic (configurable in Settings; <code>0</code> disables). Direct hits to
+        a container's port also keep it alive — the idle monitor reads vLLM's
+        <code>/metrics</code> request counter.</li>
+      <li>The next request for a stopped model transparently restarts it; weights stay in the host's
+        page cache, so warm reloads are much faster than the first cold load.</li>
+      <li><strong>Cross-backend mutual exclusion.</strong> vLLM, Unsloth, and Ollama never share the
+        GPU at once. Booting or starting a vLLM container first unloads any loaded Unsloth model and
+        runs <code>ollama stop</code> on every model Ollama has loaded; loading an Unsloth model first
+        stops running vLLM containers and unloads Ollama models. Eviction is best-effort and runs
+        before the requested action — one backend being unreachable won't block the others.</li>
+    </ul>
   </div>
 </section>
 
@@ -289,38 +1304,350 @@
   </div>
 </section>
 
+<!-- ============== OLLAMA ============== -->
+<section x-show="tab==='ollama'" class="page">
+  <div class="page-head">
+    <h2>Ollama</h2>
+    <span class="muted" x-show="state?.ollama">
+      <template x-if="state?.ollama?.reachable">
+        <span>Connected · <span x-text="state?.ollama?.models?.length || 0"></span> model(s)</span>
+      </template>
+      <template x-if="state?.ollama && !state?.ollama?.reachable">
+        <span style="color:#e57373">Unreachable: <span x-text="state?.ollama?.error || ''"></span></span>
+      </template>
+    </span>
+  </div>
+
+  <div class="card">
+    <p class="card-desc">Ollama models appear in <code>/v1/models</code> with a <code>CLOUD </code> prefix. To call one through the controller, send the prefixed id as the OpenAI <code>model</code> field, e.g. <code>"model": "CLOUD llama3.1:8b"</code>. The controller strips the prefix and forwards to the Ollama base URL configured below.</p>
+    <div class="grid">
+      <label class="full">
+        <span>Ollama base URL <span class="tip" tabindex="0" data-tip="HTTP endpoint of an Ollama daemon. Default localhost:11434 if running on this host. Change to a remote URL to point at a different Ollama instance."></span></span>
+        <div class="row">
+          <input type="text" x-model="ollamaForm.base_url" :placeholder="state?.settings?.ollama_base_url || 'http://localhost:11434'">
+          <button class="btn btn-primary" @click="saveOllamaUrl()" :disabled="!ollamaForm.base_url">Save</button>
+        </div>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <label class="full">
+        <span>Pull model <span class="tip" tabindex="0" data-tip="Paste an Ollama model name to download via `ollama pull`, e.g. llama3.1:8b, qwen2.5-coder:32b, mistral-nemo. Progress streams below."></span></span>
+        <div class="row">
+          <input type="text" x-model="ollamaPull.name" placeholder="llama3.1:8b" :disabled="ollamaPull.busy">
+          <button class="btn btn-primary" @click="pullOllama()" :disabled="ollamaPull.busy || !ollamaPull.name">Pull</button>
+        </div>
+      </label>
+      <div class="full" x-show="ollamaPull.lines.length">
+        <pre class="logbox"><template x-for="(l,i) in ollamaPull.lines.slice(-200)" :key="i"><span x-text="l + '\n'"></span></template></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <label class="full">
+        <span>Installed models</span>
+        <div class="row">
+          <select x-model="ollamaSelected" style="flex:1">
+            <option value="">— pick a model —</option>
+            <template x-for="m in state?.ollama?.models || []" :key="m.name">
+              <option :value="m.name" x-text="`${m.name}  (${fmtBytes(m.size)})`"></option>
+            </template>
+          </select>
+          <button class="btn btn-danger" @click="deleteOllama(ollamaSelected)" :disabled="!ollamaSelected">Delete</button>
+        </div>
+      </label>
+    </div>
+    <div class="card-grid" x-show="(state?.ollama?.models?.length ?? 0) > 0" style="margin-top:12px">
+      <template x-for="m in state?.ollama?.models || []" :key="m.name">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title mono" x-text="m.name"></div>
+              <div class="card-sub mono" x-text="`CLOUD ${m.name}`"></div>
+            </div>
+            <div class="status-pill">ollama</div>
+          </div>
+          <dl class="kv">
+            <dt>Size</dt><dd x-text="fmtBytes(m.size)"></dd>
+            <dt>Family</dt><dd class="mono ellipsis" x-text="m.details?.family || '—'"></dd>
+            <dt>Quant</dt><dd class="mono ellipsis" x-text="m.details?.quantization_level || '—'"></dd>
+          </dl>
+          <div class="card-actions">
+            <button class="btn btn-danger" @click="deleteOllama(m.name)">Delete</button>
+          </div>
+        </div>
+      </template>
+    </div>
+    <div class="empty" x-show="(state?.ollama?.models?.length ?? 0) === 0 && state?.ollama?.reachable">
+      No Ollama models installed yet. Use the Pull form above.
+    </div>
+  </div>
+</section>
+
+<!-- ============== USAGE ============== -->
+<section x-show="tab==='usage'" class="page">
+  <div class="page-head">
+    <h2>Usage</h2>
+    <div class="sub-tabs">
+      <button :class="{'active': usageSubTab === 'cost'}" @click="usageSubTab = 'cost'">Cost</button>
+      <button :class="{'active': usageSubTab === 'analysis'}" @click="usageSubTab = 'analysis'">Analysis</button>
+    </div>
+    <button class="btn btn-danger" x-show="usageSubTab === 'cost'" @click="resetTokenStats()" title="Hard reset: clear all lifetime token counters for every model">↺ Reset lifetime counters</button>
+  </div>
+
+  <!-- ── Cost tab ── -->
+  <div x-show="usageSubTab === 'cost'">
+
+  <!-- Model usage breakdown -->
+  <div class="card" x-show="state">
+    <h3>Model usage</h3>
+    <div x-show="Object.keys(state?.token_stats || {}).length === 0" class="empty">
+      No token usage recorded yet.
+    </div>
+    <div class="usage-table-wrap" x-show="Object.keys(state?.token_stats || {}).length > 0">
+      <table class="usage-table">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th style="text-align:right">↓ Input tokens</th>
+            <th style="text-align:right">↳ Cached</th>
+            <th style="text-align:right">↑ Output tokens</th>
+            <th style="text-align:right">Requests</th>
+            <th style="text-align:right">Avg speed</th>
+            <th style="text-align:right">Decode time</th>
+            <th style="text-align:right">Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(s, model) in state?.token_stats || {}" :key="model">
+            <tr>
+              <td class="mono" x-text="model"></td>
+              <td style="text-align:right" x-text="fmtTokens(s.input)"></td>
+              <td style="text-align:right" x-text="s.cached ? fmtTokens(s.cached) : '—'"></td>
+              <td style="text-align:right" x-text="fmtTokens(s.output)"></td>
+              <td style="text-align:right" x-text="s.requests ?? 0"></td>
+              <td style="text-align:right" x-text="fmtSpeed(model)"></td>
+              <td style="text-align:right" x-text="s.gen_time_s ? s.gen_time_s.toFixed(1) + ' s' : '—'"></td>
+              <td style="text-align:right" x-html="tokenCostCell(model)"></td>
+            </tr>
+          </template>
+          <tr class="usage-total">
+            <td><strong>Total</strong></td>
+            <td style="text-align:right" x-text="fmtTokens(totalInputTokens())"></td>
+            <td style="text-align:right" x-text="fmtTokens(totalCachedTokens())"></td>
+            <td style="text-align:right" x-text="fmtTokens(totalOutputTokens())"></td>
+            <td style="text-align:right" x-text="totalRequests()"></td>
+            <td></td>
+            <td></td>
+            <td style="text-align:right" x-text="totalCost()"></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Flagship pricing configuration -->
+  <div class="card" x-show="state">
+    <h3>Flagship pricing</h3>
+    <p class="card-desc">Set the per-1M token cost for each flagship model. These feed into the opportunity cost table below — how much you'd save by running locally instead of calling an API.</p>
+    <table class="usage-pricing-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th style="text-align:right">↓ Input / 1M</th>
+          <th style="text-align:right">↑ Output / 1M</th>
+          <th style="text-align:right">Enabled</th>
+          <th style="width:36px"></th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="name in flagshipModelList()" :key="name">
+          <tr>
+            <td><strong x-text="name"></strong></td>
+            <td style="text-align:right">
+              <input type="number" min="0" step="0.01"
+                     class="inline-num"
+                     x-model.number="flagshipPricingFor(name).input"
+                     @input="flagshipPricingDirty = true"
+                     :placeholder="'$0.00'">
+            </td>
+            <td style="text-align:right">
+              <input type="number" min="0" step="0.01"
+                     class="inline-num"
+                     x-model.number="flagshipPricingFor(name).output"
+                     @input="flagshipPricingDirty = true"
+                     :placeholder="'$0.00'">
+            </td>
+            <td style="text-align:right">
+              <label class="toggle-sm" style="justify-content:flex-end">
+                <input type="checkbox" x-model="flagshipPricingFor(name).enabled" @change="flagshipPricingDirty = true">
+                <span class="toggle-slider"></span>
+              </label>
+            </td>
+            <td style="text-align:center">
+              <button class="icon-btn btn-danger" @click="removeFlagshipModel(name)" title="Remove model">✕</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div class="actions" style="margin-top:12px">
+      <button class="btn btn-ghost" @click="addFlagshipModel()">+ Add model</button>
+      <button class="btn btn-primary" @click="saveFlagshipPricing()" :disabled="pricingSaving">
+        <span x-show="!pricingSaving">Save pricing</span>
+        <span x-show="pricingSaving">Saving…</span>
+      </button>
+      <span class="muted" x-show="pricingSaved">Saved.</span>
+    </div>
+  </div>
+
+  <!-- Opportunity cost comparison -->
+  <div class="card" x-show="state">
+    <h3>Opportunity cost</h3>
+    <p class="card-desc">How much it would've cost to serve all these tokens through each flagship model's API, instead of running locally.</p>
+    <div x-show="Object.keys(state?.token_stats || {}).length === 0" class="empty">
+      No usage data yet to compare.
+    </div>
+    <table class="usage-table" x-show="Object.keys(state?.token_stats || {}).length > 0">
+      <thead>
+        <tr>
+          <th>Flagship model</th>
+          <th style="text-align:right">↓ Input cost</th>
+          <th style="text-align:right">↑ Output cost</th>
+          <th style="text-align:right">Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="name in flagshipModelList()" :key="name">
+          <tr :class="{'usage-disabled': !flagshipPricingFor(name).enabled && flagshipPricingFor(name).input === 0}">
+            <td>
+              <strong x-text="name"></strong>
+              <span class="muted" x-show="!flagshipPricingFor(name).enabled && flagshipPricingFor(name).input === 0" style="margin-left:6px">— no pricing set</span>
+            </td>
+            <td style="text-align:right" x-text="oppCostInput(name)"></td>
+            <td style="text-align:right" x-text="oppCostOutput(name)"></td>
+            <td style="text-align:right"><strong x-text="oppCostTotal(name)"></strong></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  </div>
+  <!-- / Cost tab -->
+
+  <!-- ── Analysis tab ── -->
+  <div x-show="usageSubTab === 'analysis'" x-init="loadAnalysisData()">
+
+    <!-- Date filtering + chart mode -->
+    <div class="card" style="margin-bottom:16px">
+      <h3>Filters</h3>
+      <div style="display:flex; gap:16px; align-items:end; flex-wrap:wrap">
+        <div>
+          <label style="display:block; font-size:12px; color:var(--text-dim); margin-bottom:4px">Start date</label>
+          <input type="date" x-model="analysisDateStart" @change="loadAnalysisData()">
+        </div>
+        <div>
+          <label style="display:block; font-size:12px; color:var(--text-dim); margin-bottom:4px">End date</label>
+          <input type="date" x-model="analysisDateEnd" @change="loadAnalysisData()">
+        </div>
+        <div>
+          <label style="display:block; font-size:12px; color:var(--text-dim); margin-bottom:4px">Chart mode</label>
+          <select x-model="analysisChartMode" @change="loadAnalysisData()">
+            <option value="hour">Per hour</option>
+            <option value="day">Per day</option>
+          </select>
+        </div>
+        <div style="margin-left:auto; text-align:right">
+          <span class="muted" x-show="analysisLoading">Loading…</span>
+          <span class="muted" x-show="!analysisLoading && analysisDaily.length === 0">No data for this period.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- GitHub-style activity grid -->
+    <div class="card" x-show="!analysisLoading && analysisDaily.length > 0">
+      <h3>Activity (last 12 weeks)</h3>
+      <p class="card-desc">Daily token volume. Darker = more tokens.</p>
+      <div class="activity-grid" x-html="renderActivityGrid()"></div>
+    </div>
+
+    <!-- Hourly / daily bar chart -->
+    <div class="card" x-show="!analysisLoading && (analysisHourly.length > 0 || analysisDaily.length > 0)">
+      <h3 x-text="analysisChartMode === 'hour' ? 'Hourly token usage' : 'Daily token usage'"></h3>
+      <p class="card-desc" x-text="analysisChartMode === 'hour' ? 'Tokens per hour for the selected date.' : 'Tokens per day for the selected range.'"></p>
+      <div class="bar-chart" x-html="renderBarChart()"></div>
+    </div>
+
+  </div>
+  <!-- / Analysis tab -->
+
+</section>
+
 <!-- ============== SETTINGS ============== -->
 <section x-show="tab==='settings'" class="page">
   <div class="page-head"><h2>Settings</h2></div>
   <div class="card" x-show="state">
     <div class="grid">
       <label>
-        <span>Max concurrent models</span>
-        <input type="number" min="1" x-model.number="settingsForm.max_concurrent_models">
+        <span>Max retries <span class="tip" tabindex="0" data-tip="If an inference request fails (timeout, container error, etc.), the controller retries this many times before marking the job as final error. 0 = no retries."></span></span>
+        <input type="number" min="0" max="10" x-model.number="settingsForm.max_retries">
       </label>
       <label>
-        <span>Default GPU memory utilization</span>
+        <span>Idle timeout (seconds) <span class="tip" tabindex="0" data-tip="Auto-stop a managed container after this many seconds of inactivity. The idle monitor watches each container's vLLM /metrics request counters and resets the clock when the controller dispatches a job (or when you hit the container's /v1/* directly). The next inference request for a stopped model will restart it. Set to 0 to disable auto-stop."></span></span>
+        <input type="number" min="0" x-model.number="settingsForm.idle_timeout_seconds">
+      </label>
+      <label>
+        <span>Default GPU memory utilization <span class="tip" tabindex="0" data-tip="Prefilled into the launch form when creating a new model container. Range 0.1–0.98."></span></span>
         <input type="number" step="0.05" min="0.1" max="0.98" x-model.number="settingsForm.default_gpu_memory_utilization">
       </label>
       <label>
-        <span>vLLM image</span>
+        <span>vLLM image <span class="tip" tabindex="0" data-tip="Docker image used when launching new model containers. Must contain a working `vllm` CLI."></span></span>
         <input type="text" x-model="settingsForm.vllm_image">
       </label>
       <label>
-        <span>HF cache (host)</span>
+        <span>HF cache (host) <span class="tip" tabindex="0" data-tip="Host directory mounted into each container at /root/.cache/huggingface. Sharing one cache means downloaded weights are reused across containers — you don't re-download a model when relaunching it."></span></span>
         <input type="text" x-model="settingsForm.hf_cache">
       </label>
       <label>
-        <span>Shared memory size</span>
+        <span>Shared memory size <span class="tip" tabindex="0" data-tip="Container --shm-size. vLLM uses /dev/shm for inter-process tensor passing. 16g is a comfortable default for most models."></span></span>
         <input type="text" x-model="settingsForm.shm_size">
       </label>
       <label>
-        <span>Port range start</span>
+        <span>Port range start <span class="tip" tabindex="0" data-tip="Lower bound of the host-port range used to auto-allocate ports for new containers."></span></span>
         <input type="number" x-model.number="settingsForm.port_range_start">
       </label>
       <label>
-        <span>Port range end</span>
+        <span>Port range end <span class="tip" tabindex="0" data-tip="Upper bound of the host-port range used to auto-allocate ports."></span></span>
         <input type="number" x-model.number="settingsForm.port_range_end">
+      </label>
+      <label>
+        <span>Cluster node name <span class="tip" tabindex="0" data-tip="Display name advertised to a paired coordinator."></span></span>
+        <input type="text" x-model="settingsForm.cluster_node_name" placeholder="Spark 1">
+      </label>
+      <label>
+        <span>ConnectX fabric IP <em class="muted">(blank = detect)</em> <span class="tip" tabindex="0" data-tip="IPv4 address used for NCCL/Gloo distributed inference traffic. This is separate from the management/agent address."></span></span>
+        <input type="text" x-model="settingsForm.cluster_fabric_ip" placeholder="169.254.10.1">
+      </label>
+      <label>
+        <span>ConnectX interface <em class="muted">(blank = detect)</em> <span class="tip" tabindex="0" data-tip="Interface exported as NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME for sharded launches."></span></span>
+        <input type="text" x-model="settingsForm.cluster_fabric_interface" placeholder="enp1s0f0np0">
+      </label>
+      <label>
+        <span>llama-server binary <span class="tip" tabindex="0" data-tip="Path to the llama-server executable used to serve GGUF models from the local HF cache."></span></span>
+        <input type="text" x-model="settingsForm.llama_server_bin">
+      </label>
+      <label>
+        <span>llama-server host <span class="tip" tabindex="0" data-tip="Bind address for the launched llama-server. Keep 127.0.0.1 — clients reach the model through this controller's /v1 proxy."></span></span>
+        <input type="text" x-model="settingsForm.llama_server_host" placeholder="127.0.0.1">
+      </label>
+      <label>
+        <span>llama-server port <span class="tip" tabindex="0" data-tip="First port tried when launching llama-server; the next few ports are tried if occupied."></span></span>
+        <input type="number" x-model.number="settingsForm.llama_server_port" placeholder="8100">
       </label>
     </div>
     <div class="actions">
@@ -328,6 +1655,19 @@
       <span class="muted" x-show="settingsSaved">Saved.</span>
     </div>
   </div>
+</section>
+
+<!-- ============== LOGS ============== -->
+<section x-show="tab==='logs'" class="page">
+  <div class="page-head">
+    <h2>Server Logs</h2>
+    <div style="display:flex; gap:8px; align-items:center">
+      <span class="muted" x-text="serverLogs.lines.length ? `${serverLogs.lines.length} lines` : ''"></span>
+      <button class="btn btn-ghost" @click="serverLogs.autoScroll = !serverLogs.autoScroll" x-text="serverLogs.autoScroll ? 'Auto-scroll: on' : 'Auto-scroll: off'"></button>
+      <button class="btn btn-ghost" @click="refreshServerLogs()">Refresh</button>
+    </div>
+  </div>
+  <pre class="logbox tall" x-ref="serverLogBox" style="max-height: calc(100vh - 180px); font-size: 12px;"><template x-for="(l,i) in serverLogs.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
 </section>
 
 </main>
@@ -343,6 +1683,189 @@
       </div>
     </div>
     <pre class="logbox tall" x-text="logsModal.text"></pre>
+  </div>
+</div>
+
+<!-- ============== SPARK RUN EDITOR MODAL ============== -->
+<div class="modal" x-show="sparkEditor.open" @click.self="sparkEditor.open = false">
+  <div class="modal-body spark-editor-body">
+    <div class="modal-head">
+      <h3>Save SparkRun</h3>
+      <button class="btn" @click="sparkEditor.open = false">Close</button>
+    </div>
+    <p class="card-desc">
+      Save a SparkRun reference, not a recipe. SparkRun resolves it now so this card shows the model and its actual settings.
+    </p>
+    <div class="grid spark-editor-grid">
+      <label class="full">
+        <span>Runnable SparkRun reference</span>
+        <input class="mono" type="text" x-model="sparkForm.reference" placeholder="@spark-arena/1199b578-cfa4-47cd-b1fa-374fd4815565">
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" @click="saveSparkLaunch()" :disabled="!sparkForm.reference.trim()">Save SparkRun</button>
+      <span class="muted" x-show="sparkSaved">Saved.</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============== SPARK RUN LOG MODAL ============== -->
+<div class="modal" x-show="sparkRun.open" @click.self="sparkRun.open = false">
+  <div class="modal-body spark-run-body">
+    <div class="modal-head">
+      <h3>
+        Spark Run · <span x-text="sparkRun.recipeName"></span>
+        <span class="status-pill" :class="{
+          'pill-running': sparkRun.status === 'running' || sparkRun.status === 'starting',
+          'pill-ready': sparkRun.status === 'done',
+          'pill-error': sparkRun.status === 'error' || sparkRun.status === 'canceled',
+        }" x-text="sparkRun.status || 'idle'"></span>
+      </h3>
+      <div>
+        <button class="btn btn-danger" @click="stopSparkRun()" x-show="sparkRun.busy">Stop</button>
+        <button class="btn" @click="sparkRun.open = false">Close</button>
+      </div>
+    </div>
+    <pre class="logbox tall" x-ref="sparkRunLog" style="max-height: 60vh; font-size: 12px;"><template x-for="(l,i) in sparkRun.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
+  </div>
+</div>
+
+<!-- ============== SPARK RUN OVERRIDES MODAL ============== -->
+<div class="modal" x-show="sparkLaunchRun.open" @click.self="sparkLaunchRun.open = false">
+  <div class="modal-body spark-editor-body spark-launch-body">
+    <div class="modal-head"><h3>Run <span x-text="sparkLaunchRun.name"></span></h3><button class="btn" @click="sparkLaunchRun.open = false">Close</button></div>
+    <p class="card-desc mono" x-text="'sparkrun run ' + sparkLaunchRun.reference"></p>
+    <div class="spark-resolved" x-show="sparkLaunchRun.resolvedCommand || sparkLaunchRun.recipeDefaults.length || sparkLaunchRun.recipeEnv.length || sparkLaunchRun.recipeMods.length">
+      <h4>Resolved recipe command · all arguments</h4>
+      <pre class="logbox spark-command" x-show="sparkLaunchRun.resolvedCommand" x-text="sparkLaunchRun.resolvedCommand"></pre>
+      <div class="grid spark-resolved-grid" x-show="sparkLaunchRun.recipeDefaults.length || sparkLaunchRun.recipeEnv.length || sparkLaunchRun.recipeMods.length">
+        <div x-show="sparkLaunchRun.recipeDefaults.length">
+          <h4>Recipe defaults</h4>
+          <dl class="kv">
+            <template x-for="entry in sparkLaunchRun.recipeDefaults" :key="entry[0]">
+              <div class="spark-kv-row"><dt class="mono" x-text="entry[0]"></dt><dd class="mono" x-text="typeof entry[1] === 'object' ? JSON.stringify(entry[1]) : entry[1]"></dd></div>
+            </template>
+          </dl>
+        </div>
+        <div x-show="sparkLaunchRun.recipeEnv.length || sparkLaunchRun.recipeMods.length">
+          <div x-show="sparkLaunchRun.recipeEnv.length">
+            <h4>Environment</h4>
+            <dl class="kv">
+              <template x-for="entry in sparkLaunchRun.recipeEnv" :key="entry[0]">
+                <div class="spark-kv-row"><dt class="mono" x-text="entry[0]"></dt><dd class="mono" x-text="typeof entry[1] === 'object' ? JSON.stringify(entry[1]) : entry[1]"></dd></div>
+              </template>
+            </dl>
+          </div>
+          <div x-show="sparkLaunchRun.recipeMods.length">
+            <h4>Mods</h4>
+            <div class="mono" x-text="sparkLaunchRun.recipeMods.join('\n')"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <h4>Launch overrides</h4>
+    <div class="grid spark-editor-grid">
+      <label><span>Parallel streams</span><input type="number" min="1" x-model.number="sparkLaunchRun.overrides.parallel_streams" placeholder="Recipe default"></label>
+      <label><span>Tensor parallelism</span><input type="number" min="1" x-model.number="sparkLaunchRun.overrides.tensor_parallel" placeholder="Recipe default"></label>
+      <label><span>GPU memory fraction</span><input type="number" min="0" max="1" step="0.01" x-model.number="sparkLaunchRun.overrides.gpu_memory_utilization" placeholder="Recipe default"></label>
+      <label><span>Max model length</span><input type="number" min="1" x-model.number="sparkLaunchRun.overrides.max_model_len" placeholder="Recipe default"></label>
+      <label><span>Port</span><input type="number" min="1" max="65535" x-model.number="sparkLaunchRun.overrides.port" placeholder="Recipe default"></label>
+      <label><span>Served model name</span><input type="text" x-model="sparkLaunchRun.overrides.served_model_name" placeholder="Recipe default"></label>
+      <label class="full"><span>Additional options <em class="muted">(one <code>key=value</code> per line)</em></span><textarea class="mono" rows="4" x-model="sparkLaunchRun.optionsText" placeholder="enable_prefix_caching=true"></textarea></label>
+    </div>
+    <div class="actions"><button class="btn btn-primary" @click="runSparkLaunch()">Run</button></div>
+  </div>
+</div>
+
+<!-- ============== SPARK RUN HISTORY MODAL ============== -->
+<div class="modal" x-show="sparkRunHistory.open" @click.self="sparkRunHistory.open = false">
+  <div class="modal-body spark-run-body">
+    <div class="modal-head">
+      <h3>Spark Run log · <span x-text="sparkRunHistory.recipeName"></span>
+        <span class="status-pill" :class="{
+          'pill-running': sparkRunHistory.status === 'running' || sparkRunHistory.status === 'starting',
+          'pill-ready': sparkRunHistory.status === 'done',
+          'pill-error': sparkRunHistory.status === 'error' || sparkRunHistory.status === 'canceled',
+        }" x-text="sparkRunHistory.status || 'idle'"></span>
+      </h3>
+      <button class="btn" @click="sparkRunHistory.open = false">Close</button>
+    </div>
+    <pre class="logbox tall" style="max-height: 60vh; font-size: 12px;"><template x-for="(l,i) in sparkRunHistory.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
+  </div>
+</div>
+
+<!-- ============== SPARK RECIPE RUNS MODAL ============== -->
+<div class="modal" x-show="sparkRecipeRuns.open" @click.self="sparkRecipeRuns.open = false">
+  <div class="modal-body spark-run-body">
+    <div class="modal-head">
+      <h3>Spark Run history · <span x-text="sparkRecipeRuns.recipeName"></span></h3>
+      <button class="btn" @click="sparkRecipeRuns.open = false">Close</button>
+    </div>
+    <div class="empty" x-show="(sparkRecipeRuns.runs?.length ?? 0) === 0">
+      No runs yet. Click <strong>Run</strong> on the recipe to start one.
+      <br><span class="muted">Run history is kept in memory and cleared when the controller restarts.</span>
+    </div>
+    <div class="queue-list" x-show="(sparkRecipeRuns.runs?.length ?? 0) > 0">
+      <template x-for="run in sparkRecipeRuns.runs" :key="run.id">
+        <div class="queue-item" :class="'q-' + (run.status || 'done')">
+          <div class="q-icon">
+            <span x-text="run.status === 'running' || run.status === 'starting' ? '▶' : (run.status === 'error' || run.status === 'canceled' ? '✕' : '✓')"></span>
+          </div>
+          <div class="q-row-wrap">
+            <div class="q-row">
+              <span class="q-model" x-text="run.recipe_name || run.id"></span>
+              <span class="q-status" x-text="run.status || 'done'"></span>
+              <span class="q-time" x-show="run.elapsed_s != null" x-text="run.elapsed_s + 's'"></span>
+            </div>
+            <div class="q-preview" x-text="run.last_line || ''"></div>
+          </div>
+          <div class="q-actions">
+            <button class="btn btn-ghost" @click="viewSparkRunLog(run)">View log</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+
+<!-- ============== SPARK RECIPE DOWNLOAD MODAL ============== -->
+<div class="modal" x-show="sparkDownload.open" @click.self="sparkDownload.open = false">
+  <div class="modal-body spark-download-body">
+    <div class="modal-head">
+      <h3>Use recipe with spark-vllm-docker · <span x-text="sparkDownload.recipe?.name"></span></h3>
+      <button class="btn" @click="sparkDownload.open = false">Close</button>
+    </div>
+
+    <div class="spark-download-section">
+      <h4>Recipe YAML</h4>
+      <div class="codebox-wrap">
+        <button class="copy-btn" @click="copySparkYaml(sparkDownload.recipe)">Copy recipe</button>
+        <pre class="codebox"><code x-text="sparkDownload.recipe?.yaml || '(no yaml)'"></code></pre>
+      </div>
+    </div>
+
+    <div class="spark-download-section">
+      <h4>Download</h4>
+      <p class="card-desc">
+        To use this recipe with spark-vllm-docker:</p>
+      <ol class="spark-download-steps">
+        <li>Download the recipe directly using the permalink:</li>
+      </ol>
+      <div class="codebox-wrap">
+        <button class="copy-btn" @click="copySparkDownloadUrl()"
+                :class="{ copied: sparkDownload.copied }"
+                x-text="sparkDownload.copied ? 'Copied' : 'Copy'">Copy</button>
+        <pre class="codebox"><code x-text="'curl -o recipe.yaml ' + sparkDownloadUrl()"></code></pre>
+      </div>
+      <ol class="spark-download-steps" start="2">
+        <li>Or copy the recipe above and save it as a <code>.yaml</code> file.</li>
+        <li>Follow the instructions in the spark-vllm-docker recipes documentation.</li>
+        <li>Run your benchmark using the recipe.</li>
+      </ol>
+      <div class="spark-download-actions">
+        <a class="btn btn-primary" :href="sparkDownloadUrl()" download="recipe.yaml">Download recipe.yaml</a>
+      </div>
+    </div>
   </div>
 </div>
 

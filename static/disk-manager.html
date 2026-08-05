@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Disk Manager · VLLM Controller</title>
+<link rel="stylesheet" href="/static/styles.css?v=46">
+<link rel="stylesheet" href="/static/disk-manager.css?v=3">
+<script defer src="/static/disk-manager.js?v=3"></script>
+</head>
+<body class="disk-manager-page">
+  <header class="disk-manager-header">
+    <div class="logo">
+      <span class="logo-mark"></span>
+      <span class="logo-text">VLLM<span>Controller</span></span>
+    </div>
+    <div>
+      <h1>Disk Manager</h1>
+      <p>Inspect disk usage and permanently remove files or directories.</p>
+    </div>
+    <button id="choose-directory" class="btn btn-ghost">Choose directory</button>
+    <button id="rescan" class="btn btn-ghost" disabled>Rescan</button>
+  </header>
+
+  <main class="disk-manager-main">
+    <section class="disk-summary panel">
+      <div><span class="summary-label">Directory</span><strong id="summary-path" class="mono">No directory selected</strong></div>
+      <div><span class="summary-label">Contents</span><strong id="summary-count">—</strong></div>
+      <div><span class="summary-label">Total size</span><strong id="summary-size">—</strong></div>
+      <div><span class="summary-label">Scan status</span><strong id="summary-status">Choose a directory to begin</strong></div>
+    </section>
+
+    <section id="scan-progress" class="scan-progress panel" hidden>
+      <div class="scan-progress-head">
+        <div><strong id="progress-title">Scanning directory…</strong><span id="progress-percent">0%</span></div>
+        <span id="progress-eta">Estimating time remaining…</span>
+      </div>
+      <div class="scan-progress-track"><span id="progress-bar"></span></div>
+      <div class="scan-progress-details">
+        <span id="progress-items">0 items discovered</span>
+        <span id="progress-size">0 B found</span>
+        <span id="progress-rate">Calculating scan rate…</span>
+        <span id="progress-current" class="mono">.</span>
+      </div>
+    </section>
+
+    <section id="treemap-section" class="panel disk-treemap-panel" hidden>
+      <div class="section-heading">
+        <div><h2>Largest items</h2><p>Relative area represents size. Click a tile to find it in the table.</p></div>
+      </div>
+      <div id="treemap" class="disk-treemap"></div>
+    </section>
+
+    <section class="panel disk-table-panel">
+      <div class="disk-toolbar">
+        <div class="section-heading"><h2>Directory tree</h2><span id="visible-count" class="muted"></span></div>
+        <input id="filter" class="input disk-filter" type="search" placeholder="Filter by name or path" disabled>
+        <button id="delete-selected" class="btn btn-danger" disabled>Permanently delete</button>
+      </div>
+      <div id="error-banner" class="disk-error" hidden></div>
+      <div class="disk-table-wrap">
+        <table class="disk-table">
+          <thead>
+            <tr>
+              <th class="check-cell"><input id="select-all" type="checkbox" aria-label="Select all visible items" disabled></th>
+              <th>Name</th>
+              <th><button class="sort-button active" data-sort="size">Size <span class="sort-arrow">↓</span></button></th>
+              <th><button class="sort-button" data-sort="modified">Date last modified <span class="sort-arrow"></span></button></th>
+              <th>Type</th>
+            </tr>
+          </thead>
+          <tbody id="disk-rows">
+            <tr class="empty-row"><td colspan="5">Choose a directory to scan its contents.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="directory-dialog" class="directory-dialog">
+    <form method="dialog">
+      <div class="directory-dialog-head">
+        <div><h2>Choose a directory</h2><p>Select a directory on the controller host.</p></div>
+        <button value="cancel" class="icon-close" aria-label="Close">×</button>
+      </div>
+      <div class="path-controls">
+        <button id="directory-up" type="button" class="btn btn-ghost" title="Parent directory">↑ Up</button>
+        <input id="directory-path" class="input mono" value="/" aria-label="Directory path">
+        <button id="directory-go" type="button" class="btn btn-ghost">Go</button>
+      </div>
+      <div id="directory-error" class="disk-error" hidden></div>
+      <div id="directory-list" class="directory-list"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button id="directory-ok" value="default" class="btn btn-primary">OK — scan this directory</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-dialog" class="delete-dialog">
+    <form method="dialog">
+      <h2>Permanently delete selected items?</h2>
+      <p id="delete-summary"></p>
+      <div id="delete-preview" class="delete-preview mono"></div>
+      <label class="delete-confirm-label">Type <strong>DELETE</strong> to confirm
+        <input id="delete-confirm" class="input" autocomplete="off">
+      </label>
+      <p class="danger-copy">This bypasses the trash and cannot be undone.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button id="delete-confirm-button" value="default" class="btn btn-danger" disabled>Delete permanently</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

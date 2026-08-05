@@ -1072,6 +1072,47 @@ select option {
   margin: 0;
 }
 .logbox.tall { max-height: 60vh; }
+.modal-body.cluster-logs-modal {
+  width: min(1500px, 96vw);
+  max-height: 90vh;
+}
+.cluster-log-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr));
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+}
+.cluster-log-panel {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+}
+.cluster-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cluster-log-head > div { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.cluster-log-container {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cluster-log-output {
+  flex: 1 1 auto;
+  min-height: 420px;
+  max-height: 68vh;
+}
 
 /* ─── modal ────────────────────────────────────────────────── */
 .modal {
@@ -1103,6 +1144,7 @@ select option {
   .topbar-stats { order: 2; width: 100%; }
   .topbar-right { order: 1; flex: 1; justify-content: flex-end; }
   .stat-row { grid-template-columns: repeat(2, 1fr); }
+  .cluster-log-output { min-height: 280px; max-height: 55vh; }
   main { padding: 16px; }
   .tabs { padding: 10px 12px 0; overflow-x: auto; }
 }

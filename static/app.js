@@ -116,7 +116,7 @@ function app() {
     analysisDaily: [],             // fetched daily data
     analysisLoading: false,
 
-    logsModal: { open: false, name: '', text: '', deploymentId: null },
+    logsModal: { open: false, name: '', text: '', deploymentId: null, members: [] },
 
     serverLogs: { lines: [], autoScroll: true, _interval: null },
 
@@ -1367,7 +1367,13 @@ function app() {
     },
 
     async openDeploymentLogs(deployment) {
-      this.logsModal = {open:true, name:`Cluster · ${deployment.name}`, text:'Loading cluster logs…', deploymentId:deployment.id};
+      this.logsModal = {
+        open: true,
+        name: `Cluster · ${deployment.name}`,
+        text: 'Loading cluster logs…',
+        deploymentId: deployment.id,
+        members: [],
+      };
       await this.refreshLogs();
     },
 
@@ -1376,10 +1382,10 @@ function app() {
         const r = await fetch(`/api/deployments/${this.logsModal.deploymentId}/logs`);
         if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
         const data = await r.json();
-        this.logsModal.text = (data.members || []).map(m =>
-          `===== ${m.node_name || m.node_id} · rank ${m.rank} =====\n${m.error || m.logs || '(no logs)'}`
-        ).join('\n\n');
+        this.logsModal.members = data.members || [];
+        this.logsModal.text = this.logsModal.members.length ? '' : '(no cluster members)';
       } catch (e) {
+        this.logsModal.members = [];
         this.logsModal.text = 'Failed to fetch cluster logs: ' + e.message;
       }
     },
@@ -1589,6 +1595,7 @@ function app() {
       this.logsModal.name = name;
       this.logsModal.text = 'Loading…';
       this.logsModal.deploymentId = null;
+      this.logsModal.members = [];
       await this.refreshLogs();
     },
     async refreshLogs() {
@@ -2765,6 +2772,7 @@ metadata:
           body: JSON.stringify(this.settingsForm),
         });
         if (!r.ok) throw new Error(await r.text());
+        this.settingsForm = await r.json();
         this.settingsSaved = true;
         setTimeout(() => { this.settingsSaved = false; }, 2500);
         await this.refresh();

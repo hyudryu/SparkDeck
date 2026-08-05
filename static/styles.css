@@ -187,6 +187,26 @@ body {
 .topbar-stats-content {
   /* Alpine controls display; no max-height trickery needed */
 }
+.stats-node-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 3px 0 8px;
+}
+.stats-node-picker select {
+  width: min(260px, 100%);
+  min-width: 150px;
+  padding: 4px 24px 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+}
+.stats-node-picker option:disabled { color: var(--text-muted); }
+.stats-node-status { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+.stats-node-status.online { color: var(--accent-green); }
+.stats-node-status.offline { color: var(--accent-red); }
 
 .fan-settings-toggle {
   display: inline-flex; align-items: center; gap: 4px;

@@ -125,6 +125,7 @@ function app() {
     diskLastAt: null,
     fanMaxSpeed: false,
     topbarStatsCollapsed: false,
+    statsNodeId: 'local',
     fanSettingsOpen: false,
     fanSettingsLiveMode: '',
     fanSettingsExpectedMode: '',
@@ -194,6 +195,11 @@ function app() {
         if (!r.ok) throw new Error(r.statusText);
         const s = await r.json();
         this.state = s;
+        if (!(s.nodes || []).some(n => n.id === this.statsNodeId && n.online)) {
+          this.statsNodeId = (s.nodes || []).find(n => n.local && n.online)?.id
+            || (s.nodes || []).find(n => n.online)?.id
+            || 'local';
+        }
         this._syncFanSettings(s.stats?.fan);
         this._tokenCostCache = {}; // invalidate cost cache on refresh
         this.connected = true;
@@ -444,6 +450,22 @@ function app() {
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     },
 
+    statsNodes() { return this.state?.nodes || []; },
+    selectedStatsNode() {
+      return this.statsNodes().find(n => n.id === this.statsNodeId && n.online)
+        || this.statsNodes().find(n => n.local && n.online)
+        || this.statsNodes().find(n => n.online)
+        || null;
+    },
+    nodeStats() {
+      const node = this.selectedStatsNode();
+      return node?.local ? (this.state?.stats || {}) : (node?.stats || {});
+    },
+    nodeDisk() {
+      const node = this.selectedStatsNode();
+      return node?.local ? this.disk : (node?.disk || null);
+    },
+    statsGpu() { return this.nodeStats()?.gpus?.[0] || null; },
     gpu() { return this.state?.stats?.gpus?.[0] || null; },
     gpuTotalGb() {
       const totalMib = this.state?.stats?.gpus?.[0]?.mem_total_mib;

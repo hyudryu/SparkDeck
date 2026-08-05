@@ -97,6 +97,19 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    def test_hf_token_is_masked_publicly_and_exported_to_containers(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"hf_token": "hf_test_secret", "hf_cache": ""}
+
+        public = instance.public_settings()
+        environment = instance._container_hf_environment()
+
+        self.assertEqual(public["hf_token"], "")
+        self.assertTrue(public["hf_token_configured"])
+        self.assertNotIn("hf_test_secret", json.dumps(public))
+        self.assertEqual(environment["HF_TOKEN"], "hf_test_secret")
+        self.assertEqual(environment["HUGGING_FACE_HUB_TOKEN"], "hf_test_secret")
+
     async def test_members_are_persisted_before_slow_node_launches_finish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

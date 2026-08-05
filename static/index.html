@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=47">
-<script src="/static/app.js?v=47"></script>
+<link rel="stylesheet" href="/static/styles.css?v=48">
+<script src="/static/app.js?v=48"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -26,81 +26,92 @@
       <span class="stats-chevron" :class="{open: !topbarStatsCollapsed}">⌄</span>
     </button>
     <div class="topbar-stats-content" x-show="!topbarStatsCollapsed" x-transition>
+    <div class="stats-node-picker" x-show="statsNodes().length">
+      <span class="stat-label">Cluster node</span>
+      <select x-model="statsNodeId" aria-label="Select cluster node for telemetry">
+        <template x-for="node in statsNodes()" :key="node.id">
+          <option :value="node.id" :disabled="!node.online"
+                  x-text="`${node.name || node.hostname || node.id} · ${node.status || (node.online ? 'online' : 'offline')}`"></option>
+        </template>
+      </select>
+      <span class="stats-node-status" :class="selectedStatsNode()?.online ? 'online' : 'offline'"
+            x-text="selectedStatsNode()?.online ? '● Live' : '● Offline'"></span>
+    </div>
     <template x-if="state">
       <div class="stat-row">
         <!-- CPU -->
         <div class="stat" :title="`CPU usage`">
           <span class="stat-label">CPU</span>
-          <span class="stat-value" x-text="fmtPct(state.stats.cpu_pct)"></span>
-          <div class="bar"><span :style="`width:${Math.round(state.stats.cpu_pct ?? 0)}%`"></span></div>
+          <span class="stat-value" x-text="fmtPct(nodeStats().cpu_pct)"></span>
+          <div class="bar"><span :style="`width:${Math.round(nodeStats().cpu_pct ?? 0)}%`"></span></div>
         </div>
         <!-- CPU clock -->
-        <div class="stat" :title="`CPU ${fmtClock(state.stats.cpu_clock_mhz, state.stats.cpu_clock_max_mhz)} · base ${state.stats.cpu_clock_base_mhz ?? '—'} MHz`">
+        <div class="stat" :title="`CPU ${fmtClock(nodeStats().cpu_clock_mhz, nodeStats().cpu_clock_max_mhz)} · base ${nodeStats().cpu_clock_base_mhz ?? '—'} MHz`">
           <span class="stat-label">CPU clock</span>
-          <span class="stat-value" x-text="fmtClockDelta(state.stats.cpu_clock_mhz, state.stats.cpu_clock_base_mhz, state.stats.cpu_clock_max_mhz)"></span>
-          <div class="bar"><span :style="`width:${clockPct(state.stats.cpu_clock_mhz, state.stats.cpu_clock_base_mhz, state.stats.cpu_clock_max_mhz)}%; background:${clockColor(state.stats.cpu_temp_c)}`"></span></div>
+          <span class="stat-value" x-text="fmtClockDelta(nodeStats().cpu_clock_mhz, nodeStats().cpu_clock_base_mhz, nodeStats().cpu_clock_max_mhz)"></span>
+          <div class="bar"><span :style="`width:${clockPct(nodeStats().cpu_clock_mhz, nodeStats().cpu_clock_base_mhz, nodeStats().cpu_clock_max_mhz)}%; background:${clockColor(nodeStats().cpu_temp_c)}`"></span></div>
         </div>
         <!-- GPU util -->
         <div class="stat">
           <span class="stat-label">GPU</span>
-          <span class="stat-value" x-text="fmtPct(gpu()?.util)"></span>
-          <div class="bar"><span :style="`width:${Math.round(gpu()?.util ?? 0)}%; background: var(--accent-green)`"></span></div>
+          <span class="stat-value" x-text="fmtPct(statsGpu()?.util)"></span>
+          <div class="bar"><span :style="`width:${Math.round(statsGpu()?.util ?? 0)}%; background: var(--accent-green)`"></span></div>
         </div>
         <!-- GPU clock -->
-        <div class="stat" :title="`GPU ${fmtClock(gpu()?.clock_mhz, gpu()?.clock_max_mhz)} · base ${gpu()?.clock_base_mhz ?? '—'} MHz`">
+        <div class="stat" :title="`GPU ${fmtClock(statsGpu()?.clock_mhz, statsGpu()?.clock_max_mhz)} · base ${statsGpu()?.clock_base_mhz ?? '—'} MHz`">
           <span class="stat-label">GPU clock</span>
-          <span class="stat-value" x-text="fmtClockDelta(gpu()?.clock_mhz, gpu()?.clock_base_mhz, gpu()?.clock_max_mhz)"></span>
-          <div class="bar"><span :style="`width:${clockPct(gpu()?.clock_mhz, gpu()?.clock_base_mhz, gpu()?.clock_max_mhz)}%; background:${clockColor(gpu()?.temp)}`"></span></div>
+          <span class="stat-value" x-text="fmtClockDelta(statsGpu()?.clock_mhz, statsGpu()?.clock_base_mhz, statsGpu()?.clock_max_mhz)"></span>
+          <div class="bar"><span :style="`width:${clockPct(statsGpu()?.clock_mhz, statsGpu()?.clock_base_mhz, statsGpu()?.clock_max_mhz)}%; background:${clockColor(statsGpu()?.temp)}`"></span></div>
         </div>
         <!-- RAM -->
         <div class="stat">
           <span class="stat-label">RAM</span>
-          <span class="stat-value" x-text="fmtBytes(state.stats.mem.used) + ' / ' + fmtBytes(state.stats.mem.total)"></span>
-          <div class="bar"><span :style="`width:${Math.round(state.stats.mem.pct ?? 0)}%; background: var(--accent-blue)`"></span></div>
+          <span class="stat-value" x-text="nodeStats().mem ? fmtBytes(nodeStats().mem.used) + ' / ' + fmtBytes(nodeStats().mem.total) : '— / —'"></span>
+          <div class="bar"><span :style="`width:${Math.round(nodeStats().mem?.pct ?? 0)}%; background: var(--accent-blue)`"></span></div>
         </div>
         <!-- Disk -->
         <div class="stat">
           <div class="stat-label-row">
             <span class="stat-label">Disk</span>
             <span class="stat-label-actions">
-              <button class="stat-manage-btn" @click="openDiskManager()" title="Open disk manager in a new tab">Manage</button>
-              <button class="icon-btn" :class="{'spin': diskLoading}" @click="refreshDisk()" :disabled="diskLoading" title="Refresh disk">↻</button>
+              <button class="stat-manage-btn" x-show="selectedStatsNode()?.local" @click="openDiskManager()" title="Open disk manager in a new tab">Manage</button>
+              <button class="icon-btn" x-show="selectedStatsNode()?.local" :class="{'spin': diskLoading}" @click="refreshDisk()" :disabled="diskLoading" title="Refresh disk">↻</button>
             </span>
           </div>
-          <span class="stat-value" x-text="disk?.used != null ? fmtBytes(disk.used) + ' / ' + fmtBytes(disk.total) : '— / —'"></span>
-          <div class="bar"><span :style="`width:${Math.round(disk?.pct ?? 0)}%; background: var(--accent-purple)`"></span></div>
-          <span class="muted" style="font-size:11px; margin-top:2px" x-text="disk?.free != null ? fmtGb1(disk.free) + ' free' : ''"></span>
+          <span class="stat-value" x-text="nodeDisk()?.used != null ? fmtBytes(nodeDisk().used) + ' / ' + fmtBytes(nodeDisk().total) : '— / —'"></span>
+          <div class="bar"><span :style="`width:${Math.round(nodeDisk()?.pct ?? 0)}%; background: var(--accent-purple)`"></span></div>
+          <span class="muted" style="font-size:11px; margin-top:2px" x-text="nodeDisk()?.free != null ? fmtGb1(nodeDisk().free) + ' free' : ''"></span>
         </div>
         <!-- CPU temp -->
         <div class="stat">
           <span class="stat-label">CPU temp</span>
-          <span class="stat-value" x-text="fmtTemp(state.stats.cpu_temp_c)"></span>
-          <div class="bar"><span :style="`width:${tempPct(state.stats.cpu_temp_c)}%; background:${tempColor(state.stats.cpu_temp_c)}`"></span></div>
+          <span class="stat-value" x-text="fmtTemp(nodeStats().cpu_temp_c)"></span>
+          <div class="bar"><span :style="`width:${tempPct(nodeStats().cpu_temp_c)}%; background:${tempColor(nodeStats().cpu_temp_c)}`"></span></div>
         </div>
         <!-- GPU temp -->
         <div class="stat">
           <span class="stat-label">GPU temp</span>
-          <span class="stat-value" x-text="fmtTemp(gpu()?.temp)"></span>
-          <div class="bar"><span :style="`width:${tempPct(gpu()?.temp)}%; background:${tempColor(gpu()?.temp)}`"></span></div>
+          <span class="stat-value" x-text="fmtTemp(statsGpu()?.temp)"></span>
+          <div class="bar"><span :style="`width:${tempPct(statsGpu()?.temp)}%; background:${tempColor(statsGpu()?.temp)}`"></span></div>
         </div>
         <!-- Power -->
         <div class="stat">
           <span class="stat-label">Power</span>
-          <span class="stat-value" x-text="fmtWatts(gpu()?.power_draw_w, gpu()?.power_limit_w)"></span>
-          <div class="bar"><span :style="`width:${powerPct(gpu()?.power_draw_w, gpu()?.power_limit_w)}%; background:${powerColor(gpu()?.power_draw_w, gpu()?.power_limit_w)}`"></span></div>
+          <span class="stat-value" x-text="fmtWatts(statsGpu()?.power_draw_w, statsGpu()?.power_limit_w)"></span>
+          <div class="bar"><span :style="`width:${powerPct(statsGpu()?.power_draw_w, statsGpu()?.power_limit_w)}%; background:${powerColor(statsGpu()?.power_draw_w, statsGpu()?.power_limit_w)}`"></span></div>
         </div>
         <!-- Interactive local and SSH users -->
         <div class="stat stat-users"
-             :title="state.stats.online_users?.count == null
+             :title="nodeStats().online_users?.count == null
                ? 'Could not read login sessions'
-               : `${state.stats.online_users.sessions} login session${state.stats.online_users.sessions === 1 ? '' : 's'} · ${state.stats.online_users.names.join(', ') || 'no users online'}`">
+               : `${nodeStats().online_users.sessions} login session${nodeStats().online_users.sessions === 1 ? '' : 's'} · ${nodeStats().online_users.names.join(', ') || 'no users online'}`">
           <span class="stat-label">Online users</span>
           <span class="stat-value"
-                x-text="state.stats.online_users?.count == null
+                x-text="nodeStats().online_users?.count == null
                   ? '—'
-                  : `${state.stats.online_users.count} · ${state.stats.online_users.names.join(', ') || 'none'}`"></span>
-          <span class="online-users-status" :class="{'active': state.stats.online_users?.count > 0}"
-                x-text="state.stats.online_users?.count > 0 ? '● Active login' : 'No active logins'"></span>
+                  : `${nodeStats().online_users.count} · ${nodeStats().online_users.names.join(', ') || 'none'}`"></span>
+          <span class="online-users-status" :class="{'active': nodeStats().online_users?.count > 0}"
+                x-text="nodeStats().online_users?.count > 0 ? '● Active login' : 'No active logins'"></span>
         </div>
         <!-- Session tokens -->
         <div class="stat stat-tokens" title="Session input/output tokens served since the controller started (or last reset), per model + quant variant. Speed counts decode time only (first to last output token; prefill excluded): while requests are streaming it is the live aggregate across all active streams, otherwise the session average. Reset clears only this session; lifetime counters are in the Usage tab.">

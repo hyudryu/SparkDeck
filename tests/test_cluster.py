@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -96,6 +97,110 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_members_are_persisted_before_slow_node_launches_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = []
+            entered = 0
+            both_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def cluster_nodes(local_stats=None):
+                return [
+                    {
+                        "id": "local", "name": "Spark 1", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.1",
+                        "fabric_interface": "cx7-local", "interfaces": [],
+                    },
+                    {
+                        "id": "remote-1", "name": "Spark 2", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.2",
+                        "fabric_interface": "cx7-remote", "interfaces": [],
+                    },
+                ]
+
+            async def allocate_port():
+                return 8008
+
+            async def create_member(node_id, payload):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+                await release.wait()
+                return {"id": f"container-{node_id}", "status": "running"}
+
+            instance.cluster_nodes = cluster_nodes
+            instance._allocate_port = allocate_port
+            instance._create_member = create_member
+
+            task = asyncio.create_task(instance.create_deployment({
+                "model": "deepseek-ai/DeepSeek-V4-Flash",
+                "engine": "vllm",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+            }))
+            await asyncio.wait_for(both_entered.wait(), 1)
+
+            self.assertEqual(len(instance.deployments[0]["members"]), 2)
+            self.assertTrue(all(
+                member["status"] == "queued"
+                for member in instance.deployments[0]["members"]
+            ))
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(len(persisted[0]["members"]), 2)
+            self.assertEqual(persisted[0]["api_port"], 8008)
+
+            release.set()
+            await task
+
+    async def test_cluster_logs_show_progress_before_container_exists(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_member_launches = {}
+        instance._cluster_launch_update(
+            "cluster-test-r0", "pulling_image",
+            "Downloading Docker image example/vllm:latest; this can take several minutes",
+            model="example/model",
+            cluster_member={"deployment_id": "test", "node_id": "local", "rank": 0},
+        )
+
+        async def is_managed_container(name):
+            return False
+
+        instance.is_managed_container = is_managed_container
+        logs = await instance.get_cluster_member_logs("cluster-test-r0")
+
+        self.assertIn("Controller launch progress", logs)
+        self.assertIn("Downloading Docker image", logs)
+        self.assertIn("Container has not been created yet", logs)
+
+    async def test_combined_logs_fall_back_to_coordinator_status(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "test",
+            "members": [{
+                "node_id": "remote-1", "node_name": "Spark 2", "rank": 1,
+                "container_name": "cluster-test-r1", "status": "queued",
+                "phase": {"phase": "queued", "message": "Waiting for image pull"},
+            }],
+        }]
+
+        async def member_action(member, action):
+            raise RuntimeError("older agent has not created the container")
+
+        instance._member_action = member_action
+        result = await instance.deployment_logs("test")
+
+        self.assertIn("Coordinator launch status", result["members"][0]["logs"])
+        self.assertIn("Waiting for image pull", result["members"][0]["logs"])
+        self.assertIn("older agent", result["members"][0]["logs"])
+        self.assertIsNone(result["members"][0]["error"])
+
     async def test_vllm_sharded_launch_generates_coordinated_rank_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

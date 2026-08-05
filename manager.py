@@ -2,11 +2,13 @@
 VLLMController - container + queue + telemetry manager.
 """
 import asyncio
+import copy
 import json
 import math
 import os
 import re
 import socket
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -576,6 +578,194 @@ class Manager:
             result.append(value)
             i += 1
         return result
+
+    @staticmethod
+    def _cli_option(args: list[str], names: set[str], cast=None):
+        """Return the last value supplied for one of ``names``.
+
+        Docker images may persist options as either ``--flag value`` or
+        ``--flag=value``.  Load-settings discovery needs to understand both
+        forms so editing a container never silently resets an existing flag.
+        """
+        found = None
+        for i, raw in enumerate(args):
+            token = str(raw)
+            key, separator, inline = token.partition("=")
+            if key not in names:
+                continue
+            if separator:
+                found = inline
+            elif i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
+                found = args[i + 1]
+        if found is None or cast is None:
+            return found
+        try:
+            return cast(found)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _shell_vllm_command(script: str):
+        """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
+        return re.search(
+            r"(?:^|;\s*|\bexec\s+)(?:[^\s;]*/)?vllm\s+serve\s+"
+            r"(?P<model>(?:\"[^\"]*\"|'[^']*'|[^\s;]+))(?P<flags>.*)$",
+            script or "",
+            re.DOTALL,
+        )
+
+    @classmethod
+    def _thinking_config(cls, args: list[str]) -> tuple[str, dict, str | None]:
+        """Return mode, full chat-template kwargs, and its thinking key."""
+        raw = cls._cli_option(args, {"--default-chat-template-kwargs"})
+        if raw is None:
+            return "default", {}, None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "default", {}, None
+        if not isinstance(payload, dict):
+            return "default", {}, None
+        for key in ("enable_thinking", "thinking"):
+            if isinstance(payload.get(key), bool):
+                return ("enabled" if payload[key] else "disabled"), payload, key
+        return "default", payload, None
+
+    def _container_load_settings(self, cmd: list[str], engine: str, model: str) -> dict:
+        """Extract editable launch settings from a Docker command.
+
+        Common performance controls get dedicated UI fields. Every remaining
+        flag is also exposed as text so new engine options do not require a
+        controller release before users can edit them. Shell-wrapped commands
+        retain their original quoting and variable expressions.
+        """
+        cmd = [str(value) for value in (cmd or [])]
+        engine = engine if engine == "sglang" else "vllm"
+        command_flags = ""
+        analysis_cmd = cmd
+        if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
+            match = self._shell_vllm_command(cmd[-1])
+            if match:
+                command_flags = match.group("flags").strip()
+                try:
+                    analysis_cmd = [
+                        "vllm", "serve", shlex.split(match.group("model"))[0],
+                        *shlex.split(command_flags),
+                    ]
+                except (ValueError, IndexError):
+                    analysis_cmd = cmd
+        if engine == "sglang":
+            managed = {
+                "--model-path", "--host", "--port", "--tp-size",
+                "--context-length", "--max-running-requests",
+                "--mem-fraction-static", "--max-total-tokens",
+                "--kv-cache-dtype",
+            }
+            skip_tokens = {"-m", "python", "python3", "sglang.launch_server", model}
+            extra_args = []
+            i = 0
+            while i < len(analysis_cmd):
+                token = analysis_cmd[i]
+                key = token.split("=", 1)[0]
+                if key in managed:
+                    if "=" not in token and i + 1 < len(analysis_cmd):
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                if token in skip_tokens:
+                    i += 1
+                    continue
+                extra_args.append(token)
+                i += 1
+            if not command_flags:
+                editable = []
+                i = 0
+                while i < len(analysis_cmd):
+                    token = analysis_cmd[i]
+                    if token in {"python", "python3", "-m", "sglang.launch_server"}:
+                        i += 1
+                        continue
+                    if token == "--model-path" and i + 1 < len(analysis_cmd):
+                        i += 2
+                        continue
+                    editable.append(token)
+                    i += 1
+                command_flags = shlex.join(editable)
+            thinking_mode, _, _ = self._thinking_config(analysis_cmd)
+            return {
+                "editable": "--model-path" in analysis_cmd,
+                "engine": engine,
+                "gpu_memory_utilization": self._cli_option(
+                    analysis_cmd, {"--mem-fraction-static"}, float
+                ),
+                "max_concurrency": self._cli_option(
+                    analysis_cmd, {"--max-running-requests"}, int
+                ),
+                "kv_cache_dtype": self._cli_option(analysis_cmd, {"--kv-cache-dtype"}),
+                "context_window": self._cli_option(
+                    analysis_cmd, {"--context-length"}, int
+                ),
+                "tensor_parallel_size": self._cli_option(
+                    analysis_cmd, {"--tp-size"}, int
+                ),
+                "thinking_mode": thinking_mode,
+                "extra_args": extra_args,
+                "command_flags": command_flags,
+            }
+
+        managed = {
+            "--host", "--port", "--gpu-memory-utilization",
+            "--gpu_memory_utilization", "--max-model-len", "--max-model-length",
+            "--max-num-seqs", "--kv-cache-dtype",
+        }
+        try:
+            model_index = analysis_cmd.index("serve") + 2
+        except ValueError:
+            try:
+                model_index = analysis_cmd.index(model) + 1
+            except ValueError:
+                model_index = len(analysis_cmd)
+        if not command_flags:
+            command_flags = shlex.join(analysis_cmd[model_index:])
+        extra_args = []
+        i = model_index
+        while i < len(analysis_cmd):
+            token = analysis_cmd[i]
+            key = token.split("=", 1)[0]
+            if key in managed:
+                if "=" not in token and i + 1 < len(analysis_cmd):
+                    i += 2
+                else:
+                    i += 1
+                continue
+            extra_args.append(token)
+            i += 1
+        thinking_mode, _, _ = self._thinking_config(analysis_cmd)
+        return {
+            "editable": "serve" in analysis_cmd,
+            "engine": engine,
+            "gpu_memory_utilization": self._cli_option(
+                analysis_cmd,
+                {"--gpu-memory-utilization", "--gpu_memory_utilization"},
+                float,
+            ),
+            "max_concurrency": self._cli_option(
+                analysis_cmd, {"--max-num-seqs"}, int
+            ),
+            "kv_cache_dtype": self._cli_option(
+                analysis_cmd, {"--kv-cache-dtype"}
+            ),
+            "context_window": self._cli_option(
+                analysis_cmd, {"--max-model-len", "--max-model-length"}, int
+            ),
+            "tensor_parallel_size": self._cli_option(
+                analysis_cmd, {"--tensor-parallel-size", "-tp"}, int
+            ),
+            "thinking_mode": thinking_mode,
+            "extra_args": extra_args,
+            "command_flags": command_flags,
+        }
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
@@ -2565,6 +2755,8 @@ class Manager:
             "stats_key": self._stats_key(model, variant),
             "port": host_port,
             "managed": is_managed,
+            "engine": engine_label,
+            "load_settings": self._container_load_settings(cmd, engine_label, model),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),
         }
@@ -2866,9 +3058,7 @@ class Manager:
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
-                container = self.client.containers.run(
-                    **run_options,
-                )
+                container = self.client.containers.run(**run_options)
                 container.reload()
                 self._cluster_launch_update(
                     name, "starting", "Container created; starting the model server",
@@ -3008,9 +3198,7 @@ class Manager:
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
-                container = self.client.containers.run(
-                    **run_options,
-                )
+                container = self.client.containers.run(**run_options)
                 container.reload()
                 self._cluster_launch_update(
                     name, "starting", "Container created; starting the model server",
@@ -3051,6 +3239,221 @@ class Manager:
             container.start()
         await asyncio.to_thread(_do)
         return {"ok": True}
+
+    @staticmethod
+    def _replace_command_option(
+        flags: str, names: set[str], value: str | int | float | None
+    ) -> str:
+        """Replace scalar CLI options without disturbing other shell text."""
+        option = "(?:" + "|".join(
+            re.escape(name) for name in sorted(names, key=len, reverse=True)
+        ) + ")"
+        scalar = r'''(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)'''
+        pattern = rf"(?<!\S){option}(?:={scalar}|\s+{scalar})"
+        updated = re.sub(pattern, "", flags or "")
+        # Do not normalize internal whitespace: image-specific flags may carry
+        # shell expressions or quoted templates whose contents are significant.
+        updated = updated.strip()
+        if value is None or str(value).strip() == "":
+            return updated
+        canonical = sorted(names, key=lambda name: (len(name), name))[0]
+        return f"{updated} {canonical} {value}".strip()
+
+    def _replace_thinking_config(self, flags: str, mode: str) -> str:
+        """Update thinking without discarding unrelated chat-template kwargs."""
+        if mode not in {"default", "enabled", "disabled"}:
+            raise ValueError("thinking_mode must be default, enabled, or disabled")
+        try:
+            tokens = shlex.split(flags)
+        except ValueError as exc:
+            raise ValueError("command flags have invalid shell quoting") from exc
+        _, payload, key = self._thinking_config(tokens)
+        if mode == "default":
+            if key is None:
+                return flags
+            payload.pop(key, None)
+        else:
+            key = key or "enable_thinking"
+            payload[key] = mode == "enabled"
+        value = None
+        if payload:
+            value = shlex.quote(json.dumps(payload, separators=(",", ":")))
+        return self._replace_command_option(
+            flags, {"--default-chat-template-kwargs"}, value
+        )
+
+    def _updated_container_command(
+        self, cmd: list[str], engine: str, model: str, settings: dict
+    ) -> list[str]:
+        """Apply an edited settings form to an existing Docker command."""
+        existing = self._container_load_settings(cmd, engine, model)
+        flags = str(settings.get("command_flags", existing["command_flags"]) or "")
+        if len(flags) > 65536:
+            raise ValueError("command flags must be 65536 characters or fewer")
+
+        def positive_int(key: str):
+            value = settings.get(key, existing.get(key))
+            if value in (None, ""):
+                return None
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a positive integer") from exc
+            if value <= 0:
+                raise ValueError(f"{key} must be a positive integer")
+            return value
+
+        gpu = settings.get(
+            "gpu_memory_utilization", existing.get("gpu_memory_utilization")
+        )
+        if gpu not in (None, ""):
+            try:
+                gpu = float(gpu)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("gpu_memory_utilization must be a number") from exc
+            if not 0 < gpu <= 1:
+                raise ValueError("gpu_memory_utilization must be between 0 and 1")
+        else:
+            gpu = None
+        concurrency = positive_int("max_concurrency")
+        context_window = positive_int("context_window")
+        kv_dtype = settings.get("kv_cache_dtype", existing.get("kv_cache_dtype"))
+        kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
+        thinking_mode = settings.get(
+            "thinking_mode", existing.get("thinking_mode", "default")
+        )
+
+        if engine == "sglang":
+            flags = self._replace_command_option(
+                flags, {"--mem-fraction-static"}, gpu
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-running-requests"}, concurrency
+            )
+            flags = self._replace_command_option(
+                flags, {"--context-length"}, context_window
+            )
+        else:
+            flags = self._replace_command_option(
+                flags,
+                {"--gpu-memory-utilization", "--gpu_memory_utilization"},
+                gpu,
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-num-seqs"}, concurrency
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-model-len", "--max-model-length"}, context_window
+            )
+        flags = self._replace_command_option(flags, {"--kv-cache-dtype"}, kv_dtype)
+        flags = self._replace_thinking_config(flags, str(thinking_mode))
+
+        original = [str(value) for value in (cmd or [])]
+        # Preserve host/port because Docker's network bindings and controller
+        # routing still point at the existing values.
+        if engine == "vllm" and len(original) >= 3 and original[-2] in {"-c", "-lc"}:
+            match = self._shell_vllm_command(original[-1])
+            if not match:
+                raise ValueError("could not locate the vLLM command in the shell script")
+            old_flags = match.group("flags")
+            try:
+                old_tokens = shlex.split(old_flags)
+            except ValueError as exc:
+                raise ValueError("the existing vLLM command has invalid shell quoting") from exc
+            for names in ({"--host"}, {"--port"}):
+                flags = self._replace_command_option(
+                    flags, names, self._cli_option(old_tokens, names)
+                )
+            script = original[-1]
+            trailing = "\n" if script.endswith("\n") else ""
+            script = script[:match.start("flags")].rstrip() + " " + flags + trailing
+            return [*original[:-1], script]
+
+        try:
+            flag_tokens = shlex.split(flags)
+        except ValueError as exc:
+            raise ValueError("command flags have invalid shell quoting") from exc
+        if engine == "sglang":
+            try:
+                model_index = original.index("--model-path")
+                prefix = original[:model_index + 2]
+            except ValueError as exc:
+                raise ValueError("could not locate --model-path in the SGLang command") from exc
+        else:
+            try:
+                model_index = original.index("serve") + 1
+                prefix = original[:model_index + 1]
+            except ValueError as exc:
+                raise ValueError("could not locate the model in the vLLM command") from exc
+        # Keep the original network endpoint even if it was edited in the raw
+        # flags field; changing it would make the existing port mapping stale.
+        old_flag_tokens = original[len(prefix):]
+        for names in ({"--host"}, {"--port"}):
+            flag_tokens = self._without_cli_options(flag_tokens, names)
+            old_value = self._cli_option(old_flag_tokens, names)
+            if old_value is not None:
+                flag_tokens += [sorted(names)[0], str(old_value)]
+        return [*prefix, *flag_tokens]
+
+    async def update_container_settings(self, name: str, settings: dict) -> dict:
+        """Transactionally recreate a Docker model with an edited command.
+
+        Docker cannot mutate a container command in place. The original is
+        stopped and renamed, then retained until the exact-config clone has
+        been created (and started when appropriate). A failed replacement is
+        removed and the original name/state is restored.
+        """
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+
+        async with self.lock:
+            container = await asyncio.to_thread(self.client.containers.get, name)
+            container.reload()
+            labels = container.labels or {}
+            if labels.get(DEPLOYMENT_LABEL):
+                raise ValueError("edit the deployment recipe instead of one cluster member")
+            attrs = copy.deepcopy(container.attrs or {})
+            config = copy.deepcopy(attrs.get("Config") or {})
+            cmd = config.get("Cmd") or []
+            engine = labels.get("vllm-controller.engine", "vllm")
+            model = labels.get(MODEL_LABEL, "")
+            new_cmd = self._updated_container_command(cmd, engine, model, settings)
+            was_running = container.status in {"running", "restarting", "paused"}
+            backup_name = f"{name}.settings-backup-{uuid.uuid4().hex[:8]}"
+
+            create_config = config
+            create_config["Cmd"] = new_cmd
+            create_config["HostConfig"] = copy.deepcopy(attrs.get("HostConfig") or {})
+
+            def _replace():
+                backup = container
+                if was_running:
+                    backup.stop(timeout=30)
+                backup.rename(backup_name)
+                try:
+                    created = self.client.api.create_container_from_config(
+                        create_config, name=name
+                    )
+                    replacement = self.client.containers.get(created["Id"])
+                    if was_running:
+                        replacement.start()
+                    replacement.reload()
+                    summary = self._container_summary(replacement)
+                    backup.remove(force=True)
+                    return summary
+                except Exception:
+                    try:
+                        self.client.containers.get(name).remove(force=True)
+                    except Exception:
+                        pass
+                    backup = self.client.containers.get(backup_name)
+                    backup.rename(name)
+                    if was_running:
+                        backup.start()
+                    raise
+
+            summary = await asyncio.to_thread(_replace)
+            return {"ok": True, "container": summary}
 
     async def is_managed_container(self, name: str) -> bool:
         def _check():

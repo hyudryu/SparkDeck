@@ -34,6 +34,9 @@ DEFAULT_SETTINGS = {
     "idle_timeout_seconds": 30,  # 0 disables auto-stop
     "vllm_image": "nvcr.io/nvidia/vllm:26.03.post1-py3",
     "hf_cache": "/home/hyudryu/.cache/huggingface",
+    # Stored server-side and never returned by the settings/state APIs. An
+    # empty value falls back to the process environment or the HF cache token.
+    "hf_token": "",
     "port_range_start": 8000,
     "port_range_end": 8099,
     "shm_size": "16g",
@@ -658,6 +661,10 @@ class Manager:
         base = {
             "model": model,
             "engine": engine,
+            # Agent requests are authenticated and the deployment payload is
+            # not persisted. Forward the coordinator credential so every
+            # selected node downloads as the same HF account.
+            "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
             "extra_args": list(body.get("extra_args") or []),
@@ -1092,6 +1099,35 @@ class Manager:
             volumes[local] = {"bind": local, "mode": "rw"}
         return volumes
 
+    def _resolved_hf_token(self, explicit: str | None = None) -> str:
+        """Resolve an HF credential without exposing it through public state."""
+        candidates = [
+            explicit,
+            self.settings.get("hf_token"),
+            os.environ.get("HF_TOKEN"),
+            os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        cache = self.settings.get("hf_cache")
+        if cache:
+            try:
+                token = (Path(cache).expanduser() / "token").read_text(encoding="utf-8").strip()
+                if token:
+                    return token
+            except OSError:
+                pass
+        return ""
+
+    def _container_hf_environment(self, explicit: str | None = None) -> dict[str, str]:
+        token = self._resolved_hf_token(explicit)
+        if not token:
+            return {}
+        # New huggingface_hub versions prefer HF_TOKEN; older Transformers
+        # integrations still inspect HUGGING_FACE_HUB_TOKEN.
+        return {"HF_TOKEN": token, "HUGGING_FACE_HUB_TOKEN": token}
+
     def _read_fan_config(self) -> dict:
         path = self._fan_config_path()
         try:
@@ -1275,14 +1311,25 @@ class Manager:
 
     def _save_settings(self):
         self.settings_path.write_text(json.dumps(self.settings, indent=2))
+        self.settings_path.chmod(0o600)
+
+    def public_settings(self) -> dict:
+        public = {k: v for k, v in self.settings.items() if k != "hf_token"}
+        public["hf_token"] = ""
+        public["hf_token_configured"] = bool(self._resolved_hf_token())
+        return public
 
     async def update_settings(self, data: dict) -> dict:
         async with self.lock:
             for k, v in data.items():
                 if k in DEFAULT_SETTINGS:
+                    # The UI sends an empty password field when an existing
+                    # token should remain unchanged.
+                    if k == "hf_token" and not str(v or "").strip():
+                        continue
                     self.settings[k] = v
             self._save_settings()
-        return self.settings
+        return self.public_settings()
 
     # ---------- lifetime token stats ----------
     # Counters are keyed by model id plus a variant tag (quant/dtype) so the
@@ -2683,6 +2730,7 @@ class Manager:
         sg_image: str | None = None,
         recipe_id: str | None = None,
         cluster_member: dict | None = None,
+        hf_token: str | None = None,
     ) -> dict:
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
@@ -2800,6 +2848,9 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                hf_environment = self._container_hf_environment(hf_token)
+                if hf_environment:
+                    run_options["environment"] = hf_environment
                 if distributed_member:
                     run_options["network_mode"] = "host"
                     run_options["ulimits"] = [
@@ -2807,10 +2858,10 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options["environment"] = {
+                        run_options.setdefault("environment", {}).update({
                             "NCCL_SOCKET_IFNAME": iface,
                             "GLOO_SOCKET_IFNAME": iface,
-                        }
+                        })
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
@@ -2939,6 +2990,9 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                hf_environment = self._container_hf_environment(hf_token)
+                if hf_environment:
+                    run_options["environment"] = hf_environment
                 if distributed_member:
                     run_options["network_mode"] = "host"
                     run_options["ulimits"] = [
@@ -2946,10 +3000,10 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options["environment"] = {
+                        run_options.setdefault("environment", {}).update({
                             "NCCL_SOCKET_IFNAME": iface,
                             "GLOO_SOCKET_IFNAME": iface,
-                        }
+                        })
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
@@ -5094,7 +5148,7 @@ class Manager:
             "containers": containers,
             "images": images,
             "stats": stats,
-            "settings": self.settings,
+            "settings": self.public_settings(),
             "nodes": nodes,
             "deployments": public_deployments,
             "recipes": list(self.recipes),

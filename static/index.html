@@ -823,6 +823,16 @@
       No containers running. Pick an image above and click <strong>Launch…</strong>.
     </div>
 
+    <datalist id="docker-kv-cache-types">
+      <option value="auto"></option>
+      <option value="bfloat16"></option>
+      <option value="fp8"></option>
+      <option value="fp8_e4m3"></option>
+      <option value="fp8_e5m2"></option>
+      <option value="nvfp4"></option>
+      <option value="nvfp4_ds_mla"></option>
+    </datalist>
+
   <div class="card-grid">
     <template x-for="c in (state?.containers || []).filter(c => !c.deployment_id)" :key="c.id">
       <div class="card container-card" :class="`status-${c.status} phase-${c.phase?.phase || c.status}`">
@@ -853,17 +863,64 @@
         <dl class="kv">
           <dt>Port</dt><dd x-text="c.port || '—'"></dd>
           <dt>Image</dt><dd class="mono ellipsis" x-text="c.image"></dd>
+          <dt>Engine</dt><dd x-text="c.engine || 'vllm'"></dd>
           <dt>Managed</dt><dd x-text="c.managed ? 'yes' : 'external'"></dd>
           <dt>VRAM</dt><dd x-text="c.vram_gb != null ? c.vram_gb + ' GB (est.)' : '—'"></dd>
         </dl>
+
+        <details class="unsloth-settings docker-settings" x-show="c.load_settings?.editable"
+                 :open="dockerSettingsOpen[c.name] === true"
+                 @toggle="onDockerSettingsToggle(c, $event.target.open)">
+          <summary>Load settings</summary>
+          <div class="grid unsloth-grid" x-show="dockerSettingsOpen[c.name]">
+            <label>
+              <span>Concurrent requests <span class="tip" tabindex="0" :data-tip="c.engine === 'sglang' ? 'SGLang --max-running-requests.' : 'vLLM --max-num-seqs: maximum requests processed concurrently.'"></span></span>
+              <input type="number" min="1" step="1"
+                     x-model.number="dockerSettingsFor(c).max_concurrency"
+                     placeholder="engine default">
+            </label>
+            <label>
+              <span>KV cache type <span class="tip" tabindex="0" data-tip="The engine's --kv-cache-dtype. Lower precision saves memory; supported values depend on the image and model."></span></span>
+              <input type="text" list="docker-kv-cache-types"
+                     x-model="dockerSettingsFor(c).kv_cache_dtype"
+                     placeholder="engine default">
+            </label>
+            <label>
+              <span>Context window <span class="tip" tabindex="0" :data-tip="c.engine === 'sglang' ? 'SGLang --context-length.' : 'vLLM --max-model-len.'"></span></span>
+              <input type="number" min="1" step="1024"
+                     x-model.number="dockerSettingsFor(c).context_window"
+                     placeholder="model default">
+            </label>
+            <label>
+              <span>GPU memory util <span class="tip" tabindex="0" :data-tip="c.engine === 'sglang' ? 'SGLang --mem-fraction-static.' : 'vLLM --gpu-memory-utilization.'"></span></span>
+              <input type="number" min="0.01" max="1" step="0.01"
+                     x-model.number="dockerSettingsFor(c).gpu_memory_utilization"
+                     placeholder="engine default">
+            </label>
+            <label class="docker-flags-field">
+              <span>Command flags <span class="tip" tabindex="0" data-tip="All server flags, including image-specific options. Host and port remain fixed so Docker networking and controller routing keep working."></span></span>
+              <textarea rows="7" class="mono" x-model="dockerSettingsFor(c).command_flags"
+                        placeholder="No additional flags"></textarea>
+            </label>
+          </div>
+          <div class="actions" x-show="dockerSettingsOpen[c.name]">
+            <button class="btn btn-ghost" @click="saveDockerSettings(c)"
+                    :disabled="dockerSettingsSaving[c.name]"
+                    x-text="dockerSettingsSaving[c.name] ? 'Saving…' : 'Save settings'"></button>
+            <span class="muted">Saving recreates this container; running models restart automatically.</span>
+          </div>
+        </details>
         <div class="card-actions">
           <button class="btn" @click="startContainer(c.name)" :disabled="c.status==='running'">Start</button>
           <button class="btn" @click="stopContainer(c.name)"
-                  :disabled="!['running','restarting'].includes(c.status) || containerStopping[c.name]">
+                  :disabled="!canStopContainer(c) || containerStopping[c.name]">
             <span x-show="!containerStopping[c.name]">Stop</span>
             <span x-show="containerStopping[c.name]">Stopping…</span>
           </button>
           <button class="btn btn-ghost" @click="openLogs(c.name)">Logs</button>
+          <button class="btn btn-ghost" x-show="c.load_settings?.editable" @click="toggleDockerSettings(c)"
+                  x-text="dockerSettingsOpen[c.name] ? 'Hide settings' : 'Settings'"></button>
+          <span class="muted" x-show="dockerSettingsSaved[c.name]">Saved.</span>
           <button class="btn" @click="copyToRecipe(c.name)" :disabled="!c.model" title="Save this container's config as a recipe you can re-launch">Copy to Recipes</button>
           <button class="btn btn-danger" @click="removeContainer(c.name)">Remove</button>
         </div>
@@ -1238,7 +1295,7 @@ for chunk in stream:
         <tr><td>GET</td>    <td><code>/api/state</code></td>             <td>Aggregate state: containers, ollama, settings, stats</td></tr>
         <tr><td>GET</td>    <td><code>/api/stats</code></td>             <td>Host telemetry (CPU/GPU/RAM/temps/power/network)</td></tr>
         <tr><td>GET/POST</td><td><code>/api/settings</code></td>         <td>Read/update controller settings</td></tr>
-        <tr><td>GET/POST/DELETE</td><td><code>/api/containers[/...]</code></td><td>List/create/start/stop/remove vLLM containers, fetch logs</td></tr>
+        <tr><td>GET/POST/PUT/DELETE</td><td><code>/api/containers[/...]</code></td><td>List/create/start/stop/remove vLLM containers, edit load settings, fetch logs</td></tr>
         <tr><td>POST</td>   <td><code>/api/images/pull</code></td>       <td>Pull a docker image (SSE progress stream)</td></tr>
         <tr><td colspan="3" style="opacity:0.7; padding-top:12px"><strong>Ollama management</strong></td></tr>
         <tr><td>GET</td>    <td><code>/api/ollama/models</code></td>     <td>List installed Ollama models + reachability</td></tr>

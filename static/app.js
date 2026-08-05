@@ -28,6 +28,10 @@ function app() {
     recipeSaved: false,
     recipeLaunching: {},
     containerStopping: {},
+    dockerSettingsOpen: {},
+    dockerSettingsSaved: {},
+    dockerSettingsSaving: {},
+    dockerSettingsForm: {},
     clusterForm: {
       name: '', agent_url: '', pairing_code: '', fabric_ip: '', fabric_interface: '',
     },
@@ -230,6 +234,14 @@ function app() {
           }
           if (this.unslothStopping[m.id] == null) {
             this.unslothStopping[m.id] = false;
+          }
+        }
+        // Keep closed Docker load-settings drawers aligned with the command
+        // Docker is actually storing. Open drawers retain the user's draft.
+        for (const c of (s.containers || [])) {
+          if (!c?.name || !c.load_settings) continue;
+          if (!this.dockerSettingsForm[c.name] || !this.dockerSettingsOpen[c.name]) {
+            this.dockerSettingsForm[c.name] = { ...c.load_settings };
           }
         }
         // Auto-switch the token card to the newly loaded model.
@@ -1543,14 +1555,28 @@ function app() {
     },
 
     async startContainer(name) {
-      await fetch(`/api/containers/${encodeURIComponent(name)}/start`, { method: 'POST' });
-      this.refresh();
+      try {
+        const r = await fetch(`/api/containers/${encodeURIComponent(name)}/start`, { method: 'POST' });
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        await this.refresh();
+      } catch (e) {
+        alert('Start failed: ' + e.message);
+      }
+    },
+    canStopContainer(c) {
+      // Health can report ready while Docker's cached status is briefly stale.
+      // The server-side stop operation is idempotent, so keep Stop available
+      // for any live/ready card unless an action is already in flight.
+      return ['running', 'restarting', 'paused'].includes(c?.status)
+        || c?.phase?.phase === 'ready';
     },
     async stopContainer(name) {
       if (this.containerStopping[name]) return;
       this.containerStopping[name] = true;
       const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), 30000);
+      // The server allows up to 30 seconds for Docker shutdown and cleanup;
+      // leave room for the HTTP response so a successful stop is not aborted.
+      const timer = setTimeout(() => ac.abort(), 45000);
       try {
         const r = await fetch(`/api/containers/${encodeURIComponent(name)}/stop`, {
           method: 'POST',
@@ -1578,6 +1604,52 @@ function app() {
         this.state.containers = (this.state.containers || []).filter(c => c.name !== name);
       }
       this.refresh();
+    },
+
+    dockerSettingsFor(c) {
+      if (!this.dockerSettingsForm[c.name]) {
+        this.dockerSettingsForm[c.name] = { ...(c.load_settings || {}) };
+      }
+      return this.dockerSettingsForm[c.name];
+    },
+
+    toggleDockerSettings(c) {
+      if (!this.dockerSettingsOpen[c.name]) {
+        this.dockerSettingsForm[c.name] = { ...(c.load_settings || {}) };
+      }
+      this.dockerSettingsOpen[c.name] = !this.dockerSettingsOpen[c.name];
+    },
+
+    onDockerSettingsToggle(c, open) {
+      if (open && !this.dockerSettingsOpen[c.name]) {
+        this.dockerSettingsForm[c.name] = { ...(c.load_settings || {}) };
+      }
+      this.dockerSettingsOpen[c.name] = open;
+    },
+
+    async saveDockerSettings(c) {
+      if (this.dockerSettingsSaving[c.name]) return;
+      const action = c.status === 'running' ? 'restart' : 'recreate';
+      if (!confirm(`Save load settings and ${action} "${c.name}"?`)) return;
+      this.dockerSettingsSaving[c.name] = true;
+      this.dockerSettingsSaved[c.name] = false;
+      try {
+        const r = await fetch(`/api/containers/${encodeURIComponent(c.name)}/settings`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ settings: this.dockerSettingsFor(c) }),
+        });
+        const reply = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(reply.detail || r.statusText);
+        this.dockerSettingsOpen[c.name] = false;
+        this.dockerSettingsSaved[c.name] = true;
+        setTimeout(() => { this.dockerSettingsSaved[c.name] = false; }, 2500);
+        await this.refresh();
+      } catch (e) {
+        alert('Save settings failed: ' + e.message);
+      } finally {
+        this.dockerSettingsSaving[c.name] = false;
+      }
     },
 
     async copyToRecipe(name) {

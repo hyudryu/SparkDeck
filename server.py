@@ -452,6 +452,17 @@ async def stop_container(name: str):
         raise HTTPException(500, str(e))
 
 
+@app.put("/api/containers/{name}/settings")
+async def update_container_settings(name: str, req: Request):
+    body = await req.json()
+    try:
+        return await manager.update_container_settings(name, body.get("settings") or {})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.delete("/api/containers/{name}")
 async def remove_container(name: str):
     try:

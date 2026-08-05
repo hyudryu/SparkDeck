@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -94,6 +95,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "--max-model-len=1048576",
             "--kv-cache-dtype", "fp8",
             "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+            "--default-chat-template-kwargs", '{"enable_thinking":true,"tools":true}',
             "--enable-prefix-caching",
         ]
 
@@ -103,18 +105,29 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["context_window"], 1048576)
         self.assertEqual(settings["kv_cache_dtype"], "fp8")
         self.assertEqual(settings["gpu_memory_utilization"], 0.85)
+        self.assertEqual(settings["thinking_mode"], "enabled")
         self.assertIn("--speculative-config", settings["command_flags"])
         updated = self.manager._updated_container_command(
             command,
             "vllm",
             model,
-            {**settings, "max_concurrency": 4, "kv_cache_dtype": "fp8_e4m3"},
+            {
+                **settings,
+                "max_concurrency": 4,
+                "kv_cache_dtype": "fp8_e4m3",
+                "thinking_mode": "disabled",
+            },
         )
         self.assertEqual(self.manager._cli_option(updated, {"--max-num-seqs"}), "4")
         self.assertEqual(
             self.manager._cli_option(updated, {"--kv-cache-dtype"}), "fp8_e4m3"
         )
         self.assertIn('{"method":"mtp","num_speculative_tokens":3}', updated)
+        template_kwargs = json.loads(
+            self.manager._cli_option(updated, {"--default-chat-template-kwargs"})
+        )
+        self.assertFalse(template_kwargs["enable_thinking"])
+        self.assertTrue(template_kwargs["tools"])
 
     def test_shell_wrapped_vllm_preserves_preamble_and_expressions(self):
         script = (
@@ -122,7 +135,9 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "exec /opt/env/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash "
             "--served-model-name deepseek-v4-flash --host 0.0.0.0 --port 8889 "
             "--max-num-seqs 12 --max-cudagraph-capture-size $(( 12 * (5 + 1) )) "
-            '--kv-cache-dtype nvfp4_ds_mla --speculative-config "${SPEC}"\n'
+            "--kv-cache-dtype nvfp4_ds_mla "
+            "--default-chat-template-kwargs '{\"thinking\":false}' "
+            '--speculative-config "${SPEC}"\n'
         )
         command = ["bash", "-lc", script]
 
@@ -133,17 +148,29 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             command,
             "vllm",
             "deepseek-v4-flash",
-            {**settings, "max_concurrency": 6, "context_window": 524288},
+            {
+                **settings,
+                "max_concurrency": 6,
+                "context_window": 524288,
+                "thinking_mode": "enabled",
+            },
         )
 
         self.assertEqual(settings["max_concurrency"], 12)
         self.assertEqual(settings["kv_cache_dtype"], "nvfp4_ds_mla")
+        self.assertEqual(settings["thinking_mode"], "disabled")
         self.assertIn("export CUDA_HOME=/opt/cuda", updated[-1])
         self.assertIn('$(( 12 * (5 + 1) ))', updated[-1])
         self.assertIn('"${SPEC}"', updated[-1])
         self.assertIn("--max-num-seqs 6", updated[-1])
         self.assertIn("--max-model-len 524288", updated[-1])
         self.assertIn("--port 8889", updated[-1])
+        self.assertEqual(
+            self.manager._container_load_settings(
+                updated, "vllm", "deepseek-v4-flash"
+            )["thinking_mode"],
+            "enabled",
+        )
 
     def test_sglang_settings_use_engine_specific_flags(self):
         model = "example/SGLang-Model"

@@ -189,14 +189,20 @@ async def agent_stop_container(name: str, req: Request):
 
 @app.delete("/api/agent/containers/{name}")
 async def agent_remove_container(name: str, req: Request):
-    await _require_managed_agent_container(name, req)
-    return await manager.remove_container(name)
+    _require_agent(req)
+    try:
+        return await manager.remove_cluster_member(name)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.get("/api/agent/containers/{name}/logs")
 async def agent_container_logs(name: str, req: Request):
-    await _require_managed_agent_container(name, req)
-    return {"logs": await manager.get_logs(name, 300)}
+    _require_agent(req)
+    try:
+        return {"logs": await manager.get_cluster_member_logs(name, 300)}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/nodes")

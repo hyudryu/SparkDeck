@@ -240,6 +240,14 @@ function app() {
         // Docker is actually storing. Open drawers retain the user's draft.
         for (const c of (s.containers || [])) {
           if (!c?.name || !c.load_settings) continue;
+          // Alpine's boolean-attribute binding is most reliable when dynamic
+          // object keys are initialized explicitly instead of left undefined.
+          if (this.containerStopping[c.name] == null) {
+            this.containerStopping[c.name] = false;
+          }
+          if (this.dockerSettingsSaving[c.name] == null) {
+            this.dockerSettingsSaving[c.name] = false;
+          }
           if (!this.dockerSettingsForm[c.name] || !this.dockerSettingsOpen[c.name]) {
             this.dockerSettingsForm[c.name] = { ...c.load_settings };
           }

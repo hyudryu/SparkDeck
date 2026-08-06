@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=51">
-<script src="/static/app.js?v=51"></script>
+<link rel="stylesheet" href="/static/styles.css?v=52">
+<script src="/static/app.js?v=52"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -913,7 +913,6 @@
           </div>
           <div class="actions" x-show="dockerSettingsOpen[c.name]">
             <button class="btn btn-ghost" @click="saveDockerSettings(c)"
-                    :disabled="dockerSettingsSaving[c.name]"
                     x-text="dockerSettingsSaving[c.name] ? 'Saving…' : 'Save settings'"></button>
             <span class="muted">Saving recreates this container; running models restart automatically.</span>
           </div>
@@ -921,7 +920,7 @@
         <div class="card-actions">
           <button class="btn" @click="startContainer(c.name)" :disabled="c.status==='running'">Start</button>
           <button class="btn" @click="stopContainer(c.name)"
-                  :disabled="!canStopContainer(c) || containerStopping[c.name]">
+                  :disabled="!canStopContainer(c)">
             <span x-show="!containerStopping[c.name]">Stop</span>
             <span x-show="containerStopping[c.name]">Stopping…</span>
           </button>

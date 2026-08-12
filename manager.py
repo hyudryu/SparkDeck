@@ -1402,6 +1402,31 @@ class Manager:
             lock = self._deployment_action_lock = asyncio.Lock()
         return lock
 
+    @staticmethod
+    def _member_action_errors(results: list[Any], action: str) -> list[str]:
+        """Return actionable member errors, keeping DELETE idempotent.
+
+        Older node agents return 404 after a cluster member has already been
+        removed. That is the desired end state for a remove action, so it must
+        not leave an undeletable deployment card behind.
+        """
+        errors = []
+        for result in results:
+            if not isinstance(result, Exception):
+                continue
+            message = str(result)
+            already_absent = action == "remove" and any(
+                marker in message.lower()
+                for marker in (
+                    "cluster member not found",
+                    "managed container not found",
+                    "no such container",
+                )
+            )
+            if not already_absent:
+                errors.append(message)
+        return errors
+
     async def deployment_action(self, deployment_id: str, action: str) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
@@ -1426,7 +1451,7 @@ class Manager:
                 ],
                 return_exceptions=True,
             )
-            remove_errors = [str(result) for result in removed if isinstance(result, Exception)]
+            remove_errors = self._member_action_errors(removed, "remove")
             if remove_errors:
                 deployment["status"] = "stopped"
                 deployment["error"] = "; ".join(remove_errors)
@@ -1462,7 +1487,7 @@ class Manager:
             *[self._member_action(m, action) for m in deployment.get("members", [])],
             return_exceptions=True,
         )
-        errors = [str(r) for r in results if isinstance(r, Exception)]
+        errors = self._member_action_errors(results, action)
         if action == "remove" and not errors:
             self.deployments = [d for d in self.deployments if d.get("id") != deployment_id]
         else:
@@ -1733,7 +1758,7 @@ class Manager:
         if name in launches:
             launches.pop(name, None)
             return {"ok": True}
-        raise ValueError("cluster member not found")
+        return {"ok": True, "already_absent": True}
 
     # ---------- memory bandwidth (Grace/GB10 SCF PMU) ----------
     # Grace exposes memory traffic on the Coresight SCF PMU

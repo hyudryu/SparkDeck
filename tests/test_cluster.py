@@ -124,6 +124,65 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
+    def test_gguf_variant_size_includes_every_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = (
+                root / "hub" / "models--example--Huge-GGUF" /
+                "snapshots" / "snapshot-1" / "Q8_0"
+            )
+            snapshot.mkdir(parents=True)
+            for shard, size in ((1, 11), (2, 13), (3, 17)):
+                path = snapshot / f"Huge-Q8_0-{shard:05d}-of-00003.gguf"
+                path.write_bytes(b"x" * size)
+
+            instance = Manager.__new__(Manager)
+            instance.settings = {"hf_cache": str(root)}
+            models = instance._scan_gguf_models()
+
+            variant = models[0]["variants"][0]
+            self.assertEqual(variant["size_bytes"], 41)
+            self.assertEqual(len(variant["files"]), 3)
+            self.assertIn("-00001-of-00003.gguf", variant["path"])
+
+    def test_rpc_progress_uses_fabric_transfer_counter(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._llama_pid = 123
+        instance._rpc_tx_counter = lambda endpoints: (1050, ["cx7-test"])
+        info = {
+            "size_bytes": 200,
+            "tensor_parallel_size": 2,
+            "rpc_endpoints": ["169.254.1.2:50052"],
+            "rpc_tx_start": 1000,
+        }
+
+        percent, detail = instance._llama_transfer_progress(info)
+
+        self.assertEqual(percent, 48)
+        self.assertIn("RPC transfer over cx7-test", detail)
+        self.assertIn("50.0 B / ~100.0 B", detail)
+
+    def test_llama_logs_are_read_incrementally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._llama_log_dir = Path(directory)
+            instance._llama_current_log = instance._llama_log_dir / "llama-server-1.log"
+            instance._llama_current_log.write_text("first\nsecond\n")
+            instance._llama_launching = None
+            instance._llama_model = "example/model"
+            instance._llama_pid = None
+            instance._llama_adopt_tried = True
+
+            first = instance.get_llama_server_logs(since=0, limit_bytes=4096)
+            second = instance.get_llama_server_logs(
+                since=first["next_offset"], limit_bytes=4096
+            )
+
+            self.assertEqual(first["text"], "first\nsecond\n")
+            self.assertTrue(first["complete"])
+            self.assertEqual(second["text"], "")
+            self.assertEqual(second["log_id"], "llama-server-1.log")
+
     def test_tp2_arguments_use_rpc_tensor_split(self) -> None:
         argv = Manager._llama_tensor_parallel_args(
             ["llama-server", "-m", "model.gguf"],

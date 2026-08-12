@@ -293,6 +293,8 @@ class Manager:
         self._llama_lock = asyncio.Lock()
         self._llama_state_path = self.data_dir / "llama_server.json"
         self._llama_log_dir = self.data_dir / "logs"
+        self._llama_current_log: Path | None = None
+        self._llama_current_log_model: str | None = None
         # llama.cpp tensor parallelism uses its RPC backend: rank 0 runs the
         # public llama-server locally and each additional Spark exposes one
         # CUDA device through an authenticated agent-managed RPC worker.
@@ -4611,19 +4613,28 @@ class Manager:
                 if f.name.lower().startswith("mmproj"):
                     mmproj = mmproj or str(f)
                     continue
-                if re.search(r"-\d{5}-of-\d{5}$", f.stem) and "-00001-of-" not in f.stem:
-                    continue  # count size, but only first shard becomes the entry
                 quant = self._quant_from_filename(parts[1], f)
                 if not quant:
                     continue
                 q = quants.setdefault(quant, {
                     "quant": quant, "filename": f.name,
-                    "path": str(f), "size_bytes": 0,
+                    "path": None, "size_bytes": 0, "files": [],
                 })
                 q["size_bytes"] += st.st_size
+                q["files"].append(str(f))
+                is_later_shard = (
+                    re.search(r"-\d{5}-of-\d{5}$", f.stem) is not None
+                    and "-00001-of-" not in f.stem
+                )
+                if not is_later_shard:
+                    q["filename"] = f.name
+                    q["path"] = str(f)
             if not quants:
                 continue
-            variants = sorted(quants.values(), key=lambda v: -v["size_bytes"])
+            variants = sorted(
+                (q for q in quants.values() if q.get("path")),
+                key=lambda v: -v["size_bytes"],
+            )
             models.append({
                 "id": repo_id,
                 "name": parts[1],
@@ -4890,6 +4901,10 @@ class Manager:
                     self._llama_port = int(st.get("port") or 0)
                     self._llama_rpc_nodes = list(st.get("rpc_node_ids") or [])
                     self._llama_rpc_endpoints = list(st.get("rpc_endpoints") or [])
+                    log_path = str(st.get("log_path") or "")
+                    if log_path:
+                        self._llama_current_log = Path(log_path)
+                        self._llama_current_log_model = st.get("model")
                     self._llama_ready = True  # adopted servers were ready
                     return
         except Exception:
@@ -4914,6 +4929,7 @@ class Manager:
             self._llama_state_path.write_text(json.dumps({
                 "pid": pid, "model": model, "port": port,
                 "gguf_path": gguf_path, "started_at": time.time(),
+                "log_path": str(self._llama_current_log or ""),
                 "rpc_node_ids": self._llama_rpc_nodes,
                 "rpc_endpoints": self._llama_rpc_endpoints,
             }, indent=2))
@@ -4941,17 +4957,111 @@ class Manager:
         ("CUDA error", "CUDA error"),
     ]
 
+    @staticmethod
+    def _proc_read_bytes(pid: int | None) -> int | None:
+        if not pid:
+            return None
+        try:
+            for line in Path(f"/proc/{pid}/io").read_text().splitlines():
+                if line.startswith("read_bytes:"):
+                    return int(line.split(":", 1)[1].strip())
+        except (OSError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _rpc_tx_counter(endpoints: list[str]) -> tuple[int | None, list[str]]:
+        """Return bytes sent on the interfaces routing to RPC workers."""
+        interfaces: set[str] = set()
+        for endpoint in endpoints:
+            host = endpoint.rsplit(":", 1)[0].strip("[]")
+            try:
+                result = subprocess.run(
+                    ["ip", "route", "get", host], capture_output=True,
+                    text=True, timeout=2, check=False,
+                )
+                match = re.search(r"\bdev\s+(\S+)", result.stdout)
+                if match:
+                    interfaces.add(match.group(1))
+            except (OSError, subprocess.SubprocessError):
+                continue
+        if not interfaces:
+            return None, []
+        total = 0
+        try:
+            for interface in interfaces:
+                total += int(Path(
+                    f"/sys/class/net/{interface}/statistics/tx_bytes"
+                ).read_text().strip())
+        except (OSError, ValueError):
+            return None, sorted(interfaces)
+        return total, sorted(interfaces)
+
+    @staticmethod
+    def _format_progress_bytes(value: float) -> str:
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if value < 1024 or unit == "TiB":
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} TiB"
+
+    def _llama_transfer_progress(self, info: dict) -> tuple[int | None, str]:
+        total = int(info.get("size_bytes") or 0)
+        if total <= 0:
+            return None, ""
+
+        endpoints = list(info.get("rpc_endpoints") or [])
+        if endpoints and info.get("rpc_tx_start") is not None:
+            current, interfaces = self._rpc_tx_counter(endpoints)
+            start = int(info["rpc_tx_start"])
+            transferred = max(0, (current or start) - start)
+            tp_size = max(1, int(info.get("tensor_parallel_size") or 1))
+            expected = total * max(1, tp_size - 1) / tp_size
+            source = f"RPC transfer over {', '.join(interfaces or info.get('rpc_interfaces') or [])}"
+        else:
+            current = self._proc_read_bytes(self._llama_pid)
+            start = int(info.get("read_bytes_start") or 0)
+            if current is None:
+                return None, ""
+            transferred = max(0, current - start)
+            expected = total
+            source = "Model data read"
+
+        fraction = min(1.0, transferred / expected) if expected else 0.0
+        # Weight transfer is most of startup. Reserve the final 5% for model
+        # initialization, context/KV allocation, and the health transition.
+        percent = min(95, round(fraction * 95))
+        now = time.monotonic()
+        previous_bytes = info.get("progress_sample_bytes")
+        previous_time = info.get("progress_sample_time")
+        rate = None
+        if previous_bytes is not None and previous_time is not None and now > previous_time:
+            rate = max(0.0, transferred - previous_bytes) / (now - previous_time)
+        info["progress_sample_bytes"] = transferred
+        info["progress_sample_time"] = now
+
+        detail = (
+            f"{source}: {self._format_progress_bytes(transferred)} / "
+            f"~{self._format_progress_bytes(expected)}"
+        )
+        if rate and rate > 0:
+            detail += f" · {self._format_progress_bytes(rate)}/s"
+        if fraction >= 1.0:
+            detail += " · initializing"
+        return percent, detail
+
     def _llama_launch_status(self) -> dict | None:
         """Launch-in-flight status for /api/state: model, variant, start time,
-        current phase, last log line, and load percent. llama-server doesn't
-        log a percentage, so progress is measured as resident bytes of the
-        process's .gguf mappings (smaps) vs. total variant size — the pages
-        are touched as weights are read/copied to the GPU."""
+        current phase, last log line, and load percent. Standalone
+        llama-server does not expose its internal callback, so progress uses
+        native log percentages when present and observable file/RPC transfer
+        counters otherwise."""
         info = self._llama_launching
         if not info:
             return None
         phase = "Starting"
         log_line = ""
+        tail = ""
         try:
             tail = Path(info["log"]).read_bytes()[-4096:].decode(errors="replace")
             for marker, label in self._LLAMA_PHASES:
@@ -4963,22 +5073,22 @@ class Manager:
         except Exception:
             pass
         percent = None
-        try:
-            resident = 0
-            cur_file = False
-            header_re = re.compile(r"^[0-9a-f]+-[0-9a-f]+ ")
-            with open(f"/proc/{self._llama_pid}/smaps", "r", errors="replace") as f:
-                for line in f:
-                    if header_re.match(line):
-                        # mapping header line: ends with the mapped path (if any)
-                        cur_file = ".gguf" in line
-                    elif cur_file and line.startswith("Rss:"):
-                        resident += int(line.split()[1]) * 1024
-            total = int(info.get("size_bytes") or 0)
-            if total > 0 and resident > 0:
-                percent = max(1, min(99, round(100 * resident / total)))
-        except Exception:
-            pass
+        progress_detail = ""
+        # Prefer a native percentage if a llama.cpp build emits one. Current
+        # standalone server builds keep their progress callback internal, so
+        # fall back to observable file/RPC transfer counters.
+        native = re.findall(
+            r"(?:load(?:ing)?(?: model)?|progress)[^%\r\n]{0,80}"
+            r"\b(\d{1,3}(?:\.\d+)?)\s*%",
+            tail, flags=re.I,
+        )
+        if native:
+            percent = min(99, max(0, round(float(native[-1]))))
+            progress_detail = "llama.cpp reported load progress"
+        else:
+            percent, progress_detail = self._llama_transfer_progress(info)
+        if percent is not None and percent >= 95 and phase == "Loading model weights":
+            phase = "Initializing model"
         return {
             "model": info["model"],
             "variant": info["variant"],
@@ -4986,8 +5096,55 @@ class Manager:
             "phase": phase,
             "log_line": log_line,
             "percent": percent,
+            "progress_detail": progress_detail,
+            "log_available": bool(info.get("log")),
             "tensor_parallel_size": info.get("tensor_parallel_size", 1),
             "rpc_endpoints": list(info.get("rpc_endpoints") or []),
+        }
+
+    def get_llama_server_logs(self, since: int = 0, limit_bytes: int = 262144) -> dict:
+        """Read the active/most-recent managed llama-server log incrementally."""
+        log_value = (self._llama_launching or {}).get("log")
+        path = Path(log_value) if log_value else self._llama_current_log
+        if path is None:
+            candidates = sorted(
+                self._llama_log_dir.glob("llama-server-*.log"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            ) if self._llama_log_dir.is_dir() else []
+            path = candidates[0] if candidates else None
+        if path is None or not path.is_file():
+            return {
+                "log_id": None, "text": "", "offset": 0,
+                "next_offset": 0, "size_bytes": 0, "complete": True,
+            }
+        try:
+            if path.resolve().parent != self._llama_log_dir.resolve():
+                raise ValueError("invalid llama-server log path")
+        except OSError as exc:
+            raise ValueError("invalid llama-server log path") from exc
+
+        size = path.stat().st_size
+        offset = max(0, int(since or 0))
+        if offset > size:
+            offset = 0
+        limit = max(4096, min(1024 * 1024, int(limit_bytes or 262144)))
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            content = handle.read(limit)
+        next_offset = offset + len(content)
+        return {
+            "log_id": path.name,
+            "text": content.decode(errors="replace"),
+            "offset": offset,
+            "next_offset": next_offset,
+            "size_bytes": size,
+            "complete": next_offset >= size,
+            "running": self._llama_running(),
+            "model": (
+                getattr(self, "_llama_current_log_model", None)
+                or self._llama_model
+            ),
         }
 
     async def _stop_running_cluster_deployments(self) -> None:
@@ -5179,6 +5336,9 @@ class Manager:
 
             self._llama_log_dir.mkdir(parents=True, exist_ok=True)
             log_path = self._llama_log_dir / f"llama-server-{int(time.time())}.log"
+            self._llama_current_log = log_path
+            self._llama_current_log_model = model_path
+            rpc_tx_start, rpc_interfaces = self._rpc_tx_counter(rpc_endpoints)
             log_file = open(log_path, "wb")
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -5198,8 +5358,12 @@ class Manager:
                 "model": model_path, "variant": variant["quant"],
                 "started_at": time.time(), "log": str(log_path),
                 "size_bytes": variant.get("size_bytes") or 0,
+                "model_files": list(variant.get("files") or [variant["path"]]),
+                "read_bytes_start": self._proc_read_bytes(proc.pid) or 0,
                 "tensor_parallel_size": tp_size,
                 "rpc_endpoints": rpc_endpoints,
+                "rpc_tx_start": rpc_tx_start,
+                "rpc_interfaces": rpc_interfaces,
             }
             self._llama_write_state(proc.pid, model_path, port, variant["path"])
             print(f"[llama] launched pid={proc.pid} port={port} model={model_path} "

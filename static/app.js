@@ -37,6 +37,22 @@ function app() {
     },
     clusterPairing: false,
     clusterBusy: {},
+    deploymentSettingsOpen: {},
+    deploymentSettingsSaved: {},
+    deploymentSettingsSaving: {},
+    deploymentSettingsForm: {},
+    deploymentSettingsBaseline: {},
+    deploymentIdCopied: {},
+    KV_CACHE_DTYPE_OPTIONS: [
+      'auto', 'bfloat16', 'float16', 'fp8', 'fp8_ds_mla', 'fp8_e4m3',
+      'fp8_e5m2', 'fp8_inc', 'fp8_per_token_head', 'int4_per_token_head',
+      'int8_per_token_head', 'nvfp4', 'nvfp4_ds_mla', 'turboquant_3bit_nc',
+      'turboquant_4bit_nc', 'turboquant_k3v4_nc', 'turboquant_k8v4',
+    ],
+    aliasEditorOpen: {},
+    aliasEditorValue: {},
+    aliasEditorSaving: {},
+    aliasEditorSaved: {},
 
     chat: {
       model: '',
@@ -71,6 +87,8 @@ function app() {
     sparkForm: {
       reference: '',
     },
+    sparkSaving: false,
+    sparkSaveError: '',
     sparkSaved: false,
     sparkYamlError: '',
     sparkRun: {
@@ -78,7 +96,7 @@ function app() {
       status: '', busy: false, runId: null, abort: null,
     },
     sparkRunHistory: {
-      open: false, runId: null, recipeName: '', lines: [], status: '',
+      open: false, runId: null, recipeName: '', lines: [], status: '', autoScroll: true,
     },
     sparkLaunchRun: {
       open: false, id: null, name: '', reference: '', optionsText: '',
@@ -113,6 +131,12 @@ function app() {
 
     // Usage tab sub-navigation.
     usageSubTab: 'cost',           // 'cost' | 'analysis'
+    usageSortKey: 'input',         // model | input | cached | output | requests | speed | time | cost
+    usageSortDirection: 'desc',
+    usageAliasEditing: {},
+    usageAliasValue: {},
+    usageAliasSaving: {},
+    usageAliasSaved: {},
     analysisDateStart: '',         // YYYY-MM-DD or '' for default range
     analysisDateEnd: '',           // YYYY-MM-DD or '' for default range
     analysisChartMode: 'hour',     // 'hour' | 'day'
@@ -120,9 +144,15 @@ function app() {
     analysisDaily: [],             // fetched daily data
     analysisLoading: false,
 
-    logsModal: { open: false, name: '', text: '', deploymentId: null, members: [] },
+    logsModal: {
+      open: false, name: '', text: '', deploymentId: null, members: [], autoScroll: true,
+    },
+    _logsTailInterval: null,
+    _logsRefreshInFlight: false,
+    _sparkHistoryTailInterval: null,
+    _sparkHistoryRefreshInFlight: false,
 
-    serverLogs: { lines: [], autoScroll: true, _interval: null },
+    serverLogs: { lines: [], autoScroll: true, _interval: null, _loading: false },
 
     disk: null,
     diskLoading: false,
@@ -187,6 +217,14 @@ function app() {
           this._stopLogPolling();
         }
       });
+      this.$watch('logsModal.open', (open) => {
+        if (open) this._startLogsTail();
+        else this._stopLogsTail();
+      });
+      this.$watch('sparkRunHistory.open', (open) => {
+        if (open) this._startSparkHistoryTail();
+        else this._stopSparkHistoryTail();
+      });
       // Load analysis data when switching to the Analysis sub-tab
       this.$watch('usageSubTab', (v) => {
         if (v === 'analysis') this.loadAnalysisData();
@@ -250,6 +288,21 @@ function app() {
           }
           if (!this.dockerSettingsForm[c.name] || !this.dockerSettingsOpen[c.name]) {
             this.dockerSettingsForm[c.name] = { ...c.load_settings };
+          }
+        }
+        // Closed cluster editors track the saved backend values. Open
+        // editors retain their local draft while state polling continues.
+        for (const deployment of (s.deployments || [])) {
+          if (!deployment?.id) continue;
+          if (this.deploymentSettingsSaving[deployment.id] == null) {
+            this.deploymentSettingsSaving[deployment.id] = false;
+          }
+          if (!this.deploymentSettingsForm[deployment.id] || !this.deploymentSettingsOpen[deployment.id]) {
+            const draft = this.deploymentSettingsDraft(deployment);
+            this.deploymentSettingsForm[deployment.id] = draft;
+            this.deploymentSettingsBaseline[deployment.id] = this.deploymentSettingsSnapshot(
+              deployment, draft
+            );
           }
         }
         // Auto-switch the token card to the newly loaded model.
@@ -592,6 +645,7 @@ function app() {
       const v = Number(n);
       if (v < 1000) return String(v);
       if (v < 1_000_000) return `${(v / 1000).toFixed(v < 10_000 ? 1 : 0)}k`;
+      if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(v < 10_000_000_000 ? 1 : 0)}B`;
       return `${(v / 1_000_000).toFixed(v < 10_000_000 ? 1 : 0)}M`;
     },
     // Format a cost value as USD (e.g. "$1.23" or "$0.00").
@@ -898,6 +952,104 @@ function app() {
     },
 
     // ─── aggregate usage ────────────────────────────────────
+    usageAlias(model) {
+      return this.state?.usage_aliases?.[model] || '';
+    },
+    usageAverageSpeed(stats) {
+      const tokens = Number(stats?.gen_tokens || 0);
+      const seconds = Number(stats?.gen_time_s || 0);
+      if (!tokens || !seconds) return null;
+      const value = tokens / seconds;
+      return Number.isFinite(value) ? value : null;
+    },
+    usageCostValue(model) {
+      const value = Number(this.state?.token_costs?.[model]?.total_cost);
+      return Number.isFinite(value) ? value : 0;
+    },
+    usageCostDisplay(model) {
+      const value = this.usageCostValue(model);
+      return value > 0 ? this.fmtCost(value) : '—';
+    },
+    usageSortValue(row, key) {
+      const stats = row.stats || {};
+      if (key === 'model') return (row.alias || row.model).toLocaleLowerCase();
+      if (key === 'speed') return this.usageAverageSpeed(stats);
+      if (key === 'time') return Number(stats.gen_time_s || 0);
+      if (key === 'cost') return this.usageCostValue(row.model);
+      return Number(stats[key] || 0);
+    },
+    usageRows() {
+      const rows = Object.entries(this.state?.token_stats || {}).map(([model, stats]) => ({
+        model,
+        stats,
+        alias: this.usageAlias(model),
+      }));
+      const key = this.usageSortKey;
+      const direction = this.usageSortDirection === 'asc' ? 1 : -1;
+      return rows.sort((left, right) => {
+        const a = this.usageSortValue(left, key);
+        const b = this.usageSortValue(right, key);
+        const aMissing = a == null || (typeof a === 'number' && !Number.isFinite(a));
+        const bMissing = b == null || (typeof b === 'number' && !Number.isFinite(b));
+        if (aMissing !== bMissing) return aMissing ? 1 : -1;
+        let comparison = 0;
+        if (typeof a === 'string' || typeof b === 'string') {
+          comparison = String(a).localeCompare(String(b), undefined, {numeric: true, sensitivity: 'base'});
+        } else {
+          comparison = Number(a) - Number(b);
+        }
+        if (comparison === 0) comparison = left.model.localeCompare(right.model);
+        return comparison * direction;
+      });
+    },
+    setUsageSort(key) {
+      if (this.usageSortKey === key) {
+        this.usageSortDirection = this.usageSortDirection === 'asc' ? 'desc' : 'asc';
+      } else {
+        this.usageSortKey = key;
+        this.usageSortDirection = key === 'model' ? 'asc' : 'desc';
+      }
+    },
+    usageSortIndicator(key) {
+      if (this.usageSortKey !== key) return '↕';
+      return this.usageSortDirection === 'asc' ? '↑' : '↓';
+    },
+    usageSortAria(key) {
+      if (this.usageSortKey !== key) return 'none';
+      return this.usageSortDirection === 'asc' ? 'ascending' : 'descending';
+    },
+    startUsageAliasEdit(model) {
+      this.usageAliasValue[model] = this.usageAlias(model);
+      this.usageAliasEditing[model] = true;
+    },
+    cancelUsageAliasEdit(model) {
+      this.usageAliasEditing[model] = false;
+    },
+    async saveUsageAlias(model) {
+      if (this.usageAliasSaving[model]) return;
+      this.usageAliasSaving[model] = true;
+      this.usageAliasSaved[model] = false;
+      try {
+        const response = await fetch('/api/token-stats/alias', {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({
+            model,
+            alias: this.usageAliasValue[model]?.trim() || null,
+          }),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.usageAliasEditing[model] = false;
+        this.usageAliasSaved[model] = true;
+        setTimeout(() => { this.usageAliasSaved[model] = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Rename failed: ' + error.message);
+      } finally {
+        this.usageAliasSaving[model] = false;
+      }
+    },
     totalInputTokens() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.input || 0), 0);
     },
@@ -1182,6 +1334,14 @@ function app() {
       return out;
     },
 
+    shellJoin(args) {
+      return (args || []).map(value => {
+        const text = String(value);
+        if (/^[a-zA-Z0-9_@%+=:,./-]+$/.test(text)) return text;
+        return "'" + text.replaceAll("'", "'\\''") + "'";
+      }).join(' ');
+    },
+
     parsePasteCmd() {
       const txt = (this.form.pasteCmd || '').trim();
       if (!txt) return;
@@ -1327,6 +1487,40 @@ function app() {
       });
     },
 
+    deploymentIsLaunching(deployment) {
+      return ['launching', 'starting'].includes(deployment?.status);
+    },
+
+    deploymentProgress(deployment) {
+      const members = deployment?.members || [];
+      if (!members.length) return null;
+      let hasKnownProgress = false;
+      let total = 0;
+      for (const member of members) {
+        const phase = member?.phase || {};
+        if (phase.phase === 'ready') {
+          total += 1;
+          hasKnownProgress = true;
+        } else if (phase.progress != null && Number.isFinite(Number(phase.progress))) {
+          total += Math.max(0, Math.min(1, Number(phase.progress)));
+          hasKnownProgress = true;
+        }
+      }
+      return hasKnownProgress ? total / members.length : null;
+    },
+
+    deploymentProgressMessage(deployment) {
+      const members = deployment?.members || [];
+      if (!members.length) return 'Preparing cluster launch…';
+      const ready = members.filter(member => member?.phase?.phase === 'ready').length;
+      const active = members.find(member => member?.phase?.phase !== 'ready') || members[0];
+      const detail = active?.phase?.message || active?.status || 'Starting…';
+      const rank = active?.rank != null ? `rank ${active.rank}` : (active?.node_name || 'member');
+      return ready > 0
+        ? `${ready}/${members.length} ranks ready · ${rank}: ${detail}`
+        : `${rank}: ${detail}`;
+    },
+
     async pairClusterNode() {
       if (!this.clusterForm.agent_url || !this.clusterForm.pairing_code) return;
       this.clusterPairing = true;
@@ -1386,6 +1580,213 @@ function app() {
       }
     },
 
+    async copyDeploymentId(deployment) {
+      try {
+        await navigator.clipboard.writeText(deployment.id);
+        this.deploymentIdCopied[deployment.id] = true;
+        setTimeout(() => { this.deploymentIdCopied[deployment.id] = false; }, 2000);
+      } catch (error) {
+        alert('Copy failed: ' + error.message);
+      }
+    },
+
+    aliasEditorKey(kind, item) {
+      return `${kind}:${kind === 'deployment' ? item.id : item.name}`;
+    },
+
+    toggleAliasEditor(kind, item) {
+      const key = this.aliasEditorKey(kind, item);
+      if (!this.aliasEditorOpen[key]) {
+        this.aliasEditorValue[key] = kind === 'deployment' ? (item.name || '') : (item.alias || '');
+      }
+      this.aliasEditorOpen[key] = !this.aliasEditorOpen[key];
+    },
+
+    async saveAlias(kind, item) {
+      const key = this.aliasEditorKey(kind, item);
+      if (this.aliasEditorSaving[key]) return;
+      const identifier = kind === 'deployment' ? item.id : item.name;
+      const path = kind === 'deployment'
+        ? `/api/deployments/${encodeURIComponent(identifier)}/alias`
+        : `/api/containers/${encodeURIComponent(identifier)}/alias`;
+      this.aliasEditorSaving[key] = true;
+      this.aliasEditorSaved[key] = false;
+      try {
+        const response = await fetch(path, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({alias: this.aliasEditorValue[key]?.trim() || null}),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.aliasEditorOpen[key] = false;
+        this.aliasEditorSaved[key] = true;
+        setTimeout(() => { this.aliasEditorSaved[key] = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Rename failed: ' + error.message);
+      } finally {
+        this.aliasEditorSaving[key] = false;
+      }
+    },
+
+    deploymentSettingsDraft(deployment) {
+      const settings = deployment?.launch_settings || {};
+      const controls = deployment?.launch_controls || {};
+      const gpuGb = settings.gpu_memory_gb;
+      return {
+        deployment_name: settings.deployment_name || deployment?.name || '',
+        model: settings.model || deployment?.model || '',
+        engine: settings.engine || deployment?.engine || 'vllm',
+        image: settings.image || '',
+        extra: this.shellJoin(settings.extra_args || []),
+        gpu_mem_mode: gpuGb != null ? 'gb' : 'fraction',
+        gpu_memory_utilization: settings.gpu_memory_utilization ?? 0.9,
+        gpu_memory_gb: gpuGb ?? null,
+        context_window: controls.context_window ?? null,
+        max_concurrency: controls.max_concurrency ?? null,
+        kv_cache_dtype: controls.kv_cache_dtype || '',
+        thinking_mode: controls.thinking_mode || 'default',
+        dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens ?? null,
+        max_cudagraph_capture_size: controls.max_cudagraph_capture_size ?? null,
+        max_num_batched_tokens: controls.max_num_batched_tokens ?? null,
+        sg_tp_size: settings.sg_tp_size ?? 1,
+        sg_context_length: settings.sg_context_length ?? 32768,
+        sg_max_running_requests: settings.sg_max_running_requests ?? null,
+        sg_mem_fraction: settings.sg_mem_fraction ?? 0.92,
+        sg_image: settings.sg_image || '',
+        deployment_mode: settings.deployment_mode || deployment?.mode || 'single',
+        node_ids: [...(settings.node_ids || deployment?.node_ids || ['local'])],
+        port: settings.port ?? deployment?.api_port ?? null,
+      };
+    },
+
+    deploymentSettingsFor(deployment) {
+      if (!this.deploymentSettingsForm[deployment.id]) {
+        this.deploymentSettingsForm[deployment.id] = this.deploymentSettingsDraft(deployment);
+      }
+      return this.deploymentSettingsForm[deployment.id];
+    },
+
+    toggleDeploymentSettings(deployment) {
+      if (!this.deploymentSettingsOpen[deployment.id]) {
+        const draft = this.deploymentSettingsDraft(deployment);
+        this.deploymentSettingsForm[deployment.id] = draft;
+        this.deploymentSettingsBaseline[deployment.id] = this.deploymentSettingsSnapshot(
+          deployment, draft
+        );
+      }
+      this.deploymentSettingsOpen[deployment.id] = !this.deploymentSettingsOpen[deployment.id];
+    },
+
+    deploymentSettingsNodeSelected(deployment, nodeId) {
+      return this.deploymentSettingsFor(deployment).node_ids.includes(nodeId);
+    },
+
+    toggleDeploymentSettingsNode(deployment, node) {
+      if (!node.online || deployment.status !== 'stopped') return;
+      const form = this.deploymentSettingsFor(deployment);
+      if (form.deployment_mode === 'sharded' && node.id === 'local' && form.node_ids.includes('local')) return;
+      if (form.node_ids.includes(node.id)) {
+        form.node_ids = form.node_ids.filter(id => id !== node.id);
+      } else if (form.deployment_mode === 'single') {
+        form.node_ids = [node.id];
+      } else {
+        form.node_ids = [...form.node_ids, node.id];
+      }
+      if (form.deployment_mode === 'sharded' && form.node_ids.includes('local')) {
+        form.node_ids = ['local', ...form.node_ids.filter(id => id !== 'local')];
+      }
+    },
+
+    deploymentSettingsModeChanged(deployment) {
+      const form = this.deploymentSettingsFor(deployment);
+      if (form.deployment_mode === 'single') {
+        form.node_ids = form.node_ids.slice(0, 1);
+      } else if (form.deployment_mode === 'sharded' && form.node_ids.includes('local')) {
+        form.node_ids = ['local', ...form.node_ids.filter(id => id !== 'local')];
+      }
+    },
+
+    deploymentSettingsValid(deployment) {
+      const form = this.deploymentSettingsFor(deployment);
+      if (!form.model || !form.node_ids.length) return false;
+      return form.deployment_mode === 'single' || form.node_ids.length >= 2;
+    },
+
+    deploymentSettingsPayload(deployment, suppliedForm = null) {
+      const form = suppliedForm || this.deploymentSettingsFor(deployment);
+      return {
+        deployment_name: form.deployment_name?.trim() || form.model.trim(),
+        model: form.model.trim(),
+        engine: form.engine,
+        image: form.engine === 'vllm' ? (form.image?.trim() || null) : null,
+        extra_args: this.shellSplit(form.extra),
+        deployment_mode: form.deployment_mode,
+        node_ids: [...form.node_ids],
+        port: form.port || null,
+        gpu_memory_utilization: form.engine === 'vllm' && form.gpu_mem_mode === 'fraction'
+          ? (form.gpu_memory_utilization || null) : null,
+        gpu_memory_gb: form.engine === 'vllm' && form.gpu_mem_mode === 'gb'
+          ? (form.gpu_memory_gb || null) : null,
+        sg_tp_size: form.engine === 'sglang' ? (form.sg_tp_size || 1) : null,
+        sg_context_length: form.engine === 'sglang' ? (form.context_window || 32768) : null,
+        sg_max_running_requests: form.engine === 'sglang' ? (form.max_concurrency || null) : null,
+        sg_mem_fraction: form.engine === 'sglang' ? (form.sg_mem_fraction || 0.92) : null,
+        sg_image: form.engine === 'sglang' ? (form.sg_image?.trim() || null) : null,
+        launch_controls: {
+          context_window: form.context_window || null,
+          max_concurrency: form.max_concurrency || null,
+          kv_cache_dtype: form.kv_cache_dtype || null,
+          thinking_mode: form.thinking_mode || 'default',
+          dspark_num_speculative_tokens: form.engine === 'vllm'
+            ? (form.dspark_num_speculative_tokens || null) : null,
+          max_cudagraph_capture_size: form.engine === 'vllm'
+            ? (form.max_cudagraph_capture_size || null) : null,
+          max_num_batched_tokens: form.engine === 'vllm'
+            ? (form.max_num_batched_tokens || null) : null,
+        },
+      };
+    },
+
+    deploymentSettingsSnapshot(deployment, suppliedForm = null) {
+      return JSON.stringify(this.deploymentSettingsPayload(deployment, suppliedForm));
+    },
+
+    deploymentSettingsChanged(deployment) {
+      const baseline = this.deploymentSettingsBaseline[deployment.id];
+      if (baseline == null) return false;
+      return this.deploymentSettingsSnapshot(deployment) !== baseline;
+    },
+
+    async saveDeploymentSettings(deployment) {
+      if (deployment.status !== 'stopped' || this.deploymentSettingsSaving[deployment.id]
+          || !this.deploymentSettingsChanged(deployment)) return;
+      const form = this.deploymentSettingsFor(deployment);
+      const body = this.deploymentSettingsPayload(deployment, form);
+      this.deploymentSettingsSaving[deployment.id] = true;
+      this.deploymentSettingsSaved[deployment.id] = false;
+      try {
+        const response = await fetch(`/api/deployments/${deployment.id}/settings`, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify(body),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.deploymentSettingsBaseline[deployment.id] = this.deploymentSettingsSnapshot(
+          deployment, form
+        );
+        this.deploymentSettingsSaved[deployment.id] = true;
+        setTimeout(() => { this.deploymentSettingsSaved[deployment.id] = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Save launch settings failed: ' + error.message);
+      } finally {
+        this.deploymentSettingsSaving[deployment.id] = false;
+      }
+    },
+
     async openDeploymentLogs(deployment) {
       this.logsModal = {
         open: true,
@@ -1393,18 +1794,24 @@ function app() {
         text: 'Loading cluster logs…',
         deploymentId: deployment.id,
         members: [],
+        autoScroll: true,
       };
-      await this.refreshLogs();
+      this._startLogsTail();
     },
 
     async refreshDeploymentLogs() {
+      const deploymentId = this.logsModal.deploymentId;
+      if (!deploymentId) return;
       try {
-        const r = await fetch(`/api/deployments/${this.logsModal.deploymentId}/logs`);
+        const r = await fetch(`/api/deployments/${deploymentId}/logs`);
         if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
         const data = await r.json();
+        if (!this.logsModal.open || this.logsModal.deploymentId !== deploymentId) return;
         this.logsModal.members = data.members || [];
         this.logsModal.text = this.logsModal.members.length ? '' : '(no cluster members)';
+        this._scrollLogsToBottom();
       } catch (e) {
+        if (!this.logsModal.open || this.logsModal.deploymentId !== deploymentId) return;
         this.logsModal.members = [];
         this.logsModal.text = 'Failed to fetch cluster logs: ' + e.message;
       }
@@ -1671,24 +2078,53 @@ function app() {
     },
 
     async openLogs(name) {
-      this.logsModal.open = true;
-      this.logsModal.name = name;
-      this.logsModal.text = 'Loading…';
-      this.logsModal.deploymentId = null;
-      this.logsModal.members = [];
-      await this.refreshLogs();
+      this.logsModal = {
+        open: true, name, text: 'Loading…', deploymentId: null, members: [], autoScroll: true,
+      };
+      this._startLogsTail();
     },
     async refreshLogs() {
-      if (this.logsModal.deploymentId) return this.refreshDeploymentLogs();
-      const name = this.logsModal.name;
-      if (!name) return;
+      if (!this.logsModal.open || this._logsRefreshInFlight) return;
+      this._logsRefreshInFlight = true;
       try {
-        const r = await fetch(`/api/containers/${encodeURIComponent(name)}/logs?tail=400`);
-        const j = await r.json();
-        this.logsModal.text = j.logs || '(no logs)';
-      } catch (e) {
-        this.logsModal.text = 'Failed to fetch logs: ' + e.message;
+        if (this.logsModal.deploymentId) return await this.refreshDeploymentLogs();
+        const name = this.logsModal.name;
+        if (!name) return;
+        try {
+          const r = await fetch(`/api/containers/${encodeURIComponent(name)}/logs?tail=400`);
+          if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+          const j = await r.json();
+          if (!this.logsModal.open || this.logsModal.name !== name || this.logsModal.deploymentId) return;
+          this.logsModal.text = j.logs || '(no logs)';
+          this._scrollLogsToBottom();
+        } catch (e) {
+          if (!this.logsModal.open || this.logsModal.name !== name || this.logsModal.deploymentId) return;
+          this.logsModal.text = 'Failed to fetch logs: ' + e.message;
+        }
+      } finally {
+        this._logsRefreshInFlight = false;
       }
+    },
+    _startLogsTail() {
+      this._stopLogsTail();
+      this.refreshLogs();
+      this._logsTailInterval = setInterval(() => {
+        if (this.logsModal.open && !document.hidden) this.refreshLogs();
+      }, 1000);
+    },
+    _stopLogsTail() {
+      if (this._logsTailInterval) {
+        clearInterval(this._logsTailInterval);
+        this._logsTailInterval = null;
+      }
+    },
+    _scrollLogsToBottom() {
+      if (!this.logsModal.autoScroll) return;
+      setTimeout(() => {
+        document.querySelectorAll('#logs-modal .logbox').forEach((element) => {
+          element.scrollTop = element.scrollHeight;
+        });
+      }, 0);
     },
 
     // ─── images ──────────────────────────────────────────────
@@ -1846,8 +2282,19 @@ function app() {
             for (const raw of p.split('\n')) {
               const line = raw.replace(/^data: /, '').trim();
               if (!line || line === '[DONE]') continue;
+              let obj;
               try {
-                const obj = JSON.parse(line);
+                obj = JSON.parse(line);
+              } catch {
+                continue;
+              }
+              if (obj.error) {
+                const detail = typeof obj.error === 'string'
+                  ? obj.error
+                  : (obj.error.message || JSON.stringify(obj.error));
+                throw new Error(detail);
+              }
+              {
                 const choice = obj.choices?.[0];
                 const delta = choice?.delta;
                 const content = delta?.content;
@@ -1894,7 +2341,7 @@ function app() {
                 if (Number.isFinite(usageTokens) && usageTokens >= 0) {
                   this.chat.messages[assistantIdx].totalTokens = usageTokens;
                 }
-              } catch { }
+              }
             }
           }
         }
@@ -2028,6 +2475,8 @@ function app() {
         kv_unified: false,
         load_in_4bit: false,
         tensor_parallel: false,
+        tensor_parallel_size: 2,
+        split_mode: 'tensor',
         trust_remote_code: false,
         mtp_enabled: false,
         mtp_predict_tokens: 3,
@@ -2178,24 +2627,30 @@ function app() {
     openSparkLaunchEditor() {
       this.sparkEditor.id = null;
       this.sparkForm = { reference: '' };
+      this.sparkSaveError = '';
       this.sparkEditor.open = true;
     },
 
     async saveSparkLaunch() {
       const reference = this.sparkForm.reference.trim();
-      if (!reference) return;
+      if (!reference || this.sparkSaving) return;
+      this.sparkSaving = true;
+      this.sparkSaveError = '';
       try {
         const r = await fetch('/api/spark-launches', {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ reference }),
         });
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+        const reply = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(reply.detail || r.statusText);
         this.sparkSaved = true;
         setTimeout(() => { this.sparkSaved = false; }, 2500);
         this.sparkEditor.open = false;
         await this.refresh();
       } catch (e) {
-        alert('SparkRun could not be saved: ' + e.message);
+        this.sparkSaveError = e.message || 'SparkRun could not be saved';
+      } finally {
+        this.sparkSaving = false;
       }
     },
 
@@ -2322,12 +2777,56 @@ function app() {
 
     async viewSparkRunLog(run) {
       if (!run) return;
-      this.sparkRunHistory = { open: true, runId: run.id, recipeName: run.recipe_name || '', lines: [], status: run.status || '' };
+      this.sparkRunHistory = {
+        open: true, runId: run.id, recipeName: run.recipe_name || '',
+        lines: [], status: run.status || '', autoScroll: true,
+      };
+      this._startSparkHistoryTail();
+    },
+
+    async refreshSparkRunHistory() {
+      const runId = this.sparkRunHistory.runId;
+      if (!this.sparkRunHistory.open || !runId || this._sparkHistoryRefreshInFlight) return;
+      this._sparkHistoryRefreshInFlight = true;
       try {
-        const r = await fetch(`/api/spark-runs/${run.id}/logs`);
+        const r = await fetch(`/api/spark-runs/${runId}/logs`);
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-        this.sparkRunHistory.lines = (await r.json()).lines || [];
-      } catch (e) { this.sparkRunHistory.lines = [`Failed to load logs: ${e.message}`]; }
+        const data = await r.json();
+        if (!this.sparkRunHistory.open || this.sparkRunHistory.runId !== runId) return;
+        this.sparkRunHistory.lines = data.lines || [];
+        const run = (this.state?.spark_runs || []).find((item) => item.id === runId);
+        if (run?.status) this.sparkRunHistory.status = run.status;
+        this._scrollSparkHistoryToBottom();
+      } catch (e) {
+        if (this.sparkRunHistory.open && this.sparkRunHistory.runId === runId) {
+          this.sparkRunHistory.lines = [`Failed to load logs: ${e.message}`];
+        }
+      } finally {
+        this._sparkHistoryRefreshInFlight = false;
+      }
+    },
+
+    _startSparkHistoryTail() {
+      this._stopSparkHistoryTail();
+      this.refreshSparkRunHistory();
+      this._sparkHistoryTailInterval = setInterval(() => {
+        if (this.sparkRunHistory.open && !document.hidden) this.refreshSparkRunHistory();
+      }, 1000);
+    },
+
+    _stopSparkHistoryTail() {
+      if (this._sparkHistoryTailInterval) {
+        clearInterval(this._sparkHistoryTailInterval);
+        this._sparkHistoryTailInterval = null;
+      }
+    },
+
+    _scrollSparkHistoryToBottom() {
+      if (!this.sparkRunHistory.autoScroll) return;
+      setTimeout(() => {
+        const element = this.$refs?.sparkRunHistoryLog;
+        if (element) element.scrollTop = element.scrollHeight;
+      }, 0);
     },
 
     openSparkRecipeRuns(launch) {
@@ -2765,8 +3264,19 @@ metadata:
             for (const raw of p.split('\n')) {
               const line = raw.replace(/^data: /, '').trim();
               if (!line || line === '[DONE]') continue;
+              let obj;
               try {
-                const obj = JSON.parse(line);
+                obj = JSON.parse(line);
+              } catch {
+                continue;
+              }
+              if (obj.error) {
+                const detail = typeof obj.error === 'string'
+                  ? obj.error
+                  : (obj.error.message || JSON.stringify(obj.error));
+                throw new Error(detail);
+              }
+              {
                 const choice = obj.choices?.[0];
                 const delta = choice?.delta;
                 const content = delta?.content;
@@ -2790,7 +3300,7 @@ metadata:
                 }
                 const usageTokens = Number(obj.usage?.completion_tokens);
                 if (Number.isFinite(usageTokens)) panel.tokens = usageTokens;
-              } catch { }
+              }
             }
           }
         }
@@ -2812,6 +3322,8 @@ metadata:
 
     // ─── server logs ─────────────────────────────────────────
     async refreshServerLogs() {
+      if (this.serverLogs._loading) return;
+      this.serverLogs._loading = true;
       try {
         const r = await fetch('/api/server-logs?tail=500');
         if (!r.ok) return;
@@ -2824,6 +3336,7 @@ metadata:
           }, 0);
         }
       } catch { }
+      finally { this.serverLogs._loading = false; }
     },
 
     _startLogPolling() {
@@ -2833,7 +3346,7 @@ metadata:
         if (this.tab === 'logs' && !document.hidden) {
           this.refreshServerLogs();
         }
-      }, 5000);
+      }, 1000);
     },
 
     _stopLogPolling() {

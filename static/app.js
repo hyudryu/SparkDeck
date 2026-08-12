@@ -146,7 +146,7 @@ function app() {
 
     logsModal: {
       open: false, name: '', text: '', deploymentId: null, members: [], autoScroll: true,
-      llama: false, logId: null, logOffset: 0,
+      llama: false, llamaModel: null, logId: null, logOffset: 0,
     },
     _logsTailInterval: null,
     _logsRefreshInFlight: false,
@@ -1797,6 +1797,7 @@ function app() {
         members: [],
         autoScroll: true,
         llama: false,
+        llamaModel: null,
         logId: null,
         logOffset: 0,
       };
@@ -2085,6 +2086,7 @@ function app() {
       this.logsModal = {
         open: true, name, text: 'Loading…', deploymentId: null, members: [], autoScroll: true,
         llama: false, logId: null, logOffset: 0,
+        llamaModel: null,
       };
       this._startLogsTail();
     },
@@ -2097,19 +2099,25 @@ function app() {
         members: [],
         autoScroll: true,
         llama: true,
+        llamaModel: model,
         logId: null,
         logOffset: 0,
       };
       this._startLogsTail();
     },
     async refreshUnslothLogs() {
-      const model = this.logsModal.name;
+      const model = this.logsModal.llamaModel;
       const offset = Number(this.logsModal.logOffset || 0);
       try {
-        const r = await fetch(`/api/unsloth/logs?since=${offset}&limit_bytes=1048576`);
+        const params = new URLSearchParams({
+          model_path: model || '',
+          since: String(offset),
+          limit_bytes: '1048576',
+        });
+        const r = await fetch(`/api/unsloth/logs?${params}`);
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
         const data = await r.json();
-        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.name !== model) return;
+        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.llamaModel !== model) return;
         if (!data.log_id) {
           this.logsModal.text = '(no llama-server log available)';
           return;
@@ -2124,7 +2132,7 @@ function app() {
         this.logsModal.logOffset = data.next_offset || 0;
         this._scrollLogsToBottom();
       } catch (e) {
-        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.name !== model) return;
+        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.llamaModel !== model) return;
         this.logsModal.text = 'Failed to fetch llama-server logs: ' + e.message;
       }
     },

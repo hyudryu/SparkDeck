@@ -565,6 +565,48 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("older agent", result["members"][0]["logs"])
         self.assertIsNone(result["members"][0]["error"])
 
+    async def test_remove_cluster_member_is_idempotent_when_already_absent(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_member_launches = {}
+
+        async def is_managed_container(name):
+            return False
+
+        instance.is_managed_container = is_managed_container
+
+        self.assertEqual(
+            await instance.remove_cluster_member("missing-member"),
+            {"ok": True, "already_absent": True},
+        )
+
+    async def test_remove_deployment_accepts_missing_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "stale-deployment",
+                "status": "error",
+                "members": [
+                    {"node_id": "local", "container_name": "missing-r0"},
+                    {"node_id": "remote-1", "container_name": "missing-r1"},
+                ],
+            }]
+
+            async def member_action(member, action):
+                if member["node_id"] == "local":
+                    raise ValueError("cluster member not found")
+                raise RuntimeError(
+                    'Spark 2 agent error: {"detail":"cluster member not found"}'
+                )
+
+            instance._member_action = member_action
+
+            result = await instance.deployment_action("stale-deployment", "remove")
+
+            self.assertEqual(result, {"ok": True, "errors": []})
+            self.assertEqual(instance.deployments, [])
+            self.assertEqual(json.loads(instance.deployments_path.read_text()), [])
+
     async def test_vllm_sharded_launch_generates_coordinated_rank_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

@@ -4970,7 +4970,19 @@ class Manager:
         return None
 
     @staticmethod
-    def _rpc_tx_counter(endpoints: list[str]) -> tuple[int | None, list[str]]:
+    def _interface_tx_counter(interfaces: list[str]) -> int | None:
+        total = 0
+        try:
+            for interface in set(interfaces):
+                total += int(Path(
+                    f"/sys/class/net/{interface}/statistics/tx_bytes"
+                ).read_text().strip())
+        except (OSError, ValueError):
+            return None
+        return total
+
+    @classmethod
+    def _rpc_tx_counter(cls, endpoints: list[str]) -> tuple[int | None, list[str]]:
         """Return bytes sent on the interfaces routing to RPC workers."""
         interfaces: set[str] = set()
         for endpoint in endpoints:
@@ -4987,15 +4999,8 @@ class Manager:
                 continue
         if not interfaces:
             return None, []
-        total = 0
-        try:
-            for interface in interfaces:
-                total += int(Path(
-                    f"/sys/class/net/{interface}/statistics/tx_bytes"
-                ).read_text().strip())
-        except (OSError, ValueError):
-            return None, sorted(interfaces)
-        return total, sorted(interfaces)
+        values = sorted(interfaces)
+        return cls._interface_tx_counter(values), values
 
     @staticmethod
     def _format_progress_bytes(value: float) -> str:
@@ -5012,7 +5017,10 @@ class Manager:
 
         endpoints = list(info.get("rpc_endpoints") or [])
         if endpoints and info.get("rpc_tx_start") is not None:
-            current, interfaces = self._rpc_tx_counter(endpoints)
+            interfaces = list(info.get("rpc_interfaces") or [])
+            current = self._interface_tx_counter(interfaces) if interfaces else None
+            if current is None:
+                current, interfaces = self._rpc_tx_counter(endpoints)
             start = int(info["rpc_tx_start"])
             transferred = max(0, (current or start) - start)
             tp_size = max(1, int(info.get("tensor_parallel_size") or 1))

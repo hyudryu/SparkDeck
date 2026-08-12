@@ -146,6 +146,7 @@ function app() {
 
     logsModal: {
       open: false, name: '', text: '', deploymentId: null, members: [], autoScroll: true,
+      llama: false, logId: null, logOffset: 0,
     },
     _logsTailInterval: null,
     _logsRefreshInFlight: false,
@@ -1795,6 +1796,9 @@ function app() {
         deploymentId: deployment.id,
         members: [],
         autoScroll: true,
+        llama: false,
+        logId: null,
+        logOffset: 0,
       };
       this._startLogsTail();
     },
@@ -2080,14 +2084,56 @@ function app() {
     async openLogs(name) {
       this.logsModal = {
         open: true, name, text: 'Loading…', deploymentId: null, members: [], autoScroll: true,
+        llama: false, logId: null, logOffset: 0,
       };
       this._startLogsTail();
+    },
+    async openUnslothLogs(model) {
+      this.logsModal = {
+        open: true,
+        name: `llama-server · ${model}`,
+        text: 'Loading full llama-server log…',
+        deploymentId: null,
+        members: [],
+        autoScroll: true,
+        llama: true,
+        logId: null,
+        logOffset: 0,
+      };
+      this._startLogsTail();
+    },
+    async refreshUnslothLogs() {
+      const model = this.logsModal.name;
+      const offset = Number(this.logsModal.logOffset || 0);
+      try {
+        const r = await fetch(`/api/unsloth/logs?since=${offset}&limit_bytes=1048576`);
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+        const data = await r.json();
+        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.name !== model) return;
+        if (!data.log_id) {
+          this.logsModal.text = '(no llama-server log available)';
+          return;
+        }
+        if (data.model) this.logsModal.name = `llama-server · ${data.model}`;
+        if (this.logsModal.logId !== data.log_id || data.offset === 0 && offset > 0) {
+          this.logsModal.logId = data.log_id;
+          this.logsModal.text = '';
+          this.logsModal.logOffset = 0;
+        }
+        if (data.text) this.logsModal.text += data.text;
+        this.logsModal.logOffset = data.next_offset || 0;
+        this._scrollLogsToBottom();
+      } catch (e) {
+        if (!this.logsModal.open || !this.logsModal.llama || this.logsModal.name !== model) return;
+        this.logsModal.text = 'Failed to fetch llama-server logs: ' + e.message;
+      }
     },
     async refreshLogs() {
       if (!this.logsModal.open || this._logsRefreshInFlight) return;
       this._logsRefreshInFlight = true;
       try {
         if (this.logsModal.deploymentId) return await this.refreshDeploymentLogs();
+        if (this.logsModal.llama) return await this.refreshUnslothLogs();
         const name = this.logsModal.name;
         if (!name) return;
         try {

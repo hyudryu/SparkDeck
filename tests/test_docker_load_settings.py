@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -128,6 +130,43 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(template_kwargs["enable_thinking"])
         self.assertTrue(template_kwargs["tools"])
+
+    async def test_container_alias_is_persisted_without_renaming_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            name = "external-vllm"
+            containers = FakeContainers()
+            container = FakeContainer(
+                containers,
+                "container-id",
+                name,
+                {
+                    "Image": "example/vllm:latest",
+                    "Cmd": ["vllm", "serve", "example/Model"],
+                    "Labels": {},
+                },
+                {},
+            )
+            containers.add(container)
+            self.manager.client = SimpleNamespace(containers=containers)
+            self.manager.container_aliases_path = Path(directory) / "container_aliases.json"
+            self.manager.container_aliases = {}
+
+            result = await self.manager.update_container_alias(name, "Fast benchmark")
+
+            self.assertEqual(result["alias"], "Fast benchmark")
+            self.assertEqual(container.name, name)
+            self.assertEqual(
+                json.loads(self.manager.container_aliases_path.read_text()),
+                {name: "Fast benchmark"},
+            )
+            summary = self.manager._container_summary(container)
+            self.assertEqual(summary["alias"], "Fast benchmark")
+
+            cleared = await self.manager.update_container_alias(name, "")
+            self.assertIsNone(cleared["alias"])
+            self.assertEqual(
+                json.loads(self.manager.container_aliases_path.read_text()), {}
+            )
 
     def test_shell_wrapped_vllm_preserves_preamble_and_expressions(self):
         script = (

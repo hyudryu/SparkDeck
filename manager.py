@@ -55,6 +55,8 @@ DEFAULT_SETTINGS = {
     "llama_server_bin": "~/.unsloth/llama.cpp/llama-server",
     "llama_server_host": "127.0.0.1",
     "llama_server_port": 8100,
+    "llama_rpc_server_bin": "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server",
+    "llama_rpc_port": 50052,
     # Flagship model pricing: input/output cost per 1M tokens (USD).
     # Editable from the Usage tab; used for opportunity-cost comparison
     # against locally-served models.
@@ -80,6 +82,17 @@ RANK_LABEL = "vllm-controller.rank"
 SERVICE_PORT_LABEL = "vllm-controller.service-port"
 MODE_LABEL = "vllm-controller.deployment-mode"
 NNODES_LABEL = "vllm-controller.nnodes"
+
+# Distributed workers form one rendezvous generation.  Checking every two
+# minutes catches a split rank well before the default 601-second TCPStore
+# timeout.  Start times farther apart than one interval indicate that Docker
+# restarted only part of the deployment.
+CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
+# A first launch may legitimately wait up to the distributed store's 601s
+# join timeout while another node finishes pulling its image. Once a restart
+# counter baseline exists, any single-rank increment is detected immediately.
+CLUSTER_START_SKEW_SECONDS = 660.0
+CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
 
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
@@ -134,6 +147,8 @@ UNSLOTH_DEFAULT_SETTINGS = {
     "kv_unified": False,        # each slot gets its own KV pool (no sharing)
     "load_in_4bit": False,
     "tensor_parallel": False,
+    "tensor_parallel_size": 2,
+    "split_mode": "tensor",      # llama-server: tensor (experimental), layer, or row
     "trust_remote_code": False,
     # Multi-token prediction uses the model's built-in MTP head.  It only
     # applies to MTP-capable GGUFs (for example Qwen MTP variants).
@@ -224,6 +239,8 @@ class Manager:
         # restarts. Only cleared via the reset endpoint.
         self.token_stats_path = self.data_dir / "token_stats.json"
         self.token_stats: dict[str, dict] = self._load_token_stats()
+        self.usage_aliases_path = self.data_dir / "usage_aliases.json"
+        self.usage_aliases: dict[str, str] = self._load_usage_aliases()
         # Session token counters — same shape as token_stats but NOT
         # persisted. Tracks tokens served since the controller started (or
         # since the last session reset). The topbar widget shows these; the
@@ -243,11 +260,15 @@ class Manager:
         self.lock = asyncio.Lock()
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
+        self.cluster_health_task: asyncio.Task | None = None
+        self._deployment_action_lock = asyncio.Lock()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(self.data_dir, self.http)
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
+        self.container_aliases_path = self.data_dir / "container_aliases.json"
+        self.container_aliases: dict[str, str] = self._load_container_aliases()
         self._cpu_prev: tuple[int, int] | None = None
         self._stats_cache: dict[str, Any] = {}
         self._stats_ts: float = 0.0
@@ -272,6 +293,22 @@ class Manager:
         self._llama_lock = asyncio.Lock()
         self._llama_state_path = self.data_dir / "llama_server.json"
         self._llama_log_dir = self.data_dir / "logs"
+        # llama.cpp tensor parallelism uses its RPC backend: rank 0 runs the
+        # public llama-server locally and each additional Spark exposes one
+        # CUDA device through an authenticated agent-managed RPC worker.
+        self._llama_rpc_proc: asyncio.subprocess.Process | None = None
+        self._llama_rpc_pid: int | None = None
+        self._llama_rpc_host: str | None = None
+        self._llama_rpc_port: int = 0
+        self._llama_rpc_lock = asyncio.Lock()
+        self._llama_rpc_state_path = self.data_dir / "llama_rpc_server.json"
+        self._llama_rpc_log_path = self._llama_log_dir / "llama-rpc-server.log"
+        self._llama_rpc_adopt_tried = False
+        # Remote workers used by the currently launched local llama-server.
+        # Persisted in llama_server.json so controller restarts can clean them
+        # up when the model is unloaded.
+        self._llama_rpc_nodes: list[str] = []
+        self._llama_rpc_endpoints: list[str] = []
         # In-flight load_unsloth_model task, so the UI's Cancel-load button
         # can abort a launch that is still waiting for readiness.
         self._llama_load_task: asyncio.Task | None = None
@@ -305,10 +342,11 @@ class Manager:
     async def start(self):
         self.worker_task = asyncio.create_task(self._worker_loop())
         self.idle_task = asyncio.create_task(self._idle_monitor_loop())
+        self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
         self._start_mem_bw_monitor()
 
     async def stop(self):
-        for t in (self.worker_task, self.idle_task):
+        for t in (self.worker_task, self.idle_task, self.cluster_health_task):
             if t:
                 t.cancel()
                 try:
@@ -371,6 +409,8 @@ class Manager:
                     "port": c.get("port"),
                     "deployment_id": c.get("deployment_id"),
                     "rank": c.get("rank"),
+                    "started_at": c.get("started_at"),
+                    "restart_count": c.get("restart_count", 0),
                     "phase": c.get("phase"),
                 }
                 for c in containers if c.get("managed")
@@ -418,6 +458,7 @@ class Manager:
             "stats": stats,
             "disk": disk,
             "containers": containers,
+            "llama_rpc": self.llama_rpc_status(),
         }
 
     def _cluster_launch_update(
@@ -556,10 +597,320 @@ class Manager:
         tmp.write_text(json.dumps(self.deployments, indent=2), encoding="utf-8")
         tmp.replace(self.deployments_path)
 
+    def _load_container_aliases(self) -> dict[str, str]:
+        if not self.container_aliases_path.exists():
+            return {}
+        try:
+            value = json.loads(self.container_aliases_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(name): str(alias)
+                for name, alias in value.items()
+                if str(name).strip() and str(alias).strip()
+            }
+        except Exception:
+            return {}
+
+    def _save_container_aliases(self) -> None:
+        tmp = self.container_aliases_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.container_aliases, indent=2), encoding="utf-8")
+        tmp.replace(self.container_aliases_path)
+
+    def _load_usage_aliases(self) -> dict[str, str]:
+        if not self.usage_aliases_path.exists():
+            return {}
+        try:
+            value = json.loads(self.usage_aliases_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(model): str(alias)
+                for model, alias in value.items()
+                if str(model).strip() and str(alias).strip()
+            }
+        except Exception:
+            return {}
+
+    def _save_usage_aliases(self) -> None:
+        tmp = self.usage_aliases_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.usage_aliases, indent=2), encoding="utf-8")
+        tmp.replace(self.usage_aliases_path)
+
+    def update_usage_alias(self, model: Any, alias: Any) -> dict:
+        model_key = str(model or "").strip()
+        if not model_key or model_key not in self.token_stats:
+            raise ValueError("usage model not found")
+        normalized = self._normalized_alias(alias)
+        if normalized:
+            self.usage_aliases[model_key] = normalized
+        else:
+            self.usage_aliases.pop(model_key, None)
+        self._save_usage_aliases()
+        return {"ok": True, "model": model_key, "alias": normalized or None}
+
+    @staticmethod
+    def _normalized_alias(value: Any, fallback: str = "") -> str:
+        alias = str(value or "").strip()
+        if len(alias) > 120:
+            raise ValueError("alias must be 120 characters or fewer")
+        return alias or fallback
+
+    def update_deployment_alias(self, deployment_id: str, alias: Any) -> dict:
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise ValueError("deployment not found")
+        deployment["name"] = self._normalized_alias(alias, deployment.get("model") or deployment_id)
+        if deployment.get("launch_settings"):
+            deployment["launch_settings"]["deployment_name"] = deployment["name"]
+        self._save_deployments()
+        return deployment
+
+    async def update_container_alias(self, name: str, alias: Any) -> dict:
+        try:
+            self.client.containers.get(name)
+        except Exception as exc:
+            raise ValueError("container not found") from exc
+        normalized = self._normalized_alias(alias)
+        if normalized:
+            self.container_aliases[name] = normalized
+        else:
+            self.container_aliases.pop(name, None)
+        self._save_container_aliases()
+        return {"ok": True, "name": name, "alias": normalized or None}
+
     def _deployment(self, deployment_id: str) -> dict | None:
         return next(
             (d for d in self.deployments if d.get("id") == deployment_id), None
         )
+
+    @staticmethod
+    def _deployment_launch_settings(body: dict) -> dict:
+        """Return the durable, credential-free inputs for a cluster launch."""
+        return {
+            "deployment_name": body.get("deployment_name") or body.get("name"),
+            "model": body.get("model") or "",
+            "engine": body.get("engine") or "vllm",
+            "image": body.get("image") or None,
+            "extra_args": list(body.get("extra_args") or []),
+            "gpu_memory_utilization": body.get("gpu_memory_utilization"),
+            "gpu_memory_gb": body.get("gpu_memory_gb"),
+            "sg_tp_size": body.get("sg_tp_size"),
+            "sg_context_length": body.get("sg_context_length"),
+            "sg_max_running_requests": body.get("sg_max_running_requests"),
+            "sg_mem_fraction": body.get("sg_mem_fraction"),
+            "sg_image": body.get("sg_image") or None,
+            "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
+            "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
+            "port": body.get("port"),
+        }
+
+    @classmethod
+    def _deployment_launch_controls(cls, settings: dict) -> dict:
+        """Parse common cluster controls without removing image-specific args."""
+        args = list(settings.get("extra_args") or [])
+        engine = settings.get("engine") or "vllm"
+        speculative = {}
+        raw_speculative = cls._cli_option(args, {"--speculative-config"})
+        if raw_speculative:
+            try:
+                parsed = json.loads(raw_speculative)
+                if isinstance(parsed, dict):
+                    speculative = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        thinking_mode, _, _ = cls._thinking_config(args)
+        context_window = cls._cli_option(
+            args,
+            {"--context-length"} if engine == "sglang"
+            else {"--max-model-len", "--max-model-length"},
+            int,
+        )
+        max_concurrency = cls._cli_option(
+            args,
+            {"--max-running-requests"} if engine == "sglang"
+            else {"--max-num-seqs"},
+            int,
+        )
+        if engine == "sglang":
+            context_window = settings.get("sg_context_length") or context_window
+            max_concurrency = settings.get("sg_max_running_requests") or max_concurrency
+        return {
+            "context_window": context_window,
+            "max_concurrency": max_concurrency,
+            "kv_cache_dtype": cls._cli_option(args, {"--kv-cache-dtype"}),
+            "thinking_mode": thinking_mode,
+            "dspark_num_speculative_tokens": (
+                speculative.get("num_speculative_tokens")
+                if isinstance(speculative.get("num_speculative_tokens"), int)
+                else None
+            ),
+            "max_cudagraph_capture_size": cls._cli_option(
+                args, {"--max-cudagraph-capture-size"}, int
+            ),
+            "max_num_batched_tokens": cls._cli_option(
+                args, {"--max-num-batched-tokens"}, int
+            ),
+        }
+
+    def _apply_deployment_launch_controls(
+        self, args: list[str], engine: str, controls: dict
+    ) -> list[str]:
+        """Merge structured editor fields back into the complete argv."""
+        flags = shlex.join([str(value) for value in args])
+
+        def positive_int(key: str) -> int | None:
+            value = controls.get(key)
+            if value in (None, ""):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a positive integer") from exc
+            if parsed <= 0:
+                raise ValueError(f"{key} must be a positive integer")
+            return parsed
+
+        flags = self._replace_command_option(
+            flags,
+            {"--context-length"} if engine == "sglang"
+            else {"--max-model-len", "--max-model-length"},
+            None if engine == "sglang" else positive_int("context_window"),
+        )
+        flags = self._replace_command_option(
+            flags,
+            {"--max-running-requests"} if engine == "sglang"
+            else {"--max-num-seqs"},
+            None if engine == "sglang" else positive_int("max_concurrency"),
+        )
+        kv_dtype = controls.get("kv_cache_dtype")
+        kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
+        flags = self._replace_command_option(
+            flags, {"--kv-cache-dtype"}, kv_dtype
+        )
+        flags = self._replace_thinking_config(
+            flags, str(controls.get("thinking_mode") or "default")
+        )
+
+        if engine == "vllm":
+            flags = self._replace_command_option(
+                flags,
+                {"--max-cudagraph-capture-size"},
+                positive_int("max_cudagraph_capture_size"),
+            )
+            flags = self._replace_command_option(
+                flags,
+                {"--max-num-batched-tokens"},
+                positive_int("max_num_batched_tokens"),
+            )
+
+            speculative_tokens = positive_int("dspark_num_speculative_tokens")
+            try:
+                current_tokens = shlex.split(flags)
+            except ValueError as exc:
+                raise ValueError("launch arguments have invalid shell quoting") from exc
+            raw_speculative = self._cli_option(
+                current_tokens, {"--speculative-config"}
+            )
+            speculative: dict[str, Any] = {}
+            if raw_speculative:
+                try:
+                    parsed = json.loads(raw_speculative)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("--speculative-config must contain valid JSON") from exc
+                if not isinstance(parsed, dict):
+                    raise ValueError("--speculative-config must contain a JSON object")
+                speculative = parsed
+            if speculative_tokens is None:
+                speculative.pop("num_speculative_tokens", None)
+            else:
+                speculative["num_speculative_tokens"] = speculative_tokens
+            speculative_value = None
+            if speculative:
+                speculative_value = shlex.quote(
+                    json.dumps(speculative, separators=(",", ":"))
+                )
+            flags = self._replace_command_option(
+                flags, {"--speculative-config"}, speculative_value
+            )
+
+        try:
+            return shlex.split(flags)
+        except ValueError as exc:
+            raise ValueError("launch arguments have invalid shell quoting") from exc
+
+    def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
+        """Save the inputs used to rebuild a stopped clustered deployment."""
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise ValueError("deployment not found")
+        if deployment.get("status") != "stopped":
+            raise ValueError("stop the cluster before changing its launch settings")
+
+        current = deployment.get("launch_settings") or {
+            "deployment_name": deployment.get("name"),
+            "model": deployment.get("model"),
+            "engine": deployment.get("engine", "vllm"),
+            "deployment_mode": deployment.get("mode", "single"),
+            "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
+            "port": deployment.get("api_port"),
+        }
+        merged = {**current, **body}
+        controls = body.get("launch_controls")
+        if isinstance(controls, dict) and (merged.get("engine") or "vllm") == "sglang":
+            merged["sg_context_length"] = controls.get("context_window")
+            merged["sg_max_running_requests"] = controls.get("max_concurrency")
+        settings = self._deployment_launch_settings(merged)
+        if "launch_controls" in body:
+            if not isinstance(controls, dict):
+                raise ValueError("launch_controls must be an object")
+            settings["extra_args"] = self._apply_deployment_launch_controls(
+                settings["extra_args"], settings["engine"], controls
+            )
+        if not settings["model"]:
+            raise ValueError("model is required")
+        if settings["engine"] not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
+        mode = settings["deployment_mode"]
+        if mode not in {"single", "sharded", "replicated"}:
+            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if mode == "single":
+            settings["node_ids"] = settings["node_ids"][:1] or [LOCAL_NODE_ID]
+        elif len(settings["node_ids"]) < 2:
+            raise ValueError(f"{mode} deployment requires at least two nodes")
+        if mode == "sharded" and settings["node_ids"][0] != LOCAL_NODE_ID:
+            raise ValueError("the coordinator must be the first node in a sharded deployment")
+        if mode == "sharded" and settings["engine"] == "vllm":
+            requested_tp = self._cli_option(
+                settings["extra_args"], {"--tensor-parallel-size", "-tp"}, int
+            )
+            requested_pp = self._cli_option(
+                settings["extra_args"], {"--pipeline-parallel-size", "-pp"}, int
+            )
+            if requested_tp is not None or requested_pp is not None:
+                tp = requested_tp or 1
+                pp = requested_pp or 1
+                if tp < 1 or pp < 1 or tp * pp != len(settings["node_ids"]):
+                    raise ValueError(
+                        "explicit tensor/pipeline parallel sizes must be positive "
+                        f"and multiply to the {len(settings['node_ids'])} selected nodes"
+                    )
+
+        # Preserve the assigned API port unless the editor explicitly changes it.
+        if settings.get("port") is None:
+            settings["port"] = deployment.get("api_port")
+        deployment.update({
+            "name": settings.get("deployment_name") or settings["model"],
+            "model": settings["model"],
+            "engine": settings["engine"],
+            "mode": mode,
+            "node_ids": settings["node_ids"],
+            "launch_settings": settings,
+            "settings_dirty": True,
+            "error": None,
+        })
+        self._save_deployments()
+        return deployment
 
     @staticmethod
     def _without_cli_options(args: list[str], names: set[str]) -> list[str]:
@@ -779,6 +1130,26 @@ class Manager:
         )
 
     async def create_deployment(self, body: dict) -> dict:
+        body = dict(body)
+        controls = body.get("launch_controls")
+        if controls is not None:
+            if not isinstance(controls, dict):
+                raise ValueError("launch_controls must be an object")
+            engine = body.get("engine") or "vllm"
+            controls = {
+                **self._deployment_launch_controls(
+                    self._deployment_launch_settings(body)
+                ),
+                **controls,
+            }
+            if engine == "sglang":
+                if "context_window" in controls:
+                    body["sg_context_length"] = controls.get("context_window")
+                if "max_concurrency" in controls:
+                    body["sg_max_running_requests"] = controls.get("max_concurrency")
+            body["extra_args"] = self._apply_deployment_launch_controls(
+                list(body.get("extra_args") or []), engine, controls
+            )
         mode = body.get("deployment_mode") or "single"
         if mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
@@ -809,6 +1180,29 @@ class Manager:
         model = body.get("model") or ""
         if not model:
             raise ValueError("model is required")
+        vllm_parallel_layout: tuple[int, int] | None = None
+        if mode == "sharded" and engine == "vllm":
+            requested_args = list(body.get("extra_args") or [])
+            requested_tp = self._cli_option(
+                requested_args, {"--tensor-parallel-size", "-tp"}, int
+            )
+            requested_pp = self._cli_option(
+                requested_args, {"--pipeline-parallel-size", "-pp"}, int
+            )
+            if requested_tp is not None or requested_pp is not None:
+                tp = requested_tp or 1
+                pp = requested_pp or 1
+                if tp < 1 or pp < 1 or tp * pp != len(node_ids):
+                    raise ValueError(
+                        "explicit tensor/pipeline parallel sizes must be positive "
+                        f"and multiply to the {len(node_ids)} selected nodes"
+                    )
+                vllm_parallel_layout = (tp, pp)
+            else:
+                # Default to one local tensor-parallel rank per node and
+                # pipeline parallelism across nodes. Models that do not
+                # implement SupportsPP can explicitly request TP=nnodes, PP=1.
+                vllm_parallel_layout = (1, len(node_ids))
         requested_port = body.get("port")
         if requested_port is None:
             requested_port = await self._allocate_port()
@@ -844,6 +1238,10 @@ class Manager:
             "status": "launching",
             "members": [],
             "created_at": time.time(),
+            "recipe_id": body.get("recipe_id"),
+            "managed_by": body.get("managed_by"),
+            "automation_run_id": body.get("automation_run_id"),
+            "settings_dirty": False,
         }
         self.deployments.append(deployment)
         self._save_deployments()
@@ -890,6 +1288,7 @@ class Manager:
             })
             if mode == "sharded":
                 if engine == "vllm":
+                    tp_size, pp_size = vllm_parallel_layout or (1, len(node_ids))
                     vllm_args = self._without_cli_options(
                         payload["extra_args"],
                         {"--distributed-executor-backend", "--nnodes", "--node-rank",
@@ -905,11 +1304,8 @@ class Manager:
                         "--node-rank", str(rank),
                         "--master-addr", master_ip,
                         "--master-port", "29501",
-                        # Each DGX Spark contributes one GPU. Pipeline
-                        # parallelism spans nodes; tensor parallelism remains
-                        # within a node, matching vLLM's multi-node guidance.
-                        "--tensor-parallel-size", "1",
-                        "--pipeline-parallel-size", str(len(node_ids)),
+                        "--tensor-parallel-size", str(tp_size),
+                        "--pipeline-parallel-size", str(pp_size),
                     ]
                     if rank > 0:
                         payload["extra_args"].append("--headless")
@@ -942,6 +1338,12 @@ class Manager:
         # so it can ask every node for controller-side launch progress.
         deployment["members"] = member_specs
         deployment["api_port"] = requested_port
+        deployment["launch_settings"] = self._deployment_launch_settings({
+            **body,
+            "deployment_name": deployment["name"],
+            "node_ids": node_ids,
+            "port": requested_port,
+        })
         self._save_deployments()
 
         created = await asyncio.gather(*tasks, return_exceptions=True)
@@ -988,12 +1390,69 @@ class Manager:
             node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
         )
 
+    def _cluster_action_lock(self) -> asyncio.Lock:
+        """Return the lifecycle lock, including on lightweight test instances."""
+        lock = getattr(self, "_deployment_action_lock", None)
+        if lock is None:
+            lock = self._deployment_action_lock = asyncio.Lock()
+        return lock
+
     async def deployment_action(self, deployment_id: str, action: str) -> dict:
+        # A health recovery and a user action must never interleave their
+        # per-rank stop/start requests.
+        async with self._cluster_action_lock():
+            return await self._deployment_action_locked(deployment_id, action)
+
+    async def _deployment_action_locked(self, deployment_id: str, action: str) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
+
+        if action == "start" and deployment.get("settings_dirty"):
+            # The stopped containers still contain the old argv. Remove them,
+            # then use the normal fully validated launch path with the saved
+            # settings so every node/rank receives a coherent replacement.
+            removed = await asyncio.gather(
+                *[
+                    self._member_action(member, "remove")
+                    for member in deployment.get("members", [])
+                ],
+                return_exceptions=True,
+            )
+            remove_errors = [str(result) for result in removed if isinstance(result, Exception)]
+            if remove_errors:
+                deployment["status"] = "stopped"
+                deployment["error"] = "; ".join(remove_errors)
+                self._save_deployments()
+                return {"ok": False, "errors": remove_errors}
+
+            deployment["members"] = []
+            deployment["error"] = None
+            self._save_deployments()
+            launch_body = dict(deployment.get("launch_settings") or {})
+            launch_body["recipe_id"] = deployment.get("recipe_id")
+            try:
+                replacement = await self.create_deployment(launch_body)
+            except Exception:
+                # Keep the saved card so its settings can be corrected and
+                # retried. create_deployment also leaves its failed attempt
+                # visible with the node-specific diagnostic.
+                deployment["status"] = "stopped"
+                self._save_deployments()
+                raise
+            self.deployments = [
+                item for item in self.deployments if item.get("id") != deployment_id
+            ]
+            self._save_deployments()
+            return {
+                "ok": True,
+                "errors": [],
+                "deployment": replacement,
+                "replaced_deployment_id": deployment_id,
+            }
+
         results = await asyncio.gather(
             *[self._member_action(m, action) for m in deployment.get("members", [])],
             return_exceptions=True,
@@ -1002,12 +1461,211 @@ class Manager:
         if action == "remove" and not errors:
             self.deployments = [d for d in self.deployments if d.get("id") != deployment_id]
         else:
-            deployment["status"] = "error" if errors else (
-                "starting" if action == "start" else "stopped"
-            )
+            if errors:
+                # A partial start is still intended to be running; keep it in
+                # the health monitor's candidate set so the successful rank is
+                # stopped and the complete cluster is retried atomically.
+                deployment["status"] = "degraded" if action == "start" else "error"
+            else:
+                deployment["status"] = "starting" if action == "start" else "stopped"
             deployment["error"] = "; ".join(errors) if errors else None
         self._save_deployments()
         return {"ok": not errors, "errors": errors}
+
+    @staticmethod
+    def _container_started_epoch(value: Any) -> float | None:
+        if not value or str(value).startswith("0001-"):
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _cluster_health_issue(self, deployment: dict, nodes: list[dict]) -> str | None:
+        """Describe a recoverable split deployment, or return ``None``.
+
+        An unreachable agent is deliberately not called unhealthy here: the
+        coordinator cannot guarantee that its worker was stopped, so starting
+        a new rendezvous generation would risk preserving the exact zombie we
+        are trying to prevent.
+        """
+        members = deployment.get("members") or []
+        if len(members) < 2:
+            return None
+        if deployment.get("status") in {"stopped", "error", "launching"}:
+            return None
+
+        node_by_id = {node.get("id"): node for node in nodes}
+        member_containers = []
+        for member in members:
+            node = node_by_id.get(member.get("node_id"))
+            if not node or not node.get("online") or not node.get("docker_ready"):
+                return None
+            containers = {
+                container.get("name"): container
+                for container in node.get("containers") or []
+            }
+            member_containers.append(containers.get(member.get("container_name")))
+
+        states = [
+            container.get("status", "unknown") if container else "missing"
+            for container in member_containers
+        ]
+        # A launch still represented by a synthetic agent row is not a failed
+        # runtime. create_deployment changes the saved state from launching
+        # only after every slow image pull/container creation has returned.
+        if any(state in {"queued", "creating"} for state in states):
+            return None
+
+        if not all(state == "running" for state in states):
+            detail = ", ".join(
+                f"rank {member.get('rank')}: {state}"
+                for member, state in zip(members, states)
+            )
+            return f"cluster ranks are split ({detail})"
+
+        started = [
+            self._container_started_epoch((container or {}).get("started_at"))
+            for container in member_containers
+        ]
+        known_started = [value for value in started if value is not None]
+        start_skew = (
+            max(known_started) - min(known_started)
+            if len(known_started) == len(members)
+            else None
+        )
+        restart_counts = {
+            member.get("container_name"): int((container or {}).get("restart_count") or 0)
+            for member, container in zip(members, member_containers)
+        }
+        baseline = deployment.get("health_restart_counts")
+        accept_recovery = deployment.get("health_accept_restart_counts")
+        if accept_recovery and start_skew is not None:
+            if start_skew <= CLUSTER_RECOVERY_ALIGNMENT_SECONDS:
+                deployment["health_restart_counts"] = restart_counts
+                deployment.pop("health_accept_restart_counts", None)
+                baseline = restart_counts
+        elif not isinstance(baseline, dict):
+            if start_skew is not None and start_skew <= CLUSTER_RECOVERY_ALIGNMENT_SECONDS:
+                # Adopt an already-coordinated deployment after a controller
+                # upgrade, even if its historical restart counters differ.
+                deployment["health_restart_counts"] = restart_counts
+                baseline = restart_counts
+            elif len(set(restart_counts.values())) > 1:
+                return "cluster ranks have different Docker restart generations"
+            else:
+                deployment["health_restart_counts"] = restart_counts
+                baseline = restart_counts
+
+        if isinstance(baseline, dict):
+            changed = [
+                name for name, count in restart_counts.items()
+                if int(baseline.get(name, count)) != count
+            ]
+            if changed:
+                return "Docker restarted only part of the cluster"
+
+        if len(known_started) == len(members):
+            if start_skew is not None and start_skew > CLUSTER_START_SKEW_SECONDS:
+                return "cluster ranks were started in different rendezvous generations"
+            return None
+        return None
+
+    async def _recover_cluster_deployment(self, deployment_id: str, issue: str) -> None:
+        """Stop every rank, then start every rank as one atomic generation."""
+        async with self._cluster_action_lock():
+            deployment = self._deployment(deployment_id)
+            if not deployment or deployment.get("status") in {"stopped", "error", "launching"}:
+                return
+            members = list(deployment.get("members") or [])
+            if len(members) < 2:
+                return
+
+            checked_at = time.time()
+            deployment["status"] = "recovering"
+            deployment["health_issue"] = issue
+            deployment["health_checked_at"] = checked_at
+            self._save_deployments()
+            print(f"[cluster-health] {deployment_id}: {issue}; stopping every rank")
+
+            stopped = await asyncio.gather(
+                *(self._member_action(member, "stop") for member in members),
+                return_exceptions=True,
+            )
+            stop_errors = [
+                f"rank {member.get('rank')}: {result}"
+                for member, result in zip(members, stopped)
+                if isinstance(result, Exception)
+            ]
+            if stop_errors:
+                deployment["status"] = "degraded"
+                deployment["error"] = (
+                    "Automatic recovery could not stop every rank; no rank was restarted: "
+                    + "; ".join(stop_errors)
+                )
+                self._save_deployments()
+                print(f"[cluster-health] {deployment_id}: {deployment['error']}")
+                return
+
+            started = await asyncio.gather(
+                *(self._member_action(member, "start") for member in members),
+                return_exceptions=True,
+            )
+            start_errors = [
+                f"rank {member.get('rank')}: {result}"
+                for member, result in zip(members, started)
+                if isinstance(result, Exception)
+            ]
+            deployment["health_restarted_at"] = time.time()
+            if start_errors:
+                deployment["status"] = "degraded"
+                deployment["error"] = "Automatic recovery failed to start every rank: " + "; ".join(start_errors)
+            else:
+                deployment["status"] = "starting"
+                deployment["error"] = None
+                deployment["health_issue"] = None
+                # Manual Docker start does not clear cumulative RestartCount.
+                # Adopt the post-recovery counters on the next aligned check.
+                deployment["health_accept_restart_counts"] = True
+            self._save_deployments()
+            print(
+                f"[cluster-health] {deployment_id}: "
+                + (deployment.get("error") or "all ranks restarted together")
+            )
+
+    async def _cluster_health_tick(self) -> None:
+        candidates = [
+            deployment for deployment in list(self.deployments)
+            if len(deployment.get("members") or []) >= 2
+            and deployment.get("status") not in {"stopped", "error", "launching"}
+        ]
+        if not candidates:
+            return
+        nodes = await self.cluster_nodes()
+        for deployment in candidates:
+            old_health = (
+                deployment.get("health_restart_counts"),
+                deployment.get("health_accept_restart_counts"),
+            )
+            issue = self._cluster_health_issue(deployment, nodes)
+            new_health = (
+                deployment.get("health_restart_counts"),
+                deployment.get("health_accept_restart_counts"),
+            )
+            if new_health != old_health:
+                self._save_deployments()
+            if issue:
+                await self._recover_cluster_deployment(deployment.get("id"), issue)
+
+    async def _cluster_health_monitor_loop(self) -> None:
+        # Let startup finish before the first probe, then reconcile at the
+        # requested two-minute cadence.
+        while True:
+            await asyncio.sleep(CLUSTER_HEALTH_INTERVAL_SECONDS)
+            try:
+                await self._cluster_health_tick()
+            except Exception as exc:
+                print(f"[cluster-health] check failed: {exc}")
 
     async def deployment_logs(self, deployment_id: str) -> dict:
         deployment = self._deployment(deployment_id)
@@ -1267,7 +1925,36 @@ class Manager:
         expanded = str(Path(model_path).expanduser().resolve())
         return expanded if Path(expanded).is_dir() else None
 
-    def _build_volumes(self, model_path: str, hf_cache: str | None = None) -> dict:
+    def _image_hf_cache_target(self, image: str | None) -> str:
+        """Return the Hugging Face cache directory declared by *image*.
+
+        Most vLLM images use ``/root/.cache/huggingface``, but custom runtime
+        images can set ``HF_HOME`` to another absolute path.  Mounting the
+        host cache at the image's declared location keeps offline images able
+        to resolve snapshots without overriding their runtime environment.
+        """
+        fallback = "/root/.cache/huggingface"
+        if not image:
+            return fallback
+        try:
+            docker_image = self.client.images.get(image)
+            env = ((docker_image.attrs or {}).get("Config") or {}).get("Env") or []
+        except Exception:
+            return fallback
+        for entry in env:
+            if not isinstance(entry, str) or not entry.startswith("HF_HOME="):
+                continue
+            target = entry.partition("=")[2].strip().rstrip("/")
+            if target.startswith("/") and target != "":
+                return target
+        return fallback
+
+    def _build_volumes(
+        self,
+        model_path: str,
+        hf_cache: str | None = None,
+        image: str | None = None,
+    ) -> dict:
         """Build the ``volumes`` dict for a Docker container.
 
         Always mounts the HuggingFace cache (if provided).  Additionally, when
@@ -1280,7 +1967,7 @@ class Manager:
         if hf_cache:
             resolved = str(Path(hf_cache).expanduser().resolve())
             volumes[resolved] = {
-                "bind": "/root/.cache/huggingface",
+                "bind": self._image_hf_cache_target(image),
                 "mode": "rw",
             }
         # Local model path
@@ -2097,12 +2784,34 @@ class Manager:
         sg_image: str | None = None,
         deployment_mode: str = "single",
         node_ids: list[str] | None = None,
+        launch_controls: dict | None = None,
+        force_new: bool = False,
     ) -> dict:
         if not model:
             raise ValueError("model is required")
+        if launch_controls is not None:
+            if not isinstance(launch_controls, dict):
+                raise ValueError("launch_controls must be an object")
+            launch_controls = {
+                **self._deployment_launch_controls({
+                    "engine": engine,
+                    "extra_args": list(extra_args or []),
+                    "sg_context_length": sg_context_length,
+                    "sg_max_running_requests": sg_max_running_requests,
+                }),
+                **launch_controls,
+            }
+            extra_args = self._apply_deployment_launch_controls(
+                list(extra_args or []), engine, launch_controls
+            )
+            if engine == "sglang":
+                if "context_window" in launch_controls:
+                    sg_context_length = launch_controls.get("context_window")
+                if "max_concurrency" in launch_controls:
+                    sg_max_running_requests = launch_controls.get("max_concurrency")
         async with self.lock:
             key = self._recipe_key(model, image, extra_args, engine, deployment_mode, node_ids)
-            for r in self.recipes:
+            for r in [] if force_new else self.recipes:
                 if self._recipe_key(
                     r.get("model", ""), r.get("image"), r.get("extra_args"),
                     r.get("engine", "vllm"), r.get("deployment_mode", "single"),
@@ -2164,6 +2873,66 @@ class Manager:
                 return True
         return False
 
+    async def update_recipe(self, rid: str, changes: dict) -> dict:
+        """Update the durable launch inputs for an existing recipe."""
+        if not isinstance(changes, dict):
+            raise ValueError("recipe changes must be an object")
+        allowed = {
+            "name", "model", "engine", "image", "extra_args",
+            "gpu_memory_utilization", "gpu_memory_gb", "sg_tp_size",
+            "sg_context_length", "sg_max_running_requests", "sg_mem_fraction",
+            "sg_image", "deployment_mode", "node_ids", "launch_controls",
+        }
+        unknown = sorted(set(changes) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported recipe field(s): {', '.join(unknown)}")
+        async with self.lock:
+            recipe = next((r for r in self.recipes if r.get("id") == rid), None)
+            if not recipe:
+                raise ValueError("recipe not found")
+            merged = {**recipe, **changes}
+            if not str(merged.get("model") or "").strip():
+                raise ValueError("model is required")
+            engine = merged.get("engine") or "vllm"
+            if engine not in {"vllm", "sglang"}:
+                raise ValueError("engine must be vllm or sglang")
+            mode = merged.get("deployment_mode") or "single"
+            if mode not in {"single", "sharded", "replicated"}:
+                raise ValueError("deployment_mode must be single, sharded, or replicated")
+            nodes = list(dict.fromkeys(merged.get("node_ids") or [LOCAL_NODE_ID]))
+            if mode == "single":
+                nodes = nodes[:1]
+            elif len(nodes) < 2:
+                raise ValueError(f"{mode} deployment requires at least two nodes")
+            controls = changes.get("launch_controls")
+            if controls is not None:
+                if not isinstance(controls, dict):
+                    raise ValueError("launch_controls must be an object")
+                controls = {
+                    **self._deployment_launch_controls(
+                        self._deployment_launch_settings(merged)
+                    ),
+                    **controls,
+                }
+                merged["extra_args"] = self._apply_deployment_launch_controls(
+                    list(merged.get("extra_args") or []), engine, controls
+                )
+                if engine == "sglang":
+                    if "context_window" in controls:
+                        merged["sg_context_length"] = controls.get("context_window")
+                    if "max_concurrency" in controls:
+                        merged["sg_max_running_requests"] = controls.get("max_concurrency")
+            merged.pop("launch_controls", None)
+            merged["node_ids"] = nodes
+            merged["engine"] = engine
+            merged["deployment_mode"] = mode
+            merged["extra_args"] = list(merged.get("extra_args") or [])
+            merged["updated_at"] = time.time()
+            recipe.clear()
+            recipe.update(merged)
+            self._save_recipes()
+            return dict(recipe)
+
     async def get_recipe(self, rid: str) -> dict | None:
         for r in self.recipes:
             if r.get("id") == rid:
@@ -2183,6 +2952,46 @@ class Manager:
 
     def _save_spark_launches(self):
         self.spark_launches_path.write_text(json.dumps(self.spark_launches, indent=2))
+
+    @staticmethod
+    def _normalize_spark_reference(reference: str) -> str:
+        """Accept the reference formats users commonly paste into the portal."""
+        value = (reference or "").strip()
+        if value.lower().startswith("sparkrun run "):
+            try:
+                tokens = shlex.split(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid SparkRun command: {exc}") from exc
+            if len(tokens) < 3:
+                raise ValueError("SparkRun command is missing a recipe reference")
+            value = tokens[2]
+
+        uuid_match = re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            value,
+        )
+        if uuid_match:
+            return f"@spark-arena/{value.lower()}"
+
+        if re.match(r"https?://(?:www\.)?spark-arena\.com/", value, re.IGNORECASE):
+            match = re.search(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                value,
+            )
+            if match:
+                return f"@spark-arena/{match.group(0).lower()}"
+        return value
+
+    @staticmethod
+    def _sparkrun_error(stderr: bytes, reference: str) -> str:
+        """Return the useful CLI error without exposing a Python traceback."""
+        text = stderr.decode("utf-8", errors="replace").strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        detail = lines[-1] if lines else f"SparkRun could not resolve {reference}"
+        detail = re.sub(r"^[\w.]+(?:Error|Exception):\s*", "", detail)
+        return detail[:1000]
 
     @staticmethod
     def _sparkrun_executable() -> str:
@@ -2252,8 +3061,7 @@ class Manager:
             await proc.wait()
             raise ValueError("SparkRun took too long to resolve this run")
         if proc.returncode:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            raise ValueError(detail or f"SparkRun could not resolve {reference}")
+            raise ValueError(self._sparkrun_error(stderr, reference))
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError as e:
@@ -2308,7 +3116,7 @@ class Manager:
         return temp.name, temp.name, repairs
 
     async def add_spark_launch(self, reference: str) -> dict:
-        reference = (reference or "").strip()
+        reference = self._normalize_spark_reference(reference)
         if not reference or len(reference) > 500 or any(c in reference for c in "\r\n\x00"):
             raise ValueError("a valid SparkRun reference is required")
         name, metadata = await self._resolve_spark_reference(reference)
@@ -2746,6 +3554,7 @@ class Manager:
         summary = {
             "id": c.short_id,
             "name": c.name,
+            "alias": getattr(self, "container_aliases", {}).get(c.name),
             "image": image_tag,
             "status": c.status,
             "model": model,
@@ -2759,6 +3568,8 @@ class Manager:
             "load_settings": self._container_load_settings(cmd, engine_label, model),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),
+            "started_at": (c.attrs.get("State") or {}).get("StartedAt"),
+            "restart_count": c.attrs.get("RestartCount", 0),
         }
         if labels.get(DEPLOYMENT_LABEL):
             summary.update({
@@ -3031,7 +3842,9 @@ class Manager:
                     "entrypoint": ["python3"],
                     "name": name,
                     "detach": True,
-                    "volumes": self._build_volumes(model, self.settings["hf_cache"]),
+                    "volumes": self._build_volumes(
+                        model, self.settings["hf_cache"], image
+                    ),
                     "ipc_mode": "host",
                     "shm_size": self.settings["shm_size"],
                     "device_requests": [
@@ -3171,7 +3984,9 @@ class Manager:
                     "entrypoint": [],
                     "name": name,
                     "detach": True,
-                    "volumes": self._build_volumes(model, self.settings["hf_cache"]),
+                    "volumes": self._build_volumes(
+                        model, self.settings["hf_cache"], image
+                    ),
                     "ipc_mode": "host",
                     "shm_size": self.settings["shm_size"],
                     "device_requests": [
@@ -3491,6 +4306,10 @@ class Manager:
             self.client.containers.get(name).remove(force=True)
         await asyncio.to_thread(_do)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
+        aliases = getattr(self, "container_aliases", {})
+        if name in aliases:
+            aliases.pop(name, None)
+            self._save_container_aliases()
         return {"ok": True}
 
     async def get_logs(self, name: str, tail: int = 200) -> str:
@@ -3707,7 +4526,10 @@ class Manager:
     def get_unsloth_settings(self, model_path: str) -> dict:
         """Saved per-model launch settings, merged over defaults."""
         saved = self.unsloth_settings.get(model_path, {})
-        return {**UNSLOTH_DEFAULT_SETTINGS, **saved}
+        merged = {**UNSLOTH_DEFAULT_SETTINGS, **saved}
+        if merged.get("split_mode") not in {"tensor", "layer", "row"}:
+            merged["split_mode"] = UNSLOTH_DEFAULT_SETTINGS["split_mode"]
+        return merged
 
     async def set_unsloth_settings(self, model_path: str, settings: dict) -> dict:
         async with self.lock:
@@ -3716,6 +4538,11 @@ class Manager:
                 if k in UNSLOTH_DEFAULT_SETTINGS:
                     merged[k] = v
             merged["parallel"] = max(1, min(16, int(merged.get("parallel") or 1)))
+            merged["tensor_parallel_size"] = max(
+                2, min(16, int(merged.get("tensor_parallel_size") or 2))
+            )
+            if merged.get("split_mode") not in {"tensor", "layer", "row"}:
+                merged["split_mode"] = UNSLOTH_DEFAULT_SETTINGS["split_mode"]
             merged["mtp_predict_tokens"] = max(
                 1, min(64, int(merged.get("mtp_predict_tokens") or 1))
             )
@@ -3813,12 +4640,19 @@ class Manager:
 
     async def _find_gguf(self, model_path: str, variant: str) -> tuple[dict, dict]:
         """Resolve (model entry, variant entry) for a repo id + quant tag."""
+        def normalized_quant(value: str) -> str:
+            value = str(value or "").strip()
+            return re.sub(r"^(?:ggml-model-|model-)", "", value, flags=re.I).upper()
+
         models = await asyncio.to_thread(self._scan_gguf_models)
         for m in models:
             if m["id"] != model_path:
                 continue
             for v in m["variants"]:
-                if v["quant"] == variant:
+                if (
+                    v["quant"] == variant
+                    or normalized_quant(v["quant"]) == normalized_quant(variant)
+                ):
                     return m, v
             raise LookupError(
                 f"variant '{variant}' not downloaded for '{model_path}' "
@@ -3888,6 +4722,156 @@ class Manager:
         except OSError:
             return False
 
+    def _llama_rpc_binary(self) -> Path:
+        """Resolve the ggml RPC worker next to the configured llama-server."""
+        configured = Path(
+            self.settings.get("llama_rpc_server_bin")
+            or "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server"
+        ).expanduser()
+        llama_bin = Path(self.settings["llama_server_bin"]).expanduser()
+        candidates = [
+            configured,
+            llama_bin.parent / "ggml-rpc-server",
+            llama_bin.parent / "rpc-server",
+            llama_bin.parent / "build" / "bin" / "ggml-rpc-server",
+        ]
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        return configured
+
+    def _llama_rpc_adopt(self) -> None:
+        if self._llama_rpc_adopt_tried:
+            return
+        self._llama_rpc_adopt_tried = True
+        try:
+            state = json.loads(self._llama_rpc_state_path.read_text())
+            pid = int(state.get("pid") or 0)
+            host = str(state.get("host") or "")
+            port = int(state.get("port") or 0)
+            if pid and host and port and self._pid_alive(pid):
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+                    errors="replace"
+                )
+                if "rpc-server" in cmdline and host in cmdline and str(port) in cmdline:
+                    self._llama_rpc_pid = pid
+                    self._llama_rpc_host = host
+                    self._llama_rpc_port = port
+                    return
+        except Exception:
+            pass
+        try:
+            self._llama_rpc_state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def llama_rpc_status(self) -> dict:
+        self._llama_rpc_adopt()
+        running = bool(
+            self._llama_rpc_pid and self._pid_alive(self._llama_rpc_pid)
+        )
+        return {
+            "available": self._llama_rpc_binary().is_file(),
+            "running": running,
+            "host": self._llama_rpc_host if running else None,
+            "port": self._llama_rpc_port if running else None,
+            "pid": self._llama_rpc_pid if running else None,
+        }
+
+    async def start_llama_rpc_worker(self, host: str, port: int | None = None) -> dict:
+        """Expose this node's CUDA device to a trusted coordinator fabric."""
+        host = str(host or "").strip()
+        port = int(port or self.settings.get("llama_rpc_port") or 50052)
+        if not host:
+            raise ValueError("fabric host is required")
+        if port < 1024 or port > 65535:
+            raise ValueError("llama RPC port must be between 1024 and 65535")
+        local_addresses = {
+            address
+            for interface in self._network_interfaces()
+            for address in interface.get("ipv4") or []
+        }
+        if host not in local_addresses:
+            raise ValueError(f"{host} is not an address on this node")
+        binary = self._llama_rpc_binary()
+        if not binary.is_file():
+            raise RuntimeError(
+                f"ggml-rpc-server binary not found at {binary}; rebuild llama.cpp "
+                "with -DGGML_RPC=ON"
+            )
+
+        async with self._llama_rpc_lock:
+            current = self.llama_rpc_status()
+            if current["running"] and current["host"] == host and current["port"] == port:
+                return current
+            await self.stop_llama_rpc_worker()
+            await self.evict_other_backends(protect="unsloth")
+            self._llama_log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = open(self._llama_rpc_log_path, "ab")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    str(binary), "--host", host, "--port", str(port), "--cache",
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            finally:
+                log_file.close()
+            self._llama_rpc_proc = proc
+            self._llama_rpc_pid = proc.pid
+            self._llama_rpc_host = host
+            self._llama_rpc_port = port
+            self._llama_rpc_state_path.write_text(json.dumps({
+                "pid": proc.pid,
+                "host": host,
+                "port": port,
+                "started_at": time.time(),
+            }, indent=2))
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if proc.returncode is not None:
+                    break
+                try:
+                    reader, writer = await asyncio.open_connection(host, port)
+                    writer.close()
+                    await writer.wait_closed()
+                    return self.llama_rpc_status()
+                except Exception:
+                    await asyncio.sleep(0.5)
+            tail = ""
+            try:
+                tail = self._llama_rpc_log_path.read_text(errors="replace")[-1200:]
+            except Exception:
+                pass
+            await self.stop_llama_rpc_worker()
+            raise RuntimeError(f"ggml-rpc-server failed to start. Log tail:\n{tail}")
+
+    async def stop_llama_rpc_worker(self) -> dict:
+        self._llama_rpc_adopt()
+        pid = self._llama_rpc_pid
+        if pid and self._pid_alive(pid):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            deadline = time.time() + 10
+            while time.time() < deadline and self._pid_alive(pid):
+                await asyncio.sleep(0.25)
+            if self._pid_alive(pid):
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        self._llama_rpc_proc = None
+        self._llama_rpc_pid = None
+        self._llama_rpc_host = None
+        self._llama_rpc_port = 0
+        try:
+            self._llama_rpc_state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"ok": True, **self.llama_rpc_status()}
+
     def _llama_adopt(self):
         """One-shot: re-adopt a llama-server we launched before a controller
         restart, using the state file. Validates pid + cmdline."""
@@ -3904,6 +4888,8 @@ class Manager:
                     self._llama_pid = pid
                     self._llama_model = st.get("model")
                     self._llama_port = int(st.get("port") or 0)
+                    self._llama_rpc_nodes = list(st.get("rpc_node_ids") or [])
+                    self._llama_rpc_endpoints = list(st.get("rpc_endpoints") or [])
                     self._llama_ready = True  # adopted servers were ready
                     return
         except Exception:
@@ -3928,6 +4914,8 @@ class Manager:
             self._llama_state_path.write_text(json.dumps({
                 "pid": pid, "model": model, "port": port,
                 "gguf_path": gguf_path, "started_at": time.time(),
+                "rpc_node_ids": self._llama_rpc_nodes,
+                "rpc_endpoints": self._llama_rpc_endpoints,
             }, indent=2))
         except Exception as e:
             print(f"[llama] failed to write state file: {e}")
@@ -3998,7 +4986,100 @@ class Manager:
             "phase": phase,
             "log_line": log_line,
             "percent": percent,
+            "tensor_parallel_size": info.get("tensor_parallel_size", 1),
+            "rpc_endpoints": list(info.get("rpc_endpoints") or []),
         }
+
+    async def _stop_running_cluster_deployments(self) -> None:
+        """Free both sides of a sharded Docker deployment before llama RPC."""
+        active_ids = {
+            container.get("deployment_id")
+            for container in await self.list_containers()
+            if container.get("status") == "running" and container.get("deployment_id")
+        }
+        for deployment in list(self.deployments):
+            if deployment.get("status") == "stopped":
+                continue
+            if deployment.get("status") == "error" and deployment.get("id") not in active_ids:
+                continue
+            await self.deployment_action(deployment["id"], "stop")
+
+    async def _start_llama_rpc_cluster(self, tp_size: int) -> list[str]:
+        """Start one authenticated RPC worker for every non-local TP rank."""
+        nodes = await self.cluster_nodes()
+        remotes = [
+            node for node in nodes
+            if not node.get("local") and node.get("online")
+        ]
+        needed = tp_size - 1
+        if len(remotes) < needed:
+            raise RuntimeError(
+                f"llama.cpp TP={tp_size} needs {needed} online remote node(s); "
+                f"only {len(remotes)} available"
+            )
+        selected = remotes[:needed]
+        port = int(self.settings.get("llama_rpc_port") or 50052)
+        started: list[str] = []
+        endpoints: list[str] = []
+        try:
+            for node in selected:
+                fabric_ip, _ = self._inferred_fabric(
+                    node, node.get("fabric_ip"), node.get("fabric_interface")
+                )
+                if not fabric_ip:
+                    raise RuntimeError(
+                        f"could not determine fabric IP for {node.get('name', node['id'])}"
+                    )
+                await self.node_registry.request(
+                    node["id"], "POST", "/api/agent/llama-rpc",
+                    json_body={"host": fabric_ip, "port": port}, timeout=45,
+                )
+                started.append(node["id"])
+                endpoints.append(f"{fabric_ip}:{port}")
+        except Exception:
+            await asyncio.gather(*(
+                self.node_registry.request(
+                    node_id, "DELETE", "/api/agent/llama-rpc", timeout=15
+                )
+                for node_id in started
+            ), return_exceptions=True)
+            raise
+        self._llama_rpc_nodes = started
+        self._llama_rpc_endpoints = endpoints
+        return endpoints
+
+    @staticmethod
+    def _llama_tensor_parallel_args(
+        argv: list[str], endpoints: list[str], tp_size: int,
+        split_mode: str = "tensor",
+    ) -> list[str]:
+        if tp_size < 2 or len(endpoints) != tp_size - 1:
+            raise ValueError("llama.cpp multi-GPU endpoints do not match GPU count")
+        if split_mode not in {"tensor", "layer", "row"}:
+            raise ValueError(f"unsupported llama.cpp split mode: {split_mode}")
+        return [
+            *argv,
+            "--rpc", ",".join(endpoints),
+            "--split-mode", split_mode,
+            "--tensor-split", ",".join("1" for _ in range(tp_size)),
+            "--fit", "off",
+        ]
+
+    async def _stop_remote_llama_rpc_workers(self) -> None:
+        node_ids = list(self._llama_rpc_nodes)
+        self._llama_rpc_nodes = []
+        self._llama_rpc_endpoints = []
+        if not node_ids:
+            return
+        results = await asyncio.gather(*(
+            self.node_registry.request(
+                node_id, "DELETE", "/api/agent/llama-rpc", timeout=15
+            )
+            for node_id in node_ids
+        ), return_exceptions=True)
+        for node_id, result in zip(node_ids, results):
+            if isinstance(result, Exception):
+                print(f"[llama-rpc] failed to stop {node_id}: {result}")
 
     async def load_unsloth_model(self, model_path: str, overrides: dict | None = None) -> dict:
         """Launch llama-server for a cached GGUF model. Settings come from the
@@ -4013,6 +5094,11 @@ class Manager:
                 if k in settings:
                     settings[k] = v
         settings["parallel"] = max(1, min(16, int(settings.get("parallel") or 1)))
+        settings["tensor_parallel_size"] = max(
+            2, min(16, int(settings.get("tensor_parallel_size") or 2))
+        )
+        if settings.get("split_mode") not in {"tensor", "layer", "row"}:
+            settings["split_mode"] = UNSLOTH_DEFAULT_SETTINGS["split_mode"]
         settings["mtp_predict_tokens"] = max(
             1, min(64, int(settings.get("mtp_predict_tokens") or 1))
         )
@@ -4024,6 +5110,8 @@ class Manager:
         host = self.settings.get("llama_server_host") or "127.0.0.1"
 
         parallel = settings["parallel"]
+        tensor_parallel = bool(settings.get("tensor_parallel"))
+        tp_size = int(settings.get("tensor_parallel_size") or 2) if tensor_parallel else 1
         max_seq = int(settings.get("max_seq_length") or 0)
         # When multiple parallel slots are active, scale context per slot so each
         # slot gets a full max_seq_length window (llama-server shares -c across slots).
@@ -4062,7 +5150,15 @@ class Manager:
             # GPU: stop vLLM containers and Ollama models. protect="unsloth"
             # so the eviction doesn't stop the server we just want to swap.
             await self._stop_llama_server()
+            if tensor_parallel:
+                await self._stop_running_cluster_deployments()
             await self.evict_other_backends(protect="unsloth")
+            rpc_endpoints: list[str] = []
+            if tensor_parallel:
+                rpc_endpoints = await self._start_llama_rpc_cluster(tp_size)
+                argv = self._llama_tensor_parallel_args(
+                    argv, rpc_endpoints, tp_size, settings["split_mode"]
+                )
 
             base_port = int(self.settings.get("llama_server_port") or 8100)
             port = None
@@ -4077,6 +5173,7 @@ class Manager:
                 finally:
                     s.close()
             if port is None:
+                await self._stop_remote_llama_rpc_workers()
                 raise RuntimeError(f"no free port in {base_port}..{base_port + 9}")
             argv[argv.index("--port") + 1] = str(port)
 
@@ -4089,7 +5186,9 @@ class Manager:
                 )
             except Exception:
                 log_file.close()
+                await self._stop_remote_llama_rpc_workers()
                 raise
+            log_file.close()
             self._llama_proc = proc
             self._llama_pid = proc.pid
             self._llama_model = model_path
@@ -4099,10 +5198,12 @@ class Manager:
                 "model": model_path, "variant": variant["quant"],
                 "started_at": time.time(), "log": str(log_path),
                 "size_bytes": variant.get("size_bytes") or 0,
+                "tensor_parallel_size": tp_size,
+                "rpc_endpoints": rpc_endpoints,
             }
             self._llama_write_state(proc.pid, model_path, port, variant["path"])
             print(f"[llama] launched pid={proc.pid} port={port} model={model_path} "
-                  f"variant={variant['quant']} log={log_path}")
+                  f"variant={variant['quant']} tp={tp_size} log={log_path}")
 
             # Wait for readiness; on failure include the log tail.
             try:
@@ -4127,6 +5228,12 @@ class Manager:
                         pass
                     await self._stop_llama_server()
                     if proc.returncode is not None:
+                        if "LLAMA_SPLIT_MODE_TENSOR not implemented" in tail:
+                            raise RuntimeError(
+                                "llama-server tensor split does not support this model "
+                                "architecture. In Load settings, select Layer split and "
+                                f"retry. Log tail:\n{tail}"
+                            )
                         raise RuntimeError(
                             f"llama-server exited during load (code {proc.returncode}). "
                             f"Log tail:\n{tail}"
@@ -4169,6 +5276,7 @@ class Manager:
         self._llama_model = None
         self._llama_port = 0
         self._llama_ready = False
+        await self._stop_remote_llama_rpc_workers()
         try:
             self._llama_state_path.unlink(missing_ok=True)
         except Exception:
@@ -5506,6 +6614,8 @@ class Manager:
         for saved in self.deployments:
             deployment = {**saved, "members": []}
             member_states = []
+            runtime_flags = []
+            primary_container = None
             for original in saved.get("members", []):
                 member = dict(original)
                 node = node_by_id.get(member.get("node_id"), {})
@@ -5518,6 +6628,17 @@ class Manager:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")
                     member["container_id"] = container.get("id", member.get("container_id"))
+                    load_settings = container.get("load_settings") or {}
+                    command_flags = load_settings.get("command_flags")
+                    if command_flags is not None:
+                        runtime_flags.append({
+                            "node_id": member.get("node_id"),
+                            "node_name": member.get("node_name"),
+                            "rank": member.get("rank"),
+                            "command_flags": command_flags,
+                        })
+                    if primary_container is None or member.get("rank") == 0:
+                        primary_container = container
                 elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
                 member["node_status"] = node.get("status", "unknown")
@@ -5532,6 +6653,32 @@ class Manager:
                     primary = deployment["members"][0]
                     phase = primary.get("phase") or {}
                     deployment["status"] = "ready" if phase.get("phase") == "ready" else "starting"
+            if not deployment.get("launch_settings"):
+                load_settings = (primary_container or {}).get("load_settings") or {}
+                try:
+                    recovered_args = shlex.split(load_settings.get("command_flags") or "")
+                except ValueError:
+                    recovered_args = list(load_settings.get("extra_args") or [])
+                recovered_args = self._without_cli_options(
+                    recovered_args,
+                    {"--host", "--port", "--gpu-memory-utilization",
+                     "--gpu_memory_utilization"},
+                )
+                deployment["launch_settings"] = self._deployment_launch_settings({
+                    "deployment_name": saved.get("name"),
+                    "model": saved.get("model"),
+                    "engine": saved.get("engine", "vllm"),
+                    "image": (primary_container or {}).get("image"),
+                    "extra_args": recovered_args,
+                    "gpu_memory_utilization": load_settings.get("gpu_memory_utilization"),
+                    "deployment_mode": saved.get("mode", "single"),
+                    "node_ids": saved.get("node_ids") or [LOCAL_NODE_ID],
+                    "port": saved.get("api_port"),
+                })
+            deployment["launch_controls"] = self._deployment_launch_controls(
+                deployment["launch_settings"]
+            )
+            deployment["runtime_flags"] = runtime_flags
             public_deployments.append(deployment)
         running_models = [c for c in containers if c["status"] == "running"]
         # Token-stats key of the model currently holding the GPU, so the UI
@@ -5557,6 +6704,11 @@ class Manager:
             "recipes": list(self.recipes),
             "recipe_launches": dict(self.recipe_launches),
             "token_stats": self.token_stats,
+            "token_costs": {
+                model: self.calculate_cost(model, model_stats)
+                for model, model_stats in self.token_stats.items()
+            },
+            "usage_aliases": dict(self.usage_aliases),
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
             "ollama": ollama,

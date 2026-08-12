@@ -38,16 +38,103 @@ FastAPI service.
    - **Replicated** — an independent complete model on every selected node.
 
 Sharded vLLM launches use native multi-node multiprocessing with coordinator-
-owned rank/master arguments, one tensor-parallel rank per DGX Spark, pipeline
-parallelism across nodes, and headless worker ranks. Sharded SGLang launches use coordinated
+owned rank/master arguments and headless worker ranks. By default, pipeline
+parallelism spans the selected nodes; recipes can explicitly select a valid
+tensor/pipeline layout whose product equals the node count. Sharded SGLang launches use coordinated
 `--nnodes`, `--node-rank`, `--dist-init-addr`, and TP arguments. Cluster
 containers use host networking, `/dev/infiniband` when present, unlimited
 memlock, and node-specific NCCL/Gloo interface settings. The public model API
 is the rank-0 endpoint on node 1.
 
+Stopped cluster deployment cards expose **Launch settings**. The editor shows
+the saved common arguments and each rank's generated runtime flags. Common
+vLLM/SGLang controls are parsed into dedicated fields, including context,
+concurrency, KV-cache dtype, thinking, speculative-token count, CUDA-graph
+capture size, and batched-token limits. Saving
+marks the deployment for rebuild, and the next Start recreates every member
+with the edited model, image, memory, topology, and command-line settings.
+Cluster deployments and standalone Docker model cards also have a **Rename**
+action. These aliases are display-only, persist across controller restarts,
+and never change Docker identities, API model names, routing, or running state.
+
 Agent credentials and paired-node tokens are stored in `data/agent.json` and
 `data/nodes.json` with mode `0600`. Do not expose either controller to the
 public internet; use a trusted LAN, Tailscale, or WireGuard management network.
+
+### llama.cpp tensor parallelism
+
+GGUF models in the **llama-server** section can use paired Spark GPUs through
+llama.cpp's RPC backend. Build the matching worker binary on every Spark from
+the same llama.cpp source revision used by `llama-server`:
+
+```bash
+cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build-rpc \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_ARCHITECTURES=121 -DGGML_CUDA=ON -DGGML_RPC=ON \
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/.unsloth/llama.cpp/build-rpc \
+  --target ggml-rpc-server -j 8
+```
+
+In a model's **Load settings**, enable **Multi-GPU cluster**, choose the GPU
+count, and select a split mode. A count of 2 uses the coordinator GPU plus one
+paired Spark. The
+coordinator starts the remote worker through its authenticated agent API,
+binds it only to the selected ConnectX address, and launches `llama-server`
+with `--rpc`, the selected `--split-mode`, and an equal `--tensor-split`.
+`tensor` is experimental and is unavailable for some architectures, including
+DeepSeek 4; use `layer` for those models. Workers are stopped when the model
+unloads or its launch fails. The llama.cpp RPC protocol
+itself is unauthenticated, so keep the ConnectX fabric isolated and never bind
+its port to a public or general-purpose network.
+
+## MCP cluster automation and A/B testing
+
+The controller includes an MCP control plane for recipes, cluster lifecycle,
+and reproducible benchmarks. It uses Streamable HTTP on the controller's
+existing port at `http://127.0.0.1:7878/mcp`; no second process or port is
+required.
+
+For clients that accept an HTTP MCP URL, configure:
+
+```text
+http://127.0.0.1:7878/mcp
+```
+
+For example, Codex can use this project configuration:
+
+```toml
+[mcp_servers.vllm-controller]
+url = "http://127.0.0.1:7878/mcp"
+```
+
+The server publishes tools to list recipes/deployments, create/update/clone a
+recipe, deploy with overrides, wait for readiness, benchmark a deployment,
+stop or delete by deployment ID, and run a complete sequential A/B comparison.
+`run_cluster_ab_test` launches A, waits, warms up, measures it, frees its GPUs,
+then repeats for B using identical prompts. Results include aggregate output
+tokens/second, request throughput, mean/p50/p95 latency, the winning variant,
+and percentage change. The last 100 outcomes are retained in
+`data/mcp_ab_results.json`.
+
+MCP deployments are tagged with `managed_by=vllm-controller-mcp` and an
+`automation_run_id`. Stop/delete tools reject deployment IDs created outside
+MCP unless the caller explicitly sets `allow_unowned=true`. The A/B tool is
+idle-cluster-safe by default and only removes deployment IDs from its own run.
+
+The MCP route follows the same network exposure as VLLMController. To require a
+bearer token for MCP requests, set these variables on the controller service:
+
+```bash
+VLLM_MCP_TOKEN='replace-with-a-long-random-token' \
+VLLM_MCP_PUBLIC_URL='http://your-private-host:7878/mcp' \
+./run.sh
+```
+
+Send that value as `Authorization: Bearer <token>` from the MCP client. Keep
+the endpoint on a trusted private network; bearer authentication does not add
+TLS.
 
 ## Calling a model
 
@@ -147,7 +234,7 @@ curl -s -X POST http://<controller>:7878/api/queue/<job_id>/run
 | `GET`/`POST` | `/api/settings`         | Read/update controller settings |
 | `GET`/`POST`/`DELETE` | `/api/containers[/...]` | List/create/start/stop/remove containers, fetch logs |
 | `POST`/`PATCH`/`DELETE` | `/api/nodes[/...]` | Pair, configure, probe, or remove cluster nodes |
-| `POST`/`GET` | `/api/deployments/{id}/...` | Start/stop/remove a deployment or collect member logs |
+| `POST`/`GET`/`PUT` | `/api/deployments/{id}/...` | Start/stop/remove a deployment, edit launch settings, or collect member logs |
 | `GET`/`POST`/`DELETE` | `/api/agent/...` | Authenticated node status, pairing, and member lifecycle API |
 | `POST`   | `/api/images/pull`          | Pull a docker image (SSE progress stream) |
 
@@ -172,7 +259,7 @@ Persisted in `data/settings.json`. All fields are editable from the Settings tab
 | `max_retries` | `2` | Retries on inference failure (0 = none) |
 | `idle_timeout_seconds` | `30` | Auto-stop after this many seconds of inactivity (0 disables) |
 | `vllm_image` | `nvcr.io/nvidia/vllm:26.03.post1-py3` | Image used for new model containers |
-| `hf_cache` | `~/.cache/huggingface` | Bind-mounted into each container at `/root/.cache/huggingface` |
+| `hf_cache` | `~/.cache/huggingface` | Bind-mounted at the image's `HF_HOME` (or `/root/.cache/huggingface` when unset) |
 | `shm_size` | `16g` | `--shm-size` for new containers |
 | `default_gpu_memory_utilization` | `0.9` | Pre-fills the launch form |
 | `port_range_start` / `port_range_end` | `8000` / `8099` | Auto-allocated host ports |

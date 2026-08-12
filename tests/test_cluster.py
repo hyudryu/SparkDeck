@@ -33,6 +33,34 @@ class AgentCredentialsTests(unittest.TestCase):
             normalize_agent_url("http://user:secret@spark-2:7878")
 
 
+class SparkRunReferenceTests(unittest.TestCase):
+    UUID = "13321ed7-516e-412a-ba13-bf00c4d805c3"
+
+    def test_normalizes_common_portal_inputs(self) -> None:
+        expected = f"@spark-arena/{self.UUID}"
+        for value in (
+            self.UUID,
+            f"https://spark-arena.com/api/recipes/{self.UUID}/raw",
+            f"https://spark-arena.com/recipes/{self.UUID}",
+            f"sparkrun run @spark-arena/{self.UUID} --solo",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(Manager._normalize_spark_reference(value), expected)
+
+    def test_preserves_local_recipe_reference(self) -> None:
+        self.assertEqual(
+            Manager._normalize_spark_reference("recipes/custom.yaml"),
+            "recipes/custom.yaml",
+        )
+
+    def test_cli_error_does_not_expose_traceback(self) -> None:
+        stderr = b"Traceback (most recent call last):\nValueError: recipe not found\n"
+        self.assertEqual(
+            Manager._sparkrun_error(stderr, "missing"),
+            "recipe not found",
+        )
+
+
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -53,7 +81,6 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await client.aclose()
-
             self.assertNotIn("agent_token", public)
             saved = json.loads((Path(directory) / "nodes.json").read_text())
             self.assertEqual(saved[0]["agent_token"], "durable-secret")
@@ -96,7 +123,183 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 await client.aclose()
 
 
+class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
+    def test_tp2_arguments_use_rpc_tensor_split(self) -> None:
+        argv = Manager._llama_tensor_parallel_args(
+            ["llama-server", "-m", "model.gguf"],
+            ["10.100.144.2:50052"],
+            2,
+        )
+
+        self.assertEqual(argv[argv.index("--rpc") + 1], "10.100.144.2:50052")
+        self.assertEqual(argv[argv.index("--split-mode") + 1], "tensor")
+        self.assertEqual(argv[argv.index("--tensor-split") + 1], "1,1")
+        self.assertEqual(argv[argv.index("--fit") + 1], "off")
+
+    def test_layer_split_arguments_use_rpc_workers(self) -> None:
+        argv = Manager._llama_tensor_parallel_args(
+            ["llama-server", "-m", "model.gguf"],
+            ["10.100.144.2:50052"],
+            2,
+            "layer",
+        )
+
+        self.assertEqual(argv[argv.index("--rpc") + 1], "10.100.144.2:50052")
+        self.assertEqual(argv[argv.index("--split-mode") + 1], "layer")
+        self.assertEqual(argv[argv.index("--tensor-split") + 1], "1,1")
+
+    def test_rejects_unknown_llama_split_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported llama.cpp split mode"):
+            Manager._llama_tensor_parallel_args(
+                ["llama-server", "-m", "model.gguf"],
+                ["10.100.144.2:50052"],
+                2,
+                "unsupported",
+            )
+
+    async def test_starts_remote_rpc_worker_on_connectx_fabric(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"llama_rpc_port": 50052}
+        instance._llama_rpc_nodes = []
+        instance._llama_rpc_endpoints = []
+        requests = []
+
+        async def cluster_nodes(local_stats=None):
+            return [
+                {
+                    "id": "local", "local": True, "name": "Spark 1",
+                    "online": True, "fabric_ip": "10.100.144.1",
+                    "fabric_interface": "enp1s0f0np0", "interfaces": [],
+                },
+                {
+                    "id": "remote-1", "local": False, "name": "Spark 2",
+                    "online": True, "fabric_ip": None,
+                    "fabric_interface": None,
+                    "interfaces": [{
+                        "name": "enp1s0f0np0", "up": True, "rdma": True,
+                        "ipv4": ["10.100.144.2"],
+                    }],
+                },
+            ]
+
+        class Registry:
+            async def request(self, node_id, method, path, **kwargs):
+                requests.append((node_id, method, path, kwargs))
+                return {"running": True}
+
+        instance.cluster_nodes = cluster_nodes
+        instance.node_registry = Registry()
+
+        endpoints = await instance._start_llama_rpc_cluster(2)
+
+        self.assertEqual(endpoints, ["10.100.144.2:50052"])
+        self.assertEqual(instance._llama_rpc_nodes, ["remote-1"])
+        self.assertEqual(requests[0][0:3], (
+            "remote-1", "POST", "/api/agent/llama-rpc"
+        ))
+        self.assertEqual(requests[0][3]["json_body"], {
+            "host": "10.100.144.2", "port": 50052,
+        })
+
+    async def test_saved_short_quant_matches_ggml_model_filename(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._scan_gguf_models = lambda: [{
+            "id": "example/model-GGUF",
+            "variants": [{"quant": "ggml-model-Q8_0", "path": "/m.gguf"}],
+        }]
+
+        _, variant = await instance._find_gguf("example/model-GGUF", "Q8_0")
+
+        self.assertEqual(variant["path"], "/m.gguf")
+
+
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    def test_usage_alias_is_persisted_and_can_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.token_stats = {"model/a [Q8]": {"input": 1}}
+            instance.usage_aliases = {}
+            instance.usage_aliases_path = Path(directory) / "usage_aliases.json"
+
+            saved = instance.update_usage_alias("model/a [Q8]", "Fast local")
+            self.assertEqual(saved["alias"], "Fast local")
+            self.assertEqual(
+                json.loads(instance.usage_aliases_path.read_text()),
+                {"model/a [Q8]": "Fast local"},
+            )
+
+            cleared = instance.update_usage_alias("model/a [Q8]", None)
+            self.assertIsNone(cleared["alias"])
+            self.assertEqual(json.loads(instance.usage_aliases_path.read_text()), {})
+
+    async def test_recipe_clone_controls_and_update_are_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = []
+            instance.recipes_path = Path(directory) / "recipes.json"
+
+            base = await instance.add_recipe(
+                "model/a", name="Base", extra_args=[], force_new=True
+            )
+            clone = await instance.add_recipe(
+                "model/a",
+                name="Variant",
+                extra_args=[],
+                launch_controls={"max_concurrency": 8},
+                force_new=True,
+            )
+            updated = await instance.update_recipe(
+                clone["id"],
+                {"launch_controls": {"context_window": 32768}},
+            )
+
+            self.assertNotEqual(base["id"], clone["id"])
+            self.assertEqual(
+                instance._cli_option(updated["extra_args"], {"--max-num-seqs"}, int),
+                8,
+            )
+            self.assertEqual(
+                instance._cli_option(updated["extra_args"], {"--max-model-len"}, int),
+                32768,
+            )
+            saved = json.loads(instance.recipes_path.read_text())
+            self.assertEqual(len(saved), 2)
+
+    def test_hf_cache_mount_uses_image_hf_home(self) -> None:
+        instance = Manager.__new__(Manager)
+        image = type("Image", (), {
+            "attrs": {"Config": {"Env": ["HOME=/tmp", "HF_HOME=/cache/huggingface"]}}
+        })()
+        instance.client = type("Client", (), {
+            "images": type("Images", (), {"get": lambda self, name: image})()
+        })()
+
+        volumes = instance._build_volumes(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "/host/huggingface",
+            "custom-vllm:latest",
+        )
+
+        self.assertEqual(
+            volumes["/host/huggingface"]["bind"], "/cache/huggingface"
+        )
+
+    def test_hf_cache_mount_falls_back_for_standard_images(self) -> None:
+        instance = Manager.__new__(Manager)
+        image = type("Image", (), {"attrs": {"Config": {"Env": []}}})()
+        instance.client = type("Client", (), {
+            "images": type("Images", (), {"get": lambda self, name: image})()
+        })()
+
+        volumes = instance._build_volumes(
+            "example/Model", "/host/huggingface", "standard-vllm:latest"
+        )
+
+        self.assertEqual(
+            volumes["/host/huggingface"]["bind"], "/root/.cache/huggingface"
+        )
+
     def test_hf_token_is_masked_publicly_and_exported_to_containers(self) -> None:
         instance = Manager.__new__(Manager)
         instance.settings = {"hf_token": "hf_test_secret", "hf_cache": ""}
@@ -258,8 +461,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
-                    "--max-model-len", "65536", "--tensor-parallel-size", "99",
-                    "--pipeline-parallel-size", "99", "--headless",
+                    "--max-model-len", "65536", "--tensor-parallel-size", "2",
+                    "--pipeline-parallel-size", "1", "--headless",
                 ],
             })
 
@@ -269,14 +472,252 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
                 self.assertEqual(args[args.index("--nnodes") + 1], "2")
-                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "1")
-                self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "2")
+                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "2")
+                self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "1")
                 self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.1")
                 self.assertEqual("--headless" in args, rank > 0)
                 self.assertEqual(args.count("--tensor-parallel-size"), 1)
                 self.assertEqual(args.count("--pipeline-parallel-size"), 1)
                 self.assertEqual(payload["cluster_member"]["fabric_interface"],
                                  "cx7-local" if node_id == "local" else "cx7-remote")
+
+    async def test_vllm_sharded_launch_rejects_invalid_explicit_parallelism(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "cluster_fabric_ip": "169.254.10.1",
+            "cluster_fabric_interface": "cx7-local",
+        }
+        instance.deployments = []
+
+        async def cluster_nodes(local_stats=None):
+            return [
+                {
+                    "id": "local", "name": "Spark 1", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.1",
+                    "fabric_interface": "cx7-local", "interfaces": [],
+                },
+                {
+                    "id": "remote-1", "name": "Spark 2", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.2",
+                    "fabric_interface": "cx7-remote", "interfaces": [],
+                },
+            ]
+
+        instance.cluster_nodes = cluster_nodes
+
+        with self.assertRaisesRegex(ValueError, "multiply to the 2 selected nodes"):
+            await instance.create_deployment({
+                "model": "example/Model",
+                "engine": "vllm",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "extra_args": [
+                    "--tensor-parallel-size", "2",
+                    "--pipeline-parallel-size", "2",
+                ],
+            })
+
+        self.assertEqual(instance.deployments, [])
+
+    def test_stopped_deployment_launch_settings_are_saved_and_marked_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "Old name",
+                "model": "example/Old",
+                "engine": "vllm",
+                "mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "api_port": 8000,
+                "members": [],
+            }]
+
+            updated = instance.update_deployment_settings("deployment-1", {
+                "deployment_name": "Faster cluster",
+                "model": "example/New",
+                "engine": "vllm",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "extra_args": [
+                    "--max-model-len", "131072",
+                    "--tensor-parallel-size", "2",
+                    "--pipeline-parallel-size", "1",
+                ],
+                "image": "example/vllm:test",
+            })
+
+            self.assertTrue(updated["settings_dirty"])
+            self.assertEqual(updated["name"], "Faster cluster")
+            self.assertEqual(updated["launch_settings"]["port"], 8000)
+            self.assertEqual(
+                updated["launch_settings"]["extra_args"][1], "131072"
+            )
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(persisted[0]["launch_settings"]["image"], "example/vllm:test")
+
+    def test_cluster_launch_controls_parse_and_round_trip_dspark_flags(self) -> None:
+        instance = Manager.__new__(Manager)
+        args = [
+            "--max-model-len", "500000",
+            "--max-num-seqs", "12",
+            "--kv-cache-dtype", "nvfp4_ds_mla",
+            "--max-cudagraph-capture-size", "72",
+            "--max-num-batched-tokens", "8192",
+            "--default-chat-template-kwargs", '{"thinking":true,"tools":true}',
+            "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}',
+            "--image-specific-flag", "kept",
+        ]
+
+        parsed = instance._deployment_launch_controls({
+            "engine": "vllm", "extra_args": args,
+        })
+
+        self.assertEqual(parsed["context_window"], 500000)
+        self.assertEqual(parsed["max_concurrency"], 12)
+        self.assertEqual(parsed["kv_cache_dtype"], "nvfp4_ds_mla")
+        self.assertEqual(parsed["thinking_mode"], "enabled")
+        self.assertEqual(parsed["dspark_num_speculative_tokens"], 5)
+        self.assertEqual(parsed["max_cudagraph_capture_size"], 72)
+        self.assertEqual(parsed["max_num_batched_tokens"], 8192)
+
+        updated = instance._apply_deployment_launch_controls(
+            args,
+            "vllm",
+            {
+                "context_window": 262144,
+                "max_concurrency": 8,
+                "kv_cache_dtype": "fp8_per_token_head",
+                "thinking_mode": "disabled",
+                "dspark_num_speculative_tokens": 3,
+                "max_cudagraph_capture_size": 48,
+                "max_num_batched_tokens": 4096,
+            },
+        )
+
+        self.assertEqual(
+            instance._cli_option(updated, {"--max-model-len"}, int), 262144
+        )
+        self.assertEqual(instance._cli_option(updated, {"--max-num-seqs"}, int), 8)
+        self.assertEqual(
+            instance._cli_option(updated, {"--kv-cache-dtype"}),
+            "fp8_per_token_head",
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--max-cudagraph-capture-size"}, int), 48
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--max-num-batched-tokens"}, int), 4096
+        )
+        speculative = json.loads(
+            instance._cli_option(updated, {"--speculative-config"})
+        )
+        self.assertEqual(speculative["num_speculative_tokens"], 3)
+        self.assertEqual(speculative["method"], "dspark")
+        self.assertEqual(speculative["draft_sample_method"], "probabilistic")
+        template = json.loads(
+            instance._cli_option(updated, {"--default-chat-template-kwargs"})
+        )
+        self.assertFalse(template["thinking"])
+        self.assertTrue(template["tools"])
+        self.assertEqual(
+            instance._cli_option(updated, {"--image-specific-flag"}), "kept"
+        )
+
+    def test_running_deployment_settings_cannot_be_changed(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1", "status": "ready", "members": [],
+        }]
+
+        with self.assertRaisesRegex(ValueError, "stop the cluster"):
+            instance.update_deployment_settings("deployment-1", {"model": "example/New"})
+
+    def test_running_deployment_can_be_renamed_without_dirtying_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "example/Model",
+                "model": "example/Model",
+                "status": "ready",
+                "settings_dirty": False,
+                "launch_settings": {
+                    "deployment_name": "example/Model",
+                    "model": "example/Model",
+                },
+                "members": [],
+            }]
+
+            updated = instance.update_deployment_alias(
+                "deployment-1", "Production reasoning"
+            )
+
+            self.assertEqual(updated["name"], "Production reasoning")
+            self.assertEqual(
+                updated["launch_settings"]["deployment_name"],
+                "Production reasoning",
+            )
+            self.assertFalse(updated["settings_dirty"])
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(persisted[0]["name"], "Production reasoning")
+
+    async def test_starting_dirty_deployment_rebuilds_every_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Editable cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "settings_dirty": True,
+                "members": [
+                    {"node_id": "local", "container_name": "old-r0"},
+                    {"node_id": "remote-1", "container_name": "old-r1"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Editable cluster",
+                    "model": "example/Model",
+                    "engine": "vllm",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": ["--tensor-parallel-size", "2"],
+                    "port": 8000,
+                },
+            }
+            instance.deployments = [old]
+            removed = []
+            launched = []
+
+            async def member_action(member, action):
+                removed.append((member["container_name"], action))
+                return {"ok": True}
+
+            async def create_deployment(body):
+                launched.append(body)
+                replacement = {
+                    "id": "deployment-new", "status": "starting", "members": [],
+                }
+                instance.deployments.append(replacement)
+                return replacement
+
+            instance._member_action = member_action
+            instance.create_deployment = create_deployment
+
+            result = await instance.deployment_action("deployment-old", "start")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(removed, [("old-r0", "remove"), ("old-r1", "remove")])
+            self.assertEqual(launched[0]["port"], 8000)
+            self.assertEqual([d["id"] for d in instance.deployments], ["deployment-new"])
 
     async def test_idle_monitor_never_stops_one_cluster_member(self) -> None:
         instance = Manager.__new__(Manager)
@@ -309,6 +750,170 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         await instance._idle_tick()
 
         self.assertEqual(stopped, [])
+
+    @staticmethod
+    def _health_deployment(status="ready"):
+        return {
+            "id": "deployment-1",
+            "status": status,
+            "members": [
+                {"node_id": "local", "rank": 0, "container_name": "rank-0"},
+                {"node_id": "remote-1", "rank": 1, "container_name": "rank-1"},
+            ],
+        }
+
+    @staticmethod
+    def _health_nodes(rank_0, rank_1):
+        return [
+            {
+                "id": "local", "online": True, "docker_ready": True,
+                "containers": [{"name": "rank-0", **rank_0}],
+            },
+            {
+                "id": "remote-1", "online": True, "docker_ready": True,
+                "containers": [{"name": "rank-1", **rank_1}],
+            },
+        ]
+
+    def test_cluster_health_detects_running_and_stopped_split(self) -> None:
+        instance = Manager.__new__(Manager)
+        issue = instance._cluster_health_issue(
+            self._health_deployment(),
+            self._health_nodes(
+                {"status": "running"},
+                {"status": "exited"},
+            ),
+        )
+
+        self.assertIn("ranks are split", issue)
+        self.assertIn("rank 1: exited", issue)
+
+    def test_cluster_health_detects_asymmetric_running_generation(self) -> None:
+        instance = Manager.__new__(Manager)
+        issue = instance._cluster_health_issue(
+            self._health_deployment(),
+            self._health_nodes(
+                {
+                    "status": "running", "restart_count": 1,
+                    "started_at": "2026-08-08T18:52:28Z",
+                },
+                {
+                    "status": "running", "restart_count": 0,
+                    "started_at": "2026-08-08T16:09:00Z",
+                },
+            ),
+        )
+
+        self.assertIn("different Docker restart generations", issue)
+
+    def test_cluster_health_accepts_aligned_start_after_recovery(self) -> None:
+        instance = Manager.__new__(Manager)
+        issue = instance._cluster_health_issue(
+            self._health_deployment(status="starting"),
+            self._health_nodes(
+                {
+                    "status": "running", "restart_count": 1,
+                    "started_at": "2026-08-08T19:00:00Z",
+                },
+                {
+                    "status": "running", "restart_count": 0,
+                    "started_at": "2026-08-08T19:00:02Z",
+                },
+            ),
+        )
+
+        self.assertIsNone(issue)
+
+    def test_cluster_health_detects_restart_after_baseline(self) -> None:
+        instance = Manager.__new__(Manager)
+        deployment = self._health_deployment()
+        deployment["health_restart_counts"] = {"rank-0": 1, "rank-1": 0}
+        issue = instance._cluster_health_issue(
+            deployment,
+            self._health_nodes(
+                {
+                    "status": "running", "restart_count": 2,
+                    "started_at": "2026-08-08T19:05:00Z",
+                },
+                {
+                    "status": "running", "restart_count": 0,
+                    "started_at": "2026-08-08T19:00:00Z",
+                },
+            ),
+        )
+
+        self.assertEqual(issue, "Docker restarted only part of the cluster")
+
+    async def test_cluster_recovery_stops_all_ranks_before_starting_any(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [self._health_deployment()]
+            events = []
+            both_stopping = asyncio.Event()
+            release_stops = asyncio.Event()
+
+            async def member_action(member, action):
+                events.append((action, member["rank"]))
+                if action == "stop":
+                    if sum(1 for event in events if event[0] == "stop") == 2:
+                        both_stopping.set()
+                    await release_stops.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            recovery = asyncio.create_task(instance._recover_cluster_deployment(
+                "deployment-1", "cluster ranks are split"
+            ))
+            await asyncio.wait_for(both_stopping.wait(), 1)
+            self.assertFalse(any(action == "start" for action, _ in events))
+            release_stops.set()
+            await recovery
+
+            first_start = next(i for i, event in enumerate(events) if event[0] == "start")
+            self.assertTrue(all(action == "stop" for action, _ in events[:first_start]))
+            self.assertEqual(instance.deployments[0]["status"], "starting")
+            self.assertIsNone(instance.deployments[0]["error"])
+
+    async def test_cluster_recovery_does_not_start_if_a_rank_cannot_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [self._health_deployment()]
+            starts = []
+
+            async def member_action(member, action):
+                if action == "stop" and member["rank"] == 1:
+                    raise RuntimeError("GPU process did not stop")
+                if action == "start":
+                    starts.append(member["rank"])
+                return {"ok": True}
+
+            instance._member_action = member_action
+            await instance._recover_cluster_deployment(
+                "deployment-1", "cluster ranks are split"
+            )
+
+            self.assertEqual(starts, [])
+            self.assertEqual(instance.deployments[0]["status"], "degraded")
+            self.assertIn("no rank was restarted", instance.deployments[0]["error"])
+
+    async def test_partial_manual_start_remains_eligible_for_health_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [self._health_deployment(status="stopped")]
+
+            async def member_action(member, action):
+                if member["rank"] == 1:
+                    raise RuntimeError("rank 1 did not start")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            result = await instance.deployment_action("deployment-1", "start")
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(instance.deployments[0]["status"], "degraded")
 
     def test_node_in_use_by_deployment_cannot_be_removed(self) -> None:
         instance = Manager.__new__(Manager)

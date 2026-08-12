@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -15,10 +16,24 @@ import httpx
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import Manager, ClientAbort, FanSettingsConflict
 from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
+from mcp_server import ControllerClient, build_server
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
+mcp_control = build_server(
+    ControllerClient("http://127.0.0.1:7878"),
+    token=os.environ.get("VLLM_MCP_TOKEN"),
+    public_url=os.environ.get(
+        "VLLM_MCP_PUBLIC_URL", "http://127.0.0.1:7878/mcp"
+    ),
+)
+mcp_http_app = mcp_control.streamable_http_app(
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
+    host="0.0.0.0",
+)
 
 
 def _watch_disconnect(req: Request, event: asyncio.Event) -> asyncio.Task:
@@ -85,11 +100,12 @@ _install_log_capture()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await manager.start()
-    try:
-        yield
-    finally:
-        await manager.stop()
+    async with mcp_control.session_manager.run():
+        await manager.start()
+        try:
+            yield
+        finally:
+            await manager.stop()
 
 
 app = FastAPI(title="VLLMController", lifespan=lifespan)
@@ -146,6 +162,30 @@ async def agent_pair(req: Request):
 async def agent_status(req: Request):
     _require_agent(req)
     return await manager.agent_status()
+
+
+@app.get("/api/agent/llama-rpc")
+async def agent_llama_rpc_status(req: Request):
+    _require_agent(req)
+    return manager.llama_rpc_status()
+
+
+@app.post("/api/agent/llama-rpc")
+async def agent_start_llama_rpc(req: Request):
+    _require_agent(req)
+    body = await req.json()
+    try:
+        return await manager.start_llama_rpc_worker(
+            body.get("host") or "", body.get("port")
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/agent/llama-rpc")
+async def agent_stop_llama_rpc(req: Request):
+    _require_agent(req)
+    return await manager.stop_llama_rpc_worker()
 
 
 @app.post("/api/agent/containers")
@@ -251,6 +291,23 @@ async def deployment_action(deployment_id: str, action: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.put("/api/deployments/{deployment_id}/settings")
+async def update_deployment_settings(deployment_id: str, req: Request):
+    try:
+        return manager.update_deployment_settings(deployment_id, await req.json())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/deployments/{deployment_id}/alias")
+async def update_deployment_alias(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+        return manager.update_deployment_alias(deployment_id, body.get("alias"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/deployments/{deployment_id}/logs")
 async def deployment_logs(deployment_id: str):
     try:
@@ -323,6 +380,16 @@ async def reset_token_stats():
 async def reset_session_token_stats():
     """Clear only the session counters, not the persisted lifetime stats."""
     return manager.reset_session_token_stats()
+
+
+@app.put("/api/token-stats/alias")
+async def update_usage_alias(req: Request):
+    try:
+        body = await req.json()
+        return manager.update_usage_alias(body.get("model"), body.get("alias"))
+    except ValueError as exc:
+        status = 404 if str(exc) == "usage model not found" else 400
+        raise HTTPException(status, str(exc)) from exc
 
 
 @app.get("/api/token-cost/{model_path:path}")
@@ -463,6 +530,17 @@ async def update_container_settings(name: str, req: Request):
         raise HTTPException(500, str(e))
 
 
+@app.put("/api/containers/{name}/alias")
+async def update_container_alias(name: str, req: Request):
+    body = await req.json()
+    try:
+        return await manager.update_container_alias(name, body.get("alias"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.delete("/api/containers/{name}")
 async def remove_container(name: str):
     try:
@@ -512,6 +590,8 @@ async def create_recipe(req: Request):
             sg_image=body.get("sg_image"),
             deployment_mode=body.get("deployment_mode", "single"),
             node_ids=body.get("node_ids") or [LOCAL_NODE_ID],
+            launch_controls=body.get("launch_controls"),
+            force_new=bool(body.get("force_new")),
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -530,6 +610,7 @@ async def launch_recipe(rid: str):
             launch_body = dict(recipe)
             launch_body.pop("id", None)
             launch_body.pop("created_at", None)
+            launch_body["recipe_id"] = rid
             result = await manager.create_deployment(launch_body)
             manager.recipe_launches[rid] = {
                 "phase": "Starting cluster", "deployment_id": result.get("id"),
@@ -556,6 +637,15 @@ async def launch_recipe(rid: str):
             "phase": "Failed", "error": str(e), "finished_at": time.time(),
         }
         raise HTTPException(500, str(e))
+
+
+@app.put("/api/recipes/{rid}")
+async def update_recipe(rid: str, req: Request):
+    try:
+        return await manager.update_recipe(rid, await req.json())
+    except ValueError as exc:
+        status = 404 if str(exc) == "recipe not found" else 400
+        raise HTTPException(status, str(exc)) from exc
 
 
 @app.delete("/api/recipes/{rid}")
@@ -886,6 +976,17 @@ async def disk_manager_page():
     return FileResponse(ROOT / "static" / "disk-manager.html")
 
 
+# Keep MCP on the exact /mcp path without Starlette's trailing-slash redirect.
+# This catch-all mount must remain after the controller's own routes.
+app.mount("", mcp_http_app, name="mcp")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=7878, log_level="info")
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=7878,
+        log_level="info",
+        timeout_graceful_shutdown=10,
+    )

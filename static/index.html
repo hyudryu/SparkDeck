@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=52">
-<script src="/static/app.js?v=52"></script>
+<link rel="stylesheet" href="/static/styles.css?v=59">
+<script src="/static/app.js?v=59"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -477,10 +477,41 @@
             <div>
               <div class="card-title" x-text="d.name"></div>
               <div class="card-sub mono" x-text="d.model"></div>
+              <div class="deployment-id-row">
+                <span class="card-sub mono" x-text="`ID ${d.id}`"></span>
+                <button class="btn btn-ghost deployment-id-copy" @click="copyDeploymentId(d)"
+                        x-text="deploymentIdCopied[d.id] ? 'Copied' : 'Copy ID'"></button>
+              </div>
             </div>
             <div class="card-pills">
               <span class="status-pill pill-spark" x-text="`${d.mode} · ${d.members?.length || 0} nodes`"></span>
+              <span class="status-pill pill-recipe" x-show="d.settings_dirty">edited settings</span>
               <span class="status-pill" :class="d.status === 'ready' ? 'pill-ready' : (d.status === 'error' || d.status === 'degraded' ? 'pill-error' : 'pill-starting')" x-text="d.status"></span>
+            </div>
+          </div>
+          <div class="alias-editor" x-show="aliasEditorOpen[aliasEditorKey('deployment', d)]" x-transition>
+            <label>
+              <span>Cluster nickname / alias</span>
+              <input type="text" maxlength="120" x-model="aliasEditorValue[aliasEditorKey('deployment', d)]"
+                     @keydown.enter.prevent="saveAlias('deployment', d)"
+                     placeholder="e.g. DeepSeek fast, Production reasoning">
+            </label>
+            <div class="actions">
+              <button class="btn btn-primary" @click="saveAlias('deployment', d)"
+                      :disabled="aliasEditorSaving[aliasEditorKey('deployment', d)]"
+                      x-text="aliasEditorSaving[aliasEditorKey('deployment', d)] ? 'Saving…' : 'Save name'"></button>
+              <button class="btn btn-ghost" @click="toggleAliasEditor('deployment', d)">Cancel</button>
+              <span class="muted">Blank restores the model name.</span>
+            </div>
+          </div>
+          <div class="phase deployment-progress" x-show="deploymentIsLaunching(d)">
+            <div class="phase-row">
+              <span class="phase-label" x-text="deploymentProgressMessage(d)"></span>
+              <span class="phase-pct" x-show="deploymentProgress(d) != null"
+                    x-text="Math.round((deploymentProgress(d) || 0) * 100) + '%'"></span>
+            </div>
+            <div class="phase-bar" :class="{indeterminate: deploymentProgress(d) == null}">
+              <span :style="`width: ${deploymentProgress(d) != null ? deploymentProgress(d) * 100 : 30}%`"></span>
             </div>
           </div>
           <div class="deployment-members">
@@ -498,9 +529,165 @@
             <dt>Engine</dt><dd x-text="d.engine"></dd>
             <dt>API</dt><dd class="mono" x-text="d.api_port ? (deploymentApiUrls(d).join(', ') || '—') : '—'"></dd>
           </dl>
+          <div class="deployment-settings-panel" x-show="deploymentSettingsOpen[d.id]" x-transition>
+            <p class="card-desc" x-show="d.status === 'stopped'">
+              Saved changes are applied to every rank when you next start this cluster.
+            </p>
+            <p class="form-warning" x-show="d.status !== 'stopped'">
+              Stop the cluster to edit and save its launch settings.
+            </p>
+            <div class="grid grid-form">
+              <label>
+                <span>Deployment name</span>
+                <input type="text" x-model="deploymentSettingsFor(d).deployment_name" :disabled="d.status !== 'stopped'">
+              </label>
+              <label>
+                <span>Model</span>
+                <input type="text" class="mono" x-model="deploymentSettingsFor(d).model" :disabled="d.status !== 'stopped'">
+              </label>
+              <label>
+                <span>Engine</span>
+                <select x-model="deploymentSettingsFor(d).engine" :disabled="d.status !== 'stopped'">
+                  <option value="vllm">vLLM</option>
+                  <option value="sglang">SGLang</option>
+                </select>
+              </label>
+              <label>
+                <span>Deployment mode</span>
+                <select x-model="deploymentSettingsFor(d).deployment_mode"
+                        @change="deploymentSettingsModeChanged(d)" :disabled="d.status !== 'stopped'">
+                  <option value="single">Single node</option>
+                  <option value="sharded">Sharded across nodes</option>
+                  <option value="replicated">Replicated on selected nodes</option>
+                </select>
+              </label>
+              <label>
+                <span>API port</span>
+                <input type="number" min="1" max="65535" x-model.number="deploymentSettingsFor(d).port" :disabled="d.status !== 'stopped'">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm'">
+                <span>Image <em class="muted">(blank = default)</em></span>
+                <input type="text" class="mono" x-model="deploymentSettingsFor(d).image" :disabled="d.status !== 'stopped'">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm'">
+                <span>GPU memory mode</span>
+                <select x-model="deploymentSettingsFor(d).gpu_mem_mode" :disabled="d.status !== 'stopped'">
+                  <option value="fraction">Fraction</option>
+                  <option value="gb">Absolute GB</option>
+                </select>
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm' && deploymentSettingsFor(d).gpu_mem_mode === 'fraction'">
+                <span>GPU memory util</span>
+                <input type="number" min="0.1" max="0.98" step="0.01"
+                       x-model.number="deploymentSettingsFor(d).gpu_memory_utilization" :disabled="d.status !== 'stopped'">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm' && deploymentSettingsFor(d).gpu_mem_mode === 'gb'">
+                <span>GPU memory GB</span>
+                <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).gpu_memory_gb" :disabled="d.status !== 'stopped'">
+              </label>
+              <label>
+                <span>Context window <span class="tip" tabindex="0" data-tip="vLLM --max-model-len or SGLang --context-length."></span></span>
+                <input type="number" min="1" step="1024" x-model.number="deploymentSettingsFor(d).context_window"
+                       :disabled="d.status !== 'stopped'" placeholder="model default">
+              </label>
+              <label>
+                <span>Concurrent streams <span class="tip" tabindex="0" data-tip="vLLM --max-num-seqs or SGLang --max-running-requests."></span></span>
+                <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).max_concurrency"
+                       :disabled="d.status !== 'stopped'" placeholder="engine default">
+              </label>
+              <label>
+                <span>KV cache type <span class="tip" tabindex="0" data-tip="--kv-cache-dtype. Availability depends on the selected image, accelerator, and model."></span></span>
+                <select x-model="deploymentSettingsFor(d).kv_cache_dtype" :disabled="d.status !== 'stopped'">
+                  <option value="">Engine default</option>
+                  <template x-for="dtype in KV_CACHE_DTYPE_OPTIONS" :key="`cluster-kv-${dtype}`">
+                    <option :value="dtype" x-text="dtype"></option>
+                  </template>
+                  <template x-if="deploymentSettingsFor(d).kv_cache_dtype && !KV_CACHE_DTYPE_OPTIONS.includes(deploymentSettingsFor(d).kv_cache_dtype)">
+                    <option :value="deploymentSettingsFor(d).kv_cache_dtype"
+                            x-text="`${deploymentSettingsFor(d).kv_cache_dtype} (image-specific)`"></option>
+                  </template>
+                </select>
+              </label>
+              <label>
+                <span>Thinking / reasoning <span class="tip" tabindex="0" data-tip="Parses and updates thinking or enable_thinking inside --default-chat-template-kwargs while preserving its other JSON properties."></span></span>
+                <select x-model="deploymentSettingsFor(d).thinking_mode" :disabled="d.status !== 'stopped'">
+                  <option value="default">Model default</option>
+                  <option value="enabled">True / enabled</option>
+                  <option value="disabled">False / disabled</option>
+                </select>
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm'">
+                <span>D-Spark speculative tokens <span class="tip" tabindex="0" data-tip="num_speculative_tokens inside --speculative-config. Other speculative JSON properties remain unchanged."></span></span>
+                <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).dspark_num_speculative_tokens"
+                       :disabled="d.status !== 'stopped'" placeholder="disabled / unset">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm'">
+                <span>Max CUDA graph capture size <span class="tip" tabindex="0" data-tip="vLLM --max-cudagraph-capture-size."></span></span>
+                <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).max_cudagraph_capture_size"
+                       :disabled="d.status !== 'stopped'" placeholder="engine default">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'vllm'">
+                <span>Max batched tokens <span class="tip" tabindex="0" data-tip="vLLM --max-num-batched-tokens."></span></span>
+                <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).max_num_batched_tokens"
+                       :disabled="d.status !== 'stopped'" placeholder="engine default">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'sglang'">
+                <span>TP size</span>
+                <input type="number" min="1" x-model.number="deploymentSettingsFor(d).sg_tp_size" :disabled="d.status !== 'stopped'">
+              </label>
+              <label x-show="deploymentSettingsFor(d).engine === 'sglang'">
+                <span>Memory fraction</span>
+                <input type="number" min="0.1" max="0.98" step="0.01" x-model.number="deploymentSettingsFor(d).sg_mem_fraction" :disabled="d.status !== 'stopped'">
+              </label>
+              <label class="full" x-show="deploymentSettingsFor(d).engine === 'sglang'">
+                <span>SGLang image <em class="muted">(blank = default)</em></span>
+                <input type="text" class="mono" x-model="deploymentSettingsFor(d).sg_image" :disabled="d.status !== 'stopped'">
+              </label>
+              <label class="full deployment-flags-field">
+                <span>Common launch flags <span class="tip" tabindex="0" data-tip="Editable flags shared by every rank. Structured controls above override their matching raw flags when saved. The controller also regenerates topology flags such as --node-rank and --master-addr for each node."></span></span>
+                <textarea rows="8" class="mono" x-model="deploymentSettingsFor(d).extra"
+                          :disabled="d.status !== 'stopped'" placeholder="--max-model-len 65536 --tensor-parallel-size 2 --pipeline-parallel-size 1"></textarea>
+              </label>
+            </div>
+            <div class="deployment-settings-nodes">
+              <span class="field-heading">Launch nodes</span>
+              <div class="node-choice-list">
+                <template x-for="node in state?.nodes || []" :key="`deployment-settings-${d.id}-${node.id}`">
+                  <button type="button" class="node-choice"
+                          :class="{selected: deploymentSettingsNodeSelected(d, node.id), offline: !node.online}"
+                          :disabled="d.status !== 'stopped' || !node.online"
+                          @click="toggleDeploymentSettingsNode(d, node)">
+                    <span class="dot" :class="node.online ? 'dot-ok' : 'dot-bad'"></span>
+                    <span><strong x-text="node.name"></strong><small x-text="node.local ? 'Coordinator' : (node.online ? 'Online' : 'Offline')"></small></span>
+                    <span class="node-check" x-text="deploymentSettingsNodeSelected(d, node.id) ? '✓' : ''"></span>
+                  </button>
+                </template>
+              </div>
+            </div>
+            <div class="deployment-runtime-flags" x-show="(d.runtime_flags || []).length">
+              <h4>Current rank-specific runtime flags</h4>
+              <template x-for="entry in d.runtime_flags || []" :key="`${d.id}-runtime-${entry.rank}`">
+                <div>
+                  <span class="muted" x-text="`${entry.node_name || entry.node_id} · rank ${entry.rank}`"></span>
+                  <pre class="logbox mono" x-text="entry.command_flags || '(no additional flags)'"></pre>
+                </div>
+              </template>
+            </div>
+            <div class="actions">
+              <button class="btn btn-primary" @click="saveDeploymentSettings(d)"
+                      x-show="d.status === 'stopped'"
+                      :disabled="deploymentSettingsSaving[d.id] || !deploymentSettingsValid(d) || !deploymentSettingsChanged(d)"
+                      x-text="deploymentSettingsSaving[d.id] ? 'Saving…' : 'Save launch settings'"></button>
+              <span class="muted" x-show="deploymentSettingsSaved[d.id]">Saved. Start will apply these settings.</span>
+            </div>
+          </div>
           <div class="card-actions">
             <button class="btn btn-primary" x-show="d.status === 'stopped'" @click="deploymentAction(d, 'start')" :disabled="clusterBusy[d.id] === true">Start cluster</button>
             <button class="btn btn-ghost" x-show="d.status !== 'stopped'" @click="deploymentAction(d, 'stop')" :disabled="clusterBusy[d.id] === true">Stop cluster</button>
+            <button class="btn btn-ghost" @click="toggleAliasEditor('deployment', d)">Rename</button>
+            <span class="muted" x-show="aliasEditorSaved[aliasEditorKey('deployment', d)]">Name saved.</span>
+            <button class="btn btn-ghost" @click="toggleDeploymentSettings(d)"
+                    x-text="deploymentSettingsOpen[d.id] ? 'Hide launch settings' : 'Launch settings'"></button>
             <button class="btn btn-ghost" @click="openDeploymentLogs(d)">Combined logs</button>
             <button class="btn btn-danger" @click="deploymentAction(d, 'remove')" :disabled="clusterBusy[d.id] === true">Remove</button>
           </div>
@@ -737,6 +924,23 @@
               <input type="number" min="1" max="16" x-model.number="unslothFormFor(m.id).parallel">
             </label>
             <label>
+              <span>Multi-GPU cluster <span class="tip" tabindex="0" data-tip="Run llama-server on this Spark and start authenticated ggml RPC workers on paired Sparks over the ConnectX fabric."></span></span>
+              <input type="checkbox" x-model="unslothFormFor(m.id).tensor_parallel">
+            </label>
+            <label x-show="unslothFormFor(m.id).tensor_parallel">
+              <span>GPU count <span class="tip" tabindex="0" data-tip="Total GPUs, including this coordinator. A count of 2 uses one local Spark plus one paired Spark."></span></span>
+              <input type="number" min="2" max="16" step="1"
+                     x-model.number="unslothFormFor(m.id).tensor_parallel_size">
+            </label>
+            <label x-show="unslothFormFor(m.id).tensor_parallel">
+              <span>Split mode <span class="tip" tabindex="0" data-tip="Layer supports all architectures and is required for DeepSeek 4. Tensor parallelizes each layer but is experimental and architecture-limited. Row splits individual weights across GPUs."></span></span>
+              <select x-model="unslothFormFor(m.id).split_mode">
+                <option value="layer">Layer (compatible)</option>
+                <option value="tensor">Tensor (experimental)</option>
+                <option value="row">Row</option>
+              </select>
+            </label>
+            <label>
               <span>Unified KV cache <span class="tip" tabindex="0" data-tip="llama-server --kv-unified: one KV pool shared by all slots, so a single request can use the full context window regardless of Parallel slots. Off = each slot is capped at context ÷ slots tokens."></span></span>
               <input type="checkbox" x-model="unslothFormFor(m.id).kv_unified">
             </label>
@@ -824,13 +1028,9 @@
     </div>
 
     <datalist id="docker-kv-cache-types">
-      <option value="auto"></option>
-      <option value="bfloat16"></option>
-      <option value="fp8"></option>
-      <option value="fp8_e4m3"></option>
-      <option value="fp8_e5m2"></option>
-      <option value="nvfp4"></option>
-      <option value="nvfp4_ds_mla"></option>
+      <template x-for="dtype in KV_CACHE_DTYPE_OPTIONS" :key="`docker-kv-${dtype}`">
+        <option :value="dtype"></option>
+      </template>
     </datalist>
 
   <div class="card-grid">
@@ -838,12 +1038,30 @@
       <div class="card container-card" :class="`status-${c.status} phase-${c.phase?.phase || c.status}`">
         <div class="card-head">
           <div>
-            <div class="card-title" x-text="c.model || c.name"></div>
-            <div class="card-sub" x-text="c.name"></div>
+            <div class="card-title" x-text="c.alias || c.model || c.name"></div>
+            <div class="card-sub" x-show="c.alias" x-text="c.model || 'Unknown model'"></div>
+            <div class="card-sub mono" x-text="c.name"></div>
           </div>
           <div class="card-pills">
             <span class="status-pill" :class="`pill-${c.phase?.phase || c.status}`" x-text="c.phase?.phase || c.status"></span>
             <span class="status-pill pill-spark" x-show="c.source === 'atlas-serving'">Atlas Serving</span>
+            <span class="status-pill pill-recipe" x-show="c.alias">alias</span>
+          </div>
+        </div>
+
+        <div class="alias-editor" x-show="aliasEditorOpen[aliasEditorKey('container', c)]" x-transition>
+          <label>
+            <span>Container nickname / alias</span>
+            <input type="text" maxlength="120" x-model="aliasEditorValue[aliasEditorKey('container', c)]"
+                   @keydown.enter.prevent="saveAlias('container', c)"
+                   placeholder="e.g. Qwen benchmark, Fast draft model">
+          </label>
+          <div class="actions">
+            <button class="btn btn-primary" @click="saveAlias('container', c)"
+                    :disabled="aliasEditorSaving[aliasEditorKey('container', c)]"
+                    x-text="aliasEditorSaving[aliasEditorKey('container', c)] ? 'Saving…' : 'Save alias'"></button>
+            <button class="btn btn-ghost" @click="toggleAliasEditor('container', c)">Cancel</button>
+            <span class="muted">Blank removes the alias. Docker's internal name stays unchanged.</span>
           </div>
         </div>
 
@@ -925,6 +1143,8 @@
             <span x-show="containerStopping[c.name]">Stopping…</span>
           </button>
           <button class="btn btn-ghost" @click="openLogs(c.name)">Logs</button>
+          <button class="btn btn-ghost" @click="toggleAliasEditor('container', c)">Rename</button>
+          <span class="muted" x-show="aliasEditorSaved[aliasEditorKey('container', c)]">Alias saved.</span>
           <button class="btn btn-ghost" x-show="c.load_settings?.editable" @click="toggleDockerSettings(c)"
                   x-text="dockerSettingsOpen[c.name] ? 'Hide settings' : 'Settings'"></button>
           <span class="muted" x-show="dockerSettingsSaved[c.name]">Saved.</span>
@@ -1487,27 +1707,39 @@ for chunk in stream:
       <table class="usage-table">
         <thead>
           <tr>
-            <th>Model</th>
-            <th style="text-align:right">↓ Input tokens</th>
-            <th style="text-align:right">↳ Cached</th>
-            <th style="text-align:right">↑ Output tokens</th>
-            <th style="text-align:right">Requests</th>
-            <th style="text-align:right">Avg speed</th>
-            <th style="text-align:right">Decode time</th>
-            <th style="text-align:right">Cost</th>
+            <th :aria-sort="usageSortAria('model')"><button class="usage-sort" @click="setUsageSort('model')">Model / alias <span x-text="usageSortIndicator('model')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('input')"><button class="usage-sort usage-sort-right" @click="setUsageSort('input')">Input tokens <span x-text="usageSortIndicator('input')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('cached')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cached')">Cached <span x-text="usageSortIndicator('cached')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('output')"><button class="usage-sort usage-sort-right" @click="setUsageSort('output')">Output tokens <span x-text="usageSortIndicator('output')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('requests')"><button class="usage-sort usage-sort-right" @click="setUsageSort('requests')">Requests <span x-text="usageSortIndicator('requests')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('speed')"><button class="usage-sort usage-sort-right" @click="setUsageSort('speed')">Avg speed <span x-text="usageSortIndicator('speed')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('time')"><button class="usage-sort usage-sort-right" @click="setUsageSort('time')">Decode time <span x-text="usageSortIndicator('time')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('cost')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cost')">Cost <span x-text="usageSortIndicator('cost')"></span></button></th>
           </tr>
         </thead>
         <tbody>
-          <template x-for="(s, model) in state?.token_stats || {}" :key="model">
+          <template x-for="row in usageRows()" :key="row.model">
             <tr>
-              <td class="mono" x-text="model"></td>
-              <td style="text-align:right" x-text="fmtTokens(s.input)"></td>
-              <td style="text-align:right" x-text="s.cached ? fmtTokens(s.cached) : '—'"></td>
-              <td style="text-align:right" x-text="fmtTokens(s.output)"></td>
-              <td style="text-align:right" x-text="s.requests ?? 0"></td>
-              <td style="text-align:right" x-text="fmtSpeed(model)"></td>
-              <td style="text-align:right" x-text="s.gen_time_s ? s.gen_time_s.toFixed(1) + ' s' : '—'"></td>
-              <td style="text-align:right" x-html="tokenCostCell(model)"></td>
+              <td class="usage-model-cell">
+                <div class="usage-model-title">
+                  <strong class="mono" x-text="row.alias || row.model"></strong>
+                  <button class="usage-alias-button" @click="startUsageAliasEdit(row.model)" :title="row.alias ? 'Rename usage alias' : 'Add usage alias'" aria-label="Rename usage alias">✎</button>
+                  <span class="muted usage-alias-saved" x-show="usageAliasSaved[row.model]">Saved</span>
+                </div>
+                <div class="muted mono usage-model-id" x-show="row.alias" x-text="row.model"></div>
+                <form class="usage-alias-editor" x-show="usageAliasEditing[row.model]" @submit.prevent="saveUsageAlias(row.model)">
+                  <input type="text" maxlength="120" x-model="usageAliasValue[row.model]" placeholder="Usage alias">
+                  <button class="btn btn-primary" type="submit" :disabled="usageAliasSaving[row.model]" x-text="usageAliasSaving[row.model] ? 'Saving…' : 'Save'"></button>
+                  <button class="btn btn-ghost" type="button" @click="cancelUsageAliasEdit(row.model)">Cancel</button>
+                </form>
+              </td>
+              <td style="text-align:right" x-text="fmtTokens(row.stats.input)"></td>
+              <td style="text-align:right" x-text="row.stats.cached ? fmtTokens(row.stats.cached) : '—'"></td>
+              <td style="text-align:right" x-text="fmtTokens(row.stats.output)"></td>
+              <td style="text-align:right" x-text="row.stats.requests ?? 0"></td>
+              <td style="text-align:right" x-text="usageAverageSpeed(row.stats) != null ? usageAverageSpeed(row.stats).toFixed(1) + ' tok/s' : '—'"></td>
+              <td style="text-align:right" x-text="row.stats.gen_time_s ? row.stats.gen_time_s.toFixed(1) + ' s' : '—'"></td>
+              <td style="text-align:right" x-text="usageCostDisplay(row.model)"></td>
             </tr>
           </template>
           <tr class="usage-total">
@@ -1685,7 +1917,7 @@ for chunk in stream:
         <input type="text" x-model="settingsForm.vllm_image">
       </label>
       <label>
-        <span>HF cache (host) <span class="tip" tabindex="0" data-tip="Host directory mounted into each container at /root/.cache/huggingface. Sharing one cache means downloaded weights are reused across containers — you don't re-download a model when relaunching it."></span></span>
+        <span>HF cache (host) <span class="tip" tabindex="0" data-tip="Host directory mounted at the container image's HF_HOME, or /root/.cache/huggingface when HF_HOME is unset. Sharing one cache means downloaded weights are reused across containers — you don't re-download a model when relaunching it."></span></span>
         <input type="text" x-model="settingsForm.hf_cache">
       </label>
       <label>
@@ -1730,6 +1962,14 @@ for chunk in stream:
         <span>llama-server port <span class="tip" tabindex="0" data-tip="First port tried when launching llama-server; the next few ports are tried if occupied."></span></span>
         <input type="number" x-model.number="settingsForm.llama_server_port" placeholder="8100">
       </label>
+      <label>
+        <span>llama RPC worker binary <span class="tip" tabindex="0" data-tip="Path to ggml-rpc-server on every paired Spark. Build llama.cpp with GGML_RPC enabled."></span></span>
+        <input type="text" x-model="settingsForm.llama_rpc_server_bin" placeholder="~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server">
+      </label>
+      <label>
+        <span>llama RPC port <span class="tip" tabindex="0" data-tip="ConnectX-only port used between llama-server and remote ggml RPC workers."></span></span>
+        <input type="number" x-model.number="settingsForm.llama_rpc_port" placeholder="50052">
+      </label>
     </div>
     <div class="actions">
       <button class="btn btn-primary" @click="saveSettings()">Save</button>
@@ -1744,8 +1984,8 @@ for chunk in stream:
     <h2>Server Logs</h2>
     <div style="display:flex; gap:8px; align-items:center">
       <span class="muted" x-text="serverLogs.lines.length ? `${serverLogs.lines.length} lines` : ''"></span>
+      <span class="status-pill pill-ready">LIVE</span>
       <button class="btn btn-ghost" @click="serverLogs.autoScroll = !serverLogs.autoScroll" x-text="serverLogs.autoScroll ? 'Auto-scroll: on' : 'Auto-scroll: off'"></button>
-      <button class="btn btn-ghost" @click="refreshServerLogs()">Refresh</button>
     </div>
   </div>
   <pre class="logbox tall" x-ref="serverLogBox" style="max-height: calc(100vh - 180px); font-size: 12px;"><template x-for="(l,i) in serverLogs.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
@@ -1754,12 +1994,14 @@ for chunk in stream:
 </main>
 
 <!-- ============== LOGS MODAL ============== -->
-<div class="modal" x-show="logsModal.open" @click.self="logsModal.open = false">
+<div id="logs-modal" class="modal" x-show="logsModal.open" @click.self="logsModal.open = false">
   <div class="modal-body" :class="{'cluster-logs-modal': logsModal.deploymentId}">
     <div class="modal-head">
       <h3 x-text="`Logs · ${logsModal.name}`"></h3>
       <div>
-        <button class="btn btn-ghost" @click="refreshLogs()">Refresh</button>
+        <span class="status-pill pill-ready">LIVE</span>
+        <button class="btn btn-ghost" @click="logsModal.autoScroll = !logsModal.autoScroll"
+                x-text="logsModal.autoScroll ? 'Auto-scroll: on' : 'Auto-scroll: off'"></button>
         <button class="btn" @click="logsModal.open = false">Close</button>
       </div>
     </div>
@@ -1794,16 +2036,22 @@ for chunk in stream:
       <button class="btn" @click="sparkEditor.open = false">Close</button>
     </div>
     <p class="card-desc">
-      Save a SparkRun reference, not a recipe. SparkRun resolves it now so this card shows the model and its actual settings.
+      Paste a SparkRun reference, Spark Arena URL or UUID, or a <code>sparkrun run …</code> command.
+      SparkRun resolves it now so this card shows the actual model and settings.
     </p>
     <div class="grid spark-editor-grid">
       <label class="full">
         <span>Runnable SparkRun reference</span>
-        <input class="mono" type="text" x-model="sparkForm.reference" placeholder="@spark-arena/1199b578-cfa4-47cd-b1fa-374fd4815565">
+        <input class="mono" type="text" x-model="sparkForm.reference"
+               @keydown.enter.prevent="saveSparkLaunch()"
+               placeholder="@spark-arena/1199b578-cfa4-47cd-b1fa-374fd4815565">
       </label>
     </div>
+    <div class="form-warning" x-show="sparkSaveError" x-text="sparkSaveError"></div>
     <div class="actions">
-      <button class="btn btn-primary" @click="saveSparkLaunch()" :disabled="!sparkForm.reference.trim()">Save SparkRun</button>
+      <button class="btn btn-primary" @click="saveSparkLaunch()"
+              :disabled="sparkSaving || !sparkForm.reference.trim()"
+              x-text="sparkSaving ? 'Resolving…' : 'Save SparkRun'">Save SparkRun</button>
       <span class="muted" x-show="sparkSaved">Saved.</span>
     </div>
   </div>
@@ -1888,9 +2136,14 @@ for chunk in stream:
           'pill-error': sparkRunHistory.status === 'error' || sparkRunHistory.status === 'canceled',
         }" x-text="sparkRunHistory.status || 'idle'"></span>
       </h3>
-      <button class="btn" @click="sparkRunHistory.open = false">Close</button>
+      <div>
+        <span class="status-pill pill-ready">LIVE</span>
+        <button class="btn btn-ghost" @click="sparkRunHistory.autoScroll = !sparkRunHistory.autoScroll"
+                x-text="sparkRunHistory.autoScroll ? 'Auto-scroll: on' : 'Auto-scroll: off'"></button>
+        <button class="btn" @click="sparkRunHistory.open = false">Close</button>
+      </div>
     </div>
-    <pre class="logbox tall" style="max-height: 60vh; font-size: 12px;"><template x-for="(l,i) in sparkRunHistory.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
+    <pre class="logbox tall" x-ref="sparkRunHistoryLog" style="max-height: 60vh; font-size: 12px;"><template x-for="(l,i) in sparkRunHistory.lines" :key="i"><span x-text="l + '\n'"></span></template></pre>
   </div>
 </div>
 
@@ -1924,47 +2177,6 @@ for chunk in stream:
           </div>
         </div>
       </template>
-    </div>
-  </div>
-</div>
-
-<!-- ============== SPARK RECIPE DOWNLOAD MODAL ============== -->
-<div class="modal" x-show="sparkDownload.open" @click.self="sparkDownload.open = false">
-  <div class="modal-body spark-download-body">
-    <div class="modal-head">
-      <h3>Use recipe with spark-vllm-docker · <span x-text="sparkDownload.recipe?.name"></span></h3>
-      <button class="btn" @click="sparkDownload.open = false">Close</button>
-    </div>
-
-    <div class="spark-download-section">
-      <h4>Recipe YAML</h4>
-      <div class="codebox-wrap">
-        <button class="copy-btn" @click="copySparkYaml(sparkDownload.recipe)">Copy recipe</button>
-        <pre class="codebox"><code x-text="sparkDownload.recipe?.yaml || '(no yaml)'"></code></pre>
-      </div>
-    </div>
-
-    <div class="spark-download-section">
-      <h4>Download</h4>
-      <p class="card-desc">
-        To use this recipe with spark-vllm-docker:</p>
-      <ol class="spark-download-steps">
-        <li>Download the recipe directly using the permalink:</li>
-      </ol>
-      <div class="codebox-wrap">
-        <button class="copy-btn" @click="copySparkDownloadUrl()"
-                :class="{ copied: sparkDownload.copied }"
-                x-text="sparkDownload.copied ? 'Copied' : 'Copy'">Copy</button>
-        <pre class="codebox"><code x-text="'curl -o recipe.yaml ' + sparkDownloadUrl()"></code></pre>
-      </div>
-      <ol class="spark-download-steps" start="2">
-        <li>Or copy the recipe above and save it as a <code>.yaml</code> file.</li>
-        <li>Follow the instructions in the spark-vllm-docker recipes documentation.</li>
-        <li>Run your benchmark using the recipe.</li>
-      </ol>
-      <div class="spark-download-actions">
-        <a class="btn btn-primary" :href="sparkDownloadUrl()" download="recipe.yaml">Download recipe.yaml</a>
-      </div>
     </div>
   </div>
 </div>

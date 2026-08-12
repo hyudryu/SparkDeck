@@ -124,6 +124,154 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
+    def test_gguf_variant_size_includes_every_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = (
+                root / "hub" / "models--example--Huge-GGUF" /
+                "snapshots" / "snapshot-1" / "Q8_0"
+            )
+            snapshot.mkdir(parents=True)
+            for shard, size in ((1, 11), (2, 13), (3, 17)):
+                path = snapshot / f"Huge-Q8_0-{shard:05d}-of-00003.gguf"
+                path.write_bytes(b"x" * size)
+
+            instance = Manager.__new__(Manager)
+            instance.settings = {"hf_cache": str(root)}
+            models = instance._scan_gguf_models()
+
+            variant = models[0]["variants"][0]
+            self.assertEqual(variant["size_bytes"], 41)
+            self.assertEqual(len(variant["files"]), 3)
+            self.assertIn("-00001-of-00003.gguf", variant["path"])
+
+    def test_gguf_scan_omits_variant_without_first_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = (
+                root / "hub" / "models--example--Incomplete-GGUF" /
+                "snapshots" / "snapshot-1" / "Q8_0"
+            )
+            snapshot.mkdir(parents=True)
+            for shard in (2, 3):
+                path = snapshot / f"Incomplete-Q8_0-{shard:05d}-of-00003.gguf"
+                path.write_bytes(b"incomplete")
+
+            instance = Manager.__new__(Manager)
+            instance.settings = {"hf_cache": str(root)}
+
+            self.assertEqual(instance._scan_gguf_models(), [])
+
+    def test_rpc_progress_uses_fabric_transfer_counter(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._llama_pid = 123
+        instance._interface_tx_counter = lambda interfaces: 1050
+        instance._rpc_tx_counter = lambda endpoints: self.fail(
+            "route lookup should not run during progress polling"
+        )
+        info = {
+            "size_bytes": 200,
+            "tensor_parallel_size": 2,
+            "rpc_endpoints": ["169.254.1.2:50052"],
+            "rpc_tx_start": 1000,
+            "rpc_interfaces": ["cx7-test"],
+        }
+
+        percent, detail = instance._llama_transfer_progress(info)
+
+        self.assertEqual(percent, 48)
+        self.assertIn("RPC transfer over cx7-test", detail)
+        self.assertIn("50.0 B / ~100.0 B", detail)
+
+    def test_cached_local_load_stays_indeterminate_without_physical_io(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._llama_pid = 123
+        instance._proc_read_bytes = lambda pid: 1000
+        info = {
+            "size_bytes": 200,
+            "rpc_endpoints": [],
+            "read_bytes_start": 1000,
+        }
+
+        percent, detail = instance._llama_transfer_progress(info)
+
+        self.assertIsNone(percent)
+        self.assertIn("filesystem cache", detail)
+
+    def test_llama_logs_are_read_incrementally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._llama_log_dir = Path(directory)
+            instance._llama_current_log = instance._llama_log_dir / "llama-server-1.log"
+            instance._llama_current_log.write_text("first\nsecond\n")
+            instance._llama_launching = None
+            instance._llama_model = "example/model"
+            instance._llama_pid = None
+            instance._llama_adopt_tried = True
+
+            first = instance.get_llama_server_logs(since=0, limit_bytes=4096)
+            second = instance.get_llama_server_logs(
+                since=first["next_offset"], limit_bytes=4096
+            )
+
+            self.assertEqual(first["text"], "first\nsecond\n")
+            self.assertTrue(first["complete"])
+            self.assertEqual(second["text"], "")
+            self.assertEqual(second["log_id"], "llama-server-1.log")
+
+    def test_llama_log_chunks_preserve_split_utf8_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._llama_log_dir = Path(directory)
+            instance._llama_current_log = instance._llama_log_dir / "llama-server-utf8.log"
+            expected = "a" * 4095 + "€" + "z"
+            instance._llama_current_log.write_bytes(expected.encode())
+            instance._llama_launching = None
+            instance._llama_model = "example/model"
+            instance._llama_pid = None
+            instance._llama_adopt_tried = True
+
+            first = instance.get_llama_server_logs(since=0, limit_bytes=4096)
+            second = instance.get_llama_server_logs(
+                since=first["next_offset"], limit_bytes=4096
+            )
+
+            self.assertNotIn("�", first["text"] + second["text"])
+            self.assertEqual(first["text"] + second["text"], expected)
+
+    def test_llama_logs_resolve_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._llama_log_dir = Path(directory)
+            first_path = instance._llama_log_dir / "llama-server-a.log"
+            second_path = instance._llama_log_dir / "llama-server-b.log"
+            first_path.write_text("model A log")
+            second_path.write_text("model B log")
+            instance._llama_model_logs = {
+                "example/a": str(first_path),
+                "example/b": str(second_path),
+            }
+            instance._llama_current_log = second_path
+            instance._llama_current_log_model = "example/b"
+            instance._llama_launching = None
+            instance._llama_model = "example/b"
+            instance._llama_pid = None
+            instance._llama_adopt_tried = True
+
+            result = instance.get_llama_server_logs(model_path="example/a")
+
+            self.assertEqual(result["text"], "model A log")
+            self.assertEqual(result["model"], "example/a")
+
+    def test_llama_log_names_are_collision_resistant(self) -> None:
+        log_dir = Path("/tmp/logs")
+
+        first = Manager._new_llama_log_path(log_dir)
+        second = Manager._new_llama_log_path(log_dir)
+
+        self.assertNotEqual(first, second)
+        self.assertRegex(first.name, r"^llama-server-\d+-[0-9a-f]{8}\.log$")
+
     def test_tp2_arguments_use_rpc_tensor_split(self) -> None:
         argv = Manager._llama_tensor_parallel_args(
             ["llama-server", "-m", "model.gguf"],

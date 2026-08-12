@@ -997,16 +997,28 @@
                   x-text="unslothStopping[m.id] ? 'Stopping…' : 'Stop'"></button>
           <button class="btn btn-ghost" @click="toggleUnslothSettings(m.id)"
                   x-text="unslothSettingsOpen[m.id] ? 'Hide settings' : 'Settings'"></button>
+          <button class="btn btn-ghost" @click="openUnslothLogs(m.id)">Logs</button>
         </div>
 
         <!-- launch progress (server-driven; visible in every tab) -->
         <div class="phase launch-progress" x-show="state?.unsloth?.launching?.model === m.id">
           <div class="phase-row">
             <span class="phase-label" x-text="(state?.unsloth?.launching?.phase || 'Starting') + (state?.unsloth?.launching?.variant ? ' — ' + state.unsloth.launching.variant : '')"></span>
-            <span class="phase-pct" x-text="elapsedSince(state?.unsloth?.launching?.started_at)"></span>
+            <span class="phase-pct">
+              <strong x-show="state?.unsloth?.launching?.percent != null"
+                      x-text="`${state.unsloth.launching.percent}%`"></strong>
+              <span x-show="state?.unsloth?.launching?.percent != null"> · </span>
+              <span x-text="elapsedSince(state?.unsloth?.launching?.started_at)"></span>
+            </span>
           </div>
-          <div class="phase-bar indeterminate"><span></span></div>
-          <div class="phase-label mono" style="margin-top:6px" x-text="state?.unsloth?.launching?.log_line || ''"></div>
+          <div class="phase-bar" :class="{indeterminate: state?.unsloth?.launching?.percent == null}">
+            <span :style="state?.unsloth?.launching?.percent != null ? `width:${state.unsloth.launching.percent}%` : ''"></span>
+          </div>
+          <div class="phase-label mono" style="margin-top:6px"
+               x-text="state?.unsloth?.launching?.progress_detail || state?.unsloth?.launching?.log_line || ''"></div>
+          <div class="phase-label mono" style="margin-top:4px"
+               x-show="state?.unsloth?.launching?.progress_detail && state?.unsloth?.launching?.log_line"
+               x-text="state?.unsloth?.launching?.log_line || ''"></div>
         </div>
       </div>
     </template>

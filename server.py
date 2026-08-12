@@ -873,9 +873,14 @@ async def unsloth_save_settings(req: Request):
 
 
 @app.get("/api/unsloth/logs")
-async def unsloth_logs(since: int = 0, limit_bytes: int = 262144):
+async def unsloth_logs(
+    model_path: str | None = None, since: int = 0,
+    limit_bytes: int = 262144,
+):
     try:
-        return manager.get_llama_server_logs(since=since, limit_bytes=limit_bytes)
+        return manager.get_llama_server_logs(
+            model_path=model_path, since=since, limit_bytes=limit_bytes
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:

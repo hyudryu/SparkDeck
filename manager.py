@@ -2,6 +2,7 @@
 VLLMController - container + queue + telemetry manager.
 """
 import asyncio
+import codecs
 import copy
 import json
 import math
@@ -295,6 +296,8 @@ class Manager:
         self._llama_log_dir = self.data_dir / "logs"
         self._llama_current_log: Path | None = None
         self._llama_current_log_model: str | None = None
+        self._llama_log_index_path = self.data_dir / "llama_logs.json"
+        self._llama_model_logs: dict[str, str] = self._load_llama_log_index()
         # llama.cpp tensor parallelism uses its RPC backend: rank 0 runs the
         # public llama-server locally and each additional Spark exposes one
         # CUDA device through an authenticated agent-managed RPC worker.
@@ -4635,6 +4638,8 @@ class Manager:
                 (q for q in quants.values() if q.get("path")),
                 key=lambda v: -v["size_bytes"],
             )
+            if not variants:
+                continue
             models.append({
                 "id": repo_id,
                 "name": parts[1],
@@ -5018,20 +5023,27 @@ class Manager:
         endpoints = list(info.get("rpc_endpoints") or [])
         if endpoints and info.get("rpc_tx_start") is not None:
             interfaces = list(info.get("rpc_interfaces") or [])
-            current = self._interface_tx_counter(interfaces) if interfaces else None
+            if not interfaces:
+                return None, ""
+            current = self._interface_tx_counter(interfaces)
             if current is None:
-                current, interfaces = self._rpc_tx_counter(endpoints)
+                return None, ""
             start = int(info["rpc_tx_start"])
-            transferred = max(0, (current or start) - start)
+            transferred = max(0, current - start)
             tp_size = max(1, int(info.get("tensor_parallel_size") or 1))
             expected = total * max(1, tp_size - 1) / tp_size
-            source = f"RPC transfer over {', '.join(interfaces or info.get('rpc_interfaces') or [])}"
+            source = f"RPC transfer over {', '.join(interfaces)}"
         else:
             current = self._proc_read_bytes(self._llama_pid)
             start = int(info.get("read_bytes_start") or 0)
             if current is None:
                 return None, ""
             transferred = max(0, current - start)
+            # read_bytes counts physical storage I/O only. A page-cached GGUF
+            # can load normally while this remains zero, so do not publish a
+            # determinate 0% that looks stalled.
+            if transferred == 0:
+                return None, "Loading model from filesystem cache"
             expected = total
             source = "Model data read"
 
@@ -5110,11 +5122,55 @@ class Manager:
             "rpc_endpoints": list(info.get("rpc_endpoints") or []),
         }
 
-    def get_llama_server_logs(self, since: int = 0, limit_bytes: int = 262144) -> dict:
-        """Read the active/most-recent managed llama-server log incrementally."""
-        log_value = (self._llama_launching or {}).get("log")
-        path = Path(log_value) if log_value else self._llama_current_log
-        if path is None:
+    def _load_llama_log_index(self) -> dict[str, str]:
+        try:
+            value = json.loads(self._llama_log_index_path.read_text())
+            if isinstance(value, dict):
+                return {
+                    str(model): str(path) for model, path in value.items()
+                    if str(model).strip() and str(path).strip()
+                }
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def _remember_llama_log(self, model_path: str, path: Path) -> None:
+        self._llama_model_logs[model_path] = str(path)
+        temporary = self._llama_log_index_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self._llama_model_logs, indent=2))
+        temporary.replace(self._llama_log_index_path)
+
+    @staticmethod
+    def _new_llama_log_path(log_dir: Path) -> Path:
+        return log_dir / (
+            f"llama-server-{time.time_ns()}-{uuid.uuid4().hex[:8]}.log"
+        )
+
+    def get_llama_server_logs(
+        self, model_path: str | None = None, since: int = 0,
+        limit_bytes: int = 262144,
+    ) -> dict:
+        """Read one model's managed llama-server log incrementally."""
+        requested_model = str(model_path or "").strip() or None
+        launching = self._llama_launching or {}
+        log_value = launching.get("log") if (
+            not requested_model or launching.get("model") == requested_model
+        ) else None
+        path = Path(log_value) if log_value else None
+        if path is None and requested_model:
+            indexed = getattr(self, "_llama_model_logs", {}).get(requested_model)
+            if indexed:
+                path = Path(indexed)
+            elif requested_model in {
+                self._llama_model,
+                getattr(self, "_llama_current_log_model", None),
+            }:
+                path = self._llama_current_log
+        elif path is None:
+            path = self._llama_current_log
+        if path is None and (
+            not requested_model or requested_model == self._llama_model
+        ):
             candidates = sorted(
                 self._llama_log_dir.glob("llama-server-*.log"),
                 key=lambda item: item.stat().st_mtime,
@@ -5141,16 +5197,23 @@ class Manager:
             handle.seek(offset)
             content = handle.read(limit)
         next_offset = offset + len(content)
+        at_eof = next_offset >= size
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        text = decoder.decode(content, final=at_eof)
+        pending, _ = decoder.getstate()
+        if pending and not at_eof:
+            next_offset -= len(pending)
         return {
             "log_id": path.name,
-            "text": content.decode(errors="replace"),
+            "text": text,
             "offset": offset,
             "next_offset": next_offset,
             "size_bytes": size,
             "complete": next_offset >= size,
             "running": self._llama_running(),
             "model": (
-                getattr(self, "_llama_current_log_model", None)
+                requested_model
+                or getattr(self, "_llama_current_log_model", None)
                 or self._llama_model
             ),
         }
@@ -5343,10 +5406,13 @@ class Manager:
             argv[argv.index("--port") + 1] = str(port)
 
             self._llama_log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self._llama_log_dir / f"llama-server-{int(time.time())}.log"
+            log_path = self._new_llama_log_path(self._llama_log_dir)
             self._llama_current_log = log_path
             self._llama_current_log_model = model_path
-            rpc_tx_start, rpc_interfaces = self._rpc_tx_counter(rpc_endpoints)
+            self._remember_llama_log(model_path, log_path)
+            rpc_tx_start, rpc_interfaces = await asyncio.to_thread(
+                self._rpc_tx_counter, rpc_endpoints
+            )
             log_file = open(log_path, "wb")
             try:
                 proc = await asyncio.create_subprocess_exec(

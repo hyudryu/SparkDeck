@@ -38,6 +38,7 @@
             x-text="selectedStatsNode()?.online ? '● Live' : '● Offline'"></span>
     </div>
     <template x-if="state">
+      <div class="stats-telemetry-layout">
       <div class="stat-row">
         <!-- CPU -->
         <div class="stat" :title="`CPU usage`">
@@ -164,6 +165,7 @@
             </svg>
           </div>
         </template>
+      </div>
       </div>
     </template>
     </div>

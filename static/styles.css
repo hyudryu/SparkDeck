@@ -68,6 +68,7 @@ body {
   grid-template-columns: repeat(12, minmax(110px, 1fr));
   gap: 14px;
 }
+.stats-telemetry-layout { min-width: 0; }
 .stat {
   display: flex; flex-direction: column; gap: 4px;
   padding: 6px 12px;

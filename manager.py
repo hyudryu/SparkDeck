@@ -299,6 +299,9 @@ class Manager:
         self._temperature_history: deque[dict[str, float | None]] = deque(
             maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES,
         )
+        self._remote_temperature_histories: dict[
+            str, deque[dict[str, float | None]]
+        ] = {}
         # container_name -> {"last_active": ts, "counter": int}
         self._activity: dict[str, dict] = {}
         # timestamp, {iface: (rx_bytes, tx_bytes)}
@@ -628,6 +631,10 @@ class Manager:
                 pass
 
         await asyncio.gather(*(add_legacy_disk(node) for node in nodes))
+        for node in nodes:
+            if node.get("local") or not node.get("online"):
+                continue
+            self._record_remote_temperature_sample(node)
         return nodes
 
     async def pair_node(self, body: dict) -> dict:
@@ -2098,6 +2105,9 @@ class Manager:
             return_exceptions=True,
         )
         nodes.extend(status for status in remote if isinstance(status, dict))
+        for node in nodes:
+            if node.get("id") != LOCAL_NODE_ID:
+                self._record_remote_temperature_sample(node)
         self._set_fan_temperature_override(
             self._cluster_temperature_override(nodes),
         )
@@ -6695,11 +6705,14 @@ class Manager:
         return {**stats, "active_requests": self.active_requests()}
 
     def _record_temperature_sample(
-        self, stats: dict, observed_at: float | None = None,
+        self,
+        stats: dict,
+        observed_at: float | None = None,
+        history: deque[dict[str, float | None]] | None = None,
     ) -> bool:
         """Append at most one CPU/GPU temperature point every 30 seconds."""
         now = float(observed_at if observed_at is not None else time.time())
-        history = self._temperature_history
+        history = history if history is not None else self._temperature_history
         if history and now - float(history[-1]["ts"]) < TEMPERATURE_HISTORY_INTERVAL_SECONDS:
             return False
 
@@ -6720,19 +6733,47 @@ class Manager:
             history.popleft()
         return True
 
-    def temperature_history(self) -> dict:
+    def _record_remote_temperature_sample(self, node: dict) -> bool:
+        node_id = str(node.get("id") or "")
+        stats = node.get("stats") or {}
+        if not node_id or not stats:
+            return False
+        history = self._remote_temperature_histories.setdefault(
+            node_id,
+            deque(maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES),
+        )
+        return self._record_temperature_sample(
+            stats,
+            stats.get("ts"),
+            history,
+        )
+
+    def temperature_history(
+        self, history: deque[dict[str, float | None]] | None = None,
+    ) -> dict:
+        history = history if history is not None else self._temperature_history
         return {
             "sample_interval_seconds": TEMPERATURE_HISTORY_INTERVAL_SECONDS,
             "window_seconds": TEMPERATURE_HISTORY_WINDOW_SECONDS,
-            "samples": list(self._temperature_history),
+            "samples": list(history),
         }
 
     async def temperature_history_for_node(self, node_id: str) -> dict:
         if not node_id or node_id == LOCAL_NODE_ID:
             return {"node_id": LOCAL_NODE_ID, **self.temperature_history()}
-        result = await self.node_registry.request(
-            node_id, "GET", "/api/agent/temperature-history", timeout=5,
-        )
+        history = self._remote_temperature_histories.get(node_id)
+        if history:
+            return {"node_id": node_id, **self.temperature_history(history)}
+        # A newly selected updated agent may already have samples even before
+        # this coordinator has observed its first 30-second point. Older
+        # agents do not expose this endpoint, so return an empty graph rather
+        # than failing the whole dashboard.
+        try:
+            result = await self.node_registry.request(
+                node_id, "GET", "/api/agent/temperature-history", timeout=5,
+            )
+        except RuntimeError:
+            result = self.temperature_history(deque())
         return {"node_id": node_id, **(result or {})}
 
     async def _temperature_history_monitor_loop(self) -> None:

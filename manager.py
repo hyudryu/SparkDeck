@@ -154,6 +154,9 @@ UNSLOTH_DEFAULT_SETTINGS = {
     # Multi-token prediction uses the model's built-in MTP head.  It only
     # applies to MTP-capable GGUFs (for example Qwen MTP variants).
     "mtp_enabled": False,
+    # DSpark uses a separate draft GGUF stored alongside the target model.
+    # It is mutually exclusive with the built-in MTP draft mode.
+    "dspark_enabled": False,
     "mtp_predict_tokens": 3,
     "speculative_type": "auto",
     "spec_draft_n_max": None,
@@ -4551,6 +4554,8 @@ class Manager:
             merged["mtp_predict_tokens"] = max(
                 1, min(64, int(merged.get("mtp_predict_tokens") or 1))
             )
+            if merged.get("mtp_enabled") and merged.get("dspark_enabled"):
+                raise ValueError("MTP and DSPARK cannot be enabled at the same time")
             self.unsloth_settings[model_path] = merged
             self._save_unsloth_settings()
         return self.get_unsloth_settings(model_path)
@@ -4603,6 +4608,7 @@ class Manager:
                 continue
             snap = snaps[-1]
             quants: dict[str, dict] = {}
+            dspark_drafts: list[dict] = []
             mmproj = None
             total = 0
             latest = 0.0
@@ -4615,6 +4621,28 @@ class Manager:
                 latest = max(latest, st.st_mtime)
                 if f.name.lower().startswith("mmproj"):
                     mmproj = mmproj or str(f)
+                    continue
+                # Unsloth publishes DSpark as a separate draft GGUF, usually
+                # under dspark/ and/or with a dspark-* filename.  Do not show
+                # it as a target-model quantization in the main variant list.
+                is_dspark_draft = (
+                    f.parent.name.lower() == "dspark"
+                    or f.name.lower().startswith("dspark-")
+                )
+                if is_dspark_draft:
+                    name_upper = f.stem.upper()
+                    if "Q8_0" in name_upper:
+                        draft_quant = "Q8_0"
+                    elif "BF16" in name_upper:
+                        draft_quant = "BF16"
+                    else:
+                        draft_quant = f.stem
+                    dspark_drafts.append({
+                        "quant": draft_quant,
+                        "filename": f.name,
+                        "path": str(f),
+                        "size_bytes": st.st_size,
+                    })
                     continue
                 quant = self._quant_from_filename(parts[1], f)
                 if not quant:
@@ -4649,6 +4677,14 @@ class Manager:
                 "last_modified": latest or None,
                 "cache_path": str(repo_dir),
                 "mmproj": mmproj,
+                "dspark_drafts": sorted(
+                    dspark_drafts,
+                    key=lambda d: (
+                        0 if d["quant"] == "Q8_0" else
+                        1 if d["quant"] == "BF16" else 2,
+                        d["filename"].lower(),
+                    ),
+                ),
                 "variants": variants,
             })
         models.sort(key=lambda x: x["name"].lower())
@@ -4705,6 +4741,7 @@ class Manager:
                 "size_bytes": None,
                 "last_modified": None,
                 "cache_path": None,
+                "dspark_drafts": [],
                 "variants": [],
                 "loaded_not_cached": True,
             })
@@ -5293,6 +5330,51 @@ class Manager:
             "--fit", "off",
         ]
 
+    @staticmethod
+    def _llama_speculative_args(
+        argv: list[str], settings: dict, model_entry: dict,
+    ) -> tuple[list[str], dict | None]:
+        """Add one supported speculative mode to a llama-server command."""
+        mtp_enabled = bool(settings.get("mtp_enabled"))
+        dspark_enabled = bool(settings.get("dspark_enabled"))
+        if mtp_enabled and dspark_enabled:
+            raise ValueError("MTP and DSPARK cannot be enabled at the same time")
+
+        draft_tokens = str(settings["mtp_predict_tokens"])
+        if mtp_enabled:
+            return [
+                *argv,
+                "--spec-type", "draft-mtp",
+                "--spec-draft-n-max", draft_tokens,
+            ], None
+
+        if not dspark_enabled:
+            return argv, None
+
+        drafts = list(model_entry.get("dspark_drafts") or [])
+        if not drafts:
+            model_id = model_entry.get("id") or "the model repository"
+            raise LookupError(
+                f"DSPARK is enabled, but no DSPARK draft GGUF is downloaded for "
+                f"'{model_id}'. Download the repository's dspark/*.gguf file "
+                "with `hf download`, then refresh and retry."
+            )
+        draft = min(
+            drafts,
+            key=lambda d: (
+                0 if str(d.get("quant")).upper() == "Q8_0" else
+                1 if str(d.get("quant")).upper() == "BF16" else 2,
+                str(d.get("filename") or d.get("path") or "").lower(),
+            ),
+        )
+        return [
+            *argv,
+            "--spec-draft-model", draft["path"],
+            "--spec-type", "draft-dspark",
+            "--spec-draft-n-max", draft_tokens,
+            "--spec-draft-ngl", "99",
+        ], draft
+
     async def _stop_remote_llama_rpc_workers(self) -> None:
         node_ids = list(self._llama_rpc_nodes)
         self._llama_rpc_nodes = []
@@ -5330,6 +5412,8 @@ class Manager:
         settings["mtp_predict_tokens"] = max(
             1, min(64, int(settings.get("mtp_predict_tokens") or 1))
         )
+        if settings.get("mtp_enabled") and settings.get("dspark_enabled"):
+            raise ValueError("MTP and DSPARK cannot be enabled at the same time")
         model_entry, variant = await self._find_gguf(model_path, settings["gguf_variant"])
 
         bin_path = Path(self.settings["llama_server_bin"]).expanduser()
@@ -5365,11 +5449,9 @@ class Manager:
         kv = (settings.get("cache_type_kv") or "").strip()
         if kv:
             argv += ["--cache-type-k", kv, "--cache-type-v", kv]
-        if settings.get("mtp_enabled"):
-            argv += [
-                "--spec-type", "draft-mtp",
-                "--spec-draft-n-max", str(settings["mtp_predict_tokens"]),
-            ]
+        argv, speculative_draft = self._llama_speculative_args(
+            argv, settings, model_entry
+        )
         if model_entry.get("mmproj"):
             argv += ["--mmproj", model_entry["mmproj"]]
 
@@ -5433,6 +5515,9 @@ class Manager:
                 "started_at": time.time(), "log": str(log_path),
                 "size_bytes": variant.get("size_bytes") or 0,
                 "model_files": list(variant.get("files") or [variant["path"]]),
+                "speculative_draft": (
+                    speculative_draft.get("path") if speculative_draft else None
+                ),
                 "read_bytes_start": self._proc_read_bytes(proc.pid) or 0,
                 "tensor_parallel_size": tp_size,
                 "rpc_endpoints": rpc_endpoints,

@@ -151,9 +151,31 @@ GET  /api/fan/max-speed
 POST /api/fan/max-speed   {"enabled": true}
 ```
 
-The max-speed override file is not a settings channel. FanController currently
-reads only `max_speed` from `~/.local/state/fancontroller/control.json`; adding
-curve or PID keys there has no effect.
+The control file supports independent, short-lived runtime overrides. It is
+not a persistent settings channel, and adding curve or PID keys there has no
+effect. VLLMController preserves unrelated fields when updating either
+override:
+
+```json
+{
+  "max_speed": false,
+  "temperature_override": {
+    "temperature_c": 74.5,
+    "source": "vllm-cluster-max",
+    "sensor": "cpu",
+    "node_id": "node-3",
+    "node_name": "gx10-node-3",
+    "observed_at": 1710000000.0,
+    "expires_at": 1710000012.0
+  }
+}
+```
+
+FanController validates the temperature and expiry on every control tick and
+feeds `max(local_temperature, temperature_override)` into the existing active
+curve, PID, or hysteresis controller. An expired or malformed override is
+ignored. If neither local nor external telemetry is available, the existing
+fail-safe behavior still requests full fan speed.
 
 FanController loads persistent settings from:
 

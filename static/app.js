@@ -79,7 +79,7 @@ function app() {
     unslothForm: {},            // model_id -> working copy of launch settings
     unslothVariants: {},        // model_id -> downloaded GGUF quant variants
     unslothVariantsBusy: {},    // model_id -> bool (variant fetch in flight)
-    UNSLOTH_KV_OPTIONS: ['bf16', 'f16', 'f32', 'q8_0', 'q6_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0', 'iq4_nl'],
+    UNSLOTH_KV_OPTIONS: ['bf16', 'f16', 'f32', 'q8_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0', 'iq4_nl'],
 
     // Saved SparkRun targets. The reference remains the source of truth;
     // SparkRun resolves its current model/configuration when it is saved.
@@ -2533,6 +2533,7 @@ function app() {
         split_mode: 'tensor',
         trust_remote_code: false,
         mtp_enabled: false,
+        dspark_enabled: false,
         mtp_predict_tokens: 3,
         speculative_type: 'auto',
         spec_draft_n_max: null,

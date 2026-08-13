@@ -946,12 +946,20 @@
             </label>
             <label>
               <span>Enable MTP <span class="tip" tabindex="0" data-tip="Use llama.cpp's built-in multi-token prediction head (--spec-type draft-mtp). Requires an MTP-capable GGUF; leave off for ordinary models."></span></span>
-              <input type="checkbox" x-model="unslothFormFor(m.id).mtp_enabled">
+              <input type="checkbox" x-model="unslothFormFor(m.id).mtp_enabled"
+                     @change="if ($event.target.checked) unslothFormFor(m.id).dspark_enabled = false">
             </label>
             <label>
-              <span>MTP draft tokens <span class="tip" tabindex="0" data-tip="Maximum tokens predicted per MTP draft step (--spec-draft-n-max). Higher values can improve speed when predictions are accepted, but use more compute. 1–64."></span></span>
+              <span>Enable DSPARK <span class="tip" tabindex="0" data-tip="Use a separate DSPARK draft GGUF with llama.cpp's --spec-type draft-dspark. The controller automatically prefers the downloaded Q8_0 drafter, then BF16."></span></span>
+              <input type="checkbox" x-model="unslothFormFor(m.id).dspark_enabled"
+                     @change="if ($event.target.checked) unslothFormFor(m.id).mtp_enabled = false">
+              <span class="muted" style="font-size:11px"
+                    x-show="unslothFormFor(m.id).dspark_enabled && !(m.dspark_drafts || []).length">No DSPARK draft GGUF found in this model's HF cache.</span>
+            </label>
+            <label>
+              <span>Speculative draft tokens <span class="tip" tabindex="0" data-tip="Maximum tokens predicted per MTP or DSPARK draft step (--spec-draft-n-max). Higher values can improve speed when predictions are accepted, but use more compute. 1–64."></span></span>
               <input type="number" min="1" max="64" step="1"
-                     :disabled="!unslothFormFor(m.id).mtp_enabled"
+                     :disabled="!unslothFormFor(m.id).mtp_enabled && !unslothFormFor(m.id).dspark_enabled"
                      x-model.number="unslothFormFor(m.id).mtp_predict_tokens">
             </label>
             <label>

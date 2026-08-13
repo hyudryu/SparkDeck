@@ -89,6 +89,22 @@ unloads or its launch fails. The llama.cpp RPC protocol
 itself is unauthenticated, so keep the ConnectX fabric isolated and never bind
 its port to a public or general-purpose network.
 
+### llama.cpp DSPARK speculative decoding
+
+For a GGUF repository that publishes a separate DSPARK draft model, download
+the drafter into the same Hugging Face cache as the target model. For example:
+
+```bash
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF \
+  dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf
+```
+
+Refresh the Models page, open the target model's **Load settings**, enable
+**DSPARK**, and set **Speculative draft tokens**. The controller passes the
+downloaded draft with `--spec-draft-model`, selects `draft-dspark`, and fully
+offloads the drafter with `--spec-draft-ngl 99`. Q8_0 is preferred when both
+Q8_0 and BF16 draft files are cached. DSPARK and MTP are mutually exclusive.
+
 ## MCP cluster automation and A/B testing
 
 The controller includes an MCP control plane for recipes, cluster lifecycle,

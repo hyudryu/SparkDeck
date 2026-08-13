@@ -162,6 +162,77 @@ class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(instance._scan_gguf_models(), [])
 
+    def test_gguf_scan_separates_dspark_drafts_from_target_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = (
+                root / "hub" / "models--unsloth--DeepSeek-V4-GGUF" /
+                "snapshots" / "snapshot-1"
+            )
+            target = snapshot / "UD-Q8_K_XL" / "DeepSeek-V4-UD-Q8_K_XL.gguf"
+            q8_draft = snapshot / "dspark-DeepSeek-V4-Q8_0.gguf"
+            bf16_draft = snapshot / "dspark" / "dspark-DeepSeek-V4-BF16.gguf"
+            for path, size in ((target, 17), (q8_draft, 11), (bf16_draft, 13)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * size)
+
+            instance = Manager.__new__(Manager)
+            instance.settings = {"hf_cache": str(root)}
+            model = instance._scan_gguf_models()[0]
+
+            self.assertEqual([v["quant"] for v in model["variants"]], ["UD-Q8_K_XL"])
+            self.assertEqual(
+                [draft["quant"] for draft in model["dspark_drafts"]],
+                ["Q8_0", "BF16"],
+            )
+
+    def test_dspark_arguments_use_separate_draft_and_shared_token_count(self) -> None:
+        argv, draft = Manager._llama_speculative_args(
+            ["llama-server", "-m", "target.gguf"],
+            {
+                "mtp_enabled": False,
+                "dspark_enabled": True,
+                "mtp_predict_tokens": 3,
+            },
+            {
+                "id": "unsloth/DeepSeek-V4-GGUF",
+                "dspark_drafts": [
+                    {"quant": "BF16", "path": "/draft-bf16.gguf"},
+                    {"quant": "Q8_0", "path": "/draft-q8.gguf"},
+                ],
+            },
+        )
+
+        self.assertEqual(argv[argv.index("--spec-type") + 1], "draft-dspark")
+        self.assertEqual(argv[argv.index("--spec-draft-model") + 1], "/draft-q8.gguf")
+        self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "3")
+        self.assertEqual(argv[argv.index("--spec-draft-ngl") + 1], "99")
+        self.assertEqual(draft["quant"], "Q8_0")
+
+    def test_dspark_requires_a_downloaded_draft(self) -> None:
+        with self.assertRaisesRegex(LookupError, "no DSPARK draft GGUF"):
+            Manager._llama_speculative_args(
+                ["llama-server"],
+                {
+                    "mtp_enabled": False,
+                    "dspark_enabled": True,
+                    "mtp_predict_tokens": 3,
+                },
+                {"id": "unsloth/DeepSeek-V4-GGUF", "dspark_drafts": []},
+            )
+
+    def test_mtp_and_dspark_are_mutually_exclusive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be enabled"):
+            Manager._llama_speculative_args(
+                ["llama-server"],
+                {
+                    "mtp_enabled": True,
+                    "dspark_enabled": True,
+                    "mtp_predict_tokens": 3,
+                },
+                {},
+            )
+
     def test_rpc_progress_uses_fabric_transfer_counter(self) -> None:
         instance = Manager.__new__(Manager)
         instance._llama_pid = 123

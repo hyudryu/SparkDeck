@@ -31,6 +31,7 @@ class FanSettingsTests(unittest.TestCase):
     def manager_for(self, config_path: Path, mode: str = "curve") -> Manager:
         instance = Manager.__new__(Manager)
         instance._fan_settings_lock = threading.Lock()
+        instance._fan_control_lock = threading.Lock()
         instance._fan_config_path = lambda: config_path
         instance._read_fan_state = lambda: {
             "mode": mode,
@@ -144,6 +145,72 @@ class FanSettingsTests(unittest.TestCase):
 
             self.assertEqual(state["active_settings"], CURVE)
             self.assertEqual(state["mode"], "curve")
+
+    def test_cluster_temperature_uses_hottest_fresh_cpu_or_gpu(self) -> None:
+        now = 1_000.0
+        result = Manager._cluster_temperature_override([
+            {
+                "id": "node-1",
+                "name": "gx10-node-1",
+                "online": True,
+                "stats": {
+                    "ts": now - 1,
+                    "cpu_temp_c": 48.0,
+                    "gpus": [{"temp_c": 52.0}],
+                },
+            },
+            {
+                "id": "node-3",
+                "name": "gx10-node-3",
+                "online": True,
+                "stats": {
+                    "ts": now - 2,
+                    "cpu_temp_c": 71.5,
+                    "gpus": [{"temp_c": None}],
+                },
+            },
+            {
+                "id": "stale",
+                "name": "stale-hot-node",
+                "online": True,
+                "stats": {"ts": now - 30, "cpu_temp_c": 99.0},
+            },
+            {
+                "id": "offline",
+                "name": "offline-hot-node",
+                "online": False,
+                "stats": {"ts": now, "cpu_temp_c": 100.0},
+            },
+        ], now=now)
+
+        self.assertEqual(result["temperature_c"], 71.5)
+        self.assertEqual(result["node_id"], "node-3")
+        self.assertEqual(result["node_name"], "gx10-node-3")
+        self.assertEqual(result["sensor"], "cpu")
+        self.assertGreater(result["expires_at"], now)
+
+    def test_fan_control_updates_preserve_independent_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fancontroller" / "control.json"
+            instance = Manager.__new__(Manager)
+            instance._fan_control_lock = threading.Lock()
+            instance._fan_control_path = lambda: path
+            override = {
+                "temperature_c": 75.0,
+                "expires_at": time.time() + 10,
+            }
+
+            instance._set_fan_temperature_override(override)
+            instance.set_fan_max_speed(True)
+            self.assertEqual(json.loads(path.read_text()), {
+                "temperature_override": override,
+                "max_speed": True,
+            })
+
+            instance.set_fan_max_speed(False)
+            self.assertEqual(json.loads(path.read_text()), {
+                "temperature_override": override,
+            })
 
 
 if __name__ == "__main__":

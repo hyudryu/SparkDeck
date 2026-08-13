@@ -104,6 +104,15 @@ FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
 FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
 FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
 
+# CPU/GPU chart history.  Thirty-second samples keep the payload small while
+# retaining enough detail for a useful two-hour view (including both ends of
+# the window, hence the extra point).
+TEMPERATURE_HISTORY_INTERVAL_SECONDS = 30.0
+TEMPERATURE_HISTORY_WINDOW_SECONDS = 2 * 60 * 60
+TEMPERATURE_HISTORY_MAX_SAMPLES = (
+    int(TEMPERATURE_HISTORY_WINDOW_SECONDS / TEMPERATURE_HISTORY_INTERVAL_SECONDS) + 1
+)
+
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
@@ -275,6 +284,7 @@ class Manager:
         self.idle_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
+        self.temperature_history_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
@@ -286,6 +296,9 @@ class Manager:
         self._cpu_prev: tuple[int, int] | None = None
         self._stats_cache: dict[str, Any] = {}
         self._stats_ts: float = 0.0
+        self._temperature_history: deque[dict[str, float | None]] = deque(
+            maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES,
+        )
         # container_name -> {"last_active": ts, "counter": int}
         self._activity: dict[str, dict] = {}
         # timestamp, {iface: (rx_bytes, tx_bytes)}
@@ -363,6 +376,9 @@ class Manager:
         self.idle_task = asyncio.create_task(self._idle_monitor_loop())
         self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
         self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
+        self.temperature_history_task = asyncio.create_task(
+            self._temperature_history_monitor_loop()
+        )
         self._start_mem_bw_monitor()
 
     async def stop(self):
@@ -371,6 +387,7 @@ class Manager:
             self.idle_task,
             self.cluster_health_task,
             self.fan_cluster_task,
+            self.temperature_history_task,
         ):
             if t:
                 t.cancel()
@@ -6652,6 +6669,7 @@ class Manager:
         # updates once per second while streams are active.
         now = time.time()
         if now - self._stats_ts < 0.8 and self._stats_cache:
+            self._record_temperature_sample(self._stats_cache, now)
             return {**self._stats_cache, "active_requests": self.active_requests()}
 
         def _gather():
@@ -6673,7 +6691,59 @@ class Manager:
         stats = await asyncio.to_thread(_gather)
         self._stats_cache = stats
         self._stats_ts = now
+        self._record_temperature_sample(stats, stats.get("ts", now))
         return {**stats, "active_requests": self.active_requests()}
+
+    def _record_temperature_sample(
+        self, stats: dict, observed_at: float | None = None,
+    ) -> bool:
+        """Append at most one CPU/GPU temperature point every 30 seconds."""
+        now = float(observed_at if observed_at is not None else time.time())
+        history = self._temperature_history
+        if history and now - float(history[-1]["ts"]) < TEMPERATURE_HISTORY_INTERVAL_SECONDS:
+            return False
+
+        def finite_temperature(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return round(value, 1) if math.isfinite(value) else None
+
+        gpu = (stats.get("gpus") or [{}])[0]
+        history.append({
+            "ts": now,
+            "cpu_temp_c": finite_temperature(stats.get("cpu_temp_c")),
+            "gpu_temp_c": finite_temperature(gpu.get("temp")),
+        })
+        cutoff = now - TEMPERATURE_HISTORY_WINDOW_SECONDS
+        while history and float(history[0]["ts"]) < cutoff:
+            history.popleft()
+        return True
+
+    def temperature_history(self) -> dict:
+        return {
+            "sample_interval_seconds": TEMPERATURE_HISTORY_INTERVAL_SECONDS,
+            "window_seconds": TEMPERATURE_HISTORY_WINDOW_SECONDS,
+            "samples": list(self._temperature_history),
+        }
+
+    async def temperature_history_for_node(self, node_id: str) -> dict:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return {"node_id": LOCAL_NODE_ID, **self.temperature_history()}
+        result = await self.node_registry.request(
+            node_id, "GET", "/api/agent/temperature-history", timeout=5,
+        )
+        return {"node_id": node_id, **(result or {})}
+
+    async def _temperature_history_monitor_loop(self) -> None:
+        while True:
+            try:
+                await self.get_stats()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[telemetry] temperature history sample failed: {exc}")
+            await asyncio.sleep(TEMPERATURE_HISTORY_INTERVAL_SECONDS)
 
     async def get_disk(self) -> dict:
         """Return disk usage separately; polled infrequently by the UI."""

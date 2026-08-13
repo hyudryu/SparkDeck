@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=59">
-<script src="/static/app.js?v=59"></script>
+<link rel="stylesheet" href="/static/styles.css?v=60">
+<script src="/static/app.js?v=60"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -133,6 +133,37 @@
                 x-text="'● ' + liveReqs(tokenModel)?.connections + ' conn · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
           <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
+      </div>
+      <div class="temperature-history-row">
+        <template x-for="kind in ['cpu', 'gpu']" :key="kind">
+          <div class="temperature-history-card">
+            <div class="temperature-history-head">
+              <span class="stat-label" x-text="`${kind.toUpperCase()} temperature · past 2 hours`"></span>
+              <span class="temperature-history-value"
+                    x-text="temperatureChart(kind).latest == null ? 'Collecting…' : `${temperatureChart(kind).latest.toFixed(1)}°C`"></span>
+            </div>
+            <svg class="temperature-history-chart" viewBox="0 0 370 116" role="img"
+                 :aria-label="`${kind.toUpperCase()} temperature over the past two hours`">
+              <template x-for="tick in temperatureChart(kind).ticks" :key="`${kind}-${tick.value}`">
+                <g>
+                  <line x1="38" :y1="tick.y" x2="354" :y2="tick.y" class="temperature-chart-grid"></line>
+                  <text x="33" :y="tick.y + 3" text-anchor="end" x-text="tick.label"></text>
+                </g>
+              </template>
+              <line x1="38" y1="94" x2="354" y2="94" class="temperature-chart-axis"></line>
+              <path :d="temperatureChart(kind).path" class="temperature-chart-line"
+                    :class="`temperature-chart-line-${kind}`"></path>
+              <circle x-show="temperatureChart(kind).lastPoint"
+                      :cx="temperatureChart(kind).lastPoint?.x"
+                      :cy="temperatureChart(kind).lastPoint?.y"
+                      r="3" class="temperature-chart-latest"
+                      :class="`temperature-chart-latest-${kind}`"></circle>
+              <text x="38" y="110" text-anchor="start">−2h</text>
+              <text x="196" y="110" text-anchor="middle">−1h</text>
+              <text x="354" y="110" text-anchor="end">now</text>
+            </svg>
+          </div>
+        </template>
       </div>
     </template>
     </div>

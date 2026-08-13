@@ -15,6 +15,7 @@ class TemperatureHistoryTests(unittest.IsolatedAsyncioTestCase):
     def manager_for_test(self) -> Manager:
         instance = Manager.__new__(Manager)
         instance._temperature_history = deque(maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES)
+        instance._remote_temperature_histories = {}
         return instance
 
     def test_samples_are_downsampled_and_invalid_values_become_gaps(self) -> None:
@@ -62,6 +63,35 @@ class TemperatureHistoryTests(unittest.IsolatedAsyncioTestCase):
         instance.node_registry.request.assert_awaited_once_with(
             "node-2", "GET", "/api/agent/temperature-history", timeout=5,
         )
+
+    async def test_coordinator_history_avoids_requiring_updated_remote_agent(self) -> None:
+        instance = self.manager_for_test()
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock()
+        instance._record_remote_temperature_sample({
+            "id": "node-3",
+            "stats": {
+                "ts": 50.0,
+                "cpu_temp_c": 58.0,
+                "gpus": [{"temp": 63.0}],
+            },
+        })
+
+        result = await instance.temperature_history_for_node("node-3")
+
+        self.assertEqual(result["samples"][0]["gpu_temp_c"], 63.0)
+        instance.node_registry.request.assert_not_awaited()
+
+    async def test_old_remote_agent_returns_an_empty_graph(self) -> None:
+        instance = self.manager_for_test()
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(
+            side_effect=RuntimeError("agent error: 404")
+        )
+
+        result = await instance.temperature_history_for_node("old-node")
+
+        self.assertEqual(result["samples"], [])
 
     async def test_monitor_samples_immediately_and_stops_cleanly(self) -> None:
         instance = self.manager_for_test()

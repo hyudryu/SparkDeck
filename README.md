@@ -242,6 +242,8 @@ curl -s -X POST http://<controller>:7878/api/queue/<job_id>/run
 |---|---|---|
 | `GET`    | `/api/state`                | Aggregate state: containers, queue, settings, stats |
 | `GET`    | `/api/stats`                | Host telemetry (CPU/GPU/RAM/temps/power) |
+| `GET`    | `/api/temperature-history`  | Selected-node CPU/GPU temperatures (30-second samples, two-hour window) |
+| `GET`    | `/api/active-request-rates` | Live thinking/output token rates for the two-second UI poll |
 | `POST`   | `/api/inference`            | Submit a chat-completion job to the queue |
 | `GET`    | `/api/inference/{id}`       | Poll job status / result |
 | `POST`   | `/api/queue/{id}/run`       | Override max-concurrent and run now |

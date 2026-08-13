@@ -95,6 +95,15 @@ CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
 CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
 
+# FanController consumes a short-lived cluster temperature override. Remote
+# node probes are cached for four seconds, so a two-second publisher interval
+# keeps the file fresh without increasing agent traffic. If this controller
+# stops, FanController ignores the override after the TTL and continues from
+# its own local sensors.
+FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
+FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
+FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
+
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
@@ -265,6 +274,7 @@ class Manager:
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
+        self.fan_cluster_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
@@ -341,6 +351,7 @@ class Manager:
         self._mem_bw: dict[str, float] = {}  # {"read_bps":..., "write_bps":..., "ts":...}
         self._mem_bw_lock = threading.Lock()
         self._fan_settings_lock = threading.Lock()
+        self._fan_control_lock = threading.Lock()
         self._online_users_cache: dict[str, Any] = {
             "count": None, "names": [], "sessions": 0,
         }
@@ -351,10 +362,16 @@ class Manager:
         self.worker_task = asyncio.create_task(self._worker_loop())
         self.idle_task = asyncio.create_task(self._idle_monitor_loop())
         self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
+        self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
         self._start_mem_bw_monitor()
 
     async def stop(self):
-        for t in (self.worker_task, self.idle_task, self.cluster_health_task):
+        for t in (
+            self.worker_task,
+            self.idle_task,
+            self.cluster_health_task,
+            self.fan_cluster_task,
+        ):
             if t:
                 t.cancel()
                 try:
@@ -1902,6 +1919,11 @@ class Manager:
                 "duty_byte": data.get("duty_byte"),
                 "duty_pct": data.get("duty_pct"),
                 "temp": data.get("temp"),
+                "local_temp": data.get("local_temp"),
+                "temperature_override": data.get("temperature_override", {}),
+                "temperature_override_active": data.get(
+                    "temperature_override_active", False,
+                ),
                 "mode": data.get("mode"),
                 "active_settings": data.get("active_settings", {}),
                 "status": data.get("status"),
@@ -1920,6 +1942,120 @@ class Manager:
 
     def _fan_config_path(self) -> Path:
         return Path.home() / ".config" / "fancontroller" / "config.json"
+
+    def _read_fan_control(self) -> dict:
+        try:
+            data = json.loads(self._fan_control_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _update_fan_control(
+        self,
+        updates: dict[str, Any] | None = None,
+        remove: tuple[str, ...] = (),
+    ) -> dict:
+        """Atomically merge fields without clobbering another control type."""
+        with self._fan_control_lock:
+            path = self._fan_control_path()
+            data = self._read_fan_control()
+            for key in remove:
+                data.pop(key, None)
+            data.update(updates or {})
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not data:
+                path.unlink(missing_ok=True)
+                return {}
+            tmp = path.with_suffix(".json.tmp")
+            try:
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return data
+
+    @staticmethod
+    def _cluster_temperature_override(
+        nodes: list[dict], now: float | None = None,
+    ) -> dict | None:
+        """Return metadata for the hottest fresh CPU/GPU sensor in a cluster."""
+        current_time = time.time() if now is None else float(now)
+        hottest: tuple[float, dict] | None = None
+        for node in nodes:
+            if not node.get("online"):
+                continue
+            stats = node.get("stats") or {}
+            observed_at = stats.get("ts")
+            if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
+                continue
+            observed_at = float(observed_at)
+            if (not math.isfinite(observed_at)
+                    or current_time - observed_at > FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS):
+                continue
+            samples: list[tuple[float, str]] = []
+
+            def add(value: Any, sensor: str) -> None:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return
+                value = float(value)
+                if math.isfinite(value) and -40 <= value <= 150:
+                    samples.append((value, sensor))
+
+            add(stats.get("cpu_temp_c"), "cpu")
+            for index, gpu in enumerate(stats.get("gpus") or []):
+                if isinstance(gpu, dict):
+                    add(gpu.get("temp_c"), f"gpu:{index}")
+            if not samples:
+                continue
+            temperature_c, sensor = max(samples, key=lambda sample: sample[0])
+            metadata = {
+                "temperature_c": temperature_c,
+                "source": "vllm-cluster-max",
+                "sensor": sensor,
+                "node_id": str(node.get("id") or node.get("node_id") or ""),
+                "node_name": str(node.get("name") or node.get("hostname") or "unknown"),
+                "observed_at": observed_at,
+                "expires_at": current_time + FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS,
+            }
+            if hottest is None or temperature_c > hottest[0]:
+                hottest = (temperature_c, metadata)
+        return hottest[1] if hottest else None
+
+    def _set_fan_temperature_override(self, override: dict | None) -> None:
+        if override is None:
+            self._update_fan_control(remove=("temperature_override",))
+        else:
+            self._update_fan_control({"temperature_override": override})
+
+    async def _fan_cluster_temperature_tick(self) -> None:
+        # Only the controller attached to a live FanController should publish.
+        if self._read_fan_state() is None:
+            return
+        local_stats = await self.get_stats()
+        nodes = [{
+            "id": LOCAL_NODE_ID,
+            "name": self.settings.get("cluster_node_name") or socket.gethostname(),
+            "online": True,
+            "stats": local_stats,
+        }]
+        remote = await asyncio.gather(
+            *(self.node_registry.probe(node) for node in self.node_registry.nodes),
+            return_exceptions=True,
+        )
+        nodes.extend(status for status in remote if isinstance(status, dict))
+        self._set_fan_temperature_override(
+            self._cluster_temperature_override(nodes),
+        )
+
+    async def _fan_cluster_monitor_loop(self) -> None:
+        while True:
+            try:
+                await self._fan_cluster_temperature_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[fan-cluster] temperature sync failed: {exc}")
+            await asyncio.sleep(FAN_CLUSTER_SYNC_INTERVAL_SECONDS)
 
     # ---------- local path auto-mount ----------
     @staticmethod
@@ -2170,16 +2306,12 @@ class Manager:
             return {"enabled": False}
 
     def set_fan_max_speed(self, enabled: bool) -> dict:
-        """Write/clear the external fan max-speed override file."""
+        """Write/clear max speed without discarding cluster temperature."""
         try:
-            path = self._fan_control_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
             if enabled:
-                tmp = path.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps({"max_speed": True}), encoding="utf-8")
-                tmp.replace(path)
+                self._update_fan_control({"max_speed": True})
             else:
-                path.unlink(missing_ok=True)
+                self._update_fan_control(remove=("max_speed",))
             return {"enabled": enabled}
         except Exception as e:
             return {"error": str(e)}

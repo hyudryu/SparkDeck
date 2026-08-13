@@ -152,6 +152,9 @@
         </label>
       </div>
       <span class="stat-value" x-text="`${state?.stats?.fan?.rpm ?? '—'} RPM · ${state?.stats?.fan?.duty_pct != null ? state.stats.fan.duty_pct.toFixed(0) : '—'}%`"></span>
+      <span class="muted" style="font-size:11px"
+            x-show="state?.stats?.fan?.temperature_override_active"
+            x-text="`Cluster max ${state?.stats?.fan?.temp?.toFixed?.(1) ?? '—'}°C · ${state?.stats?.fan?.temperature_override?.node_name ?? 'remote node'}`"></span>
       <div class="bar"><span :style="`width:${Math.round(state?.stats?.fan?.duty_pct ?? 0)}%; background: ${fanMaxSpeed ? 'var(--accent-red)' : 'var(--accent-blue)'}`"></span></div>
 
       <div class="fan-settings-panel" x-show="fanSettingsOpen" x-transition>

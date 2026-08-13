@@ -416,6 +416,44 @@ class Manager:
             })
         return interfaces
 
+    @staticmethod
+    def _distributed_network_environment(
+        interface: str,
+        sys_class_net: Path = Path("/sys/class/net"),
+    ) -> dict[str, str]:
+        """Build one consistent NCCL/Gloo/UCX transport configuration.
+
+        Container images may contain host-specific RDMA defaults. Always
+        replace them using the interface selected for this cluster member so
+        socket bootstrap and collective traffic cannot target different ports.
+        """
+        environment = {
+            "NCCL_SOCKET_IFNAME": interface,
+            "GLOO_SOCKET_IFNAME": interface,
+        }
+        infiniband_dir = sys_class_net / interface / "device" / "infiniband"
+        try:
+            hcas = sorted(path.name for path in infiniband_dir.iterdir())
+        except OSError:
+            hcas = []
+        if hcas:
+            environment.update({
+                "NCCL_NET": "IB",
+                "NCCL_IB_DISABLE": "0",
+                "NCCL_IB_HCA": ",".join(hcas),
+                "UCX_NET_DEVICES": ",".join(f"{hca}:1" for hca in hcas),
+            })
+        else:
+            # Override stale RDMA defaults inherited from an image. Socket is
+            # slower but remains a valid, predictable fallback.
+            environment.update({
+                "NCCL_NET": "Socket",
+                "NCCL_IB_DISABLE": "1",
+                "NCCL_IB_HCA": "",
+                "UCX_NET_DEVICES": "",
+            })
+        return environment
+
     async def agent_status(self, stats: dict | None = None) -> dict:
         if stats is None:
             stats = await self.get_stats()
@@ -4003,10 +4041,9 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options.setdefault("environment", {}).update({
-                            "NCCL_SOCKET_IFNAME": iface,
-                            "GLOO_SOCKET_IFNAME": iface,
-                        })
+                        run_options.setdefault("environment", {}).update(
+                            self._distributed_network_environment(iface)
+                        )
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
@@ -4145,10 +4182,9 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options.setdefault("environment", {}).update({
-                            "NCCL_SOCKET_IFNAME": iface,
-                            "GLOO_SOCKET_IFNAME": iface,
-                        })
+                        run_options.setdefault("environment", {}).update(
+                            self._distributed_network_environment(iface)
+                        )
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:

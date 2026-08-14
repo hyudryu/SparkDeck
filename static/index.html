@@ -130,7 +130,7 @@
           <span class="stat-value" x-show="tokenModel"><span class="tok-dir" style="color:var(--accent-green)">Cost</span><span x-text="tokenCostDisplay(tokenModel)"></span></span>
           <span class="stat-value" x-show="!tokenModel">—</span>
           <span class="stat-value live-reqs" x-show="liveReqs(tokenModel)"
-                x-text="'● ' + liveReqs(tokenModel)?.connections + ' conn · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
+                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
           <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
       </div>
@@ -1541,6 +1541,7 @@ for chunk in stream:
         <tr><td colspan="3" style="opacity:0.7; padding-top:12px"><strong>Controller management</strong></td></tr>
         <tr><td>GET</td>    <td><code>/api/state</code></td>             <td>Aggregate state: containers, ollama, settings, stats</td></tr>
         <tr><td>GET</td>    <td><code>/api/stats</code></td>             <td>Host telemetry (CPU/GPU/RAM/temps/power/network)</td></tr>
+        <tr><td>GET</td>    <td><code>/api/inference-queue</code></td>   <td>Running and controller-queued vLLM requests by deployment</td></tr>
         <tr><td>GET/POST</td><td><code>/api/settings</code></td>         <td>Read/update controller settings</td></tr>
         <tr><td>GET/POST/PUT/DELETE</td><td><code>/api/containers[/...]</code></td><td>List/create/start/stop/remove vLLM containers, edit load settings, fetch logs</td></tr>
         <tr><td>POST</td>   <td><code>/api/images/pull</code></td>       <td>Pull a docker image (SSE progress stream)</td></tr>

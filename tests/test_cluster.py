@@ -433,23 +433,164 @@ class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    def test_distributed_network_environment_matches_selected_rdma_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            infiniband = (
+                root / "enp1s0f1np1" / "device" / "infiniband"
+            )
+            (infiniband / "rocep1s0f1").mkdir(parents=True)
+
+            environment = Manager._distributed_network_environment(
+                "enp1s0f1np1", root,
+            )
+
+        self.assertEqual(environment, {
+            "NCCL_SOCKET_IFNAME": "enp1s0f1np1",
+            "GLOO_SOCKET_IFNAME": "enp1s0f1np1",
+            "NCCL_NET": "IB",
+            "NCCL_IB_DISABLE": "0",
+            "NCCL_IB_HCA": "rocep1s0f1",
+            "UCX_NET_DEVICES": "rocep1s0f1:1",
+        })
+
+    def test_distributed_network_environment_overrides_stale_rdma_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Manager._distributed_network_environment(
+                "eth0", Path(directory),
+            )
+
+        self.assertEqual(environment["NCCL_NET"], "Socket")
+        self.assertEqual(environment["NCCL_IB_DISABLE"], "1")
+        self.assertEqual(environment["NCCL_IB_HCA"], "")
+        self.assertEqual(environment["UCX_NET_DEVICES"], "")
+
     def test_usage_alias_is_persisted_and_can_be_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
             instance.token_stats = {"model/a [Q8]": {"input": 1}}
             instance.usage_aliases = {}
             instance.usage_aliases_path = Path(directory) / "usage_aliases.json"
+            instance.usage_merge_groups = {}
+            instance.usage_merge_groups_path = (
+                Path(directory) / "usage_merge_groups.json"
+            )
 
-            saved = instance.update_usage_alias("model/a [Q8]", "Fast local")
+            saved = instance.update_usage_alias(
+                "model/a [Q8]", "Fast local",
+                merge_group="DeepSeek", update_merge_group=True,
+            )
             self.assertEqual(saved["alias"], "Fast local")
+            self.assertEqual(saved["merge_group"], "DeepSeek")
             self.assertEqual(
                 json.loads(instance.usage_aliases_path.read_text()),
                 {"model/a [Q8]": "Fast local"},
             )
+            self.assertEqual(
+                json.loads(instance.usage_merge_groups_path.read_text()),
+                {"model/a [Q8]": "DeepSeek"},
+            )
 
-            cleared = instance.update_usage_alias("model/a [Q8]", None)
+            cleared = instance.update_usage_alias(
+                "model/a [Q8]", None,
+                merge_group=None, update_merge_group=True,
+            )
             self.assertIsNone(cleared["alias"])
+            self.assertIsNone(cleared["merge_group"])
             self.assertEqual(json.loads(instance.usage_aliases_path.read_text()), {})
+            self.assertEqual(
+                json.loads(instance.usage_merge_groups_path.read_text()), {}
+            )
+
+    def test_usage_merge_group_combines_counters_cost_and_concurrent_speed(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "deepseek-thinking": {
+                "input": 100, "cached": 40, "output": 100,
+                "requests": 1, "gen_tokens": 100, "gen_time_s": 10,
+            },
+            "deepseek-chat": {
+                "input": 200, "cached": 80, "output": 200,
+                "requests": 1, "gen_tokens": 200, "gen_time_s": 10,
+            },
+        }
+        instance.usage_aliases = {"deepseek-chat": "Non-thinking"}
+        instance.usage_merge_groups = {
+            "deepseek-thinking": "DeepSeek",
+            "deepseek-chat": "DeepSeek",
+        }
+        instance.speed_samples = {
+            "deepseek-thinking": [{
+                "tokens": 100, "started_at": 1000, "ended_at": 1010,
+            }],
+            "deepseek-chat": [{
+                "tokens": 200, "started_at": 1000, "ended_at": 1010,
+            }],
+        }
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        rows = instance.usage_rows()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["label"], "DeepSeek")
+        self.assertEqual(rows[0]["stats"]["input"], 300)
+        self.assertEqual(rows[0]["stats"]["cached"], 120)
+        self.assertEqual(rows[0]["stats"]["output"], 300)
+        self.assertEqual(rows[0]["stats"]["requests"], 2)
+        self.assertAlmostEqual(rows[0]["speed"]["tok_s"], 30.0)
+
+    def test_rolling_speed_uses_only_newest_one_million_output_tokens(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.speed_samples = {
+            "model": [
+                {"tokens": 9_000_000, "started_at": 0, "ended_at": 90},
+                {"tokens": 2_000_000, "started_at": 100, "ended_at": 110},
+            ],
+        }
+
+        speed = instance.rolling_generation_speed(["model"])
+
+        self.assertEqual(speed["tokens"], 1_000_000)
+        self.assertAlmostEqual(speed["active_time_s"], 5.0)
+
+    def test_rolling_speed_sums_five_overlapping_streams(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.speed_samples = {
+            "model": [
+                {"tokens": 100, "started_at": 1000, "ended_at": 1010}
+                for _ in range(5)
+            ],
+        }
+
+        speed = instance.rolling_generation_speed(["model"])
+
+        self.assertEqual(speed["tokens"], 500)
+        self.assertAlmostEqual(speed["active_time_s"], 10.0)
+        self.assertAlmostEqual(speed["tok_s"], 50.0)
+
+    def test_cluster_pricing_applies_cache_miss_hit_and_output_rates(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "model": "deepseek/model",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+        instance.unsloth_settings = {}
+
+        cost = instance.calculate_cost("deepseek/model [nvfp4]", {
+            "input": 1_000_000,
+            "cached": 250_000,
+            "output": 500_000,
+        })
+
+        self.assertEqual(cost["input_cost_per_1m"], 2.0)
+        self.assertEqual(cost["cache_cost_per_1m"], 0.5)
+        self.assertEqual(cost["output_cost_per_1m"], 4.0)
+        self.assertEqual(cost["total_cost"], 3.62)
 
     async def test_recipe_clone_controls_and_update_are_durable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -896,6 +1037,31 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "stop the cluster"):
             instance.update_deployment_settings("deployment-1", {"model": "example/New"})
+
+    def test_running_deployment_pricing_can_be_changed_without_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-1",
+                "model": "example/Model",
+                "status": "ready",
+                "settings_dirty": False,
+                "launch_settings": {"model": "example/Model"},
+            }]
+
+            result = instance.update_deployment_pricing("deployment-1", {
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.1,
+                "output_cost_per_1m": 3.5,
+            })
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(instance.deployments[0]["settings_dirty"])
+            saved = json.loads(instance.deployments_path.read_text())[0]
+            self.assertEqual(saved["launch_settings"]["input_cost_per_1m"], 1.25)
+            self.assertEqual(saved["launch_settings"]["cache_cost_per_1m"], 0.1)
+            self.assertEqual(saved["launch_settings"]["output_cost_per_1m"], 3.5)
 
     def test_running_deployment_can_be_renamed_without_dirtying_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

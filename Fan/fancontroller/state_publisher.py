@@ -36,6 +36,8 @@ def publish(
     status: str,
     max_speed: bool = False,
     active_settings: dict[str, Any] | None = None,
+    local_temp: float | None = None,
+    temperature_override: dict[str, Any] | None = None,
 ) -> None:
     """Write current fan state to the shared JSON file."""
     try:
@@ -45,6 +47,9 @@ def publish(
             "duty_byte": int(duty_byte),
             "duty_pct": float(duty_pct),
             "temp": float(temp) if temp is not None else None,
+            "local_temp": float(local_temp) if local_temp is not None else None,
+            "temperature_override": dict(temperature_override or {}),
+            "temperature_override_active": bool(temperature_override),
             "mode": str(mode),
             "active_settings": dict(active_settings or {}),
             "status": str(status),

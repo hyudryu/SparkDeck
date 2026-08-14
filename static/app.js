@@ -42,6 +42,9 @@ function app() {
     deploymentSettingsSaving: {},
     deploymentSettingsForm: {},
     deploymentSettingsBaseline: {},
+    deploymentPricingSaving: {},
+    deploymentPricingSaved: {},
+    deploymentPricingBaseline: {},
     deploymentIdCopied: {},
     KV_CACHE_DTYPE_OPTIONS: [
       'auto', 'bfloat16', 'float16', 'fp8', 'fp8_ds_mla', 'fp8_e4m3',
@@ -135,6 +138,7 @@ function app() {
     usageSortDirection: 'desc',
     usageAliasEditing: {},
     usageAliasValue: {},
+    usageMergeValue: {},
     usageAliasSaving: {},
     usageAliasSaved: {},
     analysisDateStart: '',         // YYYY-MM-DD or '' for default range
@@ -158,6 +162,8 @@ function app() {
     disk: null,
     diskLoading: false,
     diskLastAt: null,
+    temperatureHistoryByNode: {},
+    liveRequestRates: {},
     fanMaxSpeed: false,
     topbarStatsCollapsed: false,
     statsNodeId: 'local',
@@ -188,11 +194,18 @@ function app() {
       this.topbarStatsCollapsed = window.innerWidth <= 720;
       await this.refresh();
       await this.refreshDisk();
+      await this.refreshTemperatureHistory();
+      await this.refreshLiveRequestRates();
       // 1 Hz stats polling, paused when the tab isn't visible so we don't
       // wake the GPU compositor for invisible repaints.
       setInterval(() => {
         if (!document.hidden) this.refreshStats();
       }, 1000);
+      // Token rates are deliberately sampled at a stable two-second cadence;
+      // SSE chunk frequency must not control how often the widget repaints.
+      setInterval(() => {
+        if (!document.hidden) this.refreshLiveRequestRates();
+      }, 2 * 1000);
       setInterval(() => {
         if (!document.hidden) this.refresh();
       }, 2500);
@@ -200,11 +213,17 @@ function app() {
       setInterval(() => {
         if (!document.hidden) this.refreshDisk();
       }, 5 * 60 * 1000);
+      // Temperature history changes only once per 30-second server sample.
+      setInterval(() => {
+        if (!document.hidden) this.refreshTemperatureHistory();
+      }, 30 * 1000);
       // Refresh immediately on tab regaining focus.
       document.addEventListener('visibilitychange', () => {
         if (!document.hidden) {
           this.refreshStats();
           this.refresh();
+          this.refreshTemperatureHistory();
+          this.refreshLiveRequestRates();
           if (!this.diskLastAt || Date.now() - this.diskLastAt > 5 * 60 * 1000) {
             this.refreshDisk();
           }
@@ -226,6 +245,7 @@ function app() {
         if (open) this._startSparkHistoryTail();
         else this._stopSparkHistoryTail();
       });
+      this.$watch('statsNodeId', () => this.refreshTemperatureHistory());
       // Load analysis data when switching to the Analysis sub-tab
       this.$watch('usageSubTab', (v) => {
         if (v === 'analysis') this.loadAnalysisData();
@@ -304,7 +324,21 @@ function app() {
             this.deploymentSettingsBaseline[deployment.id] = this.deploymentSettingsSnapshot(
               deployment, draft
             );
+            this.deploymentPricingBaseline[deployment.id] = this.deploymentPricingSnapshot(
+              deployment, draft
+            );
           }
+          if (this.deploymentPricingSaving[deployment.id] == null) {
+            this.deploymentPricingSaving[deployment.id] = false;
+          }
+        }
+        // Dynamic Alpine object keys must be initialized explicitly. Leaving
+        // a per-model saving flag undefined can make the boolean disabled
+        // binding sticky in some browsers after a state refresh.
+        for (const model of Object.keys(s.token_stats || {})) {
+          if (this.usageAliasSaving[model] == null) this.usageAliasSaving[model] = false;
+          if (this.usageAliasEditing[model] == null) this.usageAliasEditing[model] = false;
+          if (this.usageAliasSaved[model] == null) this.usageAliasSaved[model] = false;
         }
         // Auto-switch the token card to the newly loaded model.
         this._syncTokenModel();
@@ -360,6 +394,32 @@ function app() {
       } catch (e) {
         console.error('fan max-speed toggle failed:', e);
         this.fanMaxSpeed = !this.fanMaxSpeed;
+      }
+    },
+
+    async refreshTemperatureHistory() {
+      const nodeId = this.selectedStatsNode()?.id || this.statsNodeId || 'local';
+      try {
+        const r = await fetch(`/api/temperature-history?node_id=${encodeURIComponent(nodeId)}&t=${Date.now()}`);
+        if (!r.ok) return;
+        const history = await r.json();
+        this.temperatureHistoryByNode = {
+          ...this.temperatureHistoryByNode,
+          [nodeId]: history,
+        };
+      } catch {
+        // Keep the last successful two-hour window visible during a brief
+        // node or network interruption.
+      }
+    },
+
+    async refreshLiveRequestRates() {
+      try {
+        const r = await fetch(`/api/active-request-rates?t=${Date.now()}`);
+        if (!r.ok) return;
+        this.liveRequestRates = await r.json();
+      } catch {
+        // Retain the last sample until the next fixed-cadence poll.
       }
     },
 
@@ -540,6 +600,80 @@ function app() {
       return node?.local ? this.disk : (node?.disk || null);
     },
     statsGpu() { return this.nodeStats()?.gpus?.[0] || null; },
+    temperatureHistory() {
+      const nodeId = this.selectedStatsNode()?.id || this.statsNodeId || 'local';
+      return this.temperatureHistoryByNode[nodeId] || {
+        window_seconds: 2 * 60 * 60,
+        samples: [],
+      };
+    },
+    temperatureChart(kind) {
+      const history = this.temperatureHistory();
+      const key = kind === 'gpu' ? 'gpu_temp_c' : 'cpu_temp_c';
+      const samples = Array.isArray(history.samples) ? history.samples : [];
+      const values = samples
+        .map(sample => sample?.[key])
+        .filter(value => typeof value === 'number' && Number.isFinite(value));
+      const latest = values.length ? values[values.length - 1] : null;
+      const windowSeconds = Number(history.window_seconds) || 2 * 60 * 60;
+      const now = Date.now() / 1000;
+      const windowStart = now - windowSeconds;
+      const left = 38;
+      const right = 354;
+      const top = 10;
+      const bottom = 94;
+
+      let minTemp = values.length ? Math.min(...values) : 30;
+      let maxTemp = values.length ? Math.max(...values) : 90;
+      minTemp = Math.max(0, Math.floor((minTemp - 5) / 10) * 10);
+      maxTemp = Math.min(120, Math.ceil((maxTemp + 5) / 10) * 10);
+      if (maxTemp - minTemp < 20) {
+        const middle = (maxTemp + minTemp) / 2;
+        minTemp = Math.max(0, Math.floor((middle - 10) / 10) * 10);
+        maxTemp = minTemp + 20;
+        if (maxTemp > 120) {
+          maxTemp = 120;
+          minTemp = 100;
+        }
+      }
+
+      const x = ts => left + Math.max(0, Math.min(1, (ts - windowStart) / windowSeconds)) * (right - left);
+      const y = value => bottom - ((value - minTemp) / (maxTemp - minTemp)) * (bottom - top);
+      let path = '';
+      let drawing = false;
+      let previousTs = null;
+      const expectedInterval = Number(history.sample_interval_seconds) || 30;
+      let lastPoint = null;
+      for (const sample of samples) {
+        const ts = Number(sample?.ts);
+        const rawValue = sample?.[key];
+        const value = typeof rawValue === 'number' ? rawValue : NaN;
+        if (!Number.isFinite(ts) || !Number.isFinite(value) || ts < windowStart) {
+          drawing = false;
+          previousTs = null;
+          continue;
+        }
+        const px = x(ts);
+        const py = y(value);
+        const gap = previousTs != null && ts - previousTs > expectedInterval * 2.5;
+        path += `${!drawing || gap ? 'M' : 'L'}${px.toFixed(1)},${py.toFixed(1)} `;
+        drawing = true;
+        previousTs = ts;
+        lastPoint = { x: px, y: py, value };
+      }
+
+      const middleTemp = (minTemp + maxTemp) / 2;
+      return {
+        path: path.trim(),
+        latest,
+        lastPoint,
+        ticks: [maxTemp, middleTemp, minTemp].map(value => ({
+          value,
+          y: y(value),
+          label: `${Math.round(value)}°`,
+        })),
+      };
+    },
     gpu() { return this.state?.stats?.gpus?.[0] || null; },
     gpuTotalGb() {
       const totalMib = this.state?.stats?.gpus?.[0]?.mem_total_mib;
@@ -694,12 +828,12 @@ function app() {
       const v = r.gen_tokens / r.gen_time_s;
       return isFinite(v) ? v : null;
     },
-    // Live in-flight stream stats for a model, fed by the 1 Hz stats poll:
+    // Live in-flight stream stats for a model, fed by the fixed 2-second poll:
     // {connections, tok_s} where tok/s is the aggregate across all active
     // streams of that model. Null when nothing is streaming right now.
     liveReqs(model) {
       if (!model) return null;
-      const a = this.state?.stats?.active_requests?.[model];
+      const a = this.liveRequestRates?.[model];
       return a && a.connections > 0 ? a : null;
     },
     // While streams are active this is the live aggregate rate; otherwise
@@ -956,35 +1090,36 @@ function app() {
     usageAlias(model) {
       return this.state?.usage_aliases?.[model] || '';
     },
-    usageAverageSpeed(stats) {
-      const tokens = Number(stats?.gen_tokens || 0);
-      const seconds = Number(stats?.gen_time_s || 0);
-      if (!tokens || !seconds) return null;
-      const value = tokens / seconds;
+    usageMergeGroup(model) {
+      return this.state?.usage_merge_groups?.[model] || '';
+    },
+    usageMergeGroups() {
+      return [...new Set(Object.values(this.state?.usage_merge_groups || {}).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b));
+    },
+    usageAverageSpeed(row) {
+      if (row?.speed?.tok_s == null) return null;
+      const value = Number(row?.speed?.tok_s);
       return Number.isFinite(value) ? value : null;
     },
-    usageCostValue(model) {
-      const value = Number(this.state?.token_costs?.[model]?.total_cost);
+    usageCostValue(row) {
+      const value = Number(row?.total_cost);
       return Number.isFinite(value) ? value : 0;
     },
-    usageCostDisplay(model) {
-      const value = this.usageCostValue(model);
+    usageCostDisplay(row) {
+      const value = this.usageCostValue(row);
       return value > 0 ? this.fmtCost(value) : '—';
     },
     usageSortValue(row, key) {
       const stats = row.stats || {};
-      if (key === 'model') return (row.alias || row.model).toLocaleLowerCase();
-      if (key === 'speed') return this.usageAverageSpeed(stats);
+      if (key === 'model') return String(row.label || row.key).toLocaleLowerCase();
+      if (key === 'speed') return this.usageAverageSpeed(row);
       if (key === 'time') return Number(stats.gen_time_s || 0);
-      if (key === 'cost') return this.usageCostValue(row.model);
+      if (key === 'cost') return this.usageCostValue(row);
       return Number(stats[key] || 0);
     },
     usageRows() {
-      const rows = Object.entries(this.state?.token_stats || {}).map(([model, stats]) => ({
-        model,
-        stats,
-        alias: this.usageAlias(model),
-      }));
+      const rows = (this.state?.usage_rows || []).map(row => ({...row}));
       const key = this.usageSortKey;
       const direction = this.usageSortDirection === 'asc' ? 1 : -1;
       return rows.sort((left, right) => {
@@ -999,7 +1134,7 @@ function app() {
         } else {
           comparison = Number(a) - Number(b);
         }
-        if (comparison === 0) comparison = left.model.localeCompare(right.model);
+        if (comparison === 0) comparison = left.key.localeCompare(right.key);
         return comparison * direction;
       });
     },
@@ -1021,6 +1156,8 @@ function app() {
     },
     startUsageAliasEdit(model) {
       this.usageAliasValue[model] = this.usageAlias(model);
+      this.usageMergeValue[model] = this.usageMergeGroup(model);
+      this.usageAliasSaving[model] = false;
       this.usageAliasEditing[model] = true;
     },
     cancelUsageAliasEdit(model) {
@@ -1037,6 +1174,7 @@ function app() {
           body: JSON.stringify({
             model,
             alias: this.usageAliasValue[model]?.trim() || null,
+            merge_group: this.usageMergeValue[model]?.trim() || null,
           }),
         });
         const reply = await response.json().catch(() => ({}));
@@ -1063,30 +1201,11 @@ function app() {
     totalRequests() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.requests || 0), 0);
     },
-    // Total cost across all models (sum of per-model costs from server).
-    // Computed client-side using per-model pricing to avoid N requests.
+    // Total cost across all raw models, using the server's authoritative
+    // deployment/standalone/built-in pricing resolution.
     totalCost() {
-      let total = 0;
-      for (const [model, s] of Object.entries(this.state?.token_stats || {})) {
-        // Check per-model pricing from unsloth settings first.
-        const us = this.state?.unsloth?.models?.find(m => m.id === model);
-        const usSettings = us ? (this.state?.settings?.unsloth_settings?.[model] || {}) : {};
-        let inpRate = usSettings?.input_cost_per_1m || 0;
-        let outRate = usSettings?.output_cost_per_1m || 0;
-        let cacheRate = usSettings?.cache_cost_per_1m || 0;
-        // Fall back to built-in MODEL_PRICING if no per-model pricing set.
-        if (!inpRate && !outRate) {
-          // We use the server's per-model cost endpoint as fallback, but that
-          // is async so we approximate here: $0 when no per-model pricing.
-          // The per-model cells use the async endpoint; the total row is
-          // an approximation.
-        }
-        const cached = s.cached || 0;
-        const nonCachedInput = Math.max(0, (s.input || 0) - cached);
-        total += (nonCachedInput / 1_000_000) * inpRate
-               + (cached / 1_000_000) * cacheRate
-               + ((s.output || 0) / 1_000_000) * outRate;
-      }
+      const total = Object.values(this.state?.token_costs || {})
+        .reduce((sum, cost) => sum + Number(cost?.total_cost || 0), 0);
       return total > 0 ? this.fmtCost(total) : '—';
     },
     // Opportunity cost for a flagship model: total tokens × per-1M rate.
@@ -1651,6 +1770,9 @@ function app() {
         dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens ?? null,
         max_cudagraph_capture_size: controls.max_cudagraph_capture_size ?? null,
         max_num_batched_tokens: controls.max_num_batched_tokens ?? null,
+        input_cost_per_1m: settings.input_cost_per_1m ?? null,
+        cache_cost_per_1m: settings.cache_cost_per_1m ?? null,
+        output_cost_per_1m: settings.output_cost_per_1m ?? null,
         sg_tp_size: settings.sg_tp_size ?? 1,
         sg_context_length: settings.sg_context_length ?? 32768,
         sg_max_running_requests: settings.sg_max_running_requests ?? null,
@@ -1674,6 +1796,9 @@ function app() {
         const draft = this.deploymentSettingsDraft(deployment);
         this.deploymentSettingsForm[deployment.id] = draft;
         this.deploymentSettingsBaseline[deployment.id] = this.deploymentSettingsSnapshot(
+          deployment, draft
+        );
+        this.deploymentPricingBaseline[deployment.id] = this.deploymentPricingSnapshot(
           deployment, draft
         );
       }
@@ -1752,6 +1877,55 @@ function app() {
 
     deploymentSettingsSnapshot(deployment, suppliedForm = null) {
       return JSON.stringify(this.deploymentSettingsPayload(deployment, suppliedForm));
+    },
+
+    nullablePrice(value) {
+      return value === '' || value == null ? null : Number(value);
+    },
+
+    deploymentPricingPayload(deployment, suppliedForm = null) {
+      const form = suppliedForm || this.deploymentSettingsFor(deployment);
+      return {
+        input_cost_per_1m: this.nullablePrice(form.input_cost_per_1m),
+        cache_cost_per_1m: this.nullablePrice(form.cache_cost_per_1m),
+        output_cost_per_1m: this.nullablePrice(form.output_cost_per_1m),
+      };
+    },
+
+    deploymentPricingSnapshot(deployment, suppliedForm = null) {
+      return JSON.stringify(this.deploymentPricingPayload(deployment, suppliedForm));
+    },
+
+    deploymentPricingChanged(deployment) {
+      return this.deploymentPricingSnapshot(deployment)
+        !== this.deploymentPricingBaseline[deployment.id];
+    },
+
+    async saveDeploymentPricing(deployment) {
+      if (this.deploymentPricingSaving[deployment.id]
+          || !this.deploymentPricingChanged(deployment)) return;
+      const form = this.deploymentSettingsFor(deployment);
+      this.deploymentPricingSaving[deployment.id] = true;
+      this.deploymentPricingSaved[deployment.id] = false;
+      try {
+        const response = await fetch(`/api/deployments/${deployment.id}/pricing`, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify(this.deploymentPricingPayload(deployment, form)),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.deploymentPricingBaseline[deployment.id] = this.deploymentPricingSnapshot(
+          deployment, form
+        );
+        this.deploymentPricingSaved[deployment.id] = true;
+        setTimeout(() => { this.deploymentPricingSaved[deployment.id] = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Save pricing failed: ' + error.message);
+      } finally {
+        this.deploymentPricingSaving[deployment.id] = false;
+      }
     },
 
     deploymentSettingsChanged(deployment) {

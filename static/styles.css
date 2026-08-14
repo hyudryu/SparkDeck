@@ -68,6 +68,7 @@ body {
   grid-template-columns: repeat(12, minmax(110px, 1fr));
   gap: 14px;
 }
+.stats-telemetry-layout { min-width: 0; }
 .stat {
   display: flex; flex-direction: column; gap: 4px;
   padding: 6px 12px;
@@ -139,6 +140,62 @@ body {
   min-width: 140px;
   position: relative;
 }
+.temperature-history-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+.temperature-history-card {
+  min-width: 0;
+  padding: 8px 10px 6px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.temperature-history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 3px;
+}
+.temperature-history-value {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.temperature-history-chart {
+  display: block;
+  width: 100%;
+  height: 116px;
+  overflow: visible;
+}
+.temperature-history-chart text {
+  fill: var(--text-muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.temperature-chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+.temperature-chart-axis { stroke: var(--border-strong); stroke-width: 1; }
+.temperature-chart-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.temperature-chart-line-cpu { stroke: var(--accent-blue); }
+.temperature-chart-line-gpu { stroke: var(--accent-green); }
+.temperature-chart-latest {
+  stroke: var(--bg-1);
+  stroke-width: 1.5;
+}
+.temperature-chart-latest-cpu { fill: var(--accent-blue); }
+.temperature-chart-latest-gpu { fill: var(--accent-green); }
 .stat-label-actions { display: inline-flex; align-items: center; gap: 7px; }
 .stat-manage-btn {
   padding: 0; border: 0; background: transparent; color: var(--text-muted);
@@ -1161,6 +1218,7 @@ select option {
   .topbar-stats { order: 2; width: 100%; }
   .topbar-right { order: 1; flex: 1; justify-content: flex-end; }
   .stat-row { grid-template-columns: repeat(2, 1fr); }
+  .temperature-history-row { grid-template-columns: 1fr; }
   .cluster-log-output { min-height: 280px; max-height: 55vh; }
   main { padding: 16px; }
   .tabs { padding: 10px 12px 0; overflow-x: auto; }
@@ -1563,6 +1621,7 @@ input[type="range"]::-moz-range-thumb {
 .usage-model-title { display: flex; align-items: center; gap: 7px; }
 .usage-model-title strong { word-break: break-word; }
 .usage-model-id { margin-top: 3px; font-size: 11px; word-break: break-all; }
+.usage-model-member + .usage-model-member { margin-top: 3px; }
 .usage-alias-button {
   flex: none;
   padding: 1px 4px;
@@ -1577,12 +1636,15 @@ input[type="range"]::-moz-range-thumb {
 .usage-alias-saved { font-size: 11px; }
 .usage-alias-editor {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 7px;
 }
-.usage-alias-editor input { min-width: 160px; }
+.usage-alias-editor label { display: grid; gap: 3px; color: var(--text-muted); font-size: 11px; }
+.usage-alias-editor input { min-width: 190px; }
 .usage-alias-editor .btn { padding: 5px 8px; }
+.deployment-pricing-actions { margin-top: 10px; }
 
 .usage-table tr:hover td,
 .usage-pricing-table tr:hover td {

@@ -525,6 +525,56 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 {"model/a": "Original"},
             )
 
+    def test_one_usage_model_can_be_erased_without_touching_others(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instance = Manager.__new__(Manager)
+            instance.token_stats_path = root / "token_stats.json"
+            instance.hourly_token_stats_path = root / "hourly.json"
+            instance.speed_samples_path = root / "speed.json"
+            instance.usage_aliases_path = root / "aliases.json"
+            instance.usage_merge_groups_path = root / "groups.json"
+            instance.token_stats = {
+                "model/a": {"input": 10}, "model/b": {"input": 20},
+            }
+            instance.session_token_stats = {
+                "model/a": {"input": 1}, "model/b": {"input": 2},
+            }
+            instance.speed_samples = {
+                "model/a": [{"tokens": 1}], "model/b": [{"tokens": 2}],
+            }
+            instance.hourly_token_stats = {
+                "2026-08-14T01": {
+                    "model/a": {"input": 3}, "model/b": {"input": 4},
+                },
+            }
+            instance.usage_aliases = {
+                "model/a": "A", "model/b": "B",
+            }
+            instance.usage_merge_groups = {
+                "model/a": "group", "model/b": "group",
+            }
+
+            result = instance.erase_usage_model("model/a")
+
+            self.assertEqual(result, {"ok": True, "model": "model/a"})
+            for mapping in (
+                instance.token_stats, instance.session_token_stats,
+                instance.speed_samples, instance.usage_aliases,
+                instance.usage_merge_groups,
+            ):
+                self.assertNotIn("model/a", mapping)
+                self.assertIn("model/b", mapping)
+            self.assertNotIn(
+                "model/a", instance.hourly_token_stats["2026-08-14T01"]
+            )
+            self.assertIn(
+                "model/b", instance.hourly_token_stats["2026-08-14T01"]
+            )
+            self.assertNotIn(
+                "model/a", json.loads(instance.token_stats_path.read_text())
+            )
+
     def test_usage_merge_group_combines_counters_cost_and_concurrent_speed(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

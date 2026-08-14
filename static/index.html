@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=63">
-<script src="/static/app.js?v=63"></script>
+<link rel="stylesheet" href="/static/styles.css?v=64">
+<script src="/static/app.js?v=64"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -1825,6 +1825,10 @@ for chunk in stream:
                               :disabled="usageAliasSaving[member.model] === true"
                               x-text="usageAliasSaving[member.model] === true ? 'Saving…' : 'Save'"></button>
                       <button class="btn btn-ghost" type="button" @click="cancelUsageAliasEdit(member.model)">Cancel</button>
+                      <button class="btn btn-danger" type="button"
+                              @click="eraseUsageModel(member.model)"
+                              :disabled="usageEraseBusy[member.model] === true"
+                              x-text="usageEraseBusy[member.model] === true ? 'Erasing…' : 'Erase usage'"></button>
                     </form>
                   </div>
                 </template>

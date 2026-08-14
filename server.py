@@ -135,6 +135,20 @@ async def get_stats():
     return await manager.get_stats()
 
 
+@app.get("/api/temperature-history")
+async def get_temperature_history(node_id: str = LOCAL_NODE_ID):
+    try:
+        return await manager.temperature_history_for_node(node_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/active-request-rates")
+async def get_active_request_rates():
+    """Small endpoint polled by the token widget at a fixed cadence."""
+    return manager.active_requests()
+
+
 # ---------- cluster nodes / node agent ----------
 @app.get("/api/agent/info")
 async def agent_info():
@@ -162,6 +176,12 @@ async def agent_pair(req: Request):
 async def agent_status(req: Request):
     _require_agent(req)
     return await manager.agent_status()
+
+
+@app.get("/api/agent/temperature-history")
+async def agent_temperature_history(req: Request):
+    _require_agent(req)
+    return manager.temperature_history()
 
 
 @app.get("/api/agent/llama-rpc")

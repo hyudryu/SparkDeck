@@ -95,6 +95,24 @@ CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
 CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
 
+# FanController consumes a short-lived cluster temperature override. Remote
+# node probes are cached for four seconds, so a two-second publisher interval
+# keeps the file fresh without increasing agent traffic. If this controller
+# stops, FanController ignores the override after the TTL and continues from
+# its own local sensors.
+FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
+FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
+FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
+
+# CPU/GPU chart history.  Thirty-second samples keep the payload small while
+# retaining enough detail for a useful two-hour view (including both ends of
+# the window, hence the extra point).
+TEMPERATURE_HISTORY_INTERVAL_SECONDS = 30.0
+TEMPERATURE_HISTORY_WINDOW_SECONDS = 2 * 60 * 60
+TEMPERATURE_HISTORY_MAX_SAMPLES = (
+    int(TEMPERATURE_HISTORY_WINDOW_SECONDS / TEMPERATURE_HISTORY_INTERVAL_SECONDS) + 1
+)
+
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
@@ -191,6 +209,8 @@ MODEL_PRICING = {
     "llama-3.3-70b":       {"input": 0.59, "output": 0.79, "cache": 0.29},
 }
 
+USAGE_SPEED_WINDOW_TOKENS = 1_000_000
+
 PENDING = "pending"          # waiting for capacity
 DISPATCHING = "dispatching"  # model starting, will run when ready
 RUNNING = "running"          # inference active
@@ -245,6 +265,10 @@ class Manager:
         self.token_stats: dict[str, dict] = self._load_token_stats()
         self.usage_aliases_path = self.data_dir / "usage_aliases.json"
         self.usage_aliases: dict[str, str] = self._load_usage_aliases()
+        self.usage_merge_groups_path = self.data_dir / "usage_merge_groups.json"
+        self.usage_merge_groups: dict[str, str] = self._load_usage_merge_groups()
+        self.speed_samples_path = self.data_dir / "speed_samples.json"
+        self.speed_samples: dict[str, list[dict]] = self._load_speed_samples()
         # Session token counters — same shape as token_stats but NOT
         # persisted. Tracks tokens served since the controller started (or
         # since the last session reset). The topbar widget shows these; the
@@ -265,6 +289,8 @@ class Manager:
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
+        self.fan_cluster_task: asyncio.Task | None = None
+        self.temperature_history_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
@@ -276,6 +302,12 @@ class Manager:
         self._cpu_prev: tuple[int, int] | None = None
         self._stats_cache: dict[str, Any] = {}
         self._stats_ts: float = 0.0
+        self._temperature_history: deque[dict[str, float | None]] = deque(
+            maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES,
+        )
+        self._remote_temperature_histories: dict[
+            str, deque[dict[str, float | None]]
+        ] = {}
         # container_name -> {"last_active": ts, "counter": int}
         self._activity: dict[str, dict] = {}
         # timestamp, {iface: (rx_bytes, tx_bytes)}
@@ -349,6 +381,7 @@ class Manager:
         self._mem_bw: dict[str, float] = {}  # {"read_bps":..., "write_bps":..., "ts":...}
         self._mem_bw_lock = threading.Lock()
         self._fan_settings_lock = threading.Lock()
+        self._fan_control_lock = threading.Lock()
         self._online_users_cache: dict[str, Any] = {
             "count": None, "names": [], "sessions": 0,
         }
@@ -359,10 +392,20 @@ class Manager:
         self.worker_task = asyncio.create_task(self._worker_loop())
         self.idle_task = asyncio.create_task(self._idle_monitor_loop())
         self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
+        self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
+        self.temperature_history_task = asyncio.create_task(
+            self._temperature_history_monitor_loop()
+        )
         self._start_mem_bw_monitor()
 
     async def stop(self):
-        for t in (self.worker_task, self.idle_task, self.cluster_health_task):
+        for t in (
+            self.worker_task,
+            self.idle_task,
+            self.cluster_health_task,
+            self.fan_cluster_task,
+            self.temperature_history_task,
+        ):
             if t:
                 t.cancel()
                 try:
@@ -406,6 +449,44 @@ class Manager:
                 "rdma": rdma,
             })
         return interfaces
+
+    @staticmethod
+    def _distributed_network_environment(
+        interface: str,
+        sys_class_net: Path = Path("/sys/class/net"),
+    ) -> dict[str, str]:
+        """Build one consistent NCCL/Gloo/UCX transport configuration.
+
+        Container images may contain host-specific RDMA defaults. Always
+        replace them using the interface selected for this cluster member so
+        socket bootstrap and collective traffic cannot target different ports.
+        """
+        environment = {
+            "NCCL_SOCKET_IFNAME": interface,
+            "GLOO_SOCKET_IFNAME": interface,
+        }
+        infiniband_dir = sys_class_net / interface / "device" / "infiniband"
+        try:
+            hcas = sorted(path.name for path in infiniband_dir.iterdir())
+        except OSError:
+            hcas = []
+        if hcas:
+            environment.update({
+                "NCCL_NET": "IB",
+                "NCCL_IB_DISABLE": "0",
+                "NCCL_IB_HCA": ",".join(hcas),
+                "UCX_NET_DEVICES": ",".join(f"{hca}:1" for hca in hcas),
+            })
+        else:
+            # Override stale RDMA defaults inherited from an image. Socket is
+            # slower but remains a valid, predictable fallback.
+            environment.update({
+                "NCCL_NET": "Socket",
+                "NCCL_IB_DISABLE": "1",
+                "NCCL_IB_HCA": "",
+                "UCX_NET_DEVICES": "",
+            })
+        return environment
 
     async def agent_status(self, stats: dict | None = None) -> dict:
         if stats is None:
@@ -564,6 +645,10 @@ class Manager:
                 pass
 
         await asyncio.gather(*(add_legacy_disk(node) for node in nodes))
+        for node in nodes:
+            if node.get("local") or not node.get("online"):
+                continue
+            self._record_remote_temperature_sample(node)
         return nodes
 
     async def pair_node(self, body: dict) -> dict:
@@ -653,7 +738,38 @@ class Manager:
         tmp.write_text(json.dumps(self.usage_aliases, indent=2), encoding="utf-8")
         tmp.replace(self.usage_aliases_path)
 
-    def update_usage_alias(self, model: Any, alias: Any) -> dict:
+    def _load_usage_merge_groups(self) -> dict[str, str]:
+        if not self.usage_merge_groups_path.exists():
+            return {}
+        try:
+            value = json.loads(
+                self.usage_merge_groups_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(model): str(group)
+                for model, group in value.items()
+                if str(model).strip() and str(group).strip()
+            }
+        except Exception:
+            return {}
+
+    def _save_usage_merge_groups(self) -> None:
+        tmp = self.usage_merge_groups_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.usage_merge_groups, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.usage_merge_groups_path)
+
+    def update_usage_alias(
+        self,
+        model: Any,
+        alias: Any,
+        *,
+        merge_group: Any = None,
+        update_merge_group: bool = False,
+    ) -> dict:
         model_key = str(model or "").strip()
         if not model_key or model_key not in self.token_stats:
             raise ValueError("usage model not found")
@@ -663,7 +779,23 @@ class Manager:
         else:
             self.usage_aliases.pop(model_key, None)
         self._save_usage_aliases()
-        return {"ok": True, "model": model_key, "alias": normalized or None}
+        if update_merge_group:
+            normalized_group = self._normalized_alias(merge_group)
+            if normalized_group:
+                self.usage_merge_groups[model_key] = normalized_group
+            else:
+                self.usage_merge_groups.pop(model_key, None)
+            self._save_usage_merge_groups()
+        else:
+            normalized_group = getattr(
+                self, "usage_merge_groups", {}
+            ).get(model_key, "")
+        return {
+            "ok": True,
+            "model": model_key,
+            "alias": normalized or None,
+            "merge_group": normalized_group or None,
+        }
 
     @staticmethod
     def _normalized_alias(value: Any, fallback: str = "") -> str:
@@ -701,7 +833,19 @@ class Manager:
         )
 
     @staticmethod
-    def _deployment_launch_settings(body: dict) -> dict:
+    def _pricing_value(value: Any, field: str) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a non-negative number") from exc
+        if result < 0:
+            raise ValueError(f"{field} must be a non-negative number")
+        return result
+
+    @classmethod
+    def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
         return {
             "deployment_name": body.get("deployment_name") or body.get("name"),
@@ -719,6 +863,23 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "input_cost_per_1m": cls._pricing_value(
+                body.get("input_cost_per_1m"), "input_cost_per_1m"
+            ),
+            "cache_cost_per_1m": cls._pricing_value(
+                body.get("cache_cost_per_1m"), "cache_cost_per_1m"
+            ),
+            "output_cost_per_1m": cls._pricing_value(
+                body.get("output_cost_per_1m"), "output_cost_per_1m"
+            ),
+        }
+
+    @staticmethod
+    def _deployment_pricing(settings: dict) -> dict:
+        return {
+            "input_cost_per_1m": settings.get("input_cost_per_1m"),
+            "cache_cost_per_1m": settings.get("cache_cost_per_1m"),
+            "output_cost_per_1m": settings.get("output_cost_per_1m"),
         }
 
     @classmethod
@@ -927,6 +1088,23 @@ class Manager:
         })
         self._save_deployments()
         return deployment
+
+    def update_deployment_pricing(self, deployment_id: str, body: dict) -> dict:
+        """Update accounting metadata without restarting a running cluster."""
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise ValueError("deployment not found")
+        pricing = {
+            field: self._pricing_value(body.get(field), field)
+            for field in (
+                "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+            )
+        }
+        launch_settings = deployment.setdefault("launch_settings", {})
+        launch_settings.update(pricing)
+        deployment["pricing"] = pricing
+        self._save_deployments()
+        return {"ok": True, "deployment_id": deployment_id, **pricing}
 
     @staticmethod
     def _without_cli_options(args: list[str], names: set[str]) -> list[str]:
@@ -1935,6 +2113,11 @@ class Manager:
                 "duty_byte": data.get("duty_byte"),
                 "duty_pct": data.get("duty_pct"),
                 "temp": data.get("temp"),
+                "local_temp": data.get("local_temp"),
+                "temperature_override": data.get("temperature_override", {}),
+                "temperature_override_active": data.get(
+                    "temperature_override_active", False,
+                ),
                 "mode": data.get("mode"),
                 "active_settings": data.get("active_settings", {}),
                 "status": data.get("status"),
@@ -1953,6 +2136,123 @@ class Manager:
 
     def _fan_config_path(self) -> Path:
         return Path.home() / ".config" / "fancontroller" / "config.json"
+
+    def _read_fan_control(self) -> dict:
+        try:
+            data = json.loads(self._fan_control_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _update_fan_control(
+        self,
+        updates: dict[str, Any] | None = None,
+        remove: tuple[str, ...] = (),
+    ) -> dict:
+        """Atomically merge fields without clobbering another control type."""
+        with self._fan_control_lock:
+            path = self._fan_control_path()
+            data = self._read_fan_control()
+            for key in remove:
+                data.pop(key, None)
+            data.update(updates or {})
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not data:
+                path.unlink(missing_ok=True)
+                return {}
+            tmp = path.with_suffix(".json.tmp")
+            try:
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return data
+
+    @staticmethod
+    def _cluster_temperature_override(
+        nodes: list[dict], now: float | None = None,
+    ) -> dict | None:
+        """Return metadata for the hottest fresh CPU/GPU sensor in a cluster."""
+        current_time = time.time() if now is None else float(now)
+        hottest: tuple[float, dict] | None = None
+        for node in nodes:
+            if not node.get("online"):
+                continue
+            stats = node.get("stats") or {}
+            observed_at = stats.get("ts")
+            if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
+                continue
+            observed_at = float(observed_at)
+            if (not math.isfinite(observed_at)
+                    or current_time - observed_at > FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS):
+                continue
+            samples: list[tuple[float, str]] = []
+
+            def add(value: Any, sensor: str) -> None:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return
+                value = float(value)
+                if math.isfinite(value) and -40 <= value <= 150:
+                    samples.append((value, sensor))
+
+            add(stats.get("cpu_temp_c"), "cpu")
+            for index, gpu in enumerate(stats.get("gpus") or []):
+                if isinstance(gpu, dict):
+                    add(gpu.get("temp_c"), f"gpu:{index}")
+            if not samples:
+                continue
+            temperature_c, sensor = max(samples, key=lambda sample: sample[0])
+            metadata = {
+                "temperature_c": temperature_c,
+                "source": "vllm-cluster-max",
+                "sensor": sensor,
+                "node_id": str(node.get("id") or node.get("node_id") or ""),
+                "node_name": str(node.get("name") or node.get("hostname") or "unknown"),
+                "observed_at": observed_at,
+                "expires_at": current_time + FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS,
+            }
+            if hottest is None or temperature_c > hottest[0]:
+                hottest = (temperature_c, metadata)
+        return hottest[1] if hottest else None
+
+    def _set_fan_temperature_override(self, override: dict | None) -> None:
+        if override is None:
+            self._update_fan_control(remove=("temperature_override",))
+        else:
+            self._update_fan_control({"temperature_override": override})
+
+    async def _fan_cluster_temperature_tick(self) -> None:
+        # Only the controller attached to a live FanController should publish.
+        if self._read_fan_state() is None:
+            return
+        local_stats = await self.get_stats()
+        nodes = [{
+            "id": LOCAL_NODE_ID,
+            "name": self.settings.get("cluster_node_name") or socket.gethostname(),
+            "online": True,
+            "stats": local_stats,
+        }]
+        remote = await asyncio.gather(
+            *(self.node_registry.probe(node) for node in self.node_registry.nodes),
+            return_exceptions=True,
+        )
+        nodes.extend(status for status in remote if isinstance(status, dict))
+        for node in nodes:
+            if node.get("id") != LOCAL_NODE_ID:
+                self._record_remote_temperature_sample(node)
+        self._set_fan_temperature_override(
+            self._cluster_temperature_override(nodes),
+        )
+
+    async def _fan_cluster_monitor_loop(self) -> None:
+        while True:
+            try:
+                await self._fan_cluster_temperature_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[fan-cluster] temperature sync failed: {exc}")
+            await asyncio.sleep(FAN_CLUSTER_SYNC_INTERVAL_SECONDS)
 
     # ---------- local path auto-mount ----------
     @staticmethod
@@ -2203,16 +2503,12 @@ class Manager:
             return {"enabled": False}
 
     def set_fan_max_speed(self, enabled: bool) -> dict:
-        """Write/clear the external fan max-speed override file."""
+        """Write/clear max speed without discarding cluster temperature."""
         try:
-            path = self._fan_control_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
             if enabled:
-                tmp = path.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps({"max_speed": True}), encoding="utf-8")
-                tmp.replace(path)
+                self._update_fan_control({"max_speed": True})
             else:
-                path.unlink(missing_ok=True)
+                self._update_fan_control(remove=("max_speed",))
             return {"enabled": enabled}
         except Exception as e:
             return {"error": str(e)}
@@ -2256,9 +2552,10 @@ class Manager:
     # their "CLOUD " prefix. Persisted on every update so they survive
     # restarts; only the reset endpoint clears them.
     #
-    # Speed fields (gen_tokens / gen_time_s) measure decode only: the window
-    # from the first output chunk to the last, so prompt processing / prefill
-    # time is excluded. Average speed = gen_tokens / gen_time_s.
+    # Speed fields (gen_tokens / gen_time_s) are retained for compatibility.
+    # The Usage table uses persisted request intervals instead: its rolling
+    # 1M-output-token rate divides output tokens by the union of decode intervals,
+    # so overlapping streams contribute their combined throughput.
     def _load_token_stats(self) -> dict[str, dict]:
         if self.token_stats_path.exists():
             try:
@@ -2271,6 +2568,104 @@ class Manager:
 
     def _save_token_stats(self):
         self.token_stats_path.write_text(json.dumps(self.token_stats, indent=2))
+
+    def _load_speed_samples(self) -> dict[str, list[dict]]:
+        if self.speed_samples_path.exists():
+            try:
+                data = json.loads(self.speed_samples_path.read_text())
+                if isinstance(data, dict):
+                    return {
+                        str(model): samples
+                        for model, samples in data.items()
+                        if isinstance(samples, list)
+                    }
+            except Exception:
+                pass
+        return {}
+
+    def _save_speed_samples(self) -> None:
+        self.speed_samples_path.write_text(
+            json.dumps(self.speed_samples, indent=2)
+        )
+
+    def _record_speed_sample(
+        self, model: str, completion_tokens: int, gen_time_s: float | None
+    ) -> None:
+        if not gen_time_s or gen_time_s <= 0 or completion_tokens <= 0:
+            return
+        ended_at = time.time()
+        samples = self.speed_samples.setdefault(model, [])
+        samples.append({
+            "tokens": completion_tokens,
+            "started_at": ended_at - float(gen_time_s),
+            "ended_at": ended_at,
+        })
+        # Each model retains at least the newest 1M output tokens. The
+        # event cap prevents pathological one-token requests from growing the
+        # metadata file without bound.
+        retained = []
+        retained_tokens = 0.0
+        for sample in reversed(samples):
+            retained.append(sample)
+            retained_tokens += max(0.0, float(sample.get("tokens") or 0))
+            if retained_tokens >= USAGE_SPEED_WINDOW_TOKENS or len(retained) >= 250_000:
+                break
+        self.speed_samples[model] = list(reversed(retained))
+
+    def rolling_generation_speed(self, models: list[str]) -> dict:
+        """Aggregate decode throughput over the newest 1M output tokens.
+
+        Active-time intervals are unioned instead of summed. Consequently,
+        five overlapping 10 tok/s requests report about 50 tok/s, while idle
+        gaps between requests do not dilute inference throughput.
+        """
+        samples = []
+        for model in models:
+            for raw in getattr(self, "speed_samples", {}).get(model, []):
+                try:
+                    tokens = float(raw.get("tokens") or 0)
+                    started_at = float(raw.get("started_at"))
+                    ended_at = float(raw.get("ended_at"))
+                except (TypeError, ValueError):
+                    continue
+                if tokens <= 0 or ended_at <= started_at:
+                    continue
+                samples.append((ended_at, started_at, tokens))
+
+        selected = []
+        selected_tokens = 0.0
+        for ended_at, started_at, tokens in sorted(samples, reverse=True):
+            remaining = USAGE_SPEED_WINDOW_TOKENS - selected_tokens
+            if remaining <= 0:
+                break
+            used_tokens = min(tokens, remaining)
+            fraction = used_tokens / tokens
+            # For a partially included oldest request, keep its newest
+            # proportional section so the window ends at the latest token.
+            used_started_at = ended_at - ((ended_at - started_at) * fraction)
+            selected.append((used_started_at, ended_at))
+            selected_tokens += used_tokens
+
+        if not selected:
+            return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
+
+        active_time = 0.0
+        current_start = None
+        current_end = None
+        for started_at, ended_at in sorted(selected):
+            if current_start is None:
+                current_start, current_end = started_at, ended_at
+            elif started_at <= current_end:
+                current_end = max(current_end, ended_at)
+            else:
+                active_time += current_end - current_start
+                current_start, current_end = started_at, ended_at
+        active_time += current_end - current_start
+        return {
+            "tokens": int(selected_tokens),
+            "active_time_s": active_time,
+            "tok_s": selected_tokens / active_time if active_time > 0 else None,
+        }
 
     def _load_hourly_token_stats(self) -> dict[str, dict]:
         if self.hourly_token_stats_path.exists():
@@ -2376,6 +2771,7 @@ class Manager:
         # cached_tokens > prompt_tokens in edge cases).
         if cached_tokens > prompt_tokens:
             cached_tokens = prompt_tokens
+        self._record_speed_sample(model, completion_tokens, gen_time_s)
         # Update both lifetime and session counters with the same values.
         for stats in (self.token_stats, self.session_token_stats):
             rec = stats.setdefault(model, {})
@@ -2404,6 +2800,10 @@ class Manager:
             pass
         try:
             self._save_hourly_token_stats()
+        except Exception:
+            pass
+        try:
+            self._save_speed_samples()
         except Exception:
             pass
 
@@ -2762,8 +3162,60 @@ class Manager:
         total_req = sum(r.get("requests", 0) for r in self.token_stats.values())
         return {
             "models": self.token_stats,
+            "groups": self.usage_rows(),
             "total": {"input": total_in, "output": total_out, "cached": total_cached, "requests": total_req},
         }
+
+    def usage_rows(self) -> list[dict]:
+        """Return reversible display groups over the raw lifetime counters."""
+        rows: dict[str, dict] = {}
+        numeric_fields = (
+            "input", "output", "cached", "requests", "gen_tokens", "gen_time_s",
+        )
+        merge_groups = getattr(self, "usage_merge_groups", {})
+        aliases = getattr(self, "usage_aliases", {})
+        for model, model_stats in self.token_stats.items():
+            merge_group = str(merge_groups.get(model) or "").strip()
+            row_key = f"group:{merge_group}" if merge_group else f"model:{model}"
+            row = rows.setdefault(row_key, {
+                "key": row_key,
+                "label": merge_group or aliases.get(model) or model,
+                "merge_group": merge_group or None,
+                "models": [],
+                "members": [],
+                "stats": {field: 0 for field in numeric_fields},
+                "total_cost": 0.0,
+            })
+            row["models"].append(model)
+            row["members"].append({
+                "model": model,
+                "alias": aliases.get(model),
+                "merge_group": merge_group or None,
+            })
+            for field in numeric_fields:
+                row["stats"][field] += model_stats.get(field, 0) or 0
+            row["total_cost"] += self.calculate_cost(
+                model, model_stats
+            ).get("total_cost", 0.0)
+
+        for row in rows.values():
+            speed = self.rolling_generation_speed(row["models"])
+            # Existing installations have lifetime speed totals but no
+            # interval samples until this version records its first request.
+            # Preserve a useful fallback during that migration period.
+            if speed["tok_s"] is None:
+                legacy_tokens = row["stats"].get("gen_tokens", 0) or 0
+                legacy_time = row["stats"].get("gen_time_s", 0) or 0
+                if legacy_tokens > 0 and legacy_time > 0:
+                    speed = {
+                        "tokens": legacy_tokens,
+                        "active_time_s": legacy_time,
+                        "tok_s": legacy_tokens / legacy_time,
+                        "legacy": True,
+                    }
+            row["speed"] = speed
+            row["total_cost"] = round(row["total_cost"], 2)
+        return list(rows.values())
 
     def calculate_cost(self, model: str, stats: dict | None = None) -> dict:
         """Calculate the total cost for a model's token usage.
@@ -2789,13 +3241,40 @@ class Manager:
         output_tokens = stats.get("output", 0)
         cached_tokens = stats.get("cached", 0)
 
-        # Resolve pricing: per-model settings first, then built-in map.
+        # Resolve pricing: cluster deployment metadata first, then standalone
+        # per-model settings, then the built-in map.
         input_cost_per_1m = 0.0
         output_cost_per_1m = 0.0
         cache_cost_per_1m = 0.0
+        deployment_pricing: dict[str, Any] | None = None
+
+        model_lower = model.lower()
+        for deployment in getattr(self, "deployments", []):
+            settings = deployment.get("launch_settings") or {}
+            deployment_models = [str(deployment.get("model") or "")]
+            deployment_models.extend(
+                self._served_models_from_cmd(settings.get("extra_args") or [])
+            )
+            if not any(
+                candidate
+                and (
+                    candidate.lower() in model_lower
+                    or model_lower in candidate.lower()
+                )
+                for candidate in deployment_models
+            ):
+                continue
+            values = {
+                "input": settings.get("input_cost_per_1m"),
+                "output": settings.get("output_cost_per_1m"),
+                "cache": settings.get("cache_cost_per_1m"),
+            }
+            if any(value is not None for value in values.values()):
+                deployment_pricing = values
+                break
 
         # Check per-model unsloth settings
-        for key, settings in self.unsloth_settings.items():
+        for key, settings in getattr(self, "unsloth_settings", {}).items():
             if key.lower() in model.lower() or model.lower() in key.lower():
                 inp = settings.get("input_cost_per_1m")
                 out = settings.get("output_cost_per_1m")
@@ -2810,13 +3289,23 @@ class Manager:
 
         # Fallback to built-in pricing map (prefix match)
         if input_cost_per_1m == 0 and output_cost_per_1m == 0:
-            model_lower = model.lower()
             for prefix, rates in MODEL_PRICING.items():
                 if prefix.lower() in model_lower or model_lower in prefix.lower():
                     input_cost_per_1m = float(rates.get("input", 0))
                     output_cost_per_1m = float(rates.get("output", 0))
                     cache_cost_per_1m = float(rates.get("cache", 0))
                     break
+
+        # Cluster fields override their matching defaults independently.
+        # An explicit zero therefore means free, while a blank field keeps
+        # the standalone/built-in rate for that token class.
+        if deployment_pricing is not None:
+            if deployment_pricing["input"] is not None:
+                input_cost_per_1m = float(deployment_pricing["input"])
+            if deployment_pricing["output"] is not None:
+                output_cost_per_1m = float(deployment_pricing["output"])
+            if deployment_pricing["cache"] is not None:
+                cache_cost_per_1m = float(deployment_pricing["cache"])
 
         # Non-cached input tokens are charged at the regular input rate;
         # cached tokens are charged at the (typically lower) cache rate.
@@ -2841,8 +3330,13 @@ class Manager:
 
     def reset_token_stats(self) -> dict:
         self.token_stats = {}
+        self.speed_samples = {}
         try:
             self._save_token_stats()
+        except Exception:
+            pass
+        try:
+            self._save_speed_samples()
         except Exception:
             pass
         return self.get_token_stats()
@@ -4043,10 +4537,9 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options.setdefault("environment", {}).update({
-                            "NCCL_SOCKET_IFNAME": iface,
-                            "GLOO_SOCKET_IFNAME": iface,
-                        })
+                        run_options.setdefault("environment", {}).update(
+                            self._distributed_network_environment(iface)
+                        )
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
@@ -4185,10 +4678,9 @@ class Manager:
                     ]
                     iface = cluster_member.get("fabric_interface")
                     if iface:
-                        run_options.setdefault("environment", {}).update({
-                            "NCCL_SOCKET_IFNAME": iface,
-                            "GLOO_SOCKET_IFNAME": iface,
-                        })
+                        run_options.setdefault("environment", {}).update(
+                            self._distributed_network_environment(iface)
+                        )
                     if Path("/dev/infiniband").exists():
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
@@ -6671,6 +7163,7 @@ class Manager:
         # updates once per second while streams are active.
         now = time.time()
         if now - self._stats_ts < 0.8 and self._stats_cache:
+            self._record_temperature_sample(self._stats_cache, now)
             return {**self._stats_cache, "active_requests": self.active_requests()}
 
         def _gather():
@@ -6692,7 +7185,90 @@ class Manager:
         stats = await asyncio.to_thread(_gather)
         self._stats_cache = stats
         self._stats_ts = now
+        self._record_temperature_sample(stats, stats.get("ts", now))
         return {**stats, "active_requests": self.active_requests()}
+
+    def _record_temperature_sample(
+        self,
+        stats: dict,
+        observed_at: float | None = None,
+        history: deque[dict[str, float | None]] | None = None,
+    ) -> bool:
+        """Append at most one CPU/GPU temperature point every 30 seconds."""
+        now = float(observed_at if observed_at is not None else time.time())
+        history = history if history is not None else self._temperature_history
+        if history and now - float(history[-1]["ts"]) < TEMPERATURE_HISTORY_INTERVAL_SECONDS:
+            return False
+
+        def finite_temperature(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return round(value, 1) if math.isfinite(value) else None
+
+        gpu = (stats.get("gpus") or [{}])[0]
+        history.append({
+            "ts": now,
+            "cpu_temp_c": finite_temperature(stats.get("cpu_temp_c")),
+            "gpu_temp_c": finite_temperature(gpu.get("temp")),
+        })
+        cutoff = now - TEMPERATURE_HISTORY_WINDOW_SECONDS
+        while history and float(history[0]["ts"]) < cutoff:
+            history.popleft()
+        return True
+
+    def _record_remote_temperature_sample(self, node: dict) -> bool:
+        node_id = str(node.get("id") or "")
+        stats = node.get("stats") or {}
+        if not node_id or not stats:
+            return False
+        history = self._remote_temperature_histories.setdefault(
+            node_id,
+            deque(maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES),
+        )
+        return self._record_temperature_sample(
+            stats,
+            stats.get("ts"),
+            history,
+        )
+
+    def temperature_history(
+        self, history: deque[dict[str, float | None]] | None = None,
+    ) -> dict:
+        history = history if history is not None else self._temperature_history
+        return {
+            "sample_interval_seconds": TEMPERATURE_HISTORY_INTERVAL_SECONDS,
+            "window_seconds": TEMPERATURE_HISTORY_WINDOW_SECONDS,
+            "samples": list(history),
+        }
+
+    async def temperature_history_for_node(self, node_id: str) -> dict:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return {"node_id": LOCAL_NODE_ID, **self.temperature_history()}
+        history = self._remote_temperature_histories.get(node_id)
+        if history:
+            return {"node_id": node_id, **self.temperature_history(history)}
+        # A newly selected updated agent may already have samples even before
+        # this coordinator has observed its first 30-second point. Older
+        # agents do not expose this endpoint, so return an empty graph rather
+        # than failing the whole dashboard.
+        try:
+            result = await self.node_registry.request(
+                node_id, "GET", "/api/agent/temperature-history", timeout=5,
+            )
+        except RuntimeError:
+            result = self.temperature_history(deque())
+        return {"node_id": node_id, **(result or {})}
+
+    async def _temperature_history_monitor_loop(self) -> None:
+        while True:
+            try:
+                await self.get_stats()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[telemetry] temperature history sample failed: {exc}")
+            await asyncio.sleep(TEMPERATURE_HISTORY_INTERVAL_SECONDS)
 
     async def get_disk(self) -> dict:
         """Return disk usage separately; polled infrequently by the UI."""
@@ -7194,6 +7770,9 @@ class Manager:
             deployment["launch_controls"] = self._deployment_launch_controls(
                 deployment["launch_settings"]
             )
+            deployment["pricing"] = self._deployment_pricing(
+                deployment["launch_settings"]
+            )
             deployment["runtime_flags"] = runtime_flags
             public_deployments.append(deployment)
         running_models = [c for c in containers if c["status"] == "running"]
@@ -7225,6 +7804,8 @@ class Manager:
                 for model, model_stats in self.token_stats.items()
             },
             "usage_aliases": dict(self.usage_aliases),
+            "usage_merge_groups": dict(self.usage_merge_groups),
+            "usage_rows": self.usage_rows(),
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
             "inference_admission": self.inference_admission(),

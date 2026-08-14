@@ -137,6 +137,7 @@ function app() {
     usageSortKey: 'input',         // model | input | cached | output | requests | speed | time | cost
     usageSortDirection: 'desc',
     usageAliasEditing: {},
+    usageDetailsOpen: {},
     usageAliasValue: {},
     usageMergeValue: {},
     usageAliasSaving: {},
@@ -1167,6 +1168,15 @@ function app() {
       this.usageMergeValue[model] = this.usageMergeGroup(model);
       this.usageAliasSaving[model] = false;
       this.usageAliasEditing[model] = true;
+    },
+    toggleUsageDetails(row) {
+      const open = !this.usageDetailsOpen[row.key];
+      this.usageDetailsOpen[row.key] = open;
+      if (!open) {
+        for (const member of row.members || []) {
+          this.usageAliasEditing[member.model] = false;
+        }
+      }
     },
     cancelUsageAliasEdit(model) {
       this.usageAliasEditing[model] = false;

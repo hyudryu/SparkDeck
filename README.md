@@ -188,6 +188,15 @@ print(resp.choices[0].message.content)
 
 Streaming works the same way — pass `stream=True`.
 
+Requests sent through the controller's OpenAI-compatible endpoint
+(`http://<controller>:7878/v1`) use a per-deployment FIFO admission queue. The
+deployment's vLLM `--max-num-seqs` setting is the proxy limit: up to that many
+requests are forwarded to vLLM, while additional chat, completion, or
+controller inference-job requests wait at the controller until a slot opens. A
+client disconnect removes its queued request. Inspect live admission state with
+`GET /api/inference-queue` or the `inference_admission` field in
+`GET /api/state`. Direct container-port calls bypass this controller queue.
+
 ### ② Through the controller (queued, auto-start, retries)
 
 Submits to the controller's queue. If the model isn't running the controller will start it (subject to `max_concurrent_models`), retry on failure (up to `max_retries`), and refresh the idle clock. Returns a job id immediately — poll for the result.

@@ -213,6 +213,7 @@ USAGE_SPEED_WINDOW_TOKENS = 1_000_000
 
 PENDING = "pending"          # waiting for capacity
 DISPATCHING = "dispatching"  # model starting, will run when ready
+ADMISSION_WAITING = "admission_waiting"  # ready, queued for a proxy slot
 RUNNING = "running"          # inference active
 DONE = "done"
 ERROR = "error"
@@ -269,6 +270,8 @@ class Manager:
         self.usage_merge_groups: dict[str, str] = self._load_usage_merge_groups()
         self.speed_samples_path = self.data_dir / "speed_samples.json"
         self.speed_samples: dict[str, list[dict]] = self._load_speed_samples()
+        self._speed_samples_version = 0
+        self._speed_samples_flush_task: asyncio.Task | None = None
         # Session token counters — same shape as token_stats but NOT
         # persisted. Tracks tokens served since the controller started (or
         # since the last session reset). The topbar widget shows these; the
@@ -773,23 +776,25 @@ class Manager:
         model_key = str(model or "").strip()
         if not model_key or model_key not in self.token_stats:
             raise ValueError("usage model not found")
+        # Validate the entire request before changing either map or file.  A
+        # bad merge group must not leave an otherwise-valid alias half-saved.
         normalized = self._normalized_alias(alias)
+        normalized_group = (
+            self._normalized_alias(merge_group)
+            if update_merge_group
+            else getattr(self, "usage_merge_groups", {}).get(model_key, "")
+        )
         if normalized:
             self.usage_aliases[model_key] = normalized
         else:
             self.usage_aliases.pop(model_key, None)
         self._save_usage_aliases()
         if update_merge_group:
-            normalized_group = self._normalized_alias(merge_group)
             if normalized_group:
                 self.usage_merge_groups[model_key] = normalized_group
             else:
                 self.usage_merge_groups.pop(model_key, None)
             self._save_usage_merge_groups()
-        else:
-            normalized_group = getattr(
-                self, "usage_merge_groups", {}
-            ).get(model_key, "")
         return {
             "ok": True,
             "model": model_key,
@@ -840,7 +845,7 @@ class Manager:
             result = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{field} must be a non-negative number") from exc
-        if result < 0:
+        if not math.isfinite(result) or result < 0:
             raise ValueError(f"{field} must be a non-negative number")
         return result
 
@@ -1089,7 +1094,47 @@ class Manager:
         self._save_deployments()
         return deployment
 
-    def update_deployment_pricing(self, deployment_id: str, body: dict) -> dict:
+    def _recovered_deployment_launch_settings(
+        self, deployment: dict, primary_container: dict | None = None,
+    ) -> dict:
+        load_settings = (primary_container or {}).get("load_settings") or {}
+        try:
+            recovered_args = shlex.split(load_settings.get("command_flags") or "")
+        except ValueError:
+            recovered_args = list(load_settings.get("extra_args") or [])
+        recovered_args = self._without_cli_options(
+            recovered_args,
+            {"--host", "--port", "--gpu-memory-utilization",
+             "--gpu_memory_utilization"},
+        )
+        return self._deployment_launch_settings({
+            "deployment_name": deployment.get("name"),
+            "model": deployment.get("model"),
+            "engine": deployment.get("engine", "vllm"),
+            "image": (primary_container or {}).get("image"),
+            "extra_args": recovered_args,
+            "gpu_memory_utilization": load_settings.get(
+                "gpu_memory_utilization"
+            ),
+            "deployment_mode": deployment.get("mode", "single"),
+            "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
+            "port": deployment.get("api_port"),
+        })
+
+    @classmethod
+    def _deployment_pricing_model_key(cls, deployment: dict) -> str:
+        explicit = str(deployment.get("pricing_model_key") or "").strip()
+        if explicit:
+            return explicit
+        settings = deployment.get("launch_settings") or {}
+        model = str(deployment.get("model") or settings.get("model") or "")
+        return cls._stats_key(
+            model, cls._variant_from_cmd(settings.get("extra_args") or [])
+        ) if model else ""
+
+    async def update_deployment_pricing(
+        self, deployment_id: str, body: dict
+    ) -> dict:
         """Update accounting metadata without restarting a running cluster."""
         deployment = self._deployment(deployment_id)
         if not deployment:
@@ -1100,8 +1145,29 @@ class Manager:
                 "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
             )
         }
-        launch_settings = deployment.setdefault("launch_settings", {})
+        launch_settings = deployment.get("launch_settings")
+        if not isinstance(launch_settings, dict) or not launch_settings:
+            containers = await self.list_containers()
+            candidates = [
+                container for container in containers
+                if container.get("deployment_id") == deployment_id
+            ]
+            primary = next(
+                (container for container in candidates
+                 if container.get("rank") == 0),
+                candidates[0] if candidates else None,
+            )
+            launch_settings = self._recovered_deployment_launch_settings(
+                deployment, primary
+            )
+            deployment["launch_settings"] = launch_settings
+            if primary and primary.get("stats_key"):
+                deployment["pricing_model_key"] = primary["stats_key"]
         launch_settings.update(pricing)
+        if not deployment.get("pricing_model_key"):
+            deployment["pricing_model_key"] = (
+                self._deployment_pricing_model_key(deployment)
+            )
         deployment["pricing"] = pricing
         self._save_deployments()
         return {"ok": True, "deployment_id": deployment_id, **pricing}
@@ -2583,10 +2649,42 @@ class Manager:
                 pass
         return {}
 
+    def _write_speed_samples_snapshot(self, snapshot: dict) -> None:
+        tmp = self.speed_samples_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, separators=(",", ":")))
+        tmp.replace(self.speed_samples_path)
+
     def _save_speed_samples(self) -> None:
-        self.speed_samples_path.write_text(
-            json.dumps(self.speed_samples, indent=2)
-        )
+        self._write_speed_samples_snapshot(copy.deepcopy(self.speed_samples))
+
+    async def _flush_speed_samples_later(self) -> None:
+        """Persist request intervals in bounded batches off the event loop."""
+        await asyncio.sleep(1.0)
+        while True:
+            version = self._speed_samples_version
+            snapshot = copy.deepcopy(self.speed_samples)
+            await asyncio.to_thread(self._write_speed_samples_snapshot, snapshot)
+            if version == self._speed_samples_version:
+                return
+            # Coalesce requests that arrived while the previous snapshot was
+            # being encoded/written instead of starting one write per request.
+            await asyncio.sleep(0.1)
+
+    def _queue_speed_samples_save(self) -> None:
+        self._speed_samples_version = getattr(
+            self, "_speed_samples_version", 0
+        ) + 1
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous maintenance/tests still get durable writes.
+            self._save_speed_samples()
+            return
+        task = getattr(self, "_speed_samples_flush_task", None)
+        if task is None or task.done():
+            self._speed_samples_flush_task = loop.create_task(
+                self._flush_speed_samples_later()
+            )
 
     def _record_speed_sample(
         self, model: str, completion_tokens: int, gen_time_s: float | None
@@ -2632,35 +2730,34 @@ class Manager:
                     continue
                 samples.append((ended_at, started_at, tokens))
 
-        selected = []
-        selected_tokens = 0.0
-        for ended_at, started_at, tokens in sorted(samples, reverse=True):
-            remaining = USAGE_SPEED_WINDOW_TOKENS - selected_tokens
-            if remaining <= 0:
-                break
-            used_tokens = min(tokens, remaining)
-            fraction = used_tokens / tokens
-            # For a partially included oldest request, keep its newest
-            # proportional section so the window ends at the latest token.
-            used_started_at = ended_at - ((ended_at - started_at) * fraction)
-            selected.append((used_started_at, ended_at))
-            selected_tokens += used_tokens
-
-        if not selected:
+        if not samples:
             return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
 
+        # Sweep backward through the piecewise-constant aggregate decode
+        # rate.  This cuts the 1M-token boundary through all streams active at
+        # that instant, rather than selecting whole requests serially (which
+        # under-counted concurrent throughput at the cutoff).
+        deltas: dict[float, float] = {}
+        for ended_at, started_at, tokens in samples:
+            rate = tokens / (ended_at - started_at)
+            deltas[started_at] = deltas.get(started_at, 0.0) + rate
+            deltas[ended_at] = deltas.get(ended_at, 0.0) - rate
+        boundaries = sorted(deltas, reverse=True)
+        selected_tokens = 0.0
         active_time = 0.0
-        current_start = None
-        current_end = None
-        for started_at, ended_at in sorted(selected):
-            if current_start is None:
-                current_start, current_end = started_at, ended_at
-            elif started_at <= current_end:
-                current_end = max(current_end, ended_at)
-            else:
-                active_time += current_end - current_start
-                current_start, current_end = started_at, ended_at
-        active_time += current_end - current_start
+        aggregate_rate = 0.0
+        for index, upper in enumerate(boundaries[:-1]):
+            aggregate_rate -= deltas[upper]
+            lower = boundaries[index + 1]
+            if aggregate_rate <= 0 or upper <= lower:
+                continue
+            interval_tokens = aggregate_rate * (upper - lower)
+            remaining = USAGE_SPEED_WINDOW_TOKENS - selected_tokens
+            used_tokens = min(interval_tokens, remaining)
+            selected_tokens += used_tokens
+            active_time += used_tokens / aggregate_rate
+            if selected_tokens >= USAGE_SPEED_WINDOW_TOKENS:
+                break
         return {
             "tokens": int(selected_tokens),
             "active_time_s": active_time,
@@ -2803,7 +2900,7 @@ class Manager:
         except Exception:
             pass
         try:
-            self._save_speed_samples()
+            self._queue_speed_samples_save()
         except Exception:
             pass
 
@@ -3014,6 +3111,7 @@ class Manager:
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
+        admission_running: dict[str, int] = {}
         for admission in self.inference_admission().values():
             model = admission.get("model")
             if not model:
@@ -3023,6 +3121,16 @@ class Manager:
             })
             e["queued"] = e.get("queued", 0) + admission["queued"]
             e["admission_limit"] = admission["limit"]
+            admission_running[model] = (
+                admission_running.get(model, 0) + admission["running"]
+            )
+        # Admission owns the authoritative running count from slot grant until
+        # release.  max() includes non-streaming/prefill work that has no live
+        # token timestamps without double-counting streams tracked above.
+        for model, running in admission_running.items():
+            out[model]["connections"] = max(
+                out[model]["connections"], running
+            )
         return out
 
     # ----- controller-side inference admission queue -----
@@ -3132,6 +3240,39 @@ class Manager:
         self._drain_inference_waiters(state)
         if not state["running"] and not state["waiters"]:
             self._admission_store().pop(target, None)
+
+    async def _admit_vllm_target(
+        self,
+        model: str,
+        cancel: asyncio.Event | None,
+        container: dict | None = None,
+    ) -> tuple[dict, str | None]:
+        """Acquire admission and re-resolve runtime state before forwarding.
+
+        A queued request may outlive a container restart or port/config
+        change. Re-resolving after every grant makes the forwarded URL fresh;
+        if the admission identity or limit changed, release the old grant and
+        queue against the new target instead.
+        """
+        current = container or await self._resolve_vllm_target(model)
+        while True:
+            key = current.get("stats_key") or model
+            admission = await self._acquire_inference_slot(current, key, cancel)
+            try:
+                fresh = await self._resolve_vllm_target(model)
+            except BaseException:
+                self._release_inference_slot(admission)
+                raise
+            old_target, old_limit, _ = self._inference_admission_config(
+                current, key
+            )
+            new_target, new_limit, _ = self._inference_admission_config(
+                fresh, fresh.get("stats_key") or model
+            )
+            if old_target == new_target and old_limit == new_limit:
+                return fresh, admission
+            self._release_inference_slot(admission)
+            current = fresh
 
     def inference_admission(self) -> dict[str, dict]:
         """Public snapshot of running and controller-queued inference."""
@@ -3248,21 +3389,11 @@ class Manager:
         cache_cost_per_1m = 0.0
         deployment_pricing: dict[str, Any] | None = None
 
-        model_lower = model.lower()
+        model_lower = model.casefold()
         for deployment in getattr(self, "deployments", []):
             settings = deployment.get("launch_settings") or {}
-            deployment_models = [str(deployment.get("model") or "")]
-            deployment_models.extend(
-                self._served_models_from_cmd(settings.get("extra_args") or [])
-            )
-            if not any(
-                candidate
-                and (
-                    candidate.lower() in model_lower
-                    or model_lower in candidate.lower()
-                )
-                for candidate in deployment_models
-            ):
+            pricing_model_key = self._deployment_pricing_model_key(deployment)
+            if not pricing_model_key or pricing_model_key.casefold() != model_lower:
                 continue
             values = {
                 "input": settings.get("input_cost_per_1m"),
@@ -3331,6 +3462,11 @@ class Manager:
     def reset_token_stats(self) -> dict:
         self.token_stats = {}
         self.speed_samples = {}
+        # Ensure an in-flight batched snapshot notices the reset and follows
+        # up with the empty state after its current write completes.
+        self._speed_samples_version = getattr(
+            self, "_speed_samples_version", 0
+        ) + 1
         try:
             self._save_token_stats()
         except Exception:
@@ -3848,6 +3984,7 @@ class Manager:
                 "elapsed_s": round(now - run["started_at"], 1) if run.get("started_at") else None,
                 "last_line": lines[-1] if lines else None,
                 "error": run.get("error"),
+                "max_concurrency": run.get("max_concurrency"),
             })
         # Most recent first.
         out.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
@@ -3918,6 +4055,15 @@ class Manager:
                 yield "data: {\"done\": true}\n\n"
                 return
             cmd.extend(["-o", f"max_num_seqs={parallel_streams}"])
+        else:
+            recipe_default = (
+                (launch.get("metadata") or {}).get("defaults") or {}
+            ).get("max_num_seqs")
+            try:
+                parallel_streams = int(recipe_default)
+            except (TypeError, ValueError):
+                parallel_streams = None
+        run["max_concurrency"] = parallel_streams
         for option in overrides.get("options") or []:
             option = str(option).strip()
             if option and "=" in option and "\n" not in option and "\r" not in option:
@@ -6524,9 +6670,17 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/chat/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel, container)
+            return self._vllm_stream(
+                url, body, key, cancel, container, requested_model=model,
+            )
         else:
-            admission = await self._acquire_inference_slot(container, key, cancel)
+            admission = None
+            container, admission = await self._admit_vllm_target(
+                model, cancel, container
+            )
+            key = container.get("stats_key") or model
+            body = {**body, "model": self._upstream_model_id(container, model)}
+            url = f"http://localhost:{container['port']}/v1/chat/completions"
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -6549,9 +6703,17 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel, container)
+            return self._vllm_stream(
+                url, body, key, cancel, container, requested_model=model,
+            )
         else:
-            admission = await self._acquire_inference_slot(container, key, cancel)
+            admission = None
+            container, admission = await self._admit_vllm_target(
+                model, cancel, container
+            )
+            key = container.get("stats_key") or model
+            body = {**body, "model": self._upstream_model_id(container, model)}
+            url = f"http://localhost:{container['port']}/v1/completions"
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -6678,15 +6840,29 @@ class Manager:
         finally:
             self._track_end(rid)
 
-    async def _sparkrun_targets(self) -> dict[str, int]:
+    async def _sparkrun_targets(self) -> dict[str, dict]:
         """Discover models served by running sparkrun containers.
         sparkrun containers run in host network mode, so their internal
-        vLLM port is reachable on localhost. Returns {model_id: host_port}."""
-        out: dict[str, int] = {}
+        vLLM port is reachable on localhost. Runtime load settings are kept so
+        controller admission honors SparkRun's --max-num-seqs as well."""
+        out: dict[str, dict] = {}
+        active_run_limit = next((
+            run.get("max_concurrency")
+            for run in sorted(
+                getattr(self, "spark_runs", {}).values(),
+                key=lambda item: item.get("started_at") or 0,
+                reverse=True,
+            )
+            if run.get("status") == "running" and run.get("max_concurrency")
+        ), None)
         try:
             for c in self.client.containers.list(all=False):
                 if not c.name.startswith("sparkrun_"):
                     continue
+                summary = self._container_summary(c) or {}
+                load_settings = dict(summary.get("load_settings") or {})
+                if not load_settings.get("max_concurrency") and active_run_limit:
+                    load_settings["max_concurrency"] = active_run_limit
                 # Host-network sparkrun containers expose vLLM directly on localhost.
                 # Default recipe port is 8000; inspect the recipe command to find it.
                 port = 8000
@@ -6699,7 +6875,15 @@ class Manager:
                     for m in (r.json() or {}).get("data", []):
                         mid = m.get("id") if isinstance(m, dict) else None
                         if mid:
-                            out[mid] = port
+                            out[mid] = {
+                                **summary,
+                                "name": summary.get("name") or c.name,
+                                "model": summary.get("model") or mid,
+                                "served_models": [mid],
+                                "stats_key": summary.get("stats_key") or mid,
+                                "port": port,
+                                "load_settings": load_settings,
+                            }
                 except Exception:
                     pass
         except Exception:
@@ -6719,7 +6903,7 @@ class Manager:
         # Fallback to sparkrun-managed containers (host-network mode).
         sparkrun = await self._sparkrun_targets()
         if model in sparkrun:
-            return {"name": f"sparkrun:{model}", "model": model, "port": sparkrun[model]}
+            return sparkrun[model]
         # Try ensure_loaded to start/swap the container
         try:
             return await self.ensure_loaded(model)
@@ -6730,7 +6914,8 @@ class Manager:
 
     async def _vllm_stream(self, url: str, body: dict, key: str,
                            cancel: asyncio.Event | None = None,
-                           container: dict | None = None):
+                           container: dict | None = None,
+                           requested_model: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces stream_options.include_usage so the final chunk carries token
         counts we can record; the extra chunk is standard OpenAI behavior and
@@ -6753,14 +6938,31 @@ class Manager:
         retried_without_token_ids = False
         try:
             if container is not None:
-                admission = await self._acquire_inference_slot(
-                    container, key, cancel,
+                requested_model = requested_model or body.get("model") or key
+                endpoint = (
+                    "/v1/chat/completions"
+                    if url.endswith("/v1/chat/completions")
+                    else "/v1/completions"
                 )
+                container, admission = await self._admit_vllm_target(
+                    requested_model, cancel, container
+                )
+                key = container.get("stats_key") or requested_model
+                body["model"] = self._upstream_model_id(
+                    container, requested_model
+                )
+                url = f"http://localhost:{container['port']}{endpoint}"
             rid = self._track_start(key, streaming=True)
             while True:
-                async with self.http.stream(
+                stream_context = self.http.stream(
                     "POST", url, json=body, timeout=None,
-                ) as r:
+                )
+                entered = False
+                try:
+                    r = await self._await_or_cancel(
+                        stream_context.__aenter__(), cancel
+                    )
+                    entered = True
                     if r.status_code != 200:
                         detail = (await r.aread()).decode("utf-8", errors="replace")
                         if (
@@ -6809,6 +7011,9 @@ class Manager:
                             self._record_usage(key, usage, gen_time)
                         yield f"{line}\n\n"
                     return
+                finally:
+                    if entered:
+                        await stream_context.__aexit__(None, None, None)
         except ClientAbort:
             return
         except Exception as e:
@@ -7297,6 +7502,7 @@ class Manager:
             "error": None,
             "override": False,
             "attempts": 0,
+            "_cancel_event": asyncio.Event(),
         }
         async with self.lock:
             self.jobs[job["id"]] = job
@@ -7314,7 +7520,12 @@ class Manager:
     async def cancel_job(self, job_id: str) -> dict:
         async with self.lock:
             job = self.jobs.get(job_id)
-            if job and job["status"] in (PENDING, DISPATCHING):
+            if job and job["status"] in (
+                PENDING, DISPATCHING, ADMISSION_WAITING,
+            ):
+                event = job.get("_cancel_event")
+                if event is not None:
+                    event.set()
                 job["status"] = CANCELED
                 job["completed_at"] = time.time()
                 if job_id in self.queue:
@@ -7415,8 +7626,10 @@ class Manager:
             if target and target["status"] == "running":
                 ready = await self._check_ready(target)
                 if ready:
-                    job["status"] = RUNNING
-                    job["started_at"] = time.time()
+                    # Keep the job cancelable while it waits in the separate
+                    # controller admission queue. _run_inference marks it
+                    # RUNNING only after a slot is actually granted.
+                    job["status"] = ADMISSION_WAITING
                     asyncio.create_task(self._run_inference(jid, target))
                 else:
                     job["status"] = DISPATCHING
@@ -7619,17 +7832,21 @@ class Manager:
 
     async def _run_inference(self, jid: str, container: dict):
         job = self.jobs[jid]
-        port = container["port"]
         admission = None
+        cancel = job.get("_cancel_event")
         try:
-            admission = await self._acquire_inference_slot(
-                container, container.get("stats_key") or job["model"], None,
+            container, admission = await self._admit_vllm_target(
+                job["model"], cancel, container,
             )
+            if cancel is not None and cancel.is_set():
+                raise ClientAbort("job canceled while queued")
+            job["status"] = RUNNING
+            job["started_at"] = time.time()
             job["attempts"] = job.get("attempts", 0) + 1
             # Refresh idle clock only when the job is actually admitted to the
             # backend, not while it is waiting in the controller queue.
             self._mark_active(container.get("name"))
-            url = f"http://localhost:{port}/v1/chat/completions"
+            url = f"http://localhost:{container['port']}/v1/chat/completions"
             payload: dict = {
                 "messages": job["messages"],
             }
@@ -7644,6 +7861,9 @@ class Manager:
             )
             job["error"] = None
             job["status"] = DONE
+        except ClientAbort:
+            job["status"] = CANCELED
+            job["error"] = None
         except Exception as e:
             if isinstance(e, httpx.HTTPStatusError):
                 err_msg = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
@@ -7663,7 +7883,7 @@ class Manager:
             job["error"] = f"{err_msg} (after {attempts} attempt{'s' if attempts != 1 else ''})"
         finally:
             self._release_inference_slot(admission)
-            if job["status"] in (DONE, ERROR):
+            if job["status"] in (DONE, ERROR, CANCELED):
                 job["completed_at"] = time.time()
                 async with self.lock:
                     if jid in self.queue:
@@ -7684,7 +7904,10 @@ class Manager:
         )
         # Enrich Atlas Serving containers with their served model name. Atlas
         # runs are SparkRun containers in host-network mode.
-        sparkrun_models_by_port: dict[int, str] = {p: m for m, p in sparkrun_targets.items()}
+        sparkrun_models_by_port: dict[int, str] = {
+            target.get("port"): model
+            for model, target in sparkrun_targets.items()
+        }
         for c in containers:
             if c.get("source") == "atlas-serving":
                 if not c.get("model"):
@@ -7746,27 +7969,11 @@ class Manager:
                     phase = primary.get("phase") or {}
                     deployment["status"] = "ready" if phase.get("phase") == "ready" else "starting"
             if not deployment.get("launch_settings"):
-                load_settings = (primary_container or {}).get("load_settings") or {}
-                try:
-                    recovered_args = shlex.split(load_settings.get("command_flags") or "")
-                except ValueError:
-                    recovered_args = list(load_settings.get("extra_args") or [])
-                recovered_args = self._without_cli_options(
-                    recovered_args,
-                    {"--host", "--port", "--gpu-memory-utilization",
-                     "--gpu_memory_utilization"},
+                deployment["launch_settings"] = (
+                    self._recovered_deployment_launch_settings(
+                        saved, primary_container
+                    )
                 )
-                deployment["launch_settings"] = self._deployment_launch_settings({
-                    "deployment_name": saved.get("name"),
-                    "model": saved.get("model"),
-                    "engine": saved.get("engine", "vllm"),
-                    "image": (primary_container or {}).get("image"),
-                    "extra_args": recovered_args,
-                    "gpu_memory_utilization": load_settings.get("gpu_memory_utilization"),
-                    "deployment_mode": saved.get("mode", "single"),
-                    "node_ids": saved.get("node_ids") or [LOCAL_NODE_ID],
-                    "port": saved.get("api_port"),
-                })
             deployment["launch_controls"] = self._deployment_launch_controls(
                 deployment["launch_settings"]
             )
@@ -7813,7 +8020,12 @@ class Manager:
             "unsloth": unsloth,
             "spark_launches": list(self.spark_launches),
             "spark_runs": self._public_spark_runs(),
-            "sparkrun_targets": sparkrun_targets,
+            # Preserve the public model -> port shape; internal discovery
+            # keeps richer load settings for admission control.
+            "sparkrun_targets": {
+                model: target.get("port")
+                for model, target in sparkrun_targets.items()
+            },
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {
                 "running_models": len(running_models),

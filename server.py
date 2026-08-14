@@ -337,7 +337,7 @@ async def update_deployment_alias(deployment_id: str, req: Request):
 @app.put("/api/deployments/{deployment_id}/pricing")
 async def update_deployment_pricing(deployment_id: str, req: Request):
     try:
-        return manager.update_deployment_pricing(
+        return await manager.update_deployment_pricing(
             deployment_id, await req.json()
         )
     except ValueError as exc:

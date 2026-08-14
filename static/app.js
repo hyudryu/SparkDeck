@@ -783,6 +783,14 @@ function app() {
       if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(v < 10_000_000_000 ? 1 : 0)}B`;
       return `${(v / 1_000_000).toFixed(v < 10_000_000 ? 1 : 0)}M`;
     },
+    fmtDuration(seconds) {
+      const value = Number(seconds);
+      if (!isFinite(value) || value <= 0) return '—';
+      if (value < 60) return `${value.toFixed(1)} s`;
+      if (value < 3600) return `${(value / 60).toFixed(1)} m`;
+      if (value < 86400) return `${(value / 3600).toFixed(1)} h`;
+      return `${(value / 86400).toFixed(1)} d`;
+    },
     // Format a cost value as USD (e.g. "$1.23" or "$0.00").
     fmtCost(v) {
       if (v == null || isNaN(v)) return '';

@@ -6471,7 +6471,13 @@ class Manager:
         data = await self.get_state()
         models = []
         for c in data.get("containers", []):
-            for model_id in c.get("served_models") or [c.get("model")]:
+            model_ids = list(c.get("served_models") or [c.get("model")])
+            # A cluster's backing model is also a valid controller-side ID:
+            # routing translates it to --served-model-name upstream. Expose
+            # both so provider discovery does not hide the deployed model.
+            if c.get("deployment_id") and c.get("model"):
+                model_ids.append(c["model"])
+            for model_id in dict.fromkeys(model_ids):
                 if not model_id or any(m["id"] == model_id for m in models):
                     continue
                 models.append({

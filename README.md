@@ -53,9 +53,19 @@ concurrency, KV-cache dtype, thinking, speculative-token count, CUDA-graph
 capture size, and batched-token limits. Saving
 marks the deployment for rebuild, and the next Start recreates every member
 with the edited model, image, memory, topology, and command-line settings.
+The same panel exposes cache-miss input, cache-hit input, and output pricing
+per million tokens. Pricing is accounting metadata, can be saved while a
+cluster is running, and does not trigger a rebuild.
 Cluster deployments and standalone Docker model cards also have a **Rename**
 action. These aliases are display-only, persist across controller restarts,
 and never change Docker identities, API model names, routing, or running state.
+
+The **Usage** table has separate display aliases and merge groups. Assigning
+the same merge group to multiple model IDs combines their input, cached,
+output, request, cost, and speed columns while preserving the underlying raw
+counters. Average speed is calculated over the newest 1 million output tokens
+and unions overlapping decode intervals, so concurrent streams report
+their aggregate throughput rather than a per-stream average.
 
 Agent credentials and paired-node tokens are stored in `data/agent.json` and
 `data/nodes.json` with mode `0600`. Do not expose either controller to the
@@ -187,6 +197,15 @@ print(resp.choices[0].message.content)
 ```
 
 Streaming works the same way — pass `stream=True`.
+
+Requests sent through the controller's OpenAI-compatible endpoint
+(`http://<controller>:7878/v1`) use a per-deployment FIFO admission queue. The
+deployment's vLLM `--max-num-seqs` setting is the proxy limit: up to that many
+requests are forwarded to vLLM, while additional chat, completion, or
+controller inference-job requests wait at the controller until a slot opens. A
+client disconnect removes its queued request. Inspect live admission state with
+`GET /api/inference-queue` or the `inference_admission` field in
+`GET /api/state`. Direct container-port calls bypass this controller queue.
 
 ### ② Through the controller (queued, auto-start, retries)
 

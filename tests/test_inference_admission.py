@@ -88,6 +88,67 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
         instance._release_inference_slot(first)
         instance._release_inference_slot(second)
 
+    async def test_active_requests_includes_admitted_non_streaming_work(self) -> None:
+        instance = self.manager()
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        target = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+
+        rates = instance.active_requests()
+
+        self.assertEqual(rates["model [test]"]["connections"], 1)
+        instance._release_inference_slot(target)
+
+    async def test_target_is_refreshed_after_admission(self) -> None:
+        instance = self.manager()
+        old = container()
+        fresh = {**old, "port": 8123}
+        instance._resolve_vllm_target = mock.AsyncMock(side_effect=[old, fresh])
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance._record_usage = mock.Mock()
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [], "usage": {}}
+        instance.http = SimpleNamespace(post=mock.AsyncMock(return_value=response))
+
+        await instance._vllm_chat(
+            "model", {"model": "model", "messages": []}, stream=False,
+        )
+
+        self.assertIn(":8123/", instance.http.post.await_args.args[0])
+
+    async def test_sparkrun_parallel_stream_limit_reaches_admission(self) -> None:
+        instance = self.manager()
+        instance.spark_runs = {
+            "run": {
+                "status": "running", "started_at": 10,
+                "max_concurrency": 3,
+            },
+        }
+        docker_container = SimpleNamespace(name="sparkrun_example_solo")
+        instance.client = SimpleNamespace(
+            containers=SimpleNamespace(list=lambda **kwargs: [docker_container])
+        )
+        instance._container_summary = mock.Mock(return_value={
+            "name": docker_container.name, "load_settings": {},
+        })
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"data": [{"id": "model"}]}
+        instance.http = SimpleNamespace(
+            get=mock.AsyncMock(return_value=response),
+        )
+
+        targets = await instance._sparkrun_targets()
+
+        self.assertEqual(
+            targets["model"]["load_settings"]["max_concurrency"], 3,
+        )
+
     async def test_chat_and_completions_share_the_same_proxy_limit(self) -> None:
         instance = self.manager()
         target_container = container()
@@ -204,6 +265,75 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
         releases[1].set()
         await second
         self.assertEqual(instance.inference_admission(), {})
+
+    async def test_stream_disconnect_cancels_stalled_response_headers(self) -> None:
+        instance = self.manager()
+        target_container = container()
+        instance._resolve_vllm_target = mock.AsyncMock(
+            return_value=target_container,
+        )
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        entered = asyncio.Event()
+
+        class StalledContext:
+            async def __aenter__(self):
+                entered.set()
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, *args):
+                return False
+
+        instance.http = SimpleNamespace(
+            stream=lambda *args, **kwargs: StalledContext(),
+        )
+        cancel = asyncio.Event()
+        stream = await instance._vllm_chat(
+            "model", {"model": "model", "messages": [], "stream": True},
+            stream=True, cancel=cancel,
+        )
+        consume = asyncio.create_task(
+            anext(stream)
+        )
+        await entered.wait()
+        cancel.set()
+
+        with self.assertRaises(StopAsyncIteration):
+            await consume
+        self.assertEqual(instance.inference_admission(), {})
+
+    async def test_controller_job_is_cancelable_while_waiting_for_slot(self) -> None:
+        instance = self.manager()
+        target_container = container()
+        held = await instance._acquire_inference_slot(
+            target_container, "model [test]", None,
+        )
+        instance._resolve_vllm_target = mock.AsyncMock(
+            return_value=target_container,
+        )
+        instance.jobs = {
+            "job": {
+                "id": "job", "model": "model", "container": None,
+                "messages": [], "params": {}, "status": "admission_waiting",
+                "requested_at": 0, "started_at": None, "completed_at": None,
+                "result": None, "error": None, "attempts": 0,
+                "_cancel_event": asyncio.Event(),
+            },
+        }
+        instance.queue = __import__("collections").deque(["job"])
+        instance.lock = asyncio.Lock()
+        instance.settings = {"max_retries": 2}
+        run = asyncio.create_task(
+            instance._run_inference("job", target_container)
+        )
+        await asyncio.sleep(0)
+
+        await instance.cancel_job("job")
+        await run
+
+        self.assertEqual(instance.jobs["job"]["status"], "canceled")
+        instance._release_inference_slot(held)
 
 
 if __name__ == "__main__":

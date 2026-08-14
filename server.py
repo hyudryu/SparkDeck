@@ -135,6 +135,12 @@ async def get_stats():
     return await manager.get_stats()
 
 
+@app.get("/api/inference-queue")
+async def get_inference_queue():
+    """Controller-side vLLM admission state, keyed by deployment/container."""
+    return manager.inference_admission()
+
+
 # ---------- cluster nodes / node agent ----------
 @app.get("/api/agent/info")
 async def agent_info():

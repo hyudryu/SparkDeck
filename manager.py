@@ -327,6 +327,14 @@ class Manager:
         self._trailing_window = 5.0  # seconds
         self._active_reqs: dict[int, dict] = {}
         self._req_seq = 0
+        # Controller-side vLLM admission control. vLLM's --max-num-seqs is an
+        # engine scheduler limit, but forwarding more HTTP requests than that
+        # still lets them enter the engine and influence batching/prefill. Keep
+        # excess requests in a FIFO here so only the configured number reaches
+        # each deployment at once.
+        #
+        # target id -> {limit, running, model, waiters: deque[waiter]}
+        self._inference_admission: dict[str, dict] = {}
         # Set while a launch is in flight (model, variant, started_at, log
         # path); surfaced in /api/state so the UI can show load progress.
         self._llama_launching: dict | None = None
@@ -2606,6 +2614,145 @@ class Manager:
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
+        for admission in self.inference_admission().values():
+            model = admission.get("model")
+            if not model:
+                continue
+            e = out.setdefault(model, {
+                "connections": 0, "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+            })
+            e["queued"] = e.get("queued", 0) + admission["queued"]
+            e["admission_limit"] = admission["limit"]
+        return out
+
+    # ----- controller-side inference admission queue -----
+    @staticmethod
+    def _inference_admission_config(container: dict, model: str) -> tuple[str, int | None, str]:
+        """Return a stable target id, configured limit, and telemetry key."""
+        target = str(
+            container.get("deployment_id")
+            or container.get("name")
+            or f"port:{container.get('port')}"
+        )
+        stats_key = str(container.get("stats_key") or model)
+        raw_limit = (container.get("load_settings") or {}).get("max_concurrency")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None and limit <= 0:
+            limit = None
+        return target, limit, stats_key
+
+    def _admission_store(self) -> dict[str, dict]:
+        # Several focused tests construct Manager with __new__. Keep this
+        # state lazily initializable so those tests remain lightweight.
+        store = getattr(self, "_inference_admission", None)
+        if store is None:
+            store = self._inference_admission = {}
+        return store
+
+    @staticmethod
+    def _drain_inference_waiters(state: dict) -> None:
+        waiters = state["waiters"]
+        while state["running"] < state["limit"] and waiters:
+            waiter = waiters.popleft()
+            future = waiter["future"]
+            if future.cancelled() or future.done():
+                continue
+            waiter["granted"] = True
+            state["running"] += 1
+            future.set_result(None)
+
+    async def _acquire_inference_slot(
+        self, container: dict, model: str, cancel: asyncio.Event | None,
+    ) -> str | None:
+        """Wait for one FIFO proxy slot without contacting vLLM first."""
+        target, limit, stats_key = self._inference_admission_config(container, model)
+        if limit is None:
+            return None
+        if cancel is not None and cancel.is_set():
+            raise ClientAbort("client disconnected while queued")
+
+        store = self._admission_store()
+        state = store.setdefault(target, {
+            "limit": limit,
+            "running": 0,
+            "model": stats_key,
+            "waiters": deque(),
+        })
+        state["limit"] = limit
+        state["model"] = stats_key
+
+        loop = asyncio.get_running_loop()
+        waiter = {
+            "future": loop.create_future(),
+            "created_at": time.monotonic(),
+            "granted": False,
+        }
+        state["waiters"].append(waiter)
+        self._drain_inference_waiters(state)
+
+        cancel_waiter: asyncio.Task | None = None
+        try:
+            if cancel is None:
+                await waiter["future"]
+            else:
+                cancel_waiter = asyncio.create_task(cancel.wait())
+                done, _ = await asyncio.wait(
+                    {waiter["future"], cancel_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_waiter in done:
+                    raise ClientAbort("client disconnected while queued")
+                await waiter["future"]
+            return target
+        except BaseException:
+            if waiter["granted"]:
+                self._release_inference_slot(target)
+            else:
+                try:
+                    state["waiters"].remove(waiter)
+                except ValueError:
+                    pass
+                if not waiter["future"].done():
+                    waiter["future"].cancel()
+            raise
+        finally:
+            if cancel_waiter is not None:
+                cancel_waiter.cancel()
+
+    def _release_inference_slot(self, target: str | None) -> None:
+        if target is None:
+            return
+        state = self._admission_store().get(target)
+        if state is None:
+            return
+        state["running"] = max(0, state["running"] - 1)
+        self._drain_inference_waiters(state)
+        if not state["running"] and not state["waiters"]:
+            self._admission_store().pop(target, None)
+
+    def inference_admission(self) -> dict[str, dict]:
+        """Public snapshot of running and controller-queued inference."""
+        now = time.monotonic()
+        out = {}
+        for target, state in self._admission_store().items():
+            queued = [
+                waiter for waiter in state["waiters"]
+                if not waiter["future"].done()
+            ]
+            if not state["running"] and not queued:
+                continue
+            out[target] = {
+                "model": state.get("model"),
+                "limit": state["limit"],
+                "running": state["running"],
+                "queued": len(queued),
+                "oldest_wait_seconds": round(
+                    max(0.0, now - queued[0]["created_at"]), 1
+                ) if queued else 0.0,
+            }
         return out
 
     def get_token_stats(self) -> dict:
@@ -5885,8 +6032,9 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/chat/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel)
+            return self._vllm_stream(url, body, key, cancel, container)
         else:
+            admission = await self._acquire_inference_slot(container, key, cancel)
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -5898,6 +6046,7 @@ class Manager:
                 return data
             finally:
                 self._track_end(rid)
+                self._release_inference_slot(admission)
 
     async def _vllm_completions(self, model: str, body: dict, stream: bool,
                                 cancel: asyncio.Event | None = None):
@@ -5908,8 +6057,9 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel)
+            return self._vllm_stream(url, body, key, cancel, container)
         else:
+            admission = await self._acquire_inference_slot(container, key, cancel)
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -5921,6 +6071,7 @@ class Manager:
                 return data
             finally:
                 self._track_end(rid)
+                self._release_inference_slot(admission)
 
     def _llama_base_url(self) -> str:
         host = self.settings.get("llama_server_host") or "127.0.0.1"
@@ -6086,7 +6237,8 @@ class Manager:
             raise TimeoutError(f"Timeout waiting for model '{model}' to become ready")
 
     async def _vllm_stream(self, url: str, body: dict, key: str,
-                           cancel: asyncio.Event | None = None):
+                           cancel: asyncio.Event | None = None,
+                           container: dict | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces stream_options.include_usage so the final chunk carries token
         counts we can record; the extra chunk is standard OpenAI behavior and
@@ -6104,9 +6256,15 @@ class Manager:
                 "include_usage": True,
             },
         }
-        rid = self._track_start(key, streaming=True)
+        admission = None
+        rid = None
         retried_without_token_ids = False
         try:
+            if container is not None:
+                admission = await self._acquire_inference_slot(
+                    container, key, cancel,
+                )
+            rid = self._track_start(key, streaming=True)
             while True:
                 async with self.http.stream(
                     "POST", url, json=body, timeout=None,
@@ -6159,11 +6317,15 @@ class Manager:
                             self._record_usage(key, usage, gen_time)
                         yield f"{line}\n\n"
                     return
+        except ClientAbort:
+            return
         except Exception as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error'}})}\n\n"
             yield "data: [DONE]\n\n"
         finally:
-            self._track_end(rid)
+            if rid is not None:
+                self._track_end(rid)
+            self._release_inference_slot(admission)
 
     # ---------- system telemetry ----------
     def _read_disk(self) -> dict:
@@ -6882,10 +7044,15 @@ class Manager:
     async def _run_inference(self, jid: str, container: dict):
         job = self.jobs[jid]
         port = container["port"]
-        job["attempts"] = job.get("attempts", 0) + 1
-        # Refresh idle clock every time we route a job to this container.
-        self._mark_active(container.get("name"))
+        admission = None
         try:
+            admission = await self._acquire_inference_slot(
+                container, container.get("stats_key") or job["model"], None,
+            )
+            job["attempts"] = job.get("attempts", 0) + 1
+            # Refresh idle clock only when the job is actually admitted to the
+            # backend, not while it is waiting in the controller queue.
+            self._mark_active(container.get("name"))
             url = f"http://localhost:{port}/v1/chat/completions"
             payload: dict = {
                 "messages": job["messages"],
@@ -6919,6 +7086,7 @@ class Manager:
             job["status"] = ERROR
             job["error"] = f"{err_msg} (after {attempts} attempt{'s' if attempts != 1 else ''})"
         finally:
+            self._release_inference_slot(admission)
             if job["status"] in (DONE, ERROR):
                 job["completed_at"] = time.time()
                 async with self.lock:
@@ -7059,6 +7227,7 @@ class Manager:
             "usage_aliases": dict(self.usage_aliases),
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
+            "inference_admission": self.inference_admission(),
             "ollama": ollama,
             "unsloth": unsloth,
             "spark_launches": list(self.spark_launches),

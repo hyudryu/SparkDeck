@@ -42,7 +42,7 @@ from .sensors import aggregate_max, discover
 from .serial_link import MOCK_PORT, SerialLink, list_serial_ports
 from .settings import Settings
 from .state_publisher import STATE_DIR, publish as publish_fan_state, read as read_fan_state
-from .control_reader import read_max_speed
+from .control_reader import effective_temperature, read_control
 
 log = logging.getLogger("fancontroller")
 
@@ -725,10 +725,12 @@ class FanApp:
             return True
 
         sel = [self.source_map[k] for k in self.settings.sources if k in self.source_map]
-        temp = aggregate_max(sel) if sel else None
+        local_temp = aggregate_max(sel) if sel else None
+        control = read_control()
+        temp = effective_temperature(local_temp, control)
         now = time.monotonic()
 
-        max_speed = read_max_speed()
+        max_speed = control.max_speed
         if max_speed or temp is None:
             # Safety paths: full cooling immediately, bypassing the ramp.
             duty = 255
@@ -778,6 +780,15 @@ class FanApp:
             status=self.link_status,
             max_speed=self.max_speed_active,
             active_settings=self.settings.active_settings(),
+            local_temp=local_temp,
+            temperature_override={
+                "temperature_c": control.temperature_c,
+                "source": control.source,
+                "node_id": control.node_id,
+                "node_name": control.node_name,
+                "observed_at": control.observed_at,
+                "expires_at": control.expires_at,
+            } if control.temperature_c is not None else None,
         )
         if self.settings.mode == "curve":
             self.curve_editor.set_live_point(ctrl_temp, byte_to_pct(duty))

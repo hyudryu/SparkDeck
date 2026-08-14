@@ -433,6 +433,14 @@ async def update_usage_alias(req: Request):
         raise HTTPException(status, str(exc)) from exc
 
 
+@app.delete("/api/token-stats/{model_path:path}")
+async def erase_usage_model(model_path: str):
+    try:
+        return manager.erase_usage_model(model_path)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.get("/api/token-cost/{model_path:path}")
 async def get_token_cost(model_path: str, session: bool = False):
     stats = manager.session_token_stats.get(model_path) if session else None

@@ -3477,6 +3477,37 @@ class Manager:
             pass
         return self.get_token_stats()
 
+    def erase_usage_model(self, model: Any) -> dict:
+        """Erase every persisted usage record for one exact model key."""
+        model_key = str(model or "").strip()
+        if not model_key or model_key not in self.token_stats:
+            raise ValueError("usage model not found")
+
+        self.token_stats.pop(model_key, None)
+        self.session_token_stats.pop(model_key, None)
+        self.speed_samples.pop(model_key, None)
+        self.usage_aliases.pop(model_key, None)
+        self.usage_merge_groups.pop(model_key, None)
+        for hour_key in list(self.hourly_token_stats):
+            models = self.hourly_token_stats.get(hour_key)
+            if not isinstance(models, dict):
+                continue
+            models.pop(model_key, None)
+            if not models:
+                self.hourly_token_stats.pop(hour_key, None)
+
+        # Invalidate an older in-flight speed snapshot before persisting the
+        # erased state, so it cannot permanently restore this model.
+        self._speed_samples_version = getattr(
+            self, "_speed_samples_version", 0
+        ) + 1
+        self._save_token_stats()
+        self._save_hourly_token_stats()
+        self._save_speed_samples()
+        self._save_usage_aliases()
+        self._save_usage_merge_groups()
+        return {"ok": True, "model": model_key}
+
     def reset_session_token_stats(self) -> dict:
         """Clear only the session counters (not the persisted lifetime stats)."""
         self.session_token_stats = {}

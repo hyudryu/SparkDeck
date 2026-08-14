@@ -141,6 +141,7 @@ function app() {
     usageAliasValue: {},
     usageMergeValue: {},
     usageAliasSaving: {},
+    usageEraseBusy: {},
     usageAliasSaved: {},
     analysisDateStart: '',         // YYYY-MM-DD or '' for default range
     analysisDateEnd: '',           // YYYY-MM-DD or '' for default range
@@ -340,6 +341,7 @@ function app() {
           if (this.usageAliasSaving[model] == null) this.usageAliasSaving[model] = false;
           if (this.usageAliasEditing[model] == null) this.usageAliasEditing[model] = false;
           if (this.usageAliasSaved[model] == null) this.usageAliasSaved[model] = false;
+          if (this.usageEraseBusy[model] == null) this.usageEraseBusy[model] = false;
         }
         // Auto-switch the token card to the newly loaded model.
         this._syncTokenModel();
@@ -1205,6 +1207,25 @@ function app() {
         alert('Rename failed: ' + error.message);
       } finally {
         this.usageAliasSaving[model] = false;
+      }
+    },
+    async eraseUsageModel(model) {
+      if (!confirm(`Erase all recorded usage for ${model}? This cannot be undone. New requests for this model will create a fresh row.`)) return;
+      this.usageEraseBusy[model] = true;
+      try {
+        const response = await fetch(`/api/token-stats/${encodeURIComponent(model)}`, {
+          method: 'DELETE',
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        delete this.usageAliasEditing[model];
+        delete this.usageAliasValue[model];
+        delete this.usageMergeValue[model];
+        await this.refresh();
+      } catch (error) {
+        alert('Erase failed: ' + error.message);
+      } finally {
+        this.usageEraseBusy[model] = false;
       }
     },
     totalInputTokens() {

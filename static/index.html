@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=61">
-<script src="/static/app.js?v=61"></script>
+<link rel="stylesheet" href="/static/styles.css?v=62">
+<script src="/static/app.js?v=62"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -1832,7 +1832,7 @@ for chunk in stream:
               <td style="text-align:right" x-text="fmtTokens(row.stats.output)"></td>
               <td style="text-align:right" x-text="row.stats.requests ?? 0"></td>
               <td style="text-align:right" :title="row.speed?.legacy ? 'Legacy lifetime average until a new speed sample is recorded' : `Rolling ${fmtTokens(row.speed?.tokens || 0)} generated tokens; concurrent decode intervals are aggregated`" x-text="usageAverageSpeed(row) != null ? usageAverageSpeed(row).toFixed(1) + ' tok/s' : '—'"></td>
-              <td style="text-align:right" x-text="row.stats.gen_time_s ? row.stats.gen_time_s.toFixed(1) + ' s' : '—'"></td>
+              <td style="text-align:right" x-text="fmtDuration(row.stats.gen_time_s)"></td>
               <td style="text-align:right" x-text="usageCostDisplay(row)"></td>
             </tr>
           </template>

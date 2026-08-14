@@ -433,6 +433,38 @@ class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    def test_distributed_network_environment_matches_selected_rdma_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            infiniband = (
+                root / "enp1s0f1np1" / "device" / "infiniband"
+            )
+            (infiniband / "rocep1s0f1").mkdir(parents=True)
+
+            environment = Manager._distributed_network_environment(
+                "enp1s0f1np1", root,
+            )
+
+        self.assertEqual(environment, {
+            "NCCL_SOCKET_IFNAME": "enp1s0f1np1",
+            "GLOO_SOCKET_IFNAME": "enp1s0f1np1",
+            "NCCL_NET": "IB",
+            "NCCL_IB_DISABLE": "0",
+            "NCCL_IB_HCA": "rocep1s0f1",
+            "UCX_NET_DEVICES": "rocep1s0f1:1",
+        })
+
+    def test_distributed_network_environment_overrides_stale_rdma_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Manager._distributed_network_environment(
+                "eth0", Path(directory),
+            )
+
+        self.assertEqual(environment["NCCL_NET"], "Socket")
+        self.assertEqual(environment["NCCL_IB_DISABLE"], "1")
+        self.assertEqual(environment["NCCL_IB_HCA"], "")
+        self.assertEqual(environment["UCX_NET_DEVICES"], "")
+
     def test_usage_alias_is_persisted_and_can_be_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

@@ -12,7 +12,7 @@ import os
 import signal
 import time
 
-from .control_reader import read_max_speed
+from .control_reader import effective_temperature, read_control
 from .controller import (
     FanCurve,
     Hysteresis,
@@ -93,8 +93,9 @@ class FanDaemon:
         self.status = status
         log.info("serial: %s", status)
 
-    def _target_duty(self, temp: float | None, now: float) -> tuple[int, bool]:
-        max_speed = read_max_speed()
+    def _target_duty(
+        self, temp: float | None, now: float, max_speed: bool = False,
+    ) -> tuple[int, bool]:
         if max_speed or temp is None:
             self.slew.sync(100.0, now)
             return 255, max_speed
@@ -124,8 +125,12 @@ class FanDaemon:
         if current_mtime != self.settings_mtime_ns:
             self._load_settings()
 
-        temp = aggregate_max(self.selected_sources) if self.selected_sources else None
-        duty, max_speed = self._target_duty(temp, time.monotonic())
+        local_temp = aggregate_max(self.selected_sources) if self.selected_sources else None
+        control = read_control()
+        temp = effective_temperature(local_temp, control)
+        duty, max_speed = self._target_duty(
+            temp, time.monotonic(), control.max_speed,
+        )
         assert self.link is not None
         self.link.set_duty(duty)
         display_rpm = (
@@ -141,6 +146,15 @@ class FanDaemon:
             status=self.status,
             max_speed=max_speed,
             active_settings=self.settings.active_settings(),
+            local_temp=local_temp,
+            temperature_override={
+                "temperature_c": control.temperature_c,
+                "source": control.source,
+                "node_id": control.node_id,
+                "node_name": control.node_name,
+                "observed_at": control.observed_at,
+                "expires_at": control.expires_at,
+            } if control.temperature_c is not None else None,
         )
 
     def run(self) -> None:

@@ -209,8 +209,11 @@ MODEL_PRICING = {
     "llama-3.3-70b":       {"input": 0.59, "output": 0.79, "cache": 0.29},
 }
 
+USAGE_SPEED_WINDOW_TOKENS = 1_000_000
+
 PENDING = "pending"          # waiting for capacity
 DISPATCHING = "dispatching"  # model starting, will run when ready
+ADMISSION_WAITING = "admission_waiting"  # ready, queued for a proxy slot
 RUNNING = "running"          # inference active
 DONE = "done"
 ERROR = "error"
@@ -263,6 +266,12 @@ class Manager:
         self.token_stats: dict[str, dict] = self._load_token_stats()
         self.usage_aliases_path = self.data_dir / "usage_aliases.json"
         self.usage_aliases: dict[str, str] = self._load_usage_aliases()
+        self.usage_merge_groups_path = self.data_dir / "usage_merge_groups.json"
+        self.usage_merge_groups: dict[str, str] = self._load_usage_merge_groups()
+        self.speed_samples_path = self.data_dir / "speed_samples.json"
+        self.speed_samples: dict[str, list[dict]] = self._load_speed_samples()
+        self._speed_samples_version = 0
+        self._speed_samples_flush_task: asyncio.Task | None = None
         # Session token counters — same shape as token_stats but NOT
         # persisted. Tracks tokens served since the controller started (or
         # since the last session reset). The topbar widget shows these; the
@@ -353,6 +362,14 @@ class Manager:
         self._trailing_window = 5.0  # seconds
         self._active_reqs: dict[int, dict] = {}
         self._req_seq = 0
+        # Controller-side vLLM admission control. vLLM's --max-num-seqs is an
+        # engine scheduler limit, but forwarding more HTTP requests than that
+        # still lets them enter the engine and influence batching/prefill. Keep
+        # excess requests in a FIFO here so only the configured number reaches
+        # each deployment at once.
+        #
+        # target id -> {limit, running, model, waiters: deque[waiter]}
+        self._inference_admission: dict[str, dict] = {}
         # Set while a launch is in flight (model, variant, started_at, log
         # path); surfaced in /api/state so the UI can show load progress.
         self._llama_launching: dict | None = None
@@ -724,17 +741,66 @@ class Manager:
         tmp.write_text(json.dumps(self.usage_aliases, indent=2), encoding="utf-8")
         tmp.replace(self.usage_aliases_path)
 
-    def update_usage_alias(self, model: Any, alias: Any) -> dict:
+    def _load_usage_merge_groups(self) -> dict[str, str]:
+        if not self.usage_merge_groups_path.exists():
+            return {}
+        try:
+            value = json.loads(
+                self.usage_merge_groups_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(model): str(group)
+                for model, group in value.items()
+                if str(model).strip() and str(group).strip()
+            }
+        except Exception:
+            return {}
+
+    def _save_usage_merge_groups(self) -> None:
+        tmp = self.usage_merge_groups_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.usage_merge_groups, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.usage_merge_groups_path)
+
+    def update_usage_alias(
+        self,
+        model: Any,
+        alias: Any,
+        *,
+        merge_group: Any = None,
+        update_merge_group: bool = False,
+    ) -> dict:
         model_key = str(model or "").strip()
         if not model_key or model_key not in self.token_stats:
             raise ValueError("usage model not found")
+        # Validate the entire request before changing either map or file.  A
+        # bad merge group must not leave an otherwise-valid alias half-saved.
         normalized = self._normalized_alias(alias)
+        normalized_group = (
+            self._normalized_alias(merge_group)
+            if update_merge_group
+            else getattr(self, "usage_merge_groups", {}).get(model_key, "")
+        )
         if normalized:
             self.usage_aliases[model_key] = normalized
         else:
             self.usage_aliases.pop(model_key, None)
         self._save_usage_aliases()
-        return {"ok": True, "model": model_key, "alias": normalized or None}
+        if update_merge_group:
+            if normalized_group:
+                self.usage_merge_groups[model_key] = normalized_group
+            else:
+                self.usage_merge_groups.pop(model_key, None)
+            self._save_usage_merge_groups()
+        return {
+            "ok": True,
+            "model": model_key,
+            "alias": normalized or None,
+            "merge_group": normalized_group or None,
+        }
 
     @staticmethod
     def _normalized_alias(value: Any, fallback: str = "") -> str:
@@ -772,7 +838,19 @@ class Manager:
         )
 
     @staticmethod
-    def _deployment_launch_settings(body: dict) -> dict:
+    def _pricing_value(value: Any, field: str) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a non-negative number") from exc
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f"{field} must be a non-negative number")
+        return result
+
+    @classmethod
+    def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
         return {
             "deployment_name": body.get("deployment_name") or body.get("name"),
@@ -790,6 +868,23 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "input_cost_per_1m": cls._pricing_value(
+                body.get("input_cost_per_1m"), "input_cost_per_1m"
+            ),
+            "cache_cost_per_1m": cls._pricing_value(
+                body.get("cache_cost_per_1m"), "cache_cost_per_1m"
+            ),
+            "output_cost_per_1m": cls._pricing_value(
+                body.get("output_cost_per_1m"), "output_cost_per_1m"
+            ),
+        }
+
+    @staticmethod
+    def _deployment_pricing(settings: dict) -> dict:
+        return {
+            "input_cost_per_1m": settings.get("input_cost_per_1m"),
+            "cache_cost_per_1m": settings.get("cache_cost_per_1m"),
+            "output_cost_per_1m": settings.get("output_cost_per_1m"),
         }
 
     @classmethod
@@ -998,6 +1093,84 @@ class Manager:
         })
         self._save_deployments()
         return deployment
+
+    def _recovered_deployment_launch_settings(
+        self, deployment: dict, primary_container: dict | None = None,
+    ) -> dict:
+        load_settings = (primary_container or {}).get("load_settings") or {}
+        try:
+            recovered_args = shlex.split(load_settings.get("command_flags") or "")
+        except ValueError:
+            recovered_args = list(load_settings.get("extra_args") or [])
+        recovered_args = self._without_cli_options(
+            recovered_args,
+            {"--host", "--port", "--gpu-memory-utilization",
+             "--gpu_memory_utilization"},
+        )
+        return self._deployment_launch_settings({
+            "deployment_name": deployment.get("name"),
+            "model": deployment.get("model"),
+            "engine": deployment.get("engine", "vllm"),
+            "image": (primary_container or {}).get("image"),
+            "extra_args": recovered_args,
+            "gpu_memory_utilization": load_settings.get(
+                "gpu_memory_utilization"
+            ),
+            "deployment_mode": deployment.get("mode", "single"),
+            "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
+            "port": deployment.get("api_port"),
+        })
+
+    @classmethod
+    def _deployment_pricing_model_key(cls, deployment: dict) -> str:
+        explicit = str(deployment.get("pricing_model_key") or "").strip()
+        if explicit:
+            return explicit
+        settings = deployment.get("launch_settings") or {}
+        model = str(deployment.get("model") or settings.get("model") or "")
+        return cls._stats_key(
+            model, cls._variant_from_cmd(settings.get("extra_args") or [])
+        ) if model else ""
+
+    async def update_deployment_pricing(
+        self, deployment_id: str, body: dict
+    ) -> dict:
+        """Update accounting metadata without restarting a running cluster."""
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise ValueError("deployment not found")
+        pricing = {
+            field: self._pricing_value(body.get(field), field)
+            for field in (
+                "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+            )
+        }
+        launch_settings = deployment.get("launch_settings")
+        if not isinstance(launch_settings, dict) or not launch_settings:
+            containers = await self.list_containers()
+            candidates = [
+                container for container in containers
+                if container.get("deployment_id") == deployment_id
+            ]
+            primary = next(
+                (container for container in candidates
+                 if container.get("rank") == 0),
+                candidates[0] if candidates else None,
+            )
+            launch_settings = self._recovered_deployment_launch_settings(
+                deployment, primary
+            )
+            deployment["launch_settings"] = launch_settings
+            if primary and primary.get("stats_key"):
+                deployment["pricing_model_key"] = primary["stats_key"]
+        launch_settings.update(pricing)
+        if not deployment.get("pricing_model_key"):
+            deployment["pricing_model_key"] = (
+                self._deployment_pricing_model_key(deployment)
+            )
+        deployment["pricing"] = pricing
+        self._save_deployments()
+        return {"ok": True, "deployment_id": deployment_id, **pricing}
 
     @staticmethod
     def _without_cli_options(args: list[str], names: set[str]) -> list[str]:
@@ -2445,9 +2618,10 @@ class Manager:
     # their "CLOUD " prefix. Persisted on every update so they survive
     # restarts; only the reset endpoint clears them.
     #
-    # Speed fields (gen_tokens / gen_time_s) measure decode only: the window
-    # from the first output chunk to the last, so prompt processing / prefill
-    # time is excluded. Average speed = gen_tokens / gen_time_s.
+    # Speed fields (gen_tokens / gen_time_s) are retained for compatibility.
+    # The Usage table uses persisted request intervals instead: its rolling
+    # 1M-output-token rate divides output tokens by the union of decode intervals,
+    # so overlapping streams contribute their combined throughput.
     def _load_token_stats(self) -> dict[str, dict]:
         if self.token_stats_path.exists():
             try:
@@ -2460,6 +2634,135 @@ class Manager:
 
     def _save_token_stats(self):
         self.token_stats_path.write_text(json.dumps(self.token_stats, indent=2))
+
+    def _load_speed_samples(self) -> dict[str, list[dict]]:
+        if self.speed_samples_path.exists():
+            try:
+                data = json.loads(self.speed_samples_path.read_text())
+                if isinstance(data, dict):
+                    return {
+                        str(model): samples
+                        for model, samples in data.items()
+                        if isinstance(samples, list)
+                    }
+            except Exception:
+                pass
+        return {}
+
+    def _write_speed_samples_snapshot(self, snapshot: dict) -> None:
+        tmp = self.speed_samples_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, separators=(",", ":")))
+        tmp.replace(self.speed_samples_path)
+
+    def _save_speed_samples(self) -> None:
+        self._write_speed_samples_snapshot(copy.deepcopy(self.speed_samples))
+
+    async def _flush_speed_samples_later(self) -> None:
+        """Persist request intervals in bounded batches off the event loop."""
+        await asyncio.sleep(1.0)
+        while True:
+            version = self._speed_samples_version
+            snapshot = copy.deepcopy(self.speed_samples)
+            await asyncio.to_thread(self._write_speed_samples_snapshot, snapshot)
+            if version == self._speed_samples_version:
+                return
+            # Coalesce requests that arrived while the previous snapshot was
+            # being encoded/written instead of starting one write per request.
+            await asyncio.sleep(0.1)
+
+    def _queue_speed_samples_save(self) -> None:
+        self._speed_samples_version = getattr(
+            self, "_speed_samples_version", 0
+        ) + 1
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous maintenance/tests still get durable writes.
+            self._save_speed_samples()
+            return
+        task = getattr(self, "_speed_samples_flush_task", None)
+        if task is None or task.done():
+            self._speed_samples_flush_task = loop.create_task(
+                self._flush_speed_samples_later()
+            )
+
+    def _record_speed_sample(
+        self, model: str, completion_tokens: int, gen_time_s: float | None
+    ) -> None:
+        if not gen_time_s or gen_time_s <= 0 or completion_tokens <= 0:
+            return
+        ended_at = time.time()
+        samples = self.speed_samples.setdefault(model, [])
+        samples.append({
+            "tokens": completion_tokens,
+            "started_at": ended_at - float(gen_time_s),
+            "ended_at": ended_at,
+        })
+        # Each model retains at least the newest 1M output tokens. The
+        # event cap prevents pathological one-token requests from growing the
+        # metadata file without bound.
+        retained = []
+        retained_tokens = 0.0
+        for sample in reversed(samples):
+            retained.append(sample)
+            retained_tokens += max(0.0, float(sample.get("tokens") or 0))
+            if retained_tokens >= USAGE_SPEED_WINDOW_TOKENS or len(retained) >= 250_000:
+                break
+        self.speed_samples[model] = list(reversed(retained))
+
+    def rolling_generation_speed(self, models: list[str]) -> dict:
+        """Aggregate decode throughput over the newest 1M output tokens.
+
+        Active-time intervals are unioned instead of summed. Consequently,
+        five overlapping 10 tok/s requests report about 50 tok/s, while idle
+        gaps between requests do not dilute inference throughput.
+        """
+        samples = []
+        for model in models:
+            for raw in getattr(self, "speed_samples", {}).get(model, []):
+                try:
+                    tokens = float(raw.get("tokens") or 0)
+                    started_at = float(raw.get("started_at"))
+                    ended_at = float(raw.get("ended_at"))
+                except (TypeError, ValueError):
+                    continue
+                if tokens <= 0 or ended_at <= started_at:
+                    continue
+                samples.append((ended_at, started_at, tokens))
+
+        if not samples:
+            return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
+
+        # Sweep backward through the piecewise-constant aggregate decode
+        # rate.  This cuts the 1M-token boundary through all streams active at
+        # that instant, rather than selecting whole requests serially (which
+        # under-counted concurrent throughput at the cutoff).
+        deltas: dict[float, float] = {}
+        for ended_at, started_at, tokens in samples:
+            rate = tokens / (ended_at - started_at)
+            deltas[started_at] = deltas.get(started_at, 0.0) + rate
+            deltas[ended_at] = deltas.get(ended_at, 0.0) - rate
+        boundaries = sorted(deltas, reverse=True)
+        selected_tokens = 0.0
+        active_time = 0.0
+        aggregate_rate = 0.0
+        for index, upper in enumerate(boundaries[:-1]):
+            aggregate_rate -= deltas[upper]
+            lower = boundaries[index + 1]
+            if aggregate_rate <= 0 or upper <= lower:
+                continue
+            interval_tokens = aggregate_rate * (upper - lower)
+            remaining = USAGE_SPEED_WINDOW_TOKENS - selected_tokens
+            used_tokens = min(interval_tokens, remaining)
+            selected_tokens += used_tokens
+            active_time += used_tokens / aggregate_rate
+            if selected_tokens >= USAGE_SPEED_WINDOW_TOKENS:
+                break
+        return {
+            "tokens": int(selected_tokens),
+            "active_time_s": active_time,
+            "tok_s": selected_tokens / active_time if active_time > 0 else None,
+        }
 
     def _load_hourly_token_stats(self) -> dict[str, dict]:
         if self.hourly_token_stats_path.exists():
@@ -2565,6 +2868,7 @@ class Manager:
         # cached_tokens > prompt_tokens in edge cases).
         if cached_tokens > prompt_tokens:
             cached_tokens = prompt_tokens
+        self._record_speed_sample(model, completion_tokens, gen_time_s)
         # Update both lifetime and session counters with the same values.
         for stats in (self.token_stats, self.session_token_stats):
             rec = stats.setdefault(model, {})
@@ -2593,6 +2897,10 @@ class Manager:
             pass
         try:
             self._save_hourly_token_stats()
+        except Exception:
+            pass
+        try:
+            self._queue_speed_samples_save()
         except Exception:
             pass
 
@@ -2803,6 +3111,189 @@ class Manager:
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
+        admission_running: dict[str, int] = {}
+        for admission in self.inference_admission().values():
+            model = admission.get("model")
+            if not model:
+                continue
+            e = out.setdefault(model, {
+                "connections": 0, "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+            })
+            e["queued"] = e.get("queued", 0) + admission["queued"]
+            e["admission_limit"] = admission["limit"]
+            admission_running[model] = (
+                admission_running.get(model, 0) + admission["running"]
+            )
+        # Admission owns the authoritative running count from slot grant until
+        # release.  max() includes non-streaming/prefill work that has no live
+        # token timestamps without double-counting streams tracked above.
+        for model, running in admission_running.items():
+            out[model]["connections"] = max(
+                out[model]["connections"], running
+            )
+        return out
+
+    # ----- controller-side inference admission queue -----
+    @staticmethod
+    def _inference_admission_config(container: dict, model: str) -> tuple[str, int | None, str]:
+        """Return a stable target id, configured limit, and telemetry key."""
+        target = str(
+            container.get("deployment_id")
+            or container.get("name")
+            or f"port:{container.get('port')}"
+        )
+        stats_key = str(container.get("stats_key") or model)
+        raw_limit = (container.get("load_settings") or {}).get("max_concurrency")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None and limit <= 0:
+            limit = None
+        return target, limit, stats_key
+
+    def _admission_store(self) -> dict[str, dict]:
+        # Several focused tests construct Manager with __new__. Keep this
+        # state lazily initializable so those tests remain lightweight.
+        store = getattr(self, "_inference_admission", None)
+        if store is None:
+            store = self._inference_admission = {}
+        return store
+
+    @staticmethod
+    def _drain_inference_waiters(state: dict) -> None:
+        waiters = state["waiters"]
+        while state["running"] < state["limit"] and waiters:
+            waiter = waiters.popleft()
+            future = waiter["future"]
+            if future.cancelled() or future.done():
+                continue
+            waiter["granted"] = True
+            state["running"] += 1
+            future.set_result(None)
+
+    async def _acquire_inference_slot(
+        self, container: dict, model: str, cancel: asyncio.Event | None,
+    ) -> str | None:
+        """Wait for one FIFO proxy slot without contacting vLLM first."""
+        target, limit, stats_key = self._inference_admission_config(container, model)
+        if limit is None:
+            return None
+        if cancel is not None and cancel.is_set():
+            raise ClientAbort("client disconnected while queued")
+
+        store = self._admission_store()
+        state = store.setdefault(target, {
+            "limit": limit,
+            "running": 0,
+            "model": stats_key,
+            "waiters": deque(),
+        })
+        state["limit"] = limit
+        state["model"] = stats_key
+
+        loop = asyncio.get_running_loop()
+        waiter = {
+            "future": loop.create_future(),
+            "created_at": time.monotonic(),
+            "granted": False,
+        }
+        state["waiters"].append(waiter)
+        self._drain_inference_waiters(state)
+
+        cancel_waiter: asyncio.Task | None = None
+        try:
+            if cancel is None:
+                await waiter["future"]
+            else:
+                cancel_waiter = asyncio.create_task(cancel.wait())
+                done, _ = await asyncio.wait(
+                    {waiter["future"], cancel_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_waiter in done:
+                    raise ClientAbort("client disconnected while queued")
+                await waiter["future"]
+            return target
+        except BaseException:
+            if waiter["granted"]:
+                self._release_inference_slot(target)
+            else:
+                try:
+                    state["waiters"].remove(waiter)
+                except ValueError:
+                    pass
+                if not waiter["future"].done():
+                    waiter["future"].cancel()
+            raise
+        finally:
+            if cancel_waiter is not None:
+                cancel_waiter.cancel()
+
+    def _release_inference_slot(self, target: str | None) -> None:
+        if target is None:
+            return
+        state = self._admission_store().get(target)
+        if state is None:
+            return
+        state["running"] = max(0, state["running"] - 1)
+        self._drain_inference_waiters(state)
+        if not state["running"] and not state["waiters"]:
+            self._admission_store().pop(target, None)
+
+    async def _admit_vllm_target(
+        self,
+        model: str,
+        cancel: asyncio.Event | None,
+        container: dict | None = None,
+    ) -> tuple[dict, str | None]:
+        """Acquire admission and re-resolve runtime state before forwarding.
+
+        A queued request may outlive a container restart or port/config
+        change. Re-resolving after every grant makes the forwarded URL fresh;
+        if the admission identity or limit changed, release the old grant and
+        queue against the new target instead.
+        """
+        current = container or await self._resolve_vllm_target(model)
+        while True:
+            key = current.get("stats_key") or model
+            admission = await self._acquire_inference_slot(current, key, cancel)
+            try:
+                fresh = await self._resolve_vllm_target(model)
+            except BaseException:
+                self._release_inference_slot(admission)
+                raise
+            old_target, old_limit, _ = self._inference_admission_config(
+                current, key
+            )
+            new_target, new_limit, _ = self._inference_admission_config(
+                fresh, fresh.get("stats_key") or model
+            )
+            if old_target == new_target and old_limit == new_limit:
+                return fresh, admission
+            self._release_inference_slot(admission)
+            current = fresh
+
+    def inference_admission(self) -> dict[str, dict]:
+        """Public snapshot of running and controller-queued inference."""
+        now = time.monotonic()
+        out = {}
+        for target, state in self._admission_store().items():
+            queued = [
+                waiter for waiter in state["waiters"]
+                if not waiter["future"].done()
+            ]
+            if not state["running"] and not queued:
+                continue
+            out[target] = {
+                "model": state.get("model"),
+                "limit": state["limit"],
+                "running": state["running"],
+                "queued": len(queued),
+                "oldest_wait_seconds": round(
+                    max(0.0, now - queued[0]["created_at"]), 1
+                ) if queued else 0.0,
+            }
         return out
 
     def get_token_stats(self) -> dict:
@@ -2812,8 +3303,60 @@ class Manager:
         total_req = sum(r.get("requests", 0) for r in self.token_stats.values())
         return {
             "models": self.token_stats,
+            "groups": self.usage_rows(),
             "total": {"input": total_in, "output": total_out, "cached": total_cached, "requests": total_req},
         }
+
+    def usage_rows(self) -> list[dict]:
+        """Return reversible display groups over the raw lifetime counters."""
+        rows: dict[str, dict] = {}
+        numeric_fields = (
+            "input", "output", "cached", "requests", "gen_tokens", "gen_time_s",
+        )
+        merge_groups = getattr(self, "usage_merge_groups", {})
+        aliases = getattr(self, "usage_aliases", {})
+        for model, model_stats in self.token_stats.items():
+            merge_group = str(merge_groups.get(model) or "").strip()
+            row_key = f"group:{merge_group}" if merge_group else f"model:{model}"
+            row = rows.setdefault(row_key, {
+                "key": row_key,
+                "label": merge_group or aliases.get(model) or model,
+                "merge_group": merge_group or None,
+                "models": [],
+                "members": [],
+                "stats": {field: 0 for field in numeric_fields},
+                "total_cost": 0.0,
+            })
+            row["models"].append(model)
+            row["members"].append({
+                "model": model,
+                "alias": aliases.get(model),
+                "merge_group": merge_group or None,
+            })
+            for field in numeric_fields:
+                row["stats"][field] += model_stats.get(field, 0) or 0
+            row["total_cost"] += self.calculate_cost(
+                model, model_stats
+            ).get("total_cost", 0.0)
+
+        for row in rows.values():
+            speed = self.rolling_generation_speed(row["models"])
+            # Existing installations have lifetime speed totals but no
+            # interval samples until this version records its first request.
+            # Preserve a useful fallback during that migration period.
+            if speed["tok_s"] is None:
+                legacy_tokens = row["stats"].get("gen_tokens", 0) or 0
+                legacy_time = row["stats"].get("gen_time_s", 0) or 0
+                if legacy_tokens > 0 and legacy_time > 0:
+                    speed = {
+                        "tokens": legacy_tokens,
+                        "active_time_s": legacy_time,
+                        "tok_s": legacy_tokens / legacy_time,
+                        "legacy": True,
+                    }
+            row["speed"] = speed
+            row["total_cost"] = round(row["total_cost"], 2)
+        return list(rows.values())
 
     def calculate_cost(self, model: str, stats: dict | None = None) -> dict:
         """Calculate the total cost for a model's token usage.
@@ -2839,13 +3382,30 @@ class Manager:
         output_tokens = stats.get("output", 0)
         cached_tokens = stats.get("cached", 0)
 
-        # Resolve pricing: per-model settings first, then built-in map.
+        # Resolve pricing: cluster deployment metadata first, then standalone
+        # per-model settings, then the built-in map.
         input_cost_per_1m = 0.0
         output_cost_per_1m = 0.0
         cache_cost_per_1m = 0.0
+        deployment_pricing: dict[str, Any] | None = None
+
+        model_lower = model.casefold()
+        for deployment in getattr(self, "deployments", []):
+            settings = deployment.get("launch_settings") or {}
+            pricing_model_key = self._deployment_pricing_model_key(deployment)
+            if not pricing_model_key or pricing_model_key.casefold() != model_lower:
+                continue
+            values = {
+                "input": settings.get("input_cost_per_1m"),
+                "output": settings.get("output_cost_per_1m"),
+                "cache": settings.get("cache_cost_per_1m"),
+            }
+            if any(value is not None for value in values.values()):
+                deployment_pricing = values
+                break
 
         # Check per-model unsloth settings
-        for key, settings in self.unsloth_settings.items():
+        for key, settings in getattr(self, "unsloth_settings", {}).items():
             if key.lower() in model.lower() or model.lower() in key.lower():
                 inp = settings.get("input_cost_per_1m")
                 out = settings.get("output_cost_per_1m")
@@ -2860,13 +3420,23 @@ class Manager:
 
         # Fallback to built-in pricing map (prefix match)
         if input_cost_per_1m == 0 and output_cost_per_1m == 0:
-            model_lower = model.lower()
             for prefix, rates in MODEL_PRICING.items():
                 if prefix.lower() in model_lower or model_lower in prefix.lower():
                     input_cost_per_1m = float(rates.get("input", 0))
                     output_cost_per_1m = float(rates.get("output", 0))
                     cache_cost_per_1m = float(rates.get("cache", 0))
                     break
+
+        # Cluster fields override their matching defaults independently.
+        # An explicit zero therefore means free, while a blank field keeps
+        # the standalone/built-in rate for that token class.
+        if deployment_pricing is not None:
+            if deployment_pricing["input"] is not None:
+                input_cost_per_1m = float(deployment_pricing["input"])
+            if deployment_pricing["output"] is not None:
+                output_cost_per_1m = float(deployment_pricing["output"])
+            if deployment_pricing["cache"] is not None:
+                cache_cost_per_1m = float(deployment_pricing["cache"])
 
         # Non-cached input tokens are charged at the regular input rate;
         # cached tokens are charged at the (typically lower) cache rate.
@@ -2891,8 +3461,18 @@ class Manager:
 
     def reset_token_stats(self) -> dict:
         self.token_stats = {}
+        self.speed_samples = {}
+        # Ensure an in-flight batched snapshot notices the reset and follows
+        # up with the empty state after its current write completes.
+        self._speed_samples_version = getattr(
+            self, "_speed_samples_version", 0
+        ) + 1
         try:
             self._save_token_stats()
+        except Exception:
+            pass
+        try:
+            self._save_speed_samples()
         except Exception:
             pass
         return self.get_token_stats()
@@ -3404,6 +3984,7 @@ class Manager:
                 "elapsed_s": round(now - run["started_at"], 1) if run.get("started_at") else None,
                 "last_line": lines[-1] if lines else None,
                 "error": run.get("error"),
+                "max_concurrency": run.get("max_concurrency"),
             })
         # Most recent first.
         out.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
@@ -3474,6 +4055,15 @@ class Manager:
                 yield "data: {\"done\": true}\n\n"
                 return
             cmd.extend(["-o", f"max_num_seqs={parallel_streams}"])
+        else:
+            recipe_default = (
+                (launch.get("metadata") or {}).get("defaults") or {}
+            ).get("max_num_seqs")
+            try:
+                parallel_streams = int(recipe_default)
+            except (TypeError, ValueError):
+                parallel_streams = None
+        run["max_concurrency"] = parallel_streams
         for option in overrides.get("options") or []:
             option = str(option).strip()
             if option and "=" in option and "\n" not in option and "\r" not in option:
@@ -6080,8 +6670,17 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/chat/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel)
+            return self._vllm_stream(
+                url, body, key, cancel, container, requested_model=model,
+            )
         else:
+            admission = None
+            container, admission = await self._admit_vllm_target(
+                model, cancel, container
+            )
+            key = container.get("stats_key") or model
+            body = {**body, "model": self._upstream_model_id(container, model)}
+            url = f"http://localhost:{container['port']}/v1/chat/completions"
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -6093,6 +6692,7 @@ class Manager:
                 return data
             finally:
                 self._track_end(rid)
+                self._release_inference_slot(admission)
 
     async def _vllm_completions(self, model: str, body: dict, stream: bool,
                                 cancel: asyncio.Event | None = None):
@@ -6103,8 +6703,17 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/completions"
         if stream:
-            return self._vllm_stream(url, body, key, cancel)
+            return self._vllm_stream(
+                url, body, key, cancel, container, requested_model=model,
+            )
         else:
+            admission = None
+            container, admission = await self._admit_vllm_target(
+                model, cancel, container
+            )
+            key = container.get("stats_key") or model
+            body = {**body, "model": self._upstream_model_id(container, model)}
+            url = f"http://localhost:{container['port']}/v1/completions"
             rid = self._track_start(key)
             try:
                 r = await self._await_or_cancel(
@@ -6116,6 +6725,7 @@ class Manager:
                 return data
             finally:
                 self._track_end(rid)
+                self._release_inference_slot(admission)
 
     def _llama_base_url(self) -> str:
         host = self.settings.get("llama_server_host") or "127.0.0.1"
@@ -6230,15 +6840,29 @@ class Manager:
         finally:
             self._track_end(rid)
 
-    async def _sparkrun_targets(self) -> dict[str, int]:
+    async def _sparkrun_targets(self) -> dict[str, dict]:
         """Discover models served by running sparkrun containers.
         sparkrun containers run in host network mode, so their internal
-        vLLM port is reachable on localhost. Returns {model_id: host_port}."""
-        out: dict[str, int] = {}
+        vLLM port is reachable on localhost. Runtime load settings are kept so
+        controller admission honors SparkRun's --max-num-seqs as well."""
+        out: dict[str, dict] = {}
+        active_run_limit = next((
+            run.get("max_concurrency")
+            for run in sorted(
+                getattr(self, "spark_runs", {}).values(),
+                key=lambda item: item.get("started_at") or 0,
+                reverse=True,
+            )
+            if run.get("status") == "running" and run.get("max_concurrency")
+        ), None)
         try:
             for c in self.client.containers.list(all=False):
                 if not c.name.startswith("sparkrun_"):
                     continue
+                summary = self._container_summary(c) or {}
+                load_settings = dict(summary.get("load_settings") or {})
+                if not load_settings.get("max_concurrency") and active_run_limit:
+                    load_settings["max_concurrency"] = active_run_limit
                 # Host-network sparkrun containers expose vLLM directly on localhost.
                 # Default recipe port is 8000; inspect the recipe command to find it.
                 port = 8000
@@ -6251,7 +6875,15 @@ class Manager:
                     for m in (r.json() or {}).get("data", []):
                         mid = m.get("id") if isinstance(m, dict) else None
                         if mid:
-                            out[mid] = port
+                            out[mid] = {
+                                **summary,
+                                "name": summary.get("name") or c.name,
+                                "model": summary.get("model") or mid,
+                                "served_models": [mid],
+                                "stats_key": summary.get("stats_key") or mid,
+                                "port": port,
+                                "load_settings": load_settings,
+                            }
                 except Exception:
                     pass
         except Exception:
@@ -6271,7 +6903,7 @@ class Manager:
         # Fallback to sparkrun-managed containers (host-network mode).
         sparkrun = await self._sparkrun_targets()
         if model in sparkrun:
-            return {"name": f"sparkrun:{model}", "model": model, "port": sparkrun[model]}
+            return sparkrun[model]
         # Try ensure_loaded to start/swap the container
         try:
             return await self.ensure_loaded(model)
@@ -6281,7 +6913,9 @@ class Manager:
             raise TimeoutError(f"Timeout waiting for model '{model}' to become ready")
 
     async def _vllm_stream(self, url: str, body: dict, key: str,
-                           cancel: asyncio.Event | None = None):
+                           cancel: asyncio.Event | None = None,
+                           container: dict | None = None,
+                           requested_model: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces stream_options.include_usage so the final chunk carries token
         counts we can record; the extra chunk is standard OpenAI behavior and
@@ -6299,13 +6933,36 @@ class Manager:
                 "include_usage": True,
             },
         }
-        rid = self._track_start(key, streaming=True)
+        admission = None
+        rid = None
         retried_without_token_ids = False
         try:
+            if container is not None:
+                requested_model = requested_model or body.get("model") or key
+                endpoint = (
+                    "/v1/chat/completions"
+                    if url.endswith("/v1/chat/completions")
+                    else "/v1/completions"
+                )
+                container, admission = await self._admit_vllm_target(
+                    requested_model, cancel, container
+                )
+                key = container.get("stats_key") or requested_model
+                body["model"] = self._upstream_model_id(
+                    container, requested_model
+                )
+                url = f"http://localhost:{container['port']}{endpoint}"
+            rid = self._track_start(key, streaming=True)
             while True:
-                async with self.http.stream(
+                stream_context = self.http.stream(
                     "POST", url, json=body, timeout=None,
-                ) as r:
+                )
+                entered = False
+                try:
+                    r = await self._await_or_cancel(
+                        stream_context.__aenter__(), cancel
+                    )
+                    entered = True
                     if r.status_code != 200:
                         detail = (await r.aread()).decode("utf-8", errors="replace")
                         if (
@@ -6354,11 +7011,18 @@ class Manager:
                             self._record_usage(key, usage, gen_time)
                         yield f"{line}\n\n"
                     return
+                finally:
+                    if entered:
+                        await stream_context.__aexit__(None, None, None)
+        except ClientAbort:
+            return
         except Exception as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error'}})}\n\n"
             yield "data: [DONE]\n\n"
         finally:
-            self._track_end(rid)
+            if rid is not None:
+                self._track_end(rid)
+            self._release_inference_slot(admission)
 
     # ---------- system telemetry ----------
     def _read_disk(self) -> dict:
@@ -6838,6 +7502,7 @@ class Manager:
             "error": None,
             "override": False,
             "attempts": 0,
+            "_cancel_event": asyncio.Event(),
         }
         async with self.lock:
             self.jobs[job["id"]] = job
@@ -6855,7 +7520,12 @@ class Manager:
     async def cancel_job(self, job_id: str) -> dict:
         async with self.lock:
             job = self.jobs.get(job_id)
-            if job and job["status"] in (PENDING, DISPATCHING):
+            if job and job["status"] in (
+                PENDING, DISPATCHING, ADMISSION_WAITING,
+            ):
+                event = job.get("_cancel_event")
+                if event is not None:
+                    event.set()
                 job["status"] = CANCELED
                 job["completed_at"] = time.time()
                 if job_id in self.queue:
@@ -6956,8 +7626,10 @@ class Manager:
             if target and target["status"] == "running":
                 ready = await self._check_ready(target)
                 if ready:
-                    job["status"] = RUNNING
-                    job["started_at"] = time.time()
+                    # Keep the job cancelable while it waits in the separate
+                    # controller admission queue. _run_inference marks it
+                    # RUNNING only after a slot is actually granted.
+                    job["status"] = ADMISSION_WAITING
                     asyncio.create_task(self._run_inference(jid, target))
                 else:
                     job["status"] = DISPATCHING
@@ -7160,12 +7832,21 @@ class Manager:
 
     async def _run_inference(self, jid: str, container: dict):
         job = self.jobs[jid]
-        port = container["port"]
-        job["attempts"] = job.get("attempts", 0) + 1
-        # Refresh idle clock every time we route a job to this container.
-        self._mark_active(container.get("name"))
+        admission = None
+        cancel = job.get("_cancel_event")
         try:
-            url = f"http://localhost:{port}/v1/chat/completions"
+            container, admission = await self._admit_vllm_target(
+                job["model"], cancel, container,
+            )
+            if cancel is not None and cancel.is_set():
+                raise ClientAbort("job canceled while queued")
+            job["status"] = RUNNING
+            job["started_at"] = time.time()
+            job["attempts"] = job.get("attempts", 0) + 1
+            # Refresh idle clock only when the job is actually admitted to the
+            # backend, not while it is waiting in the controller queue.
+            self._mark_active(container.get("name"))
+            url = f"http://localhost:{container['port']}/v1/chat/completions"
             payload: dict = {
                 "messages": job["messages"],
             }
@@ -7180,6 +7861,9 @@ class Manager:
             )
             job["error"] = None
             job["status"] = DONE
+        except ClientAbort:
+            job["status"] = CANCELED
+            job["error"] = None
         except Exception as e:
             if isinstance(e, httpx.HTTPStatusError):
                 err_msg = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
@@ -7198,7 +7882,8 @@ class Manager:
             job["status"] = ERROR
             job["error"] = f"{err_msg} (after {attempts} attempt{'s' if attempts != 1 else ''})"
         finally:
-            if job["status"] in (DONE, ERROR):
+            self._release_inference_slot(admission)
+            if job["status"] in (DONE, ERROR, CANCELED):
                 job["completed_at"] = time.time()
                 async with self.lock:
                     if jid in self.queue:
@@ -7219,7 +7904,10 @@ class Manager:
         )
         # Enrich Atlas Serving containers with their served model name. Atlas
         # runs are SparkRun containers in host-network mode.
-        sparkrun_models_by_port: dict[int, str] = {p: m for m, p in sparkrun_targets.items()}
+        sparkrun_models_by_port: dict[int, str] = {
+            target.get("port"): model
+            for model, target in sparkrun_targets.items()
+        }
         for c in containers:
             if c.get("source") == "atlas-serving":
                 if not c.get("model"):
@@ -7281,28 +7969,15 @@ class Manager:
                     phase = primary.get("phase") or {}
                     deployment["status"] = "ready" if phase.get("phase") == "ready" else "starting"
             if not deployment.get("launch_settings"):
-                load_settings = (primary_container or {}).get("load_settings") or {}
-                try:
-                    recovered_args = shlex.split(load_settings.get("command_flags") or "")
-                except ValueError:
-                    recovered_args = list(load_settings.get("extra_args") or [])
-                recovered_args = self._without_cli_options(
-                    recovered_args,
-                    {"--host", "--port", "--gpu-memory-utilization",
-                     "--gpu_memory_utilization"},
+                deployment["launch_settings"] = (
+                    self._recovered_deployment_launch_settings(
+                        saved, primary_container
+                    )
                 )
-                deployment["launch_settings"] = self._deployment_launch_settings({
-                    "deployment_name": saved.get("name"),
-                    "model": saved.get("model"),
-                    "engine": saved.get("engine", "vllm"),
-                    "image": (primary_container or {}).get("image"),
-                    "extra_args": recovered_args,
-                    "gpu_memory_utilization": load_settings.get("gpu_memory_utilization"),
-                    "deployment_mode": saved.get("mode", "single"),
-                    "node_ids": saved.get("node_ids") or [LOCAL_NODE_ID],
-                    "port": saved.get("api_port"),
-                })
             deployment["launch_controls"] = self._deployment_launch_controls(
+                deployment["launch_settings"]
+            )
+            deployment["pricing"] = self._deployment_pricing(
                 deployment["launch_settings"]
             )
             deployment["runtime_flags"] = runtime_flags
@@ -7336,13 +8011,21 @@ class Manager:
                 for model, model_stats in self.token_stats.items()
             },
             "usage_aliases": dict(self.usage_aliases),
+            "usage_merge_groups": dict(self.usage_merge_groups),
+            "usage_rows": self.usage_rows(),
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
+            "inference_admission": self.inference_admission(),
             "ollama": ollama,
             "unsloth": unsloth,
             "spark_launches": list(self.spark_launches),
             "spark_runs": self._public_spark_runs(),
-            "sparkrun_targets": sparkrun_targets,
+            # Preserve the public model -> port shape; internal discovery
+            # keeps richer load settings for admission control.
+            "sparkrun_targets": {
+                model: target.get("port")
+                for model, target in sparkrun_targets.items()
+            },
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {
                 "running_models": len(running_models),

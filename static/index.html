@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=60">
-<script src="/static/app.js?v=60"></script>
+<link rel="stylesheet" href="/static/styles.css?v=62">
+<script src="/static/app.js?v=62"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -131,7 +131,7 @@
           <span class="stat-value" x-show="tokenModel"><span class="tok-dir" style="color:var(--accent-green)">Cost</span><span x-text="tokenCostDisplay(tokenModel)"></span></span>
           <span class="stat-value" x-show="!tokenModel">—</span>
           <span class="stat-value live-reqs" x-show="liveReqs(tokenModel)"
-                x-text="'● ' + liveReqs(tokenModel)?.connections + ' conn · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
+                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
           <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
       </div>
@@ -667,6 +667,21 @@
                 <input type="number" min="1" step="1" x-model.number="deploymentSettingsFor(d).max_num_batched_tokens"
                        :disabled="d.status !== 'stopped'" placeholder="engine default">
               </label>
+              <label>
+                <span>Input cache miss / 1M ($)</span>
+                <input type="number" min="0" step="0.01" x-model.number="deploymentSettingsFor(d).input_cost_per_1m"
+                       placeholder="built-in / unset">
+              </label>
+              <label>
+                <span>Input cache hit / 1M ($)</span>
+                <input type="number" min="0" step="0.01" x-model.number="deploymentSettingsFor(d).cache_cost_per_1m"
+                       placeholder="built-in / unset">
+              </label>
+              <label>
+                <span>Output / 1M ($)</span>
+                <input type="number" min="0" step="0.01" x-model.number="deploymentSettingsFor(d).output_cost_per_1m"
+                       placeholder="built-in / unset">
+              </label>
               <label x-show="deploymentSettingsFor(d).engine === 'sglang'">
                 <span>TP size</span>
                 <input type="number" min="1" x-model.number="deploymentSettingsFor(d).sg_tp_size" :disabled="d.status !== 'stopped'">
@@ -684,6 +699,13 @@
                 <textarea rows="8" class="mono" x-model="deploymentSettingsFor(d).extra"
                           :disabled="d.status !== 'stopped'" placeholder="--max-model-len 65536 --tensor-parallel-size 2 --pipeline-parallel-size 1"></textarea>
               </label>
+            </div>
+            <div class="actions deployment-pricing-actions">
+              <button class="btn btn-primary" @click="saveDeploymentPricing(d)"
+                      :disabled="deploymentPricingSaving[d.id] === true || !deploymentPricingChanged(d)"
+                      x-text="deploymentPricingSaving[d.id] === true ? 'Saving…' : 'Save pricing'"></button>
+              <span class="muted">Pricing is accounting-only and can be changed while the cluster is running.</span>
+              <span class="muted" x-show="deploymentPricingSaved[d.id]">Pricing saved.</span>
             </div>
             <div class="deployment-settings-nodes">
               <span class="field-heading">Launch nodes</span>
@@ -1577,6 +1599,7 @@ for chunk in stream:
         <tr><td colspan="3" style="opacity:0.7; padding-top:12px"><strong>Controller management</strong></td></tr>
         <tr><td>GET</td>    <td><code>/api/state</code></td>             <td>Aggregate state: containers, ollama, settings, stats</td></tr>
         <tr><td>GET</td>    <td><code>/api/stats</code></td>             <td>Host telemetry (CPU/GPU/RAM/temps/power/network)</td></tr>
+        <tr><td>GET</td>    <td><code>/api/inference-queue</code></td>   <td>Running and controller-queued vLLM requests by deployment</td></tr>
         <tr><td>GET/POST</td><td><code>/api/settings</code></td>         <td>Read/update controller settings</td></tr>
         <tr><td>GET/POST/PUT/DELETE</td><td><code>/api/containers[/...]</code></td><td>List/create/start/stop/remove vLLM containers, edit load settings, fetch logs</td></tr>
         <tr><td>POST</td>   <td><code>/api/images/pull</code></td>       <td>Pull a docker image (SSE progress stream)</td></tr>
@@ -1756,6 +1779,7 @@ for chunk in stream:
   <!-- Model usage breakdown -->
   <div class="card" x-show="state">
     <h3>Model usage</h3>
+    <p class="card-desc">Aliases rename a row. Assign the same merge group to multiple model IDs to combine their token totals, cost, and rolling aggregate throughput without changing the raw counters.</p>
     <div x-show="Object.keys(state?.token_stats || {}).length === 0" class="empty">
       No token usage recorded yet.
     </div>
@@ -1768,34 +1792,48 @@ for chunk in stream:
             <th style="text-align:right" :aria-sort="usageSortAria('cached')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cached')">Cached <span x-text="usageSortIndicator('cached')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('output')"><button class="usage-sort usage-sort-right" @click="setUsageSort('output')">Output tokens <span x-text="usageSortIndicator('output')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('requests')"><button class="usage-sort usage-sort-right" @click="setUsageSort('requests')">Requests <span x-text="usageSortIndicator('requests')"></span></button></th>
-            <th style="text-align:right" :aria-sort="usageSortAria('speed')"><button class="usage-sort usage-sort-right" @click="setUsageSort('speed')">Avg speed <span x-text="usageSortIndicator('speed')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('speed')"><button class="usage-sort usage-sort-right" @click="setUsageSort('speed')">Avg speed (last 1M output) <span x-text="usageSortIndicator('speed')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('time')"><button class="usage-sort usage-sort-right" @click="setUsageSort('time')">Decode time <span x-text="usageSortIndicator('time')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('cost')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cost')">Cost <span x-text="usageSortIndicator('cost')"></span></button></th>
           </tr>
         </thead>
         <tbody>
-          <template x-for="row in usageRows()" :key="row.model">
+          <template x-for="row in usageRows()" :key="row.key">
             <tr>
               <td class="usage-model-cell">
                 <div class="usage-model-title">
-                  <strong class="mono" x-text="row.alias || row.model"></strong>
-                  <button class="usage-alias-button" @click="startUsageAliasEdit(row.model)" :title="row.alias ? 'Rename usage alias' : 'Add usage alias'" aria-label="Rename usage alias">✎</button>
-                  <span class="muted usage-alias-saved" x-show="usageAliasSaved[row.model]">Saved</span>
+                  <strong class="mono" x-text="row.label"></strong>
+                  <span class="status-pill pill-recipe" x-show="row.merge_group" x-text="`${row.models.length} merged`"></span>
+                  <button class="usage-alias-button" x-show="!row.merge_group"
+                          @click="startUsageAliasEdit(row.members[0].model)" title="Edit usage alias and merge group" aria-label="Edit usage model">✎</button>
+                  <span class="muted usage-alias-saved" x-show="!row.merge_group && usageAliasSaved[row.members[0].model]">Saved</span>
                 </div>
-                <div class="muted mono usage-model-id" x-show="row.alias" x-text="row.model"></div>
-                <form class="usage-alias-editor" x-show="usageAliasEditing[row.model]" @submit.prevent="saveUsageAlias(row.model)">
-                  <input type="text" maxlength="120" x-model="usageAliasValue[row.model]" placeholder="Usage alias">
-                  <button class="btn btn-primary" type="submit" :disabled="usageAliasSaving[row.model]" x-text="usageAliasSaving[row.model] ? 'Saving…' : 'Save'"></button>
-                  <button class="btn btn-ghost" type="button" @click="cancelUsageAliasEdit(row.model)">Cancel</button>
-                </form>
+                <template x-for="member in row.members" :key="member.model">
+                  <div class="usage-model-member">
+                    <div class="muted mono usage-model-id" x-show="row.merge_group || member.alias">
+                      <span x-text="member.alias ? `${member.alias} · ${member.model}` : member.model"></span>
+                      <button class="usage-alias-button" x-show="row.merge_group"
+                              @click="startUsageAliasEdit(member.model)" title="Edit usage alias and merge group" aria-label="Edit usage model">✎</button>
+                      <span class="usage-alias-saved" x-show="usageAliasSaved[member.model]">Saved</span>
+                    </div>
+                    <form class="usage-alias-editor" x-show="usageAliasEditing[member.model]" @submit.prevent="saveUsageAlias(member.model)">
+                      <label><span>Display alias</span><input type="text" maxlength="120" x-model="usageAliasValue[member.model]" placeholder="Optional alias"></label>
+                      <label><span>Merge group</span><input type="text" maxlength="120" list="usage-merge-groups" x-model="usageMergeValue[member.model]" placeholder="Optional group"></label>
+                      <button class="btn btn-primary" type="submit"
+                              :disabled="usageAliasSaving[member.model] === true"
+                              x-text="usageAliasSaving[member.model] === true ? 'Saving…' : 'Save'"></button>
+                      <button class="btn btn-ghost" type="button" @click="cancelUsageAliasEdit(member.model)">Cancel</button>
+                    </form>
+                  </div>
+                </template>
               </td>
               <td style="text-align:right" x-text="fmtTokens(row.stats.input)"></td>
               <td style="text-align:right" x-text="row.stats.cached ? fmtTokens(row.stats.cached) : '—'"></td>
               <td style="text-align:right" x-text="fmtTokens(row.stats.output)"></td>
               <td style="text-align:right" x-text="row.stats.requests ?? 0"></td>
-              <td style="text-align:right" x-text="usageAverageSpeed(row.stats) != null ? usageAverageSpeed(row.stats).toFixed(1) + ' tok/s' : '—'"></td>
-              <td style="text-align:right" x-text="row.stats.gen_time_s ? row.stats.gen_time_s.toFixed(1) + ' s' : '—'"></td>
-              <td style="text-align:right" x-text="usageCostDisplay(row.model)"></td>
+              <td style="text-align:right" :title="row.speed?.legacy ? 'Legacy lifetime average until a new speed sample is recorded' : `Rolling ${fmtTokens(row.speed?.tokens || 0)} generated tokens; concurrent decode intervals are aggregated`" x-text="usageAverageSpeed(row) != null ? usageAverageSpeed(row).toFixed(1) + ' tok/s' : '—'"></td>
+              <td style="text-align:right" x-text="fmtDuration(row.stats.gen_time_s)"></td>
+              <td style="text-align:right" x-text="usageCostDisplay(row)"></td>
             </tr>
           </template>
           <tr class="usage-total">
@@ -1810,6 +1848,11 @@ for chunk in stream:
           </tr>
         </tbody>
       </table>
+      <datalist id="usage-merge-groups">
+        <template x-for="group in usageMergeGroups()" :key="group">
+          <option :value="group"></option>
+        </template>
+      </datalist>
     </div>
   </div>
 

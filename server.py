@@ -135,6 +135,12 @@ async def get_stats():
     return await manager.get_stats()
 
 
+@app.get("/api/inference-queue")
+async def get_inference_queue():
+    """Controller-side vLLM admission state, keyed by deployment/container."""
+    return manager.inference_admission()
+
+
 @app.get("/api/temperature-history")
 async def get_temperature_history(node_id: str = LOCAL_NODE_ID):
     try:
@@ -328,6 +334,16 @@ async def update_deployment_alias(deployment_id: str, req: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.put("/api/deployments/{deployment_id}/pricing")
+async def update_deployment_pricing(deployment_id: str, req: Request):
+    try:
+        return await manager.update_deployment_pricing(
+            deployment_id, await req.json()
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/deployments/{deployment_id}/logs")
 async def deployment_logs(deployment_id: str):
     try:
@@ -406,7 +422,12 @@ async def reset_session_token_stats():
 async def update_usage_alias(req: Request):
     try:
         body = await req.json()
-        return manager.update_usage_alias(body.get("model"), body.get("alias"))
+        return manager.update_usage_alias(
+            body.get("model"),
+            body.get("alias"),
+            merge_group=body.get("merge_group"),
+            update_merge_group="merge_group" in body,
+        )
     except ValueError as exc:
         status = 404 if str(exc) == "usage model not found" else 400
         raise HTTPException(status, str(exc)) from exc

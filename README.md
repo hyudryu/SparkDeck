@@ -67,6 +67,13 @@ counters. Average speed is calculated over the newest 1 million output tokens
 and unions overlapping decode intervals, so concurrent streams report
 their aggregate throughput rather than a per-stream average.
 
+Enable **Sync token usage** in Settings on the coordinator and each
+participating node to replicate lifetime and hourly per-model counters every
+five seconds. The coordinator pulls each node's independently versioned
+component and pushes the union back to all participating peers, so every node
+shows the same cluster aggregate without counting a replicated snapshot more
+than once. The sync endpoints use the existing paired-node authentication.
+
 Agent credentials and paired-node tokens are stored in `data/agent.json` and
 `data/nodes.json` with mode `0600`. Do not expose either controller to the
 public internet; use a trusted LAN, Tailscale, or WireGuard management network.
@@ -207,6 +214,22 @@ client disconnect removes its queued request. Inspect live admission state with
 `GET /api/inference-queue` or the `inference_admission` field in
 `GET /api/state`. Direct container-port calls bypass this controller queue.
 
+The controller also includes an optional adaptive vLLM stream nudger, disabled
+by default. When enabled and two or more
+forwarded streams remain below 5 aggregate tokens/second for three seconds, it
+temporarily lowers that deployment's effective admission limit to one. Newer
+streams that have emitted no SSE data are closed upstream, kept connected at
+the controller, and transparently replayed through the FIFO queue. A stream
+that has emitted any data is never replayed, because doing so could duplicate
+or change its output; the nudger only prevents additional concurrent work in
+that case. After one stall interval at a limit of one, the controller restores
+one slot per interval until it reaches the configured limit. Throughput remains
+monitored during recovery; another sustained low-rate interval returns the
+effective limit to one. The enable flag, rate threshold, and stall interval are
+controller settings:
+`vllm_nudger_enabled`, `vllm_nudger_rate_threshold`, and
+`vllm_nudger_stall_seconds`.
+
 ### ② Through the controller (queued, auto-start, retries)
 
 Submits to the controller's queue. If the model isn't running the controller will start it (subject to `max_concurrent_models`), retry on failure (up to `max_retries`), and refresh the idle clock. Returns a job id immediately — poll for the result.
@@ -301,8 +324,18 @@ Persisted in `data/settings.json`. All fields are editable from the Settings tab
 | `default_gpu_memory_utilization` | `0.9` | Pre-fills the launch form |
 | `port_range_start` / `port_range_end` | `8000` / `8099` | Auto-allocated host ports |
 | `cluster_node_name` | Hostname | Name displayed on the Cluster tab |
+| `vllm_auto_adjust_concurrency` | `true` | Floor vLLM's startup full-context KV concurrency and redeploy all ranks when `--max-num-seqs` is higher |
+| `sync_token_usage` | `false` | Idempotently aggregate lifetime/hourly usage across participating paired nodes |
 | `cluster_fabric_ip` | Auto-detect | ConnectX/data-plane address for distributed inference |
 | `cluster_fabric_interface` | Auto-detect | Interface used for NCCL and Gloo collectives |
+
+For each active vLLM deployment, the controller watches startup logs for
+`GPU KV cache size` and `Maximum concurrency for … tokens per request`. When
+the reported context length matches `--max-model-len` and the floored maximum
+is below `--max-num-seqs`, it saves the lower limit, stops every rank, and
+recreates the deployment with one coherent configuration. The observed KV
+capacity, per-rank reports, and adjustment are retained on the deployment for
+diagnostics. Disable **Auto-fit vLLM concurrency** to opt out.
 
 ## Stack
 

@@ -52,6 +52,26 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in result["data"]], [SERVED_MODEL])
 
+    async def test_cluster_models_endpoint_also_advertises_backing_model(self) -> None:
+        manager = Manager.__new__(Manager)
+        container = {
+            **self.container_summary(),
+            "deployment_id": "deployment-a",
+        }
+        manager.get_state = mock.AsyncMock(return_value={
+            "containers": [container],
+            "ollama": {"models": []},
+            "unsloth": {},
+            "sparkrun_targets": {},
+        })
+
+        result = await manager.proxy_models()
+
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            [SERVED_MODEL, BACKING_MODEL],
+        )
+
     async def test_backing_model_request_is_rewritten_for_vllm(self) -> None:
         manager = Manager.__new__(Manager)
         container = self.container_summary()

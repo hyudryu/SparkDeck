@@ -47,6 +47,38 @@ class StreamTokenRateTests(unittest.TestCase):
             rates = instance.active_requests()
 
         self.assertEqual(rates["model"]["output_tok_s"], 3.0)
+        self.assertEqual(rates["model"]["decoded_tokens"], 3)
+
+    def test_live_decoded_tokens_include_reasoning_and_visible_output(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+
+        with mock.patch.object(manager_module.time, "monotonic", return_value=100.0):
+            request_id = instance._track_start("model", streaming=True)
+            instance._track_output(request_id, 99.0, "thinking", count=5)
+            instance._track_output(request_id, 99.5, "output", count=2)
+            rates = instance.active_requests()
+
+        self.assertEqual(rates["model"]["decoded_tokens"], 7)
+
+    def test_paused_replay_stream_is_not_reported_as_running(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+
+        running = instance._track_start("model", streaming=True)
+        paused = instance._track_start("model", streaming=True)
+        instance._active_reqs[paused]["paused"] = True
+
+        rates = instance.active_requests()
+
+        self.assertEqual(rates["model"]["connections"], 1)
+        self.assertEqual(rates["model"]["decoded_tokens"], 0)
+        self.assertIn(running, instance._active_reqs)
+        self.assertIn(paused, instance._active_reqs)
 
 
 if __name__ == "__main__":

@@ -190,6 +190,24 @@ async def agent_temperature_history(req: Request):
     return manager.temperature_history()
 
 
+@app.get("/api/agent/token-usage")
+async def agent_token_usage(req: Request):
+    _require_agent(req)
+    return manager.token_usage_sync_snapshot()
+
+
+@app.post("/api/agent/token-usage")
+async def agent_merge_token_usage(req: Request):
+    _require_agent(req)
+    if not manager.settings.get("sync_token_usage"):
+        return {"enabled": False, "changed": False}
+    try:
+        changed = manager.merge_token_usage_sync(await req.json())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"enabled": True, "changed": changed}
+
+
 @app.get("/api/agent/llama-rpc")
 async def agent_llama_rpc_status(req: Request):
     _require_agent(req)
@@ -264,10 +282,14 @@ async def agent_remove_container(name: str, req: Request):
 
 
 @app.get("/api/agent/containers/{name}/logs")
-async def agent_container_logs(name: str, req: Request):
+async def agent_container_logs(name: str, req: Request, tail: int = 300):
     _require_agent(req)
     try:
-        return {"logs": await manager.get_cluster_member_logs(name, 300)}
+        return {
+            "logs": await manager.get_cluster_member_logs(
+                name, max(1, min(tail, 100_000))
+            )
+        }
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 

@@ -434,6 +434,22 @@ class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _usage_sync_manager(
+        root: Path, node_id: str, token_stats: dict, hourly: dict,
+    ) -> Manager:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"sync_token_usage": True}
+        instance.agent_credentials = mock.Mock(node_id=node_id)
+        instance.token_stats = json.loads(json.dumps(token_stats))
+        instance.hourly_token_stats = json.loads(json.dumps(hourly))
+        instance.token_stats_path = root / f"{node_id}-tokens.json"
+        instance.hourly_token_stats_path = root / f"{node_id}-hourly.json"
+        instance.token_usage_sync_path = root / f"{node_id}-sync.json"
+        instance.token_usage_sync = instance._load_token_usage_sync()
+        instance._rebuild_synced_token_usage()
+        return instance
+
     def test_distributed_network_environment_matches_selected_rdma_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -574,6 +590,85 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(
                 "model/a", json.loads(instance.token_stats_path.read_text())
             )
+
+    def test_token_usage_sync_fans_out_three_node_totals_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node1 = self._usage_sync_manager(
+                root, "node-1",
+                {"model/a": {"input": 10, "output": 2, "requests": 1}},
+                {"2026-08-15T07": {"model/a": {"input": 10, "output": 2,
+                                                  "requests": 1}}},
+            )
+            node2 = self._usage_sync_manager(
+                root, "node-2",
+                {"model/b": {"input": 20, "output": 4, "requests": 1}},
+                {"2026-08-15T07": {"model/b": {"input": 20, "output": 4,
+                                                  "requests": 1}}},
+            )
+            node3 = self._usage_sync_manager(
+                root, "node-3",
+                {"model/a": {"input": 5, "output": 3, "requests": 1},
+                 "model/c": {"input": 30, "output": 6, "requests": 1}},
+                {"2026-08-15T07": {
+                    "model/a": {"input": 5, "output": 3, "requests": 1},
+                    "model/c": {"input": 30, "output": 6, "requests": 1},
+                }},
+            )
+
+            # Node 1 acts as the paired coordinator: pull both peers, then
+            # push the union back to them.
+            self.assertTrue(node1.merge_token_usage_sync(
+                node2.token_usage_sync_snapshot()
+            ))
+            self.assertTrue(node1.merge_token_usage_sync(
+                node3.token_usage_sync_snapshot()
+            ))
+            union = node1.token_usage_sync_snapshot()
+            self.assertTrue(node2.merge_token_usage_sync(union))
+            self.assertTrue(node3.merge_token_usage_sync(union))
+
+            for node in (node1, node2, node3):
+                self.assertEqual(node.token_stats["model/a"]["input"], 15)
+                self.assertEqual(node.token_stats["model/a"]["output"], 5)
+                self.assertEqual(node.token_stats["model/b"]["input"], 20)
+                self.assertEqual(node.token_stats["model/c"]["input"], 30)
+                self.assertEqual(
+                    node.hourly_token_stats["2026-08-15T07"]["model/a"]["input"],
+                    15,
+                )
+
+            # Replaying the same full-mesh snapshots must not add them again.
+            before = json.loads(json.dumps(node1.token_stats))
+            self.assertFalse(node1.merge_token_usage_sync(union))
+            self.assertEqual(node1.token_stats, before)
+
+    def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node1 = self._usage_sync_manager(
+                root, "node-1", {"model/a": {"input": 10}},
+                {"2026-08-15T07": {"model/a": {"input": 10}}},
+            )
+            node2 = self._usage_sync_manager(
+                root, "node-2", {"model/b": {"input": 20}},
+                {"2026-08-15T07": {"model/b": {"input": 20}}},
+            )
+            stale = node2.token_usage_sync_snapshot()
+            node1.merge_token_usage_sync(stale)
+            node1._reset_synced_token_usage()
+            node1._rebuild_synced_token_usage()
+
+            self.assertEqual(node1.token_stats, {})
+            self.assertFalse(node1.merge_token_usage_sync(stale))
+            self.assertEqual(node1.token_stats, {})
+            self.assertTrue(node2.merge_token_usage_sync(
+                node1.token_usage_sync_snapshot()
+            ))
+            self.assertEqual(node2.token_stats, {})
+            # Lifetime reset preserves historical hourly analysis counters.
+            self.assertIn("model/a", node2.hourly_token_stats["2026-08-15T07"])
+            self.assertIn("model/b", node2.hourly_token_stats["2026-08-15T07"])
 
     def test_usage_merge_group_combines_counters_cost_and_concurrent_speed(self) -> None:
         instance = Manager.__new__(Manager)
@@ -1145,6 +1240,282 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             instance._cli_option(updated, {"--image-specific-flag"}), "kept"
         )
+
+    def test_vllm_capacity_log_parser_extracts_safe_full_context_limit(self) -> None:
+        reports = Manager._parse_vllm_capacity_log("""
+            GPU KV cache size: 2,288,000 tokens
+            Maximum concurrency for 400,000 tokens per request: 5.72x
+        """)
+
+        self.assertEqual(reports, [{
+            "context_tokens": 400_000,
+            "maximum_concurrency": 5.72,
+            "safe_concurrency": 5,
+            "gpu_kv_cache_tokens": 2_288_000,
+        }])
+
+    async def test_capacity_tick_records_safe_configuration_without_redeploy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings = {"vllm_auto_adjust_concurrency": True}
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-1",
+                "model": "example/Model",
+                "engine": "vllm",
+                "status": "starting",
+                "members": [{"rank": 0}],
+                "launch_settings": {
+                    "engine": "vllm",
+                    "extra_args": [
+                        "--max-model-len", "400000", "--max-num-seqs", "5",
+                    ],
+                },
+            }
+            instance.deployments = [deployment]
+            instance._deployment_capacity_reports = mock.AsyncMock(return_value=[
+                {"rank": 0, "context_tokens": 400_000,
+                 "maximum_concurrency": 5.72, "safe_concurrency": 5,
+                 "gpu_kv_cache_tokens": 2_288_000},
+            ])
+            instance._auto_reduce_vllm_concurrency = mock.AsyncMock()
+
+            await instance._deployment_capacity_tick()
+
+            instance._auto_reduce_vllm_concurrency.assert_not_awaited()
+            self.assertEqual(deployment["kv_capacity"]["status"], "within_limit")
+            self.assertEqual(
+                deployment["kv_capacity"]["reports"][0]["gpu_kv_cache_tokens"],
+                2_288_000,
+            )
+
+    async def test_capacity_tick_ignores_report_for_another_context_length(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"vllm_auto_adjust_concurrency": True}
+        deployment = {
+            "id": "deployment-1",
+            "engine": "vllm",
+            "status": "starting",
+            "members": [{"rank": 0}],
+            "launch_settings": {
+                "engine": "vllm",
+                "extra_args": [
+                    "--max-model-len", "400000", "--max-num-seqs", "6",
+                ],
+            },
+        }
+        instance.deployments = [deployment]
+        instance._deployment_capacity_reports = mock.AsyncMock(return_value=[
+            {"rank": 0, "context_tokens": 131_072,
+             "maximum_concurrency": 2.5, "safe_concurrency": 2,
+             "gpu_kv_cache_tokens": 327_680},
+        ])
+        instance._auto_reduce_vllm_concurrency = mock.AsyncMock()
+
+        await instance._deployment_capacity_tick()
+
+        instance._auto_reduce_vllm_concurrency.assert_not_awaited()
+        self.assertNotIn("kv_capacity", deployment)
+
+    async def test_capacity_tick_uses_lowest_rank_and_requests_redeploy(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"vllm_auto_adjust_concurrency": True}
+        deployment = {
+            "id": "deployment-1",
+            "engine": "vllm",
+            "status": "starting",
+            "members": [{"rank": 0}, {"rank": 1}],
+            "launch_settings": {
+                "engine": "vllm",
+                "extra_args": [
+                    "--max-model-len", "400000", "--max-num-seqs", "6",
+                ],
+            },
+        }
+        instance.deployments = [deployment]
+        instance._deployment_capacity_reports = mock.AsyncMock(return_value=[
+            {"rank": 0, "context_tokens": 400_000,
+             "maximum_concurrency": 5.72, "safe_concurrency": 5},
+            {"rank": 1, "context_tokens": 400_000,
+             "maximum_concurrency": 4.98, "safe_concurrency": 4},
+        ])
+        instance._auto_reduce_vllm_concurrency = mock.AsyncMock()
+
+        await instance._deployment_capacity_tick()
+
+        args = instance._auto_reduce_vllm_concurrency.await_args.args
+        self.assertEqual(args[0], "deployment-1")
+        self.assertEqual(args[1], 4)
+        self.assertEqual(args[2]["maximum_concurrency"], 4.98)
+
+    async def test_capacity_reports_deep_scans_old_deployment_only_once(self) -> None:
+        instance = Manager.__new__(Manager)
+        deployment = {
+            "id": "deployment-1",
+            "members": [{"rank": 0, "node_id": "local"}],
+        }
+        calls = []
+
+        async def member_action(member, action, **kwargs):
+            tail = kwargs["log_tail"]
+            calls.append(tail)
+            if tail == 100_000:
+                return {"logs": """
+                    GPU KV cache size: 1,229,206 tokens
+                    Maximum concurrency for 420,000 tokens per request: 2.93x
+                """}
+            return {"logs": "recent runtime output"}
+
+        instance._member_action = member_action
+
+        first = await instance._deployment_capacity_reports(deployment)
+        second = await instance._deployment_capacity_reports(deployment)
+
+        self.assertEqual(calls, [3000, 100_000, 3000])
+        self.assertEqual(first[0]["safe_concurrency"], 2)
+        self.assertEqual(first[0]["gpu_kv_cache_tokens"], 1_229_206)
+        self.assertEqual(second, [])
+
+    async def test_capacity_redeploy_guard_delays_model_resolution(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._capacity_redeploying_models = {"served-model"}
+        container = {
+            "name": "rank-0",
+            "model": "example/Model",
+            "served_models": ["served-model"],
+            "status": "running",
+        }
+        instance.list_containers = mock.AsyncMock(return_value=[container])
+        instance._check_ready = mock.AsyncMock(return_value=True)
+        instance._mark_active = mock.Mock()
+        instance._sparkrun_targets = mock.AsyncMock(return_value={})
+
+        resolving = asyncio.create_task(
+            instance._resolve_vllm_target("served-model")
+        )
+        await asyncio.sleep(0.01)
+
+        self.assertFalse(resolving.done())
+        instance.list_containers.assert_not_awaited()
+        instance._capacity_redeploying_models.clear()
+        resolved = await asyncio.wait_for(resolving, timeout=1)
+
+        self.assertIs(resolved, container)
+        instance.list_containers.assert_awaited_once()
+
+    async def test_capacity_redeploy_stops_all_ranks_and_saves_lower_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._deployment_action_lock = asyncio.Lock()
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-1",
+                "model": "example/Model",
+                "engine": "vllm",
+                "status": "starting",
+                "settings_dirty": False,
+                "members": [
+                    {"rank": 0, "node_id": "local", "container_name": "rank-0"},
+                    {"rank": 1, "node_id": "remote", "container_name": "rank-1"},
+                ],
+                "launch_settings": {
+                    "engine": "vllm",
+                    "extra_args": [
+                        "--max-model-len", "400000", "--max-num-seqs", "6",
+                    ],
+                },
+            }
+            instance.deployments = [deployment]
+            actions = []
+
+            async def member_action(member, action, **kwargs):
+                self.assertIn(
+                    "example/Model", instance._capacity_redeploying_models
+                )
+                self.assertIn(
+                    "served-model", instance._capacity_redeploying_models
+                )
+                actions.append((action, member["rank"]))
+                return {"ok": True}
+
+            replacement = {"id": "deployment-2"}
+            instance._member_action = member_action
+            instance.list_containers = mock.AsyncMock(return_value=[{
+                "name": "rank-0",
+                "model": "example/Model",
+                "served_models": ["served-model"],
+            }])
+            instance._deployment_action_locked = mock.AsyncMock(return_value={
+                "ok": True, "deployment": replacement,
+            })
+            observation = {
+                "maximum_concurrency": 4.98,
+                "safe_concurrency": 4,
+            }
+
+            await instance._auto_reduce_vllm_concurrency(
+                "deployment-1", 4, observation,
+            )
+
+            controls = instance._deployment_launch_controls(
+                deployment["launch_settings"]
+            )
+            self.assertEqual(controls["max_concurrency"], 4)
+            self.assertEqual(actions, [("stop", 0), ("stop", 1)])
+            instance._deployment_action_locked.assert_awaited_once_with(
+                "deployment-1", "start"
+            )
+            self.assertEqual(
+                replacement["auto_concurrency_adjustment"]["from"], 6
+            )
+            self.assertEqual(
+                replacement["auto_concurrency_adjustment"]["to"], 4
+            )
+            self.assertEqual(
+                replacement["kv_capacity"]["status"], "awaiting_recheck"
+            )
+            self.assertEqual(instance._capacity_redeploying_models, set())
+
+    async def test_capacity_redeploy_does_not_restart_after_partial_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._deployment_action_lock = asyncio.Lock()
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-1",
+                "engine": "vllm",
+                "status": "starting",
+                "members": [
+                    {"rank": 0, "node_id": "local", "container_name": "rank-0"},
+                    {"rank": 1, "node_id": "remote", "container_name": "rank-1"},
+                ],
+                "launch_settings": {
+                    "engine": "vllm",
+                    "extra_args": [
+                        "--max-model-len", "400000", "--max-num-seqs", "6",
+                    ],
+                },
+            }
+            instance.deployments = [deployment]
+
+            async def member_action(member, action, **kwargs):
+                if member["rank"] == 1:
+                    raise RuntimeError("node unavailable")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            instance._deployment_action_locked = mock.AsyncMock()
+
+            await instance._auto_reduce_vllm_concurrency(
+                "deployment-1", 4, {
+                    "maximum_concurrency": 4.98,
+                    "safe_concurrency": 4,
+                },
+            )
+
+            instance._deployment_action_locked.assert_not_awaited()
+            self.assertEqual(deployment["status"], "error")
+            self.assertIn("no rank was restarted", deployment["error"])
 
     def test_running_deployment_settings_cannot_be_changed(self) -> None:
         instance = Manager.__new__(Manager)

@@ -5,6 +5,7 @@ import asyncio
 import codecs
 import copy
 import json
+import logging
 import math
 import os
 import re
@@ -44,6 +45,18 @@ DEFAULT_SETTINGS = {
     "port_range_end": 8099,
     "shm_size": "16g",
     "default_gpu_memory_utilization": 0.9,
+    # If concurrent vLLM streams stop making progress, temporarily serialize
+    # the deployment. Streams that have not emitted anything can be aborted
+    # upstream and transparently replayed from the controller queue.
+    "vllm_nudger_enabled": False,
+    "vllm_nudger_rate_threshold": 5.0,
+    "vllm_nudger_stall_seconds": 3.0,
+    # Trust vLLM's startup KV-capacity report and lower --max-num-seqs with a
+    # coordinated redeploy when the configured full-context concurrency is unsafe.
+    "vllm_auto_adjust_concurrency": True,
+    # Exchange per-node lifetime/hourly token counters with paired nodes.
+    # Per-origin revisions make repeated pull/push cycles idempotent.
+    "sync_token_usage": False,
     # Cluster management uses the normal LAN/Tailscale address while model
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
@@ -70,6 +83,8 @@ DEFAULT_SETTINGS = {
     },
 }
 
+logger = logging.getLogger(__name__)
+
 # The official SGLang image exposes ``python3`` rather than a ``python``
 # executable. Keep this separate from the vLLM setting because SGLang recipes
 # should not fall back to the configured vLLM image.
@@ -94,6 +109,20 @@ CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
 # counter baseline exists, any single-rank increment is detected immediately.
 CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
+
+# vLLM prints its allocated KV capacity after engine initialization. Poll only
+# deployments that have not produced a usable capacity report yet; once found,
+# the result is persisted with the deployment.
+VLLM_CAPACITY_SCAN_INTERVAL_SECONDS = 5.0
+VLLM_GPU_KV_CACHE_RE = re.compile(
+    r"GPU KV cache size:\s*([\d,]+)\s+tokens",
+    re.IGNORECASE,
+)
+VLLM_MAX_CONCURRENCY_RE = re.compile(
+    r"Maximum concurrency for\s+([\d,]+)\s+tokens per request:\s*"
+    r"([0-9]+(?:\.[0-9]+)?)x",
+    re.IGNORECASE,
+)
 
 # FanController consumes a short-lived cluster temperature override. Remote
 # node probes are cached for four seconds, so a two-second publisher interval
@@ -150,6 +179,10 @@ FAN_MODE_DEFAULTS = {
 class ClientAbort(Exception):
     """Raised when the downstream /v1 client disconnects mid-request, so the
     proxy can unwind without recording usage or returning a response."""
+
+
+class StreamNudge(Exception):
+    """Raised internally to close and replay a zero-output upstream stream."""
 
 
 class FanSettingsConflict(Exception):
@@ -292,12 +325,30 @@ class Manager:
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
+        self.deployment_capacity_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
         self.temperature_history_task: asyncio.Task | None = None
+        self.inference_nudger_task: asyncio.Task | None = None
+        self.token_usage_sync_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
+        # A controller restart can attach to an older deployment whose vLLM
+        # capacity line has already rolled beyond the normal short log tail.
+        # Permit one bounded deep-history lookup per deployment, then resume
+        # lightweight polling while new engines are still initializing.
+        self._capacity_deep_scan_attempted: set[str] = set()
+        self._capacity_redeploying_models: set[str] = set()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(self.data_dir, self.http)
+        self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
+        self.token_usage_sync = self._load_token_usage_sync()
+        self._token_usage_sync_status: dict[str, Any] = {
+            "enabled": bool(self.settings.get("sync_token_usage")),
+            "last_sync_at": None,
+            "peers": 0,
+            "error": None,
+        }
+        self._rebuild_synced_token_usage()
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
         self.container_aliases_path = self.data_dir / "container_aliases.json"
@@ -370,6 +421,7 @@ class Manager:
         #
         # target id -> {limit, running, model, waiters: deque[waiter]}
         self._inference_admission: dict[str, dict] = {}
+        self._nudger_slow_since: dict[str, float] = {}
         # Set while a launch is in flight (model, variant, started_at, log
         # path); surfaced in /api/state so the UI can show load progress.
         self._llama_launching: dict | None = None
@@ -395,9 +447,18 @@ class Manager:
         self.worker_task = asyncio.create_task(self._worker_loop())
         self.idle_task = asyncio.create_task(self._idle_monitor_loop())
         self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
+        self.deployment_capacity_task = asyncio.create_task(
+            self._deployment_capacity_monitor_loop()
+        )
         self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
         self.temperature_history_task = asyncio.create_task(
             self._temperature_history_monitor_loop()
+        )
+        self.inference_nudger_task = asyncio.create_task(
+            self._inference_nudger_loop()
+        )
+        self.token_usage_sync_task = asyncio.create_task(
+            self._token_usage_sync_loop()
         )
         self._start_mem_bw_monitor()
 
@@ -406,8 +467,11 @@ class Manager:
             self.worker_task,
             self.idle_task,
             self.cluster_health_task,
+            self.deployment_capacity_task,
             self.fan_cluster_task,
             self.temperature_history_task,
+            self.inference_nudger_task,
+            self.token_usage_sync_task,
         ):
             if t:
                 t.cancel()
@@ -662,6 +726,75 @@ class Manager:
             fabric_ip=body.get("fabric_ip"),
             fabric_interface=body.get("fabric_interface"),
         )
+
+    async def sync_token_usage_once(self) -> dict:
+        """Pull per-origin counters from peers, merge, then fan out the union."""
+        enabled = bool(self.settings.get("sync_token_usage"))
+        status = getattr(self, "_token_usage_sync_status", {})
+        status.update({"enabled": enabled, "error": None})
+        self._token_usage_sync_status = status
+        if not enabled:
+            status["peers"] = 0
+            return dict(status)
+
+        nodes = [
+            node for node in self.node_registry.nodes
+            if node.get("enabled", True)
+        ]
+        pulls = await asyncio.gather(*(
+            self.node_registry.request(
+                node["id"], "GET", "/api/agent/token-usage", timeout=5
+            )
+            for node in nodes
+        ), return_exceptions=True)
+        participating: list[dict] = []
+        errors: list[str] = []
+        for node, result in zip(nodes, pulls):
+            if isinstance(result, Exception):
+                errors.append(f"{node.get('name', node['id'])}: {result}")
+                continue
+            if not isinstance(result, dict) or not result.get("enabled"):
+                continue
+            try:
+                self.merge_token_usage_sync(result)
+                participating.append(node)
+            except (OSError, ValueError) as exc:
+                errors.append(f"{node.get('name', node['id'])}: {exc}")
+
+        snapshot = self.token_usage_sync_snapshot()
+        pushes = await asyncio.gather(*(
+            self.node_registry.request(
+                node["id"], "POST", "/api/agent/token-usage",
+                json_body=snapshot, timeout=5,
+            )
+            for node in participating
+        ), return_exceptions=True)
+        for node, result in zip(participating, pushes):
+            if isinstance(result, Exception):
+                errors.append(f"{node.get('name', node['id'])}: {result}")
+
+        status.update({
+            "last_sync_at": time.time(),
+            "peers": len(participating),
+            "error": "; ".join(errors) if errors else None,
+        })
+        return dict(status)
+
+    async def _token_usage_sync_loop(self) -> None:
+        while True:
+            try:
+                if self.settings.get("sync_token_usage"):
+                    await self.sync_token_usage_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("token usage synchronization failed")
+                self._token_usage_sync_status.update({
+                    "enabled": True,
+                    "last_sync_at": time.time(),
+                    "error": str(exc),
+                })
+            await asyncio.sleep(5.0)
 
     async def refresh_node(self, node_id: str) -> dict:
         node = self.node_registry.get(node_id)
@@ -1091,6 +1224,8 @@ class Manager:
             "settings_dirty": True,
             "error": None,
         })
+        deployment.pop("kv_capacity", None)
+        deployment.pop("auto_concurrency_adjustment", None)
         self._save_deployments()
         return deployment
 
@@ -1632,7 +1767,9 @@ class Manager:
             raise RuntimeError(deployment["error"])
         return deployment
 
-    async def _member_action(self, member: dict, action: str) -> Any:
+    async def _member_action(
+        self, member: dict, action: str, *, log_tail: int = 300,
+    ) -> Any:
         node_id = member["node_id"]
         name = member["container_name"]
         if node_id == LOCAL_NODE_ID:
@@ -1643,9 +1780,13 @@ class Manager:
             if action == "remove":
                 return await self.remove_cluster_member(name)
             if action == "logs":
-                return {"logs": await self.get_cluster_member_logs(name, 300)}
+                return {"logs": await self.get_cluster_member_logs(name, log_tail)}
         method = "GET" if action == "logs" else ("DELETE" if action == "remove" else "POST")
-        suffix = "/logs" if action == "logs" else ("" if action == "remove" else f"/{action}")
+        suffix = (
+            f"/logs?tail={max(1, min(int(log_tail), 100_000))}"
+            if action == "logs"
+            else ("" if action == "remove" else f"/{action}")
+        )
         return await self.node_registry.request(
             node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
         )
@@ -1941,6 +2082,290 @@ class Manager:
                 self._save_deployments()
             if issue:
                 await self._recover_cluster_deployment(deployment.get("id"), issue)
+
+    @staticmethod
+    def _parse_vllm_capacity_log(text: str) -> list[dict]:
+        """Extract vLLM's full-context KV concurrency reports from logs."""
+        reports = []
+        for match in VLLM_MAX_CONCURRENCY_RE.finditer(text or ""):
+            try:
+                context_tokens = int(match.group(1).replace(",", ""))
+                maximum = float(match.group(2))
+            except (TypeError, ValueError):
+                continue
+            if context_tokens > 0 and math.isfinite(maximum) and maximum >= 0:
+                cache_matches = list(
+                    VLLM_GPU_KV_CACHE_RE.finditer((text or "")[:match.start()])
+                )
+                gpu_kv_cache_tokens = None
+                if cache_matches:
+                    try:
+                        gpu_kv_cache_tokens = int(
+                            cache_matches[-1].group(1).replace(",", "")
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                reports.append({
+                    "context_tokens": context_tokens,
+                    "maximum_concurrency": maximum,
+                    "safe_concurrency": math.floor(maximum),
+                    "gpu_kv_cache_tokens": gpu_kv_cache_tokens,
+                })
+        return reports
+
+    async def _deployment_capacity_reports(
+        self, deployment: dict,
+    ) -> list[dict]:
+        members = list(deployment.get("members") or [])
+        values = await asyncio.gather(*(
+            self._member_action(member, "logs", log_tail=3000)
+            for member in members
+        ), return_exceptions=True)
+        parsed_by_member: list[list[dict]] = []
+        for value in values:
+            if isinstance(value, Exception) or not isinstance(value, dict):
+                parsed_by_member.append([])
+            else:
+                parsed_by_member.append(
+                    self._parse_vllm_capacity_log(value.get("logs") or "")
+                )
+
+        deployment_id = str(deployment.get("id") or "")
+        attempted = getattr(self, "_capacity_deep_scan_attempted", None)
+        if attempted is None:
+            attempted = self._capacity_deep_scan_attempted = set()
+        if deployment_id not in attempted and not all(parsed_by_member):
+            attempted.add(deployment_id)
+            missing = [
+                index for index, parsed in enumerate(parsed_by_member)
+                if not parsed
+            ]
+            deep_values = await asyncio.gather(*(
+                self._member_action(members[index], "logs", log_tail=100_000)
+                for index in missing
+            ), return_exceptions=True)
+            for index, value in zip(missing, deep_values):
+                if isinstance(value, Exception) or not isinstance(value, dict):
+                    continue
+                parsed_by_member[index] = self._parse_vllm_capacity_log(
+                    value.get("logs") or ""
+                )
+
+        reports = []
+        for member, parsed in zip(members, parsed_by_member):
+            # A restarted container can only have one current Docker log, but
+            # tolerate duplicate lines by keeping its most recent report.
+            if parsed:
+                reports.append({
+                    **parsed[-1],
+                    "rank": member.get("rank"),
+                    "node_id": member.get("node_id"),
+                    "node_name": member.get("node_name"),
+                })
+        return reports
+
+    async def _auto_reduce_vllm_concurrency(
+        self, deployment_id: str, safe_limit: int, observation: dict,
+    ) -> None:
+        """Persist a lower --max-num-seqs and rebuild every rank once."""
+        async with self._cluster_action_lock():
+            deployment = self._deployment(deployment_id)
+            if (
+                not deployment
+                or deployment.get("engine") != "vllm"
+                or deployment.get("status") in {"stopped", "error", "launching"}
+            ):
+                return
+            settings = copy.deepcopy(deployment.get("launch_settings") or {})
+            if not settings:
+                observation["status"] = "could_not_adjust"
+                observation["error"] = "deployment has no saved launch settings"
+                deployment["kv_capacity"] = observation
+                self._save_deployments()
+                return
+            controls = self._deployment_launch_controls(settings)
+            configured = controls.get("max_concurrency")
+            if configured is None or int(configured) <= safe_limit:
+                observation["status"] = "within_limit"
+                deployment["kv_capacity"] = observation
+                self._save_deployments()
+                return
+
+            previous_limit = int(configured)
+            controls["max_concurrency"] = safe_limit
+            settings["extra_args"] = self._apply_deployment_launch_controls(
+                list(settings.get("extra_args") or []), "vllm", controls
+            )
+            adjustment = {
+                "from": previous_limit,
+                "to": safe_limit,
+                "reason": "vLLM reported lower full-context KV capacity",
+                "started_at": time.time(),
+            }
+            observation.update({
+                "status": "redeploying",
+                "configured_concurrency": previous_limit,
+                "adjusted_concurrency": safe_limit,
+            })
+            deployment.update({
+                "launch_settings": settings,
+                "settings_dirty": True,
+                "status": "capacity_redeploying",
+                "kv_capacity": observation,
+                "auto_concurrency_adjustment": adjustment,
+                "error": None,
+            })
+            self._save_deployments()
+            print(
+                f"[vllm-capacity] {deployment_id}: reducing max concurrency "
+                f"from {previous_limit} to {safe_limit}; stopping every rank"
+            )
+
+            members = list(deployment.get("members") or [])
+            member_names = {
+                member.get("container_name") for member in members
+                if member.get("container_name")
+            }
+            protected_models = {str(deployment.get("model") or "")}
+            try:
+                containers = await self.list_containers()
+                for container in containers:
+                    if container.get("name") in member_names:
+                        protected_models.update(self._container_model_ids(container))
+            except Exception:
+                # The deployment's backing model still protects normal calls;
+                # aliases are best-effort if Docker inspection is unavailable.
+                pass
+            protected_models.discard("")
+            guard = getattr(self, "_capacity_redeploying_models", None)
+            if guard is None:
+                guard = self._capacity_redeploying_models = set()
+            guard.update(protected_models)
+            try:
+                stopped = await asyncio.gather(*(
+                    self._member_action(member, "stop") for member in members
+                ), return_exceptions=True)
+                stop_errors = [
+                    f"rank {member.get('rank')}: {result}"
+                    for member, result in zip(members, stopped)
+                    if isinstance(result, Exception)
+                ]
+                if stop_errors:
+                    observation["status"] = "redeploy_failed"
+                    observation["error"] = "could not stop every rank"
+                    deployment["status"] = "error"
+                    deployment["error"] = (
+                        "Automatic KV-capacity adjustment could not stop every rank; "
+                        "no rank was restarted: " + "; ".join(stop_errors)
+                    )
+                    self._save_deployments()
+                    return
+
+                deployment["status"] = "stopped"
+                self._save_deployments()
+                result = await self._deployment_action_locked(deployment_id, "start")
+                replacement = (
+                    result.get("deployment") if isinstance(result, dict) else None
+                )
+                if (
+                    not isinstance(result, dict)
+                    or not result.get("ok")
+                    or not isinstance(replacement, dict)
+                ):
+                    observation["status"] = "redeploy_failed"
+                    deployment["kv_capacity"] = observation
+                    self._save_deployments()
+                    return
+
+                adjustment["completed_at"] = time.time()
+                replacement["auto_concurrency_adjustment"] = adjustment
+                replacement["kv_capacity"] = {
+                    **observation,
+                    "status": "awaiting_recheck",
+                    "configured_concurrency": safe_limit,
+                }
+                self._save_deployments()
+                print(
+                    f"[vllm-capacity] {replacement.get('id')}: redeployed with "
+                    f"max concurrency {safe_limit}"
+                )
+            finally:
+                guard.difference_update(protected_models)
+
+    async def _deployment_capacity_tick(self) -> None:
+        if not self.settings.get("vllm_auto_adjust_concurrency", True):
+            return
+        candidates = [
+            deployment for deployment in list(self.deployments)
+            if deployment.get("engine") == "vllm"
+            and deployment.get("members")
+            and deployment.get("status") not in {
+                "stopped", "error", "launching", "recovering",
+                "capacity_redeploying",
+            }
+            and (deployment.get("kv_capacity") or {}).get("status") not in {
+                "within_limit", "reported", "insufficient_for_one",
+                "could_not_adjust", "redeploy_failed",
+            }
+        ]
+        for deployment in candidates:
+            reports = await self._deployment_capacity_reports(deployment)
+            if not reports:
+                continue
+            settings = deployment.get("launch_settings") or {}
+            controls = self._deployment_launch_controls(settings)
+            context_window = controls.get("context_window")
+            matching = [
+                report for report in reports
+                if context_window is None
+                or report["context_tokens"] == int(context_window)
+            ]
+            if not matching:
+                continue
+            maximum = min(
+                report["maximum_concurrency"] for report in matching
+            )
+            safe_limit = math.floor(maximum)
+            configured = controls.get("max_concurrency")
+            observation = {
+                "status": "reported",
+                "observed_at": time.time(),
+                "context_tokens": matching[0]["context_tokens"],
+                "maximum_concurrency": maximum,
+                "safe_concurrency": safe_limit,
+                "configured_concurrency": configured,
+                "reports": matching,
+            }
+            if configured is None:
+                deployment["kv_capacity"] = observation
+                self._save_deployments()
+                continue
+            if safe_limit < 1:
+                observation["status"] = "insufficient_for_one"
+                observation["error"] = (
+                    "vLLM reports insufficient KV cache for one full-context request"
+                )
+                deployment["kv_capacity"] = observation
+                self._save_deployments()
+                continue
+            if safe_limit >= int(configured):
+                observation["status"] = "within_limit"
+                deployment["kv_capacity"] = observation
+                self._save_deployments()
+                continue
+            await self._auto_reduce_vllm_concurrency(
+                deployment.get("id"), safe_limit, observation
+            )
+
+    async def _deployment_capacity_monitor_loop(self) -> None:
+        while True:
+            await asyncio.sleep(VLLM_CAPACITY_SCAN_INTERVAL_SECONDS)
+            try:
+                await self._deployment_capacity_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("vLLM KV-capacity monitor failed")
 
     async def _cluster_health_monitor_loop(self) -> None:
         # Let startup finish before the first probe, then reconcile at the
@@ -2635,6 +3060,238 @@ class Manager:
     def _save_token_stats(self):
         self.token_stats_path.write_text(json.dumps(self.token_stats, indent=2))
 
+    # Token-usage synchronization stores one authoritative component per
+    # controller node. Peers exchange the whole bounded ledger and select the
+    # newest revision for each origin, rather than adding aggregate totals.
+    # This makes pull/push fan-out idempotent and prevents replication loops.
+    @staticmethod
+    def _usage_version_key(value: Any) -> tuple[int, str]:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return (0, "")
+        try:
+            counter = max(0, int(value[0]))
+        except (TypeError, ValueError):
+            counter = 0
+        return counter, str(value[1] or "")
+
+    def _local_usage_node_id(self) -> str:
+        credentials = getattr(self, "agent_credentials", None)
+        return str(getattr(credentials, "node_id", None) or LOCAL_NODE_ID)
+
+    def _load_token_usage_sync(self) -> dict:
+        path = self.token_usage_sync_path
+        if path.exists():
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(value, dict)
+                    and value.get("version") == 1
+                    and isinstance(value.get("origins"), dict)
+                ):
+                    value.setdefault("epoch", [0, ""])
+                    value.setdefault("model_epochs", {})
+                    return value
+            except Exception:
+                pass
+
+        # Attribute an existing installation's counters to this node exactly
+        # once. Subsequent startups load this source ledger instead of treating
+        # the already-aggregated compatibility files as new local usage.
+        node_id = self._local_usage_node_id()
+        models = copy.deepcopy(getattr(self, "token_stats", {}))
+        hourly = copy.deepcopy(getattr(self, "hourly_token_stats", {}))
+        model_epochs = {model: [0, ""] for model in models}
+        return {
+            "version": 1,
+            "epoch": [0, ""],
+            "model_epochs": copy.deepcopy(model_epochs),
+            "origins": {
+                node_id: {
+                    "revision": 0,
+                    "token_stats": models,
+                    "hourly_token_stats": hourly,
+                    "model_epochs": model_epochs,
+                },
+            },
+        }
+
+    def _save_token_usage_sync(self) -> None:
+        path = self.token_usage_sync_path
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(self.token_usage_sync, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    @staticmethod
+    def _sum_usage_records(target: dict, source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        for field in (
+            "input", "output", "cached", "requests",
+            "gen_tokens", "gen_time_s",
+        ):
+            value = source.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                target[field] = target.get(field, 0) + max(0, value)
+
+    def _rebuild_synced_token_usage(self) -> None:
+        ledger = getattr(self, "token_usage_sync", None)
+        if not isinstance(ledger, dict):
+            return
+        aggregate: dict[str, dict] = {}
+        hourly: dict[str, dict[str, dict]] = {}
+        current_model_epochs = ledger.get("model_epochs") or {}
+        origins = ledger.get("origins") or {}
+        for component in origins.values():
+            if not isinstance(component, dict):
+                continue
+            component_epochs = component.get("model_epochs") or {}
+            for model, stats in (component.get("token_stats") or {}).items():
+                if self._usage_version_key(component_epochs.get(model)) != (
+                    self._usage_version_key(current_model_epochs.get(model))
+                ):
+                    continue
+                self._sum_usage_records(aggregate.setdefault(str(model), {}), stats)
+            for hour_key, models in (
+                component.get("hourly_token_stats") or {}
+            ).items():
+                if not isinstance(models, dict):
+                    continue
+                for model, stats in models.items():
+                    if self._usage_version_key(component_epochs.get(model)) != (
+                        self._usage_version_key(current_model_epochs.get(model))
+                    ):
+                        continue
+                    hour = hourly.setdefault(str(hour_key), {})
+                    self._sum_usage_records(hour.setdefault(str(model), {}), stats)
+        self.token_stats = aggregate
+        self.hourly_token_stats = hourly
+
+    def _record_local_synced_tokens(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cached_tokens: int,
+        gen_time_s: float | None,
+        hour_key: str,
+    ) -> None:
+        ledger = getattr(self, "token_usage_sync", None)
+        if not isinstance(ledger, dict):
+            return
+        node_id = self._local_usage_node_id()
+        origins = ledger.setdefault("origins", {})
+        component = origins.setdefault(node_id, {
+            "revision": 0,
+            "token_stats": {},
+            "hourly_token_stats": {},
+            "model_epochs": {},
+        })
+        global_model_epochs = ledger.setdefault("model_epochs", {})
+        model_version = global_model_epochs.setdefault(model, [0, ""])
+        component_epochs = component.setdefault("model_epochs", {})
+        if self._usage_version_key(component_epochs.get(model)) != (
+            self._usage_version_key(model_version)
+        ):
+            component.setdefault("token_stats", {})[model] = {}
+            for models in component.setdefault("hourly_token_stats", {}).values():
+                if isinstance(models, dict):
+                    models.pop(model, None)
+            component_epochs[model] = list(model_version)
+
+        def add(rec: dict) -> None:
+            rec["input"] = rec.get("input", 0) + prompt_tokens
+            rec["output"] = rec.get("output", 0) + completion_tokens
+            rec["cached"] = rec.get("cached", 0) + cached_tokens
+            rec["requests"] = rec.get("requests", 0) + 1
+            if gen_time_s and gen_time_s > 0 and completion_tokens > 0:
+                rec["gen_tokens"] = rec.get("gen_tokens", 0) + completion_tokens
+                rec["gen_time_s"] = rec.get("gen_time_s", 0.0) + gen_time_s
+
+        add(component.setdefault("token_stats", {}).setdefault(model, {}))
+        hour = component.setdefault("hourly_token_stats", {}).setdefault(
+            hour_key, {}
+        )
+        add(hour.setdefault(model, {}))
+        component["revision"] = int(component.get("revision") or 0) + 1
+        try:
+            self._save_token_usage_sync()
+        except Exception:
+            pass
+
+    def token_usage_sync_snapshot(self) -> dict:
+        return {
+            "enabled": bool(self.settings.get("sync_token_usage")),
+            "ledger": copy.deepcopy(self.token_usage_sync),
+        }
+
+    def merge_token_usage_sync(self, payload: Any) -> bool:
+        remote = payload.get("ledger") if isinstance(payload, dict) else None
+        if (
+            not isinstance(remote, dict)
+            or remote.get("version") != 1
+            or not isinstance(remote.get("origins"), dict)
+        ):
+            raise ValueError("invalid token usage sync payload")
+        local = self.token_usage_sync
+        local_epoch = self._usage_version_key(local.get("epoch"))
+        remote_epoch = self._usage_version_key(remote.get("epoch"))
+        changed = False
+        if remote_epoch > local_epoch:
+            self.token_usage_sync = copy.deepcopy(remote)
+            local = self.token_usage_sync
+            changed = True
+        elif remote_epoch < local_epoch:
+            return False
+        else:
+            local_model_epochs = local.setdefault("model_epochs", {})
+            for model, version in (remote.get("model_epochs") or {}).items():
+                if self._usage_version_key(version) > self._usage_version_key(
+                    local_model_epochs.get(model)
+                ):
+                    local_model_epochs[str(model)] = list(version)
+                    changed = True
+
+            local_origins = local.setdefault("origins", {})
+            for origin, component in remote["origins"].items():
+                if not isinstance(component, dict):
+                    continue
+                try:
+                    remote_revision = max(0, int(component.get("revision") or 0))
+                except (TypeError, ValueError):
+                    continue
+                current = local_origins.get(origin)
+                try:
+                    local_revision = max(
+                        0, int((current or {}).get("revision") or 0)
+                    )
+                except (TypeError, ValueError):
+                    local_revision = 0
+                if current is None or remote_revision > local_revision:
+                    local_origins[str(origin)] = copy.deepcopy(component)
+                    changed = True
+
+        # After adopting a cluster reset, retain an empty component for this
+        # node so its next local request joins the new epoch cleanly.
+        local_node_id = self._local_usage_node_id()
+        origins = local.setdefault("origins", {})
+        if local_node_id not in origins:
+            origins[local_node_id] = {
+                "revision": 0,
+                "token_stats": {},
+                "hourly_token_stats": {},
+                "model_epochs": {},
+            }
+            changed = True
+        if changed:
+            self._rebuild_synced_token_usage()
+            self._save_token_usage_sync()
+            self._save_token_stats()
+            self._save_hourly_token_stats()
+        return changed
+
     def _load_speed_samples(self) -> dict[str, list[dict]]:
         if self.speed_samples_path.exists():
             try:
@@ -2868,6 +3525,15 @@ class Manager:
         # cached_tokens > prompt_tokens in edge cases).
         if cached_tokens > prompt_tokens:
             cached_tokens = prompt_tokens
+        hour_key = datetime.now().strftime("%Y-%m-%dT%H")
+        self._record_local_synced_tokens(
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            gen_time_s,
+            hour_key,
+        )
         self._record_speed_sample(model, completion_tokens, gen_time_s)
         # Update both lifetime and session counters with the same values.
         for stats in (self.token_stats, self.session_token_stats):
@@ -2882,7 +3548,6 @@ class Manager:
                 rec["gen_tokens"] = rec.get("gen_tokens", 0) + completion_tokens
                 rec["gen_time_s"] = rec.get("gen_time_s", 0.0) + gen_time_s
         # Record hourly stats for the Analysis charts.
-        hour_key = datetime.now().strftime("%Y-%m-%dT%H")
         hrec = self.hourly_token_stats.setdefault(hour_key, {}).setdefault(model, {})
         hrec["input"] = hrec.get("input", 0) + prompt_tokens
         hrec["output"] = hrec.get("output", 0) + completion_tokens
@@ -2990,14 +3655,26 @@ class Manager:
     # upstream connection, which is what makes the inference server cancel
     # the task on its side.
     @staticmethod
-    async def _await_or_cancel(coro, cancel: asyncio.Event | None):
-        """Await a coroutine, aborting it when `cancel` fires."""
-        if cancel is None:
+    async def _await_or_cancel(
+        coro,
+        cancel: asyncio.Event | None,
+        interrupt: asyncio.Event | None = None,
+    ):
+        """Await a coroutine, aborting it on disconnect or a stream nudge."""
+        if cancel is None and interrupt is None:
             return await coro
         t = asyncio.create_task(coro)
-        cw = asyncio.create_task(cancel.wait())
-        done, _ = await asyncio.wait({t, cw}, return_when=asyncio.FIRST_COMPLETED)
-        cw.cancel()
+        cw = asyncio.create_task(cancel.wait()) if cancel is not None else None
+        iw = (
+            asyncio.create_task(interrupt.wait())
+            if interrupt is not None else None
+        )
+        watchers = {task for task in (cw, iw) if task is not None}
+        done, _ = await asyncio.wait(
+            {t, *watchers}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        for watcher in watchers:
+            watcher.cancel()
         if t in done:
             return t.result()
         t.cancel()
@@ -3005,10 +3682,18 @@ class Manager:
             await t
         except BaseException:
             pass
+        if cw is not None and cw in done:
+            raise ClientAbort("client disconnected")
+        if iw is not None and iw in done:
+            raise StreamNudge("stream selected for transparent replay")
         raise ClientAbort("client disconnected")
 
     @staticmethod
-    async def _aiter_lines_cancellable(r, cancel: asyncio.Event | None):
+    async def _aiter_lines_cancellable(
+        r,
+        cancel: asyncio.Event | None,
+        interrupt: asyncio.Event | None = None,
+    ):
         """Yield lines from an httpx streaming response, stopping promptly
         when `cancel` fires (even during a long prefill with no output). The
         caller's `async with` then closes the response, and closing that
@@ -3019,7 +3704,7 @@ class Manager:
             while True:
                 if pending is None:
                     pending = asyncio.create_task(aiter.__anext__())
-                if cancel is None:
+                if cancel is None and interrupt is None:
                     try:
                         line = await pending
                     except StopAsyncIteration:
@@ -3027,11 +3712,41 @@ class Manager:
                     pending = None
                     yield line
                     continue
-                cw = asyncio.create_task(cancel.wait())
-                done, _ = await asyncio.wait(
-                    {pending, cw}, return_when=asyncio.FIRST_COMPLETED
+                cw = (
+                    asyncio.create_task(cancel.wait())
+                    if cancel is not None else None
                 )
-                cw.cancel()
+                iw = (
+                    asyncio.create_task(interrupt.wait())
+                    if interrupt is not None else None
+                )
+                watchers = {task for task in (cw, iw) if task is not None}
+                done, _ = await asyncio.wait(
+                    {pending, *watchers}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for watcher in watchers:
+                    watcher.cancel()
+                # Events win a simultaneous race with an upstream line. This
+                # prevents a first token from slipping downstream after the
+                # nudger selected a zero-output stream for safe replay.
+                if cw is not None and cw in done:
+                    if not pending.done():
+                        pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
+                    return
+                if iw is not None and iw in done:
+                    if not pending.done():
+                        pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
+                    raise StreamNudge(
+                        "stream selected for transparent replay"
+                    )
                 if pending not in done:
                     pending.cancel()
                     try:
@@ -3050,12 +3765,24 @@ class Manager:
                 pending.cancel()
 
     # ----- live request tracking (Tokens widget) -----
-    def _track_start(self, key: str, streaming: bool = False) -> int:
+    def _track_start(
+        self,
+        key: str,
+        streaming: bool = False,
+        admission_target: str | None = None,
+        nudge_event: asyncio.Event | None = None,
+    ) -> int:
         self._req_seq += 1
         rid = self._req_seq
         self._active_reqs[rid] = {
             "key": key, "thinking": deque(), "output": deque(),
             "streaming": streaming,
+            "started_at": time.monotonic(),
+            "total_tokens": 0,
+            "forwarded_chunks": 0,
+            "admission_target": admission_target,
+            "nudge_event": nudge_event,
+            "paused": False,
         }
         return rid
 
@@ -3064,6 +3791,7 @@ class Manager:
     ):
         rec = self._active_reqs.get(rid)
         if rec is not None and count > 0:
+            rec["total_tokens"] = rec.get("total_tokens", 0) + count
             timestamps = rec[kind]
             timestamps.extend([ts] * count)
             cutoff = ts - self._trailing_window
@@ -3079,6 +3807,12 @@ class Manager:
         out: dict[str, dict] = {}
         stale: list[int] = []
         for rid, rec in list(self._active_reqs.items()):
+            # A zero-output stream selected for transparent replay stays in
+            # _active_reqs so its downstream connection remains open, but it
+            # has released its admission slot and is waiting in the FIFO.
+            # Do not report that paused request as running.
+            if rec.get("paused"):
+                continue
             # Only clean up non-streaming requests that have no timestamps.
             # Streaming requests are cleaned up by _track_end() in each
             # stream method's finally block — they may simply not have
@@ -3088,9 +3822,11 @@ class Manager:
                 stale.append(rid)
                 continue
             e = out.setdefault(rec["key"], {
-                "connections": 0, "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+                "connections": 0, "decoded_tokens": 0,
+                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
             })
             e["connections"] += 1
+            e["decoded_tokens"] += int(rec.get("total_tokens") or 0)
             for kind, field in (("thinking", "thinking_tok_s"), ("output", "output_tok_s")):
                 timestamps = rec[kind]
                 cutoff = now - self._trailing_window
@@ -3117,10 +3853,13 @@ class Manager:
             if not model:
                 continue
             e = out.setdefault(model, {
-                "connections": 0, "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+                "connections": 0, "decoded_tokens": 0,
+                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
             })
             e["queued"] = e.get("queued", 0) + admission["queued"]
-            e["admission_limit"] = admission["limit"]
+            e["admission_limit"] = admission.get(
+                "effective_limit", admission["limit"]
+            )
             admission_running[model] = (
                 admission_running.get(model, 0) + admission["running"]
             )
@@ -3163,7 +3902,8 @@ class Manager:
     @staticmethod
     def _drain_inference_waiters(state: dict) -> None:
         waiters = state["waiters"]
-        while state["running"] < state["limit"] and waiters:
+        limit = state.get("effective_limit", state["limit"])
+        while state["running"] < limit and waiters:
             waiter = waiters.popleft()
             future = waiter["future"]
             if future.cancelled() or future.done():
@@ -3240,6 +3980,7 @@ class Manager:
         self._drain_inference_waiters(state)
         if not state["running"] and not state["waiters"]:
             self._admission_store().pop(target, None)
+            getattr(self, "_nudger_slow_since", {}).pop(target, None)
 
     async def _admit_vllm_target(
         self,
@@ -3285,7 +4026,7 @@ class Manager:
             ]
             if not state["running"] and not queued:
                 continue
-            out[target] = {
+            snapshot = {
                 "model": state.get("model"),
                 "limit": state["limit"],
                 "running": state["running"],
@@ -3294,7 +4035,199 @@ class Manager:
                     max(0.0, now - queued[0]["created_at"]), 1
                 ) if queued else 0.0,
             }
+            effective_limit = state.get("effective_limit")
+            if effective_limit is not None and effective_limit != state["limit"]:
+                snapshot["effective_limit"] = effective_limit
+            if state.get("nudger"):
+                snapshot["nudger"] = dict(state["nudger"])
+            out[target] = snapshot
         return out
+
+    def _inference_nudger_tick(self, now: float | None = None) -> None:
+        """Detect stalled streams, serialize, then gradually restore capacity.
+
+        Only streams with zero emitted tokens are interrupted and replayed.
+        Once a stream has produced any reasoning or visible output, replaying
+        it could duplicate or change content, so it is never interrupted.
+        A serialized target is held at one slot for ``stall_seconds``, then
+        gains one slot per interval until its configured limit is restored.
+        Low throughput during recovery sends it back to one slot.
+        """
+        settings = getattr(self, "settings", DEFAULT_SETTINGS)
+        if not settings.get("vllm_nudger_enabled", True):
+            return
+        try:
+            threshold = max(
+                0.0, float(settings.get("vllm_nudger_rate_threshold", 5.0))
+            )
+            stall_seconds = max(
+                0.5, float(settings.get("vllm_nudger_stall_seconds", 3.0))
+            )
+        except (TypeError, ValueError):
+            threshold, stall_seconds = 5.0, 3.0
+        now = time.monotonic() if now is None else now
+        slow_since = getattr(self, "_nudger_slow_since", None)
+        if slow_since is None:
+            slow_since = self._nudger_slow_since = {}
+
+        groups: dict[str, list[tuple[int, dict]]] = {}
+        for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
+            target = rec.get("admission_target")
+            if (
+                not target
+                or not rec.get("streaming")
+                or rec.get("paused")
+                or rec.get("nudge_event") is None
+            ):
+                continue
+            groups.setdefault(target, []).append((rid, rec))
+
+        recovering = {
+            target for target, state in self._admission_store().items()
+            if state.get("effective_limit") is not None
+        }
+        for target in set(slow_since) | set(groups) | recovering:
+            streams = groups.get(target, [])
+            state = self._admission_store().get(target)
+            if state is None:
+                slow_since.pop(target, None)
+                continue
+
+            try:
+                configured_limit = max(1, int(state["limit"]))
+            except (KeyError, TypeError, ValueError):
+                configured_limit = 1
+            effective_limit = state.get("effective_limit")
+            if effective_limit is not None:
+                try:
+                    effective_limit = max(
+                        1, min(configured_limit, int(effective_limit))
+                    )
+                except (TypeError, ValueError):
+                    effective_limit = 1
+                state["effective_limit"] = effective_limit
+
+            if len(streams) < 2:
+                slow_since.pop(target, None)
+                if (state.get("nudger") or {}).get("status") == "watching":
+                    state.pop("nudger", None)
+
+            # A limit of one is the recovery baseline. There cannot be a
+            # concurrent-stream signal until the next slot is admitted, so
+            # hold it for one interval and then probe with one more slot.
+            monitor_concurrency = len(streams) >= 2 and effective_limit != 1
+            if monitor_concurrency:
+                cutoff = now - stall_seconds
+                recent_tokens = 0
+                for _, rec in streams:
+                    for kind in ("thinking", "output"):
+                        timestamps = rec.get(kind, ())
+                        recent_tokens += sum(ts >= cutoff for ts in timestamps)
+                rate = recent_tokens / stall_seconds
+                if rate >= threshold:
+                    slow_since.pop(target, None)
+                    if (state.get("nudger") or {}).get("status") == "watching":
+                        state.pop("nudger", None)
+                else:
+                    # The stall clock cannot predate the newest concurrent
+                    # stream, including one admitted by a recovery step.
+                    newest_start = max(
+                        rec.get("started_at", now) for _, rec in streams
+                    )
+                    began = slow_since.setdefault(target, newest_start)
+                    if now - began < stall_seconds:
+                        state["nudger"] = {
+                            **(state.get("nudger") or {}),
+                            "status": "watching",
+                            "rate_tok_s": round(rate, 1),
+                            "threshold_tok_s": threshold,
+                            "effective_limit": effective_limit,
+                            "configured_limit": configured_limit,
+                        }
+                        # Do not raise the limit while a low-rate interval is
+                        # still being evaluated.
+                        continue
+
+                    streams.sort(
+                        key=lambda item: item[1].get("started_at", now)
+                    )
+                    survivor_id = streams[0][0]
+                    victims = [
+                        (rid, rec) for rid, rec in streams[1:]
+                        if rec.get("total_tokens", 0) == 0
+                        and rec.get("forwarded_chunks", 0) == 0
+                    ]
+                    state["effective_limit"] = 1
+                    state["_nudger_next_step_at"] = now + stall_seconds
+                    nudger = state.get("nudger") or {}
+                    nudger.update({
+                        "status": (
+                            "nudging" if victims else "blocked_partial_output"
+                        ),
+                        "rate_tok_s": round(rate, 1),
+                        "threshold_tok_s": threshold,
+                        "effective_limit": 1,
+                        "configured_limit": configured_limit,
+                        "survivor_request": survivor_id,
+                        "replayed_requests": len(victims),
+                        "trigger_count": int(
+                            nudger.get("trigger_count", 0)
+                        ) + 1,
+                        "triggered_at": time.time(),
+                    })
+                    if not victims:
+                        nudger["reason"] = (
+                            "all newer streams already emitted output; "
+                            "unsafe to replay"
+                        )
+                    state["nudger"] = nudger
+                    for _, rec in victims:
+                        rec["nudge_event"].set()
+                    slow_since.pop(target, None)
+                    continue
+
+            effective_limit = state.get("effective_limit")
+            if effective_limit is None:
+                continue
+            if effective_limit >= configured_limit:
+                state.pop("effective_limit", None)
+                state.pop("_nudger_next_step_at", None)
+                state.pop("nudger", None)
+                self._drain_inference_waiters(state)
+                continue
+
+            next_step_at = state.setdefault(
+                "_nudger_next_step_at", now + stall_seconds
+            )
+            if now < next_step_at:
+                continue
+
+            next_limit = min(configured_limit, effective_limit + 1)
+            if next_limit >= configured_limit:
+                state.pop("effective_limit", None)
+                state.pop("_nudger_next_step_at", None)
+                state.pop("nudger", None)
+            else:
+                state["effective_limit"] = next_limit
+                state["_nudger_next_step_at"] = now + stall_seconds
+                nudger = state.get("nudger") or {}
+                nudger.update({
+                    "status": "recovering",
+                    "effective_limit": next_limit,
+                    "configured_limit": configured_limit,
+                })
+                state["nudger"] = nudger
+            self._drain_inference_waiters(state)
+
+    async def _inference_nudger_loop(self) -> None:
+        while True:
+            try:
+                self._inference_nudger_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("vLLM inference nudger tick failed")
+            await asyncio.sleep(0.5)
 
     def get_token_stats(self) -> dict:
         total_in = sum(r.get("input", 0) for r in self.token_stats.values())
@@ -3459,7 +4392,52 @@ class Manager:
             "total_cost": total_cost,
         }
 
+    def _reset_synced_token_usage(self) -> None:
+        ledger = getattr(self, "token_usage_sync", None)
+        if not isinstance(ledger, dict):
+            return
+        node_id = self._local_usage_node_id()
+        counter = self._usage_version_key(ledger.get("epoch"))[0] + 1
+        origins = copy.deepcopy(ledger.get("origins") or {})
+        for component in origins.values():
+            if not isinstance(component, dict):
+                continue
+            component["token_stats"] = {}
+            component["revision"] = int(component.get("revision") or 0) + 1
+        origins.setdefault(node_id, {
+            "revision": 0,
+            "token_stats": {},
+            "hourly_token_stats": {},
+            "model_epochs": {},
+        })
+        self.token_usage_sync = {
+            "version": 1,
+            "epoch": [counter, node_id],
+            "model_epochs": copy.deepcopy(ledger.get("model_epochs") or {}),
+            "origins": origins,
+        }
+        self._save_token_usage_sync()
+
+    def _erase_synced_usage_model(self, model: str) -> None:
+        ledger = getattr(self, "token_usage_sync", None)
+        if not isinstance(ledger, dict):
+            return
+        node_id = self._local_usage_node_id()
+        model_epochs = ledger.setdefault("model_epochs", {})
+        counter = self._usage_version_key(model_epochs.get(model))[0] + 1
+        model_epochs[model] = [counter, node_id]
+        for component in (ledger.get("origins") or {}).values():
+            if not isinstance(component, dict):
+                continue
+            (component.get("token_stats") or {}).pop(model, None)
+            for models in (component.get("hourly_token_stats") or {}).values():
+                if isinstance(models, dict):
+                    models.pop(model, None)
+            component["revision"] = int(component.get("revision") or 0) + 1
+        self._save_token_usage_sync()
+
     def reset_token_stats(self) -> dict:
+        self._reset_synced_token_usage()
         self.token_stats = {}
         self.speed_samples = {}
         # Ensure an in-flight batched snapshot notices the reset and follows
@@ -3483,6 +4461,7 @@ class Manager:
         if not model_key or model_key not in self.token_stats:
             raise ValueError("usage model not found")
 
+        self._erase_synced_usage_model(model_key)
         self.token_stats.pop(model_key, None)
         self.session_token_stats.pop(model_key, None)
         self.speed_samples.pop(model_key, None)
@@ -6929,6 +7908,12 @@ class Manager:
 
     async def _resolve_vllm_target(self, model: str) -> dict:
         """Find or start a running vLLM container for the given model."""
+        # A capacity-triggered replacement briefly has no container for the
+        # intended deployment. Do not let ensure_loaded wake an older stopped
+        # copy of the same model during that gap; wait until the coherent
+        # replacement generation has at least been created.
+        while model in getattr(self, "_capacity_redeploying_models", set()):
+            await asyncio.sleep(0.25)
         containers = await self.list_containers()
         # Look for a running container with this model
         for c in containers:
@@ -6972,6 +7957,8 @@ class Manager:
         }
         admission = None
         rid = None
+        endpoint = None
+        nudge_event = asyncio.Event()
         retried_without_token_ids = False
         try:
             if container is not None:
@@ -6989,15 +7976,21 @@ class Manager:
                     container, requested_model
                 )
                 url = f"http://localhost:{container['port']}{endpoint}"
-            rid = self._track_start(key, streaming=True)
+            rid = self._track_start(
+                key,
+                streaming=True,
+                admission_target=admission,
+                nudge_event=nudge_event,
+            )
             while True:
                 stream_context = self.http.stream(
                     "POST", url, json=body, timeout=None,
                 )
                 entered = False
+                nudged = False
                 try:
                     r = await self._await_or_cancel(
-                        stream_context.__aenter__(), cancel
+                        stream_context.__aenter__(), cancel, nudge_event,
                     )
                     entered = True
                     if r.status_code != 200:
@@ -7021,7 +8014,9 @@ class Manager:
                         return
                     first_out_ts = None
                     last_out_ts = None
-                    async for line in self._aiter_lines_cancellable(r, cancel):
+                    async for line in self._aiter_lines_cancellable(
+                        r, cancel, nudge_event,
+                    ):
                         if not line:
                             continue
                         thinking_tokens, output_tokens = (
@@ -7046,11 +8041,51 @@ class Manager:
                                 else None
                             )
                             self._record_usage(key, usage, gen_time)
+                        rec = self._active_reqs.get(rid)
+                        if rec is not None:
+                            rec["forwarded_chunks"] = (
+                                rec.get("forwarded_chunks", 0) + 1
+                            )
                         yield f"{line}\n\n"
                     return
+                except StreamNudge:
+                    nudged = True
                 finally:
                     if entered:
                         await stream_context.__aexit__(None, None, None)
+                if nudged:
+                    rec = self._active_reqs.get(rid)
+                    if rec is None:
+                        return
+                    if (
+                        rec.get("total_tokens", 0) > 0
+                        or rec.get("forwarded_chunks", 0) > 0
+                    ):
+                        yield f"data: {json.dumps({'error': {'message': 'Stream stalled after output began and cannot be safely replayed; retry the request', 'type': 'nudger_retry', 'code': 'stream_nudge_retry', 'retryable': True}})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    # This request has sent nothing downstream, so closing its
+                    # upstream response and replaying the exact body is
+                    # transparent to the client. Release before re-acquiring:
+                    # the nudger has reduced this target to one active slot.
+                    rec["paused"] = True
+                    rec["admission_target"] = None
+                    self._release_inference_slot(admission)
+                    admission = None
+                    nudge_event.clear()
+                    if container is None or requested_model is None:
+                        return
+                    container, admission = await self._admit_vllm_target(
+                        requested_model, cancel, container
+                    )
+                    key = container.get("stats_key") or requested_model
+                    body["model"] = self._upstream_model_id(
+                        container, requested_model
+                    )
+                    url = f"http://localhost:{container['port']}{endpoint}"
+                    rec["key"] = key
+                    rec["admission_target"] = admission
+                    rec["paused"] = False
         except ClientAbort:
             return
         except Exception as e:
@@ -8038,6 +9073,7 @@ class Manager:
             "images": images,
             "stats": stats,
             "settings": self.public_settings(),
+            "token_usage_sync": dict(self._token_usage_sync_status),
             "nodes": nodes,
             "deployments": public_deployments,
             "recipes": list(self.recipes),

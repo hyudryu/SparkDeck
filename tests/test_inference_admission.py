@@ -303,6 +303,252 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             await consume
         self.assertEqual(instance.inference_admission(), {})
 
+    async def test_nudger_replays_only_newer_zero_output_stream(self) -> None:
+        instance = self.manager()
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance._nudger_slow_since = {}
+        instance.settings = {
+            "vllm_nudger_enabled": True,
+            "vllm_nudger_rate_threshold": 5.0,
+            "vllm_nudger_stall_seconds": 3.0,
+        }
+        first_slot = await instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        )
+        second_slot = await instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        )
+        first_event, second_event = asyncio.Event(), asyncio.Event()
+        first = instance._track_start(
+            "model [test]", True, first_slot, first_event,
+        )
+        second = instance._track_start(
+            "model [test]", True, second_slot, second_event,
+        )
+        instance._active_reqs[first]["started_at"] = 90.0
+        instance._active_reqs[second]["started_at"] = 91.0
+
+        instance._inference_nudger_tick(now=91.0)
+        instance._inference_nudger_tick(now=94.1)
+
+        state = instance.inference_admission()["deployment-a"]
+        self.assertEqual(state["effective_limit"], 1)
+        self.assertEqual(state["nudger"]["status"], "nudging")
+        self.assertEqual(state["nudger"]["survivor_request"], first)
+        self.assertFalse(first_event.is_set())
+        self.assertTrue(second_event.is_set())
+
+        instance._track_end(first)
+        instance._track_end(second)
+        instance._release_inference_slot(first_slot)
+        instance._release_inference_slot(second_slot)
+
+    async def test_nudger_never_interrupts_partial_output(self) -> None:
+        instance = self.manager()
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance._nudger_slow_since = {}
+        instance.settings = {
+            "vllm_nudger_enabled": True,
+            "vllm_nudger_rate_threshold": 5.0,
+            "vllm_nudger_stall_seconds": 3.0,
+        }
+        slots = [
+            await instance._acquire_inference_slot(
+                container(limit=3), "model [test]", None,
+            )
+            for _ in range(2)
+        ]
+        events = [asyncio.Event(), asyncio.Event()]
+        requests = [
+            instance._track_start("model [test]", True, slots[i], events[i])
+            for i in range(2)
+        ]
+        for index, rid in enumerate(requests):
+            instance._active_reqs[rid]["started_at"] = 90.0 + index
+        instance._track_output(requests[1], 91.0, "thinking", 1)
+        instance._active_reqs[requests[1]]["forwarded_chunks"] = 1
+
+        instance._inference_nudger_tick(now=91.0)
+        instance._inference_nudger_tick(now=94.1)
+
+        state = instance.inference_admission()["deployment-a"]
+        self.assertEqual(state["effective_limit"], 1)
+        self.assertEqual(
+            state["nudger"]["status"], "blocked_partial_output",
+        )
+        self.assertFalse(any(event.is_set() for event in events))
+
+        for rid in requests:
+            instance._track_end(rid)
+        for slot in slots:
+            instance._release_inference_slot(slot)
+
+    async def test_effective_limit_stops_new_grants_until_running_is_one(self) -> None:
+        instance = self.manager()
+        first = await instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        )
+        second = await instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        )
+        instance._inference_admission["deployment-a"]["effective_limit"] = 1
+        third = asyncio.create_task(instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        ))
+        await asyncio.sleep(0)
+
+        instance._release_inference_slot(first)
+        await asyncio.sleep(0)
+        self.assertFalse(third.done())
+        instance._release_inference_slot(second)
+        self.assertEqual(await third, "deployment-a")
+        instance._release_inference_slot("deployment-a")
+
+    async def test_nudger_restores_one_slot_per_stall_interval(self) -> None:
+        instance = self.manager()
+        instance._nudger_slow_since = {}
+        instance._active_reqs = {}
+        instance.settings = {
+            "vllm_nudger_enabled": True,
+            "vllm_nudger_rate_threshold": 5.0,
+            "vllm_nudger_stall_seconds": 3.0,
+        }
+        first = await instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        )
+        state = instance._inference_admission["deployment-a"]
+        state["effective_limit"] = 1
+        state["_nudger_next_step_at"] = 103.0
+        second = asyncio.create_task(instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        ))
+        third = asyncio.create_task(instance._acquire_inference_slot(
+            container(limit=3), "model [test]", None,
+        ))
+        await asyncio.sleep(0)
+
+        instance._inference_nudger_tick(now=102.9)
+        self.assertFalse(second.done())
+        self.assertEqual(state["effective_limit"], 1)
+
+        instance._inference_nudger_tick(now=103.0)
+        self.assertEqual(await second, "deployment-a")
+        self.assertFalse(third.done())
+        self.assertEqual(state["effective_limit"], 2)
+        self.assertEqual(state["_nudger_next_step_at"], 106.0)
+
+        instance._inference_nudger_tick(now=105.9)
+        self.assertFalse(third.done())
+        instance._inference_nudger_tick(now=106.0)
+        self.assertEqual(await third, "deployment-a")
+        self.assertNotIn("effective_limit", state)
+        self.assertNotIn("_nudger_next_step_at", state)
+
+        for target in (first, "deployment-a", "deployment-a"):
+            instance._release_inference_slot(target)
+
+    async def test_low_throughput_during_recovery_returns_limit_to_one(self) -> None:
+        instance = self.manager()
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance._nudger_slow_since = {}
+        instance.settings = {
+            "vllm_nudger_enabled": True,
+            "vllm_nudger_rate_threshold": 5.0,
+            "vllm_nudger_stall_seconds": 3.0,
+        }
+        slots = [
+            await instance._acquire_inference_slot(
+                container(limit=3), "model [test]", None,
+            )
+            for _ in range(2)
+        ]
+        events = [asyncio.Event(), asyncio.Event()]
+        requests = [
+            instance._track_start("model [test]", True, slots[i], events[i])
+            for i in range(2)
+        ]
+        for rid in requests:
+            instance._active_reqs[rid]["started_at"] = 100.0
+        state = instance._inference_admission["deployment-a"]
+        state["effective_limit"] = 2
+        state["_nudger_next_step_at"] = 103.0
+
+        instance._inference_nudger_tick(now=100.0)
+        instance._inference_nudger_tick(now=103.1)
+
+        self.assertEqual(state["effective_limit"], 1)
+        self.assertEqual(state["_nudger_next_step_at"], 106.1)
+        self.assertEqual(state["nudger"]["status"], "nudging")
+        self.assertTrue(events[1].is_set())
+
+        for rid in requests:
+            instance._track_end(rid)
+        for slot in slots:
+            instance._release_inference_slot(slot)
+
+    async def test_zero_output_nudge_transparently_reopens_upstream(self) -> None:
+        instance = self.manager()
+        target_container = container(limit=3)
+        instance._resolve_vllm_target = mock.AsyncMock(
+            return_value=target_container,
+        )
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance._record_usage = mock.Mock()
+        upstream_calls = []
+        first_opened = asyncio.Event()
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, first):
+                self.first = first
+
+            async def __aenter__(self):
+                if self.first:
+                    first_opened.set()
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def aiter_lines(self):
+                if self.first:
+                    await asyncio.Event().wait()
+                yield 'data: {"choices":[{"delta":{"content":"ok"},"token_ids":[1]}]}'
+                yield "data: [DONE]"
+
+        class Http:
+            def stream(self, method, url, **kwargs):
+                upstream_calls.append(url)
+                return Response(len(upstream_calls) == 1)
+
+        instance.http = Http()
+        stream = await instance._vllm_chat(
+            "model", {"model": "model", "messages": [], "stream": True},
+            stream=True,
+        )
+
+        async def consume():
+            return [chunk async for chunk in stream]
+
+        task = asyncio.create_task(consume())
+        await first_opened.wait()
+        rec = next(iter(instance._active_reqs.values()))
+        rec["nudge_event"].set()
+        chunks = await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(len(upstream_calls), 2)
+        self.assertEqual(sum("content" in chunk for chunk in chunks), 1)
+        self.assertEqual(instance.inference_admission(), {})
+
     async def test_controller_job_is_cancelable_while_waiting_for_slot(self) -> None:
         instance = self.manager()
         target_container = container()

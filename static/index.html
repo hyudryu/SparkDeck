@@ -131,7 +131,7 @@
           <span class="stat-value" x-show="tokenModel"><span class="tok-dir" style="color:var(--accent-green)">Cost</span><span x-text="tokenCostDisplay(tokenModel)"></span></span>
           <span class="stat-value" x-show="!tokenModel">—</span>
           <span class="stat-value live-reqs" x-show="liveReqs(tokenModel)"
-                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
+                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · decoded ' + fmtTokens(liveReqs(tokenModel)?.decoded_tokens || 0) + ' tok · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
           <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
       </div>
@@ -2046,6 +2046,14 @@ for chunk in stream:
       <label>
         <span>Cluster node name <span class="tip" tabindex="0" data-tip="Display name advertised to a paired coordinator."></span></span>
         <input type="text" x-model="settingsForm.cluster_node_name" placeholder="Spark 1">
+      </label>
+      <label>
+        <span>Sync token usage <span class="tip" tabindex="0" data-tip="Exchange lifetime and hourly per-model token counters with paired nodes every five seconds. Enable this on the coordinator and participating nodes. Per-node revisions prevent repeated syncs from double-counting usage."></span></span>
+        <input type="checkbox" x-model="settingsForm.sync_token_usage">
+      </label>
+      <label>
+        <span>Auto-fit vLLM concurrency <span class="tip" tabindex="0" data-tip="Read vLLM's startup maximum full-context concurrency from every deployment's logs. If its conservative floor is below --max-num-seqs, save the lower value and redeploy all ranks as one coordinated generation."></span></span>
+        <input type="checkbox" x-model="settingsForm.vllm_auto_adjust_concurrency">
       </label>
       <label>
         <span>ConnectX fabric IP <em class="muted">(blank = detect)</em> <span class="tip" tabindex="0" data-tip="IPv4 address used for NCCL/Gloo distributed inference traffic. This is separate from the management/agent address."></span></span>

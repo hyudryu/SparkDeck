@@ -899,17 +899,37 @@ function app() {
         // Invalid or unavailable local storage should not prevent the chart loading.
       }
     },
-    openTemperatureRunColorPicker(runId) {
+    openTemperatureRunColorPicker(runId, anchor) {
       const picker = this.$refs.temperatureRunColorPicker;
       if (!picker || !runId) return;
       this.temperatureRunColorPickerId = String(runId);
       picker.value = this.temperatureRunColor(runId);
-      picker.click();
+      const rect = anchor?.getBoundingClientRect?.();
+      if (rect) {
+        // Chromium anchors its native color panel to the input, so keep the
+        // invisible input directly below the SVG dot instead of off-screen.
+        const anchorLeft = Math.max(
+          0, Math.min(window.innerWidth - 2, rect.left + rect.width / 2)
+        );
+        const anchorTop = Math.max(
+          0, Math.min(window.innerHeight - 2, rect.bottom + 2)
+        );
+        picker.style.left = `${Math.round(anchorLeft)}px`;
+        picker.style.top = `${Math.round(anchorTop)}px`;
+      }
+      picker.focus({preventScroll: true});
+      try {
+        if (typeof picker.showPicker === 'function') picker.showPicker();
+        else picker.click();
+      } catch (_) {
+        // Older browsers can reject showPicker even during a user gesture.
+        picker.click();
+      }
     },
     handleTemperatureRunChartColor(event) {
       const target = event?.target?.closest?.('[data-temperature-run-color]');
       if (!target) return;
-      this.openTemperatureRunColorPicker(target.dataset.temperatureRunColor);
+      this.openTemperatureRunColorPicker(target.dataset.temperatureRunColor, target);
     },
     setTemperatureRunColor(color) {
       const runId = this.temperatureRunColorPickerId;
@@ -1172,7 +1192,27 @@ function app() {
           Select one or more runs to graph.
         </text>
       `;
-      return `${ticks}${lines}${maxMarkers}${legend}${empty}`;
+      const axes = `
+        <line x1="${number(chart.left)}" y1="${number(chart.top)}"
+              x2="${number(chart.left)}" y2="${number(chart.bottom)}"
+              class="temp-export-axis"></line>
+        <line x1="${number(chart.left)}" y1="${number(chart.bottom)}"
+              x2="${number(chart.right)}" y2="${number(chart.bottom)}"
+              class="temp-export-axis"></line>
+        <text x="${number(chart.left)}" y="452" text-anchor="middle"
+              class="temp-export-label">0s</text>
+        <text x="${number(chart.right)}" y="452" text-anchor="middle"
+              class="temp-export-label">${this.escapeHtml(this.fmtTemperatureRunDuration(chart.maxSeconds))}</text>
+        <text x="450" y="472" text-anchor="middle" class="temp-export-label">
+          Time since recording start
+        </text>
+        <text x="15" y="${number((chart.top + chart.bottom) / 2)}"
+              text-anchor="middle" class="temp-export-label"
+              transform="rotate(-90 15 ${number((chart.top + chart.bottom) / 2)})">
+          Temperature (°C)
+        </text>
+      `;
+      return `${ticks}${lines}${maxMarkers}${legend}${empty}${axes}`;
     },
     fmtTemperatureRunDuration(seconds) {
       const value = Math.max(0, Math.round(Number(seconds) || 0));

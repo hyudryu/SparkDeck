@@ -1476,11 +1476,14 @@ function app() {
     },
     fmtLivePPSpeed(model) {
       const live = this.liveReqs(model);
+      // A vLLM continuous-usage snapshot does not include cache-hit detail
+      // until its terminal chunk. Never show a partial aggregate while even
+      // one active request still has an unresolved uncached-token count.
+      if (live?.pp_measuring > 0) return 'measuring…';
       const value = Number(live?.pp_tok_s);
       if (Number.isFinite(value) && value > 0) {
         return `${value.toFixed(1)} tok/s`;
       }
-      if (live?.pp_measuring > 0) return 'measuring…';
       return this.fmtPPSpeed(model);
     },
     fmtMessageRate(tokens, elapsedMs) {

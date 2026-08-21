@@ -143,6 +143,11 @@ function app() {
     usageAliasSaving: {},
     usageEraseBusy: {},
     usageAliasSaved: {},
+    usageRuleSource: '',
+    usageRuleDestination: '',
+    usageRuleSaving: false,
+    usageRuleSaved: false,
+    usageRuleDeleting: {},
     analysisDateStart: '',         // YYYY-MM-DD or '' for default range
     analysisDateEnd: '',           // YYYY-MM-DD or '' for default range
     analysisChartMode: 'hour',     // 'hour' | 'day'
@@ -165,6 +170,20 @@ function app() {
     diskLoading: false,
     diskLastAt: null,
     temperatureHistoryByNode: {},
+    temperatureRuns: [],
+    temperatureRunsActiveId: null,
+    temperatureRunData: {},
+    temperatureRunSelected: {},
+    temperatureRunTargetNode: 'local',
+    temperatureRunTargetTemp: 60,
+    temperatureRunTriggerMargin: 5,
+    temperatureRunBusy: false,
+    temperatureRunCancelBusy: false,
+    temperatureRunError: '',
+    temperatureRunRenameId: null,
+    temperatureRunRenameValue: '',
+    temperatureRunRenameBusy: false,
+    _temperatureRunsRefreshInFlight: false,
     liveRequestRates: {},
     fanMaxSpeed: false,
     topbarStatsCollapsed: false,
@@ -191,6 +210,17 @@ function app() {
     pricingSaved: false,
 
     // ─── lifecycle ───────────────────────────────────────────
+    _hasSelectedText() {
+      const selection = window.getSelection?.();
+      if (selection && !selection.isCollapsed && selection.toString()) return true;
+
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        return Number(active.selectionEnd) > Number(active.selectionStart);
+      }
+      return false;
+    },
+
     async init() {
       // On mobile, start stats collapsed so the topbar doesn't eat the whole screen.
       this.topbarStatsCollapsed = window.innerWidth <= 720;
@@ -199,17 +229,19 @@ function app() {
       await this.refreshTemperatureHistory();
       await this.refreshLiveRequestRates();
       // 1 Hz stats polling, paused when the tab isn't visible so we don't
-      // wake the GPU compositor for invisible repaints.
+      // wake the GPU compositor for invisible repaints. Automatic updates
+      // also defer while text is selected so Alpine DOM patches do not clear
+      // a selection the user is copying.
       setInterval(() => {
-        if (!document.hidden) this.refreshStats();
+        if (!document.hidden) this.refreshStats(true);
       }, 1000);
       // Token rates are deliberately sampled at a stable two-second cadence;
       // SSE chunk frequency must not control how often the widget repaints.
       setInterval(() => {
-        if (!document.hidden) this.refreshLiveRequestRates();
+        if (!document.hidden) this.refreshLiveRequestRates(true);
       }, 2 * 1000);
       setInterval(() => {
-        if (!document.hidden) this.refresh();
+        if (!document.hidden) this.refresh(true);
       }, 2500);
       // Disk space changes slowly — poll it every 5 minutes instead.
       setInterval(() => {
@@ -217,15 +249,19 @@ function app() {
       }, 5 * 60 * 1000);
       // Temperature history changes only once per 30-second server sample.
       setInterval(() => {
-        if (!document.hidden) this.refreshTemperatureHistory();
+        if (!document.hidden) this.refreshTemperatureHistory(true);
       }, 30 * 1000);
+      setInterval(() => {
+        if (!document.hidden && this.tab === 'temps') this.refreshTemperatureRuns(true);
+      }, 1000);
       // Refresh immediately on tab regaining focus.
       document.addEventListener('visibilitychange', () => {
         if (!document.hidden) {
-          this.refreshStats();
-          this.refresh();
-          this.refreshTemperatureHistory();
-          this.refreshLiveRequestRates();
+          this.refreshStats(true);
+          this.refresh(true);
+          this.refreshTemperatureHistory(true);
+          this.refreshLiveRequestRates(true);
+          if (this.tab === 'temps') this.refreshTemperatureRuns(true);
           if (!this.diskLastAt || Date.now() - this.diskLastAt > 5 * 60 * 1000) {
             this.refreshDisk();
           }
@@ -238,6 +274,7 @@ function app() {
         } else {
           this._stopLogPolling();
         }
+        if (v === 'temps') this.refreshTemperatureRuns();
       });
       this.$watch('logsModal.open', (open) => {
         if (open) this._startLogsTail();
@@ -254,11 +291,13 @@ function app() {
       });
     },
 
-    async refresh() {
+    async refresh(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       try {
         const r = await fetch(`/api/state?t=${Date.now()}`);
         if (!r.ok) throw new Error(r.statusText);
         const s = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         this.state = s;
         if (!(s.nodes || []).some(n => n.id === this.statsNodeId && n.online)) {
           this.statsNodeId = (s.nodes || []).find(n => n.local && n.online)?.id
@@ -350,13 +389,15 @@ function app() {
       }
     },
 
-    async refreshStats() {
+    async refreshStats(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       // Lightweight stats refresh between full refreshes
       try {
         // Bust caches so browser doesn't serve a stale stats snapshot.
         const r = await fetch(`/api/stats?t=${Date.now()}`);
         if (!r.ok) return;
         const stats = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         if (this.state) this.state.stats = stats;
         // Sync the max-speed toggle with the daemon's reported state.
         if (stats.fan && typeof stats.fan.max_speed === 'boolean') {
@@ -400,12 +441,14 @@ function app() {
       }
     },
 
-    async refreshTemperatureHistory() {
+    async refreshTemperatureHistory(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       const nodeId = this.selectedStatsNode()?.id || this.statsNodeId || 'local';
       try {
         const r = await fetch(`/api/temperature-history?node_id=${encodeURIComponent(nodeId)}&t=${Date.now()}`);
         if (!r.ok) return;
         const history = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         this.temperatureHistoryByNode = {
           ...this.temperatureHistoryByNode,
           [nodeId]: history,
@@ -416,11 +459,14 @@ function app() {
       }
     },
 
-    async refreshLiveRequestRates() {
+    async refreshLiveRequestRates(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       try {
         const r = await fetch(`/api/active-request-rates?t=${Date.now()}`);
         if (!r.ok) return;
-        this.liveRequestRates = await r.json();
+        const rates = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.liveRequestRates = rates;
       } catch {
         // Retain the last sample until the next fixed-cadence poll.
       }
@@ -677,6 +723,303 @@ function app() {
         })),
       };
     },
+    temperatureTargetNodes() {
+      return (this.state?.nodes || []).filter(node =>
+        node?.online && node?.enabled !== false
+      );
+    },
+    temperatureActiveRun() {
+      return this.temperatureRuns.find(run => run.id === this.temperatureRunsActiveId) || null;
+    },
+    temperatureRunStatusLabel(run) {
+      const labels = {
+        armed: 'Waiting for heat',
+        recording: 'Recording',
+        complete: 'Complete',
+        cancelled: 'Cancelled',
+        interrupted: 'Interrupted',
+      };
+      return labels[run?.status] || run?.status || 'Unknown';
+    },
+    temperatureRunStatusClass(run) {
+      if (run?.status === 'recording') return 'pill-error';
+      if (run?.status === 'armed') return 'pill-degraded';
+      if (run?.status === 'complete') return 'pill-ready';
+      return 'pill-exited';
+    },
+    async refreshTemperatureRuns(preserveSelection = false) {
+      if (this._temperatureRunsRefreshInFlight) return;
+      if (preserveSelection && this._hasSelectedText()) return;
+      this._temperatureRunsRefreshInFlight = true;
+      try {
+        const response = await fetch(`/api/temperature-runs?t=${Date.now()}`);
+        if (!response.ok) throw new Error(response.statusText);
+        const snapshot = await response.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.temperatureRuns = Array.isArray(snapshot.runs) ? snapshot.runs : [];
+        this.temperatureRunsActiveId = snapshot.active_run_id || null;
+
+        const nodes = this.temperatureTargetNodes();
+        if (!nodes.some(node => node.id === this.temperatureRunTargetNode)) {
+          this.temperatureRunTargetNode = nodes[0]?.id || 'local';
+        }
+
+        const selected = {...this.temperatureRunSelected};
+        if (this.temperatureRunsActiveId) selected[this.temperatureRunsActiveId] = true;
+        if (!Object.values(selected).some(Boolean)) {
+          const first = this.temperatureRuns.find(run => Number(run.sample_count) > 0);
+          if (first) selected[first.id] = true;
+        }
+        this.temperatureRunSelected = selected;
+        await Promise.all(
+          this.temperatureRuns
+            .filter(run => selected[run.id])
+            .map(run => this.loadTemperatureRun(run.id, preserveSelection))
+        );
+        this.temperatureRunError = '';
+      } catch (error) {
+        this.temperatureRunError = `Temperature runs refresh failed: ${error.message}`;
+      } finally {
+        this._temperatureRunsRefreshInFlight = false;
+      }
+    },
+    async loadTemperatureRun(runId, preserveSelection = false) {
+      try {
+        const response = await fetch(`/api/temperature-runs/${encodeURIComponent(runId)}?t=${Date.now()}`);
+        if (!response.ok) throw new Error(response.statusText);
+        const run = await response.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.temperatureRunData = {...this.temperatureRunData, [runId]: run};
+      } catch (error) {
+        this.temperatureRunError = `Could not load temperature run: ${error.message}`;
+      }
+    },
+    async toggleTemperatureRun(runId) {
+      const selected = !this.temperatureRunSelected[runId];
+      this.temperatureRunSelected = {
+        ...this.temperatureRunSelected,
+        [runId]: selected,
+      };
+      if (selected) await this.loadTemperatureRun(runId);
+    },
+    async armTemperatureRun() {
+      if (this.temperatureRunBusy) return;
+      this.temperatureRunBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch('/api/temperature-runs', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({
+            node_id: this.temperatureRunTargetNode,
+            target_temp_c: this.temperatureRunTargetTemp,
+            trigger_margin_pct: this.temperatureRunTriggerMargin,
+          }),
+        });
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [run.id]: run};
+        this.temperatureRunSelected = {...this.temperatureRunSelected, [run.id]: true};
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunBusy = false;
+      }
+    },
+    async cancelTemperatureRun() {
+      if (this.temperatureRunCancelBusy) return;
+      this.temperatureRunCancelBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch('/api/temperature-runs/cancel', {method: 'POST'});
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [run.id]: run};
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunCancelBusy = false;
+      }
+    },
+    startTemperatureRunRename(run) {
+      this.temperatureRunRenameId = run.id;
+      this.temperatureRunRenameValue = run.name || '';
+    },
+    async saveTemperatureRunName(runId) {
+      const name = this.temperatureRunRenameValue.trim();
+      if (!name || this.temperatureRunRenameBusy) return;
+      this.temperatureRunRenameBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch(`/api/temperature-runs/${encodeURIComponent(runId)}`, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({name}),
+        });
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [runId]: run};
+        this.temperatureRunRenameId = null;
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunRenameBusy = false;
+      }
+    },
+    temperatureSelectedRunData() {
+      return this.temperatureRuns
+        .filter(run => this.temperatureRunSelected[run.id])
+        .map(run => this.temperatureRunData[run.id])
+        .filter(Boolean);
+    },
+    temperatureRunColor(runId) {
+      const palette = [
+        '#6fcf97', '#56a8f5', '#f2c94c', '#bb6bd9',
+        '#f2994a', '#eb5757', '#2dd4bf', '#a78bfa',
+      ];
+      let hash = 0;
+      for (const char of String(runId || '')) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+      return palette[hash % palette.length];
+    },
+    temperatureRunChart() {
+      const runs = this.temperatureSelectedRunData();
+      const allValues = [];
+      let maxSeconds = 1;
+      for (const run of runs) {
+        for (const sample of (run.samples || [])) {
+          maxSeconds = Math.max(maxSeconds, Number(sample.elapsed_seconds) || 0);
+          for (const key of ['cpu_temp_c', 'gpu_temp_c']) {
+            const rawValue = sample[key];
+            if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+              allValues.push(rawValue);
+            }
+          }
+        }
+      }
+
+      let minTemp = allValues.length ? Math.min(...allValues) : 30;
+      let maxTemp = allValues.length ? Math.max(...allValues) : 90;
+      minTemp = Math.max(0, Math.floor((minTemp - 5) / 10) * 10);
+      maxTemp = Math.min(130, Math.ceil((maxTemp + 5) / 10) * 10);
+      if (maxTemp - minTemp < 20) maxTemp = Math.min(130, minTemp + 20);
+
+      const left = 62;
+      const right = 878;
+      const legendColumns = 3;
+      const legendRows = Math.max(1, Math.ceil(runs.length / legendColumns));
+      const top = 18 + legendRows * 27;
+      const bottom = 426;
+      const x = seconds => left + Math.max(0, Math.min(1, seconds / maxSeconds)) * (right - left);
+      const y = value => bottom - ((value - minTemp) / (maxTemp - minTemp)) * (bottom - top);
+      const pathFor = (samples, key) => {
+        let path = '';
+        let drawing = false;
+        let previousSeconds = null;
+        for (const sample of (samples || [])) {
+          const seconds = Number(sample.elapsed_seconds);
+          const rawValue = sample[key];
+          const value = typeof rawValue === 'number' ? rawValue : NaN;
+          if (!Number.isFinite(seconds) || !Number.isFinite(value)) {
+            drawing = false;
+            previousSeconds = null;
+            continue;
+          }
+          const gap = previousSeconds != null && seconds - previousSeconds > 2.5;
+          path += `${!drawing || gap ? 'M' : 'L'}${x(seconds).toFixed(1)},${y(value).toFixed(1)} `;
+          drawing = true;
+          previousSeconds = seconds;
+        }
+        return path.trim();
+      };
+      const series = runs.map((run, index) => ({
+        id: run.id,
+        name: run.name,
+        nodeName: run.node_name,
+        color: this.temperatureRunColor(run.id),
+        cpuPath: pathFor(run.samples, 'cpu_temp_c'),
+        gpuPath: pathFor(run.samples, 'gpu_temp_c'),
+        legendX: left + (index % legendColumns) * 272,
+        legendY: 22 + Math.floor(index / legendColumns) * 27,
+      }));
+      const tickCount = 5;
+      const ticks = Array.from({length: tickCount}, (_, index) => {
+        const value = maxTemp - (index * (maxTemp - minTemp) / (tickCount - 1));
+        return {value, y: y(value), label: `${Math.round(value)}°C`};
+      });
+      return {left, right, top, bottom, minTemp, maxTemp, maxSeconds, ticks, series};
+    },
+    fmtTemperatureRunDuration(seconds) {
+      const value = Math.max(0, Math.round(Number(seconds) || 0));
+      if (value < 60) return `${value}s`;
+      if (value < 3600) return `${Math.floor(value / 60)}m ${value % 60}s`;
+      return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
+    },
+    _downloadTemperatureBlob(blob, extension) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `temperature-runs-${stamp}.${extension}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    exportTemperatureCSV() {
+      const runs = this.temperatureSelectedRunData();
+      if (!runs.length) return;
+      const cell = value => {
+        const text = value == null ? '' : String(value);
+        return `"${text.replace(/"/g, '""')}"`;
+      };
+      const rows = [[
+        'run_id', 'run_name', 'node', 'elapsed_seconds', 'cpu_temp_c', 'gpu_temp_c',
+      ]];
+      for (const run of runs) {
+        for (const sample of (run.samples || [])) {
+          rows.push([
+            run.id, run.name, run.node_name || run.node_id,
+            sample.elapsed_seconds, sample.cpu_temp_c, sample.gpu_temp_c,
+          ]);
+        }
+      }
+      const csv = rows.map(row => row.map(cell).join(',')).join('\n');
+      this._downloadTemperatureBlob(
+        new Blob([csv], {type: 'text/csv;charset=utf-8'}), 'csv'
+      );
+    },
+    async exportTemperaturePNG() {
+      const svg = this.$refs.temperatureRunChart;
+      if (!svg || !this.temperatureSelectedRunData().length) return;
+      try {
+        const clone = svg.cloneNode(true);
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        clone.setAttribute('width', '1800');
+        clone.setAttribute('height', '960');
+        const source = new XMLSerializer().serializeToString(clone);
+        const svgUrl = URL.createObjectURL(new Blob([source], {type: 'image/svg+xml'}));
+        const image = new Image();
+        await new Promise((resolve, reject) => {
+          image.onload = resolve;
+          image.onerror = reject;
+          image.src = svgUrl;
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = 1800;
+        canvas.height = 960;
+        const context = canvas.getContext('2d');
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(svgUrl);
+        const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        if (!png) throw new Error('PNG encoder returned no data');
+        this._downloadTemperatureBlob(png, 'png');
+      } catch (error) {
+        this.temperatureRunError = `PNG export failed: ${error.message}`;
+      }
+    },
     gpu() { return this.state?.stats?.gpus?.[0] || null; },
     gpuTotalGb() {
       const totalMib = this.state?.stats?.gpus?.[0]?.mem_total_mib;
@@ -832,11 +1175,11 @@ function app() {
       }
       return '—';
     },
-    // Average decode speed (output tokens / generation time, prefill excluded).
-    avgSpeed(model) {
+    // Average prompt-processing speed for requests with a measured TTFT.
+    avgPPSpeed(model) {
       const r = this.tokenStatsFor(model);
-      if (!r || !r.gen_time_s) return null;
-      const v = r.gen_tokens / r.gen_time_s;
+      if (!r || !r.pp_time_s) return null;
+      const v = r.pp_tokens / r.pp_time_s;
       return isFinite(v) ? v : null;
     },
     // Live in-flight stream stats for a model, fed by the fixed 2-second poll:
@@ -847,13 +1190,18 @@ function app() {
       const a = this.liveRequestRates?.[model];
       return a && a.connections > 0 ? a : null;
     },
-    // While streams are active this is the live aggregate rate; otherwise
-    // the lifetime average.
-    fmtSpeed(model) {
-      const live = this.liveReqs(model);
-      if (live) return `${live.output_tok_s.toFixed(1)} tok/s`;
-      const v = this.avgSpeed(model);
+    fmtPPSpeed(model) {
+      const v = this.avgPPSpeed(model);
       return v != null ? `${v.toFixed(1)} tok/s` : '—';
+    },
+    fmtLivePPSpeed(model) {
+      const live = this.liveReqs(model);
+      const value = Number(live?.pp_tok_s);
+      if (Number.isFinite(value) && value > 0) {
+        return `${value.toFixed(1)} tok/s`;
+      }
+      if (live?.pp_measuring > 0) return 'measuring…';
+      return this.fmtPPSpeed(model);
     },
     fmtMessageRate(tokens, elapsedMs) {
       if (!tokens || !elapsedMs) return '—';
@@ -1108,6 +1456,29 @@ function app() {
       return [...new Set(Object.values(this.state?.usage_merge_groups || {}).filter(Boolean))]
         .sort((a, b) => a.localeCompare(b));
     },
+    usageRoutingRules() {
+      return Object.entries(this.state?.usage_routing_rules || {})
+        .map(([source, destination]) => ({source, destination}))
+        .sort((left, right) => left.source.localeCompare(
+          right.source, undefined, {numeric: true, sensitivity: 'base'}
+        ));
+    },
+    usageRuleModels() {
+      const models = new Set(Object.keys(this.state?.token_stats || {}));
+      for (const {source, destination} of this.usageRoutingRules()) {
+        models.add(source);
+        models.add(destination);
+      }
+      return [...models].sort((a, b) => a.localeCompare(
+        b, undefined, {numeric: true, sensitivity: 'base'}
+      ));
+    },
+    usageVisibleMembers(row) {
+      return (row?.members || []).filter(member => !member.routed_to);
+    },
+    usageMasterMember(row) {
+      return this.usageVisibleMembers(row)[0] || null;
+    },
     usageAverageSpeed(row) {
       if (row?.speed?.tok_s == null) return null;
       const value = Number(row?.speed?.tok_s);
@@ -1121,12 +1492,37 @@ function app() {
       const value = this.usageCostValue(row);
       return value > 0 ? this.fmtCost(value) : '—';
     },
+    usageInputMiss(row) {
+      const stats = row?.stats || {};
+      const value = stats.input_miss ?? Math.max(0, Number(stats.input || 0) - Number(stats.cached || 0));
+      return Math.max(0, Number(value || 0));
+    },
+    usageCachedTokens(row) {
+      return Math.max(0, Number(row?.stats?.cached || 0));
+    },
+    usageTokensDisplay(row, value) {
+      const prefix = Number(row?.stats?.estimated_cached || 0) > 0 ? '~' : '';
+      return `${prefix}${this.fmtTokens(value)}`;
+    },
+    usageInputBreakdownTitle(row) {
+      const stats = row?.stats || {};
+      const estimated = Number(stats.estimated_cached || 0);
+      if (!estimated) return 'Prompt tokens newly processed (cache misses)';
+      return `Estimated cache misses. Cache hits include ${this.fmtTokens(stats.measured_cached || 0)} measured + ${this.fmtTokens(estimated)} estimated legacy tokens at ${Number(row.cache_estimate?.rate_pct || 0).toFixed(1)}%.`;
+    },
+    usageCacheBreakdownTitle(row) {
+      const stats = row?.stats || {};
+      const estimated = Number(stats.estimated_cached || 0);
+      if (!estimated) return 'Measured prompt tokens reused from the prefix/KV cache';
+      return `${this.fmtTokens(stats.measured_cached || 0)} measured + ${this.fmtTokens(estimated)} estimated legacy cache-hit tokens.`;
+    },
     usageSortValue(row, key) {
       const stats = row.stats || {};
       if (key === 'model') return String(row.label || row.key).toLocaleLowerCase();
       if (key === 'speed') return this.usageAverageSpeed(row);
       if (key === 'time') return Number(stats.gen_time_s || 0);
       if (key === 'cost') return this.usageCostValue(row);
+      if (key === 'input') return this.usageInputMiss(row);
       return Number(stats[key] || 0);
     },
     usageRows() {
@@ -1228,11 +1624,63 @@ function app() {
         this.usageEraseBusy[model] = false;
       }
     },
+    async saveUsageRoutingRule() {
+      const source = this.usageRuleSource.trim();
+      const destination = this.usageRuleDestination.trim();
+      if (!source || !destination) {
+        alert('Enter both a source model and a destination model.');
+        return;
+      }
+      if (this.usageRuleSaving) return;
+      this.usageRuleSaving = true;
+      this.usageRuleSaved = false;
+      try {
+        const response = await fetch('/api/token-stats/rules', {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({source, destination}),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.usageRuleSource = '';
+        this.usageRuleDestination = '';
+        this.usageRuleSaved = true;
+        setTimeout(() => { this.usageRuleSaved = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Rule save failed: ' + error.message);
+      } finally {
+        this.usageRuleSaving = false;
+      }
+    },
+    async deleteUsageRoutingRule(source) {
+      if (this.usageRuleDeleting[source]) return;
+      this.usageRuleDeleting[source] = true;
+      try {
+        const response = await fetch(
+          `/api/token-stats/rules/${encodeURIComponent(source)}`,
+          {method: 'DELETE'},
+        );
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        await this.refresh();
+      } catch (error) {
+        alert('Rule delete failed: ' + error.message);
+      } finally {
+        this.usageRuleDeleting[source] = false;
+      }
+    },
     totalInputTokens() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.input || 0), 0);
     },
     totalCachedTokens() {
-      return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.cached || 0), 0);
+      return (this.state?.usage_rows || []).reduce((s, row) => s + this.usageCachedTokens(row), 0);
+    },
+    totalInputMissTokens() {
+      return (this.state?.usage_rows || []).reduce((s, row) => s + this.usageInputMiss(row), 0);
+    },
+    usageTotalsEstimated() {
+      return (this.state?.usage_rows || []).some(row => Number(row?.stats?.estimated_cached || 0) > 0);
     },
     totalOutputTokens() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.output || 0), 0);
@@ -1240,11 +1688,11 @@ function app() {
     totalRequests() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.requests || 0), 0);
     },
-    // Total cost across all raw models, using the server's authoritative
-    // deployment/standalone/built-in pricing resolution.
+    // Sum the authoritative display rows so routed source usage uses its
+    // destination/master model's pricing without double-counting raw models.
     totalCost() {
-      const total = Object.values(this.state?.token_costs || {})
-        .reduce((sum, cost) => sum + Number(cost?.total_cost || 0), 0);
+      const total = (this.state?.usage_rows || [])
+        .reduce((sum, row) => sum + Number(row?.total_cost || 0), 0);
       return total > 0 ? this.fmtCost(total) : '—';
     },
     // Opportunity cost for a flagship model: total tokens × per-1M rate.
@@ -1501,6 +1949,30 @@ function app() {
       }).join(' ');
     },
 
+    deploymentAdditionalArgs(args) {
+      // Scalar options with dedicated editor fields must not also appear in
+      // the raw flags textarea. Otherwise editing the raw copy is silently
+      // undone by the stale structured value when the settings are saved.
+      const managed = new Set([
+        '--context-length', '--max-model-len', '--max-model-length',
+        '--max-running-requests', '--max-num-seqs', '--kv-cache-dtype',
+        '--max-cudagraph-capture-size', '--max-num-batched-tokens',
+      ]);
+      const result = [];
+      const values = args || [];
+      for (let i = 0; i < values.length; i++) {
+        const value = String(values[i]);
+        const name = value.split('=', 1)[0];
+        if (!managed.has(name)) {
+          result.push(values[i]);
+          continue;
+        }
+        if (!value.includes('=') && i + 1 < values.length
+            && !String(values[i + 1]).startsWith('--')) i++;
+      }
+      return result;
+    },
+
     parsePasteCmd() {
       const txt = (this.form.pasteCmd || '').trim();
       if (!txt) return;
@@ -1680,6 +2152,59 @@ function app() {
         : `${rank}: ${detail}`;
     },
 
+    deploymentApiModel(deployment) {
+      return deployment?.served_model
+        || deployment?.served_models?.[0]
+        || deployment?.model
+        || 'Unknown model';
+    },
+
+    deploymentDisplayName(deployment) {
+      const apiModel = this.deploymentApiModel(deployment);
+      const name = deployment?.name;
+      // A deployment created without a nickname inherits the backing model
+      // path. Treat that generated value as a fallback, not a public label.
+      return name && name !== deployment?.model ? name : apiModel;
+    },
+
+    deploymentInUse(deployment) {
+      const statsKey = deployment?.stats_key;
+      return Boolean(statsKey && this.liveReqs(statsKey));
+    },
+
+    deploymentLastUsedLabel(deployment) {
+      if (this.deploymentInUse(deployment)) return 'In-Use';
+      const timestamp = Number(deployment?.last_used_at);
+      if (!Number.isFinite(timestamp) || timestamp <= 0) return 'Never used';
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+      if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'} ago`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+      const days = Math.floor(hours / 24);
+      return `${days} day${days === 1 ? '' : 's'} ago`;
+    },
+
+    deploymentLastUsedClass(deployment) {
+      if (this.deploymentInUse(deployment)) return 'pill-error';
+      return Number(deployment?.last_used_at) > 0 ? '' : 'deployment-never-used';
+    },
+
+    deploymentLastUsedStyle(deployment) {
+      if (this.deploymentInUse(deployment)) return '';
+      const timestamp = Number(deployment?.last_used_at);
+      if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+      const elapsed = Math.max(0, Date.now() / 1000 - timestamp);
+      const progress = Math.min(1, elapsed / (30 * 60));
+      const red = [239, 91, 91];
+      const green = [111, 207, 151];
+      const rgb = red.map((value, index) => Math.round(
+        value + (green[index] - value) * progress
+      ));
+      return `color: rgb(${rgb.join(',')}); background: rgba(${rgb.join(',')},.14); border-color: rgba(${rgb.join(',')},.42)`;
+    },
+
     async pairClusterNode() {
       if (!this.clusterForm.agent_url || !this.clusterForm.pairing_code) return;
       this.clusterPairing = true;
@@ -1798,7 +2323,7 @@ function app() {
         model: settings.model || deployment?.model || '',
         engine: settings.engine || deployment?.engine || 'vllm',
         image: settings.image || '',
-        extra: this.shellJoin(settings.extra_args || []),
+        extra: this.shellJoin(this.deploymentAdditionalArgs(settings.extra_args)),
         gpu_mem_mode: gpuGb != null ? 'gb' : 'fraction',
         gpu_memory_utilization: settings.gpu_memory_utilization ?? 0.9,
         gpu_memory_gb: gpuGb ?? null,

@@ -143,6 +143,11 @@ function app() {
     usageAliasSaving: {},
     usageEraseBusy: {},
     usageAliasSaved: {},
+    usageRuleSource: '',
+    usageRuleDestination: '',
+    usageRuleSaving: false,
+    usageRuleSaved: false,
+    usageRuleDeleting: {},
     analysisDateStart: '',         // YYYY-MM-DD or '' for default range
     analysisDateEnd: '',           // YYYY-MM-DD or '' for default range
     analysisChartMode: 'hour',     // 'hour' | 'day'
@@ -191,6 +196,17 @@ function app() {
     pricingSaved: false,
 
     // ─── lifecycle ───────────────────────────────────────────
+    _hasSelectedText() {
+      const selection = window.getSelection?.();
+      if (selection && !selection.isCollapsed && selection.toString()) return true;
+
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        return Number(active.selectionEnd) > Number(active.selectionStart);
+      }
+      return false;
+    },
+
     async init() {
       // On mobile, start stats collapsed so the topbar doesn't eat the whole screen.
       this.topbarStatsCollapsed = window.innerWidth <= 720;
@@ -199,17 +215,19 @@ function app() {
       await this.refreshTemperatureHistory();
       await this.refreshLiveRequestRates();
       // 1 Hz stats polling, paused when the tab isn't visible so we don't
-      // wake the GPU compositor for invisible repaints.
+      // wake the GPU compositor for invisible repaints. Automatic updates
+      // also defer while text is selected so Alpine DOM patches do not clear
+      // a selection the user is copying.
       setInterval(() => {
-        if (!document.hidden) this.refreshStats();
+        if (!document.hidden) this.refreshStats(true);
       }, 1000);
       // Token rates are deliberately sampled at a stable two-second cadence;
       // SSE chunk frequency must not control how often the widget repaints.
       setInterval(() => {
-        if (!document.hidden) this.refreshLiveRequestRates();
+        if (!document.hidden) this.refreshLiveRequestRates(true);
       }, 2 * 1000);
       setInterval(() => {
-        if (!document.hidden) this.refresh();
+        if (!document.hidden) this.refresh(true);
       }, 2500);
       // Disk space changes slowly — poll it every 5 minutes instead.
       setInterval(() => {
@@ -217,15 +235,15 @@ function app() {
       }, 5 * 60 * 1000);
       // Temperature history changes only once per 30-second server sample.
       setInterval(() => {
-        if (!document.hidden) this.refreshTemperatureHistory();
+        if (!document.hidden) this.refreshTemperatureHistory(true);
       }, 30 * 1000);
       // Refresh immediately on tab regaining focus.
       document.addEventListener('visibilitychange', () => {
         if (!document.hidden) {
-          this.refreshStats();
-          this.refresh();
-          this.refreshTemperatureHistory();
-          this.refreshLiveRequestRates();
+          this.refreshStats(true);
+          this.refresh(true);
+          this.refreshTemperatureHistory(true);
+          this.refreshLiveRequestRates(true);
           if (!this.diskLastAt || Date.now() - this.diskLastAt > 5 * 60 * 1000) {
             this.refreshDisk();
           }
@@ -254,11 +272,13 @@ function app() {
       });
     },
 
-    async refresh() {
+    async refresh(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       try {
         const r = await fetch(`/api/state?t=${Date.now()}`);
         if (!r.ok) throw new Error(r.statusText);
         const s = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         this.state = s;
         if (!(s.nodes || []).some(n => n.id === this.statsNodeId && n.online)) {
           this.statsNodeId = (s.nodes || []).find(n => n.local && n.online)?.id
@@ -350,13 +370,15 @@ function app() {
       }
     },
 
-    async refreshStats() {
+    async refreshStats(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       // Lightweight stats refresh between full refreshes
       try {
         // Bust caches so browser doesn't serve a stale stats snapshot.
         const r = await fetch(`/api/stats?t=${Date.now()}`);
         if (!r.ok) return;
         const stats = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         if (this.state) this.state.stats = stats;
         // Sync the max-speed toggle with the daemon's reported state.
         if (stats.fan && typeof stats.fan.max_speed === 'boolean') {
@@ -400,12 +422,14 @@ function app() {
       }
     },
 
-    async refreshTemperatureHistory() {
+    async refreshTemperatureHistory(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       const nodeId = this.selectedStatsNode()?.id || this.statsNodeId || 'local';
       try {
         const r = await fetch(`/api/temperature-history?node_id=${encodeURIComponent(nodeId)}&t=${Date.now()}`);
         if (!r.ok) return;
         const history = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
         this.temperatureHistoryByNode = {
           ...this.temperatureHistoryByNode,
           [nodeId]: history,
@@ -416,11 +440,14 @@ function app() {
       }
     },
 
-    async refreshLiveRequestRates() {
+    async refreshLiveRequestRates(preserveSelection = false) {
+      if (preserveSelection && this._hasSelectedText()) return;
       try {
         const r = await fetch(`/api/active-request-rates?t=${Date.now()}`);
         if (!r.ok) return;
-        this.liveRequestRates = await r.json();
+        const rates = await r.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.liveRequestRates = rates;
       } catch {
         // Retain the last sample until the next fixed-cadence poll.
       }
@@ -832,11 +859,11 @@ function app() {
       }
       return '—';
     },
-    // Average decode speed (output tokens / generation time, prefill excluded).
-    avgSpeed(model) {
+    // Average prompt-processing speed for requests with a measured TTFT.
+    avgPPSpeed(model) {
       const r = this.tokenStatsFor(model);
-      if (!r || !r.gen_time_s) return null;
-      const v = r.gen_tokens / r.gen_time_s;
+      if (!r || !r.pp_time_s) return null;
+      const v = r.pp_tokens / r.pp_time_s;
       return isFinite(v) ? v : null;
     },
     // Live in-flight stream stats for a model, fed by the fixed 2-second poll:
@@ -847,13 +874,18 @@ function app() {
       const a = this.liveRequestRates?.[model];
       return a && a.connections > 0 ? a : null;
     },
-    // While streams are active this is the live aggregate rate; otherwise
-    // the lifetime average.
-    fmtSpeed(model) {
-      const live = this.liveReqs(model);
-      if (live) return `${live.output_tok_s.toFixed(1)} tok/s`;
-      const v = this.avgSpeed(model);
+    fmtPPSpeed(model) {
+      const v = this.avgPPSpeed(model);
       return v != null ? `${v.toFixed(1)} tok/s` : '—';
+    },
+    fmtLivePPSpeed(model) {
+      const live = this.liveReqs(model);
+      const value = Number(live?.pp_tok_s);
+      if (Number.isFinite(value) && value > 0) {
+        return `${value.toFixed(1)} tok/s`;
+      }
+      if (live?.pp_measuring > 0) return 'measuring…';
+      return this.fmtPPSpeed(model);
     },
     fmtMessageRate(tokens, elapsedMs) {
       if (!tokens || !elapsedMs) return '—';
@@ -1108,6 +1140,29 @@ function app() {
       return [...new Set(Object.values(this.state?.usage_merge_groups || {}).filter(Boolean))]
         .sort((a, b) => a.localeCompare(b));
     },
+    usageRoutingRules() {
+      return Object.entries(this.state?.usage_routing_rules || {})
+        .map(([source, destination]) => ({source, destination}))
+        .sort((left, right) => left.source.localeCompare(
+          right.source, undefined, {numeric: true, sensitivity: 'base'}
+        ));
+    },
+    usageRuleModels() {
+      const models = new Set(Object.keys(this.state?.token_stats || {}));
+      for (const {source, destination} of this.usageRoutingRules()) {
+        models.add(source);
+        models.add(destination);
+      }
+      return [...models].sort((a, b) => a.localeCompare(
+        b, undefined, {numeric: true, sensitivity: 'base'}
+      ));
+    },
+    usageVisibleMembers(row) {
+      return (row?.members || []).filter(member => !member.routed_to);
+    },
+    usageMasterMember(row) {
+      return this.usageVisibleMembers(row)[0] || null;
+    },
     usageAverageSpeed(row) {
       if (row?.speed?.tok_s == null) return null;
       const value = Number(row?.speed?.tok_s);
@@ -1121,12 +1176,37 @@ function app() {
       const value = this.usageCostValue(row);
       return value > 0 ? this.fmtCost(value) : '—';
     },
+    usageInputMiss(row) {
+      const stats = row?.stats || {};
+      const value = stats.input_miss ?? Math.max(0, Number(stats.input || 0) - Number(stats.cached || 0));
+      return Math.max(0, Number(value || 0));
+    },
+    usageCachedTokens(row) {
+      return Math.max(0, Number(row?.stats?.cached || 0));
+    },
+    usageTokensDisplay(row, value) {
+      const prefix = Number(row?.stats?.estimated_cached || 0) > 0 ? '~' : '';
+      return `${prefix}${this.fmtTokens(value)}`;
+    },
+    usageInputBreakdownTitle(row) {
+      const stats = row?.stats || {};
+      const estimated = Number(stats.estimated_cached || 0);
+      if (!estimated) return 'Prompt tokens newly processed (cache misses)';
+      return `Estimated cache misses. Cache hits include ${this.fmtTokens(stats.measured_cached || 0)} measured + ${this.fmtTokens(estimated)} estimated legacy tokens at ${Number(row.cache_estimate?.rate_pct || 0).toFixed(1)}%.`;
+    },
+    usageCacheBreakdownTitle(row) {
+      const stats = row?.stats || {};
+      const estimated = Number(stats.estimated_cached || 0);
+      if (!estimated) return 'Measured prompt tokens reused from the prefix/KV cache';
+      return `${this.fmtTokens(stats.measured_cached || 0)} measured + ${this.fmtTokens(estimated)} estimated legacy cache-hit tokens.`;
+    },
     usageSortValue(row, key) {
       const stats = row.stats || {};
       if (key === 'model') return String(row.label || row.key).toLocaleLowerCase();
       if (key === 'speed') return this.usageAverageSpeed(row);
       if (key === 'time') return Number(stats.gen_time_s || 0);
       if (key === 'cost') return this.usageCostValue(row);
+      if (key === 'input') return this.usageInputMiss(row);
       return Number(stats[key] || 0);
     },
     usageRows() {
@@ -1228,11 +1308,63 @@ function app() {
         this.usageEraseBusy[model] = false;
       }
     },
+    async saveUsageRoutingRule() {
+      const source = this.usageRuleSource.trim();
+      const destination = this.usageRuleDestination.trim();
+      if (!source || !destination) {
+        alert('Enter both a source model and a destination model.');
+        return;
+      }
+      if (this.usageRuleSaving) return;
+      this.usageRuleSaving = true;
+      this.usageRuleSaved = false;
+      try {
+        const response = await fetch('/api/token-stats/rules', {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({source, destination}),
+        });
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        this.usageRuleSource = '';
+        this.usageRuleDestination = '';
+        this.usageRuleSaved = true;
+        setTimeout(() => { this.usageRuleSaved = false; }, 2500);
+        await this.refresh();
+      } catch (error) {
+        alert('Rule save failed: ' + error.message);
+      } finally {
+        this.usageRuleSaving = false;
+      }
+    },
+    async deleteUsageRoutingRule(source) {
+      if (this.usageRuleDeleting[source]) return;
+      this.usageRuleDeleting[source] = true;
+      try {
+        const response = await fetch(
+          `/api/token-stats/rules/${encodeURIComponent(source)}`,
+          {method: 'DELETE'},
+        );
+        const reply = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(reply.detail || response.statusText);
+        await this.refresh();
+      } catch (error) {
+        alert('Rule delete failed: ' + error.message);
+      } finally {
+        this.usageRuleDeleting[source] = false;
+      }
+    },
     totalInputTokens() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.input || 0), 0);
     },
     totalCachedTokens() {
-      return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.cached || 0), 0);
+      return (this.state?.usage_rows || []).reduce((s, row) => s + this.usageCachedTokens(row), 0);
+    },
+    totalInputMissTokens() {
+      return (this.state?.usage_rows || []).reduce((s, row) => s + this.usageInputMiss(row), 0);
+    },
+    usageTotalsEstimated() {
+      return (this.state?.usage_rows || []).some(row => Number(row?.stats?.estimated_cached || 0) > 0);
     },
     totalOutputTokens() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.output || 0), 0);
@@ -1240,11 +1372,11 @@ function app() {
     totalRequests() {
       return Object.values(this.state?.token_stats || {}).reduce((s, r) => s + (r.requests || 0), 0);
     },
-    // Total cost across all raw models, using the server's authoritative
-    // deployment/standalone/built-in pricing resolution.
+    // Sum the authoritative display rows so routed source usage uses its
+    // destination/master model's pricing without double-counting raw models.
     totalCost() {
-      const total = Object.values(this.state?.token_costs || {})
-        .reduce((sum, cost) => sum + Number(cost?.total_cost || 0), 0);
+      const total = (this.state?.usage_rows || [])
+        .reduce((sum, row) => sum + Number(row?.total_cost || 0), 0);
       return total > 0 ? this.fmtCost(total) : '—';
     },
     // Opportunity cost for a flagship model: total tokens × per-1M rate.
@@ -1501,6 +1633,30 @@ function app() {
       }).join(' ');
     },
 
+    deploymentAdditionalArgs(args) {
+      // Scalar options with dedicated editor fields must not also appear in
+      // the raw flags textarea. Otherwise editing the raw copy is silently
+      // undone by the stale structured value when the settings are saved.
+      const managed = new Set([
+        '--context-length', '--max-model-len', '--max-model-length',
+        '--max-running-requests', '--max-num-seqs', '--kv-cache-dtype',
+        '--max-cudagraph-capture-size', '--max-num-batched-tokens',
+      ]);
+      const result = [];
+      const values = args || [];
+      for (let i = 0; i < values.length; i++) {
+        const value = String(values[i]);
+        const name = value.split('=', 1)[0];
+        if (!managed.has(name)) {
+          result.push(values[i]);
+          continue;
+        }
+        if (!value.includes('=') && i + 1 < values.length
+            && !String(values[i + 1]).startsWith('--')) i++;
+      }
+      return result;
+    },
+
     parsePasteCmd() {
       const txt = (this.form.pasteCmd || '').trim();
       if (!txt) return;
@@ -1680,6 +1836,59 @@ function app() {
         : `${rank}: ${detail}`;
     },
 
+    deploymentApiModel(deployment) {
+      return deployment?.served_model
+        || deployment?.served_models?.[0]
+        || deployment?.model
+        || 'Unknown model';
+    },
+
+    deploymentDisplayName(deployment) {
+      const apiModel = this.deploymentApiModel(deployment);
+      const name = deployment?.name;
+      // A deployment created without a nickname inherits the backing model
+      // path. Treat that generated value as a fallback, not a public label.
+      return name && name !== deployment?.model ? name : apiModel;
+    },
+
+    deploymentInUse(deployment) {
+      const statsKey = deployment?.stats_key;
+      return Boolean(statsKey && this.liveReqs(statsKey));
+    },
+
+    deploymentLastUsedLabel(deployment) {
+      if (this.deploymentInUse(deployment)) return 'In-Use';
+      const timestamp = Number(deployment?.last_used_at);
+      if (!Number.isFinite(timestamp) || timestamp <= 0) return 'Never used';
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+      if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'} ago`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+      const days = Math.floor(hours / 24);
+      return `${days} day${days === 1 ? '' : 's'} ago`;
+    },
+
+    deploymentLastUsedClass(deployment) {
+      if (this.deploymentInUse(deployment)) return 'pill-error';
+      return Number(deployment?.last_used_at) > 0 ? '' : 'deployment-never-used';
+    },
+
+    deploymentLastUsedStyle(deployment) {
+      if (this.deploymentInUse(deployment)) return '';
+      const timestamp = Number(deployment?.last_used_at);
+      if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+      const elapsed = Math.max(0, Date.now() / 1000 - timestamp);
+      const progress = Math.min(1, elapsed / (30 * 60));
+      const red = [239, 91, 91];
+      const green = [111, 207, 151];
+      const rgb = red.map((value, index) => Math.round(
+        value + (green[index] - value) * progress
+      ));
+      return `color: rgb(${rgb.join(',')}); background: rgba(${rgb.join(',')},.14); border-color: rgba(${rgb.join(',')},.42)`;
+    },
+
     async pairClusterNode() {
       if (!this.clusterForm.agent_url || !this.clusterForm.pairing_code) return;
       this.clusterPairing = true;
@@ -1798,7 +2007,7 @@ function app() {
         model: settings.model || deployment?.model || '',
         engine: settings.engine || deployment?.engine || 'vllm',
         image: settings.image || '',
-        extra: this.shellJoin(settings.extra_args || []),
+        extra: this.shellJoin(this.deploymentAdditionalArgs(settings.extra_args)),
         gpu_mem_mode: gpuGb != null ? 'gb' : 'fraction',
         gpu_memory_utilization: settings.gpu_memory_utilization ?? 0.9,
         gpu_memory_gb: gpuGb ?? null,

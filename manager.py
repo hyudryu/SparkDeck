@@ -142,6 +142,12 @@ TEMPERATURE_HISTORY_MAX_SAMPLES = (
     int(TEMPERATURE_HISTORY_WINDOW_SECONDS / TEMPERATURE_HISTORY_INTERVAL_SECONDS) + 1
 )
 
+# On-demand benchmark recordings use a finer cadence than the compact header
+# history. A run is armed at a target temperature, starts once the hottest
+# available CPU/GPU sensor reaches the configured margin above that target,
+# and stops automatically after the node cools below the target.
+TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS = 1.0
+
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
@@ -336,6 +342,7 @@ class Manager:
         self.deployment_capacity_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
         self.temperature_history_task: asyncio.Task | None = None
+        self.temperature_recording_task: asyncio.Task | None = None
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
@@ -372,6 +379,20 @@ class Manager:
         self._remote_temperature_histories: dict[
             str, deque[dict[str, float | None]]
         ] = {}
+        self.temperature_runs_path = self.data_dir / "temperature_runs.json"
+        self.temperature_runs: dict[str, dict] = self._load_temperature_runs()
+        self._active_temperature_run_id: str | None = None
+        self._temperature_recording_lock = asyncio.Lock()
+        self._temperature_runs_last_saved_at = 0.0
+        interrupted_runs = False
+        for run in self.temperature_runs.values():
+            if run.get("status") not in {"armed", "recording"}:
+                continue
+            run["status"] = "interrupted"
+            run["stopped_at"] = run.get("last_sample_at") or time.time()
+            interrupted_runs = True
+        if interrupted_runs:
+            self._save_temperature_runs()
         # container_name -> {"last_active": ts, "counter": int}
         self._activity: dict[str, dict] = {}
         # timestamp, {iface: (rx_bytes, tx_bytes)}
@@ -480,6 +501,7 @@ class Manager:
             self.deployment_capacity_task,
             self.fan_cluster_task,
             self.temperature_history_task,
+            self.temperature_recording_task,
             self.inference_nudger_task,
             self.token_usage_sync_task,
         ):
@@ -489,6 +511,14 @@ class Manager:
                     await t
                 except asyncio.CancelledError:
                     pass
+        active_run_id = getattr(self, "_active_temperature_run_id", None)
+        active_run = getattr(self, "temperature_runs", {}).get(active_run_id)
+        if active_run and active_run.get("status") in {"armed", "recording"}:
+            active_run["status"] = "interrupted"
+            active_run["stopped_at"] = time.time()
+            self._save_temperature_runs()
+        self._active_temperature_run_id = None
+        self.temperature_recording_task = None
         self._stop_mem_bw_monitor()
         await self.http.aclose()
 
@@ -8941,6 +8971,256 @@ class Manager:
         except RuntimeError:
             result = self.temperature_history(deque())
         return {"node_id": node_id, **(result or {})}
+
+    def _load_temperature_runs(self) -> dict[str, dict]:
+        try:
+            raw = json.loads(self.temperature_runs_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        entries = raw.get("runs") if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return {}
+        runs: dict[str, dict] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            run_id = str(entry.get("id") or "").strip()
+            if not run_id:
+                continue
+            run = copy.deepcopy(entry)
+            run["id"] = run_id
+            run["name"] = str(run.get("name") or f"Temperature run {run_id}")[:120]
+            run["samples"] = [
+                sample for sample in (run.get("samples") or [])
+                if isinstance(sample, dict)
+            ]
+            runs[run_id] = run
+        return runs
+
+    def _save_temperature_runs(self) -> None:
+        path = self.temperature_runs_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "version": 1,
+            "runs": list(self.temperature_runs.values()),
+        }, indent=2), encoding="utf-8")
+        temporary.replace(path)
+        self._temperature_runs_last_saved_at = time.time()
+
+    @staticmethod
+    def _public_temperature_run(run: dict, *, include_samples: bool = False) -> dict:
+        public = {
+            key: copy.deepcopy(value)
+            for key, value in run.items()
+            if key != "samples"
+        }
+        samples = run.get("samples") or []
+        public["sample_count"] = len(samples)
+        if samples:
+            public["duration_seconds"] = round(
+                max(0.0, float(samples[-1].get("elapsed_seconds") or 0.0)), 3,
+            )
+        else:
+            public["duration_seconds"] = 0.0
+        if include_samples:
+            public["samples"] = copy.deepcopy(samples)
+        return public
+
+    def temperature_runs_state(self) -> dict:
+        runs = sorted(
+            (
+                self._public_temperature_run(run)
+                for run in self.temperature_runs.values()
+            ),
+            key=lambda run: float(run.get("armed_at") or 0.0),
+            reverse=True,
+        )
+        return {
+            "sample_interval_seconds": TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS,
+            "active_run_id": self._active_temperature_run_id,
+            "runs": runs,
+        }
+
+    def temperature_run(self, run_id: str) -> dict:
+        run = self.temperature_runs.get(str(run_id or ""))
+        if not run:
+            raise ValueError("temperature run not found")
+        return self._public_temperature_run(run, include_samples=True)
+
+    @staticmethod
+    def _temperature_run_values(stats: dict) -> tuple[float | None, float | None]:
+        def finite(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return round(value, 1) if math.isfinite(value) else None
+
+        gpu = (stats.get("gpus") or [{}])[0]
+        return finite(stats.get("cpu_temp_c")), finite(gpu.get("temp"))
+
+    async def _temperature_stats_for_node(self, node_id: str) -> dict:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return await self.get_stats()
+        result = await self.node_registry.request(
+            node_id, "GET", "/api/agent/stats", timeout=5,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("node returned invalid temperature telemetry")
+        return result
+
+    def _temperature_node_name(self, node_id: str) -> str:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return str(self.settings.get("cluster_node_name") or socket.gethostname())
+        node = self.node_registry.get(node_id)
+        if not node:
+            raise ValueError("target node not found")
+        if not node.get("enabled", True):
+            raise ValueError(f"node {node.get('name', node_id)} is disabled")
+        return str(node.get("name") or node.get("hostname") or node_id)
+
+    def _process_temperature_run_sample(
+        self, run: dict, stats: dict, observed_at: float,
+    ) -> str:
+        cpu_temp, gpu_temp = self._temperature_run_values(stats)
+        available = [value for value in (cpu_temp, gpu_temp) if value is not None]
+        hottest = max(available) if available else None
+        status = run.get("status")
+        if status == "armed":
+            if hottest is None or hottest < float(run["trigger_temp_c"]):
+                return "waiting"
+            run["status"] = "recording"
+            run["started_at"] = observed_at
+            status = "recording"
+
+        if status != "recording":
+            return str(status or "idle")
+
+        started_at = float(run.get("started_at") or observed_at)
+        run.setdefault("samples", []).append({
+            "elapsed_seconds": round(max(0.0, observed_at - started_at), 3),
+            "cpu_temp_c": cpu_temp,
+            "gpu_temp_c": gpu_temp,
+        })
+        run["last_sample_at"] = observed_at
+        run.pop("last_error", None)
+        if hottest is not None and hottest < float(run["target_temp_c"]):
+            run["status"] = "complete"
+            run["stopped_at"] = observed_at
+            return "complete"
+        return "recording"
+
+    async def _temperature_recording_loop(self, run_id: str) -> None:
+        try:
+            while self._active_temperature_run_id == run_id:
+                await asyncio.sleep(TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS)
+                run = self.temperature_runs.get(run_id)
+                if not run or run.get("status") not in {"armed", "recording"}:
+                    break
+                observed_at = time.time()
+                try:
+                    stats = await self._temperature_stats_for_node(run["node_id"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    run["last_error"] = str(exc)
+                    stats = {}
+                result = self._process_temperature_run_sample(run, stats, observed_at)
+                if result == "complete":
+                    self._active_temperature_run_id = None
+                    self._save_temperature_runs()
+                    break
+                if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                    self._save_temperature_runs()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.temperature_recording_task is asyncio.current_task():
+                self.temperature_recording_task = None
+
+    async def arm_temperature_recording(
+        self,
+        node_id: Any,
+        target_temp_c: Any,
+        trigger_margin_pct: Any = 5.0,
+    ) -> dict:
+        node_id = str(node_id or LOCAL_NODE_ID).strip() or LOCAL_NODE_ID
+        try:
+            target = float(target_temp_c)
+            margin = float(trigger_margin_pct)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target temperature and trigger margin must be numbers") from exc
+        if not math.isfinite(target) or target < 1 or target > 120:
+            raise ValueError("target temperature must be between 1 and 120°C")
+        if not math.isfinite(margin) or margin < 0 or margin > 100:
+            raise ValueError("trigger margin must be between 0 and 100%")
+
+        async with self._temperature_recording_lock:
+            if self._active_temperature_run_id:
+                raise ValueError("a temperature run is already armed or recording")
+            node_name = self._temperature_node_name(node_id)
+            stats = await self._temperature_stats_for_node(node_id)
+            now = time.time()
+            run_id = uuid.uuid4().hex[:10]
+            run = {
+                "id": run_id,
+                "name": f"{node_name} · {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}",
+                "node_id": node_id,
+                "node_name": node_name,
+                "status": "armed",
+                "armed_at": now,
+                "started_at": None,
+                "stopped_at": None,
+                "target_temp_c": round(target, 1),
+                "trigger_margin_pct": round(margin, 1),
+                "trigger_temp_c": round(target * (1.0 + margin / 100.0), 1),
+                "samples": [],
+            }
+            self.temperature_runs[run_id] = run
+            self._active_temperature_run_id = run_id
+            self._process_temperature_run_sample(run, stats, now)
+            self._save_temperature_runs()
+            self.temperature_recording_task = asyncio.create_task(
+                self._temperature_recording_loop(run_id)
+            )
+            return self._public_temperature_run(run, include_samples=True)
+
+    async def cancel_armed_temperature_recording(self) -> dict:
+        async with self._temperature_recording_lock:
+            run_id = self._active_temperature_run_id
+            run = self.temperature_runs.get(run_id)
+            if not run:
+                raise ValueError("no temperature run is armed")
+            if run.get("status") != "armed":
+                raise ValueError(
+                    "recording has started and will stop automatically below its target"
+                )
+            task = self.temperature_recording_task
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            run["status"] = "cancelled"
+            run["stopped_at"] = time.time()
+            self._active_temperature_run_id = None
+            self.temperature_recording_task = None
+            self._save_temperature_runs()
+            return self._public_temperature_run(run, include_samples=True)
+
+    def rename_temperature_run(self, run_id: str, name: Any) -> dict:
+        run = self.temperature_runs.get(str(run_id or ""))
+        if not run:
+            raise ValueError("temperature run not found")
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("run name is required")
+        if len(clean_name) > 120:
+            raise ValueError("run name must be 120 characters or fewer")
+        run["name"] = clean_name
+        self._save_temperature_runs()
+        return self._public_temperature_run(run, include_samples=True)
 
     async def _temperature_history_monitor_loop(self) -> None:
         while True:

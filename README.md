@@ -60,6 +60,12 @@ Cluster deployments and standalone Docker model cards also have a **Rename**
 action. These aliases are display-only, persist across controller restarts,
 and never change Docker identities, API model names, routing, or running state.
 
+The **Temps** tab records one-second CPU and GPU temperature runs for any
+online cluster node. A run arms at a configurable target plus trigger margin,
+starts when the hotter sensor reaches that threshold, and stops automatically
+after the node cools below the target. Saved runs can be renamed, overlaid in
+one graph, and exported as PNG or CSV.
+
 The **Usage** table has separate display aliases and merge groups. Assigning
 the same merge group to multiple model IDs combines their input, cached,
 output, request, cost, and speed columns while preserving the underlying raw

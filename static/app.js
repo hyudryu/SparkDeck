@@ -170,6 +170,20 @@ function app() {
     diskLoading: false,
     diskLastAt: null,
     temperatureHistoryByNode: {},
+    temperatureRuns: [],
+    temperatureRunsActiveId: null,
+    temperatureRunData: {},
+    temperatureRunSelected: {},
+    temperatureRunTargetNode: 'local',
+    temperatureRunTargetTemp: 60,
+    temperatureRunTriggerMargin: 5,
+    temperatureRunBusy: false,
+    temperatureRunCancelBusy: false,
+    temperatureRunError: '',
+    temperatureRunRenameId: null,
+    temperatureRunRenameValue: '',
+    temperatureRunRenameBusy: false,
+    _temperatureRunsRefreshInFlight: false,
     liveRequestRates: {},
     fanMaxSpeed: false,
     topbarStatsCollapsed: false,
@@ -237,6 +251,9 @@ function app() {
       setInterval(() => {
         if (!document.hidden) this.refreshTemperatureHistory(true);
       }, 30 * 1000);
+      setInterval(() => {
+        if (!document.hidden && this.tab === 'temps') this.refreshTemperatureRuns(true);
+      }, 1000);
       // Refresh immediately on tab regaining focus.
       document.addEventListener('visibilitychange', () => {
         if (!document.hidden) {
@@ -244,6 +261,7 @@ function app() {
           this.refresh(true);
           this.refreshTemperatureHistory(true);
           this.refreshLiveRequestRates(true);
+          if (this.tab === 'temps') this.refreshTemperatureRuns(true);
           if (!this.diskLastAt || Date.now() - this.diskLastAt > 5 * 60 * 1000) {
             this.refreshDisk();
           }
@@ -256,6 +274,7 @@ function app() {
         } else {
           this._stopLogPolling();
         }
+        if (v === 'temps') this.refreshTemperatureRuns();
       });
       this.$watch('logsModal.open', (open) => {
         if (open) this._startLogsTail();
@@ -703,6 +722,303 @@ function app() {
           label: `${Math.round(value)}°`,
         })),
       };
+    },
+    temperatureTargetNodes() {
+      return (this.state?.nodes || []).filter(node =>
+        node?.online && node?.enabled !== false
+      );
+    },
+    temperatureActiveRun() {
+      return this.temperatureRuns.find(run => run.id === this.temperatureRunsActiveId) || null;
+    },
+    temperatureRunStatusLabel(run) {
+      const labels = {
+        armed: 'Waiting for heat',
+        recording: 'Recording',
+        complete: 'Complete',
+        cancelled: 'Cancelled',
+        interrupted: 'Interrupted',
+      };
+      return labels[run?.status] || run?.status || 'Unknown';
+    },
+    temperatureRunStatusClass(run) {
+      if (run?.status === 'recording') return 'pill-error';
+      if (run?.status === 'armed') return 'pill-degraded';
+      if (run?.status === 'complete') return 'pill-ready';
+      return 'pill-exited';
+    },
+    async refreshTemperatureRuns(preserveSelection = false) {
+      if (this._temperatureRunsRefreshInFlight) return;
+      if (preserveSelection && this._hasSelectedText()) return;
+      this._temperatureRunsRefreshInFlight = true;
+      try {
+        const response = await fetch(`/api/temperature-runs?t=${Date.now()}`);
+        if (!response.ok) throw new Error(response.statusText);
+        const snapshot = await response.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.temperatureRuns = Array.isArray(snapshot.runs) ? snapshot.runs : [];
+        this.temperatureRunsActiveId = snapshot.active_run_id || null;
+
+        const nodes = this.temperatureTargetNodes();
+        if (!nodes.some(node => node.id === this.temperatureRunTargetNode)) {
+          this.temperatureRunTargetNode = nodes[0]?.id || 'local';
+        }
+
+        const selected = {...this.temperatureRunSelected};
+        if (this.temperatureRunsActiveId) selected[this.temperatureRunsActiveId] = true;
+        if (!Object.values(selected).some(Boolean)) {
+          const first = this.temperatureRuns.find(run => Number(run.sample_count) > 0);
+          if (first) selected[first.id] = true;
+        }
+        this.temperatureRunSelected = selected;
+        await Promise.all(
+          this.temperatureRuns
+            .filter(run => selected[run.id])
+            .map(run => this.loadTemperatureRun(run.id, preserveSelection))
+        );
+        this.temperatureRunError = '';
+      } catch (error) {
+        this.temperatureRunError = `Temperature runs refresh failed: ${error.message}`;
+      } finally {
+        this._temperatureRunsRefreshInFlight = false;
+      }
+    },
+    async loadTemperatureRun(runId, preserveSelection = false) {
+      try {
+        const response = await fetch(`/api/temperature-runs/${encodeURIComponent(runId)}?t=${Date.now()}`);
+        if (!response.ok) throw new Error(response.statusText);
+        const run = await response.json();
+        if (preserveSelection && this._hasSelectedText()) return;
+        this.temperatureRunData = {...this.temperatureRunData, [runId]: run};
+      } catch (error) {
+        this.temperatureRunError = `Could not load temperature run: ${error.message}`;
+      }
+    },
+    async toggleTemperatureRun(runId) {
+      const selected = !this.temperatureRunSelected[runId];
+      this.temperatureRunSelected = {
+        ...this.temperatureRunSelected,
+        [runId]: selected,
+      };
+      if (selected) await this.loadTemperatureRun(runId);
+    },
+    async armTemperatureRun() {
+      if (this.temperatureRunBusy) return;
+      this.temperatureRunBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch('/api/temperature-runs', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({
+            node_id: this.temperatureRunTargetNode,
+            target_temp_c: this.temperatureRunTargetTemp,
+            trigger_margin_pct: this.temperatureRunTriggerMargin,
+          }),
+        });
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [run.id]: run};
+        this.temperatureRunSelected = {...this.temperatureRunSelected, [run.id]: true};
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunBusy = false;
+      }
+    },
+    async cancelArmedTemperatureRun() {
+      if (this.temperatureRunCancelBusy) return;
+      this.temperatureRunCancelBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch('/api/temperature-runs/cancel', {method: 'POST'});
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [run.id]: run};
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunCancelBusy = false;
+      }
+    },
+    startTemperatureRunRename(run) {
+      this.temperatureRunRenameId = run.id;
+      this.temperatureRunRenameValue = run.name || '';
+    },
+    async saveTemperatureRunName(runId) {
+      const name = this.temperatureRunRenameValue.trim();
+      if (!name || this.temperatureRunRenameBusy) return;
+      this.temperatureRunRenameBusy = true;
+      this.temperatureRunError = '';
+      try {
+        const response = await fetch(`/api/temperature-runs/${encodeURIComponent(runId)}`, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({name}),
+        });
+        const run = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(run.detail || response.statusText);
+        this.temperatureRunData = {...this.temperatureRunData, [runId]: run};
+        this.temperatureRunRenameId = null;
+        await this.refreshTemperatureRuns();
+      } catch (error) {
+        this.temperatureRunError = error.message;
+      } finally {
+        this.temperatureRunRenameBusy = false;
+      }
+    },
+    temperatureSelectedRunData() {
+      return this.temperatureRuns
+        .filter(run => this.temperatureRunSelected[run.id])
+        .map(run => this.temperatureRunData[run.id])
+        .filter(Boolean);
+    },
+    temperatureRunColor(runId) {
+      const palette = [
+        '#6fcf97', '#56a8f5', '#f2c94c', '#bb6bd9',
+        '#f2994a', '#eb5757', '#2dd4bf', '#a78bfa',
+      ];
+      let hash = 0;
+      for (const char of String(runId || '')) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+      return palette[hash % palette.length];
+    },
+    temperatureRunChart() {
+      const runs = this.temperatureSelectedRunData();
+      const allValues = [];
+      let maxSeconds = 1;
+      for (const run of runs) {
+        for (const sample of (run.samples || [])) {
+          maxSeconds = Math.max(maxSeconds, Number(sample.elapsed_seconds) || 0);
+          for (const key of ['cpu_temp_c', 'gpu_temp_c']) {
+            const rawValue = sample[key];
+            if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+              allValues.push(rawValue);
+            }
+          }
+        }
+      }
+
+      let minTemp = allValues.length ? Math.min(...allValues) : 30;
+      let maxTemp = allValues.length ? Math.max(...allValues) : 90;
+      minTemp = Math.max(0, Math.floor((minTemp - 5) / 10) * 10);
+      maxTemp = Math.min(130, Math.ceil((maxTemp + 5) / 10) * 10);
+      if (maxTemp - minTemp < 20) maxTemp = Math.min(130, minTemp + 20);
+
+      const left = 62;
+      const right = 878;
+      const legendColumns = 3;
+      const legendRows = Math.max(1, Math.ceil(runs.length / legendColumns));
+      const top = 18 + legendRows * 27;
+      const bottom = 426;
+      const x = seconds => left + Math.max(0, Math.min(1, seconds / maxSeconds)) * (right - left);
+      const y = value => bottom - ((value - minTemp) / (maxTemp - minTemp)) * (bottom - top);
+      const pathFor = (samples, key) => {
+        let path = '';
+        let drawing = false;
+        let previousSeconds = null;
+        for (const sample of (samples || [])) {
+          const seconds = Number(sample.elapsed_seconds);
+          const rawValue = sample[key];
+          const value = typeof rawValue === 'number' ? rawValue : NaN;
+          if (!Number.isFinite(seconds) || !Number.isFinite(value)) {
+            drawing = false;
+            previousSeconds = null;
+            continue;
+          }
+          const gap = previousSeconds != null && seconds - previousSeconds > 2.5;
+          path += `${!drawing || gap ? 'M' : 'L'}${x(seconds).toFixed(1)},${y(value).toFixed(1)} `;
+          drawing = true;
+          previousSeconds = seconds;
+        }
+        return path.trim();
+      };
+      const series = runs.map((run, index) => ({
+        id: run.id,
+        name: run.name,
+        nodeName: run.node_name,
+        color: this.temperatureRunColor(run.id),
+        cpuPath: pathFor(run.samples, 'cpu_temp_c'),
+        gpuPath: pathFor(run.samples, 'gpu_temp_c'),
+        legendX: left + (index % legendColumns) * 272,
+        legendY: 22 + Math.floor(index / legendColumns) * 27,
+      }));
+      const tickCount = 5;
+      const ticks = Array.from({length: tickCount}, (_, index) => {
+        const value = maxTemp - (index * (maxTemp - minTemp) / (tickCount - 1));
+        return {value, y: y(value), label: `${Math.round(value)}°C`};
+      });
+      return {left, right, top, bottom, minTemp, maxTemp, maxSeconds, ticks, series};
+    },
+    fmtTemperatureRunDuration(seconds) {
+      const value = Math.max(0, Math.round(Number(seconds) || 0));
+      if (value < 60) return `${value}s`;
+      if (value < 3600) return `${Math.floor(value / 60)}m ${value % 60}s`;
+      return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
+    },
+    _downloadTemperatureBlob(blob, extension) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `temperature-runs-${stamp}.${extension}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    exportTemperatureCSV() {
+      const runs = this.temperatureSelectedRunData();
+      if (!runs.length) return;
+      const cell = value => {
+        const text = value == null ? '' : String(value);
+        return `"${text.replace(/"/g, '""')}"`;
+      };
+      const rows = [[
+        'run_id', 'run_name', 'node', 'elapsed_seconds', 'cpu_temp_c', 'gpu_temp_c',
+      ]];
+      for (const run of runs) {
+        for (const sample of (run.samples || [])) {
+          rows.push([
+            run.id, run.name, run.node_name || run.node_id,
+            sample.elapsed_seconds, sample.cpu_temp_c, sample.gpu_temp_c,
+          ]);
+        }
+      }
+      const csv = rows.map(row => row.map(cell).join(',')).join('\n');
+      this._downloadTemperatureBlob(
+        new Blob([csv], {type: 'text/csv;charset=utf-8'}), 'csv'
+      );
+    },
+    async exportTemperaturePNG() {
+      const svg = this.$refs.temperatureRunChart;
+      if (!svg || !this.temperatureSelectedRunData().length) return;
+      try {
+        const clone = svg.cloneNode(true);
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        clone.setAttribute('width', '1800');
+        clone.setAttribute('height', '960');
+        const source = new XMLSerializer().serializeToString(clone);
+        const svgUrl = URL.createObjectURL(new Blob([source], {type: 'image/svg+xml'}));
+        const image = new Image();
+        await new Promise((resolve, reject) => {
+          image.onload = resolve;
+          image.onerror = reject;
+          image.src = svgUrl;
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = 1800;
+        canvas.height = 960;
+        const context = canvas.getContext('2d');
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(svgUrl);
+        const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        if (!png) throw new Error('PNG encoder returned no data');
+        this._downloadTemperatureBlob(png, 'png');
+      } catch (error) {
+        this.temperatureRunError = `PNG export failed: ${error.message}`;
+      }
     },
     gpu() { return this.state?.stats?.gpus?.[0] || null; },
     gpuTotalGb() {

@@ -766,10 +766,6 @@ function app() {
 
         const selected = {...this.temperatureRunSelected};
         if (this.temperatureRunsActiveId) selected[this.temperatureRunsActiveId] = true;
-        if (!Object.values(selected).some(Boolean)) {
-          const first = this.temperatureRuns.find(run => Number(run.sample_count) > 0);
-          if (first) selected[first.id] = true;
-        }
         this.temperatureRunSelected = selected;
         await Promise.all(
           this.temperatureRuns
@@ -951,6 +947,57 @@ function app() {
       });
       return {left, right, top, bottom, minTemp, maxTemp, maxSeconds, ticks, series};
     },
+    temperatureRunSvgMarkup() {
+      // Alpine's x-for template cloning is unreliable inside an SVG tree in
+      // Chromium: the chart data is populated, but the template children
+      // remain inert. Build the generated SVG nodes explicitly so both the
+      // browser view and the cloned PNG export contain the plotted data.
+      const chart = this.temperatureRunChart();
+      const number = value => Number(value).toFixed(1);
+      const ticks = chart.ticks.map(tick => `
+        <g>
+          <line x1="${number(chart.left)}" y1="${number(tick.y)}"
+                x2="${number(chart.right)}" y2="${number(tick.y)}"
+                class="temp-export-grid"></line>
+          <line x1="${number(chart.left - 5)}" y1="${number(tick.y)}"
+                x2="${number(chart.left)}" y2="${number(tick.y)}"
+                class="temp-export-axis"></line>
+          <text x="${number(chart.left - 10)}" y="${number(tick.y + 4)}"
+                text-anchor="end" class="temp-export-label">${this.escapeHtml(tick.label)}</text>
+        </g>
+      `).join('');
+      const lines = chart.series.map(series => `
+        <g>
+          <path d="${series.cpuPath}" stroke="${series.color}"
+                class="temp-export-line"></path>
+          <path d="${series.gpuPath}" stroke="${series.color}"
+                stroke-dasharray="4 7" class="temp-export-line"></path>
+        </g>
+      `).join('');
+      const legend = chart.series.map(series => {
+        const label = String(series.name || '').length > 18
+          ? `${String(series.name).slice(0, 17)}…`
+          : String(series.name || '');
+        return `
+          <g transform="translate(${number(series.legendX)} ${number(series.legendY)})">
+            <circle cx="4" cy="0" r="4" fill="${series.color}"></circle>
+            <text x="13" y="4" class="temp-export-title">${this.escapeHtml(label)}</text>
+            <line x1="145" y1="0" x2="164" y2="0" stroke="${series.color}"
+                  stroke-width="2.5"></line>
+            <text x="168" y="4" class="temp-export-label">CPU</text>
+            <line x1="202" y1="0" x2="221" y2="0" stroke="${series.color}"
+                  stroke-width="2.5" stroke-dasharray="4 5"></line>
+            <text x="225" y="4" class="temp-export-label">GPU</text>
+          </g>
+        `;
+      }).join('');
+      const empty = chart.series.length ? '' : `
+        <text x="450" y="244" text-anchor="middle" class="temp-export-label">
+          Select one or more runs to graph.
+        </text>
+      `;
+      return `${ticks}${lines}${legend}${empty}`;
+    },
     fmtTemperatureRunDuration(seconds) {
       const value = Math.max(0, Math.round(Number(seconds) || 0));
       if (value < 60) return `${value}s`;
@@ -994,17 +1041,33 @@ function app() {
     async exportTemperaturePNG() {
       const svg = this.$refs.temperatureRunChart;
       if (!svg || !this.temperatureSelectedRunData().length) return;
+      let svgUrl = null;
       try {
         const clone = svg.cloneNode(true);
         clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
         clone.setAttribute('width', '1800');
         clone.setAttribute('height', '960');
+        // Alpine directives are meaningful in the live HTML DOM but make the
+        // serialized clone invalid as a standalone SVG image (notably the
+        // colon-prefixed bindings such as :x1 and :transform). The generated
+        // values and x-html children are already materialized in the clone.
+        for (const element of [clone, ...clone.querySelectorAll('*')]) {
+          for (const attribute of [...element.attributes]) {
+            if (
+              attribute.name.startsWith('x-')
+              || attribute.name.startsWith(':')
+              || attribute.name.startsWith('@')
+            ) {
+              element.removeAttribute(attribute.name);
+            }
+          }
+        }
         const source = new XMLSerializer().serializeToString(clone);
-        const svgUrl = URL.createObjectURL(new Blob([source], {type: 'image/svg+xml'}));
+        svgUrl = URL.createObjectURL(new Blob([source], {type: 'image/svg+xml'}));
         const image = new Image();
         await new Promise((resolve, reject) => {
           image.onload = resolve;
-          image.onerror = reject;
+          image.onerror = () => reject(new Error('generated SVG could not be decoded'));
           image.src = svgUrl;
         });
         const canvas = document.createElement('canvas');
@@ -1012,12 +1075,13 @@ function app() {
         canvas.height = 960;
         const context = canvas.getContext('2d');
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        URL.revokeObjectURL(svgUrl);
         const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
         if (!png) throw new Error('PNG encoder returned no data');
         this._downloadTemperatureBlob(png, 'png');
       } catch (error) {
-        this.temperatureRunError = `PNG export failed: ${error.message}`;
+        this.temperatureRunError = `PNG export failed: ${error?.message || String(error)}`;
+      } finally {
+        if (svgUrl) URL.revokeObjectURL(svgUrl);
       }
     },
     gpu() { return this.state?.stats?.gpus?.[0] || null; },

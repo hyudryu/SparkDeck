@@ -2042,9 +2042,13 @@ input[type="range"]::-moz-range-thumb {
 }
 .temperature-run-color-picker {
   position: fixed;
-  left: -100px;
+  z-index: 1000;
+  top: -10px;
+  left: -10px;
   width: 1px;
   height: 1px;
+  padding: 0;
+  border: 0;
   opacity: 0;
   pointer-events: none;
 }

@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=69">
-<script src="/static/app.js?v=77"></script>
+<link rel="stylesheet" href="/static/styles.css?v=70">
+<script src="/static/app.js?v=78"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -508,24 +508,10 @@
           <text x="450" y="24" text-anchor="middle" class="temp-export-chart-title"
                 x-text="temperatureRunChartTitle"></text>
           <g x-html="temperatureRunSvgMarkup()"></g>
-          <line :x1="temperatureRunChart().left" :y1="temperatureRunChart().top"
-                :x2="temperatureRunChart().left" :y2="temperatureRunChart().bottom"
-                class="temp-export-axis"></line>
-          <line :x1="temperatureRunChart().left" :y1="temperatureRunChart().bottom"
-                :x2="temperatureRunChart().right" :y2="temperatureRunChart().bottom"
-                class="temp-export-axis"></line>
-          <text :x="temperatureRunChart().left" y="452" text-anchor="middle"
-                class="temp-export-label">0s</text>
-          <text :x="temperatureRunChart().right" y="452" text-anchor="middle"
-                class="temp-export-label" x-text="fmtTemperatureRunDuration(temperatureRunChart().maxSeconds)"></text>
-          <text x="450" y="472" text-anchor="middle" class="temp-export-label">Time since recording start</text>
-          <text x="15" :y="(temperatureRunChart().top + temperatureRunChart().bottom) / 2"
-                text-anchor="middle" class="temp-export-label"
-                :transform="`rotate(-90 15 ${(temperatureRunChart().top + temperatureRunChart().bottom) / 2})`">Temperature (°C)</text>
         </svg>
         <input x-ref="temperatureRunColorPicker" class="temperature-run-color-picker"
                type="color" aria-label="Choose temperature run color"
-               @input="setTemperatureRunColor($event.target.value)">
+               @change="setTemperatureRunColor($event.target.value)">
       </div>
     </div>
   </div>

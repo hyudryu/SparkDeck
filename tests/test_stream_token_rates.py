@@ -51,6 +51,15 @@ class StreamTokenRateTests(unittest.TestCase):
         self.assertEqual(session["cached"], 1_000)
         self.assertEqual(session["pp_tokens"], 200)
 
+    def test_cache_detail_must_be_explicit_for_prompt_speed(self) -> None:
+        self.assertFalse(Manager._usage_has_cached_prompt_tokens({
+            "prompt_tokens": 216_000,
+        }))
+        self.assertTrue(Manager._usage_has_cached_prompt_tokens({
+            "prompt_tokens": 216_000,
+            "prompt_tokens_details": {"cached_tokens": 214_000},
+        }))
+
     def test_counts_all_mtp_token_ids_in_one_chunk(self) -> None:
         line = sse({
             "delta": {"content": " several tokens"},
@@ -188,9 +197,12 @@ class VllmStreamUsageTests(unittest.IsolatedAsyncioTestCase):
         first_usage = {
             "prompt_tokens": 1_200,
             "completion_tokens": 1,
+        }
+        final_usage = {
+            **first_usage,
+            "completion_tokens": 2,
             "prompt_tokens_details": {"cached_tokens": 1_000},
         }
-        final_usage = {**first_usage, "completion_tokens": 2}
         lines = [
             f"data: {json.dumps({'choices': [{'delta': {'content': 'a'}, 'token_ids': [1]}], 'usage': first_usage})}",
             f"data: {json.dumps({'choices': [{'delta': {'content': 'b'}, 'token_ids': [2]}], 'usage': final_usage})}",
@@ -236,15 +248,19 @@ class VllmStreamUsageTests(unittest.IsolatedAsyncioTestCase):
         )
         first_chunk = await stream.__anext__()
         self.assertIn('"completion_tokens": 1', first_chunk)
-        pp_args = instance._track_prompt_processing.call_args.args
-        self.assertEqual(pp_args[:2], (7, 200))
-        self.assertGreater(pp_args[2], 0)
+        # The real vLLM early snapshot has no cached-token detail. Treating
+        # that as zero cache hits would briefly report all 1,200 tokens as
+        # newly processed and wildly inflate live PP speed.
+        instance._track_prompt_processing.assert_not_called()
         remaining = [chunk async for chunk in stream]
 
         self.assertTrue(remaining)
         self.assertTrue(
             instance.http.body["stream_options"]["continuous_usage_stats"]
         )
+        pp_args = instance._track_prompt_processing.call_args.args
+        self.assertEqual(pp_args[:2], (7, 200))
+        self.assertGreater(pp_args[2], 0)
         instance._record_usage.assert_called_once()
         usage_args = instance._record_usage.call_args.args
         self.assertEqual(usage_args[:2], ("model", final_usage))

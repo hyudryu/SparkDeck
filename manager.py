@@ -3821,6 +3821,23 @@ class Manager:
             cached_tokens = 0
         return prompt_tokens, min(prompt_tokens, cached_tokens)
 
+    @staticmethod
+    def _usage_has_cached_prompt_tokens(usage: dict) -> bool:
+        """Whether usage contains an authoritative cached-prompt count.
+
+        vLLM continuous usage snapshots omit ``prompt_tokens_details`` until
+        the terminal chunk. Missing detail must not be interpreted as zero
+        cache hits or a mostly-cached long context produces an impossible PP
+        rate from the full prompt token count.
+        """
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, dict) or "cached_tokens" not in details:
+            return False
+        try:
+            return int(details["cached_tokens"]) >= 0
+        except (TypeError, ValueError):
+            return False
+
     def _record_usage(
         self,
         model: str,
@@ -8544,7 +8561,10 @@ class Manager:
                                 if first_out_ts is not None
                                 else None
                             )
-                            if pp_time:
+                            if (
+                                pp_time
+                                and self._usage_has_cached_prompt_tokens(usage)
+                            ):
                                 prompt_tokens, cached_tokens = (
                                     self._usage_prompt_counts(usage)
                                 )
@@ -8570,8 +8590,16 @@ class Manager:
                             if first_out_ts is not None
                             else None
                         )
+                        # Do not contaminate the completed-request PP average
+                        # when an older backend omits authoritative cache-hit
+                        # detail from its terminal usage payload.
+                        measured_pp_time = (
+                            pp_time
+                            if self._usage_has_cached_prompt_tokens(latest_usage)
+                            else None
+                        )
                         self._record_usage(
-                            key, latest_usage, gen_time, pp_time
+                            key, latest_usage, gen_time, measured_pp_time
                         )
                     return
                 except StreamNudge:

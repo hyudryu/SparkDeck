@@ -2009,6 +2009,11 @@ input[type="range"]::-moz-range-thumb {
   padding: 6px 26px 6px 8px;
   font-size: 12px;
 }
+.temperature-viewer-controls input {
+  min-width: 190px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
 .temperature-run-chart-wrap {
   width: 100%;
   overflow-x: auto;
@@ -2021,6 +2026,27 @@ input[type="range"]::-moz-range-thumb {
   width: 100%;
   min-width: 680px;
   height: auto;
+}
+.temperature-run-color-dot {
+  cursor: pointer;
+  pointer-events: all;
+  stroke: transparent;
+  stroke-width: 10px;
+  paint-order: stroke;
+}
+.temperature-run-color-dot:hover,
+.temperature-run-color-dot:focus {
+  outline: none;
+  stroke: rgba(255,255,255,.8);
+  stroke-width: 2px;
+}
+.temperature-run-color-picker {
+  position: fixed;
+  left: -100px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 @media (max-width: 1050px) {
@@ -2040,4 +2066,5 @@ input[type="range"]::-moz-range-thumb {
   .temperature-export-actions .btn { flex: 1; }
   .temperature-run-viewer > .card-head { align-items: flex-start; }
   .temperature-viewer-controls { align-items: flex-end; flex-direction: column; }
+  .temperature-viewer-controls input { min-width: 220px; }
 }

@@ -184,6 +184,9 @@ function app() {
     temperatureRunRenameValue: '',
     temperatureRunRenameBusy: false,
     temperatureRunSmoothingSeconds: 0,
+    temperatureRunChartTitle: 'Temperature Comparison',
+    temperatureRunColors: {},
+    temperatureRunColorPickerId: null,
     _temperatureRunsRefreshInFlight: false,
     liveRequestRates: {},
     fanMaxSpeed: false,
@@ -225,6 +228,7 @@ function app() {
     async init() {
       // On mobile, start stats collapsed so the topbar doesn't eat the whole screen.
       this.topbarStatsCollapsed = window.innerWidth <= 720;
+      this.loadTemperatureRunColors();
       await this.refresh();
       await this.refreshDisk();
       await this.refreshTemperatureHistory();
@@ -873,6 +877,8 @@ function app() {
         .filter(Boolean);
     },
     temperatureRunColor(runId) {
+      const override = this.temperatureRunColors[String(runId || '')];
+      if (/^#[0-9a-f]{6}$/i.test(override || '')) return override;
       const palette = [
         '#6fcf97', '#56a8f5', '#f2c94c', '#bb6bd9',
         '#f2994a', '#eb5757', '#2dd4bf', '#a78bfa',
@@ -880,6 +886,43 @@ function app() {
       let hash = 0;
       for (const char of String(runId || '')) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
       return palette[hash % palette.length];
+    },
+    loadTemperatureRunColors() {
+      try {
+        const stored = JSON.parse(localStorage.getItem('temperatureRunColors') || '{}');
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return;
+        this.temperatureRunColors = Object.fromEntries(
+          Object.entries(stored)
+            .filter(([runId, color]) => runId && /^#[0-9a-f]{6}$/i.test(color || ''))
+        );
+      } catch (_) {
+        // Invalid or unavailable local storage should not prevent the chart loading.
+      }
+    },
+    openTemperatureRunColorPicker(runId) {
+      const picker = this.$refs.temperatureRunColorPicker;
+      if (!picker || !runId) return;
+      this.temperatureRunColorPickerId = String(runId);
+      picker.value = this.temperatureRunColor(runId);
+      picker.click();
+    },
+    handleTemperatureRunChartColor(event) {
+      const target = event?.target?.closest?.('[data-temperature-run-color]');
+      if (!target) return;
+      this.openTemperatureRunColorPicker(target.dataset.temperatureRunColor);
+    },
+    setTemperatureRunColor(color) {
+      const runId = this.temperatureRunColorPickerId;
+      if (!runId || !/^#[0-9a-f]{6}$/i.test(color || '')) return;
+      this.temperatureRunColors = {
+        ...this.temperatureRunColors,
+        [runId]: color.toLowerCase(),
+      };
+      try {
+        localStorage.setItem('temperatureRunColors', JSON.stringify(this.temperatureRunColors));
+      } catch (_) {
+        // The selected color still applies for this session when storage is unavailable.
+      }
     },
     temperatureSmoothSamples(samples, windowSeconds = this.temperatureRunSmoothingSeconds) {
       const source = Array.isArray(samples) ? samples : [];
@@ -971,7 +1014,7 @@ function app() {
       const right = 878;
       const legendColumns = 3;
       const legendRows = Math.max(1, Math.ceil(runs.length / legendColumns));
-      const top = 18 + legendRows * 27;
+      const top = 42 + legendRows * 27;
       const bottom = 426;
       const x = seconds => left + Math.max(0, Math.min(1, seconds / maxSeconds)) * (right - left);
       const y = value => bottom - ((value - minTemp) / (maxTemp - minTemp)) * (bottom - top);
@@ -1003,14 +1046,56 @@ function app() {
         cpuPath: pathFor(run.samples, 'cpu_temp_c'),
         gpuPath: pathFor(run.samples, 'gpu_temp_c'),
         legendX: left + (index % legendColumns) * 272,
-        legendY: 22 + Math.floor(index / legendColumns) * 27,
+        legendY: 48 + Math.floor(index / legendColumns) * 27,
       }));
+      const maximumFor = (key, kind, markerIndex) => {
+        let maximum = null;
+        for (const run of runs) {
+          for (const sample of (run.samples || [])) {
+            const seconds = Number(sample.elapsed_seconds);
+            const value = sample[key];
+            if (
+              !Number.isFinite(seconds)
+              || typeof value !== 'number'
+              || !Number.isFinite(value)
+              || (maximum && value <= maximum.value)
+            ) continue;
+            maximum = {
+              kind,
+              value,
+              seconds,
+              runId: run.id,
+              runName: run.name || run.node_name || run.id,
+            };
+          }
+        }
+        if (!maximum) return null;
+        const markerX = x(maximum.seconds);
+        const markerY = y(maximum.value);
+        const preferBelow = markerY < top + 24 || markerIndex === 1;
+        const labelY = preferBelow && markerY < bottom - 24 ? markerY + 21 : markerY - 12;
+        return {
+          ...maximum,
+          color: this.temperatureRunColor(maximum.runId),
+          x: markerX,
+          y: markerY,
+          labelX: markerX > right - 190 ? markerX - 10 : markerX + 10,
+          labelY,
+          textAnchor: markerX > right - 190 ? 'end' : 'start',
+        };
+      };
+      const maxMarkers = [
+        maximumFor('cpu_temp_c', 'CPU', 0),
+        maximumFor('gpu_temp_c', 'GPU', 1),
+      ].filter(Boolean);
       const tickCount = 5;
       const ticks = Array.from({length: tickCount}, (_, index) => {
         const value = maxTemp - (index * (maxTemp - minTemp) / (tickCount - 1));
         return {value, y: y(value), label: `${Math.round(value)}°C`};
       });
-      return {left, right, top, bottom, minTemp, maxTemp, maxSeconds, ticks, series};
+      return {
+        left, right, top, bottom, minTemp, maxTemp, maxSeconds, ticks, series, maxMarkers,
+      };
     },
     temperatureRunSvgMarkup() {
       // Alpine's x-for template cloning is unreliable inside an SVG tree in
@@ -1039,13 +1124,39 @@ function app() {
                 stroke-dasharray="4 7" class="temp-export-line"></path>
         </g>
       `).join('');
+      const maxMarkers = chart.maxMarkers.map(marker => {
+        const runLabel = String(marker.runName || '').length > 15
+          ? `${String(marker.runName).slice(0, 14)}…`
+          : String(marker.runName || '');
+        const label = `${marker.kind} max ${Number(marker.value).toFixed(1)}°C · ${runLabel}`;
+        const shape = marker.kind === 'GPU'
+          ? `<rect x="${number(marker.x - 4.5)}" y="${number(marker.y - 4.5)}"
+                   width="9" height="9" rx="1" transform="rotate(45 ${number(marker.x)} ${number(marker.y)})"
+                   fill="#10141c" stroke="${marker.color}" stroke-width="2.5"></rect>`
+          : `<circle cx="${number(marker.x)}" cy="${number(marker.y)}" r="4.5"
+                     fill="${marker.color}" stroke="#eef2f7" stroke-width="1.5"></circle>`;
+        return `
+          <g>
+            ${shape}
+            <text x="${number(marker.labelX)}" y="${number(marker.labelY)}"
+                  text-anchor="${marker.textAnchor}"
+                  class="temp-export-max-label">${this.escapeHtml(label)}</text>
+          </g>
+        `;
+      }).join('');
       const legend = chart.series.map(series => {
         const label = String(series.name || '').length > 18
           ? `${String(series.name).slice(0, 17)}…`
           : String(series.name || '');
         return `
           <g transform="translate(${number(series.legendX)} ${number(series.legendY)})">
-            <circle cx="4" cy="0" r="4" fill="${series.color}"></circle>
+            <circle cx="4" cy="0" r="5" fill="${series.color}"
+                    class="temperature-run-color-dot"
+                    data-temperature-run-color="${this.escapeHtml(String(series.id || ''))}"
+                    role="button" tabindex="0"
+                    aria-label="Change color for ${this.escapeHtml(String(series.name || 'temperature run'))}">
+              <title>Change run color</title>
+            </circle>
             <text x="13" y="4" class="temp-export-title">${this.escapeHtml(label)}</text>
             <line x1="145" y1="0" x2="164" y2="0" stroke="${series.color}"
                   stroke-width="2.5"></line>
@@ -1061,7 +1172,7 @@ function app() {
           Select one or more runs to graph.
         </text>
       `;
-      return `${ticks}${lines}${legend}${empty}`;
+      return `${ticks}${lines}${maxMarkers}${legend}${empty}`;
     },
     fmtTemperatureRunDuration(seconds) {
       const value = Math.max(0, Math.round(Number(seconds) || 0));

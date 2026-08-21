@@ -1644,6 +1644,37 @@ input[type="range"]::-moz-range-thumb {
 .usage-alias-editor label { display: grid; gap: 3px; color: var(--text-muted); font-size: 11px; }
 .usage-alias-editor input { min-width: 190px; }
 .usage-alias-editor .btn { padding: 5px 8px; }
+.usage-rules {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+.usage-rule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-2);
+}
+.usage-rule-row .mono { overflow-wrap: anywhere; }
+.usage-rule-arrow { color: var(--text-muted); }
+.usage-rule-form {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.usage-rule-form label {
+  display: grid;
+  flex: 1 1 260px;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.usage-rule-form input { width: 100%; }
 .deployment-pricing-actions { margin-top: 10px; }
 
 .usage-table tr:hover td,
@@ -1750,6 +1781,17 @@ input[type="range"]::-moz-range-thumb {
 .deployment-card.deployment-ready { border-left-color: var(--accent-green); }
 .deployment-card.deployment-error,
 .deployment-card.deployment-degraded { border-left-color: var(--accent-red); }
+.deployment-last-used {
+  text-transform: none;
+  letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.4s, background-color 0.4s, border-color 0.4s;
+}
+.deployment-never-used {
+  color: var(--text-muted);
+  background: rgba(255,255,255,0.05);
+  border-color: var(--border-strong);
+}
 .deployment-id-row {
   display: flex;
   align-items: center;
@@ -1818,7 +1860,164 @@ input[type="range"]::-moz-range-thumb {
   overflow-wrap: anywhere;
 }
 
+/* Temperature run recorder + overlay viewer */
+.temperature-runs-page { max-width: 1500px; }
+.temperature-export-actions { margin-top: 0; }
+.temperature-recorder-card { margin-bottom: 16px; }
+.temperature-recorder-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.5fr) minmax(120px, .7fr) minmax(120px, .7fr) minmax(190px, 1fr) auto auto;
+  align-items: end;
+  gap: 12px;
+}
+.temperature-recorder-controls > label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.temperature-input-suffix,
+.temperature-recorder-controls .input-suffix {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+.temperature-recorder-controls .input-suffix:focus-within {
+  border-color: var(--accent-blue);
+}
+.temperature-recorder-controls .input-suffix input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+}
+.temperature-recorder-controls .input-suffix span {
+  padding-right: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.temperature-trigger-summary {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 2px 7px;
+  min-height: 42px;
+}
+.temperature-trigger-summary strong { color: var(--accent-amber); }
+.temperature-trigger-summary small {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+}
+.temperature-active-state {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.temperature-runs-workspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+.temperature-run-library {
+  max-height: calc(100vh - 270px);
+  overflow: auto;
+}
+.temperature-run-library h3,
+.temperature-run-viewer h3 { margin: 0; }
+.temperature-run-list { display: grid; gap: 8px; }
+.temperature-run-entry {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  cursor: pointer;
+  transition: border-color .15s, background-color .15s;
+}
+.temperature-run-entry:hover { border-color: var(--border-strong); }
+.temperature-run-entry.selected {
+  border-color: var(--accent-blue);
+  background: rgba(86,168,245,.08);
+}
+.temperature-run-check {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--accent-blue);
+  font-weight: 700;
+}
+.temperature-run-entry.selected .temperature-run-check {
+  border-color: var(--accent-blue);
+  background: rgba(86,168,245,.14);
+}
+.temperature-run-copy { display: grid; min-width: 0; gap: 3px; }
+.temperature-run-copy > .muted { font-size: 11px; }
+.temperature-run-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+.temperature-run-title-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.temperature-run-title-row .status-pill {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 8px;
+}
+.temperature-run-rename {
+  grid-column: 2 / -1;
+  display: flex;
+  gap: 6px;
+  margin-top: 3px;
+}
+.temperature-run-rename input { min-width: 0; flex: 1; }
+.temperature-run-rename .btn { padding: 5px 8px; }
+.temperature-run-viewer { min-width: 0; }
+.temperature-run-chart-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #10141c;
+}
+.temperature-run-chart {
+  display: block;
+  width: 100%;
+  min-width: 680px;
+  height: auto;
+}
+
+@media (max-width: 1050px) {
+  .temperature-recorder-controls {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+  }
+  .temperature-runs-workspace { grid-template-columns: 1fr; }
+  .temperature-run-library { max-height: none; }
+}
+
 @media (max-width: 680px) {
   .deployment-member { grid-template-columns: auto 1fr auto; }
   .deployment-member .member-phase { grid-column: 2 / -1; text-align: left; }
+  .temperature-recorder-controls { grid-template-columns: 1fr; }
+  .temperature-active-state { align-items: flex-start; flex-direction: column; }
+  .temperature-export-actions { width: 100%; }
+  .temperature-export-actions .btn { flex: 1; }
 }

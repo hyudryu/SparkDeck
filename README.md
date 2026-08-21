@@ -60,12 +60,26 @@ Cluster deployments and standalone Docker model cards also have a **Rename**
 action. These aliases are display-only, persist across controller restarts,
 and never change Docker identities, API model names, routing, or running state.
 
+The **Temps** tab records one-second CPU and GPU temperature runs for any
+online cluster node. A run arms at a configurable target plus trigger margin,
+starts when the hotter sensor reaches that threshold, and stops automatically
+after the node cools below the target. Saved runs can be renamed, overlaid in
+one graph, and exported as PNG or CSV.
+
 The **Usage** table has separate display aliases and merge groups. Assigning
 the same merge group to multiple model IDs combines their input, cached,
 output, request, cost, and speed columns while preserving the underlying raw
 counters. Average speed is calculated over the newest 1 million output tokens
 and unions overlapping decode intervals, so concurrent streams report
 their aggregate throughput rather than a per-stream average.
+Managed vLLM launches enable prompt-token details so prefix-cache hits are
+recorded separately and charged at the configured cached-input rate.
+
+The **Rules** section at the bottom of Usage configures directional accounting
+routes. A rule such as `xxx/abcdefg → xxx/1234567` rolls the source model's
+usage into the destination row and applies the destination model's pricing to
+all routed tokens, while preserving the original raw counters and without
+changing inference API routing.
 
 Enable **Sync token usage** in Settings on the coordinator and each
 participating node to replicate lifetime and hourly per-model counters every

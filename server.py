@@ -149,6 +149,52 @@ async def get_temperature_history(node_id: str = LOCAL_NODE_ID):
         raise HTTPException(502, str(exc)) from exc
 
 
+@app.get("/api/temperature-runs")
+async def get_temperature_runs():
+    return manager.temperature_runs_state()
+
+
+@app.get("/api/temperature-runs/{run_id}")
+async def get_temperature_run(run_id: str):
+    try:
+        return manager.temperature_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/temperature-runs")
+async def arm_temperature_run(req: Request):
+    body = await req.json()
+    try:
+        return await manager.arm_temperature_recording(
+            body.get("node_id"),
+            body.get("target_temp_c"),
+            body.get("trigger_margin_pct", 5),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/temperature-runs/cancel")
+async def cancel_temperature_run():
+    try:
+        return await manager.cancel_temperature_recording()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/temperature-runs/{run_id}")
+async def rename_temperature_run(run_id: str, req: Request):
+    body = await req.json()
+    try:
+        return manager.rename_temperature_run(run_id, body.get("name"))
+    except ValueError as exc:
+        status = 404 if "not found" in str(exc) else 400
+        raise HTTPException(status, str(exc)) from exc
+
+
 @app.get("/api/active-request-rates")
 async def get_active_request_rates():
     """Small endpoint polled by the token widget at a fixed cadence."""
@@ -188,6 +234,12 @@ async def agent_status(req: Request):
 async def agent_temperature_history(req: Request):
     _require_agent(req)
     return manager.temperature_history()
+
+
+@app.get("/api/agent/stats")
+async def agent_stats(req: Request):
+    _require_agent(req)
+    return await manager.get_stats()
 
 
 @app.get("/api/agent/token-usage")
@@ -453,6 +505,25 @@ async def update_usage_alias(req: Request):
     except ValueError as exc:
         status = 404 if str(exc) == "usage model not found" else 400
         raise HTTPException(status, str(exc)) from exc
+
+
+@app.put("/api/token-stats/rules")
+async def update_usage_routing_rule(req: Request):
+    try:
+        body = await req.json()
+        return manager.update_usage_routing_rule(
+            body.get("source"), body.get("destination")
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/token-stats/rules/{source:path}")
+async def delete_usage_routing_rule(source: str):
+    try:
+        return manager.delete_usage_routing_rule(source)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.delete("/api/token-stats/{model_path:path}")

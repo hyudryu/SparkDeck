@@ -1644,6 +1644,37 @@ input[type="range"]::-moz-range-thumb {
 .usage-alias-editor label { display: grid; gap: 3px; color: var(--text-muted); font-size: 11px; }
 .usage-alias-editor input { min-width: 190px; }
 .usage-alias-editor .btn { padding: 5px 8px; }
+.usage-rules {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+.usage-rule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-2);
+}
+.usage-rule-row .mono { overflow-wrap: anywhere; }
+.usage-rule-arrow { color: var(--text-muted); }
+.usage-rule-form {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.usage-rule-form label {
+  display: grid;
+  flex: 1 1 260px;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.usage-rule-form input { width: 100%; }
 .deployment-pricing-actions { margin-top: 10px; }
 
 .usage-table tr:hover td,
@@ -1750,6 +1781,17 @@ input[type="range"]::-moz-range-thumb {
 .deployment-card.deployment-ready { border-left-color: var(--accent-green); }
 .deployment-card.deployment-error,
 .deployment-card.deployment-degraded { border-left-color: var(--accent-red); }
+.deployment-last-used {
+  text-transform: none;
+  letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.4s, background-color 0.4s, border-color 0.4s;
+}
+.deployment-never-used {
+  color: var(--text-muted);
+  background: rgba(255,255,255,0.05);
+  border-color: var(--border-strong);
+}
 .deployment-id-row {
   display: flex;
   align-items: center;

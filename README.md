@@ -66,6 +66,14 @@ output, request, cost, and speed columns while preserving the underlying raw
 counters. Average speed is calculated over the newest 1 million output tokens
 and unions overlapping decode intervals, so concurrent streams report
 their aggregate throughput rather than a per-stream average.
+Managed vLLM launches enable prompt-token details so prefix-cache hits are
+recorded separately and charged at the configured cached-input rate.
+
+The **Rules** section at the bottom of Usage configures directional accounting
+routes. A rule such as `xxx/abcdefg → xxx/1234567` rolls the source model's
+usage into the destination row and applies the destination model's pricing to
+all routed tokens, while preserving the original raw counters and without
+changing inference API routing.
 
 Enable **Sync token usage** in Settings on the coordinator and each
 participating node to replicate lifetime and hourly per-model counters every

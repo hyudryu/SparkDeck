@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VLLM Controller</title>
-<link rel="stylesheet" href="/static/styles.css?v=64">
-<script src="/static/app.js?v=64"></script>
+<link rel="stylesheet" href="/static/styles.css?v=65">
+<script src="/static/app.js?v=71"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
@@ -115,7 +115,7 @@
                 x-text="nodeStats().online_users?.count > 0 ? '● Active login' : 'No active logins'"></span>
         </div>
         <!-- Session tokens -->
-        <div class="stat stat-tokens" title="Session input/output tokens served since the controller started (or last reset), per model + quant variant. Speed counts decode time only (first to last output token; prefill excluded): while requests are streaming it is the live aggregate across all active streams, otherwise the session average. Reset clears only this session; lifetime counters are in the Usage tab.">
+        <div class="stat stat-tokens" title="Session input/output tokens served since the controller started (or last reset), per model + quant variant. PP speed is uncached prompt tokens divided by request-to-first-token time for streamed requests with measured prefill timing. Reset clears only this session; lifetime counters are in the Usage tab.">
           <div class="stat-label-row">
             <span class="stat-label">Tokens</span>
             <button class="icon-btn" @click="resetSessionTokenStats()" title="Reset session token counters">↺</button>
@@ -127,11 +127,11 @@
             </template>
           </select>
           <span class="stat-value" x-show="tokenModel"><span class="tok-dir">↓ In</span><span x-text="fmtTokens(tokenStatsFor(tokenModel)?.input)"></span></span>
-          <span class="stat-value" x-show="tokenModel"><span class="tok-dir">↑ Out</span><span x-text="fmtTokens(tokenStatsFor(tokenModel)?.output) + '  ·  ' + fmtSpeed(tokenModel)"></span></span>
+          <span class="stat-value" x-show="tokenModel"><span class="tok-dir">↑ Out</span><span x-text="fmtTokens(tokenStatsFor(tokenModel)?.output) + '  ·  PP ' + fmtLivePPSpeed(tokenModel)"></span></span>
           <span class="stat-value" x-show="tokenModel"><span class="tok-dir" style="color:var(--accent-green)">Cost</span><span x-text="tokenCostDisplay(tokenModel)"></span></span>
           <span class="stat-value" x-show="!tokenModel">—</span>
           <span class="stat-value live-reqs" x-show="liveReqs(tokenModel)"
-                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · decoded ' + fmtTokens(liveReqs(tokenModel)?.decoded_tokens || 0) + ' tok · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
+                x-text="'● ' + liveReqs(tokenModel)?.connections + ' running' + (liveReqs(tokenModel)?.queued ? ' · ' + liveReqs(tokenModel).queued + ' queued' : '') + ' · PP ' + fmtLivePPSpeed(tokenModel) + ' · thinking ' + liveReqs(tokenModel)?.thinking_tok_s?.toFixed(1) + ' tok/s · output ' + liveReqs(tokenModel)?.output_tok_s?.toFixed(1) + ' tok/s'"></span>
           <span class="muted" style="font-size:11px; margin-top:2px" x-show="tokenModel && !liveReqs(tokenModel)" x-text="(tokenStatsFor(tokenModel)?.requests ?? 0) + ' reqs'"></span>
         </div>
       </div>
@@ -511,8 +511,10 @@
         <div class="card deployment-card" :class="`deployment-${d.status}`">
           <div class="card-head">
             <div>
-              <div class="card-title" x-text="d.name"></div>
-              <div class="card-sub mono" x-text="d.model"></div>
+              <div class="card-title" x-text="deploymentDisplayName(d)"></div>
+              <div class="card-sub mono"
+                   x-show="deploymentApiModel(d) !== deploymentDisplayName(d)"
+                   x-text="deploymentApiModel(d)"></div>
               <div class="deployment-id-row">
                 <span class="card-sub mono" x-text="`ID ${d.id}`"></span>
                 <button class="btn btn-ghost deployment-id-copy" @click="copyDeploymentId(d)"
@@ -520,6 +522,10 @@
               </div>
             </div>
             <div class="card-pills">
+              <span class="status-pill deployment-last-used"
+                    :class="deploymentLastUsedClass(d)"
+                    :style="deploymentLastUsedStyle(d)"
+                    x-text="deploymentLastUsedLabel(d)"></span>
               <span class="status-pill pill-spark" x-text="`${d.mode} · ${d.members?.length || 0} nodes`"></span>
               <span class="status-pill pill-recipe" x-show="d.settings_dirty">edited settings</span>
               <span class="status-pill" :class="d.status === 'ready' ? 'pill-ready' : (d.status === 'error' || d.status === 'degraded' ? 'pill-error' : 'pill-starting')" x-text="d.status"></span>
@@ -695,9 +701,9 @@
                 <input type="text" class="mono" x-model="deploymentSettingsFor(d).sg_image" :disabled="d.status !== 'stopped'">
               </label>
               <label class="full deployment-flags-field">
-                <span>Common launch flags <span class="tip" tabindex="0" data-tip="Editable flags shared by every rank. Structured controls above override their matching raw flags when saved. The controller also regenerates topology flags such as --node-rank and --master-addr for each node."></span></span>
+                <span>Additional launch flags <span class="tip" tabindex="0" data-tip="Editable image-specific flags shared by every rank. Scalar options managed by the structured controls above are omitted here. The controller also regenerates topology flags such as --node-rank and --master-addr for each node."></span></span>
                 <textarea rows="8" class="mono" x-model="deploymentSettingsFor(d).extra"
-                          :disabled="d.status !== 'stopped'" placeholder="--max-model-len 65536 --tensor-parallel-size 2 --pipeline-parallel-size 1"></textarea>
+                          :disabled="d.status !== 'stopped'" placeholder="--trust-remote-code --enable-chunked-prefill"></textarea>
               </label>
             </div>
             <div class="actions deployment-pricing-actions">
@@ -1779,7 +1785,7 @@ for chunk in stream:
   <!-- Model usage breakdown -->
   <div class="card" x-show="state">
     <h3>Model usage</h3>
-    <p class="card-desc">Aliases rename a row. Assign the same merge group to multiple model IDs to combine their token totals, cost, and rolling aggregate throughput without changing the raw counters.</p>
+    <p class="card-desc">Input misses were newly processed; input hits were reused from the prefix/KV cache. A leading ~ marks a legacy estimate. Aliases, merge groups, and routing rules do not change the raw counters.</p>
     <div x-show="Object.keys(state?.token_stats || {}).length === 0" class="empty">
       No token usage recorded yet.
     </div>
@@ -1788,8 +1794,8 @@ for chunk in stream:
         <thead>
           <tr>
             <th :aria-sort="usageSortAria('model')"><button class="usage-sort" @click="setUsageSort('model')">Model / alias <span x-text="usageSortIndicator('model')"></span></button></th>
-            <th style="text-align:right" :aria-sort="usageSortAria('input')"><button class="usage-sort usage-sort-right" @click="setUsageSort('input')">Input tokens <span x-text="usageSortIndicator('input')"></span></button></th>
-            <th style="text-align:right" :aria-sort="usageSortAria('cached')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cached')">Cached <span x-text="usageSortIndicator('cached')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('input')"><button class="usage-sort usage-sort-right" @click="setUsageSort('input')" title="Prompt tokens newly processed by the model">Input tokens (miss) <span x-text="usageSortIndicator('input')"></span></button></th>
+            <th style="text-align:right" :aria-sort="usageSortAria('cached')"><button class="usage-sort usage-sort-right" @click="setUsageSort('cached')" title="Prompt tokens reused from the prefix/KV cache">Input tokens (hit) <span x-text="usageSortIndicator('cached')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('output')"><button class="usage-sort usage-sort-right" @click="setUsageSort('output')">Output tokens <span x-text="usageSortIndicator('output')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('requests')"><button class="usage-sort usage-sort-right" @click="setUsageSort('requests')">Requests <span x-text="usageSortIndicator('requests')"></span></button></th>
             <th style="text-align:right" :aria-sort="usageSortAria('speed')"><button class="usage-sort usage-sort-right" @click="setUsageSort('speed')">Avg speed (last 1M output) <span x-text="usageSortIndicator('speed')"></span></button></th>
@@ -1805,15 +1811,16 @@ for chunk in stream:
                   <strong class="mono" x-text="row.label"></strong>
                   <span class="status-pill pill-recipe" x-show="row.merge_group" x-text="`${row.models.length} merged`"></span>
                   <button class="usage-alias-button"
-                          @click="row.merge_group ? toggleUsageDetails(row) : startUsageAliasEdit(row.members[0].model)"
+                          x-show="row.merge_group || usageMasterMember(row)"
+                          @click="row.merge_group ? toggleUsageDetails(row) : startUsageAliasEdit(usageMasterMember(row).model)"
                           title="Edit usage alias and merge group" aria-label="Edit usage model">✎</button>
-                  <span class="muted usage-alias-saved" x-show="!row.merge_group && usageAliasSaved[row.members[0].model]">Saved</span>
+                  <span class="muted usage-alias-saved" x-show="!row.merge_group && usageMasterMember(row) && usageAliasSaved[usageMasterMember(row).model]">Saved</span>
                 </div>
-                <template x-for="member in row.members" :key="member.model">
+                <template x-for="member in usageVisibleMembers(row)" :key="member.model">
                   <div class="usage-model-member">
                     <div class="muted mono usage-model-id"
                          x-show="usageDetailsOpen[row.key] || usageAliasEditing[member.model]">
-                      <span x-text="member.alias ? `${member.alias} · ${member.model}` : member.model"></span>
+                      <span x-text="`${member.alias ? member.alias + ' · ' : ''}${member.model}${member.routed_to ? ' → ' + member.routed_to : ''}`"></span>
                       <button class="usage-alias-button" x-show="row.merge_group"
                               @click="startUsageAliasEdit(member.model)" title="Edit usage alias and merge group" aria-label="Edit usage model">✎</button>
                       <span class="usage-alias-saved" x-show="usageAliasSaved[member.model]">Saved</span>
@@ -1833,19 +1840,19 @@ for chunk in stream:
                   </div>
                 </template>
               </td>
-              <td style="text-align:right" x-text="fmtTokens(row.stats.input)"></td>
-              <td style="text-align:right" x-text="row.stats.cached ? fmtTokens(row.stats.cached) : '—'"></td>
+              <td style="text-align:right" :title="usageInputBreakdownTitle(row)" x-text="usageTokensDisplay(row, usageInputMiss(row))"></td>
+              <td style="text-align:right" :title="usageCacheBreakdownTitle(row)" x-text="usageCachedTokens(row) ? usageTokensDisplay(row, usageCachedTokens(row)) : '—'"></td>
               <td style="text-align:right" x-text="fmtTokens(row.stats.output)"></td>
               <td style="text-align:right" x-text="row.stats.requests ?? 0"></td>
               <td style="text-align:right" :title="row.speed?.legacy ? 'Legacy lifetime average until a new speed sample is recorded' : `Rolling ${fmtTokens(row.speed?.tokens || 0)} generated tokens; concurrent decode intervals are aggregated`" x-text="usageAverageSpeed(row) != null ? usageAverageSpeed(row).toFixed(1) + ' tok/s' : '—'"></td>
               <td style="text-align:right" x-text="fmtDuration(row.stats.gen_time_s)"></td>
-              <td style="text-align:right" x-text="usageCostDisplay(row)"></td>
+              <td style="text-align:right" :title="row.cost_estimated ? 'Cost includes the legacy cache-hit estimate' : ''" x-text="usageCostDisplay(row)"></td>
             </tr>
           </template>
           <tr class="usage-total">
             <td><strong>Total</strong></td>
-            <td style="text-align:right" x-text="fmtTokens(totalInputTokens())"></td>
-            <td style="text-align:right" x-text="fmtTokens(totalCachedTokens())"></td>
+            <td style="text-align:right" x-text="`${usageTotalsEstimated() ? '~' : ''}${fmtTokens(totalInputMissTokens())}`"></td>
+            <td style="text-align:right" x-text="`${usageTotalsEstimated() ? '~' : ''}${fmtTokens(totalCachedTokens())}`"></td>
             <td style="text-align:right" x-text="fmtTokens(totalOutputTokens())"></td>
             <td style="text-align:right" x-text="totalRequests()"></td>
             <td></td>
@@ -1947,6 +1954,49 @@ for chunk in stream:
         </template>
       </tbody>
     </table>
+  </div>
+
+  <!-- Usage routing rules -->
+  <div class="card" x-show="state">
+    <h3>Rules</h3>
+    <p class="card-desc">Route one recorded model name into another for usage display. For example, <span class="mono">xxx/abcdefg → xxx/1234567</span> hides the source row and adds its tokens to <span class="mono">xxx/1234567</span>, pricing all usage at the destination model's rates. Raw counters and API routing are unchanged.</p>
+    <div class="usage-rules" x-show="usageRoutingRules().length > 0">
+      <template x-for="rule in usageRoutingRules()" :key="rule.source">
+        <div class="usage-rule-row">
+          <span class="mono" x-text="rule.source"></span>
+          <span class="usage-rule-arrow" aria-label="routes to">→</span>
+          <span class="mono" x-text="rule.destination"></span>
+          <button class="icon-btn btn-danger" type="button"
+                  @click="deleteUsageRoutingRule(rule.source)"
+                  :disabled="usageRuleDeleting[rule.source] === true"
+                  :title="`Delete rule for ${rule.source}`">✕</button>
+        </div>
+      </template>
+    </div>
+    <p class="empty" x-show="usageRoutingRules().length === 0">No routing rules configured.</p>
+    <form class="usage-rule-form" @submit.prevent="saveUsageRoutingRule()">
+      <label>
+        <span>Source model</span>
+        <input type="text" maxlength="512" list="usage-rule-models"
+               x-model="usageRuleSource" placeholder="xxx/abcdefg" required>
+      </label>
+      <span class="usage-rule-arrow" aria-hidden="true">→</span>
+      <label>
+        <span>Destination model</span>
+        <input type="text" maxlength="512" list="usage-rule-models"
+               x-model="usageRuleDestination" placeholder="xxx/1234567" required>
+      </label>
+      <button class="btn btn-primary" type="submit" :disabled="usageRuleSaving">
+        <span x-show="!usageRuleSaving">Add rule</span>
+        <span x-show="usageRuleSaving">Saving…</span>
+      </button>
+      <span class="muted" x-show="usageRuleSaved">Saved.</span>
+    </form>
+    <datalist id="usage-rule-models">
+      <template x-for="model in usageRuleModels()" :key="model">
+        <option :value="model"></option>
+      </template>
+    </datalist>
   </div>
 
   </div>

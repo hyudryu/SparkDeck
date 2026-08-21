@@ -827,7 +827,7 @@ function app() {
         this.temperatureRunBusy = false;
       }
     },
-    async cancelArmedTemperatureRun() {
+    async cancelTemperatureRun() {
       if (this.temperatureRunCancelBusy) return;
       this.temperatureRunCancelBusy = true;
       this.temperatureRunError = '';

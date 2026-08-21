@@ -58,11 +58,28 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
                 "extra_args": ["--served-model-name", "saved-name"],
             },
         }
-        container = {"served_models": [SERVED_MODEL]}
+        container = {"status": "running", "served_models": [SERVED_MODEL]}
 
         result = Manager._deployment_served_models(deployment, container)
 
         self.assertEqual(result, [SERVED_MODEL])
+
+    def test_cluster_display_uses_edited_saved_name_for_stopped_container(self) -> None:
+        deployment = {
+            "model": BACKING_MODEL,
+            "settings_dirty": True,
+            "launch_settings": {
+                "extra_args": ["--served-model-name", "edited-name"],
+            },
+        }
+        container = {
+            "status": "exited",
+            "served_models": ["stale-container-name"],
+        }
+
+        result = Manager._deployment_served_models(deployment, container)
+
+        self.assertEqual(result, ["edited-name"])
 
     async def test_models_endpoint_advertises_served_model_name(self) -> None:
         manager = Manager.__new__(Manager)

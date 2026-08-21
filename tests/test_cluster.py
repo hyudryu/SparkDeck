@@ -826,6 +826,54 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["cost_estimated"])
         self.assertEqual(row["total_cost"], 4.2)
 
+    def test_usage_routing_carries_source_cache_estimate_to_destination(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy-source": {
+                "input": 1_000_000, "cached": 100_000, "output": 0,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"legacy-source": "claude-opus-4"}
+        instance.usage_cache_estimates = {
+            "model:legacy-source": {"estimated_cached": 700_000},
+        }
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        row = instance.usage_rows()[0]
+
+        self.assertEqual(row["key"], "model:claude-opus-4")
+        self.assertEqual(row["stats"]["measured_cached"], 100_000)
+        self.assertEqual(row["stats"]["estimated_cached"], 700_000)
+        self.assertEqual(row["stats"]["cached"], 800_000)
+        self.assertEqual(row["total_cost"], 4.2)
+
+    def test_usage_merge_group_reprices_estimated_cache_hits(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 100_000, "output": 0,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {"claude-opus-4": "Combined"}
+        instance.usage_routing_rules = {}
+        instance.usage_cache_estimates = {
+            "group:Combined": {"estimated_cached": 700_000},
+        }
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        row = instance.usage_rows()[0]
+
+        self.assertEqual(row["stats"]["cached"], 800_000)
+        self.assertTrue(row["cost_estimated"])
+        self.assertEqual(row["total_cost"], 4.2)
+
     def test_usage_routing_rules_persist_update_delete_and_reject_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

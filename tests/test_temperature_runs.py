@@ -68,7 +68,7 @@ class TemperatureRunTests(unittest.IsolatedAsyncioTestCase):
             renamed = instance.rename_temperature_run(run["id"], "Cool-down A")
             self.assertEqual(renamed["name"], "Cool-down A")
 
-            cancelled = await instance.cancel_armed_temperature_recording()
+            cancelled = await instance.cancel_temperature_recording()
             self.assertEqual(cancelled["status"], "cancelled")
             self.assertIsNone(instance.temperature_runs_state()["active_run_id"])
 
@@ -96,9 +96,9 @@ class TemperatureRunTests(unittest.IsolatedAsyncioTestCase):
             instance.node_registry.request.assert_awaited_once_with(
                 "node-2", "GET", "/api/agent/stats", timeout=5,
             )
-            await instance.cancel_armed_temperature_recording()
+            await instance.cancel_temperature_recording()
 
-    async def test_recording_cannot_be_manually_cancelled_after_trigger(self) -> None:
+    async def test_recording_can_be_manually_cancelled_after_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = self.manager_for_test(directory)
             instance.get_stats = mock.AsyncMock(return_value={
@@ -107,10 +107,42 @@ class TemperatureRunTests(unittest.IsolatedAsyncioTestCase):
             run = await instance.arm_temperature_recording("local", 60, 5)
             self.assertEqual(run["status"], "recording")
 
-            with self.assertRaisesRegex(ValueError, "stop automatically"):
-                await instance.cancel_armed_temperature_recording()
+            cancelled = await instance.cancel_temperature_recording()
 
-            task = instance.temperature_recording_task
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertIsNone(instance._active_temperature_run_id)
+
+    def test_sustained_telemetry_failure_interrupts_run(self) -> None:
+        instance = Manager.__new__(Manager)
+        run = {"status": "recording", "samples": []}
+
+        for attempt in range(4):
+            self.assertFalse(instance._record_temperature_telemetry_failure(
+                run, "node unavailable", 100.0 + attempt,
+            ))
+        self.assertTrue(instance._record_temperature_telemetry_failure(
+            run, "node unavailable", 104.0,
+        ))
+
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(run["stopped_at"], 104.0)
+        self.assertEqual(run["samples"], [])
+
+    def test_valid_telemetry_resets_failure_streak_while_armed(self) -> None:
+        instance = Manager.__new__(Manager)
+        run = {
+            "status": "armed",
+            "target_temp_c": 60.0,
+            "trigger_temp_c": 63.0,
+            "telemetry_failures": 4,
+            "last_error": "node unavailable",
+            "samples": [],
+        }
+
+        result = instance._process_temperature_run_sample(
+            run, {"cpu_temp_c": 45.0, "gpus": []}, 100.0,
+        )
+
+        self.assertEqual(result, "waiting")
+        self.assertNotIn("telemetry_failures", run)
+        self.assertNotIn("last_error", run)

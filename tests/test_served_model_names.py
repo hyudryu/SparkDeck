@@ -39,6 +39,48 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["served_model"], SERVED_MODEL)
         self.assertEqual(summary["served_models"], [SERVED_MODEL])
 
+    def test_cluster_display_uses_saved_served_name_when_stopped(self) -> None:
+        deployment = {
+            "model": BACKING_MODEL,
+            "launch_settings": {
+                "extra_args": ["--served-model-name", SERVED_MODEL],
+            },
+        }
+
+        result = Manager._deployment_served_models(deployment)
+
+        self.assertEqual(result, [SERVED_MODEL])
+
+    def test_cluster_display_prefers_running_container_served_name(self) -> None:
+        deployment = {
+            "model": BACKING_MODEL,
+            "launch_settings": {
+                "extra_args": ["--served-model-name", "saved-name"],
+            },
+        }
+        container = {"status": "running", "served_models": [SERVED_MODEL]}
+
+        result = Manager._deployment_served_models(deployment, container)
+
+        self.assertEqual(result, [SERVED_MODEL])
+
+    def test_cluster_display_uses_edited_saved_name_for_stopped_container(self) -> None:
+        deployment = {
+            "model": BACKING_MODEL,
+            "settings_dirty": True,
+            "launch_settings": {
+                "extra_args": ["--served-model-name", "edited-name"],
+            },
+        }
+        container = {
+            "status": "exited",
+            "served_models": ["stale-container-name"],
+        }
+
+        result = Manager._deployment_served_models(deployment, container)
+
+        self.assertEqual(result, ["edited-name"])
+
     async def test_models_endpoint_advertises_served_model_name(self) -> None:
         manager = Manager.__new__(Manager)
         manager.get_state = mock.AsyncMock(return_value={
@@ -52,7 +94,7 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in result["data"]], [SERVED_MODEL])
 
-    async def test_cluster_models_endpoint_also_advertises_backing_model(self) -> None:
+    async def test_cluster_models_endpoint_hides_backing_model_when_served_name_exists(self) -> None:
         manager = Manager.__new__(Manager)
         container = {
             **self.container_summary(),
@@ -67,10 +109,25 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
 
         result = await manager.proxy_models()
 
-        self.assertEqual(
-            [item["id"] for item in result["data"]],
-            [SERVED_MODEL, BACKING_MODEL],
-        )
+        self.assertEqual([item["id"] for item in result["data"]], [SERVED_MODEL])
+
+    async def test_models_endpoint_uses_backing_model_without_served_name(self) -> None:
+        manager = Manager.__new__(Manager)
+        container = {
+            **self.container_summary(),
+            "served_model": BACKING_MODEL,
+            "served_models": [],
+        }
+        manager.get_state = mock.AsyncMock(return_value={
+            "containers": [container],
+            "ollama": {"models": []},
+            "unsloth": {},
+            "sparkrun_targets": {},
+        })
+
+        result = await manager.proxy_models()
+
+        self.assertEqual([item["id"] for item in result["data"]], [BACKING_MODEL])
 
     async def test_backing_model_request_is_rewritten_for_vllm(self) -> None:
         manager = Manager.__new__(Manager)

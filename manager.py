@@ -142,6 +142,16 @@ TEMPERATURE_HISTORY_MAX_SAMPLES = (
     int(TEMPERATURE_HISTORY_WINDOW_SECONDS / TEMPERATURE_HISTORY_INTERVAL_SECONDS) + 1
 )
 
+# On-demand benchmark recordings use a finer cadence than the compact header
+# history. A run is armed at a target temperature, starts once the hottest
+# available CPU/GPU sensor reaches the configured margin above that target,
+# and stops automatically after the node cools below the target.
+TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS = 1.0
+# A disconnected node must not leave an armed or recording run alive forever.
+# Five consecutive misses tolerate brief agent restarts while bounding the
+# amount of time an unusable recording remains active.
+TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
+
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
@@ -301,6 +311,14 @@ class Manager:
         self.usage_aliases: dict[str, str] = self._load_usage_aliases()
         self.usage_merge_groups_path = self.data_dir / "usage_merge_groups.json"
         self.usage_merge_groups: dict[str, str] = self._load_usage_merge_groups()
+        self.usage_routing_rules_path = self.data_dir / "usage_routing_rules.json"
+        self.usage_routing_rules: dict[str, str] = self._load_usage_routing_rules()
+        self.usage_cache_estimates_path = (
+            self.data_dir / "usage_cache_estimates.json"
+        )
+        self.usage_cache_estimates: dict[str, dict] = (
+            self._load_usage_cache_estimates()
+        )
         self.speed_samples_path = self.data_dir / "speed_samples.json"
         self.speed_samples: dict[str, list[dict]] = self._load_speed_samples()
         self._speed_samples_version = 0
@@ -328,6 +346,7 @@ class Manager:
         self.deployment_capacity_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
         self.temperature_history_task: asyncio.Task | None = None
+        self.temperature_recording_task: asyncio.Task | None = None
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
@@ -351,6 +370,8 @@ class Manager:
         self._rebuild_synced_token_usage()
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
+        if self._migrate_vllm_prompt_token_details():
+            self._save_deployments()
         self.container_aliases_path = self.data_dir / "container_aliases.json"
         self.container_aliases: dict[str, str] = self._load_container_aliases()
         self._cpu_prev: tuple[int, int] | None = None
@@ -362,6 +383,20 @@ class Manager:
         self._remote_temperature_histories: dict[
             str, deque[dict[str, float | None]]
         ] = {}
+        self.temperature_runs_path = self.data_dir / "temperature_runs.json"
+        self.temperature_runs: dict[str, dict] = self._load_temperature_runs()
+        self._active_temperature_run_id: str | None = None
+        self._temperature_recording_lock = asyncio.Lock()
+        self._temperature_runs_last_saved_at = 0.0
+        interrupted_runs = False
+        for run in self.temperature_runs.values():
+            if run.get("status") not in {"armed", "recording"}:
+                continue
+            run["status"] = "interrupted"
+            run["stopped_at"] = run.get("last_sample_at") or time.time()
+            interrupted_runs = True
+        if interrupted_runs:
+            self._save_temperature_runs()
         # container_name -> {"last_active": ts, "counter": int}
         self._activity: dict[str, dict] = {}
         # timestamp, {iface: (rx_bytes, tx_bytes)}
@@ -470,6 +505,7 @@ class Manager:
             self.deployment_capacity_task,
             self.fan_cluster_task,
             self.temperature_history_task,
+            self.temperature_recording_task,
             self.inference_nudger_task,
             self.token_usage_sync_task,
         ):
@@ -479,6 +515,14 @@ class Manager:
                     await t
                 except asyncio.CancelledError:
                     pass
+        active_run_id = getattr(self, "_active_temperature_run_id", None)
+        active_run = getattr(self, "temperature_runs", {}).get(active_run_id)
+        if active_run and active_run.get("status") in {"armed", "recording"}:
+            active_run["status"] = "interrupted"
+            active_run["stopped_at"] = time.time()
+            self._save_temperature_runs()
+        self._active_temperature_run_id = None
+        self.temperature_recording_task = None
         self._stop_mem_bw_monitor()
         await self.http.aclose()
 
@@ -527,10 +571,20 @@ class Manager:
         Container images may contain host-specific RDMA defaults. Always
         replace them using the interface selected for this cluster member so
         socket bootstrap and collective traffic cannot target different ports.
+
+        Images (e.g. the Aiden sparkrun builds) also bake in a hard-coded
+        NCCL_IB_GID_INDEX that only matches the build host's GID table. With
+        NCCL 2.21+ RoCE GID selection is dynamic, so a stale index (which can
+        point at an empty slot after reboot/link flaps) must be *unset*, not
+        renumbered: ``None`` lets docker-py emit a bare ``KEY`` entry, which
+        the Docker API interprets as "remove from the image environment".
         """
         environment = {
             "NCCL_SOCKET_IFNAME": interface,
             "GLOO_SOCKET_IFNAME": interface,
+            # Unset stale image-baked GID index; NCCL >= 2.21 selects the
+            # IPv4 RoCEv2 GID dynamically.
+            "NCCL_IB_GID_INDEX": None,
         }
         infiniband_dir = sys_class_net / interface / "device" / "infiniband"
         try:
@@ -834,6 +888,36 @@ class Manager:
         tmp.write_text(json.dumps(self.deployments, indent=2), encoding="utf-8")
         tmp.replace(self.deployments_path)
 
+    @staticmethod
+    def _with_vllm_prompt_token_details(args: list[Any]) -> list[Any]:
+        """Enable cached-token details unless the user explicitly chose."""
+        result = list(args)
+        names = {str(arg).split("=", 1)[0] for arg in result}
+        if not names.intersection({
+            "--enable-prompt-tokens-details",
+            "--no-enable-prompt-tokens-details",
+        }):
+            result.append("--enable-prompt-tokens-details")
+        return result
+
+    def _migrate_vllm_prompt_token_details(self) -> bool:
+        """Mark saved vLLM deployments for a reporting-capable rebuild."""
+        changed = False
+        for deployment in self.deployments:
+            settings = deployment.get("launch_settings")
+            if not isinstance(settings, dict):
+                continue
+            if (settings.get("engine") or deployment.get("engine") or "vllm") != "vllm":
+                continue
+            original = list(settings.get("extra_args") or [])
+            updated = self._with_vllm_prompt_token_details(original)
+            if updated == original:
+                continue
+            settings["extra_args"] = updated
+            deployment["settings_dirty"] = True
+            changed = True
+        return changed
+
     def _load_container_aliases(self) -> dict[str, str]:
         if not self.container_aliases_path.exists():
             return {}
@@ -897,6 +981,119 @@ class Manager:
             json.dumps(self.usage_merge_groups, indent=2), encoding="utf-8"
         )
         tmp.replace(self.usage_merge_groups_path)
+
+    def _load_usage_routing_rules(self) -> dict[str, str]:
+        if not self.usage_routing_rules_path.exists():
+            return {}
+        try:
+            value = json.loads(
+                self.usage_routing_rules_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(value, dict):
+                return {}
+            return {
+                str(source).strip(): str(destination).strip()
+                for source, destination in value.items()
+                if str(source).strip() and str(destination).strip()
+            }
+        except Exception:
+            return {}
+
+    def _save_usage_routing_rules(self) -> None:
+        tmp = self.usage_routing_rules_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.usage_routing_rules, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.usage_routing_rules_path)
+
+    def _load_usage_cache_estimates(self) -> dict[str, dict]:
+        if not self.usage_cache_estimates_path.exists():
+            return {}
+        try:
+            value = json.loads(
+                self.usage_cache_estimates_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        estimates: dict[str, dict] = {}
+        for row_key, raw in value.items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                rate_pct = min(100.0, max(0.0, float(raw["rate_pct"])))
+                legacy_input = max(0, int(raw["legacy_input"]))
+                measured_cached = min(
+                    legacy_input, max(0, int(raw.get("measured_cached") or 0))
+                )
+                estimated_cached = min(
+                    legacy_input - measured_cached,
+                    max(0, int(raw.get("estimated_cached") or 0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            estimates[str(row_key)] = {
+                "rate_pct": rate_pct,
+                "legacy_input": legacy_input,
+                "measured_cached": measured_cached,
+                "estimated_cached": estimated_cached,
+            }
+        return estimates
+
+    def _save_usage_cache_estimates(self) -> None:
+        tmp = self.usage_cache_estimates_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.usage_cache_estimates, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.usage_cache_estimates_path)
+
+    @staticmethod
+    def _usage_route_target(model: str, rules: dict[str, str]) -> str:
+        """Resolve a model through a validated, possibly chained rule map."""
+        target = model
+        seen: set[str] = set()
+        while target in rules and target not in seen:
+            seen.add(target)
+            target = rules[target]
+        return target
+
+    def update_usage_routing_rule(self, source: Any, destination: Any) -> dict:
+        source_key = str(source or "").strip()
+        destination_key = str(destination or "").strip()
+        if not source_key or not destination_key:
+            raise ValueError("source and destination are required")
+        if len(source_key) > 512 or len(destination_key) > 512:
+            raise ValueError("model names must be 512 characters or fewer")
+        if source_key == destination_key:
+            raise ValueError("source and destination must be different")
+
+        candidate = dict(getattr(self, "usage_routing_rules", {}))
+        candidate[source_key] = destination_key
+        for model in candidate:
+            current = model
+            seen: set[str] = set()
+            while current in candidate:
+                if current in seen:
+                    raise ValueError("routing rules cannot contain a cycle")
+                seen.add(current)
+                current = candidate[current]
+
+        self.usage_routing_rules = candidate
+        self._save_usage_routing_rules()
+        return {
+            "ok": True,
+            "source": source_key,
+            "destination": destination_key,
+        }
+
+    def delete_usage_routing_rule(self, source: Any) -> dict:
+        source_key = str(source or "").strip()
+        if not source_key or source_key not in self.usage_routing_rules:
+            raise ValueError("routing rule not found")
+        self.usage_routing_rules.pop(source_key)
+        self._save_usage_routing_rules()
+        return {"ok": True, "source": source_key}
 
     def update_usage_alias(
         self,
@@ -985,12 +1182,16 @@ class Manager:
     @classmethod
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
+        engine = body.get("engine") or "vllm"
+        extra_args = list(body.get("extra_args") or [])
+        if engine == "vllm":
+            extra_args = cls._with_vllm_prompt_token_details(extra_args)
         return {
             "deployment_name": body.get("deployment_name") or body.get("name"),
             "model": body.get("model") or "",
-            "engine": body.get("engine") or "vllm",
+            "engine": engine,
             "image": body.get("image") or None,
-            "extra_args": list(body.get("extra_args") or []),
+            "extra_args": extra_args,
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
             "sg_tp_size": body.get("sg_tp_size"),
@@ -1650,7 +1851,13 @@ class Manager:
             "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
-            "extra_args": list(body.get("extra_args") or []),
+            "extra_args": (
+                self._with_vllm_prompt_token_details(
+                    list(body.get("extra_args") or [])
+                )
+                if engine == "vllm"
+                else list(body.get("extra_args") or [])
+            ),
             "image": body.get("image"),
             "sg_tp_size": body.get("sg_tp_size"),
             "sg_context_length": body.get("sg_context_length"),
@@ -3130,7 +3337,7 @@ class Manager:
             return
         for field in (
             "input", "output", "cached", "requests",
-            "gen_tokens", "gen_time_s",
+            "gen_tokens", "gen_time_s", "pp_tokens", "pp_time_s",
         ):
             value = source.get(field)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -3176,6 +3383,7 @@ class Manager:
         completion_tokens: int,
         cached_tokens: int,
         gen_time_s: float | None,
+        pp_time_s: float | None,
         hour_key: str,
     ) -> None:
         ledger = getattr(self, "token_usage_sync", None)
@@ -3209,6 +3417,10 @@ class Manager:
             if gen_time_s and gen_time_s > 0 and completion_tokens > 0:
                 rec["gen_tokens"] = rec.get("gen_tokens", 0) + completion_tokens
                 rec["gen_time_s"] = rec.get("gen_time_s", 0.0) + gen_time_s
+            pp_tokens = max(0, prompt_tokens - cached_tokens)
+            if pp_time_s and pp_time_s > 0 and pp_tokens > 0:
+                rec["pp_tokens"] = rec.get("pp_tokens", 0) + pp_tokens
+                rec["pp_time_s"] = rec.get("pp_time_s", 0.0) + pp_time_s
 
         add(component.setdefault("token_stats", {}).setdefault(model, {}))
         hour = component.setdefault("hourly_token_stats", {}).setdefault(
@@ -3480,6 +3692,21 @@ class Manager:
         served = list(dict.fromkeys(served))
         return served or ([fallback] if fallback else [])
 
+    @classmethod
+    def _deployment_served_models(
+        cls, deployment: dict, primary_container: dict | None = None,
+    ) -> list[str]:
+        """Return the API-facing ids for a saved cluster deployment."""
+        if primary_container and primary_container.get("status") == "running":
+            live = primary_container.get("served_models") or []
+            if live:
+                return list(dict.fromkeys(str(value) for value in live if value))
+        settings = deployment.get("launch_settings") or {}
+        return cls._served_models_from_cmd(
+            list(settings.get("extra_args") or []),
+            str(deployment.get("model") or ""),
+        )
+
     @staticmethod
     def _container_model_ids(container: dict) -> list[str]:
         """All request ids that may be used to select a container."""
@@ -3512,6 +3739,7 @@ class Manager:
         completion_tokens: int,
         gen_time_s: float | None = None,
         cached_tokens: int = 0,
+        pp_time_s: float | None = None,
     ):
         if not model:
             return
@@ -3532,6 +3760,7 @@ class Manager:
             completion_tokens,
             cached_tokens,
             gen_time_s,
+            pp_time_s,
             hour_key,
         )
         self._record_speed_sample(model, completion_tokens, gen_time_s)
@@ -3547,6 +3776,10 @@ class Manager:
             if gen_time_s and gen_time_s > 0 and completion_tokens > 0:
                 rec["gen_tokens"] = rec.get("gen_tokens", 0) + completion_tokens
                 rec["gen_time_s"] = rec.get("gen_time_s", 0.0) + gen_time_s
+            pp_tokens = max(0, prompt_tokens - cached_tokens)
+            if pp_time_s and pp_time_s > 0 and pp_tokens > 0:
+                rec["pp_tokens"] = rec.get("pp_tokens", 0) + pp_tokens
+                rec["pp_time_s"] = rec.get("pp_time_s", 0.0) + pp_time_s
         # Record hourly stats for the Analysis charts.
         hrec = self.hourly_token_stats.setdefault(hour_key, {}).setdefault(model, {})
         hrec["input"] = hrec.get("input", 0) + prompt_tokens
@@ -3556,6 +3789,10 @@ class Manager:
         if gen_time_s and gen_time_s > 0 and completion_tokens > 0:
             hrec["gen_tokens"] = hrec.get("gen_tokens", 0) + completion_tokens
             hrec["gen_time_s"] = hrec.get("gen_time_s", 0.0) + gen_time_s
+        pp_tokens = max(0, prompt_tokens - cached_tokens)
+        if pp_time_s and pp_time_s > 0 and pp_tokens > 0:
+            hrec["pp_tokens"] = hrec.get("pp_tokens", 0) + pp_tokens
+            hrec["pp_time_s"] = hrec.get("pp_time_s", 0.0) + pp_time_s
         try:
             self._save_token_stats()
         except Exception:
@@ -3569,8 +3806,28 @@ class Manager:
         except Exception:
             pass
 
-    def _record_usage(self, model: str, usage: dict | None,
-                      gen_time_s: float | None = None):
+    @staticmethod
+    def _usage_prompt_counts(usage: dict) -> tuple[int, int]:
+        try:
+            prompt_tokens = max(0, int(usage.get("prompt_tokens") or 0))
+        except (TypeError, ValueError):
+            prompt_tokens = 0
+        details = usage.get("prompt_tokens_details")
+        try:
+            cached_tokens = max(
+                0, int((details or {}).get("cached_tokens") or 0)
+            ) if isinstance(details, dict) else 0
+        except (TypeError, ValueError):
+            cached_tokens = 0
+        return prompt_tokens, min(prompt_tokens, cached_tokens)
+
+    def _record_usage(
+        self,
+        model: str,
+        usage: dict | None,
+        gen_time_s: float | None = None,
+        pp_time_s: float | None = None,
+    ):
         """Record an OpenAI-style usage object {prompt_tokens, completion_tokens}.
 
         Also extracts cached_tokens from prompt_tokens_details when present
@@ -3578,16 +3835,14 @@ class Manager:
         """
         if not usage:
             return
-        cached = 0
-        details = usage.get("prompt_tokens_details")
-        if isinstance(details, dict):
-            cached = details.get("cached_tokens") or 0
+        prompt_tokens, cached = self._usage_prompt_counts(usage)
         self._record_tokens(
             model,
-            usage.get("prompt_tokens") or 0,
+            prompt_tokens,
             usage.get("completion_tokens") or 0,
             gen_time_s,
             cached_tokens=cached,
+            pp_time_s=pp_time_s,
         )
 
     @staticmethod
@@ -3771,6 +4026,7 @@ class Manager:
         streaming: bool = False,
         admission_target: str | None = None,
         nudge_event: asyncio.Event | None = None,
+        deployment_id: str | None = None,
     ) -> int:
         self._req_seq += 1
         rid = self._req_seq
@@ -3778,13 +4034,26 @@ class Manager:
             "key": key, "thinking": deque(), "output": deque(),
             "streaming": streaming,
             "started_at": time.monotonic(),
+            "pp_tokens": 0,
+            "pp_time_s": 0.0,
             "total_tokens": 0,
             "forwarded_chunks": 0,
             "admission_target": admission_target,
             "nudge_event": nudge_event,
+            "deployment_id": deployment_id,
             "paused": False,
         }
+        self._mark_deployment_used(deployment_id)
         return rid
+
+    def _track_prompt_processing(
+        self, rid: int, prompt_tokens: int, pp_time_s: float,
+    ) -> None:
+        rec = self._active_reqs.get(rid)
+        if rec is None or prompt_tokens <= 0 or pp_time_s <= 0:
+            return
+        rec["pp_tokens"] = int(prompt_tokens)
+        rec["pp_time_s"] = float(pp_time_s)
 
     def _track_output(
         self, rid: int, ts: float, kind: str = "output", count: int = 1,
@@ -3799,13 +4068,36 @@ class Manager:
                 timestamps.popleft()
 
     def _track_end(self, rid: int):
-        self._active_reqs.pop(rid, None)
+        rec = self._active_reqs.pop(rid, None)
+        if rec:
+            self._mark_deployment_used(rec.get("deployment_id"))
+
+    def _mark_deployment_used(self, deployment_id: str | None) -> None:
+        """Record cluster inference activity, persisting at a bounded rate."""
+        if not deployment_id:
+            return
+        now = time.time()
+        for deployment in getattr(self, "deployments", []):
+            if deployment.get("id") != deployment_id:
+                continue
+            deployment["last_used_at"] = now
+            saved_at = getattr(self, "_deployment_last_used_saved_at", None)
+            if saved_at is None:
+                saved_at = self._deployment_last_used_saved_at = {}
+            # Preserve the latest in memory for the live UI, while avoiding a
+            # deployments.json write for every chunk or concurrent request.
+            if now - float(saved_at.get(deployment_id) or 0) >= 5.0:
+                try:
+                    self._save_deployments()
+                    saved_at[deployment_id] = now
+                except Exception:
+                    pass
+            return
 
     def active_requests(self) -> dict:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
         out: dict[str, dict] = {}
-        stale: list[int] = []
         for rid, rec in list(self._active_reqs.items()):
             # A zero-output stream selected for transparent replay stays in
             # _active_reqs so its downstream connection remains open, but it
@@ -3813,20 +4105,18 @@ class Manager:
             # Do not report that paused request as running.
             if rec.get("paused"):
                 continue
-            # Only clean up non-streaming requests that have no timestamps.
-            # Streaming requests are cleaned up by _track_end() in each
-            # stream method's finally block — they may simply not have
-            # received any chunks yet (e.g. during the initial connection
-            # or thinking phase) and must not be purged prematurely.
-            if not rec.get("streaming") and not rec["thinking"] and not rec["output"]:
-                stale.append(rid)
-                continue
             e = out.setdefault(rec["key"], {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
             })
             e["connections"] += 1
             e["decoded_tokens"] += int(rec.get("total_tokens") or 0)
+            if rec.get("pp_tokens") and rec.get("pp_time_s"):
+                e["pp_tokens"] += int(rec["pp_tokens"])
+                e["pp_time_s"] += float(rec["pp_time_s"])
+            else:
+                e["pp_measuring"] += 1
             for kind, field in (("thinking", "thinking_tok_s"), ("output", "output_tok_s")):
                 timestamps = rec[kind]
                 cutoff = now - self._trailing_window
@@ -3835,10 +4125,6 @@ class Manager:
                 if timestamps:
                     observed = min(self._trailing_window, max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
-        # purge stale non-streaming entries first, so the per-model cleanup
-        # below sees the true set of active keys.
-        for rid in stale:
-            self._active_reqs.pop(rid, None)
         # clean up per-model entries when all their streams ended
         active_keys = {rec["key"] for rec in self._active_reqs.values()}
         for key in list(out.keys()):
@@ -3847,6 +4133,11 @@ class Manager:
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
+            e["pp_tok_s"] = (
+                round(e["pp_tokens"] / e["pp_time_s"], 1)
+                if e["pp_time_s"] > 0
+                else None
+            )
         admission_running: dict[str, int] = {}
         for admission in self.inference_admission().values():
             model = admission.get("model")
@@ -3855,6 +4146,8 @@ class Manager:
             e = out.setdefault(model, {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
+                "pp_tok_s": None,
             })
             e["queued"] = e.get("queued", 0) + admission["queued"]
             e["admission_limit"] = admission.get(
@@ -4241,38 +4534,78 @@ class Manager:
         }
 
     def usage_rows(self) -> list[dict]:
-        """Return reversible display groups over the raw lifetime counters."""
+        """Return reversible display groups over the raw lifetime counters.
+
+        Directional routing rules are applied first, then the destination's
+        optional merge group.  The raw counters remain keyed by the model name
+        originally recorded, so changing a rule is always reversible.
+        """
         rows: dict[str, dict] = {}
         numeric_fields = (
             "input", "output", "cached", "requests", "gen_tokens", "gen_time_s",
         )
         merge_groups = getattr(self, "usage_merge_groups", {})
         aliases = getattr(self, "usage_aliases", {})
+        routing_rules = getattr(self, "usage_routing_rules", {})
+        cache_estimates = getattr(self, "usage_cache_estimates", {})
         for model, model_stats in self.token_stats.items():
-            merge_group = str(merge_groups.get(model) or "").strip()
-            row_key = f"group:{merge_group}" if merge_group else f"model:{model}"
+            destination = self._usage_route_target(model, routing_rules)
+            merge_group = str(merge_groups.get(destination) or "").strip()
+            row_key = (
+                f"group:{merge_group}"
+                if merge_group
+                else f"model:{destination}"
+            )
             row = rows.setdefault(row_key, {
                 "key": row_key,
-                "label": merge_group or aliases.get(model) or model,
+                "label": merge_group or aliases.get(destination) or destination,
                 "merge_group": merge_group or None,
+                "route_target": None if merge_group else destination,
                 "models": [],
                 "members": [],
                 "stats": {field: 0 for field in numeric_fields},
                 "total_cost": 0.0,
+                "_estimated_cached": 0,
+                "_applied_estimate_keys": set(),
             })
+            measured_cached = max(0, int(model_stats.get("cached", 0) or 0))
+            input_tokens = max(0, int(model_stats.get("input", 0) or 0))
+            source_estimate_key = f"model:{model}"
+            source_estimate = cache_estimates.get(source_estimate_key)
+            source_estimated_cached = 0
+            if isinstance(source_estimate, dict):
+                source_estimated_cached = min(
+                    max(0, input_tokens - measured_cached),
+                    max(0, int(source_estimate.get("estimated_cached") or 0)),
+                )
+                row["_applied_estimate_keys"].add(source_estimate_key)
+                row.setdefault("_cache_estimates", []).append(source_estimate)
+            row["_estimated_cached"] += source_estimated_cached
             row["models"].append(model)
             row["members"].append({
                 "model": model,
                 "alias": aliases.get(model),
                 "merge_group": merge_group or None,
+                "routed_to": destination if destination != model else None,
+                # Private values are removed before returning the public row.
+                # They let merge groups reprice estimated cache hits at each
+                # member's actual (or routed destination's) rates.
+                "_pricing_model": destination,
+                "_cost_stats": {
+                    "input": input_tokens,
+                    "cached": measured_cached + source_estimated_cached,
+                    "output": max(0, int(model_stats.get("output", 0) or 0)),
+                },
             })
             for field in numeric_fields:
                 row["stats"][field] += model_stats.get(field, 0) or 0
-            row["total_cost"] += self.calculate_cost(
-                model, model_stats
-            ).get("total_cost", 0.0)
 
         for row in rows.values():
+            row["routed_sources"] = [
+                member["model"]
+                for member in row["members"]
+                if member.get("routed_to")
+            ]
             speed = self.rolling_generation_speed(row["models"])
             # Existing installations have lifetime speed totals but no
             # interval samples until this version records its first request.
@@ -4288,7 +4621,110 @@ class Manager:
                         "legacy": True,
                     }
             row["speed"] = speed
-            row["total_cost"] = round(row["total_cost"], 2)
+            measured_cached = max(0, int(row["stats"].get("cached", 0) or 0))
+            estimated_cached = int(row.pop("_estimated_cached", 0) or 0)
+            applied_estimate_keys = row.pop("_applied_estimate_keys", set())
+            estimate = cache_estimates.get(row["key"])
+            if (
+                isinstance(estimate, dict)
+                and row["key"] not in applied_estimate_keys
+            ):
+                extra_estimated_cached = min(
+                    max(
+                        0,
+                        int(row["stats"].get("input", 0) or 0)
+                        - measured_cached
+                        - estimated_cached,
+                    ),
+                    max(0, int(estimate.get("estimated_cached") or 0)),
+                )
+                estimated_cached += extra_estimated_cached
+                row.setdefault("_cache_estimates", []).append(estimate)
+
+                # A group-level estimate has no single source model. Spread
+                # it across each member's remaining misses so mixed-price
+                # merge groups can still be repriced consistently.
+                remaining = extra_estimated_cached
+                capacities = [
+                    max(
+                        0,
+                        int(member["_cost_stats"]["input"])
+                        - int(member["_cost_stats"]["cached"]),
+                    )
+                    for member in row["members"]
+                ]
+                remaining_capacity = sum(capacities)
+                for member, capacity in zip(row["members"], capacities):
+                    if not remaining or not remaining_capacity:
+                        break
+                    allocation = min(
+                        capacity,
+                        round(remaining * capacity / remaining_capacity),
+                    )
+                    member["_cost_stats"]["cached"] += allocation
+                    remaining -= allocation
+                    remaining_capacity -= capacity
+
+            estimates = row.pop("_cache_estimates", [])
+            if estimates:
+                row["cache_estimate"] = dict(estimates[0])
+            effective_cached = measured_cached + estimated_cached
+            row["stats"]["measured_cached"] = measured_cached
+            row["stats"]["estimated_cached"] = estimated_cached
+            row["stats"]["cached"] = effective_cached
+            row["stats"]["input_miss"] = max(
+                0, (row["stats"].get("input", 0) or 0) - effective_cached
+            )
+
+            # Routed rows use one set of rates for the entire logical model.
+            # Prefer the destination, but historical aliases may outlive the
+            # deployment that supplied their pricing. In that case, fall back
+            # to a priced member (normally the currently deployed model).
+            # Plain merge groups may intentionally mix prices, so calculate
+            # them per member after applying estimated cache hits.
+            if row.get("route_target"):
+                pricing_candidates = [row["route_target"]]
+                pricing_candidates.extend(
+                    model for model in row["models"]
+                    if model != row["route_target"]
+                )
+                pricing_model = row["route_target"]
+                for candidate in pricing_candidates:
+                    candidate_cost = self.calculate_cost(candidate, {
+                        "input": 1, "cached": 0, "output": 1,
+                    })
+                    if any(candidate_cost.get(rate, 0) for rate in (
+                        "input_cost_per_1m",
+                        "output_cost_per_1m",
+                        "cache_cost_per_1m",
+                    )):
+                        pricing_model = candidate
+                        break
+
+                row["pricing_model"] = pricing_model
+                row["total_cost"] = self.calculate_cost(pricing_model, {
+                    "input": row["stats"].get("input", 0),
+                    "cached": effective_cached,
+                    "output": row["stats"].get("output", 0),
+                })["total_cost"]
+                if estimated_cached:
+                    row["cost_estimated"] = True
+            else:
+                row["total_cost"] = sum(
+                    self.calculate_cost(
+                        member["_pricing_model"], member["_cost_stats"],
+                    ).get("total_cost", 0.0)
+                    for member in row["members"]
+                )
+                if estimated_cached:
+                    row["cost_estimated"] = True
+            row["members"].sort(key=lambda member: (
+                member["model"] != row.get("route_target"), member["model"]
+            ))
+            for member in row["members"]:
+                member.pop("_pricing_model", None)
+                member.pop("_cost_stats", None)
+            row["total_cost"] = round(max(0.0, row["total_cost"]), 2)
         return list(rows.values())
 
     def calculate_cost(self, model: str, stats: dict | None = None) -> dict:
@@ -4440,6 +4876,7 @@ class Manager:
         self._reset_synced_token_usage()
         self.token_stats = {}
         self.speed_samples = {}
+        self.usage_cache_estimates = {}
         # Ensure an in-flight batched snapshot notices the reset and follows
         # up with the empty state after its current write completes.
         self._speed_samples_version = getattr(
@@ -4451,6 +4888,10 @@ class Manager:
             pass
         try:
             self._save_speed_samples()
+        except Exception:
+            pass
+        try:
+            self._save_usage_cache_estimates()
         except Exception:
             pass
         return self.get_token_stats()
@@ -4467,6 +4908,9 @@ class Manager:
         self.speed_samples.pop(model_key, None)
         self.usage_aliases.pop(model_key, None)
         self.usage_merge_groups.pop(model_key, None)
+        cache_estimates = getattr(self, "usage_cache_estimates", None)
+        if isinstance(cache_estimates, dict):
+            cache_estimates.pop(f"model:{model_key}", None)
         for hour_key in list(self.hourly_token_stats):
             models = self.hourly_token_stats.get(hour_key)
             if not isinstance(models, dict):
@@ -4485,6 +4929,8 @@ class Manager:
         self._save_speed_samples()
         self._save_usage_aliases()
         self._save_usage_merge_groups()
+        if hasattr(self, "usage_cache_estimates_path"):
+            self._save_usage_cache_estimates()
         return {"ok": True, "model": model_key}
 
     def reset_session_token_stats(self) -> dict:
@@ -5735,7 +6181,9 @@ class Manager:
                 name, "preparing", "Preparing vLLM launch",
                 model=model, cluster_member=cluster_member,
             )
-            extra = list(extra_args or [])
+            extra = self._with_vllm_prompt_token_details(
+                list(extra_args or [])
+            )
 
             serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
             cmd = [
@@ -7451,11 +7899,6 @@ class Manager:
         models = []
         for c in data.get("containers", []):
             model_ids = list(c.get("served_models") or [c.get("model")])
-            # A cluster's backing model is also a valid controller-side ID:
-            # routing translates it to --served-model-name upstream. Expose
-            # both so provider discovery does not hide the deployed model.
-            if c.get("deployment_id") and c.get("model"):
-                model_ids.append(c["model"])
             for model_id in dict.fromkeys(model_ids):
                 if not model_id or any(m["id"] == model_id for m in models):
                     continue
@@ -7584,6 +8027,9 @@ class Manager:
                     data.get("eval_count") or 0,
                     # eval_duration is Ollama's decode-only time, in nanoseconds.
                     (data.get("eval_duration") or 0) / 1e9 or None,
+                    pp_time_s=(
+                        (data.get("prompt_eval_duration") or 0) / 1e9 or None
+                    ),
                 )
                 content = (data.get("message") or {}).get("content", "")
                 return self._ollama_to_openai_response(model, content, data)
@@ -7629,11 +8075,21 @@ class Manager:
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                     if done:
+                        prompt_tokens = obj.get("prompt_eval_count") or 0
+                        pp_time_s = (
+                            (obj.get("prompt_eval_duration") or 0) / 1e9
+                            or None
+                        )
+                        if pp_time_s:
+                            self._track_prompt_processing(
+                                rid, int(prompt_tokens), pp_time_s
+                            )
                         self._record_tokens(
                             f"{OLLAMA_PREFIX}{model}",
-                            obj.get("prompt_eval_count") or 0,
+                            prompt_tokens,
                             obj.get("eval_count") or 0,
                             (obj.get("eval_duration") or 0) / 1e9 or None,
+                            pp_time_s=pp_time_s,
                         )
                         chunk = {
                             "id": f"chatcmpl-ollama-{_time.time_ns():x}",
@@ -7697,7 +8153,9 @@ class Manager:
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
             url = f"http://localhost:{container['port']}/v1/chat/completions"
-            rid = self._track_start(key)
+            rid = self._track_start(
+                key, deployment_id=container.get("deployment_id")
+            )
             try:
                 r = await self._await_or_cancel(
                     self.http.post(url, json=body, timeout=600), cancel
@@ -7730,7 +8188,9 @@ class Manager:
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
             url = f"http://localhost:{container['port']}/v1/completions"
-            rid = self._track_start(key)
+            rid = self._track_start(
+                key, deployment_id=container.get("deployment_id")
+            )
             try:
                 r = await self._await_or_cancel(
                     self.http.post(url, json=body, timeout=600), cancel
@@ -7806,6 +8266,7 @@ class Manager:
         retried = False
         try:
             while True:
+                attempt_started_at = time.monotonic()
                 try:
                     async with self.http.stream(
                         "POST", url, json=body, timeout=None,
@@ -7846,7 +8307,23 @@ class Manager:
                                     if first_out_ts is not None
                                     else None
                                 )
-                                self._record_usage(key, usage, gen_time)
+                                pp_time = (
+                                    first_out_ts - attempt_started_at
+                                    if first_out_ts is not None
+                                    else None
+                                )
+                                if pp_time:
+                                    prompt_tokens, cached_tokens = (
+                                        self._usage_prompt_counts(usage)
+                                    )
+                                    self._track_prompt_processing(
+                                        rid,
+                                        prompt_tokens - cached_tokens,
+                                        pp_time,
+                                    )
+                                self._record_usage(
+                                    key, usage, gen_time, pp_time
+                                )
                             yield f"{line}\n\n"
                     return
                 except Exception as e:
@@ -7939,9 +8416,9 @@ class Manager:
                            container: dict | None = None,
                            requested_model: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
-        Forces stream_options.include_usage so the final chunk carries token
-        counts we can record; the extra chunk is standard OpenAI behavior and
-        safe to pass through to clients. `key` is the token-stats key (model
+        Forces continuous usage stats so prompt counts are available as soon
+        as generation begins, allowing the live prefill rate to be populated
+        before the terminal usage chunk. `key` is the token-stats key (model
         id plus variant tag). Decode speed is measured from the first to the
         last output chunk, excluding prefill."""
         body = {
@@ -7953,6 +8430,7 @@ class Manager:
             "stream_options": {
                 **(body.get("stream_options") or {}),
                 "include_usage": True,
+                "continuous_usage_stats": True,
             },
         }
         admission = None
@@ -7960,6 +8438,7 @@ class Manager:
         endpoint = None
         nudge_event = asyncio.Event()
         retried_without_token_ids = False
+        retried_without_continuous_usage = False
         try:
             if container is not None:
                 requested_model = requested_model or body.get("model") or key
@@ -7981,8 +8460,10 @@ class Manager:
                 streaming=True,
                 admission_target=admission,
                 nudge_event=nudge_event,
+                deployment_id=(container or {}).get("deployment_id"),
             )
             while True:
+                attempt_started_at = time.monotonic()
                 stream_context = self.http.stream(
                     "POST", url, json=body, timeout=None,
                 )
@@ -8009,11 +8490,30 @@ class Manager:
                                 if k != "return_token_ids"
                             }
                             continue
+                        stream_options = body.get("stream_options") or {}
+                        if (
+                            r.status_code == 400
+                            and stream_options.get("continuous_usage_stats")
+                            and not retried_without_continuous_usage
+                        ):
+                            # Keep compatibility with older vLLM releases:
+                            # live PP speed is unavailable there, but the
+                            # terminal include_usage chunk still records totals.
+                            retried_without_continuous_usage = True
+                            body = {
+                                **body,
+                                "stream_options": {
+                                    k: v for k, v in stream_options.items()
+                                    if k != "continuous_usage_stats"
+                                },
+                            }
+                            continue
                         yield f"data: {json.dumps({'error': {'message': f'HTTP {r.status_code}: {detail[:300]}', 'type': 'upstream_error', 'code': r.status_code}})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     first_out_ts = None
                     last_out_ts = None
+                    latest_usage = None
                     async for line in self._aiter_lines_cancellable(
                         r, cancel, nudge_event,
                     ):
@@ -8035,18 +8535,44 @@ class Manager:
                             last_out_ts = now
                         usage = self._usage_from_sse_line(line)
                         if usage:
-                            gen_time = (
-                                last_out_ts - first_out_ts
+                            # Continuous usage is cumulative. Keep only the
+                            # latest snapshot for lifetime accounting so each
+                            # request is counted exactly once.
+                            latest_usage = usage
+                            pp_time = (
+                                first_out_ts - attempt_started_at
                                 if first_out_ts is not None
                                 else None
                             )
-                            self._record_usage(key, usage, gen_time)
+                            if pp_time:
+                                prompt_tokens, cached_tokens = (
+                                    self._usage_prompt_counts(usage)
+                                )
+                                self._track_prompt_processing(
+                                    rid,
+                                    prompt_tokens - cached_tokens,
+                                    pp_time,
+                                )
                         rec = self._active_reqs.get(rid)
                         if rec is not None:
                             rec["forwarded_chunks"] = (
                                 rec.get("forwarded_chunks", 0) + 1
                             )
                         yield f"{line}\n\n"
+                    if latest_usage:
+                        gen_time = (
+                            last_out_ts - first_out_ts
+                            if first_out_ts is not None
+                            else None
+                        )
+                        pp_time = (
+                            first_out_ts - attempt_started_at
+                            if first_out_ts is not None
+                            else None
+                        )
+                        self._record_usage(
+                            key, latest_usage, gen_time, pp_time
+                        )
                     return
                 except StreamNudge:
                     nudged = True
@@ -8537,6 +9063,292 @@ class Manager:
             result = self.temperature_history(deque())
         return {"node_id": node_id, **(result or {})}
 
+    def _load_temperature_runs(self) -> dict[str, dict]:
+        try:
+            raw = json.loads(self.temperature_runs_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        entries = raw.get("runs") if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return {}
+        runs: dict[str, dict] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            run_id = str(entry.get("id") or "").strip()
+            if not run_id:
+                continue
+            run = copy.deepcopy(entry)
+            run["id"] = run_id
+            run["name"] = str(run.get("name") or f"Temperature run {run_id}")[:120]
+            run["samples"] = [
+                sample for sample in (run.get("samples") or [])
+                if isinstance(sample, dict)
+            ]
+            runs[run_id] = run
+        return runs
+
+    def _save_temperature_runs(self) -> None:
+        path = self.temperature_runs_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "version": 1,
+            "runs": list(self.temperature_runs.values()),
+        }, indent=2), encoding="utf-8")
+        temporary.replace(path)
+        self._temperature_runs_last_saved_at = time.time()
+
+    @staticmethod
+    def _public_temperature_run(run: dict, *, include_samples: bool = False) -> dict:
+        public = {
+            key: copy.deepcopy(value)
+            for key, value in run.items()
+            if key != "samples"
+        }
+        samples = run.get("samples") or []
+        public["sample_count"] = len(samples)
+        if samples:
+            public["duration_seconds"] = round(
+                max(0.0, float(samples[-1].get("elapsed_seconds") or 0.0)), 3,
+            )
+        else:
+            public["duration_seconds"] = 0.0
+        if include_samples:
+            public["samples"] = copy.deepcopy(samples)
+        return public
+
+    def temperature_runs_state(self) -> dict:
+        runs = sorted(
+            (
+                self._public_temperature_run(run)
+                for run in self.temperature_runs.values()
+            ),
+            key=lambda run: float(run.get("armed_at") or 0.0),
+            reverse=True,
+        )
+        return {
+            "sample_interval_seconds": TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS,
+            "active_run_id": self._active_temperature_run_id,
+            "runs": runs,
+        }
+
+    def temperature_run(self, run_id: str) -> dict:
+        run = self.temperature_runs.get(str(run_id or ""))
+        if not run:
+            raise ValueError("temperature run not found")
+        return self._public_temperature_run(run, include_samples=True)
+
+    @staticmethod
+    def _temperature_run_values(stats: dict) -> tuple[float | None, float | None]:
+        def finite(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return round(value, 1) if math.isfinite(value) else None
+
+        gpu = (stats.get("gpus") or [{}])[0]
+        return finite(stats.get("cpu_temp_c")), finite(gpu.get("temp"))
+
+    async def _temperature_stats_for_node(self, node_id: str) -> dict:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return await self.get_stats()
+        result = await self.node_registry.request(
+            node_id, "GET", "/api/agent/stats", timeout=5,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("node returned invalid temperature telemetry")
+        return result
+
+    def _temperature_node_name(self, node_id: str) -> str:
+        if not node_id or node_id == LOCAL_NODE_ID:
+            return str(self.settings.get("cluster_node_name") or socket.gethostname())
+        node = self.node_registry.get(node_id)
+        if not node:
+            raise ValueError("target node not found")
+        if not node.get("enabled", True):
+            raise ValueError(f"node {node.get('name', node_id)} is disabled")
+        return str(node.get("name") or node.get("hostname") or node_id)
+
+    def _process_temperature_run_sample(
+        self, run: dict, stats: dict, observed_at: float,
+    ) -> str:
+        cpu_temp, gpu_temp = self._temperature_run_values(stats)
+        available = [value for value in (cpu_temp, gpu_temp) if value is not None]
+        hottest = max(available) if available else None
+        if hottest is not None:
+            run.pop("last_error", None)
+            run.pop("telemetry_failures", None)
+        status = run.get("status")
+        if status == "armed":
+            if hottest is None or hottest < float(run["trigger_temp_c"]):
+                return "waiting"
+            run["status"] = "recording"
+            run["started_at"] = observed_at
+            status = "recording"
+
+        if status != "recording":
+            return str(status or "idle")
+
+        started_at = float(run.get("started_at") or observed_at)
+        run.setdefault("samples", []).append({
+            "elapsed_seconds": round(max(0.0, observed_at - started_at), 3),
+            "cpu_temp_c": cpu_temp,
+            "gpu_temp_c": gpu_temp,
+        })
+        run["last_sample_at"] = observed_at
+        if hottest is not None and hottest < float(run["target_temp_c"]):
+            run["status"] = "complete"
+            run["stopped_at"] = observed_at
+            return "complete"
+        return "recording"
+
+    @staticmethod
+    def _record_temperature_telemetry_failure(
+        run: dict, error: Exception | str, observed_at: float,
+    ) -> bool:
+        """Record a telemetry miss and interrupt a run after a bounded streak."""
+        failures = int(run.get("telemetry_failures") or 0) + 1
+        run["telemetry_failures"] = failures
+        run["last_error"] = str(error)
+        if failures < TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES:
+            return False
+        run["status"] = "interrupted"
+        run["stopped_at"] = observed_at
+        run["interruption_reason"] = (
+            f"Temperature telemetry unavailable for {failures} consecutive polls"
+        )
+        return True
+
+    async def _temperature_recording_loop(self, run_id: str) -> None:
+        try:
+            while self._active_temperature_run_id == run_id:
+                await asyncio.sleep(TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS)
+                run = self.temperature_runs.get(run_id)
+                if not run or run.get("status") not in {"armed", "recording"}:
+                    break
+                observed_at = time.time()
+                try:
+                    stats = await self._temperature_stats_for_node(run["node_id"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    interrupted = self._record_temperature_telemetry_failure(
+                        run, exc, observed_at,
+                    )
+                    if interrupted:
+                        self._active_temperature_run_id = None
+                        self._save_temperature_runs()
+                        break
+                    if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                        self._save_temperature_runs()
+                    continue
+                if not any(
+                    value is not None for value in self._temperature_run_values(stats)
+                ):
+                    interrupted = self._record_temperature_telemetry_failure(
+                        run, "temperature telemetry unavailable", observed_at,
+                    )
+                    if interrupted:
+                        self._active_temperature_run_id = None
+                        self._save_temperature_runs()
+                        break
+                    if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                        self._save_temperature_runs()
+                    continue
+                result = self._process_temperature_run_sample(run, stats, observed_at)
+                if result == "complete":
+                    self._active_temperature_run_id = None
+                    self._save_temperature_runs()
+                    break
+                if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                    self._save_temperature_runs()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.temperature_recording_task is asyncio.current_task():
+                self.temperature_recording_task = None
+
+    async def arm_temperature_recording(
+        self,
+        node_id: Any,
+        target_temp_c: Any,
+        trigger_margin_pct: Any = 5.0,
+    ) -> dict:
+        node_id = str(node_id or LOCAL_NODE_ID).strip() or LOCAL_NODE_ID
+        try:
+            target = float(target_temp_c)
+            margin = float(trigger_margin_pct)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target temperature and trigger margin must be numbers") from exc
+        if not math.isfinite(target) or target < 1 or target > 120:
+            raise ValueError("target temperature must be between 1 and 120°C")
+        if not math.isfinite(margin) or margin < 0 or margin > 100:
+            raise ValueError("trigger margin must be between 0 and 100%")
+
+        async with self._temperature_recording_lock:
+            if self._active_temperature_run_id:
+                raise ValueError("a temperature run is already armed or recording")
+            node_name = self._temperature_node_name(node_id)
+            stats = await self._temperature_stats_for_node(node_id)
+            now = time.time()
+            run_id = uuid.uuid4().hex[:10]
+            run = {
+                "id": run_id,
+                "name": f"{node_name} · {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}",
+                "node_id": node_id,
+                "node_name": node_name,
+                "status": "armed",
+                "armed_at": now,
+                "started_at": None,
+                "stopped_at": None,
+                "target_temp_c": round(target, 1),
+                "trigger_margin_pct": round(margin, 1),
+                "trigger_temp_c": round(target * (1.0 + margin / 100.0), 1),
+                "samples": [],
+            }
+            self.temperature_runs[run_id] = run
+            self._active_temperature_run_id = run_id
+            self._process_temperature_run_sample(run, stats, now)
+            self._save_temperature_runs()
+            self.temperature_recording_task = asyncio.create_task(
+                self._temperature_recording_loop(run_id)
+            )
+            return self._public_temperature_run(run, include_samples=True)
+
+    async def cancel_temperature_recording(self) -> dict:
+        async with self._temperature_recording_lock:
+            run_id = self._active_temperature_run_id
+            run = self.temperature_runs.get(run_id)
+            if not run:
+                raise ValueError("no temperature run is active")
+            task = self.temperature_recording_task
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            run["status"] = "cancelled"
+            run["stopped_at"] = time.time()
+            self._active_temperature_run_id = None
+            self.temperature_recording_task = None
+            self._save_temperature_runs()
+            return self._public_temperature_run(run, include_samples=True)
+
+    def rename_temperature_run(self, run_id: str, name: Any) -> dict:
+        run = self.temperature_runs.get(str(run_id or ""))
+        if not run:
+            raise ValueError("temperature run not found")
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("run name is required")
+        if len(clean_name) > 120:
+            raise ValueError("run name must be 120 characters or fewer")
+        run["name"] = clean_name
+        self._save_temperature_runs()
+        return self._public_temperature_run(run, include_samples=True)
+
     async def _temperature_history_monitor_loop(self) -> None:
         while True:
             try:
@@ -8915,6 +9727,7 @@ class Manager:
             job["status"] = RUNNING
             job["started_at"] = time.time()
             job["attempts"] = job.get("attempts", 0) + 1
+            self._mark_deployment_used(container.get("deployment_id"))
             # Refresh idle clock only when the job is actually admitted to the
             # backend, not while it is waiting in the controller queue.
             self._mark_active(container.get("name"))
@@ -8954,6 +9767,8 @@ class Manager:
             job["status"] = ERROR
             job["error"] = f"{err_msg} (after {attempts} attempt{'s' if attempts != 1 else ''})"
         finally:
+            if job.get("started_at"):
+                self._mark_deployment_used(container.get("deployment_id"))
             self._release_inference_slot(admission)
             if job["status"] in (DONE, ERROR, CANCELED):
                 job["completed_at"] = time.time()
@@ -9053,6 +9868,33 @@ class Manager:
                 deployment["launch_settings"]
             )
             deployment["runtime_flags"] = runtime_flags
+            deployment["served_models"] = self._deployment_served_models(
+                deployment, primary_container
+            )
+            deployment["served_model"] = (
+                deployment["served_models"][0]
+                if deployment["served_models"]
+                else deployment.get("model")
+            )
+            deployment["stats_key"] = (
+                primary_container.get("stats_key")
+                if primary_container
+                else None
+            )
+            if not deployment.get("last_used_at") and deployment["stats_key"]:
+                prior_samples = self.speed_samples.get(
+                    deployment["stats_key"], []
+                )
+                prior_last_used = max(
+                    (
+                        float(sample.get("ended_at") or 0)
+                        for sample in prior_samples
+                        if isinstance(sample, dict)
+                    ),
+                    default=0.0,
+                )
+                if prior_last_used > 0:
+                    deployment["last_used_at"] = prior_last_used
             public_deployments.append(deployment)
         running_models = [c for c in containers if c["status"] == "running"]
         # Token-stats key of the model currently holding the GPU, so the UI
@@ -9085,6 +9927,8 @@ class Manager:
             },
             "usage_aliases": dict(self.usage_aliases),
             "usage_merge_groups": dict(self.usage_merge_groups),
+            "usage_routing_rules": dict(self.usage_routing_rules),
+            "usage_cache_estimates": copy.deepcopy(self.usage_cache_estimates),
             "usage_rows": self.usage_rows(),
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),

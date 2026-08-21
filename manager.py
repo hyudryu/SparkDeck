@@ -147,6 +147,10 @@ TEMPERATURE_HISTORY_MAX_SAMPLES = (
 # available CPU/GPU sensor reaches the configured margin above that target,
 # and stops automatically after the node cools below the target.
 TEMPERATURE_RUN_SAMPLE_INTERVAL_SECONDS = 1.0
+# A disconnected node must not leave an armed or recording run alive forever.
+# Five consecutive misses tolerate brief agent restarts while bounding the
+# amount of time an unusable recording remains active.
+TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
 
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
@@ -3693,7 +3697,7 @@ class Manager:
         cls, deployment: dict, primary_container: dict | None = None,
     ) -> list[str]:
         """Return the API-facing ids for a saved cluster deployment."""
-        if primary_container:
+        if primary_container and primary_container.get("status") == "running":
             live = primary_container.get("served_models") or []
             if live:
                 return list(dict.fromkeys(str(value) for value in live if value))
@@ -4094,21 +4098,12 @@ class Manager:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
         out: dict[str, dict] = {}
-        stale: list[int] = []
         for rid, rec in list(self._active_reqs.items()):
             # A zero-output stream selected for transparent replay stays in
             # _active_reqs so its downstream connection remains open, but it
             # has released its admission slot and is waiting in the FIFO.
             # Do not report that paused request as running.
             if rec.get("paused"):
-                continue
-            # Only clean up non-streaming requests that have no timestamps.
-            # Streaming requests are cleaned up by _track_end() in each
-            # stream method's finally block — they may simply not have
-            # received any chunks yet (e.g. during the initial connection
-            # or thinking phase) and must not be purged prematurely.
-            if not rec.get("streaming") and not rec["thinking"] and not rec["output"]:
-                stale.append(rid)
                 continue
             e = out.setdefault(rec["key"], {
                 "connections": 0, "decoded_tokens": 0,
@@ -4130,10 +4125,6 @@ class Manager:
                 if timestamps:
                     observed = min(self._trailing_window, max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
-        # purge stale non-streaming entries first, so the per-model cleanup
-        # below sees the true set of active keys.
-        for rid in stale:
-            self._active_reqs.pop(rid, None)
         # clean up per-model entries when all their streams ended
         active_keys = {rec["key"] for rec in self._active_reqs.values()}
         for key in list(out.keys()):
@@ -4556,6 +4547,7 @@ class Manager:
         merge_groups = getattr(self, "usage_merge_groups", {})
         aliases = getattr(self, "usage_aliases", {})
         routing_rules = getattr(self, "usage_routing_rules", {})
+        cache_estimates = getattr(self, "usage_cache_estimates", {})
         for model, model_stats in self.token_stats.items():
             destination = self._usage_route_target(model, routing_rules)
             merge_group = str(merge_groups.get(destination) or "").strip()
@@ -4573,22 +4565,40 @@ class Manager:
                 "members": [],
                 "stats": {field: 0 for field in numeric_fields},
                 "total_cost": 0.0,
+                "_estimated_cached": 0,
+                "_applied_estimate_keys": set(),
             })
+            measured_cached = max(0, int(model_stats.get("cached", 0) or 0))
+            input_tokens = max(0, int(model_stats.get("input", 0) or 0))
+            source_estimate_key = f"model:{model}"
+            source_estimate = cache_estimates.get(source_estimate_key)
+            source_estimated_cached = 0
+            if isinstance(source_estimate, dict):
+                source_estimated_cached = min(
+                    max(0, input_tokens - measured_cached),
+                    max(0, int(source_estimate.get("estimated_cached") or 0)),
+                )
+                row["_applied_estimate_keys"].add(source_estimate_key)
+                row.setdefault("_cache_estimates", []).append(source_estimate)
+            row["_estimated_cached"] += source_estimated_cached
             row["models"].append(model)
             row["members"].append({
                 "model": model,
                 "alias": aliases.get(model),
                 "merge_group": merge_group or None,
                 "routed_to": destination if destination != model else None,
+                # Private values are removed before returning the public row.
+                # They let merge groups reprice estimated cache hits at each
+                # member's actual (or routed destination's) rates.
+                "_pricing_model": destination,
+                "_cost_stats": {
+                    "input": input_tokens,
+                    "cached": measured_cached + source_estimated_cached,
+                    "output": max(0, int(model_stats.get("output", 0) or 0)),
+                },
             })
             for field in numeric_fields:
                 row["stats"][field] += model_stats.get(field, 0) or 0
-            # A routed source is accounted as if its tokens were served by
-            # the final destination (master) model. Plain merge groups retain
-            # each member model's own pricing.
-            row["total_cost"] += self.calculate_cost(
-                destination, model_stats
-            ).get("total_cost", 0.0)
 
         for row in rows.values():
             row["routed_sources"] = [
@@ -4596,9 +4606,6 @@ class Manager:
                 for member in row["members"]
                 if member.get("routed_to")
             ]
-            row["members"].sort(key=lambda member: (
-                member["model"] != row.get("route_target"), member["model"]
-            ))
             speed = self.rolling_generation_speed(row["models"])
             # Existing installations have lifetime speed totals but no
             # interval samples until this version records its first request.
@@ -4615,14 +4622,52 @@ class Manager:
                     }
             row["speed"] = speed
             measured_cached = max(0, int(row["stats"].get("cached", 0) or 0))
-            estimated_cached = 0
-            estimate = getattr(self, "usage_cache_estimates", {}).get(row["key"])
-            if isinstance(estimate, dict):
-                estimated_cached = min(
-                    max(0, int(row["stats"].get("input", 0) or 0) - measured_cached),
+            estimated_cached = int(row.pop("_estimated_cached", 0) or 0)
+            applied_estimate_keys = row.pop("_applied_estimate_keys", set())
+            estimate = cache_estimates.get(row["key"])
+            if (
+                isinstance(estimate, dict)
+                and row["key"] not in applied_estimate_keys
+            ):
+                extra_estimated_cached = min(
+                    max(
+                        0,
+                        int(row["stats"].get("input", 0) or 0)
+                        - measured_cached
+                        - estimated_cached,
+                    ),
                     max(0, int(estimate.get("estimated_cached") or 0)),
                 )
-                row["cache_estimate"] = dict(estimate)
+                estimated_cached += extra_estimated_cached
+                row.setdefault("_cache_estimates", []).append(estimate)
+
+                # A group-level estimate has no single source model. Spread
+                # it across each member's remaining misses so mixed-price
+                # merge groups can still be repriced consistently.
+                remaining = extra_estimated_cached
+                capacities = [
+                    max(
+                        0,
+                        int(member["_cost_stats"]["input"])
+                        - int(member["_cost_stats"]["cached"]),
+                    )
+                    for member in row["members"]
+                ]
+                remaining_capacity = sum(capacities)
+                for member, capacity in zip(row["members"], capacities):
+                    if not remaining or not remaining_capacity:
+                        break
+                    allocation = min(
+                        capacity,
+                        round(remaining * capacity / remaining_capacity),
+                    )
+                    member["_cost_stats"]["cached"] += allocation
+                    remaining -= allocation
+                    remaining_capacity -= capacity
+
+            estimates = row.pop("_cache_estimates", [])
+            if estimates:
+                row["cache_estimate"] = dict(estimates[0])
             effective_cached = measured_cached + estimated_cached
             row["stats"]["measured_cached"] = measured_cached
             row["stats"]["estimated_cached"] = estimated_cached
@@ -4635,8 +4680,8 @@ class Manager:
             # Prefer the destination, but historical aliases may outlive the
             # deployment that supplied their pricing. In that case, fall back
             # to a priced member (normally the currently deployed model).
-            # Plain merge groups may intentionally mix prices, so they retain
-            # the per-member total accumulated above.
+            # Plain merge groups may intentionally mix prices, so calculate
+            # them per member after applying estimated cache hits.
             if row.get("route_target"):
                 pricing_candidates = [row["route_target"]]
                 pricing_candidates.extend(
@@ -4664,6 +4709,21 @@ class Manager:
                 })["total_cost"]
                 if estimated_cached:
                     row["cost_estimated"] = True
+            else:
+                row["total_cost"] = sum(
+                    self.calculate_cost(
+                        member["_pricing_model"], member["_cost_stats"],
+                    ).get("total_cost", 0.0)
+                    for member in row["members"]
+                )
+                if estimated_cached:
+                    row["cost_estimated"] = True
+            row["members"].sort(key=lambda member: (
+                member["model"] != row.get("route_target"), member["model"]
+            ))
+            for member in row["members"]:
+                member.pop("_pricing_model", None)
+                member.pop("_cost_stats", None)
             row["total_cost"] = round(max(0.0, row["total_cost"]), 2)
         return list(rows.values())
 
@@ -8356,9 +8416,9 @@ class Manager:
                            container: dict | None = None,
                            requested_model: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
-        Forces stream_options.include_usage so the final chunk carries token
-        counts we can record; the extra chunk is standard OpenAI behavior and
-        safe to pass through to clients. `key` is the token-stats key (model
+        Forces continuous usage stats so prompt counts are available as soon
+        as generation begins, allowing the live prefill rate to be populated
+        before the terminal usage chunk. `key` is the token-stats key (model
         id plus variant tag). Decode speed is measured from the first to the
         last output chunk, excluding prefill."""
         body = {
@@ -8370,6 +8430,7 @@ class Manager:
             "stream_options": {
                 **(body.get("stream_options") or {}),
                 "include_usage": True,
+                "continuous_usage_stats": True,
             },
         }
         admission = None
@@ -8377,6 +8438,7 @@ class Manager:
         endpoint = None
         nudge_event = asyncio.Event()
         retried_without_token_ids = False
+        retried_without_continuous_usage = False
         try:
             if container is not None:
                 requested_model = requested_model or body.get("model") or key
@@ -8428,11 +8490,30 @@ class Manager:
                                 if k != "return_token_ids"
                             }
                             continue
+                        stream_options = body.get("stream_options") or {}
+                        if (
+                            r.status_code == 400
+                            and stream_options.get("continuous_usage_stats")
+                            and not retried_without_continuous_usage
+                        ):
+                            # Keep compatibility with older vLLM releases:
+                            # live PP speed is unavailable there, but the
+                            # terminal include_usage chunk still records totals.
+                            retried_without_continuous_usage = True
+                            body = {
+                                **body,
+                                "stream_options": {
+                                    k: v for k, v in stream_options.items()
+                                    if k != "continuous_usage_stats"
+                                },
+                            }
+                            continue
                         yield f"data: {json.dumps({'error': {'message': f'HTTP {r.status_code}: {detail[:300]}', 'type': 'upstream_error', 'code': r.status_code}})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     first_out_ts = None
                     last_out_ts = None
+                    latest_usage = None
                     async for line in self._aiter_lines_cancellable(
                         r, cancel, nudge_event,
                     ):
@@ -8454,11 +8535,10 @@ class Manager:
                             last_out_ts = now
                         usage = self._usage_from_sse_line(line)
                         if usage:
-                            gen_time = (
-                                last_out_ts - first_out_ts
-                                if first_out_ts is not None
-                                else None
-                            )
+                            # Continuous usage is cumulative. Keep only the
+                            # latest snapshot for lifetime accounting so each
+                            # request is counted exactly once.
+                            latest_usage = usage
                             pp_time = (
                                 first_out_ts - attempt_started_at
                                 if first_out_ts is not None
@@ -8473,15 +8553,26 @@ class Manager:
                                     prompt_tokens - cached_tokens,
                                     pp_time,
                                 )
-                            self._record_usage(
-                                key, usage, gen_time, pp_time
-                            )
                         rec = self._active_reqs.get(rid)
                         if rec is not None:
                             rec["forwarded_chunks"] = (
                                 rec.get("forwarded_chunks", 0) + 1
                             )
                         yield f"{line}\n\n"
+                    if latest_usage:
+                        gen_time = (
+                            last_out_ts - first_out_ts
+                            if first_out_ts is not None
+                            else None
+                        )
+                        pp_time = (
+                            first_out_ts - attempt_started_at
+                            if first_out_ts is not None
+                            else None
+                        )
+                        self._record_usage(
+                            key, latest_usage, gen_time, pp_time
+                        )
                     return
                 except StreamNudge:
                     nudged = True
@@ -9085,6 +9176,9 @@ class Manager:
         cpu_temp, gpu_temp = self._temperature_run_values(stats)
         available = [value for value in (cpu_temp, gpu_temp) if value is not None]
         hottest = max(available) if available else None
+        if hottest is not None:
+            run.pop("last_error", None)
+            run.pop("telemetry_failures", None)
         status = run.get("status")
         if status == "armed":
             if hottest is None or hottest < float(run["trigger_temp_c"]):
@@ -9103,12 +9197,28 @@ class Manager:
             "gpu_temp_c": gpu_temp,
         })
         run["last_sample_at"] = observed_at
-        run.pop("last_error", None)
         if hottest is not None and hottest < float(run["target_temp_c"]):
             run["status"] = "complete"
             run["stopped_at"] = observed_at
             return "complete"
         return "recording"
+
+    @staticmethod
+    def _record_temperature_telemetry_failure(
+        run: dict, error: Exception | str, observed_at: float,
+    ) -> bool:
+        """Record a telemetry miss and interrupt a run after a bounded streak."""
+        failures = int(run.get("telemetry_failures") or 0) + 1
+        run["telemetry_failures"] = failures
+        run["last_error"] = str(error)
+        if failures < TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES:
+            return False
+        run["status"] = "interrupted"
+        run["stopped_at"] = observed_at
+        run["interruption_reason"] = (
+            f"Temperature telemetry unavailable for {failures} consecutive polls"
+        )
+        return True
 
     async def _temperature_recording_loop(self, run_id: str) -> None:
         try:
@@ -9123,8 +9233,29 @@ class Manager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    run["last_error"] = str(exc)
-                    stats = {}
+                    interrupted = self._record_temperature_telemetry_failure(
+                        run, exc, observed_at,
+                    )
+                    if interrupted:
+                        self._active_temperature_run_id = None
+                        self._save_temperature_runs()
+                        break
+                    if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                        self._save_temperature_runs()
+                    continue
+                if not any(
+                    value is not None for value in self._temperature_run_values(stats)
+                ):
+                    interrupted = self._record_temperature_telemetry_failure(
+                        run, "temperature telemetry unavailable", observed_at,
+                    )
+                    if interrupted:
+                        self._active_temperature_run_id = None
+                        self._save_temperature_runs()
+                        break
+                    if time.time() - self._temperature_runs_last_saved_at >= 5.0:
+                        self._save_temperature_runs()
+                    continue
                 result = self._process_temperature_run_sample(run, stats, observed_at)
                 if result == "complete":
                     self._active_temperature_run_id = None
@@ -9185,16 +9316,12 @@ class Manager:
             )
             return self._public_temperature_run(run, include_samples=True)
 
-    async def cancel_armed_temperature_recording(self) -> dict:
+    async def cancel_temperature_recording(self) -> dict:
         async with self._temperature_recording_lock:
             run_id = self._active_temperature_run_id
             run = self.temperature_runs.get(run_id)
             if not run:
-                raise ValueError("no temperature run is armed")
-            if run.get("status") != "armed":
-                raise ValueError(
-                    "recording has started and will stop automatically below its target"
-                )
+                raise ValueError("no temperature run is active")
             task = self.temperature_recording_task
             if task:
                 task.cancel()

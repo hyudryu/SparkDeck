@@ -414,8 +414,8 @@
       <button class="btn btn-primary" @click="armTemperatureRun()"
               :disabled="temperatureRunBusy || Boolean(temperatureActiveRun())"
               x-text="temperatureRunBusy ? 'Arming…' : 'Record'"></button>
-      <button class="btn btn-ghost" x-show="temperatureActiveRun()?.status === 'armed'"
-              @click="cancelArmedTemperatureRun()" :disabled="temperatureRunCancelBusy"
+      <button class="btn btn-ghost" x-show="temperatureActiveRun()"
+              @click="cancelTemperatureRun()" :disabled="temperatureRunCancelBusy"
               x-text="temperatureRunCancelBusy ? 'Cancelling…' : 'Cancel'"></button>
     </div>
     <div class="temperature-active-state" x-show="temperatureActiveRun()">

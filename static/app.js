@@ -183,6 +183,7 @@ function app() {
     temperatureRunRenameId: null,
     temperatureRunRenameValue: '',
     temperatureRunRenameBusy: false,
+    temperatureRunSmoothingSeconds: 0,
     _temperatureRunsRefreshInFlight: false,
     liveRequestRates: {},
     fanMaxSpeed: false,
@@ -880,8 +881,72 @@ function app() {
       for (const char of String(runId || '')) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
       return palette[hash % palette.length];
     },
+    temperatureSmoothSamples(samples, windowSeconds = this.temperatureRunSmoothingSeconds) {
+      const source = Array.isArray(samples) ? samples : [];
+      const window = Math.max(0, Number(windowSeconds) || 0);
+      if (!source.length || window <= 0) return source;
+
+      const smoothed = source.map(sample => ({...sample}));
+      const radius = window / 2;
+      const secondsAt = index => Number(source[index]?.elapsed_seconds);
+      const finiteValue = (index, key) => {
+        const value = source[index]?.[key];
+        return typeof value === 'number' && Number.isFinite(value) ? value : null;
+      };
+
+      for (const key of ['cpu_temp_c', 'gpu_temp_c']) {
+        let segmentStart = 0;
+        while (segmentStart < source.length) {
+          while (
+            segmentStart < source.length
+            && (!Number.isFinite(secondsAt(segmentStart))
+              || finiteValue(segmentStart, key) == null)
+          ) {
+            segmentStart += 1;
+          }
+          if (segmentStart >= source.length) break;
+
+          let segmentEnd = segmentStart + 1;
+          while (segmentEnd < source.length) {
+            const seconds = secondsAt(segmentEnd);
+            const previousSeconds = secondsAt(segmentEnd - 1);
+            if (
+              !Number.isFinite(seconds)
+              || finiteValue(segmentEnd, key) == null
+              || !Number.isFinite(previousSeconds)
+              || seconds - previousSeconds > 2.5
+            ) break;
+            segmentEnd += 1;
+          }
+
+          let left = segmentStart;
+          let right = segmentStart;
+          let sum = 0;
+          for (let index = segmentStart; index < segmentEnd; index += 1) {
+            const center = secondsAt(index);
+            const upper = center + radius;
+            const lower = center - radius;
+            while (right < segmentEnd && secondsAt(right) <= upper) {
+              sum += finiteValue(right, key);
+              right += 1;
+            }
+            while (left < right && secondsAt(left) < lower) {
+              sum -= finiteValue(left, key);
+              left += 1;
+            }
+            const count = right - left;
+            if (count > 0) smoothed[index][key] = Math.round((sum / count) * 100) / 100;
+          }
+          segmentStart = segmentEnd;
+        }
+      }
+      return smoothed;
+    },
     temperatureRunChart() {
-      const runs = this.temperatureSelectedRunData();
+      const runs = this.temperatureSelectedRunData().map(run => ({
+        ...run,
+        samples: this.temperatureSmoothSamples(run.samples),
+      }));
       const allValues = [];
       let maxSeconds = 1;
       for (const run of runs) {

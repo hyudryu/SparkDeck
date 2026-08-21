@@ -465,6 +465,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(environment, {
             "NCCL_SOCKET_IFNAME": "enp1s0f1np1",
             "GLOO_SOCKET_IFNAME": "enp1s0f1np1",
+            "NCCL_IB_GID_INDEX": None,
             "NCCL_NET": "IB",
             "NCCL_IB_DISABLE": "0",
             "NCCL_IB_HCA": "rocep1s0f1",
@@ -707,6 +708,150 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["stats"]["output"], 300)
         self.assertEqual(rows[0]["stats"]["requests"], 2)
         self.assertAlmostEqual(rows[0]["speed"]["tok_s"], 30.0)
+
+    def test_usage_routing_rule_rolls_source_into_destination_row(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "xxx/abcdefg": {
+                "input": 100, "cached": 25, "output": 40,
+                "requests": 2, "gen_tokens": 40, "gen_time_s": 4,
+            },
+            "xxx/1234567": {
+                "input": 300, "cached": 75, "output": 60,
+                "requests": 3, "gen_tokens": 60, "gen_time_s": 6,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"xxx/abcdefg": "xxx/1234567"}
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        rows = instance.usage_rows()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["key"], "model:xxx/1234567")
+        self.assertEqual(rows[0]["label"], "xxx/1234567")
+        self.assertEqual(rows[0]["stats"]["input"], 400)
+        self.assertEqual(rows[0]["stats"]["cached"], 100)
+        self.assertEqual(rows[0]["stats"]["output"], 100)
+        self.assertEqual(rows[0]["stats"]["requests"], 5)
+        self.assertEqual(rows[0]["routed_sources"], ["xxx/abcdefg"])
+        self.assertEqual(
+            [member["model"] for member in rows[0]["members"]],
+            ["xxx/1234567", "xxx/abcdefg"],
+        )
+
+    def test_usage_routing_rule_prices_source_at_final_master_rates(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "gemini-2.5-flash": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {
+            "gemini-2.5-flash": "master-alias",
+            "master-alias": "claude-opus-4",
+        }
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        rows = instance.usage_rows()
+
+        # Claude Opus costs $15/M input + $75/M output. Both the direct
+        # master usage and routed Gemini usage must use those rates.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["label"], "claude-opus-4")
+        self.assertEqual(rows[0]["total_cost"], 180.0)
+
+    def test_usage_routing_falls_back_to_priced_member_when_master_unpriced(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy-master": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"claude-opus-4": "legacy-master"}
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        row = instance.usage_rows()[0]
+
+        self.assertEqual(row["route_target"], "legacy-master")
+        self.assertEqual(row["pricing_model"], "claude-opus-4")
+        self.assertEqual(row["total_cost"], 180.0)
+
+    def test_usage_cache_estimate_splits_hits_misses_and_adjusts_cost(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 100_000, "output": 0,
+            },
+        }
+        instance.session_token_stats = {}
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.usage_cache_estimates = {
+            "model:claude-opus-4": {
+                "rate_pct": 80.0,
+                "legacy_input": 1_000_000,
+                "measured_cached": 100_000,
+                "estimated_cached": 700_000,
+            },
+        }
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        row = instance.usage_rows()[0]
+
+        self.assertEqual(row["stats"]["measured_cached"], 100_000)
+        self.assertEqual(row["stats"]["estimated_cached"], 700_000)
+        self.assertEqual(row["stats"]["cached"], 800_000)
+        self.assertEqual(row["stats"]["input_miss"], 200_000)
+        self.assertTrue(row["cost_estimated"])
+        self.assertEqual(row["total_cost"], 4.2)
+
+    def test_usage_routing_rules_persist_update_delete_and_reject_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_routing_rules = {}
+            instance.usage_routing_rules_path = (
+                Path(directory) / "usage_routing_rules.json"
+            )
+
+            instance.update_usage_routing_rule("model/a", "model/b")
+            instance.update_usage_routing_rule("model/b", "model/c")
+            self.assertEqual(
+                json.loads(instance.usage_routing_rules_path.read_text()),
+                {"model/a": "model/b", "model/b": "model/c"},
+            )
+            with self.assertRaisesRegex(ValueError, "cycle"):
+                instance.update_usage_routing_rule("model/c", "model/a")
+            self.assertNotIn("model/c", instance.usage_routing_rules)
+
+            instance.update_usage_routing_rule("model/a", "model/c")
+            self.assertEqual(instance.usage_routing_rules["model/a"], "model/c")
+            instance.delete_usage_routing_rule("model/a")
+            self.assertNotIn("model/a", instance.usage_routing_rules)
+            self.assertEqual(
+                json.loads(instance.usage_routing_rules_path.read_text()),
+                {"model/b": "model/c"},
+            )
 
     def test_rolling_speed_uses_only_newest_one_million_output_tokens(self) -> None:
         instance = Manager.__new__(Manager)
@@ -1090,10 +1235,58 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "1")
                 self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.1")
                 self.assertEqual("--headless" in args, rank > 0)
+                self.assertEqual(args.count("--enable-prompt-tokens-details"), 1)
                 self.assertEqual(args.count("--tensor-parallel-size"), 1)
                 self.assertEqual(args.count("--pipeline-parallel-size"), 1)
                 self.assertEqual(payload["cluster_member"]["fabric_interface"],
                                  "cx7-local" if node_id == "local" else "cx7-remote")
+
+    def test_vllm_prompt_token_details_flag_is_idempotent_and_overridable(self) -> None:
+        self.assertEqual(
+            Manager._with_vllm_prompt_token_details(["--max-model-len", "1024"]),
+            ["--max-model-len", "1024", "--enable-prompt-tokens-details"],
+        )
+        self.assertEqual(
+            Manager._with_vllm_prompt_token_details([
+                "--enable-prompt-tokens-details",
+            ]),
+            ["--enable-prompt-tokens-details"],
+        )
+        self.assertEqual(
+            Manager._with_vllm_prompt_token_details([
+                "--no-enable-prompt-tokens-details",
+            ]),
+            ["--no-enable-prompt-tokens-details"],
+        )
+
+    def test_saved_vllm_deployments_are_migrated_for_cache_reporting(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [
+            {
+                "engine": "vllm",
+                "settings_dirty": False,
+                "launch_settings": {
+                    "engine": "vllm",
+                    "extra_args": ["--max-model-len", "1024"],
+                },
+            },
+            {
+                "engine": "sglang",
+                "settings_dirty": False,
+                "launch_settings": {"engine": "sglang", "extra_args": []},
+            },
+        ]
+
+        self.assertTrue(instance._migrate_vllm_prompt_token_details())
+        self.assertIn(
+            "--enable-prompt-tokens-details",
+            instance.deployments[0]["launch_settings"]["extra_args"],
+        )
+        self.assertTrue(instance.deployments[0]["settings_dirty"])
+        self.assertEqual(
+            instance.deployments[1]["launch_settings"]["extra_args"], []
+        )
+        self.assertFalse(instance._migrate_vllm_prompt_token_details())
 
     async def test_vllm_sharded_launch_rejects_invalid_explicit_parallelism(self) -> None:
         instance = Manager.__new__(Manager)
@@ -1157,20 +1350,43 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
                     "--max-model-len", "131072",
+                    "--max-cudagraph-capture-size", "72",
                     "--tensor-parallel-size", "2",
                     "--pipeline-parallel-size", "1",
                 ],
                 "image": "example/vllm:test",
+                "launch_controls": {
+                    "context_window": 131072,
+                    "max_cudagraph_capture_size": 12,
+                },
             })
 
             self.assertTrue(updated["settings_dirty"])
             self.assertEqual(updated["name"], "Faster cluster")
             self.assertEqual(updated["launch_settings"]["port"], 8000)
             self.assertEqual(
-                updated["launch_settings"]["extra_args"][1], "131072"
+                instance._cli_option(
+                    updated["launch_settings"]["extra_args"],
+                    {"--max-model-len", "--max-model-length"}, int,
+                ),
+                131072,
+            )
+            self.assertEqual(
+                instance._cli_option(
+                    updated["launch_settings"]["extra_args"],
+                    {"--max-cudagraph-capture-size"}, int,
+                ),
+                12,
             )
             persisted = json.loads(instance.deployments_path.read_text())
             self.assertEqual(persisted[0]["launch_settings"]["image"], "example/vllm:test")
+            self.assertEqual(
+                instance._cli_option(
+                    persisted[0]["launch_settings"]["extra_args"],
+                    {"--max-cudagraph-capture-size"}, int,
+                ),
+                12,
+            )
 
     def test_cluster_launch_controls_parse_and_round_trip_dspark_flags(self) -> None:
         instance = Manager.__new__(Manager)

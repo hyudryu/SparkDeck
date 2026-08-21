@@ -455,6 +455,25 @@ async def update_usage_alias(req: Request):
         raise HTTPException(status, str(exc)) from exc
 
 
+@app.put("/api/token-stats/rules")
+async def update_usage_routing_rule(req: Request):
+    try:
+        body = await req.json()
+        return manager.update_usage_routing_rule(
+            body.get("source"), body.get("destination")
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/token-stats/rules/{source:path}")
+async def delete_usage_routing_rule(source: str):
+    try:
+        return manager.delete_usage_routing_rule(source)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.delete("/api/token-stats/{model_path:path}")
 async def erase_usage_model(model_path: str):
     try:

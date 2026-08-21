@@ -180,7 +180,7 @@ async def arm_temperature_run(req: Request):
 @app.post("/api/temperature-runs/cancel")
 async def cancel_temperature_run():
     try:
-        return await manager.cancel_armed_temperature_recording()
+        return await manager.cancel_temperature_recording()
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

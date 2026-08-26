@@ -49,4 +49,25 @@ describe('API client adapters', () => {
       expect.objectContaining({ id: 'dep-1', model_id: 'org/model', status: 'running' }),
     )
   })
+
+  it('parses legacy log levels and defaults unstructured lines to info', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('{}', { status: 404, statusText: 'Not Found', headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        logs: [
+          '12:34:56 WARNING  sparkdeck.worker  request throttled',
+          'plain legacy message',
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.logs.list()).resolves.toEqual([
+      {
+        timestamp: '12:34:56',
+        level: 'warning',
+        message: 'sparkdeck.worker  request throttled',
+      },
+      { level: 'info', message: 'plain legacy message' },
+    ])
+  })
 })

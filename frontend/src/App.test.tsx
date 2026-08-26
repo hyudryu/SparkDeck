@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { ExplorePage } from './pages/ExplorePage'
+import { ModelsPage } from './pages/ModelsPage'
 
 const fetchMock = vi.fn<typeof fetch>()
 
@@ -80,5 +81,33 @@ describe('model discovery', () => {
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
+  })
+})
+
+describe('model deployments', () => {
+  it('retains the saved context length when switching runtimes', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/settings')
+        ? { default_runtime: 'vllm', default_context_length: 32768 }
+        : { items: [] }
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Add model' }))
+
+    const contextLength = screen.getByRole('spinbutton', { name: 'Context length' })
+    const runtime = screen.getByRole('combobox', { name: 'Runtime' })
+    expect(contextLength).toHaveValue(32768)
+
+    await user.selectOptions(runtime, 'llama.cpp')
+    expect(contextLength).toHaveValue(32768)
+    await user.selectOptions(runtime, 'sglang')
+    expect(contextLength).toHaveValue(32768)
   })
 })

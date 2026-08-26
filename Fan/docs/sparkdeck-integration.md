@@ -1,4 +1,4 @@
-# FanController integration for VLLMController
+# FanController integration for SparkDeck
 
 ## State transport
 
@@ -120,9 +120,9 @@ on temperature.
 
 An unknown mode emits an empty `active_settings` object.
 
-## Current VLLMController read path
+## Current SparkDeck read path
 
-VLLMController already reads the state file in
+SparkDeck already reads the state file in
 `Manager._read_fan_state()` and exposes the result as `fan` from:
 
 ```http
@@ -137,14 +137,14 @@ return value:
 "active_settings": data.get("active_settings", {}),
 ```
 
-VLLMController currently hardcodes
+SparkDeck currently hardcodes
 `~/.local/state/fancontroller/state.json`. It should use `XDG_STATE_HOME` when
 set so its lookup matches FanController.
 
 ## Updating settings
 
 There is no FanController HTTP endpoint for changing controller settings yet.
-The existing VLLMController endpoints only control the full-speed override:
+The existing SparkDeck endpoints only control the full-speed override:
 
 ```http
 GET  /api/fan/max-speed
@@ -153,7 +153,7 @@ POST /api/fan/max-speed   {"enabled": true}
 
 The control file supports independent, short-lived runtime overrides. It is
 not a persistent settings channel, and adding curve or PID keys there has no
-effect. VLLMController preserves unrelated fields when updating either
+effect. SparkDeck preserves unrelated fields when updating either
 override:
 
 ```json
@@ -184,7 +184,7 @@ FanController loads persistent settings from:
 ```
 
 The headless daemon watches this file's nanosecond modification time and
-reloads it on its next poll, normally within one second. VLLMController can
+reloads it on its next poll, normally within one second. SparkDeck can
 therefore provide its own endpoint, for example:
 
 ```http
@@ -258,7 +258,7 @@ Because the GTK FanController UI keeps an in-memory copy of settings, avoid
 editing the same fan settings simultaneously in both UIs. A later GTK save can
 overwrite an external update with its older in-memory values.
 
-## Suggested VLLMController work
+## Suggested SparkDeck work
 
 1. Pass `active_settings` through `Manager._read_fan_state()`.
 2. Add validated `POST /api/fan/settings` manager and server methods.

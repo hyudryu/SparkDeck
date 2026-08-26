@@ -1,5 +1,5 @@
-import { useState, type FormEvent } from 'react'
-import { MoreHorizontal, Plus, Server } from 'lucide-react'
+import { useEffect, useState, type FormEvent } from 'react'
+import { Plus, Server, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
@@ -16,10 +16,25 @@ const initialForm: CreateDeploymentInput = {
 
 export function ModelsPage() {
   const resource = useResource((signal) => api.deployments.list(signal))
+  const defaults = useResource((signal) => api.settings.get(signal))
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<CreateDeploymentInput>(initialForm)
   const [busy, setBusy] = useState<string>()
   const [formError, setFormError] = useState<string>()
+  const [actionError, setActionError] = useState<string>()
+
+  useEffect(() => {
+    if (!defaults.data || creating) return
+    const runtime = defaults.data.default_runtime ?? 'vllm'
+    const contextLength = defaults.data.default_context_length ?? 8192
+    setForm((current) => ({
+      ...current,
+      runtime,
+      settings: runtime === 'llama.cpp'
+        ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
+        : { context_length: contextLength, tensor_parallel_size: 1 },
+    }))
+  }, [creating, defaults.data])
 
   const create = async (event: FormEvent) => {
     event.preventDefault()
@@ -39,9 +54,12 @@ export function ModelsPage() {
 
   const act = async (deployment: Deployment, action: 'start' | 'stop' | 'remove') => {
     setBusy(deployment.id)
+    setActionError(undefined)
     try {
       await api.deployments.action(deployment.id, action)
       resource.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
     } finally {
       setBusy(undefined)
     }
@@ -67,6 +85,7 @@ export function ModelsPage() {
       />
       {resource.loading && <LoadingState label="Loading deployments" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
+      {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {!resource.loading && !resource.error && resource.data?.length === 0 && (
         <EmptyState title="No model servers yet" description="Launch a managed runtime or connect an existing OpenAI-compatible endpoint." action={<Button variant="primary" onClick={() => setCreating(true)}>Add your first model</Button>} />
       )}
@@ -83,10 +102,12 @@ export function ModelsPage() {
                 <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                 <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
                 <div role="cell" data-label="Actions" className="row-actions">
-                  {deployment.status === 'running'
+                  {deployment.managed && (deployment.status === 'running'
                     ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
-                    : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>}
-                  <Button variant="tertiary" aria-label={`More actions for ${deployment.alias}`}><MoreHorizontal size={17} /></Button>
+                    : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
+                  <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
+                    if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')
+                  }}><Trash2 size={17} /></Button>
                 </div>
               </div>
             ))}
@@ -107,6 +128,7 @@ export function ModelsPage() {
               <label className="field"><span>Model repository or GGUF artifact</span><input required value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               <label className="check-field"><input type="checkbox" checked={!form.managed} onChange={(event) => setForm({ ...form, managed: !event.target.checked })} /><span><strong>Connect an existing endpoint</strong><small>SparkDeck will not manage its process or container.</small></span></label>
               {!form.managed && <label className="field"><span>Endpoint URL</span><input type="url" required value={form.endpoint_url} onChange={(event) => setForm({ ...form, endpoint_url: event.target.value })} placeholder="http://127.0.0.1:8001" /></label>}
+              {!form.managed && <label className="field"><span>API key (optional)</span><input type="password" autoComplete="off" value={form.api_key ?? ''} onChange={(event) => setForm({ ...form, api_key: event.target.value })} /><small>Stored in your operating system credential store, never in SparkDeck's database.</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => setForm({ ...form, settings: { ...form.settings, context_length: Number(event.target.value) } })} /></label>
                 {form.runtime === 'llama.cpp' ? (

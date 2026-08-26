@@ -84,6 +84,7 @@ interface WireBenchmark {
   generation_tokens_per_second?: number
   cold_start?: boolean
   eligible_for_community: boolean
+  sync_state?: BenchmarkSample['sync_state']
 }
 
 function deploymentFromWire(item: WireDeployment): Deployment {
@@ -135,6 +136,7 @@ export const api = {
           runtime: input.runtime,
           kind: input.managed ? 'managed' : 'external',
           base_url: input.endpoint_url || undefined,
+          api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
         }),
@@ -173,7 +175,7 @@ export const api = {
         tokens_per_second: item.generation_tokens_per_second,
         cold_start: item.cold_start,
         upload_eligible: item.eligible_for_community,
-        sync_state: item.eligible_for_community ? 'pending' : 'local',
+        sync_state: item.sync_state ?? 'local',
         created_at: item.created_at,
       }))
     },
@@ -207,10 +209,10 @@ export const api = {
   },
   images: {
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {
-      const data = await requestWithFallback<ContainerImage[] | { images: ContainerImage[] }>('/api/v1/images', '/api/images', {
+      const data = await requestWithFallback<ContainerImage[] | { items?: ContainerImage[]; images?: ContainerImage[] }>('/api/v1/images', '/api/images', {
         signal,
       })
-      const images = Array.isArray(data) ? data : data.images
+      const images = Array.isArray(data) ? data : (data.items ?? data.images ?? [])
       return images.map((item) => {
         const firstTag = item.tags?.[0]
         const separator = firstTag?.lastIndexOf(':') ?? -1

@@ -79,6 +79,7 @@ export interface CreateDeploymentInput {
   model_id: string
   runtime: RuntimeKind
   endpoint_url?: string
+  api_key?: string
   managed: boolean
   settings: DeploymentSettings
 }

@@ -23,6 +23,7 @@ from sparkdeck.routeros import (
     MNDP_TTL_SECONDS,
     ROUTEROS_TIMEOUT_SECONDS,
     RouterOSService,
+    normalize_routeros_url,
     parse_mndp_packet,
 )
 
@@ -192,6 +193,58 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
             "cpu-overtemp-check": "yes",
         })
         self.assertTrue(result["connected"])
+
+    async def test_fan_update_uses_one_config_snapshot_when_file_changes(self) -> None:
+        config_a = {
+            "base_url": "https://10.0.0.10", "username": "first",
+            "password": "first-secret", "verify_tls": True,
+        }
+        config_b = {
+            "base_url": "https://10.0.0.20", "username": "second",
+            "password": "second-secret", "verify_tls": True,
+        }
+        atomic_private_json_write(self.service.config_path, config_a)
+        snapshots = []
+
+        async def overview(config):
+            snapshots.append(dict(config))
+            if len(snapshots) == 1:
+                # Simulate a concurrent reconnect while the initial overview
+                # is still part of the fan update transaction.
+                atomic_private_json_write(self.service.config_path, config_b)
+            return {
+                "connected": True,
+                "fan_capabilities": ["fan-target-temp"],
+                "base_url": config["base_url"],
+            }
+
+        self.service._overview_with_config = mock.AsyncMock(side_effect=overview)
+        self.service._request = mock.AsyncMock(return_value=[])
+
+        result = await self.service.update_fan_settings({"fan-target-temp": 55})
+
+        self.assertEqual(snapshots, [config_a, config_a])
+        self.service._request.assert_awaited_once_with(
+            "POST", "system/health/settings/set",
+            config=config_a, json_body={"fan-target-temp": "55"},
+        )
+        self.assertEqual(result["base_url"], config_a["base_url"])
+        self.assertEqual(
+            json.loads(self.service.config_path.read_text(encoding="utf-8")),
+            config_b,
+        )
+
+    def test_url_normalization_rejects_malformed_and_out_of_range_ports(self) -> None:
+        for value in (
+            "http://10.0.0.1:not-a-port",
+            "http://10.0.0.1:65536",
+            "http://10.0.0.1:-1",
+            "http://10.0.0.1:0",
+            "http://[fe80::1",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "invalid hostname or port"):
+                    normalize_routeros_url(value)
 
     async def test_connection_rejects_non_routeros_endpoint_without_persisting(self) -> None:
         service = RouterOSService(

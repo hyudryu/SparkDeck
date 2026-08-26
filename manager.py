@@ -5668,7 +5668,25 @@ class Manager:
         persisted_mode = recipe.get("deployment_mode")
         mode = str(persisted_mode or "single")
         mode_error = None
-        saved_nodes = list(dict.fromkeys(recipe.get("node_ids") or [LOCAL_NODE_ID]))
+        raw_saved_nodes = recipe.get("node_ids")
+        saved_nodes = []
+        if raw_saved_nodes is None or raw_saved_nodes == []:
+            saved_nodes = [LOCAL_NODE_ID]
+        elif not isinstance(raw_saved_nodes, list):
+            mode_error = "persisted node_ids must be an array of non-empty node IDs"
+            saved_nodes = [LOCAL_NODE_ID]
+        else:
+            seen_nodes = set()
+            for value in raw_saved_nodes:
+                if not isinstance(value, str) or not value.strip():
+                    mode_error = "persisted node_ids must contain only non-empty node IDs"
+                    continue
+                node_id = value.strip()
+                if node_id not in seen_nodes:
+                    seen_nodes.add(node_id)
+                    saved_nodes.append(node_id)
+            if not saved_nodes:
+                saved_nodes = [LOCAL_NODE_ID]
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
@@ -5682,7 +5700,8 @@ class Manager:
             required_nodes = 1
         else:
             required_nodes = 1
-            mode_error = f"unsupported persisted deployment mode: {mode}"
+            invalid_mode = f"unsupported persisted deployment mode: {mode}"
+            mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
         model_revision = self._cli_option(args, {"--revision"})
         return {
             "required_node_count": required_nodes,

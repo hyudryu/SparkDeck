@@ -45,14 +45,15 @@ _SAFE_CONFIGURATION_KEYS = {
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
+_COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
-async def _public_connection_url(
+async def _public_connection_urls(
     url: httpx.URL, resolver: Any = socket.getaddrinfo,
-) -> tuple[httpx.URL, str, str]:
-    """Resolve and pin a public destination for one outbound connection.
+) -> tuple[tuple[httpx.URL, ...], str, str]:
+    """Resolve and pin every public destination for one outbound request.
 
-    The returned URL contains the selected IP address, so the HTTP transport
+    Each returned URL contains a validated IP address, so the HTTP transport
     cannot perform a second, attacker-controlled DNS lookup after validation.
     The caller must use the returned host header and SNI hostname so HTTPS
     authentication still applies to the configured service name.
@@ -94,7 +95,32 @@ async def _public_connection_url(
     if not addresses or any(not address.is_global for address in addresses):
         raise ValueError("community aggregate host must resolve only to public addresses")
 
-    return url.copy_with(host=str(addresses[0])), url.netloc.decode("ascii"), hostname
+    return (
+        tuple(url.copy_with(host=str(address)) for address in addresses),
+        url.netloc.decode("ascii"),
+        hostname,
+    )
+
+
+async def _read_bounded_community_response(response: httpx.Response) -> bytes:
+    """Read decoded response bytes without permitting an aggregate memory bomb."""
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise ValueError("community aggregate response has invalid length") from exc
+        if declared_length < 0:
+            raise ValueError("community aggregate response has invalid length")
+        if declared_length > _COMMUNITY_MAX_RESPONSE_BYTES:
+            raise ValueError("community aggregate response is too large")
+
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(content) + len(chunk) > _COMMUNITY_MAX_RESPONSE_BYTES:
+            raise ValueError("community aggregate response is too large")
+        content.extend(chunk)
+    return bytes(content)
 
 
 async def _get_public_community_url(
@@ -108,24 +134,52 @@ async def _get_public_community_url(
         raise ValueError("community aggregate URL is invalid") from exc
 
     for redirect_count in range(_COMMUNITY_MAX_REDIRECTS + 1):
-        pinned, host_header, sni_hostname = await _public_connection_url(
+        pinned_urls, host_header, sni_hostname = await _public_connection_urls(
             current, resolver,
         )
-        # A fresh client for every hop prevents an IP-keyed pooled TLS
-        # connection from being reused after a cross-host redirect.
-        async with httpx.AsyncClient(
-            transport=transport,
-            trust_env=False,
-            follow_redirects=False,
-            timeout=15,
-        ) as client:
-            request = client.build_request(
-                "GET",
-                pinned,
-                headers={"Host": host_header, "Connection": "close"},
-                extensions={"sni_hostname": sni_hostname},
-            )
-            response = await client.send(request)
+        response: httpx.Response | None = None
+        last_connect_error: httpx.HTTPError | None = None
+        for pinned in pinned_urls:
+            # A fresh client for every candidate prevents IP-keyed pooled TLS
+            # connections from crossing logical hosts or redirect hops.
+            async with httpx.AsyncClient(
+                transport=transport,
+                trust_env=False,
+                follow_redirects=False,
+                timeout=15,
+            ) as client:
+                request = client.build_request(
+                    "GET",
+                    pinned,
+                    headers={"Host": host_header, "Connection": "close"},
+                    extensions={"sni_hostname": sni_hostname},
+                )
+                try:
+                    streamed = await client.send(request, stream=True)
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_connect_error = exc
+                    continue
+                try:
+                    if (
+                        streamed.status_code not in _COMMUNITY_REDIRECT_STATUSES
+                        or streamed.headers.get("location") is None
+                    ):
+                        content = await _read_bounded_community_response(streamed)
+                    else:
+                        content = b""
+                    response = httpx.Response(
+                        streamed.status_code,
+                        headers=streamed.headers,
+                        content=content,
+                        request=streamed.request,
+                        extensions=streamed.extensions,
+                    )
+                finally:
+                    await streamed.aclose()
+                break
+        if response is None:
+            assert last_connect_error is not None
+            raise last_connect_error
 
         if (
             response.status_code in _COMMUNITY_REDIRECT_STATUSES

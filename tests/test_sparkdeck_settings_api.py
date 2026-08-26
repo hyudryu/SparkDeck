@@ -11,7 +11,7 @@ import httpx
 
 from cluster import NodeRegistry
 from manager import Manager
-from sparkdeck.onboarding import resolve_control_connection
+from sparkdeck.onboarding import resolve_agent_connection
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -196,6 +196,54 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "credentials in Settings"):
             instance._reject_hf_cli_credentials(["--hf-token", "hf_new_secret"])
 
+    def test_malformed_recipe_args_are_isolated_and_durable_during_startup(self):
+        class StartupContinued(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            recipes_path = Path(directory) / "recipes.json"
+            recipes_path.write_text(json.dumps([
+                {
+                    "id": "malformed", "model": "org/bad", "engine": "vllm",
+                    "extra_args": 42,
+                },
+                {
+                    "id": "valid", "model": "org/good", "engine": "vllm",
+                    "extra_args": ["--dtype", "auto", "--hf-token", "hf_secret"],
+                },
+            ]), encoding="utf-8")
+
+            with (
+                patch.object(Manager, "_load_settings", return_value={}),
+                patch.object(
+                    Manager, "_load_unsloth_settings",
+                    side_effect=StartupContinued,
+                ),
+            ):
+                with self.assertRaises(StartupContinued):
+                    Manager(Path(directory))
+
+            persisted = json.loads(recipes_path.read_text(encoding="utf-8"))
+            malformed, valid = persisted
+            self.assertEqual(malformed["extra_args"], [])
+            self.assertFalse(malformed["supported"])
+            self.assertIn("extra_args", malformed["error"])
+            self.assertEqual(valid["extra_args"], ["--dtype", "auto"])
+            self.assertNotIn("hf_secret", recipes_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(valid.get("supported"), False)
+            with patch.object(server.manager, "recipe_launches", {}):
+                malformed_item = server._public_recipe(malformed)
+                valid_item = server._public_recipe(valid)
+            self.assertFalse(malformed_item["supported"])
+            self.assertIn("extra_args", malformed_item["error"])
+            self.assertTrue(valid_item["supported"])
+
+            restarted = Manager.__new__(Manager)
+            restarted.recipes_path = recipes_path
+            restarted.recipes = restarted._load_recipes()
+            self.assertFalse(restarted._migrate_recipe_hf_credentials())
+            self.assertFalse(restarted.recipes[0]["supported"])
+
     def test_explicit_empty_controller_credential_disables_worker_fallback(self):
         instance = Manager.__new__(Manager)
         instance.settings = {
@@ -271,7 +319,7 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             registry = NodeRegistry(
                 Path(directory), client, "controller",
-                connection_resolver=resolve_control_connection,
+                connection_resolver=resolve_agent_connection,
             )
             registry.nodes = [{
                 "id": "worker-1", "name": "Worker",

@@ -32,7 +32,7 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
-from sparkdeck.onboarding import resolve_control_connection
+from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
@@ -88,6 +88,9 @@ DEFAULT_SETTINGS = {
 
 logger = logging.getLogger(__name__)
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
+PERSISTED_RECIPE_ARGS_ERROR = (
+    "unsupported persisted extra_args: expected an array of strings"
+)
 
 
 # The official SGLang image exposes ``python3`` rather than a ``python``
@@ -395,7 +398,7 @@ class Manager:
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(
             self.data_dir, self.http, self.agent_credentials.node_id,
-            connection_resolver=resolve_control_connection,
+            connection_resolver=resolve_agent_connection,
         )
         self.virtual_nas = VirtualNAS(
             self.data_dir,
@@ -1938,12 +1941,19 @@ class Manager:
 
     @classmethod
     def _without_hf_cli_credentials(cls, args: list[Any]) -> list[str]:
+        if not isinstance(args, list):
+            return []
         return cls._without_cli_options(
             [str(value) for value in (args or [])], HF_CREDENTIAL_CLI_OPTIONS,
         )
 
     @classmethod
     def _reject_hf_cli_credentials(cls, args: list[Any] | None) -> None:
+        if args is not None and (
+            not isinstance(args, list)
+            or any(not isinstance(value, str) for value in args)
+        ):
+            raise ValueError("extra_args must be an array of strings")
         original = [str(value) for value in (args or [])]
         if cls._without_hf_cli_credentials(original) != original:
             raise ValueError(
@@ -5929,7 +5939,17 @@ class Manager:
                 return 1
 
         engine = str(recipe.get("engine") or "vllm")
-        args = list(recipe.get("extra_args") or [])
+        raw_args = recipe.get("extra_args")
+        args_error = None
+        if raw_args is None:
+            args = []
+        elif not isinstance(raw_args, list) or any(
+            not isinstance(value, str) for value in raw_args
+        ):
+            args = []
+            args_error = PERSISTED_RECIPE_ARGS_ERROR
+        else:
+            args = list(raw_args)
         if engine == "sglang":
             tensor_parallel = recipe.get("sg_tp_size")
             if tensor_parallel is not None:
@@ -5952,7 +5972,7 @@ class Manager:
         parallel_nodes = tensor_parallel * pipeline_parallel
         persisted_mode = recipe.get("deployment_mode")
         mode = str(persisted_mode or "single")
-        mode_error = None
+        mode_error = args_error
         raw_saved_nodes = recipe.get("node_ids")
         saved_nodes = []
         if raw_saved_nodes is None or raw_saved_nodes == []:
@@ -6018,7 +6038,27 @@ class Manager:
         """Discard legacy CLI credentials so they cannot re-enter public state."""
         changed = False
         for recipe in self.recipes:
-            original = list(recipe.get("extra_args") or [])
+            raw_args = recipe.get("extra_args")
+            if raw_args is None:
+                original = []
+            elif not isinstance(raw_args, list) or any(
+                not isinstance(value, str) for value in raw_args
+            ):
+                existing = str(recipe.get("error") or "").strip()
+                recipe["supported"] = False
+                recipe["error"] = (
+                    existing
+                    if PERSISTED_RECIPE_ARGS_ERROR in existing
+                    else "; ".join(filter(None, [existing, PERSISTED_RECIPE_ARGS_ERROR]))
+                )
+                # Replace the corrupt launch input so every public/listing
+                # path remains safe while the durable unsupported marker keeps
+                # this recipe from being launched until the user edits it.
+                recipe["extra_args"] = []
+                changed = True
+                continue
+            else:
+                original = list(raw_args)
             sanitized = self._without_hf_cli_credentials(original)
             if sanitized != original:
                 recipe["extra_args"] = sanitized

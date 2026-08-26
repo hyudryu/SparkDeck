@@ -16,7 +16,7 @@ from cluster import (
     NodeRegistry,
     normalize_agent_url,
 )
-from manager import Manager
+from manager import Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
 from sparkdeck.onboarding import resolve_agent_connection
 
 
@@ -2483,6 +2483,130 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(removed, [("old-r0", "remove"), ("old-r1", "remove")])
             self.assertEqual(launched[0]["port"], 8000)
             self.assertEqual([d["id"] for d in instance.deployments], ["deployment-new"])
+
+    async def test_sanitized_malformed_deployment_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [{"node_id": "local", "container_name": "old-r0"}],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+
+            stopped = await instance.deployment_action("deployment-bad", "stop")
+            with self.assertRaisesRegex(ValueError, "edit extra_args"):
+                await instance.deployment_action("deployment-bad", "start")
+
+            self.assertTrue(stopped["ok"])
+            instance._member_action.assert_awaited_once_with(
+                deployment["members"][0], "stop",
+            )
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(deployment["status"], "stopped")
+            self.assertEqual(
+                deployment["launch_settings_error"],
+                PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
+
+    async def test_explicit_extra_args_repair_allows_dirty_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }]
+
+            with self.assertRaisesRegex(ValueError, "explicitly repaired"):
+                instance.update_deployment_settings(
+                    "deployment-bad", {"deployment_name": "Still unsafe"},
+                )
+            with self.assertRaisesRegex(ValueError, "explicitly repaired"):
+                instance.update_deployment_settings(
+                    "deployment-bad", {"extra_args": None},
+                )
+            updated = instance.update_deployment_settings(
+                "deployment-bad", {"extra_args": ["--max-model-len", "8192"]},
+            )
+
+            self.assertEqual(updated["status"], "stopped")
+            self.assertNotIn("launch_settings_error", updated)
+            self.assertIsNone(updated["error"])
+            self.assertIn("--max-model-len", updated["launch_settings"]["extra_args"])
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertNotIn("launch_settings_error", persisted[0])
+
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+
+            async def create_deployment(body):
+                replacement = {
+                    "id": "deployment-new", "status": "starting", "members": [],
+                }
+                instance.deployments.append(replacement)
+                return replacement
+
+            instance.create_deployment = mock.AsyncMock(side_effect=create_deployment)
+            result = await instance.deployment_action("deployment-bad", "start")
+
+            self.assertTrue(result["ok"])
+            instance.create_deployment.assert_awaited_once()
+            launch_body = instance.create_deployment.await_args.args[0]
+            self.assertIn("--max-model-len", launch_body["extra_args"])
+            self.assertEqual(
+                [deployment["id"] for deployment in instance.deployments],
+                ["deployment-new"],
+            )
+
+    def test_explicit_args_repair_preserves_unrelated_deployment_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": (
+                    "worker unavailable; " + PERSISTED_DEPLOYMENT_ARGS_ERROR
+                ),
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }]
+
+            updated = instance.update_deployment_settings(
+                "deployment-bad", {"extra_args": ["--max-model-len", "8192"]},
+            )
+
+            self.assertEqual(updated["status"], "error")
+            self.assertEqual(updated["error"], "worker unavailable")
+            self.assertNotIn("launch_settings_error", updated)
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(persisted[0]["error"], "worker unavailable")
 
     async def test_idle_monitor_never_stops_one_cluster_member(self) -> None:
         instance = Manager.__new__(Manager)

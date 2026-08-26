@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import httpx
 
 from cluster import NodeRegistry
-from manager import Manager
+from manager import Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
 from sparkdeck.onboarding import resolve_agent_connection
 
 
@@ -270,6 +270,10 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(malformed["launch_settings"]["extra_args"], [])
             self.assertEqual(malformed["status"], "error")
             self.assertIn("launch_settings.extra_args", malformed["error"])
+            self.assertEqual(
+                malformed["launch_settings_error"],
+                PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
             self.assertNotEqual(valid.get("status"), "error")
             self.assertNotIn(
                 "hf_secret", deployments_path.read_text(encoding="utf-8"),
@@ -284,6 +288,10 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
                 deployments_path.read_text(encoding="utf-8"), first_persisted,
             )
             self.assertEqual(restarted.deployments[0]["status"], "error")
+            self.assertEqual(
+                restarted.deployments[0]["launch_settings_error"],
+                PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
             self.assertNotEqual(restarted.deployments[1].get("status"), "error")
 
     def test_explicit_empty_controller_credential_disables_worker_fallback(self):

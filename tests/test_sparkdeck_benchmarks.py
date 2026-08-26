@@ -1,20 +1,34 @@
+import socket
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from sparkdeck.service import SparkDeckService
+from sparkdeck.service import (
+    SparkDeckService,
+    _COMMUNITY_MAX_RESPONSE_BYTES,
+    _read_bounded_community_response,
+)
 
 
 class FakeManager:
     def __init__(self):
         self.http = httpx.AsyncClient()
         self.list_containers = AsyncMock(return_value=[])
+        self.community_http_transport = None
+        self.community_resolver = lambda host, port, **kwargs: [(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("8.8.8.8", port),
+        )]
 
 
 class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
@@ -49,6 +63,284 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
+
+    async def test_configured_community_aggregates_are_fetched_and_sanitized(self):
+        requested = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requested.append(request)
+            return httpx.Response(200, json={"items": [{
+                "model_id": "org/community-model",
+                "context_window_size": 8192,
+                "inference_tokens_per_second": 42.5,
+                "sample_count": 12,
+                "private_remote_field": "discard-me",
+            }]}, request=request)
+
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api/v1/community",
+        )
+
+        result = await self.service.community_aggregates()
+
+        self.assertEqual(
+            [str(request.url) for request in requested],
+            ["https://8.8.8.8/api/v1/community/aggregates"],
+        )
+        self.assertEqual(requested[0].headers["host"], "community.example")
+        self.assertEqual(
+            requested[0].extensions["sni_hostname"], "community.example",
+        )
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["items"], [{
+            "model_id": "org/community-model",
+            "context_window_size": 8192,
+            "inference_tokens_per_second": 42.5,
+            "sample_count": 12,
+        }])
+        self.assertEqual(
+            result["evidence_policy"]["exact_match_dimensions"],
+            ["model_id", "context_window_size"],
+        )
+
+    async def test_local_community_database_work_runs_off_event_loop(self):
+        event_loop_thread = threading.get_ident()
+        setting_threads = []
+        aggregate_threads = []
+        get_setting = self.service.store.get_setting
+        community_aggregates = self.service.store.community_aggregates
+
+        def tracked_get_setting(*args):
+            setting_threads.append(threading.get_ident())
+            return get_setting(*args)
+
+        def tracked_aggregates():
+            aggregate_threads.append(threading.get_ident())
+            return community_aggregates()
+
+        with (
+            patch.object(self.service.store, "get_setting", tracked_get_setting),
+            patch.object(
+                self.service.store, "community_aggregates", tracked_aggregates,
+            ),
+        ):
+            result = await self.service.community_aggregates()
+
+        self.assertEqual(result["availability"], "not_configured")
+        self.assertTrue(setting_threads)
+        self.assertTrue(aggregate_threads)
+        self.assertNotIn(event_loop_thread, setting_threads)
+        self.assertNotIn(event_loop_thread, aggregate_threads)
+
+    async def test_invalid_configured_community_response_fails_visibly(self):
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"items": [{
+                "model_id": "org/model",
+                "context_window_size": 4096,
+                "inference_tokens_per_second": float("nan"),
+                "sample_count": 10,
+            }]}, request=request)
+
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/aggregates",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+    async def test_community_aggregates_reject_private_literal_without_connecting(self):
+        requests = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200),
+        )
+        self.service.store.set_setting(
+            "community_api_url", "http://169.254.169.254/latest/meta-data",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(requests, [])
+
+    async def test_community_aggregates_reject_mixed_public_private_dns(self):
+        requests = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200),
+        )
+        self.manager.community_resolver = lambda host, port, **kwargs: [
+            (
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("8.8.8.8", port),
+            ),
+            (
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("127.0.0.1", port),
+            ),
+        ]
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(requests, [])
+
+    async def test_community_redirect_to_private_address_is_rejected(self):
+        requests = []
+
+        def redirect(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                302,
+                headers={"location": "http://127.0.0.1/admin"},
+                request=request,
+            )
+
+        self.manager.community_http_transport = httpx.MockTransport(redirect)
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(str(requests[0].url), "https://8.8.8.8/api/aggregates")
+
+    async def test_community_dns_result_is_pinned_before_connection(self):
+        resolver_calls = []
+        requests = []
+
+        def rebind(host, port, **kwargs):
+            resolver_calls.append((host, port))
+            address = "8.8.4.4" if len(resolver_calls) == 1 else "127.0.0.1"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"items": []}, request=request)
+
+        self.manager.community_resolver = rebind
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting(
+            "community_api_url",
+            "https://community.example/api?next=/aggregates",
+        )
+
+        result = await self.service.community_aggregates()
+
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(resolver_calls, [("community.example", 443)])
+        self.assertEqual(
+            str(requests[0].url),
+            "https://8.8.4.4/api/aggregates?next=/aggregates",
+        )
+        self.assertEqual(requests[0].headers["host"], "community.example")
+
+    async def test_community_fetch_tries_each_validated_public_address(self):
+        resolver_calls = []
+        requests = []
+
+        def resolve(host, port, **kwargs):
+            resolver_calls.append((host, port))
+            return [
+                (
+                    socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("8.8.4.4", port),
+                ),
+                (
+                    socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("1.1.1.1", port),
+                ),
+            ]
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address unavailable", request=request)
+            return httpx.Response(200, json={"items": []}, request=request)
+
+        self.manager.community_resolver = resolve
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        result = await self.service.community_aggregates()
+
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(resolver_calls, [("community.example", 443)])
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://8.8.4.4/api/aggregates",
+            "https://1.1.1.1/api/aggregates",
+        ])
+        self.assertTrue(all(
+            request.headers["host"] == "community.example"
+            and request.extensions["sni_hostname"] == "community.example"
+            for request in requests
+        ))
+
+    async def test_community_fetch_rejects_huge_ignored_response_field(self):
+        body = (
+            b'{"items":[],"ignored":"'
+            + b"x" * _COMMUNITY_MAX_RESPONSE_BYTES
+            + b'"}'
+        )
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=body, request=request),
+        )
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable") as raised:
+            await self.service.community_aggregates()
+        self.assertRegex(str(raised.exception.__cause__), "response is too large")
+
+    async def test_community_fetch_rejects_invalid_declared_lengths(self):
+        for value in ("-1", "not-a-number"):
+            with self.subTest(content_length=value):
+                response = httpx.Response(
+                    200,
+                    headers={"content-length": value},
+                    content=b"{}",
+                )
+                with self.assertRaisesRegex(ValueError, "invalid length"):
+                    await _read_bounded_community_response(response)
+
+    async def test_community_fetch_stops_continuous_chunks_at_byte_cap(self):
+        class EndlessBody(httpx.AsyncByteStream):
+            def __init__(self):
+                self.chunks_sent = 0
+                self.closed = False
+
+            async def __aiter__(self):
+                while self.chunks_sent < 10_000:
+                    self.chunks_sent += 1
+                    yield b"x" * 65_536
+
+            async def aclose(self):
+                self.closed = True
+
+        body = EndlessBody()
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=body, request=request),
+        )
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertLess(body.chunks_sent, 10_000)
+        self.assertTrue(body.closed)
 
     async def test_cluster_routing_identifiers_never_enter_benchmark_configuration(self):
         self.service._record_response(

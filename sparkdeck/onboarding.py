@@ -11,6 +11,7 @@ import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -19,7 +20,8 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from cluster import AGENT_PROTOCOL_VERSION
+from cluster import AGENT_PROTOCOL_VERSION, normalize_agent_url
+from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json
 
 
 FORWARD_NODE_HEADER = "x-sparkdeck-forward-node"
@@ -34,21 +36,6 @@ PROXY_DISCONNECT_POLL_SECONDS = 0.1
 
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-
-
-def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    try:
-        temporary.chmod(0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
 
 
 def normalize_control_url(value: Any) -> str:
@@ -68,27 +55,139 @@ def _allowed_control_ip(value: str) -> bool:
     return address.is_loopback or address in _TAILSCALE_V4 or address in _TAILSCALE_V6
 
 
-async def validate_control_url(value: Any) -> str:
-    """Allow only loopback or Tailscale-reachable controller/agent URLs."""
-    url = normalize_control_url(value)
-    host = urlsplit(url).hostname or ""
-    if host.casefold() == "localhost":
-        return url
+@dataclass(frozen=True)
+class ControlConnection:
+    """Logical SparkDeck URL plus its IP-pinned transport destinations."""
+
+    url: str
+    connect_urls: tuple[str, ...]
+    host_header: str
+    sni_hostname: str
+
+    @property
+    def connect_url(self) -> str:
+        """First candidate retained for callers that need one preferred URL."""
+        return self.connect_urls[0]
+
+
+async def _resolve_pinned_connection(url: str) -> ControlConnection:
+    parsed = httpx.URL(url)
+    host = parsed.raw_host.decode("ascii")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        if _allowed_control_ip(host):
-            return url
-        raise ValueError("URL must resolve only to Tailscale or loopback addresses")
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
         try:
             rows = await asyncio.to_thread(
-                socket.getaddrinfo, host, None, type=socket.SOCK_STREAM
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
             )
         except OSError as exc:
             raise ValueError("URL hostname could not be resolved") from exc
-        addresses = {row[4][0].split("%", 1)[0] for row in rows}
+        addresses = []
+        for row in rows:
+            address = row[4][0].split("%", 1)[0]
+            if address not in addresses:
+                addresses.append(address)
         if not addresses or not all(_allowed_control_ip(address) for address in addresses):
-            raise ValueError("URL must resolve only to Tailscale or loopback addresses") from literal_error
-        return url
+            raise ValueError(
+                "URL must resolve only to Tailscale or loopback addresses"
+            ) from literal_error
+    else:
+        if not _allowed_control_ip(str(literal)):
+            raise ValueError("URL must resolve only to Tailscale or loopback addresses")
+        addresses = [str(literal)]
+
+    # The transport connects to this numeric address, so it cannot repeat DNS
+    # after validation. Host and SNI retain the logical paired-node identity.
+    return ControlConnection(
+        url=url,
+        connect_urls=tuple(
+            str(parsed.copy_with(host=address)) for address in addresses
+        ),
+        host_header=parsed.netloc.decode("ascii"),
+        sni_hostname=host,
+    )
+
+
+async def resolve_control_connection(value: Any) -> ControlConnection:
+    """Resolve, validate, and pin one root-level controller connection."""
+    return await _resolve_pinned_connection(normalize_control_url(value))
+
+
+async def resolve_agent_connection(value: Any) -> ControlConnection:
+    """Resolve and pin an agent URL while preserving its accepted base path."""
+    return await _resolve_pinned_connection(normalize_agent_url(str(value or "")))
+
+
+async def validate_control_url(value: Any) -> str:
+    """Allow only root-level, loopback or Tailscale-reachable controller URLs."""
+    return (await resolve_control_connection(value)).url
+
+
+class _ControlClientDisconnected(Exception):
+    pass
+
+
+async def _send_pinned_control_request(
+    http: httpx.AsyncClient,
+    connection: ControlConnection,
+    method: str,
+    path: str,
+    *,
+    query: str = "",
+    headers: dict[str, str] | None = None,
+    content: bytes | None = None,
+    json_body: Any = None,
+    timeout: float,
+    stream: bool = False,
+    disconnect_task: asyncio.Task | None = None,
+) -> httpx.Response:
+    """Send to prevalidated addresses, retrying only connection failures."""
+    last_connect_error: httpx.HTTPError | None = None
+    for connect_url in connection.connect_urls:
+        target = f"{connect_url}{path}"
+        if query:
+            target = f"{target}?{query}"
+        payload: dict[str, Any] = {}
+        if content is not None:
+            payload["content"] = content
+        elif json_body is not None:
+            payload["json"] = json_body
+        request = http.build_request(
+            method,
+            target,
+            headers={**(headers or {}), "Host": connection.host_header},
+            timeout=timeout,
+            extensions={"sni_hostname": connection.sni_hostname},
+            **payload,
+        )
+        send_task = asyncio.create_task(http.send(
+            request, stream=stream, follow_redirects=False,
+        ))
+        if disconnect_task is not None:
+            done, _ = await asyncio.wait(
+                {send_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done and disconnect_task.result():
+                if send_task.done() and not send_task.cancelled():
+                    try:
+                        response = send_task.result()
+                    except httpx.HTTPError:
+                        pass
+                    else:
+                        await response.aclose()
+                else:
+                    send_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await send_task
+                raise _ControlClientDisconnected
+        try:
+            return await send_task
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_connect_error = exc
+    assert last_connect_error is not None
+    raise last_connect_error
 
 
 class ControllerAssignment:
@@ -190,8 +289,13 @@ class OnboardingService:
         join_code = None
         if controller_url:
             try:
-                response = await self.manager.http.get(
-                    f"{controller_url}/api/v1/onboarding", timeout=3,
+                connection = await resolve_control_connection(controller_url)
+                response = await _send_pinned_control_request(
+                    self.manager.http,
+                    connection,
+                    "GET",
+                    "/api/v1/onboarding",
+                    timeout=3,
                 )
                 response.raise_for_status()
                 remote = response.json()
@@ -344,13 +448,18 @@ class OnboardingService:
         if self.assignment.load():
             raise ValueError("this node is already joined to a controller")
         await self._assert_joinable()
-        entry_url = await validate_control_url(body.get("controller_url"))
+        entry_connection = await resolve_control_connection(body.get("controller_url"))
+        entry_url = entry_connection.url
         advertise_url = await validate_control_url(body.get("advertise_url"))
         if entry_url == advertise_url:
             raise ValueError("controller_url and advertise_url must identify different nodes")
         try:
-            identity_response = await self.manager.http.get(
-                f"{entry_url}/api/v1/onboarding", timeout=5,
+            identity_response = await _send_pinned_control_request(
+                self.manager.http,
+                entry_connection,
+                "GET",
+                "/api/v1/onboarding",
+                timeout=5,
             )
             identity_response.raise_for_status()
             identity = identity_response.json()
@@ -368,11 +477,15 @@ class OnboardingService:
             raise ValueError("cluster entry protocol version mismatch")
         if identity.get("role") == "controller":
             controller_url = entry_url
+            controller_connection = entry_connection
             controller_node_id = entry_node_id
         elif identity.get("role") == "worker":
             if not identity.get("controller_reachable"):
                 raise ValueError("worker entry point cannot reach its controller")
-            controller_url = await validate_control_url(identity.get("controller_url"))
+            controller_connection = await resolve_control_connection(
+                identity.get("controller_url")
+            )
+            controller_url = controller_connection.url
             controller_node_id = str(identity.get("controller_node_id") or "")
             if not controller_node_id:
                 raise ValueError("worker entry point is missing its controller identity")
@@ -386,8 +499,12 @@ class OnboardingService:
             if controller_is_loopback:
                 raise ValueError("worker entry point advertised a loopback controller URL")
             try:
-                controller_response = await self.manager.http.get(
-                    f"{controller_url}/api/v1/onboarding", timeout=5,
+                controller_response = await _send_pinned_control_request(
+                    self.manager.http,
+                    controller_connection,
+                    "GET",
+                    "/api/v1/onboarding",
+                    timeout=5,
                 )
                 controller_response.raise_for_status()
                 controller_identity = controller_response.json()
@@ -409,9 +526,12 @@ class OnboardingService:
         else:
             raise ValueError("controller_url is not a SparkDeck cluster entry point")
 
-        response = await self.manager.http.post(
-            f"{controller_url}/api/v1/onboarding/register",
-            json={
+        response = await _send_pinned_control_request(
+            self.manager.http,
+            controller_connection,
+            "POST",
+            "/api/v1/onboarding/register",
+            json_body={
                 "join_code": str(body.get("join_code") or "").strip(),
                 "advertise_url": advertise_url,
                 "name": str(body.get("name") or self.manager.settings.get("cluster_node_name") or "Worker").strip(),
@@ -456,9 +576,12 @@ class OnboardingService:
         await self._assert_no_owned_workloads("leave")
 
         try:
-            controller_url = await validate_control_url(assignment["controller_url"])
-            response = await self.manager.http.post(
-                f"{controller_url}/api/v1/onboarding/unregister",
+            connection = await resolve_control_connection(assignment["controller_url"])
+            response = await _send_pinned_control_request(
+                self.manager.http,
+                connection,
+                "POST",
+                "/api/v1/onboarding/unregister",
                 headers={
                     FORWARD_NODE_HEADER: assignment["node_id"],
                     FORWARD_HOP_HEADER: "1",
@@ -532,13 +655,20 @@ async def forward_management_request(
 ):
     if any(request.headers.get(name) for name in FORWARD_HEADERS):
         return JSONResponse({"detail": "forwarded request chains are not allowed"}, status_code=508)
-    controller_url = normalize_control_url(assignment["controller_url"])
+    try:
+        # Revalidate the saved destination on every forwarded request. A
+        # hostname that was safe during onboarding must not be able to rebind
+        # before a write-only cluster credential is forwarded.
+        connection = await resolve_control_connection(assignment["controller_url"])
+        controller_url = connection.url
+    except ValueError as exc:
+        return JSONResponse(
+            {"detail": f"controller URL is no longer safe: {exc}"},
+            status_code=502,
+        )
     request_origin = normalize_control_url(str(request.base_url))
     if controller_url == request_origin:
         return JSONResponse({"detail": "controller URL points back to this worker"}, status_code=508)
-    target = f"{controller_url}{request.url.path}"
-    if request.url.query:
-        target = f"{target}?{request.url.query}"
     headers = {
         key: value for key, value in request.headers.items()
         if key.casefold() not in FORWARD_HEADERS | {"host", "content-length", "connection"}
@@ -549,11 +679,7 @@ async def forward_management_request(
         FORWARD_TOKEN_HEADER: assignment["forward_token"],
     })
     try:
-        upstream_request = manager.http.build_request(
-            request.method, target, headers=headers, content=await request.body(),
-            timeout=PROXY_TIMEOUT_SECONDS,
-        )
-        send_task = asyncio.create_task(manager.http.send(upstream_request, stream=True))
+        body = await request.body()
 
         async def wait_for_disconnect() -> bool:
             try:
@@ -567,33 +693,26 @@ async def forward_management_request(
 
         disconnect_task = asyncio.create_task(wait_for_disconnect())
         try:
-            done, _ = await asyncio.wait(
-                {send_task, disconnect_task},
-                return_when=asyncio.FIRST_COMPLETED,
+            upstream = await _send_pinned_control_request(
+                manager.http,
+                connection,
+                request.method,
+                request.url.path,
+                query=request.url.query,
+                headers=headers,
+                content=body,
+                timeout=PROXY_TIMEOUT_SECONDS,
+                stream=True,
+                disconnect_task=disconnect_task,
             )
-            disconnected = (
-                disconnect_task in done and disconnect_task.result()
+        except _ControlClientDisconnected:
+            return JSONResponse(
+                {"detail": "client disconnected"}, status_code=499,
             )
-            if disconnected:
-                if send_task.done() and not send_task.cancelled():
-                    upstream = send_task.result()
-                    await upstream.aclose()
-                else:
-                    send_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await send_task
-                return JSONResponse(
-                    {"detail": "client disconnected"}, status_code=499,
-                )
-            upstream = await send_task
         finally:
             disconnect_task.cancel()
             with suppress(asyncio.CancelledError):
                 await disconnect_task
-            if not send_task.done():
-                send_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await send_task
     except httpx.HTTPError as exc:
         return JSONResponse(
             {

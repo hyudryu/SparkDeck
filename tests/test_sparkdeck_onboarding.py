@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import sqlite3
 import tempfile
 import unittest
@@ -265,6 +266,67 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         posted = json.loads(requests[1].content)
         self.assertEqual(posted["pairing_code"], manager.agent_credentials.data["pairing_code"])
         await http.aclose()
+
+    async def test_join_pins_hostname_before_sending_join_and_pairing_codes(self):
+        requests = []
+        resolutions = []
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("100.64.0.10", port),
+            )]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "role": "controller",
+                    "node": {
+                        "id": "controller-id",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                })
+            return httpx.Response(200, json={
+                "ok": True, "role": "controller",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "forward_token": "forward-secret",
+                "cluster": {"nodes": []},
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        try:
+            with patch(
+                "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+            ):
+                await service.join({
+                    "controller_url": "https://controller.tail.example:7878",
+                    "join_code": "654321",
+                    "advertise_url": "http://127.0.0.1:9001",
+                    "name": "Worker",
+                }, "http://127.0.0.1:7878")
+        finally:
+            await http.aclose()
+
+        self.assertEqual(resolutions, [
+            ("controller.tail.example", 7878),
+            ("controller.tail.example", 7878),
+        ])
+        self.assertTrue(all(
+            str(request.url).startswith("https://100.64.0.10:7878/")
+            and request.headers["host"] == "controller.tail.example:7878"
+            and request.extensions["sni_hostname"] == "controller.tail.example"
+            for request in requests
+        ))
+        registration = next(request for request in requests if request.method == "POST")
+        payload = json.loads(registration.content)
+        self.assertEqual(payload["join_code"], "654321")
+        self.assertEqual(
+            payload["pairing_code"], manager.agent_credentials.data["pairing_code"],
+        )
 
     async def test_join_through_worker_verifies_referral_and_registers_directly(self):
         requests = []
@@ -571,6 +633,51 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         manager.adopt_controller_role.assert_called_once()
         await http.aclose()
 
+    async def test_leave_tries_pinned_addresses_without_re_resolving_token(self):
+        requests = []
+        resolutions = []
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.20", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.21", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address unavailable", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "https://controller.tail.example:7878",
+            "forward_token": "forward-secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        try:
+            with patch(
+                "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+            ):
+                await service.leave("http://127.0.0.1:7878")
+        finally:
+            await http.aclose()
+
+        self.assertEqual(resolutions, [("controller.tail.example", 7878)])
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://100.64.0.20:7878/api/v1/onboarding/unregister",
+            "https://100.64.0.21:7878/api/v1/onboarding/unregister",
+        ])
+        self.assertTrue(all(
+            request.headers[FORWARD_TOKEN_HEADER] == "forward-secret"
+            and request.headers["host"] == "controller.tail.example:7878"
+            and request.extensions["sni_hostname"] == "controller.tail.example"
+            for request in requests
+        ))
+
     async def test_leave_refuses_local_managed_member_without_rotating_credentials(self):
         requests = []
 
@@ -684,6 +791,93 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_tries_pinned_addresses_and_preserves_streaming(self):
+        requests = []
+        resolutions = []
+
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"first"
+                yield b"-second"
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.30", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.31", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address unavailable", request=request)
+            return httpx.Response(206, stream=Body(), request=request)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = request_for(
+            "/api/state", query="fresh=1", body=b"private-body",
+        )
+        try:
+            with patch(
+                "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+            ):
+                response = await forward_management_request(request, Mock(http=http), {
+                    "controller_url": "https://controller.tail.example:7878",
+                    "forward_token": "worker-secret", "node_id": "worker-id",
+                })
+                content = b"".join([
+                    chunk async for chunk in response.body_iterator
+                ])
+        finally:
+            await http.aclose()
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(content, b"first-second")
+        self.assertEqual(resolutions, [("controller.tail.example", 7878)])
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://100.64.0.30:7878/api/state?fresh=1",
+            "https://100.64.0.31:7878/api/state?fresh=1",
+        ])
+        self.assertTrue(all(
+            request.content == b"private-body"
+            and request.headers[FORWARD_TOKEN_HEADER] == "worker-secret"
+            and request.headers["host"] == "controller.tail.example:7878"
+            and request.extensions["sni_hostname"] == "controller.tail.example"
+            for request in requests
+        ))
+
+    async def test_proxy_does_not_follow_controller_redirect(self):
+        requests = []
+
+        class EmptyBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                if False:
+                    yield b""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                307, headers={"location": "http://127.0.0.1:9000/private"},
+                stream=EmptyBody(), request=request,
+            )
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = request_for("/api/state", body=b"private-body")
+        try:
+            response = await forward_management_request(request, Mock(http=http), {
+                "controller_url": "http://100.64.0.30:7878",
+                "forward_token": "worker-secret", "node_id": "worker-id",
+            })
+            content = b"".join([
+                chunk async for chunk in response.body_iterator
+            ])
+        finally:
+            await http.aclose()
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(content, b"")
+        self.assertEqual(len(requests), 1)
+
     async def test_proxy_cancels_stalled_controller_headers_on_browser_disconnect(self):
         started = asyncio.Event()
         cancelled = asyncio.Event()

@@ -26,6 +26,10 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
                 "lastModified": "2026-01-01T00:00:00Z",
                 "private": False,
                 "gated": "auto",
+                "safetensors": {
+                    "total": 1_500,
+                    "parameters": {"BF16": 1_000, "F32": 500},
+                },
             }, {
                 "id": "org/private-model", "private": True,
             }])
@@ -41,11 +45,21 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.url.params["limit"], "100")
         self.assertEqual(request.url.params["sort"], "downloads")
         self.assertEqual(request.url.params["direction"], "-1")
+        self.assertEqual(
+            set(request.url.params.get_list("expand[]")),
+            {
+                "author", "downloads", "likes", "tags", "safetensors", "gguf",
+                "pipeline_tag", "gated", "private", "lastModified",
+            },
+        )
         self.assertEqual(request.headers["authorization"], "Bearer hf_private_secret")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["id"], "org/Model")
         self.assertEqual(items[0]["downloads"], 42)
         self.assertEqual(items[0]["likes"], 0)
+        self.assertEqual(items[0]["parameter_count"], 1_500)
+        self.assertEqual(items[0]["weight_size_bytes"], 4_000)
+        self.assertEqual(items[0]["weight_size_source"], "safetensors")
         self.assertEqual(items[0]["tags"], ["Transformers", "safetensors"])
         self.assertTrue(next(
             item["supported"] for item in items[0]["runtime_compatibility"]
@@ -53,6 +67,16 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertNotIn("hf_private_secret", str(items))
         await http.aclose()
+
+    async def test_gguf_metadata_exposes_parameter_and_weight_size(self):
+        item = HuggingFaceCatalog._public_item({
+            "id": "org/model-GGUF", "tags": ["gguf"],
+            "gguf": {"total": 30_532_122_624, "totalFileSize": 17_310_784_672},
+        })
+
+        self.assertEqual(item["parameter_count"], 30_532_122_624)
+        self.assertEqual(item["weight_size_bytes"], 17_310_784_672)
+        self.assertEqual(item["weight_size_source"], "gguf")
 
     async def test_public_search_omits_authorization(self):
         captured = []

@@ -1,4 +1,4 @@
-"""FastAPI entry point for VLLMController."""
+"""FastAPI entry point for SparkDeck."""
 import asyncio
 import json
 import logging
@@ -17,15 +17,17 @@ from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import Manager, ClientAbort, FanSettingsConflict
 from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
 from mcp_server import ControllerClient, build_server
+from sparkdeck import SparkDeckService
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
+sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
-    token=os.environ.get("VLLM_MCP_TOKEN"),
+    token=os.environ.get("SPARKDECK_MCP_TOKEN"),
     public_url=os.environ.get(
-        "VLLM_MCP_PUBLIC_URL", "http://127.0.0.1:7878/mcp"
+        "SPARKDECK_MCP_PUBLIC_URL", "http://127.0.0.1:7878/mcp"
     ),
 )
 mcp_http_app = mcp_control.streamable_http_app(
@@ -105,10 +107,31 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
+            await sparkdeck.close()
             await manager.stop()
 
 
-app = FastAPI(title="VLLMController", lifespan=lifespan)
+app = FastAPI(
+    title="SparkDeck",
+    description="Run, compare, and benchmark open models across local inference runtimes.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; "
+        "base-uri 'self'; frame-ancestors 'none'",
+    )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return response
 
 
 def _require_agent(request: Request) -> None:
@@ -127,7 +150,11 @@ async def _require_managed_agent_container(name: str, request: Request) -> None:
 # ---------- aggregate state ----------
 @app.get("/api/state")
 async def get_state():
-    return await manager.get_state()
+    state = await manager.get_state()
+    for legacy_key in ("ollama", "unsloth", "sparkrun_targets", "spark_launches", "spark_runs"):
+        state.pop(legacy_key, None)
+    state["supported_runtimes"] = list(sparkdeck.registry.kinds)
+    return state
 
 
 @app.get("/api/stats")
@@ -699,161 +726,6 @@ async def get_logs(name: str, tail: int = 200):
         raise HTTPException(500, str(e))
 
 
-@app.post("/api/containers/{name}/to-recipe")
-async def container_to_recipe(name: str):
-    try:
-        return await manager.container_to_recipe(name)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-# ---------- recipes ----------
-@app.post("/api/recipes")
-async def create_recipe(req: Request):
-    body = await req.json()
-    if not body.get("model"):
-        raise HTTPException(400, "model is required")
-    try:
-        return await manager.add_recipe(
-            model=body["model"],
-            name=body.get("name"),
-            image=body.get("image"),
-            extra_args=body.get("extra_args"),
-            gpu_memory_utilization=body.get("gpu_memory_utilization"),
-            gpu_memory_gb=body.get("gpu_memory_gb"),
-            engine=body.get("engine", "vllm"),
-            # SGLang-specific fields
-            sg_tp_size=body.get("sg_tp_size"),
-            sg_context_length=body.get("sg_context_length"),
-            sg_max_running_requests=body.get("sg_max_running_requests"),
-            sg_mem_fraction=body.get("sg_mem_fraction"),
-            sg_image=body.get("sg_image"),
-            deployment_mode=body.get("deployment_mode", "single"),
-            node_ids=body.get("node_ids") or [LOCAL_NODE_ID],
-            launch_controls=body.get("launch_controls"),
-            force_new=bool(body.get("force_new")),
-        )
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/api/recipes/{rid}/launch")
-async def launch_recipe(rid: str):
-    recipe = await manager.get_recipe(rid)
-    if not recipe:
-        raise HTTPException(404, "recipe not found")
-    manager.recipe_launches[rid] = {
-        "phase": "Preparing launch", "started_at": time.time(),
-    }
-    try:
-        if recipe.get("deployment_mode") or recipe.get("node_ids"):
-            launch_body = dict(recipe)
-            launch_body.pop("id", None)
-            launch_body.pop("created_at", None)
-            launch_body["recipe_id"] = rid
-            result = await manager.create_deployment(launch_body)
-            manager.recipe_launches[rid] = {
-                "phase": "Starting cluster", "deployment_id": result.get("id"),
-                "started_at": time.time(),
-            }
-            return result
-        return await manager.create_container(
-            model=recipe["model"],
-            image=recipe.get("image"),
-            extra_args=recipe.get("extra_args"),
-            gpu_memory_utilization=recipe.get("gpu_memory_utilization"),
-            gpu_memory_gb=recipe.get("gpu_memory_gb"),
-            engine=recipe.get("engine", "vllm"),
-            # SGLang-specific fields
-            sg_tp_size=recipe.get("sg_tp_size"),
-            sg_context_length=recipe.get("sg_context_length"),
-            sg_max_running_requests=recipe.get("sg_max_running_requests"),
-            sg_mem_fraction=recipe.get("sg_mem_fraction"),
-            sg_image=recipe.get("sg_image"),
-            recipe_id=rid,
-        )
-    except Exception as e:
-        manager.recipe_launches[rid] = {
-            "phase": "Failed", "error": str(e), "finished_at": time.time(),
-        }
-        raise HTTPException(500, str(e))
-
-
-@app.put("/api/recipes/{rid}")
-async def update_recipe(rid: str, req: Request):
-    try:
-        return await manager.update_recipe(rid, await req.json())
-    except ValueError as exc:
-        status = 404 if str(exc) == "recipe not found" else 400
-        raise HTTPException(status, str(exc)) from exc
-
-
-@app.delete("/api/recipes/{rid}")
-async def delete_recipe(rid: str):
-    ok = await manager.delete_recipe(rid)
-    if not ok:
-        raise HTTPException(404, "recipe not found")
-    return {"ok": True}
-
-
-# ---------- saved SparkRun references ----------
-@app.post("/api/spark-launches")
-async def create_spark_launch(req: Request):
-    body = await req.json()
-    try:
-        return await manager.add_spark_launch(body.get("reference") or "")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-@app.post("/api/spark-launches/{rid}/refresh")
-async def refresh_spark_launch(rid: str):
-    launch = await manager.refresh_spark_launch(rid)
-    if not launch:
-        raise HTTPException(404, "SparkRun not found")
-    return launch
-
-
-@app.delete("/api/spark-launches/{rid}")
-async def delete_spark_launch(rid: str):
-    ok = await manager.delete_spark_launch(rid)
-    if not ok:
-        raise HTTPException(404, "SparkRun not found")
-    return {"ok": True}
-
-
-@app.post("/api/spark-launches/{rid}/run")
-async def run_spark_launch(rid: str, req: Request):
-    body = await req.json() if (await req.body()) else {}
-    launch = await manager.get_spark_launch(rid)
-    if not launch:
-        raise HTTPException(404, "SparkRun not found")
-    return StreamingResponse(
-        manager.run_spark_launch_stream(
-            rid,
-            solo=body.get("solo", True),
-            overrides=body.get("overrides") or {},
-        ),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.post("/api/spark-runs/{run_id}/cancel")
-async def cancel_spark_run(run_id: str):
-    return await manager.cancel_spark_run(run_id)
-
-
-@app.get("/api/spark-runs/{run_id}/logs")
-async def get_spark_run_logs(run_id: str):
-    lines = manager.get_spark_run_logs(run_id)
-    if lines is None:
-        raise HTTPException(404, "run not found")
-    return {"id": run_id, "lines": lines}
-
-
 # ---------- images ----------
 @app.get("/api/images")
 async def list_images():
@@ -920,119 +792,116 @@ async def clear_finished():
     return await manager.clear_finished()
 
 
-# ---------- ollama ----------
-@app.post("/api/ollama/pull")
-async def ollama_pull(req: Request):
-    body = await req.json()
-    name = body.get("name")
-    if not name:
-        raise HTTPException(400, "name is required")
-    return StreamingResponse(
-        manager.pull_ollama_model_stream(name),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.delete("/api/ollama/models/{name:path}")
-async def ollama_delete_model(name: str):
+# ---------- versioned SparkDeck application API ----------
+@app.get("/api/v1/catalog/models")
+async def catalog_models(q: str = "", limit: int = 24):
     try:
-        return await manager.delete_ollama_model(name)
-    except RuntimeError as e:
-        raise HTTPException(500, str(e))
-
-
-# ---------- unsloth ----------
-# Model identity comes in the body (ids contain "/", e.g.
-# "unsloth/Qwen3.5-35B-A3B-GGUF") to avoid path-converter ambiguity.
-@app.post("/api/unsloth/load")
-async def unsloth_load(req: Request):
-    body = await req.json()
-    model_path = body.get("model_path")
-    if not model_path:
-        raise HTTPException(400, "model_path is required")
-    # Run as a tracked task so /api/unsloth/load/cancel can abort a launch
-    # that is still waiting for readiness (large models load for minutes).
-    task = asyncio.create_task(
-        manager.load_unsloth_model(
-            model_path=model_path,
-            overrides=body.get("settings"),
-        )
-    )
-    manager._llama_load_task = task
-    try:
-        return await task
-    except asyncio.CancelledError:
-        return {"ok": False, "canceled": True, "model_path": model_path}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        manager._llama_load_task = None
-
-
-@app.post("/api/unsloth/load/cancel")
-async def unsloth_cancel_load():
-    try:
-        return await manager.cancel_unsloth_load()
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/api/unsloth/unload")
-async def unsloth_unload(req: Request):
-    body = await req.json()
-    model_path = body.get("model_path")
-    if not model_path:
-        raise HTTPException(400, "model_path is required")
-    try:
-        return await manager.unload_unsloth_model(model_path)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.get("/api/unsloth/gguf-variants")
-async def unsloth_gguf_variants(model_path: str):
-    if not model_path:
-        raise HTTPException(400, "model_path is required")
-    try:
-        return await manager.list_unsloth_gguf_variants(model_path)
+        return await sparkdeck.catalog_search(q, limit)
     except httpx.HTTPStatusError as e:
-        raise HTTPException(e.response.status_code, e.response.text[:300])
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        raise HTTPException(e.response.status_code, "model catalog request failed")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"model catalog unavailable: {e}")
 
 
-@app.post("/api/unsloth/settings")
-async def unsloth_save_settings(req: Request):
-    body = await req.json()
-    model_path = body.get("model_path")
-    if not model_path:
-        raise HTTPException(400, "model_path is required")
+@app.get("/api/v1/deployments")
+async def v1_deployments():
+    return {"items": await sparkdeck.deployments()}
+
+
+@app.post("/api/v1/deployments", status_code=201)
+async def v1_create_deployment(req: Request):
     try:
-        return await manager.set_unsloth_settings(model_path, body.get("settings") or {})
+        return await sparkdeck.create_deployment(await req.json())
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
-@app.get("/api/unsloth/logs")
-async def unsloth_logs(
-    model_path: str | None = None, since: int = 0,
-    limit_bytes: int = 262144,
-):
+@app.post("/api/v1/deployments/{deployment_id}/{action}")
+async def v1_deployment_action(deployment_id: str, action: str):
     try:
-        return manager.get_llama_server_logs(
-            model_path=model_path, since=since, limit_bytes=limit_bytes
-        )
+        return await sparkdeck.deployment_action(deployment_id, action)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
+@app.delete("/api/v1/deployments/{deployment_id}")
+async def v1_delete_deployment(deployment_id: str):
+    try:
+        return await sparkdeck.delete_deployment(deployment_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/v1/benchmarks")
+async def v1_benchmarks(limit: int = 100, offset: int = 0):
+    items, total = sparkdeck.store.benchmarks(limit, offset)
+    return {"items": items, "total": total, "limit": min(500, max(1, limit)),
+            "offset": max(0, offset)}
+
+
+@app.delete("/api/v1/benchmarks/{sample_id}")
+async def v1_delete_benchmark(sample_id: str):
+    if not sparkdeck.store.delete_benchmark(sample_id):
+        raise HTTPException(404, "benchmark sample not found")
+    return {"ok": True, "id": sample_id}
+
+
+@app.get("/api/v1/community/sync")
+async def v1_community_sync():
+    return sparkdeck.store.sync_status()
+
+
+@app.put("/api/v1/community/consent")
+async def v1_community_consent(req: Request):
+    body = await req.json()
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be a boolean")
+    sparkdeck.store.set_setting("community_consent", enabled)
+    return sparkdeck.store.sync_status()
+
+
+@app.post("/api/v1/community/retry")
+async def v1_community_retry():
+    return {"retried": sparkdeck.store.retry_outbox(),
+            "sync": sparkdeck.store.sync_status()}
+
+
+@app.post("/api/v1/community/pair")
+async def v1_community_pairing():
+    # The local contract is present so clients can expose the workflow without
+    # pretending a hosted identity/upload service exists in this release.
+    raise HTTPException(503, "community account pairing is not available in this release")
+
+
+@app.get("/api/v1/community/aggregates")
+async def v1_community_aggregates():
+    return {
+        "items": [],
+        "availability": "not_configured",
+        "evidence_policy": {
+            "minimum_samples": 10,
+            "minimum_distinct_devices": 3,
+            "exact_match_dimensions": [
+                "model_revision", "quantization", "runtime", "hardware_class",
+                "tensor_parallel_size", "context_group",
+            ],
+        },
+    }
+
+
 # ---------- OpenAI-compatible /v1 proxy ----------
 @app.get("/v1/models")
 async def v1_models():
-    return await manager.proxy_models()
+    return await sparkdeck.models()
 
 
 @app.post("/v1/chat/completions")
@@ -1047,7 +916,7 @@ async def v1_chat_completions(req: Request):
     watcher = _watch_disconnect(req, cancel)
     stream = False
     try:
-        result = await manager.proxy_chat_completions(body, cancel)
+        result = await sparkdeck.proxy(body, "chat/completions", cancel)
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         # Client left; upstream request was aborted too. Nothing to send.
@@ -1085,7 +954,7 @@ async def v1_completions(req: Request):
     watcher = _watch_disconnect(req, cancel)
     stream = False
     try:
-        result = await manager.proxy_completions(body, cancel)
+        result = await sparkdeck.proxy(body, "completions", cancel)
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         return Response(status_code=499)
@@ -1120,11 +989,16 @@ async def get_server_logs(tail: int = 500):
 
 
 # ---------- static frontend ----------
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    app.mount("/static/app", StaticFiles(directory=FRONTEND_DIST), name="sparkdeck-app")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
 @app.get("/")
 async def index():
+    if (FRONTEND_DIST / "index.html").exists():
+        return FileResponse(FRONTEND_DIST / "index.html")
     return FileResponse(ROOT / "static" / "index.html")
 
 

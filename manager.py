@@ -2,6 +2,7 @@
 import asyncio
 import codecs
 import copy
+import ipaddress
 import json
 import logging
 import math
@@ -608,6 +609,7 @@ class Manager:
     @staticmethod
     def _network_interfaces() -> list[dict]:
         """Return IPv4 interface details without adding a runtime dependency."""
+        interfaces = []
         try:
             proc = subprocess.run(
                 ["ip", "-j", "-4", "addr", "show"],
@@ -618,8 +620,7 @@ class Manager:
             )
             raw = json.loads(proc.stdout)
         except Exception:
-            return []
-        interfaces = []
+            raw = []
         for item in raw:
             name = item.get("ifname")
             if not name or name == "lo":
@@ -637,6 +638,38 @@ class Manager:
                 "up": item.get("operstate") == "UP",
                 "rdma": rdma,
             })
+
+        # Windows does not provide Linux's ``ip`` utility. Tailscale's own
+        # status contract is cross-platform and also covers installations
+        # where the tunnel adapter is hidden from ordinary interface tools.
+        if not any("tailscale" in str(item.get("name") or "").casefold()
+                   for item in interfaces):
+            try:
+                proc = subprocess.run(
+                    ["tailscale", "status", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=True,
+                )
+                status = json.loads(proc.stdout)
+                addresses = []
+                for address in status.get("TailscaleIPs") or []:
+                    try:
+                        parsed = ipaddress.ip_address(address)
+                    except ValueError:
+                        continue
+                    if parsed.version == 4:
+                        addresses.append(str(parsed))
+                if addresses:
+                    interfaces.append({
+                        "name": "tailscale0",
+                        "ipv4": list(dict.fromkeys(addresses)),
+                        "up": str(status.get("BackendState") or "").casefold() == "running",
+                        "rdma": False,
+                    })
+            except Exception:
+                pass
         return interfaces
 
     @staticmethod

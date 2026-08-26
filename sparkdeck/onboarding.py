@@ -147,9 +147,20 @@ class OnboardingService:
         ]
 
     def _access_urls(self, request_origin: str) -> list[str]:
-        parsed_origin = urlsplit(normalize_control_url(request_origin))
-        port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        normalized_origin = normalize_control_url(request_origin)
+        parsed_origin = urlsplit(normalized_origin)
         urls = []
+
+        # A Tailscale Serve hostname is the preferred cluster address because
+        # it is a browser-secure origin. Preserve it exactly as received.
+        try:
+            origin_ip = ipaddress.ip_address(parsed_origin.hostname or "")
+            origin_is_loopback = origin_ip.is_loopback
+        except ValueError:
+            origin_is_loopback = (parsed_origin.hostname or "").casefold() == "localhost"
+        if not origin_is_loopback and parsed_origin.scheme == "https":
+            urls.append(normalized_origin)
+
         for interface in self.manager._network_interfaces():
             name = str(interface.get("name") or "").casefold()
             for address in interface.get("ipv4") or []:
@@ -158,13 +169,18 @@ class OnboardingService:
                 except ValueError:
                     continue
                 if tailscale or "tailscale" in name:
-                    urls.append(f"{parsed_origin.scheme}://{address}:{port}")
-        urls.append(normalize_control_url(request_origin))
+                    # SparkDeck's built-in server is plain HTTP. TLS is
+                    # terminated separately by Tailscale Serve.
+                    urls.append(f"http://{address}:{self.port}")
+
+        # A user may open SparkDeck through its raw Tailscale IP instead of a
+        # Serve hostname. Keep that origin, but never advertise loopback to a
+        # different node as if it were a cluster-reachable address.
+        if not origin_is_loopback and normalized_origin not in urls:
+            urls.append(normalized_origin)
         return list(dict.fromkeys(urls))
 
     async def status(self, request_origin: str) -> dict[str, Any]:
-        parsed_origin = urlsplit(normalize_control_url(request_origin))
-        port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
         assignment = self.assignment.load()
         role = "worker" if assignment else "controller"
         controller_url = assignment.get("controller_url") if assignment else None
@@ -188,7 +204,7 @@ class OnboardingService:
             "node": {
                 "id": self.manager.agent_credentials.node_id,
                 "name": self.manager.settings.get("cluster_node_name"),
-                "port": port,
+                "port": self.port,
                 "protocol_version": AGENT_PROTOCOL_VERSION,
                 "access_urls": self._access_urls(request_origin),
             },

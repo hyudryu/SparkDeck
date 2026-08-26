@@ -8,6 +8,7 @@ import json
 import re
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -152,27 +153,55 @@ def _allowed_routeros_ip(value: str) -> bool:
 
 async def validate_routeros_url(value: Any) -> str:
     """Restrict the management target to cluster-private network addresses."""
+    return (await _resolve_routeros_connection(value)).url
+
+
+@dataclass(frozen=True)
+class _RouterOSConnection:
+    url: str
+    connect_urls: tuple[str, ...]
+    host_header: str
+    sni_hostname: str
+
+
+async def _resolve_routeros_connection(value: Any) -> _RouterOSConnection:
+    """Resolve once and pin every permitted RouterOS management address."""
     url = normalize_routeros_url(value)
-    host = urlsplit(url).hostname or ""
-    if host.casefold() == "localhost":
-        return url
+    parsed = httpx.URL(url)
+    host = parsed.raw_host.decode("ascii")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        if _allowed_routeros_ip(host):
-            return url
-        raise ValueError("RouterOS URL must resolve only to private network addresses")
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
         try:
             rows = await asyncio.to_thread(
-                socket.getaddrinfo, host, None, type=socket.SOCK_STREAM,
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM,
             )
         except OSError as exc:
             raise ValueError("RouterOS hostname could not be resolved") from exc
-        addresses = {row[4][0] for row in rows}
+        addresses = []
+        for row in rows:
+            address = row[4][0].split("%", 1)[0]
+            if address not in addresses:
+                addresses.append(address)
         if not addresses or not all(_allowed_routeros_ip(address) for address in addresses):
             raise ValueError(
                 "RouterOS URL must resolve only to private network addresses"
             ) from literal_error
-        return url
+    else:
+        if not _allowed_routeros_ip(str(literal)):
+            raise ValueError(
+                "RouterOS URL must resolve only to private network addresses"
+            )
+        addresses = [str(literal)]
+    return _RouterOSConnection(
+        url=url,
+        connect_urls=tuple(
+            str(parsed.copy_with(host=address)) for address in addresses
+        ),
+        host_header=parsed.netloc.decode("ascii"),
+        sni_hostname=host,
+    )
 
 
 def _single(value: Any) -> dict[str, Any]:
@@ -291,18 +320,36 @@ class RouterOSService:
         if not selected:
             raise RuntimeError("RouterOS switch is not configured")
         try:
+            connection = await _resolve_routeros_connection(selected["base_url"])
             async with httpx.AsyncClient(
                 auth=(str(selected["username"]), str(selected.get("password") or "")),
                 timeout=ROUTEROS_TIMEOUT_SECONDS,
                 verify=bool(selected.get("verify_tls", True)),
                 transport=self._transport,
+                follow_redirects=False,
+                trust_env=False,
             ) as client:
-                response = await client.request(
-                    method,
-                    f"{selected['base_url']}/rest/{path.lstrip('/')}",
-                    json=json_body,
-                    headers={"Accept": "application/json"},
-                )
+                last_connect_error: httpx.HTTPError | None = None
+                for connect_url in connection.connect_urls:
+                    try:
+                        response = await client.request(
+                            method,
+                            f"{connect_url}/rest/{path.lstrip('/')}",
+                            json=json_body,
+                            headers={
+                                "Accept": "application/json",
+                                "Host": connection.host_header,
+                            },
+                            extensions={"sni_hostname": connection.sni_hostname},
+                            follow_redirects=False,
+                        )
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                        last_connect_error = exc
+                        continue
+                    break
+                else:
+                    assert last_connect_error is not None
+                    raise last_connect_error
                 response.raise_for_status()
                 if not response.content:
                     return []
@@ -319,7 +366,7 @@ class RouterOSService:
                 pass
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"RouterOS returned HTTP {status}{suffix}") from exc
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("Could not communicate with the RouterOS REST API") from exc
 
     async def connect(self, body: dict[str, Any]) -> dict[str, Any]:

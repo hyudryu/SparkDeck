@@ -48,15 +48,30 @@ function discoveredUrl(candidate?: RouterOSDiscoveryCandidate) {
 
 function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onChanged: () => void }) {
   const [form, setForm] = useState<RouterOSConnectionInput>({
-    base_url: discoveredUrl(node.discovery[0]), username: '', password: '', verify_tls: true,
+    base_url: node.base_url?.trim() || discoveredUrl(node.discovery?.[0]),
+    username: '',
+    password: '',
+    verify_tls: node.verify_tls ?? true,
   })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
 
   useEffect(() => {
-    setForm((current) => current.base_url ? current : { ...current, base_url: discoveredUrl(node.discovery[0]) })
-  }, [node.discovery])
+    setForm((current) => {
+      if (node.configured && node.base_url) {
+        return {
+          ...current,
+          base_url: node.base_url.trim(),
+          verify_tls: node.verify_tls ?? true,
+        }
+      }
+      return current.base_url ? current : {
+        ...current,
+        base_url: discoveredUrl(node.discovery?.[0]),
+      }
+    })
+  }, [node.base_url, node.configured, node.discovery, node.verify_tls])
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -100,8 +115,8 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
   return <details className="switch-connection" open={!node.configured}>
     <summary><span><Link2 size={15} aria-hidden="true" /> {node.configured ? 'Update connection' : 'Connect this switch'}</span><small>Credentials stay on {node.node_name}</small></summary>
     <form onSubmit={(event) => void save(event)}>
-      {node.discovery.length > 0 && <div className="switch-discovery-list" aria-label={`Discovered RouterOS candidates on ${node.node_name}`}>
-        {node.discovery.map((candidate) => <button type="button" key={`${candidate.address}-${candidate.mac ?? ''}`} onClick={() => setForm({ ...form, base_url: discoveredUrl(candidate) })}>
+      {(node.discovery?.length ?? 0) > 0 && <div className="switch-discovery-list" aria-label={`Discovered RouterOS candidates on ${node.node_name}`}>
+        {node.discovery?.map((candidate) => <button type="button" key={`${candidate.address}-${candidate.mac ?? ''}`} onClick={() => setForm({ ...form, base_url: discoveredUrl(candidate) })}>
           <Cable size={15} aria-hidden="true" /><span><strong>{candidate.identity || candidate.address}</strong><small>{[candidate.board, candidate.platform, candidate.version, candidate.address].filter(Boolean).join(' · ')}</small></span>
         </button>)}
       </div>}

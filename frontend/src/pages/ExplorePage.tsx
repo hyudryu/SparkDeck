@@ -1,5 +1,6 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Check, Download, Search, Users } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { RuntimeKind } from '../api/types'
 import { EmptyState, ErrorState, formatNumber, formatRate, LoadingState, PageHeader, Panel, RuntimeMark } from '../components/ui'
@@ -13,6 +14,11 @@ export function ExplorePage() {
     (signal) => api.catalog.search(query, runtime || undefined, undefined, signal),
     [query, runtime],
   )
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setQuery(draft.trim()), 350)
+    return () => window.clearTimeout(timeout)
+  }, [draft])
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -44,7 +50,7 @@ export function ExplorePage() {
         <button className="button button-primary" type="submit">Search</button>
       </form>
 
-      <div className="result-heading">
+      <div className="result-heading" aria-live="polite">
         <div>
           <h2>{query ? `Results for “${query}”` : 'Recommended models'}</h2>
           {!loading && data && <span>{formatNumber(data.total)} models</span>}
@@ -86,7 +92,7 @@ export function ExplorePage() {
                 ) : (
                   <span className="muted">More community data needed</span>
                 )}
-                <a className="text-link" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer">Model details</a>
+                <div className="model-card-actions"><a className="text-link" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer">Details</a><Link className="button button-primary" aria-label={`Deploy ${model.id}`} to={`/models?model=${encodeURIComponent(model.id)}`}>Deploy</Link></div>
               </div>
             </Panel>
           ))}

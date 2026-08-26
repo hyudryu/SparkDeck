@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Check, Cloud, KeyRound, MonitorCog, Save } from 'lucide-react'
+import { Check, Cloud, KeyRound, MonitorCog, Network, Save } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, RuntimeKind } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -56,6 +57,10 @@ export function SettingsPage() {
             <label className="field"><span>Default runtime</span><select value={form.default_runtime} onChange={(event) => setForm({ ...form, default_runtime: event.target.value as RuntimeKind })}><option value="vllm">vLLM</option><option value="llama.cpp">llama.cpp</option><option value="sglang">SGLang</option></select></label>
             <label className="field"><span>Default context length</span><input type="number" min="256" value={form.default_context_length} onChange={(event) => setForm({ ...form, default_context_length: Number(event.target.value) })} /><small>Applied as a starting value; each deployment can override it.</small></label>
           </div>
+        </Panel>
+        <Panel className="settings-section">
+          <div className="settings-heading"><span><Network size={18} /></span><div><h2>DGX Spark cluster</h2><p>Connect nodes privately over Tailscale for targeted pulls and deployments.</p></div></div>
+          <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster onboarding</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
         </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community service</h2><p>Optional hosted service for account pairing and benchmark aggregation.</p></div></div>

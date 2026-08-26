@@ -15,6 +15,8 @@ import type {
   SyncStatus,
   NodeInventoryItem,
   ImagePullResult,
+  OnboardingStatus,
+  JoinClusterInput,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -191,6 +193,17 @@ export const api = {
       const data = await request<{ items: NodeInventoryItem[] }>('/api/v1/nodes', { signal })
       return data.items
     },
+  },
+  onboarding: {
+    get: (signal?: AbortSignal) => request<OnboardingStatus>('/api/v1/onboarding', { signal }),
+    join: (input: JoinClusterInput) => request<OnboardingStatus>('/api/v1/onboarding/join', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+    leave: () => request<OnboardingStatus>('/api/v1/onboarding/leave', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
   },
   chat: (model: string, messages: ChatMessage[], signal?: AbortSignal) =>
     request<ChatCompletionResponse>('/v1/chat/completions', {

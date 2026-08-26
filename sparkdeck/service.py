@@ -820,7 +820,7 @@ class SparkDeckService:
         names = " ".join(str(gpu.get("model") or "") for gpu in public_gpus).casefold()
         return {
             "architecture": platform.machine(),
-            "device_class": "dgx-spark" if "gb10" in names or "dgx spark" in names else "local",
+            "hardware_class": "dgx-spark" if "gb10" in names or "dgx spark" in names else "local",
             "gpu_count": len(public_gpus),
             "gpus": public_gpus,
         }

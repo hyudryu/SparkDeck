@@ -64,6 +64,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         items, _ = self.service.store.benchmarks()
         self.assertEqual(items[0]["configuration"], {"context_length": 4096})
 
+    async def test_hardware_snapshot_uses_public_hardware_class_contract(self):
+        self.manager._stats_cache = {
+            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}]
+        }
+
+        snapshot = self.service._hardware_snapshot()
+
+        self.assertEqual(snapshot["hardware_class"], "dgx-spark")
+        self.assertNotIn("device_class", snapshot)
+
     async def test_short_sample_remains_local_and_is_not_queued(self):
         self.service.store.set_setting("community_consent", True)
         self.service._record_response(

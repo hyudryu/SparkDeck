@@ -108,3 +108,23 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(
             {item["id"] for item in self.store.outbox_batch()}, {"pending", "failed"}
         )
+
+    def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
+        sample = BenchmarkSample(
+            id="legacy-hardware", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={"device_class": "dgx-spark"}, configuration={},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=300, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.set_community_consent(True)
+        self.store.add_benchmark(sample, queue=True)
+
+        local, _ = self.store.benchmarks()
+        upload = self.store.outbox_batch()
+
+        self.assertEqual(local[0]["hardware"], {"hardware_class": "dgx-spark"})
+        self.assertEqual(upload[0]["hardware"], {"hardware_class": "dgx-spark"})

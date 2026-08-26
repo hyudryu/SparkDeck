@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Activity,
   Boxes,
+  Cable,
   ChevronLeft,
   ClipboardList,
   Cpu,
@@ -27,6 +28,7 @@ const navigation = [
   { to: '/explore', label: 'Explore', icon: Search },
   { to: '/models', label: 'Models', icon: Cpu },
   { to: '/cluster', label: 'Cluster', icon: Network },
+  { to: '/switch', label: 'Switch', icon: Cable },
   { to: '/chat', label: 'Chat', icon: MessageSquareText },
   { to: '/compare', label: 'Compare', icon: GitCompareArrows },
   { to: '/benchmarks', label: 'Benchmarks', icon: ClipboardList },
@@ -49,6 +51,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<ResolvedTheme>(resolvedTheme)
   const [themeSyncing, setThemeSyncing] = useState(false)
   const [themeStatus, setThemeStatus] = useState('')
+  const [switchDetected, setSwitchDetected] = useState(false)
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
   const themeInteractedRef = useRef(false)
@@ -67,6 +70,31 @@ export function AppShell({ children }: { children: ReactNode }) {
       // The locally stored preference remains authoritative while offline.
     })
     return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    let controller: AbortController | undefined
+    const refreshPresence = () => {
+      controller?.abort()
+      controller = new AbortController()
+      api.routeros.presence(controller.signal)
+        .then((presence) => {
+          if (!disposed) setSwitchDetected(Boolean(presence.detected))
+        })
+        .catch(() => {
+          if (!disposed && !controller?.signal.aborted) setSwitchDetected(false)
+        })
+    }
+    refreshPresence()
+    const interval = window.setInterval(refreshPresence, 15_000)
+    window.addEventListener('sparkdeck:routeros-presence-changed', refreshPresence)
+    return () => {
+      disposed = true
+      controller?.abort()
+      window.clearInterval(interval)
+      window.removeEventListener('sparkdeck:routeros-presence-changed', refreshPresence)
+    }
   }, [])
 
   useEffect(() => {
@@ -132,8 +160,21 @@ export function AppShell({ children }: { children: ReactNode }) {
           </button>
         </div>
         <nav className="nav-list">
-          {navigation.map(({ to, label, icon: Icon, end }, index) => (
-            <NavLink
+          {navigation.map(({ to, label, icon: Icon, end }, index) => {
+            if (to === '/switch' && !switchDetected) {
+              return <span
+                key={to}
+                className="nav-link nav-link-disabled"
+                role="link"
+                aria-disabled="true"
+                tabIndex={0}
+                title="Switch is not detected"
+              >
+                <Icon size={19} aria-hidden="true" />
+                <span>{label}</span>
+              </span>
+            }
+            return <NavLink
               ref={index === 0 ? firstLinkRef : undefined}
               key={to}
               to={to}
@@ -144,7 +185,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <Icon size={19} aria-hidden="true" />
               <span>{label}</span>
             </NavLink>
-          ))}
+          })}
         </nav>
         <div className="sidebar-footer">
           <button

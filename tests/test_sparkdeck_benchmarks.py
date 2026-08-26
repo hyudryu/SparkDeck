@@ -85,6 +85,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         }))
         self.manager.proxy_cluster_inference = AsyncMock(return_value={
             "usage": {"prompt_tokens": 24, "completion_tokens": 20},
+            "timings": {"predicted_per_second": 80.0},
         })
         deployment = {
             "id": "dep-remote", "alias": "remote-model", "kind": "managed",
@@ -132,7 +133,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 0
         )
 
-    async def test_non_stream_elapsed_throughput_is_eligible_and_keeps_revision(self):
+    async def test_non_stream_without_native_timing_is_local_only_and_keeps_revision(self):
         self.service.store.set_setting("community_consent", True)
         self.service._record_response(
             "dep-1", "org/model", "sglang", {}, time.monotonic() - 0.2,
@@ -140,8 +141,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             revision="revision-abc",
         )
         items, _ = self.service.store.benchmarks()
-        self.assertTrue(items[0]["eligible_for_community"])
-        self.assertGreater(items[0]["generation_tokens_per_second"], 0)
+        self.assertFalse(items[0]["eligible_for_community"])
+        self.assertIsNone(items[0]["generation_tokens_per_second"])
         self.assertEqual(items[0]["model"]["revision"], "revision-abc")
 
     async def test_local_artifact_and_private_image_never_enter_outbox(self):

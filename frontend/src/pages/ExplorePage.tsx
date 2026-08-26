@@ -198,7 +198,7 @@ export function ExplorePage() {
 
       <div className="usage-tabs catalog-tabs" role="tablist" aria-label="Model catalog source">
         <button role="tab" aria-selected={tab === 'hugging-face'} onClick={() => setTab('hugging-face')}>Hugging Face</button>
-        <button role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Community run models</button>
+        <button role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Community Run Models</button>
       </div>
 
       <div className="catalog-toolbar">
@@ -228,7 +228,7 @@ export function ExplorePage() {
 
       <div className="result-heading" aria-live="polite">
         <div>
-          <h2>{tab === 'community' ? 'Community run models' : query ? `Results for “${query}”` : 'Popular Hugging Face models'}</h2>
+          <h2>{tab === 'community' ? 'Community Run Models' : query ? `Results for “${query}”` : 'Popular Hugging Face models'}</h2>
           {!loading && <span>{formatNumber(models.length)} models</span>}
         </div>
         <p>{tab === 'community' ? 'Based on aggregated benchmark samples—not live session tracking.' : 'Sorted by Hugging Face downloads unless “Only what fits” is enabled.'}</p>

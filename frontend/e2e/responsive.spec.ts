@@ -68,6 +68,24 @@ test('keeps a saved theme after reload', async ({ page }) => {
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
 })
 
+test('persists the navigation theme toggle after reload', async ({ page }) => {
+  await page.goto('/')
+  const sidebar = page.getByRole('complementary', { name: 'Primary navigation' })
+  if ((page.viewportSize()?.width ?? 0) <= 768) {
+    await page.getByRole('button', { name: 'Open navigation' }).click()
+  }
+  await sidebar.getByRole('button', { name: 'Switch to dark mode' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+
+  await page.reload()
+  if ((page.viewportSize()?.width ?? 0) <= 768) {
+    await page.getByRole('button', { name: 'Open navigation' }).click()
+  }
+  await expect(sidebar.getByRole('button', { name: 'Switch to light mode' })).toBeVisible()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await expect(sidebar).not.toContainText('Local service')
+})
+
 test('uses a drawer on mobile and a persistent sidebar on desktop', async ({ page }) => {
   await page.goto('/')
   const menu = page.getByRole('button', { name: 'Open navigation' })
@@ -115,7 +133,7 @@ test('keeps storage inventory and transfer controls touch friendly', async ({ pa
   await target.check()
   await expect(page.getByRole('checkbox', { name: /Archive Spark/ })).toBeDisabled()
   await page.getByRole('button', { name: 'Queue transfer' }).click()
-  await expect(page.getByRole('status')).toContainText('Queued org/test-model for transfer to Studio Spark.')
+  await expect(page.locator('main').getByRole('status')).toContainText('Queued org/test-model for transfer to Studio Spark.')
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)

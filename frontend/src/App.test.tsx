@@ -20,6 +20,7 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   localStorage.clear()
+  delete document.documentElement.dataset.theme
 })
 
 describe('SparkDeck application shell', () => {
@@ -27,6 +28,7 @@ describe('SparkDeck application shell', () => {
     render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
+    expect(screen.queryByText('Local service')).not.toBeInTheDocument()
     for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Storage', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
@@ -45,6 +47,38 @@ describe('SparkDeck application shell', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(open).toHaveAttribute('aria-expanded', 'false'))
+  })
+
+  it('persists the sidebar theme toggle locally and through settings', async () => {
+    const user = userEvent.setup()
+    let settings = { theme: 'light', default_runtime: 'sglang', default_context_length: 32768, community_api_url: 'https://community.example' }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
+        if (init?.method === 'PUT' || init?.method === 'POST') {
+          settings = JSON.parse(String(init.body)) as typeof settings
+        }
+        return new Response(JSON.stringify(settings), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    const first = render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    const toggle = await screen.findByRole('button', { name: 'Switch to dark mode' })
+    await user.click(toggle)
+
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(localStorage.getItem('sparkdeck.theme')).toBe('dark')
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/settings', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ ...settings, theme: 'dark' }),
+    })))
+    expect(await screen.findByText('Dark mode saved.')).toBeInTheDocument()
+
+    first.unmount()
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Switch to light mode' })).toBeInTheDocument()
+    expect(document.documentElement.dataset.theme).toBe('dark')
   })
 })
 

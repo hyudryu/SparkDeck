@@ -5,12 +5,13 @@ tokens server-side and exposes sanitized node state for the UI.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
@@ -50,6 +51,13 @@ class AgentCredentials:
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
                 if value.get("agent_token") and value.get("pairing_code"):
+                    if not value.get("cluster_join_code"):
+                        value["cluster_join_code"] = f"{secrets.randbelow(1_000_000):06d}"
+                        value["cluster_join_code_issued_at"] = time.time()
+                        _atomic_json_write(self.path, value)
+                    elif not value.get("cluster_join_code_issued_at"):
+                        value["cluster_join_code_issued_at"] = time.time()
+                        _atomic_json_write(self.path, value)
                     return value
             except Exception:
                 pass
@@ -57,6 +65,8 @@ class AgentCredentials:
             "node_id": uuid.uuid4().hex,
             "agent_token": secrets.token_urlsafe(32),
             "pairing_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code_issued_at": time.time(),
             "created_at": time.time(),
         }
         _atomic_json_write(self.path, value)
@@ -74,6 +84,49 @@ class AgentCredentials:
         return bool(token) and secrets.compare_digest(
             token, self.data.get("agent_token", "")
         )
+
+    @property
+    def cluster_join_code(self) -> str:
+        return str(self.data["cluster_join_code"])
+
+    def current_cluster_join_code(self, ttl_seconds: float = 600.0) -> str:
+        issued_at = float(self.data.get("cluster_join_code_issued_at") or 0)
+        if time.time() - issued_at > ttl_seconds:
+            self._rotate_cluster_join_code()
+        return self.cluster_join_code
+
+    def _rotate_cluster_join_code(self) -> None:
+        self.data["cluster_join_code"] = f"{secrets.randbelow(1_000_000):06d}"
+        self.data["cluster_join_code_issued_at"] = time.time()
+        _atomic_json_write(self.path, self.data)
+
+    def consume_cluster_join_code(self, join_code: str) -> None:
+        """Consume the controller's one-time cluster join code and rotate it."""
+        if not join_code or not secrets.compare_digest(
+            str(join_code), self.current_cluster_join_code()
+        ):
+            raise ValueError("invalid or expired cluster join code")
+        self._rotate_cluster_join_code()
+
+    def revoke_remote_access(self) -> None:
+        """Durably invalidate every credential shared during cluster pairing.
+
+        Keep the stable node ID, but replace the agent bearer and both pairing
+        codes in one atomic write.  Updating ``self.data`` only after the write
+        succeeds ensures callers never clear a controller assignment based on
+        an in-memory-only revocation that would disappear after a restart.
+        """
+        value = {
+            **self.data,
+            "agent_token": secrets.token_urlsafe(32),
+            "pairing_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code_issued_at": time.time(),
+            "credentials_rotated_at": time.time(),
+        }
+        value.pop("paired_at", None)
+        _atomic_json_write(self.path, value)
+        self.data = value
 
     def pair(self, pairing_code: str) -> dict:
         if not pairing_code or not secrets.compare_digest(
@@ -188,7 +241,29 @@ class NodeRegistry:
 
     @staticmethod
     def public_config(node: dict) -> dict:
-        return {k: v for k, v in node.items() if k != "agent_token"}
+        return {
+            k: v for k, v in node.items()
+            if k not in {"agent_token", "forward_token", "forward_token_hash"}
+        }
+
+    def set_forward_token(self, node_id: str, token: str) -> None:
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID:
+            raise ValueError("remote node not found")
+        node.pop("forward_token", None)
+        node["forward_token_hash"] = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+        self._save()
+
+    def accepts_forward_token(self, node_id: str, token: str) -> bool:
+        node = self.get(node_id)
+        candidate = hashlib.sha256(str(token).encode("utf-8")).hexdigest() if token else ""
+        return bool(
+            node
+            and node_id != LOCAL_NODE_ID
+            and node.get("enabled", True)
+            and token
+            and secrets.compare_digest(candidate, str(node.get("forward_token_hash") or ""))
+        )
 
     async def request(
         self,
@@ -226,6 +301,41 @@ class NodeRegistry:
                 f"could not contact {node.get('name', node_id)}: {exc}"
             ) from exc
 
+    async def open_stream(
+        self,
+        node_id: str,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        content: AsyncIterator[bytes] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 600,
+    ) -> httpx.Response:
+        """Open an authenticated agent stream; the caller must close it."""
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID:
+            raise ValueError("remote node not found")
+        if not node.get("enabled", True):
+            raise ValueError(f"node {node.get('name', node_id)} is disabled")
+        request_headers = dict(headers or {})
+        request_headers["Authorization"] = f"Bearer {node['agent_token']}"
+        payload: dict[str, Any] = {}
+        if content is not None:
+            payload["content"] = content
+        elif json_body is not None:
+            payload["json"] = json_body
+        request = self.http.build_request(
+            method, f"{node['agent_url']}{path}", headers=request_headers,
+            timeout=timeout, **payload,
+        )
+        try:
+            return await self.http.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"could not contact {node.get('name', node_id)}: {exc}"
+            ) from exc
+
     async def probe(self, node: dict, *, force: bool = False) -> dict:
         node_id = node["id"]
         cached = self._status_cache.get(node_id)
@@ -246,6 +356,21 @@ class NodeRegistry:
                     issues.append("agent protocol version mismatch")
                 if not status.get("docker_ready"):
                     issues.append("Docker is unavailable")
+                authoritative_name = str(public.get("name") or "").strip()
+                if (
+                    authoritative_name
+                    and str(status.get("name") or "").strip() != authoritative_name
+                ):
+                    try:
+                        await self.request(
+                            node_id, "PATCH", "/api/agent/node",
+                            json_body={"name": authoritative_name}, timeout=10,
+                        )
+                        status["name"] = authoritative_name
+                    except Exception:
+                        # The registry alias remains authoritative in the
+                        # controller UI and a later probe retries convergence.
+                        issues.append("node name synchronization pending")
                 result = {
                     **public,
                     **status,
@@ -254,6 +379,10 @@ class NodeRegistry:
                     "latency_ms": round((time.monotonic() - started) * 1000),
                     "last_seen": time.time(),
                 }
+                # The controller's durable registry is authoritative for the
+                # user-assigned display name. Agent status may briefly retain
+                # the prior local name after an offline rename.
+                result["name"] = public.get("name") or status.get("name")
                 result["status_message"] = "; ".join(issues) or None
             except Exception as exc:
                 previous = cached[1] if cached else {}

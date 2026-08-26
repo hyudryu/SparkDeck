@@ -1,9 +1,8 @@
-"""
-VLLMController - container + queue + telemetry manager.
-"""
+"""SparkDeck container, queue, cluster, and telemetry manager."""
 import asyncio
 import codecs
 import copy
+import ipaddress
 import json
 import logging
 import math
@@ -15,11 +14,13 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import docker
 import httpx
@@ -31,6 +32,7 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
+from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -57,19 +59,20 @@ DEFAULT_SETTINGS = {
     # Exchange per-node lifetime/hourly token counters with paired nodes.
     # Per-origin revisions make repeated pull/push cycles idempotent.
     "sync_token_usage": False,
+    # Opt-in model cache replication across authenticated cluster nodes.
+    "virtual_nas_enabled": False,
     # Cluster management uses the normal LAN/Tailscale address while model
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
     "cluster_node_name": socket.gethostname(),
     "cluster_fabric_ip": "",
     "cluster_fabric_interface": "",
-    "ollama_base_url": "http://localhost:11434",
     # llama-server launcher (GGUF models from the local HF cache). One server
     # at a time, bound to localhost and proxied via /v1.
-    "llama_server_bin": "~/.unsloth/llama.cpp/llama-server",
+    "llama_server_bin": "~/.local/share/llama.cpp/llama-server",
     "llama_server_host": "127.0.0.1",
     "llama_server_port": 8100,
-    "llama_rpc_server_bin": "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server",
+    "llama_rpc_server_bin": "~/.local/share/llama.cpp/ggml-rpc-server",
     "llama_rpc_port": 50052,
     # Flagship model pricing: input/output cost per 1M tokens (USD).
     # Editable from the Usage tab; used for opportunity-cost comparison
@@ -90,14 +93,35 @@ logger = logging.getLogger(__name__)
 # should not fall back to the configured vLLM image.
 DEFAULT_SGLANG_IMAGE = "lmsysorg/sglang:latest"
 
-CONTROLLER_LABEL = "vllm-controller"
-MODEL_LABEL = "vllm-model"
-DEPLOYMENT_LABEL = "vllm-controller.deployment"
-NODE_LABEL = "vllm-controller.node"
-RANK_LABEL = "vllm-controller.rank"
-SERVICE_PORT_LABEL = "vllm-controller.service-port"
-MODE_LABEL = "vllm-controller.deployment-mode"
-NNODES_LABEL = "vllm-controller.nnodes"
+CONTROLLER_LABEL = "io.sparkdeck.managed"
+MODEL_LABEL = "io.sparkdeck.model"
+ENGINE_LABEL = "io.sparkdeck.runtime"
+DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
+NODE_LABEL = "io.sparkdeck.node"
+RANK_LABEL = "io.sparkdeck.rank"
+SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
+MODE_LABEL = "io.sparkdeck.deployment-mode"
+NNODES_LABEL = "io.sparkdeck.nnodes"
+
+# Containers created by earlier releases remain discoverable and manageable.
+LEGACY_LABELS = {
+    CONTROLLER_LABEL: "vllm-controller",
+    MODEL_LABEL: "vllm-model",
+    ENGINE_LABEL: "vllm-controller.engine",
+    DEPLOYMENT_LABEL: "vllm-controller.deployment",
+    NODE_LABEL: "vllm-controller.node",
+    RANK_LABEL: "vllm-controller.rank",
+    SERVICE_PORT_LABEL: "vllm-controller.service-port",
+    MODE_LABEL: "vllm-controller.deployment-mode",
+    NNODES_LABEL: "vllm-controller.nnodes",
+}
+
+
+def _label_value(labels: dict, key: str, default: Any = None) -> Any:
+    value = labels.get(key)
+    if value is None:
+        value = labels.get(LEGACY_LABELS[key])
+    return default if value is None else value
 
 # Distributed workers form one rendezvous generation.  Checking every two
 # minutes catches a split rank well before the default 601-second TCPStore
@@ -155,14 +179,6 @@ TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
 # Safety margin (GB) kept free on the GPU even when running multiple models.
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
-
-# Marker shown on Ollama-sourced model ids in /v1/models. Clients must
-# echo this prefix back in the `model` field of /v1 requests for the
-# proxy to route them to Ollama instead of a vLLM container.
-# Marker shown on Ollama-sourced model ids in /v1/models. Clients must
-# echo this prefix back in the `model` field of /v1 requests for the
-# proxy to route them to Ollama instead of a vLLM container.
-OLLAMA_PREFIX = "CLOUD "
 
 FAN_MODE_DEFAULTS = {
     "curve": {
@@ -267,6 +283,20 @@ def _is_vllm_image(tag: str) -> bool:
     return "vllm" in (tag or "").lower()
 
 
+def _normalize_node_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("name must be a string")
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        raise ValueError("name must not contain control characters")
+    normalized = re.sub(r" {2,}", " ", normalized)
+    if not normalized:
+        raise ValueError("name must not be empty")
+    if len(normalized) > 80:
+        raise ValueError("name must be at most 80 characters")
+    return normalized
+
+
 def _is_atlas_serving_container(name: str, image: str) -> bool:
     """Return whether a container is an Atlas Serving run started by SparkRun.
 
@@ -359,6 +389,12 @@ class Manager:
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(self.data_dir, self.http)
+        self.virtual_nas = VirtualNAS(
+            self.data_dir,
+            lambda: Path(self.settings.get("hf_cache") or "") / "hub",
+            self.node_registry,
+            lambda: bool(self.settings.get("virtual_nas_enabled", False)),
+        )
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
@@ -478,26 +514,69 @@ class Manager:
         self._online_users_ts = 0.0
 
     # ---------- lifecycle ----------
+    def is_joined_worker(self) -> bool:
+        """Return whether this process has a durable controller assignment."""
+        path = self.data_dir / "controller.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return bool(
+                value.get("controller_url")
+                and value.get("forward_token")
+                and value.get("node_id")
+            )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return False
+
+    def _start_controller_tasks(self) -> None:
+        task_factories = (
+            ("worker_task", self._worker_loop),
+            ("idle_task", self._idle_monitor_loop),
+            ("cluster_health_task", self._cluster_health_monitor_loop),
+            ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
+            ("fan_cluster_task", self._fan_cluster_monitor_loop),
+            ("token_usage_sync_task", self._token_usage_sync_loop),
+        )
+        for field, factory in task_factories:
+            current = getattr(self, field, None)
+            if current is None or current.done():
+                setattr(self, field, asyncio.create_task(factory()))
+
+    async def adopt_worker_role(self) -> None:
+        """Stop controller-only schedulers after a successful live join."""
+        await self.virtual_nas.stop()
+        for field in (
+            "worker_task", "idle_task", "cluster_health_task",
+            "deployment_capacity_task", "fan_cluster_task",
+            "token_usage_sync_task",
+        ):
+            task = getattr(self, field, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            setattr(self, field, None)
+
+    def adopt_controller_role(self) -> None:
+        """Resume controller schedulers after leaving a controller."""
+        self._start_controller_tasks()
+        self.virtual_nas.start()
+
     async def start(self):
-        self.worker_task = asyncio.create_task(self._worker_loop())
-        self.idle_task = asyncio.create_task(self._idle_monitor_loop())
-        self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
-        self.deployment_capacity_task = asyncio.create_task(
-            self._deployment_capacity_monitor_loop()
-        )
-        self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
-        self.temperature_history_task = asyncio.create_task(
-            self._temperature_history_monitor_loop()
-        )
+        if not self.is_joined_worker():
+            self._start_controller_tasks()
+            self.virtual_nas.start()
         self.inference_nudger_task = asyncio.create_task(
             self._inference_nudger_loop()
         )
-        self.token_usage_sync_task = asyncio.create_task(
-            self._token_usage_sync_loop()
+        self.temperature_history_task = asyncio.create_task(
+            self._temperature_history_monitor_loop()
         )
         self._start_mem_bw_monitor()
 
     async def stop(self):
+        await self.virtual_nas.stop()
         for t in (
             self.worker_task,
             self.idle_task,
@@ -530,6 +609,7 @@ class Manager:
     @staticmethod
     def _network_interfaces() -> list[dict]:
         """Return IPv4 interface details without adding a runtime dependency."""
+        interfaces = []
         try:
             proc = subprocess.run(
                 ["ip", "-j", "-4", "addr", "show"],
@@ -540,8 +620,7 @@ class Manager:
             )
             raw = json.loads(proc.stdout)
         except Exception:
-            return []
-        interfaces = []
+            raw = []
         for item in raw:
             name = item.get("ifname")
             if not name or name == "lo":
@@ -559,6 +638,38 @@ class Manager:
                 "up": item.get("operstate") == "UP",
                 "rdma": rdma,
             })
+
+        # Windows does not provide Linux's ``ip`` utility. Tailscale's own
+        # status contract is cross-platform and also covers installations
+        # where the tunnel adapter is hidden from ordinary interface tools.
+        if not any("tailscale" in str(item.get("name") or "").casefold()
+                   for item in interfaces):
+            try:
+                proc = subprocess.run(
+                    ["tailscale", "status", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=True,
+                )
+                status = json.loads(proc.stdout)
+                addresses = []
+                for address in status.get("TailscaleIPs") or []:
+                    try:
+                        parsed = ipaddress.ip_address(address)
+                    except ValueError:
+                        continue
+                    if parsed.version == 4:
+                        addresses.append(str(parsed))
+                if addresses:
+                    interfaces.append({
+                        "name": "tailscale0",
+                        "ipv4": list(dict.fromkeys(addresses)),
+                        "up": str(status.get("BackendState") or "").casefold() == "running",
+                        "rdma": False,
+                    })
+            except Exception:
+                pass
         return interfaces
 
     @staticmethod
@@ -772,6 +883,246 @@ class Manager:
             self._record_remote_temperature_sample(node)
         return nodes
 
+    @staticmethod
+    def public_target_node(node: dict) -> dict:
+        """Return the stable, credential-free node selector contract."""
+        return {
+            key: node.get(key)
+            for key in (
+                "id", "name", "local", "enabled", "status", "online",
+                "last_seen", "protocol_version", "docker_ready", "fabric_ready",
+                "stats", "disk",
+            )
+        } | {
+            "selectable": bool(
+                node.get("enabled", True)
+                and node.get("online")
+                and node.get("docker_ready")
+            )
+        }
+
+    async def selected_cluster_nodes(self, node_ids: list[str] | None = None) -> list[dict]:
+        """Resolve and validate an ordered target set, defaulting to this node."""
+        raw = node_ids or [LOCAL_NODE_ID]
+        if not raw or any(not isinstance(value, str) or not value.strip() for value in raw):
+            raise ValueError("node_ids must contain non-empty node IDs")
+        requested = list(dict.fromkeys(value.strip() for value in raw))
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        missing = [node_id for node_id in requested if node_id not in available]
+        if missing:
+            raise ValueError(f"unknown cluster node(s): {', '.join(missing)}")
+        offline = [
+            node_id for node_id in requested
+            if not available[node_id].get("enabled", True)
+            or not available[node_id].get("online")
+        ]
+        if offline:
+            names = [available[node_id].get("name", node_id) for node_id in offline]
+            raise ValueError(f"cluster node(s) are offline: {', '.join(names)}")
+        docker_unready = [
+            node_id for node_id in requested
+            if not available[node_id].get("docker_ready")
+        ]
+        if docker_unready:
+            names = [available[node_id].get("name", node_id) for node_id in docker_unready]
+            raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
+        return [available[node_id] for node_id in requested]
+
+    async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
+        """Durably rename a local or paired node without exposing credentials.
+
+        The controller registry is authoritative for remote display names. An
+        online worker is also updated through its authenticated agent endpoint;
+        if that second write fails, the controller rename remains durable and
+        the response explicitly reports that worker synchronization is pending.
+        """
+        normalized = _normalize_node_name(name)
+        node_id = str(node_id or "").strip()
+        if node_id == LOCAL_NODE_ID:
+            async with self.lock:
+                self.settings["cluster_node_name"] = normalized
+                self._save_settings()
+            return {
+                **self.public_target_node({
+                    "id": LOCAL_NODE_ID, "name": normalized, "local": True,
+                    "enabled": True, "status": "online", "online": True,
+                    "docker_ready": True,
+                }),
+                "name_sync": "local",
+            }
+
+        if not self.node_registry.get(node_id):
+            raise LookupError("node not found")
+        updated = self.node_registry.update(node_id, {"name": normalized})
+        sync = "synchronized"
+        try:
+            await self.node_registry.request(
+                node_id, "PATCH", "/api/agent/node",
+                json_body={"name": normalized}, timeout=10,
+            )
+        except Exception:
+            # The controller-side name is already durable. Offline workers can
+            # be renamed safely without rolling that write back; their local UI
+            # keeps its prior name until an authenticated synchronization works.
+            sync = "pending"
+        self.node_registry._status_cache.pop(node_id, None)
+        return {
+            **self.public_target_node({
+                **updated, "name": normalized,
+                "status": "online" if sync == "synchronized" else "unreachable",
+                "online": sync == "synchronized",
+            }),
+            "name_sync": sync,
+        }
+
+    def virtual_nas_enabled(self) -> bool:
+        return bool(self.settings.get("virtual_nas_enabled", False))
+
+    async def virtual_nas_inventory(self) -> dict:
+        instructions = [
+            "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
+            "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
+        ]
+        if not self.virtual_nas_enabled():
+            return {
+                "enabled": False, "nodes": [], "jobs": [],
+                "instructions": instructions,
+            }
+        cluster_nodes = await self.cluster_nodes()
+
+        async def inventory_for(node: dict) -> dict:
+            models: list[dict] = []
+            online = bool(node.get("online"))
+            if online:
+                try:
+                    if node.get("id") == LOCAL_NODE_ID:
+                        models = await asyncio.to_thread(self.virtual_nas.inventory)
+                    else:
+                        payload = await self.node_registry.request(
+                            node["id"], "GET", "/api/agent/virtual-nas/inventory",
+                            timeout=30,
+                        )
+                        models = list((payload or {}).get("models") or [])
+                except Exception:
+                    online = False
+            return {
+                "id": node.get("id"), "name": node.get("name"),
+                "online": online,
+                "total_size": max(0, int(
+                    (node.get("disk") or {}).get("total")
+                    or (node.get("disk") or {}).get("total_bytes")
+                    or 0
+                )),
+                "free_size": max(0, int(
+                    (node.get("disk") or {}).get("free")
+                    or (node.get("disk") or {}).get("free_bytes")
+                    or 0
+                )),
+                "models": models,
+            }
+
+        nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
+        return {
+            "enabled": True, "nodes": nodes,
+            "jobs": self.virtual_nas_transfers()["items"],
+            "instructions": instructions,
+        }
+
+    async def queue_virtual_nas_transfer(
+        self, model_id: str, source_node_id: str,
+        target_node_ids: list[str],
+    ) -> dict:
+        result = await self.virtual_nas.queue_transfer(
+            model_id, source_node_id, target_node_ids,
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
+    def virtual_nas_transfers(self) -> dict:
+        return {
+            "items": [
+                self._public_virtual_nas_job(job)
+                for job in self.virtual_nas.list_transfers()["items"]
+            ]
+        }
+
+    async def cancel_virtual_nas_transfer(self, job_id: str) -> dict:
+        return self._public_virtual_nas_job(
+            await self.virtual_nas.cancel_transfer(job_id)
+        )
+
+    def _public_virtual_nas_job(self, job: dict) -> dict:
+        def node_name(node_id: str) -> str:
+            if node_id == LOCAL_NODE_ID:
+                return str(self.settings.get("cluster_node_name") or "This node")
+            node = self.node_registry.get(node_id) or {}
+            return str(node.get("name") or node_id)
+
+        total = max(0, int(job.get("bytes_total") or 0))
+        transferred = max(0, int(job.get("bytes_transferred") or 0))
+        progress = (
+            min(1.0, transferred / total) if total
+            else (1.0 if job.get("status") == "completed" else 0.0)
+        )
+        return {
+            **job,
+            "source_node_name": node_name(job["source_node_id"]),
+            "target_node_name": node_name(job["target_node_id"]),
+            "progress": progress,
+            "finished_at": job.get("completed_at"),
+        }
+
+    async def delete_virtual_nas_model(self, node_id: str, model_id: str) -> dict:
+        model_id = validate_model_id(model_id)
+        node_id = str(node_id or "")
+        if self.virtual_nas.model_in_transfer(model_id, node_id):
+            raise RuntimeError("model is in use by a virtual NAS transfer")
+        if node_id != LOCAL_NODE_ID:
+            node = self.node_registry.get(node_id)
+            if not node:
+                raise ValueError(f"unknown node_id '{node_id}'")
+            status = await self.node_registry.probe(node, force=True)
+            if not status.get("online"):
+                raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
+            result = await self.node_registry.request(
+                node_id, "DELETE",
+                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}",
+                timeout=600,
+            )
+            return {**(result or {}), "node_id": node_id, "model_id": model_id}
+        if await self._local_model_uses_cache(model_id):
+            raise RuntimeError("model is in use by a local deployment")
+        return {
+            **self.virtual_nas.delete_model(model_id),
+            "node_id": LOCAL_NODE_ID,
+        }
+
+    async def _local_model_uses_cache(self, model_id: str) -> bool:
+        active_container_states = {"created", "restarting", "running", "paused"}
+        try:
+            for container in await self.list_containers():
+                if str(container.get("status") or "").lower() not in active_container_states:
+                    continue
+                ids = set(self._container_model_ids(container))
+                ids.add(str(container.get("model") or ""))
+                if model_id in ids:
+                    return True
+        except Exception:
+            # A Docker outage is not evidence that a model is unused. Fail
+            # closed so cache deletion cannot break an opaque running process.
+            raise RuntimeError("cannot verify whether the model is in use")
+        if await self._unsloth_loaded_model() == model_id:
+            return True
+        for deployment in self.deployments:
+            if deployment.get("model") != model_id:
+                continue
+            if deployment.get("status") in {"stopped", "error", "removed"}:
+                continue
+            members = deployment.get("members") or []
+            if not members or any(member.get("node_id") == LOCAL_NODE_ID for member in members):
+                return True
+        return False
+
     async def pair_node(self, body: dict) -> dict:
         return await self.node_registry.pair_remote(
             body.get("agent_url") or "",
@@ -879,7 +1230,14 @@ class Manager:
             return []
         try:
             value = json.loads(self.deployments_path.read_text(encoding="utf-8"))
-            return value if isinstance(value, list) else []
+            if not isinstance(value, list):
+                return []
+            for deployment in value:
+                engine = str(deployment.get("engine") or "vllm")
+                if engine not in {"vllm", "sglang"}:
+                    deployment["status"] = "error"
+                    deployment["error"] = f"unsupported persisted runtime: {engine}"
+            return value
         except Exception:
             return []
 
@@ -1202,6 +1560,7 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "input_cost_per_1m": cls._pricing_value(
                 body.get("input_cost_per_1m"), "input_cost_per_1m"
             ),
@@ -1725,13 +2084,125 @@ class Manager:
             timeout=1800,
         )
 
+    def _cluster_primary_member(self, deployment_id: str) -> tuple[dict, dict]:
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise LookupError("cluster deployment not found")
+        members = sorted(
+            deployment.get("members") or [], key=lambda member: int(member.get("rank") or 0)
+        )
+        if not members:
+            raise LookupError("cluster deployment has no inference member")
+        return deployment, members[0]
+
+    async def proxy_cluster_inference(
+        self,
+        deployment_id: str,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None = None,
+    ):
+        """Proxy through the selected primary member without bypassing admission."""
+        deployment, primary = self._cluster_primary_member(deployment_id)
+        node_id = primary.get("node_id")
+        if node_id == LOCAL_NODE_ID:
+            return (
+                await self._vllm_chat(
+                    model, body, bool(body.get("stream")), cancel,
+                    container_name=primary.get("container_name"),
+                    deployment_id=deployment_id,
+                )
+                if endpoint == "chat/completions"
+                else await self._vllm_completions(
+                    model, body, bool(body.get("stream")), cancel,
+                    container_name=primary.get("container_name"),
+                    deployment_id=deployment_id,
+                )
+            )
+        if not node_id:
+            raise LookupError("cluster primary node is unavailable")
+
+        controls = self._deployment_launch_controls(deployment.get("launch_settings") or {})
+        admission_container = {
+            "deployment_id": deployment_id,
+            "name": primary.get("container_name"),
+            "stats_key": model,
+            "load_settings": {"max_concurrency": controls.get("max_concurrency")},
+        }
+        admission = await self._acquire_inference_slot(admission_container, model, cancel)
+        path = f"/api/agent/inference/{endpoint}"
+        remote_body = {
+            **body,
+            "_sparkdeck_container_name": primary.get("container_name"),
+            "_sparkdeck_deployment_id": deployment_id,
+        }
+        if body.get("stream"):
+            try:
+                response = await self._await_or_cancel(
+                    self.node_registry.open_stream(
+                        node_id, "POST", path, json_body=remote_body, timeout=600,
+                    ),
+                    cancel,
+                )
+                if response.status_code >= 400:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")
+                    await response.aclose()
+                    raise RuntimeError(f"remote inference failed: HTTP {response.status_code}: {detail[:500]}")
+            except BaseException:
+                self._release_inference_slot(admission)
+                raise
+
+            async def stream_remote():
+                try:
+                    async for line in self._aiter_lines_cancellable(response, cancel):
+                        if line:
+                            yield f"{line}\n\n"
+                finally:
+                    await response.aclose()
+                    self._release_inference_slot(admission)
+
+            return stream_remote()
+
+        try:
+            return await self._await_or_cancel(
+                self.node_registry.request(
+                    node_id, "POST", path, json_body=remote_body, timeout=600,
+                ),
+                cancel,
+            )
+        finally:
+            self._release_inference_slot(admission)
+
+    async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
+        """Check the selected primary member through its authenticated agent."""
+        _, primary = self._cluster_primary_member(deployment_id)
+        node_id = primary.get("node_id")
+        if node_id == LOCAL_NODE_ID:
+            container = await self._resolve_vllm_target(
+                model, container_name=primary.get("container_name"),
+                deployment_id=deployment_id,
+            )
+            return await self._check_ready(container)
+        result = await self.node_registry.request(
+            node_id, "POST", "/api/agent/inference/health",
+            json_body={
+                "model": model,
+                "_sparkdeck_container_name": primary.get("container_name"),
+                "_sparkdeck_deployment_id": deployment_id,
+            }, timeout=10,
+        )
+        return bool((result or {}).get("ready"))
+
     async def create_deployment(self, body: dict) -> dict:
         body = dict(body)
+        engine = str(body.get("engine") or "vllm")
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         controls = body.get("launch_controls")
         if controls is not None:
             if not isinstance(controls, dict):
                 raise ValueError("launch_controls must be an object")
-            engine = body.get("engine") or "vllm"
             controls = {
                 **self._deployment_launch_controls(
                     self._deployment_launch_settings(body)
@@ -1772,7 +2243,6 @@ class Manager:
             names = [available[n].get("name", n) for n in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
 
-        engine = body.get("engine", "vllm")
         model = body.get("model") or ""
         if not model:
             raise ValueError("model is required")
@@ -1800,8 +2270,11 @@ class Manager:
                 # implement SupportsPP can explicitly request TP=nnodes, PP=1.
                 vllm_parallel_layout = (1, len(node_ids))
         requested_port = body.get("port")
-        if requested_port is None:
-            requested_port = await self._allocate_port()
+        local_port = requested_port
+        if LOCAL_NODE_ID in node_ids and local_port is None:
+            # A controller port is meaningful only for the controller member.
+            # Remote agents allocate against their own Docker/host namespace.
+            local_port = await self._allocate_port()
         master_ip, _ = self._inferred_fabric(
             available[LOCAL_NODE_ID],
             self.settings.get("cluster_fabric_ip"),
@@ -1836,6 +2309,7 @@ class Manager:
             "created_at": time.time(),
             "recipe_id": body.get("recipe_id"),
             "managed_by": body.get("managed_by"),
+            "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "automation_run_id": body.get("automation_run_id"),
             "settings_dirty": False,
         }
@@ -1870,12 +2344,13 @@ class Manager:
         member_specs = []
         for rank, node_id in enumerate(node_ids):
             node = available[node_id]
+            member_port = local_port if node_id == LOCAL_NODE_ID else None
             fabric_ip, fabric_interface = fabrics[node_id]
             safe_model = re.sub(r"[^a-zA-Z0-9_.-]+", "-", model).strip("-").lower()
             name = f"cluster-{deployment_id}-r{rank}-{safe_model[:36]}"
             payload = dict(base)
             payload.update({
-                "port": requested_port,
+                "port": member_port,
                 "name": name,
                 "cluster_member": {
                     "deployment_id": deployment_id,
@@ -1883,7 +2358,7 @@ class Manager:
                     "rank": rank,
                     "nnodes": len(node_ids),
                     "mode": mode,
-                    "serve_port": requested_port,
+                    "serve_port": member_port,
                     "fabric_ip": fabric_ip,
                     "fabric_interface": fabric_interface,
                 },
@@ -1927,6 +2402,7 @@ class Manager:
                 "rank": rank,
                 "container_name": name,
                 "fabric_ip": fabric_ip,
+                "port": member_port,
                 "status": "queued",
                 "phase": {
                     "phase": "queued",
@@ -1939,11 +2415,13 @@ class Manager:
         # can take many minutes, and the logs UI needs the names immediately
         # so it can ask every node for controller-side launch progress.
         deployment["members"] = member_specs
-        deployment["api_port"] = requested_port
+        deployment["api_port"] = member_specs[0].get("port")
         deployment["launch_settings"] = self._deployment_launch_settings({
             **body,
             "deployment_name": deployment["name"],
             "node_ids": node_ids,
+            # Persist only a user-requested fixed port. Automatically chosen
+            # ports must be reallocated by each owning node on rebuild.
             "port": requested_port,
         })
         self._save_deployments()
@@ -1958,6 +2436,8 @@ class Manager:
             else:
                 spec["status"] = result.get("status", "starting")
                 spec["container_id"] = result.get("id")
+                spec["port"] = result.get("port") or spec.get("port")
+        deployment["api_port"] = member_specs[0].get("port") if member_specs else None
         deployment["status"] = "error" if errors else "starting"
         if errors:
             deployment["error"] = "; ".join(errors)
@@ -1972,7 +2452,12 @@ class Manager:
         self._save_deployments()
         if errors:
             raise RuntimeError(deployment["error"])
-        return deployment
+        return {
+            **deployment,
+            "selected_nodes": [
+                self.public_target_node(available[node_id]) for node_id in node_ids
+            ],
+        }
 
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
@@ -2040,6 +2525,11 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
+        if (
+            action == "start"
+            and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
+        ):
+            raise ValueError("persisted deployment runtime is no longer supported")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
 
@@ -3216,6 +3706,9 @@ class Manager:
         if self.settings_path.exists():
             try:
                 data = json.loads(self.settings_path.read_text())
+                # Removed runtimes must not remain advertised through a stale
+                # persisted setting after upgrade.
+                data.pop("ollama_base_url", None)
                 return {**DEFAULT_SETTINGS, **data}
             except Exception:
                 pass
@@ -3241,13 +3734,16 @@ class Manager:
                         continue
                     self.settings[k] = v
             self._save_settings()
+        if self.settings.get("virtual_nas_enabled") and not self.is_joined_worker():
+            self.virtual_nas.start()
+        elif not self.settings.get("virtual_nas_enabled"):
+            await self.virtual_nas.stop()
         return self.public_settings()
 
     # ---------- lifetime token stats ----------
     # Counters are keyed by model id plus a variant tag (quant/dtype) so the
     # same repo served at Q4 vs bf16 gets separate entries, e.g.
-    # "Qwen/Qwen3-8B [awq]" vs "Qwen/Qwen3-8B [bfloat16]". Ollama models keep
-    # their "CLOUD " prefix. Persisted on every update so they survive
+    # "Qwen/Qwen3-8B [awq]" vs "Qwen/Qwen3-8B [bfloat16]". Persisted on every update so they survive
     # restarts; only the reset endpoint clears them.
     #
     # Speed fields (gen_tokens / gen_time_s) are retained for compatibility.
@@ -4297,6 +4793,9 @@ class Manager:
         model: str,
         cancel: asyncio.Event | None,
         container: dict | None = None,
+        *,
+        container_name: str | None = None,
+        deployment_id: str | None = None,
     ) -> tuple[dict, str | None]:
         """Acquire admission and re-resolve runtime state before forwarding.
 
@@ -4305,12 +4804,17 @@ class Manager:
         if the admission identity or limit changed, release the old grant and
         queue against the new target instead.
         """
-        current = container or await self._resolve_vllm_target(model)
+        current = container or await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         while True:
             key = current.get("stats_key") or model
             admission = await self._acquire_inference_slot(current, key, cancel)
             try:
-                fresh = await self._resolve_vllm_target(model)
+                fresh = await self._resolve_vllm_target(
+                    model, container_name=container_name,
+                    deployment_id=deployment_id,
+                )
             except BaseException:
                 self._release_inference_slot(admission)
                 raise
@@ -5033,7 +5537,15 @@ class Manager:
     def _load_recipes(self) -> list[dict]:
         if self.recipes_path.exists():
             try:
-                return json.loads(self.recipes_path.read_text())
+                value = json.loads(self.recipes_path.read_text())
+                if not isinstance(value, list):
+                    return []
+                for recipe in value:
+                    engine = str(recipe.get("engine") or "vllm")
+                    if engine not in {"vllm", "sglang"}:
+                        recipe["supported"] = False
+                        recipe["error"] = f"unsupported persisted runtime: {engine}"
+                return value
             except Exception:
                 pass
         return []
@@ -5072,6 +5584,8 @@ class Manager:
     ) -> dict:
         if not model:
             raise ValueError("model is required")
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")
@@ -5636,8 +6150,8 @@ class Manager:
             raise ValueError(f"Container '{name}' not found")
 
         labels = c.labels or {}
-        model = labels.get(MODEL_LABEL, "")
-        engine = labels.get("vllm-controller.engine", "vllm")
+        model = _label_value(labels, MODEL_LABEL, "")
+        engine = _label_value(labels, ENGINE_LABEL, "vllm")
         attrs = c.attrs or {}
         image_tag = attrs.get("Config", {}).get("Image") or attrs.get("Image") or None
 
@@ -5734,55 +6248,24 @@ class Manager:
 
     # ---------- cross-backend mutual exclusion ----------
     async def evict_other_backends(self, protect: str = "") -> dict:
-        """
-        Release GPU memory held by backends other than `protect`, so the
-        three inference backends never share the GPU at once:
-          protect="vllm"    → stop vLLM containers, unload Unsloth, stop Ollama
-          protect="sglang"  → stop SGLang containers, unload Unsloth, stop Ollama
-          protect="unsloth" → unload Unsloth (no-op if different model), stop vLLM/SGLang, stop Ollama
-          protect="ollama"  → stop vLLM/SGLang, unload Unsloth
-          protect=""        → stop all three
-        Best-effort: logs failures but never raises, so one backend being
-        unreachable doesn't block the calling action.
-        """
-        actions: dict[str, list] = {"stopped_vllm": [], "unloaded_unsloth": [], "stopped_ollama": []}
-
-        # --- vLLM & SGLang containers ---
-        if protect not in ("vllm", "sglang"):
-            try:
-                for c in await self.list_containers():
-                    if c.get("managed") and c["status"] == "running":
-                        await self.stop_container(c["name"])
-                        self._activity.pop(c["name"], None)
-                        actions["stopped_vllm"].append(c["name"])
-            except Exception as e:
-                print(f"[evict] container stop failed: {e}")
-
-        # --- Unsloth model ---
-        if protect != "unsloth":
-            # Probe /v1/models for the loaded model — this sees loads done
-            # from the Studio UI too, not just controller-initiated ones.
-            try:
-                loaded = await self._unsloth_loaded_model()
-                if loaded:
-                    await self.unload_unsloth_model(loaded)
-                    actions["unloaded_unsloth"].append(loaded)
-            except Exception as e:
-                print(f"[evict] unsloth unload failed: {e}")
-
-        # --- Ollama models ---
-        if protect != "ollama":
-            try:
-                actions["stopped_ollama"] = await self._stop_ollama_models()
-            except Exception as e:
-                print(f"[evict] ollama stop failed: {e}")
-
-        if any(actions.values()):
-            print(f"[evict] protect={protect or 'none'}: "
-                  f"vllm={actions['stopped_vllm']} "
-                  f"unsloth={actions['unloaded_unsloth']} "
-                  f"ollama={actions['stopped_ollama']}")
-        return actions
+        """Stop other supported managed runtimes before an exclusive launch."""
+        # SparkDeck only coordinates its supported managed runtimes. Legacy
+        # local backends are deliberately not probed, stopped, or unloaded.
+        supported_actions: dict[str, list] = {"stopped": []}
+        try:
+            for container in await self.list_containers():
+                runtime = container.get("engine") or "vllm"
+                if (
+                    container.get("managed")
+                    and container.get("status") == "running"
+                    and runtime != protect
+                ):
+                    await self.stop_container(container["name"])
+                    self._activity.pop(container["name"], None)
+                    supported_actions["stopped"].append(container["name"])
+        except Exception as exc:
+            print(f"[evict] managed runtime stop failed: {exc}")
+        return supported_actions
 
     # ---------- containers ----------
     def _container_summary(self, c) -> dict | None:
@@ -5796,14 +6279,14 @@ class Manager:
             or attrs.get("Image", "")
         )
 
-        is_managed = labels.get(CONTROLLER_LABEL) == "1"
-        engine_label = labels.get("vllm-controller.engine", "vllm")
+        is_managed = _label_value(labels, CONTROLLER_LABEL) == "1"
+        engine_label = _label_value(labels, ENGINE_LABEL, "vllm")
         is_atlas_serving = _is_atlas_serving_container(c.name, image_tag)
         if not is_managed and not _is_vllm_image(image_tag) and not is_atlas_serving:
             return None
 
         # parse model from cmd or label
-        model = labels.get(MODEL_LABEL, "")
+        model = _label_value(labels, MODEL_LABEL, "")
         cmd = c.attrs.get("Config", {}).get("Cmd") or []
         if not model:
             if engine_label == "sglang":
@@ -5831,9 +6314,9 @@ class Manager:
                     break
                 except Exception:
                     pass
-        if host_port is None and labels.get(SERVICE_PORT_LABEL):
+        if host_port is None and _label_value(labels, SERVICE_PORT_LABEL):
             try:
-                host_port = int(labels[SERVICE_PORT_LABEL])
+                host_port = int(_label_value(labels, SERVICE_PORT_LABEL))
             except (TypeError, ValueError):
                 pass
 
@@ -5864,13 +6347,13 @@ class Manager:
             "started_at": (c.attrs.get("State") or {}).get("StartedAt"),
             "restart_count": c.attrs.get("RestartCount", 0),
         }
-        if labels.get(DEPLOYMENT_LABEL):
+        if _label_value(labels, DEPLOYMENT_LABEL):
             summary.update({
-                "deployment_id": labels.get(DEPLOYMENT_LABEL),
-                "node_id": labels.get(NODE_LABEL),
-                "rank": int(labels.get(RANK_LABEL, "0")),
-                "deployment_mode": labels.get(MODE_LABEL, "single"),
-                "nnodes": int(labels.get(NNODES_LABEL, "1")),
+                "deployment_id": _label_value(labels, DEPLOYMENT_LABEL),
+                "node_id": _label_value(labels, NODE_LABEL),
+                "rank": int(_label_value(labels, RANK_LABEL, "0")),
+                "deployment_mode": _label_value(labels, MODE_LABEL, "single"),
+                "nnodes": int(_label_value(labels, NNODES_LABEL, "1")),
             })
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
@@ -6027,7 +6510,10 @@ class Manager:
         recipe_id: str | None = None,
         cluster_member: dict | None = None,
         hf_token: str | None = None,
+        sparkdeck_deployment_id: str | None = None,
     ) -> dict:
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
@@ -6055,7 +6541,7 @@ class Manager:
             extra = list(extra_args or [])
             sg_cmd = ["-m", "sglang.launch_server", "--model-path", model]
             sg_cmd += ["--host", "0.0.0.0"]
-            serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
+            serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             sg_cmd += ["--port", str(serve_port)]
             if sg_tp_size and sg_tp_size > 0:
                 sg_cmd += ["--tp-size", str(sg_tp_size)]
@@ -6114,8 +6600,10 @@ class Manager:
                     })
                 labels = {
                     CONTROLLER_LABEL: "1", MODEL_LABEL: model,
-                    "vllm-controller.engine": "sglang",
+                    ENGINE_LABEL: "sglang",
                 }
+                if sparkdeck_deployment_id:
+                    labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
                 if cluster_member:
                     labels.update({
                         DEPLOYMENT_LABEL: cluster_member["deployment_id"],
@@ -6123,7 +6611,10 @@ class Manager:
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
                             str(serve_port)
-                            if distributed_member and int(cluster_member.get("rank", 0)) == 0
+                            if distributed_member and (
+                                cluster_member.get("mode") != "sharded"
+                                or int(cluster_member.get("rank", 0)) == 0
+                            )
                             else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
@@ -6202,7 +6693,7 @@ class Manager:
                 list(extra_args or [])
             )
 
-            serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
+            serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             cmd = [
                 "vllm", "serve", model,
                 "--host", "0.0.0.0",
@@ -6254,7 +6745,12 @@ class Manager:
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
                 )
-                labels = {CONTROLLER_LABEL: "1", MODEL_LABEL: model}
+                labels = {
+                    CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                    ENGINE_LABEL: "vllm",
+                }
+                if sparkdeck_deployment_id:
+                    labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
                 if cluster_member:
                     labels.update({
                         DEPLOYMENT_LABEL: cluster_member["deployment_id"],
@@ -6262,7 +6758,10 @@ class Manager:
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
                             str(serve_port)
-                            if distributed_member and int(cluster_member.get("rank", 0)) == 0
+                            if distributed_member and (
+                                cluster_member.get("mode") != "sharded"
+                                or int(cluster_member.get("rank", 0)) == 0
+                            )
                             else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
@@ -6327,13 +6826,13 @@ class Manager:
         # Estimate VRAM from the container's model label.
         try:
             c = self.client.containers.get(name)
-            model = (c.labels or {}).get(MODEL_LABEL, "")
+            model = _label_value(c.labels or {}, MODEL_LABEL, "")
             params_b, bpp = self._estimate_params_and_quant(model)
             if params_b > 0:
                 need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
                 labels = c.labels or {}
-                if labels.get(MODE_LABEL) == "sharded":
-                    need_gb /= max(1, int(labels.get(NNODES_LABEL, "1")))
+                if _label_value(labels, MODE_LABEL) == "sharded":
+                    need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
             else:
                 need_gb = 30.0  # conservative fallback
             self._try_fit_new_model(need_gb, protect_name=name)
@@ -6518,13 +7017,13 @@ class Manager:
             container = await asyncio.to_thread(self.client.containers.get, name)
             container.reload()
             labels = container.labels or {}
-            if labels.get(DEPLOYMENT_LABEL):
+            if _label_value(labels, DEPLOYMENT_LABEL):
                 raise ValueError("edit the deployment recipe instead of one cluster member")
             attrs = copy.deepcopy(container.attrs or {})
             config = copy.deepcopy(attrs.get("Config") or {})
             cmd = config.get("Cmd") or []
-            engine = labels.get("vllm-controller.engine", "vllm")
-            model = labels.get(MODEL_LABEL, "")
+            engine = _label_value(labels, ENGINE_LABEL, "vllm")
+            model = _label_value(labels, MODEL_LABEL, "")
             new_cmd = self._updated_container_command(cmd, engine, model, settings)
             was_running = container.status in {"running", "restarting", "paused"}
             backup_name = f"{name}.settings-backup-{uuid.uuid4().hex[:8]}"
@@ -6566,7 +7065,7 @@ class Manager:
     async def is_managed_container(self, name: str) -> bool:
         def _check():
             container = self.client.containers.get(name)
-            return (container.labels or {}).get(CONTROLLER_LABEL) == "1"
+            return _label_value(container.labels or {}, CONTROLLER_LABEL) == "1"
         try:
             return await asyncio.to_thread(_check)
         except Exception:
@@ -6654,11 +7153,98 @@ class Manager:
         self._images_ts = now
         return self._images_cache
 
+    async def cluster_image_inventory(self) -> dict:
+        """Return image/container inventory from each enabled cluster node."""
+        nodes = [
+            node for node in await self.cluster_nodes()
+            if node.get("local") or node.get("enabled", True)
+        ]
+
+        async def fetch(node: dict) -> dict:
+            if node.get("local"):
+                images, containers = await asyncio.gather(
+                    self.list_images(), self.list_containers(),
+                )
+                payload = {"images": images, "containers": containers}
+            else:
+                payload = await self.node_registry.request(
+                    node["id"], "GET", "/api/agent/images", timeout=15,
+                )
+            if not isinstance(payload, dict):
+                raise RuntimeError("node returned an invalid image inventory")
+            return {
+                "node": self.public_target_node(node),
+                "images": payload.get("images") or [],
+                "containers": payload.get("containers") or [],
+            }
+
+        fetched = await asyncio.gather(*(fetch(node) for node in nodes), return_exceptions=True)
+        results = []
+        errors = []
+        for node, result in zip(nodes, fetched):
+            if isinstance(result, Exception):
+                errors.append({
+                    "node": self.public_target_node(node),
+                    "error": str(result)[:500],
+                })
+            else:
+                results.append(result)
+        return {"results": results, "errors": errors, "partial": bool(errors)}
+
     async def remove_image(self, image_id: str) -> dict:
         def _do():
             self.client.images.remove(image_id, force=True)
         await asyncio.to_thread(_do)
-        return {"ok": True}
+        self._images_cache = []
+        self._images_ts = 0
+        return {"ok": True, "image": image_id}
+
+    async def remove_image_on_nodes(
+        self, image_id: str, node_ids: list[str],
+    ) -> dict:
+        """Remove an image from every recorded owner without failing fast."""
+        image_id = str(image_id or "").strip()
+        requested = list(dict.fromkeys(str(value).strip() for value in node_ids))
+        if not image_id:
+            raise ValueError("image ID is required")
+        if not requested or any(not value for value in requested):
+            raise ValueError("image owners are required")
+
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+
+        async def remove(node_id: str) -> Any:
+            node = available.get(node_id)
+            if not node:
+                raise RuntimeError("owning node is no longer registered")
+            if node_id == LOCAL_NODE_ID:
+                return await self.remove_image(image_id)
+            return await self.node_registry.request(
+                node_id, "DELETE",
+                f"/api/agent/images/{quote(image_id, safe='')}", timeout=120,
+            )
+
+        removed = await asyncio.gather(
+            *(remove(node_id) for node_id in requested), return_exceptions=True,
+        )
+        results = []
+        for node_id, result in zip(requested, removed):
+            node = available.get(node_id) or {"id": node_id, "name": node_id}
+            item = {
+                "node_id": node_id,
+                "node_name": node.get("name") or node_id,
+                "ok": not isinstance(result, Exception),
+            }
+            if isinstance(result, Exception):
+                item["error"] = str(result)
+            results.append(item)
+        selected = [available[node_id] for node_id in requested if node_id in available]
+        return {
+            "ok": all(item["ok"] for item in results),
+            "image": image_id,
+            "node_ids": requested,
+            "selected_nodes": [self.public_target_node(node) for node in selected],
+            "results": results,
+        }
 
     async def pull_image_stream(self, image: str):
         loop = asyncio.get_running_loop()
@@ -6682,117 +7268,55 @@ class Manager:
                 break
             yield f"data: {json.dumps(item)}\n\n"
 
-    # ---------- ollama ----------
-    def _ollama_url(self, path: str) -> str:
-        base = (self.settings.get("ollama_base_url") or "").rstrip("/")
-        return f"{base}{path}"
-
-    async def list_ollama_models(self) -> dict:
-        """
-        Returns {"reachable": bool, "models": [...], "error": str|None}.
-        Always succeeds — when Ollama is unreachable, returns reachable=False
-        so the UI can show that state instead of crashing the state poll.
-        """
-        try:
-            r = await self.http.get(self._ollama_url("/api/tags"), timeout=3)
-            r.raise_for_status()
-            data = r.json() or {}
-            models = []
-            for m in data.get("models") or []:
-                models.append({
-                    "name": m.get("name") or m.get("model"),
-                    "size": m.get("size"),
-                    "modified_at": m.get("modified_at"),
-                    "details": m.get("details") or {},
-                })
-            return {"reachable": True, "models": models, "error": None}
-        except Exception as e:
-            return {"reachable": False, "models": [], "error": str(e)}
-
-    async def _ollama_loaded_models(self) -> list[str]:
-        """
-        Names of models currently loaded in Ollama's VRAM, via GET /api/ps.
-        Returns [] when Ollama is unreachable (so eviction is a no-op).
-        """
-        try:
-            r = await self.http.get(self._ollama_url("/api/ps"), timeout=3)
-            if r.status_code != 200:
-                return []
-            return [
-                m.get("name") or m.get("model")
-                for m in (r.json().get("models") or [])
-                if m.get("name") or m.get("model")
-            ]
-        except Exception:
-            return []
-
-    async def _stop_ollama_models(self) -> list[str]:
-        """
-        Release Ollama's VRAM by running `ollama stop <name>` for each
-        currently loaded model. Uses the CLI (per project preference) so
-        it works regardless of which API version is installed. Best-effort:
-        logs failures but never raises, so a missing CLI or unreachable
-        daemon doesn't block the calling action.
-        """
-        names = await self._ollama_loaded_models()
-        stopped: list[str] = []
-        for name in names:
+    async def pull_image_result(self, image: str) -> dict:
+        """Pull one image locally and collapse Docker progress into a result."""
+        error = None
+        async for event in self.pull_image_stream(image):
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ollama", "stop", name,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    stopped.append(name)
-                else:
-                    err = (stderr or b"").decode("utf-8", errors="replace").strip()
-                    print(f"[evict] ollama stop {name} failed (rc={proc.returncode}): {err[:200]}")
-            except FileNotFoundError:
-                # `ollama` binary not on PATH — fall back to keep_alive:0 via API.
-                try:
-                    await self.http.post(
-                        self._ollama_url("/api/generate"),
-                        json={"model": name, "keep_alive": 0}, timeout=15,
-                    )
-                    stopped.append(name)
-                except Exception as e:
-                    print(f"[evict] ollama keep_alive:0 fallback failed for {name}: {e}")
-            except Exception as e:
-                print(f"[evict] ollama stop {name} raised: {e}")
-        return stopped
+                payload = json.loads(event.removeprefix("data:").strip())
+            except (AttributeError, json.JSONDecodeError):
+                continue
+            if payload.get("error"):
+                error = str(payload["error"])
+        if error:
+            raise RuntimeError(error)
+        return {"ok": True, "image": image}
 
-    async def pull_ollama_model_stream(self, name: str):
-        """SSE-style generator. Re-emits Ollama's pull progress as `data: {...}`."""
-        url = self._ollama_url("/api/pull")
-        try:
-            async with self.http.stream(
-                "POST", url, json={"name": name, "stream": True}, timeout=None,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode("utf-8", errors="replace")
-                    yield f"data: {json.dumps({'error': f'HTTP {r.status_code}: {detail[:300]}'})}\n\n"
-                    return
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        obj = {"status": line}
-                    yield f"data: {json.dumps(obj)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        yield "data: {\"done\": true}\n\n"
+    async def pull_image_on_nodes(
+        self, image: str, node_ids: list[str] | None = None,
+    ) -> dict:
+        """Pull a Docker image concurrently on exactly the selected nodes."""
+        image = str(image or "").strip()
+        if not image:
+            raise ValueError("image is required")
+        selected = await self.selected_cluster_nodes(node_ids)
 
-    async def delete_ollama_model(self, name: str) -> dict:
-        url = self._ollama_url("/api/delete")
-        # Ollama's delete uses DELETE with a JSON body; httpx supports content on DELETE.
-        r = await self.http.request("DELETE", url, json={"name": name}, timeout=10)
-        if r.status_code not in (200, 204):
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-        return {"ok": True}
+        async def pull(node: dict) -> dict:
+            if node["id"] == LOCAL_NODE_ID:
+                return await self.pull_image_result(image)
+            return await self.node_registry.request(
+                node["id"], "POST", "/api/agent/images/pull",
+                json_body={"image": image}, timeout=1800,
+            )
+
+        pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)
+        results = []
+        for node, result in zip(selected, pulled):
+            item = {
+                "node_id": node["id"],
+                "node_name": node.get("name") or node["id"],
+                "ok": not isinstance(result, Exception),
+            }
+            if isinstance(result, Exception):
+                item["error"] = str(result)
+            results.append(item)
+        return {
+            "ok": all(item["ok"] for item in results),
+            "image": image,
+            "node_ids": [node["id"] for node in selected],
+            "selected_nodes": [self.public_target_node(node) for node in selected],
+            "results": results,
+        }
 
     # ---------- llama-server (GGUF) launcher ----------
     # The controller scans the local HF cache for GGUF repos and launches
@@ -7064,7 +7588,7 @@ class Manager:
         """Resolve the ggml RPC worker next to the configured llama-server."""
         configured = Path(
             self.settings.get("llama_rpc_server_bin")
-            or "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server"
+            or "~/.local/share/llama.cpp/ggml-rpc-server"
         ).expanduser()
         llama_bin = Path(self.settings["llama_server_bin"]).expanduser()
         candidates = [
@@ -7742,8 +8266,8 @@ class Manager:
 
         async with self._llama_lock:
             # A different model may be running — stop it first. Then free the
-            # GPU: stop vLLM containers and Ollama models. protect="unsloth"
-            # so the eviction doesn't stop the server we just want to swap.
+            # Release other managed GPU runtimes while retaining the
+            # llama-server process this path is about to replace.
             await self._stop_llama_server()
             if tensor_parallel:
                 await self._stop_running_cluster_deployments()
@@ -7911,7 +8435,7 @@ class Manager:
 
     # ---------- /v1 proxy ----------
     async def proxy_models(self) -> dict:
-        """Return OpenAI-compatible /v1/models combining vLLM, Ollama, and Unsloth models."""
+        """Return OpenAI-compatible models from supported local runtimes."""
         data = await self.get_state()
         models = []
         for c in data.get("containers", []):
@@ -7925,20 +8449,10 @@ class Manager:
                     "owned_by": "vllm",
                     "type": "local",
                 })
-        for m in (data.get("ollama", {}).get("models") or []):
-            name = m.get("name") or m.get("model")
-            if name:
-                models.append({
-                    "id": f"{OLLAMA_PREFIX}{name}",
-                    "object": "model",
-                    "owned_by": "ollama",
-                    "type": "cloud",
-                })
         # llama-server runs one model at a time; surface the loaded one so
         # OpenAI clients can target it. The controller forwards requests to
         # the llama-server process it launched on localhost.
-        unsloth = data.get("unsloth", {})
-        loaded = unsloth.get("loaded_model")
+        loaded = await self._unsloth_loaded_model()
         if loaded:
             models.append({
                 "id": loaded,
@@ -7959,14 +8473,9 @@ class Manager:
         return {"object": "list", "data": models}
 
     async def proxy_chat_completions(self, body: dict, cancel: asyncio.Event | None = None):
-        """Route /v1/chat/completions to the right backend (Ollama, Unsloth, or vLLM)."""
+        """Route /v1/chat/completions to a supported managed backend."""
         model = body.get("model", "")
-        is_ollama = model.startswith(OLLAMA_PREFIX)
         stream = body.get("stream", False)
-
-        if is_ollama:
-            ollama_model = model[len(OLLAMA_PREFIX):]
-            return await self._ollama_chat(ollama_model, body, stream, cancel)
 
         loaded_unsloth = await self._unsloth_loaded_model()
         if loaded_unsloth and loaded_unsloth == model:
@@ -7975,23 +8484,9 @@ class Manager:
         return await self._vllm_chat(model, body, stream, cancel)
 
     async def proxy_completions(self, body: dict, cancel: asyncio.Event | None = None):
-        """Route /v1/completions to the right backend (Ollama, Unsloth, or vLLM)."""
+        """Route /v1/completions to a supported managed backend."""
         model = body.get("model", "")
-        is_ollama = model.startswith(OLLAMA_PREFIX)
         stream = body.get("stream", False)
-
-        if is_ollama:
-            ollama_model = model[len(OLLAMA_PREFIX):]
-            # Convert completions format to chat format for Ollama
-            prompt = body.get("prompt", "")
-            messages = [{"role": "user", "content": prompt}]
-            if body.get("system"):
-                messages.insert(0, {"role": "system", "content": body["system"]})
-            chat_body = {**body, "messages": messages}
-            del chat_body["prompt"]
-            if "system" in chat_body:
-                del chat_body["system"]
-            return await self._ollama_chat(ollama_model, chat_body, stream, cancel)
 
         loaded_unsloth = await self._unsloth_loaded_model()
         if loaded_unsloth and loaded_unsloth == model:
@@ -7999,161 +8494,14 @@ class Manager:
 
         return await self._vllm_completions(model, body, stream, cancel)
 
-    async def _ollama_chat(self, model: str, body: dict, stream: bool,
-                           cancel: asyncio.Event | None = None):
-        """Call Ollama's /api/chat and convert response to OpenAI format."""
-        url = self._ollama_url("/api/chat")
-        messages = body.get("messages", [])
-        ollama_body = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
-        # Map OpenAI params to Ollama params
-        options = {}
-        if "temperature" in body:
-            options["temperature"] = body["temperature"]
-        if "top_p" in body:
-            options["top_p"] = body["top_p"]
-        if "max_tokens" in body:
-            options["num_predict"] = body["max_tokens"]
-        if "seed" in body:
-            options["seed"] = body["seed"]
-        if options:
-            ollama_body["options"] = options
-
-        if stream:
-            return self._ollama_chat_stream(url, ollama_body, model, cancel)
-        else:
-            rid = self._track_start(f"{OLLAMA_PREFIX}{model}")
-            try:
-                r = await self._await_or_cancel(
-                    self.http.post(url, json=ollama_body, timeout=600), cancel
-                )
-                if r.status_code != 200:
-                    detail = r.text[:500]
-                    raise httpx.HTTPStatusError(
-                        f"HTTP {r.status_code}: {detail}",
-                        request=r.request,
-                        response=r,
-                    )
-                data = r.json()
-                self._record_tokens(
-                    f"{OLLAMA_PREFIX}{model}",
-                    data.get("prompt_eval_count") or 0,
-                    data.get("eval_count") or 0,
-                    # eval_duration is Ollama's decode-only time, in nanoseconds.
-                    (data.get("eval_duration") or 0) / 1e9 or None,
-                    pp_time_s=(
-                        (data.get("prompt_eval_duration") or 0) / 1e9 or None
-                    ),
-                )
-                content = (data.get("message") or {}).get("content", "")
-                return self._ollama_to_openai_response(model, content, data)
-            finally:
-                self._track_end(rid)
-
-    async def _ollama_chat_stream(self, url: str, body: dict, model: str,
-                                  cancel: asyncio.Event | None = None):
-        """Stream Ollama /api/chat NDJSON as OpenAI SSE."""
-        import time as _time
-        created = int(_time.time())
-        rid = self._track_start(f"{OLLAMA_PREFIX}{model}", streaming=True)
-        try:
-            async with self.http.stream(
-                "POST", url, json=body, timeout=None,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode("utf-8", errors="replace")
-                    yield f"data: {json.dumps({'error': {'message': f'HTTP {r.status_code}: {detail[:300]}', 'type': 'upstream_error', 'code': r.status_code}})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                async for line in self._aiter_lines_cancellable(r, cancel):
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    done = obj.get("done", False)
-                    delta = (obj.get("message") or {}).get("content", "")
-                    if delta:
-                        self._track_output(rid, time.monotonic(), "output")
-                        chunk = {
-                            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": f"{OLLAMA_PREFIX}{model}",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": delta},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    if done:
-                        prompt_tokens = obj.get("prompt_eval_count") or 0
-                        pp_time_s = (
-                            (obj.get("prompt_eval_duration") or 0) / 1e9
-                            or None
-                        )
-                        if pp_time_s:
-                            self._track_prompt_processing(
-                                rid, int(prompt_tokens), pp_time_s
-                            )
-                        self._record_tokens(
-                            f"{OLLAMA_PREFIX}{model}",
-                            prompt_tokens,
-                            obj.get("eval_count") or 0,
-                            (obj.get("eval_duration") or 0) / 1e9 or None,
-                            pp_time_s=pp_time_s,
-                        )
-                        chunk = {
-                            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": f"{OLLAMA_PREFIX}{model}",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-        except Exception as e:
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error'}})}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            self._track_end(rid)
-
-    def _ollama_to_openai_response(self, model: str, content: str, ollama_data: dict) -> dict:
-        """Convert Ollama /api/chat response to OpenAI /v1/chat/completions format."""
-        import time as _time
-        prompt_eval = ollama_data.get("prompt_eval_count") or 0
-        eval_count = ollama_data.get("eval_count") or 0
-        return {
-            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-            "object": "chat.completion",
-            "created": int(_time.time()),
-            "model": f"{OLLAMA_PREFIX}{model}",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_eval,
-                "completion_tokens": eval_count,
-                "total_tokens": prompt_eval + eval_count,
-            },
-        }
-
     async def _vllm_chat(self, model: str, body: dict, stream: bool,
-                         cancel: asyncio.Event | None = None):
+                         cancel: asyncio.Event | None = None, *,
+                         container_name: str | None = None,
+                         deployment_id: str | None = None):
         """Route /v1/chat/completions to the appropriate vLLM container."""
-        container = await self._resolve_vllm_target(model)
+        container = await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         port = container["port"]
         key = container.get("stats_key") or model
         body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8161,11 +8509,13 @@ class Manager:
         if stream:
             return self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
+                container_name=container_name, deployment_id=deployment_id,
             )
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
-                model, cancel, container
+                model, cancel, container, container_name=container_name,
+                deployment_id=deployment_id,
             )
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8186,9 +8536,13 @@ class Manager:
                 self._release_inference_slot(admission)
 
     async def _vllm_completions(self, model: str, body: dict, stream: bool,
-                                cancel: asyncio.Event | None = None):
+                                cancel: asyncio.Event | None = None, *,
+                                container_name: str | None = None,
+                                deployment_id: str | None = None):
         """Route /v1/completions to the appropriate vLLM container."""
-        container = await self._resolve_vllm_target(model)
+        container = await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         port = container["port"]
         key = container.get("stats_key") or model
         body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8196,11 +8550,13 @@ class Manager:
         if stream:
             return self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
+                container_name=container_name, deployment_id=deployment_id,
             )
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
-                model, cancel, container
+                model, cancel, container, container_name=container_name,
+                deployment_id=deployment_id,
             )
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8400,7 +8756,10 @@ class Manager:
             pass
         return out
 
-    async def _resolve_vllm_target(self, model: str) -> dict:
+    async def _resolve_vllm_target(
+        self, model: str, *, container_name: str | None = None,
+        deployment_id: str | None = None,
+    ) -> dict:
         """Find or start a running vLLM container for the given model."""
         # A capacity-triggered replacement briefly has no container for the
         # intended deployment. Do not let ensure_loaded wake an older stopped
@@ -8411,18 +8770,24 @@ class Manager:
         containers = await self.list_containers()
         # Look for a running container with this model
         for c in containers:
+            if container_name and c.get("name") != container_name:
+                continue
+            if (
+                deployment_id and c.get("deployment_id")
+                and c.get("deployment_id") != deployment_id
+            ):
+                continue
             if model in self._container_model_ids(c) and c["status"] == "running":
                 ready = await self._check_ready(c)
                 if ready:
                     self._mark_active(c["name"])
                     return c
-        # Fallback to sparkrun-managed containers (host-network mode).
-        sparkrun = await self._sparkrun_targets()
-        if model in sparkrun:
-            return sparkrun[model]
         # Try ensure_loaded to start/swap the container
         try:
-            return await self.ensure_loaded(model)
+            return await self.ensure_loaded(
+                model, container_name=container_name,
+                deployment_id=deployment_id,
+            )
         except LookupError:
             raise LookupError(f"No managed container found for model '{model}'")
         except TimeoutError:
@@ -8431,7 +8796,9 @@ class Manager:
     async def _vllm_stream(self, url: str, body: dict, key: str,
                            cancel: asyncio.Event | None = None,
                            container: dict | None = None,
-                           requested_model: str | None = None):
+                           requested_model: str | None = None, *,
+                           container_name: str | None = None,
+                           deployment_id: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
         as generation begins, allowing the live prefill rate to be populated
@@ -8465,7 +8832,8 @@ class Manager:
                     else "/v1/completions"
                 )
                 container, admission = await self._admit_vllm_target(
-                    requested_model, cancel, container
+                    requested_model, cancel, container,
+                    container_name=container_name, deployment_id=deployment_id,
                 )
                 key = container.get("stats_key") or requested_model
                 body["model"] = self._upstream_model_id(
@@ -8630,7 +8998,9 @@ class Manager:
                     if container is None or requested_model is None:
                         return
                     container, admission = await self._admit_vllm_target(
-                        requested_model, cancel, container
+                        requested_model, cancel, container,
+                        container_name=container_name,
+                        deployment_id=deployment_id,
                     )
                     key = container.get("stats_key") or requested_model
                     body["model"] = self._upstream_model_id(
@@ -8957,9 +9327,10 @@ class Manager:
 
         # Need to evict — find managed running containers, sorted by LRU.
         try:
-            containers = self.client.containers.list(
-                filters={"label": CONTROLLER_LABEL}
-            )
+            containers = [
+                container for container in self.client.containers.list()
+                if _label_value(container.labels or {}, CONTROLLER_LABEL) == "1"
+            ]
             running = []
             for c in containers:
                 if c.status == "running" and c.name != protect_name:
@@ -9633,7 +10004,10 @@ class Manager:
             # or see request counters.  Stopping one member independently would
             # tear down the entire deployment, so cluster lifecycle is always
             # coordinated at the deployment level.
-            if c.get("deployment_id"):
+            if c.get("deployment_id") and (
+                c.get("deployment_mode") != "single"
+                or int(c.get("nnodes") or 1) > 1
+            ):
                 continue
             phase = (c.get("phase") or {}).get("phase")
             if phase != "ready":
@@ -9671,7 +10045,11 @@ class Manager:
             return self._container_summary(c)
         return await asyncio.to_thread(_do)
 
-    async def ensure_loaded(self, model: str, timeout: float = 300.0) -> dict:
+    async def ensure_loaded(
+        self, model: str, timeout: float = 300.0, *,
+        container_name: str | None = None,
+        deployment_id: str | None = None,
+    ) -> dict:
         """
         Make a managed container for `model` running and ready. Uses VRAM-aware
         eviction: if the GPU is full (total − used − 10 GB buffer < estimated
@@ -9684,6 +10062,13 @@ class Manager:
             containers = await self.list_containers()
             target = None
             for c in containers:
+                if container_name and c.get("name") != container_name:
+                    continue
+                if (
+                    deployment_id and c.get("deployment_id")
+                    and c.get("deployment_id") != deployment_id
+                ):
+                    continue
                 if not c.get("managed") or model not in self._container_model_ids(c):
                     continue
                 # Prefer a running candidate if there are duplicates.
@@ -9809,26 +10194,11 @@ class Manager:
 
     # ---------- aggregate state ----------
     async def get_state(self) -> dict:
-        containers, images, stats, ollama, unsloth, sparkrun_targets = await asyncio.gather(
+        containers, images, stats = await asyncio.gather(
             self.list_containers(),
             self.list_images(),
             self.get_stats(),
-            self.list_ollama_models(),
-            self.list_unsloth_models(),
-            self._sparkrun_targets(),
         )
-        # Enrich Atlas Serving containers with their served model name. Atlas
-        # runs are SparkRun containers in host-network mode.
-        sparkrun_models_by_port: dict[int, str] = {
-            target.get("port"): model
-            for model, target in sparkrun_targets.items()
-        }
-        for c in containers:
-            if c.get("source") == "atlas-serving":
-                if not c.get("model"):
-                    # Atlas containers currently run in host-network mode on
-                    # their recipe's port; default is 8000.
-                    c["model"] = sparkrun_models_by_port.get(8000)
         nodes = await self.cluster_nodes(stats)
         containers_by_node: dict[str, dict[str, dict]] = {
             LOCAL_NODE_ID: {c.get("name"): c for c in containers},
@@ -9904,6 +10274,11 @@ class Manager:
                 if deployment["served_models"]
                 else deployment.get("model")
             )
+            deployment["selected_nodes"] = [
+                self.public_target_node(node_by_id[node_id])
+                for node_id in deployment.get("node_ids") or []
+                if node_id in node_by_id
+            ]
             deployment["stats_key"] = (
                 primary_container.get("stats_key")
                 if primary_container
@@ -9927,17 +10302,11 @@ class Manager:
         running_models = [c for c in containers if c["status"] == "running"]
         # Token-stats key of the model currently holding the GPU, so the UI
         # can auto-select the right per-variant entry on model switches.
-        unsloth_loaded = unsloth.get("loaded_model")
-        if unsloth_loaded:
-            loaded_stats_key = self._stats_key(
-                unsloth_loaded, self._unsloth_variant(unsloth_loaded)
-            )
-        else:
-            loaded_stats_key = next(
-                (c.get("stats_key") or c["model"]
-                 for c in running_models if c.get("model")),
-                None,
-            )
+        loaded_stats_key = next(
+            (c.get("stats_key") or c["model"]
+             for c in running_models if c.get("model")),
+            None,
+        )
         return {
             "containers": containers,
             "images": images,
@@ -9946,8 +10315,6 @@ class Manager:
             "token_usage_sync": dict(self._token_usage_sync_status),
             "nodes": nodes,
             "deployments": public_deployments,
-            "recipes": list(self.recipes),
-            "recipe_launches": dict(self.recipe_launches),
             "token_stats": self.token_stats,
             "token_costs": {
                 model: self.calculate_cost(model, model_stats)
@@ -9961,16 +10328,6 @@ class Manager:
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
             "inference_admission": self.inference_admission(),
-            "ollama": ollama,
-            "unsloth": unsloth,
-            "spark_launches": list(self.spark_launches),
-            "spark_runs": self._public_spark_runs(),
-            # Preserve the public model -> port shape; internal discovery
-            # keeps richer load settings for admission control.
-            "sparkrun_targets": {
-                model: target.get("port")
-                for model, target in sparkrun_targets.items()
-            },
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {
                 "running_models": len(running_models),
@@ -9981,15 +10338,7 @@ class Manager:
                     "used_gb": round(((stats.get("gpus") or [{}])[0].get("mem_used_mib") or 0) / 1024.0, 1),
                 },
                 "total_containers": len(containers),
-                "saved_recipes": len(self.recipes),
-                "ollama_models": len(ollama.get("models") or []),
-                "ollama_reachable": ollama.get("reachable", False),
-                "unsloth_models": len(unsloth.get("models") or []),
-                "unsloth_reachable": unsloth.get("reachable", False),
-                "unsloth_loaded": unsloth.get("loaded_model"),
                 "loaded_stats_key": loaded_stats_key,
-                "spark_launches": len(self.spark_launches),
-                "spark_runs": sum(1 for r in self._public_spark_runs() if r.get("status") == "running"),
                 "cluster_nodes": len(nodes),
                 "cluster_nodes_online": sum(1 for n in nodes if n.get("online")),
                 "cluster_deployments": len(public_deployments),

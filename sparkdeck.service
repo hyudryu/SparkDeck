@@ -1,0 +1,23 @@
+[Unit]
+Description=SparkDeck model discovery, serving, and benchmark dashboard
+Documentation=https://github.com/hyudryu/SparkDeck
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/SparkDeck
+EnvironmentFile=-%h/.config/sparkdeck/sparkdeck.env
+ExecStart=%h/SparkDeck/run.sh
+Restart=on-failure
+RestartSec=5
+# llama-server can be adopted again after SparkDeck restarts.
+KillMode=process
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -33,6 +33,7 @@ class FakeManager:
         self.node_registry.set_forward_token = Mock()
         self.node_registry.accepts_forward_token = Mock(return_value=True)
         self.node_registry.remove = Mock(return_value=True)
+        self.remove_cluster_node = Mock(return_value=True)
         self.pair_node = AsyncMock(return_value={
             "id": "worker-id", "name": "Worker",
             "protocol_version": AGENT_PROTOCOL_VERSION,
@@ -364,7 +365,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("forward_token", json.dumps(status))
         await manager.http.aclose()
 
-    async def test_leave_revokes_locally_then_unregisters_before_clearing_assignment(self):
+    async def test_leave_unregisters_then_revokes_before_clearing_assignment(self):
         requests = []
         observed = {}
 
@@ -401,7 +402,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0].headers[FORWARD_TOKEN_HEADER], "secret")
         self.assertEqual(observed, {
             "assignment_present": True,
-            "old_agent_revoked": True,
+            "old_agent_revoked": False,
         })
         await http.aclose()
 
@@ -424,6 +425,60 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.agent_credentials.accepts_token(old_token))
         self.assertIsNone(service.assignment.load())
         manager.adopt_controller_role.assert_called_once()
+        await http.aclose()
+
+    async def test_leave_refuses_local_managed_member_without_rotating_credentials(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"ok": True})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.list_containers.return_value = [{
+            "name": "cluster-member", "managed": True,
+            "deployment_id": "deployment-1", "status": "running",
+        }]
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        with self.assertRaisesRegex(ValueError, "cannot leave.*1 managed container"):
+            await service.leave("http://127.0.0.1:7878")
+
+        self.assertTrue(manager.agent_credentials.accepts_token(old_token))
+        self.assertIsNotNone(service.assignment.load())
+        self.assertEqual(requests, [])
+        manager.adopt_controller_role.assert_not_called()
+        await http.aclose()
+
+    async def test_leave_honors_authoritative_controller_deployment_guard(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(409, json={
+                "detail": "node is still used by production; remove that deployment first",
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        with self.assertRaisesRegex(ValueError, "controller still has a deployment"):
+            await service.leave("http://127.0.0.1:7878")
+
+        self.assertTrue(manager.agent_credentials.accepts_token(old_token))
+        self.assertIsNotNone(service.assignment.load())
+        manager.adopt_controller_role.assert_not_called()
         await http.aclose()
 
     async def test_leave_keeps_assignment_when_credential_rotation_is_not_durable(self):
@@ -454,7 +509,17 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertTrue(result["revoked"])
-        manager.node_registry.remove.assert_called_once_with("worker-id")
+        manager.remove_cluster_node.assert_called_once_with("worker-id")
+        manager.remove_cluster_node.reset_mock()
+        manager.remove_cluster_node.side_effect = ValueError(
+            "node is still used by production; remove that deployment first"
+        )
+        with self.assertRaisesRegex(ValueError, "still used by production"):
+            service.unregister({
+                FORWARD_HOP_HEADER: "1",
+                FORWARD_NODE_HEADER: "worker-id",
+                FORWARD_TOKEN_HEADER: "secret",
+            })
         with self.assertRaises(PermissionError):
             service.unregister({FORWARD_HOP_HEADER: "2"})
 

@@ -406,7 +406,12 @@ async def agent_info():
 async def agent_pair(req: Request):
     body = await req.json()
     try:
-        result = manager.agent_credentials.pair(body.get("pairing_code") or "")
+        pairing_code = body.get("pairing_code") or ""
+        manager.agent_credentials.validate_pairing_code(pairing_code)
+        manager.rebase_token_usage_for_pairing(
+            body.get("usage_epoch"), body.get("usage_model_epochs")
+        )
+        result = manager.agent_credentials.pair(pairing_code)
     except ValueError as exc:
         raise HTTPException(403, str(exc)) from exc
     result["name"] = manager.settings.get("cluster_node_name")

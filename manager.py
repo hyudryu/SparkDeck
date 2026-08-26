@@ -17,7 +17,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -266,6 +266,7 @@ MODEL_PRICING = {
 }
 
 USAGE_SPEED_WINDOW_TOKENS = 1_000_000
+USAGE_HOURLY_RETENTION_DAYS = 370
 
 PENDING = "pending"          # waiting for capacity
 DISPATCHING = "dispatching"  # model starting, will run when ready
@@ -1137,6 +1138,10 @@ class Manager:
             name=body.get("name"),
             fabric_ip=body.get("fabric_ip"),
             fabric_interface=body.get("fabric_interface"),
+            usage_epoch=copy.deepcopy(self.token_usage_sync.get("epoch")),
+            usage_model_epochs=copy.deepcopy(
+                self.token_usage_sync.get("model_epochs") or {}
+            ),
         )
 
     async def sync_token_usage_once(self) -> dict:
@@ -3787,6 +3792,43 @@ class Manager:
         credentials = getattr(self, "agent_credentials", None)
         return str(getattr(credentials, "node_id", None) or LOCAL_NODE_ID)
 
+    @staticmethod
+    def _prune_hourly_usage(
+        hourly: Any, now: datetime | None = None,
+    ) -> bool:
+        """Retain the UTC history needed by the one-year activity view."""
+        if not isinstance(hourly, dict):
+            return False
+        current = now or datetime.now(timezone.utc)
+        cutoff = (current - timedelta(days=USAGE_HOURLY_RETENTION_DAYS)).replace(
+            minute=0, second=0, microsecond=0, tzinfo=None,
+        )
+        changed = False
+        for hour_key in list(hourly):
+            try:
+                hour = datetime.strptime(str(hour_key), "%Y-%m-%dT%H")
+            except ValueError:
+                hourly.pop(hour_key, None)
+                changed = True
+                continue
+            if hour < cutoff:
+                hourly.pop(hour_key, None)
+                changed = True
+        return changed
+
+    @classmethod
+    def _prune_usage_ledger(cls, ledger: Any) -> bool:
+        if not isinstance(ledger, dict):
+            return False
+        changed = False
+        for component in (ledger.get("origins") or {}).values():
+            if not isinstance(component, dict):
+                continue
+            changed = cls._prune_hourly_usage(
+                component.get("hourly_token_stats")
+            ) or changed
+        return changed
+
     def _load_token_usage_sync(self) -> dict:
         path = self.token_usage_sync_path
         if path.exists():
@@ -3799,6 +3841,15 @@ class Manager:
                 ):
                     value.setdefault("epoch", [0, ""])
                     value.setdefault("model_epochs", {})
+                    local = (value.get("origins") or {}).get(
+                        self._local_usage_node_id()
+                    )
+                    if isinstance(local, dict):
+                        local.setdefault(
+                            "speed_samples",
+                            copy.deepcopy(getattr(self, "speed_samples", {})),
+                        )
+                    self._prune_usage_ledger(value)
                     return value
             except Exception:
                 pass
@@ -3809,6 +3860,7 @@ class Manager:
         node_id = self._local_usage_node_id()
         models = copy.deepcopy(getattr(self, "token_stats", {}))
         hourly = copy.deepcopy(getattr(self, "hourly_token_stats", {}))
+        self._prune_hourly_usage(hourly)
         model_epochs = {model: [0, ""] for model in models}
         return {
             "version": 1,
@@ -3820,6 +3872,9 @@ class Manager:
                     "token_stats": models,
                     "hourly_token_stats": hourly,
                     "model_epochs": model_epochs,
+                    "speed_samples": copy.deepcopy(
+                        getattr(self, "speed_samples", {})
+                    ),
                 },
             },
         }
@@ -3877,6 +3932,11 @@ class Manager:
                     self._sum_usage_records(hour.setdefault(str(model), {}), stats)
         self.token_stats = aggregate
         self.hourly_token_stats = hourly
+        local_component = origins.get(self._local_usage_node_id())
+        if isinstance(local_component, dict):
+            self.speed_samples = copy.deepcopy(
+                local_component.get("speed_samples") or {}
+            )
 
     def _record_local_synced_tokens(
         self,
@@ -3887,6 +3947,7 @@ class Manager:
         gen_time_s: float | None,
         pp_time_s: float | None,
         hour_key: str,
+        ended_at: float | None = None,
     ) -> None:
         ledger = getattr(self, "token_usage_sync", None)
         if not isinstance(ledger, dict):
@@ -3898,6 +3959,7 @@ class Manager:
             "token_stats": {},
             "hourly_token_stats": {},
             "model_epochs": {},
+            "speed_samples": {},
         })
         global_model_epochs = ledger.setdefault("model_epochs", {})
         model_version = global_model_epochs.setdefault(model, [0, ""])
@@ -3909,6 +3971,7 @@ class Manager:
             for models in component.setdefault("hourly_token_stats", {}).values():
                 if isinstance(models, dict):
                     models.pop(model, None)
+            component.setdefault("speed_samples", {}).pop(model, None)
             component_epochs[model] = list(model_version)
 
         def add(rec: dict) -> None:
@@ -3929,6 +3992,14 @@ class Manager:
             hour_key, {}
         )
         add(hour.setdefault(model, {}))
+        self._append_speed_sample(
+            component.setdefault("speed_samples", {}),
+            model,
+            completion_tokens,
+            gen_time_s,
+            ended_at,
+        )
+        self._prune_hourly_usage(component.get("hourly_token_stats"))
         component["revision"] = int(component.get("revision") or 0) + 1
         try:
             self._save_token_usage_sync()
@@ -3936,6 +4007,10 @@ class Manager:
             pass
 
     def token_usage_sync_snapshot(self) -> dict:
+        if self._prune_usage_ledger(self.token_usage_sync):
+            self._rebuild_synced_token_usage()
+            self._save_token_usage_sync()
+            self._save_hourly_token_stats()
         return {
             "enabled": True,
             "ledger": copy.deepcopy(self.token_usage_sync),
@@ -3949,16 +4024,22 @@ class Manager:
             or not isinstance(remote.get("origins"), dict)
         ):
             raise ValueError("invalid token usage sync payload")
+        remote = copy.deepcopy(remote)
+        self._prune_usage_ledger(remote)
         local = self.token_usage_sync
+        changed = self._prune_usage_ledger(local)
         local_epoch = self._usage_version_key(local.get("epoch"))
         remote_epoch = self._usage_version_key(remote.get("epoch"))
-        changed = False
         if remote_epoch > local_epoch:
             self.token_usage_sync = copy.deepcopy(remote)
             local = self.token_usage_sync
             changed = True
         elif remote_epoch < local_epoch:
-            return False
+            if changed:
+                self._rebuild_synced_token_usage()
+                self._save_token_usage_sync()
+                self._save_hourly_token_stats()
+            return changed
         else:
             local_model_epochs = local.setdefault("model_epochs", {})
             for model, version in (remote.get("model_epochs") or {}).items():
@@ -3997,6 +4078,7 @@ class Manager:
                 "token_stats": {},
                 "hourly_token_stats": {},
                 "model_epochs": {},
+                "speed_samples": {},
             }
             changed = True
         if changed:
@@ -4005,6 +4087,53 @@ class Manager:
             self._save_token_stats()
             self._save_hourly_token_stats()
         return changed
+
+    def rebase_token_usage_for_pairing(
+        self, epoch: Any, model_epochs: Any,
+    ) -> None:
+        """Start an exclusive pairing in the coordinator's reset domain.
+
+        Only this node's source component crosses the cluster boundary. This
+        prevents usage learned from an old coordinator from being relayed to a
+        new one, while rebasing pre-membership resets so neither side can wipe
+        the other's current counters during the first synchronization.
+        """
+        ledger = getattr(self, "token_usage_sync", {})
+        node_id = self._local_usage_node_id()
+        component = copy.deepcopy(
+            (ledger.get("origins") or {}).get(node_id) or {}
+        )
+        component.setdefault("revision", 0)
+        component.setdefault("token_stats", {})
+        component.setdefault("hourly_token_stats", {})
+        component.setdefault(
+            "speed_samples", copy.deepcopy(getattr(self, "speed_samples", {}))
+        )
+        supplied_model_epochs = model_epochs if isinstance(model_epochs, dict) else {}
+        normalized_model_epochs: dict[str, list[Any]] = {}
+        component_models = set(component["token_stats"]) | set(
+            component["speed_samples"]
+        )
+        for hourly_models in component["hourly_token_stats"].values():
+            if isinstance(hourly_models, dict):
+                component_models.update(str(model) for model in hourly_models)
+        for model in component_models:
+            normalized_model_epochs[str(model)] = list(
+                self._usage_version_key(supplied_model_epochs.get(model))
+            )
+        component["model_epochs"] = copy.deepcopy(normalized_model_epochs)
+        component["revision"] = int(component.get("revision") or 0) + 1
+        self._prune_hourly_usage(component["hourly_token_stats"])
+        self.token_usage_sync = {
+            "version": 1,
+            "epoch": list(self._usage_version_key(epoch)),
+            "model_epochs": copy.deepcopy(normalized_model_epochs),
+            "origins": {node_id: component},
+        }
+        self._rebuild_synced_token_usage()
+        self._save_token_usage_sync()
+        self._save_token_stats()
+        self._save_hourly_token_stats()
 
     def _load_speed_samples(self) -> dict[str, list[dict]]:
         if self.speed_samples_path.exists():
@@ -4057,17 +4186,22 @@ class Manager:
                 self._flush_speed_samples_later()
             )
 
-    def _record_speed_sample(
-        self, model: str, completion_tokens: int, gen_time_s: float | None
+    @staticmethod
+    def _append_speed_sample(
+        target: dict[str, list[dict]],
+        model: str,
+        completion_tokens: int,
+        gen_time_s: float | None,
+        ended_at: float | None = None,
     ) -> None:
         if not gen_time_s or gen_time_s <= 0 or completion_tokens <= 0:
             return
-        ended_at = time.time()
-        samples = self.speed_samples.setdefault(model, [])
+        sample_ended_at = ended_at if ended_at is not None else time.time()
+        samples = target.setdefault(model, [])
         samples.append({
             "tokens": completion_tokens,
-            "started_at": ended_at - float(gen_time_s),
-            "ended_at": ended_at,
+            "started_at": sample_ended_at - float(gen_time_s),
+            "ended_at": sample_ended_at,
         })
         # Each model retains at least the newest 1M output tokens. The
         # event cap prevents pathological one-token requests from growing the
@@ -4079,7 +4213,18 @@ class Manager:
             retained_tokens += max(0.0, float(sample.get("tokens") or 0))
             if retained_tokens >= USAGE_SPEED_WINDOW_TOKENS or len(retained) >= 250_000:
                 break
-        self.speed_samples[model] = list(reversed(retained))
+        target[model] = list(reversed(retained))
+
+    def _record_speed_sample(
+        self,
+        model: str,
+        completion_tokens: int,
+        gen_time_s: float | None,
+        ended_at: float | None = None,
+    ) -> None:
+        self._append_speed_sample(
+            self.speed_samples, model, completion_tokens, gen_time_s, ended_at
+        )
 
     def rolling_generation_speed(self, models: list[str]) -> dict:
         """Aggregate decode throughput over the newest 1M output tokens.
@@ -4089,17 +4234,35 @@ class Manager:
         gaps between requests do not dilute inference throughput.
         """
         samples = []
+        sample_maps: list[dict] = []
+        ledger = getattr(self, "token_usage_sync", None)
+        if isinstance(ledger, dict):
+            global_epochs = ledger.get("model_epochs") or {}
+            for component in (ledger.get("origins") or {}).values():
+                if not isinstance(component, dict):
+                    continue
+                component_epochs = component.get("model_epochs") or {}
+                eligible = {
+                    model: values
+                    for model, values in (component.get("speed_samples") or {}).items()
+                    if self._usage_version_key(component_epochs.get(model))
+                    == self._usage_version_key(global_epochs.get(model))
+                }
+                sample_maps.append(eligible)
+        if not any(mapping.get(model) for mapping in sample_maps for model in models):
+            sample_maps = [getattr(self, "speed_samples", {})]
         for model in models:
-            for raw in getattr(self, "speed_samples", {}).get(model, []):
-                try:
-                    tokens = float(raw.get("tokens") or 0)
-                    started_at = float(raw.get("started_at"))
-                    ended_at = float(raw.get("ended_at"))
-                except (TypeError, ValueError):
-                    continue
-                if tokens <= 0 or ended_at <= started_at:
-                    continue
-                samples.append((ended_at, started_at, tokens))
+            for sample_map in sample_maps:
+                for raw in sample_map.get(model, []):
+                    try:
+                        tokens = float(raw.get("tokens") or 0)
+                        started_at = float(raw.get("started_at"))
+                        ended_at = float(raw.get("ended_at"))
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    if tokens <= 0 or ended_at <= started_at:
+                        continue
+                    samples.append((ended_at, started_at, tokens))
 
         if not samples:
             return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
@@ -4255,7 +4418,8 @@ class Manager:
         # cached_tokens > prompt_tokens in edge cases).
         if cached_tokens > prompt_tokens:
             cached_tokens = prompt_tokens
-        hour_key = datetime.now().strftime("%Y-%m-%dT%H")
+        hour_key = self._usage_hour_key()
+        ended_at = time.time()
         self._record_local_synced_tokens(
             model,
             prompt_tokens,
@@ -4264,8 +4428,9 @@ class Manager:
             gen_time_s,
             pp_time_s,
             hour_key,
+            ended_at,
         )
-        self._record_speed_sample(model, completion_tokens, gen_time_s)
+        self._record_speed_sample(model, completion_tokens, gen_time_s, ended_at)
         # Update both lifetime and session counters with the same values.
         for stats in (self.token_stats, self.session_token_stats):
             rec = stats.setdefault(model, {})
@@ -4295,6 +4460,7 @@ class Manager:
         if pp_time_s and pp_time_s > 0 and pp_tokens > 0:
             hrec["pp_tokens"] = hrec.get("pp_tokens", 0) + pp_tokens
             hrec["pp_time_s"] = hrec.get("pp_time_s", 0.0) + pp_time_s
+        self._prune_hourly_usage(self.hourly_token_stats)
         try:
             self._save_token_stats()
         except Exception:
@@ -4307,6 +4473,11 @@ class Manager:
             self._queue_speed_samples_save()
         except Exception:
             pass
+
+    @staticmethod
+    def _usage_hour_key() -> str:
+        """Return a timezone-independent cluster history bucket."""
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
 
     @staticmethod
     def _usage_prompt_counts(usage: dict) -> tuple[int, int]:
@@ -5366,12 +5537,14 @@ class Manager:
             if not isinstance(component, dict):
                 continue
             component["token_stats"] = {}
+            component["speed_samples"] = {}
             component["revision"] = int(component.get("revision") or 0) + 1
         origins.setdefault(node_id, {
             "revision": 0,
             "token_stats": {},
             "hourly_token_stats": {},
             "model_epochs": {},
+            "speed_samples": {},
         })
         self.token_usage_sync = {
             "version": 1,
@@ -5396,6 +5569,7 @@ class Manager:
             for models in (component.get("hourly_token_stats") or {}).values():
                 if isinstance(models, dict):
                     models.pop(model, None)
+            (component.get("speed_samples") or {}).pop(model, None)
             component["revision"] = int(component.get("revision") or 0) + 1
         self._save_token_usage_sync()
 
@@ -5515,7 +5689,10 @@ class Manager:
                       if end else None)
         else:
             # Default: last *weeks* weeks.
-            end_dt = datetime.now() + timedelta(days=1)
+            end_dt = (
+                datetime.now(timezone.utc).replace(tzinfo=None)
+                + timedelta(days=1)
+            )
             start_dt = end_dt - timedelta(weeks=weeks)
         daily: dict[str, dict] = {}
         for hour_key, models in self.hourly_token_stats.items():

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -6,7 +7,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
+from cluster import AGENT_PROTOCOL_VERSION, NodeRegistry
 from manager import Manager
+from sparkdeck.onboarding import is_forwardable_path
 from sparkdeck.service import SparkDeckService
 
 
@@ -64,6 +67,127 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "unknown cluster node"):
             await self.manager.pull_image_on_nodes("example/image", ["missing"])
         self.manager.pull_image_result.assert_not_awaited()
+
+
+class NodeRenameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_rename_is_normalized_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager.__new__(Manager)
+            manager.settings = {"cluster_node_name": "Old name"}
+            manager.settings_path = Path(directory) / "settings.json"
+            manager.lock = asyncio.Lock()
+
+            result = await manager.rename_cluster_node("local", "  Main   Spark  ")
+
+            self.assertEqual(result["name"], "Main Spark")
+            self.assertEqual(result["name_sync"], "local")
+            saved = json.loads(manager.settings_path.read_text())
+            self.assertEqual(saved["cluster_node_name"], "Main Spark")
+
+    async def test_remote_rename_persists_registry_and_syncs_authenticated_worker(self):
+        manager = Manager.__new__(Manager)
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "remote-1", "name": "Old", "agent_token": "secret",
+        }
+        manager.node_registry.update.return_value = {
+            "id": "remote-1", "name": "Compute 1", "agent_url": "https://private",
+        }
+        manager.node_registry.request = AsyncMock(return_value={"name": "Compute 1"})
+        manager.node_registry._status_cache = {"remote-1": (1, {})}
+
+        result = await manager.rename_cluster_node("remote-1", "Compute 1")
+
+        manager.node_registry.update.assert_called_once_with(
+            "remote-1", {"name": "Compute 1"},
+        )
+        manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "PATCH", "/api/agent/node",
+            json_body={"name": "Compute 1"}, timeout=10,
+        )
+        self.assertEqual(result["name_sync"], "synchronized")
+        self.assertNotIn("agent_url", result)
+        self.assertNotIn("agent_token", result)
+
+    async def test_offline_remote_rename_remains_durable_and_reports_pending_sync(self):
+        manager = Manager.__new__(Manager)
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {"id": "remote-1", "name": "Old"}
+        manager.node_registry.update.return_value = {"id": "remote-1", "name": "New"}
+        manager.node_registry.request = AsyncMock(side_effect=RuntimeError("offline"))
+        manager.node_registry._status_cache = {}
+
+        result = await manager.rename_cluster_node("remote-1", "New")
+
+        manager.node_registry.update.assert_called_once()
+        self.assertEqual(result["name"], "New")
+        self.assertEqual(result["name_sync"], "pending")
+        self.assertFalse(result["online"])
+
+    async def test_invalid_names_are_rejected_before_any_write(self):
+        manager = Manager.__new__(Manager)
+        for value in ("", "   ", "bad\nname", "x" * 81, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    await manager.rename_cluster_node("local", value)
+
+    async def test_registry_alias_remains_authoritative_over_agent_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient()
+            registry = NodeRegistry(Path(directory), client)
+            remote = {
+                "id": "remote-1", "name": "Controller alias", "enabled": True,
+                "agent_url": "https://private", "agent_token": "secret",
+            }
+            registry.nodes = [remote]
+            registry.request = AsyncMock(return_value={
+                "name": "Stale worker name", "protocol_version": AGENT_PROTOCOL_VERSION,
+                "docker_ready": True,
+            })
+
+            result = await registry.probe(remote, force=True)
+
+            self.assertEqual(result["name"], "Controller alias")
+            self.assertEqual(registry.request.await_args_list[-1].args, (
+                "remote-1", "PATCH", "/api/agent/node",
+            ))
+            self.assertEqual(
+                registry.request.await_args_list[-1].kwargs["json_body"],
+                {"name": "Controller alias"},
+            )
+            await client.aclose()
+
+    async def test_later_probe_reconciles_an_offline_rename_to_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient()
+            registry = NodeRegistry(Path(directory), client)
+            remote = {
+                "id": "remote-1", "name": "New durable alias", "enabled": True,
+                "agent_url": "https://private", "agent_token": "secret",
+            }
+            registry.nodes = [remote]
+            registry.request = AsyncMock(side_effect=[
+                {
+                    "name": "Old worker name",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                    "docker_ready": True,
+                },
+                {"name": "New durable alias"},
+            ])
+
+            result = await registry.probe(remote, force=True)
+
+            self.assertTrue(result["online"])
+            self.assertEqual(result["name"], "New durable alias")
+            registry.request.assert_awaited_with(
+                "remote-1", "PATCH", "/api/agent/node",
+                json_body={"name": "New durable alias"}, timeout=10,
+            )
+            await client.aclose()
+
+    def test_versioned_rename_is_forwarded_but_agent_sync_stays_local(self):
+        self.assertTrue(is_forwardable_path("/api/v1/nodes/remote-1"))
+        self.assertFalse(is_forwardable_path("/api/agent/node"))
 
 
 class FakeServiceManager:

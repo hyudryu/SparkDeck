@@ -356,6 +356,21 @@ class NodeRegistry:
                     issues.append("agent protocol version mismatch")
                 if not status.get("docker_ready"):
                     issues.append("Docker is unavailable")
+                authoritative_name = str(public.get("name") or "").strip()
+                if (
+                    authoritative_name
+                    and str(status.get("name") or "").strip() != authoritative_name
+                ):
+                    try:
+                        await self.request(
+                            node_id, "PATCH", "/api/agent/node",
+                            json_body={"name": authoritative_name}, timeout=10,
+                        )
+                        status["name"] = authoritative_name
+                    except Exception:
+                        # The registry alias remains authoritative in the
+                        # controller UI and a later probe retries convergence.
+                        issues.append("node name synchronization pending")
                 result = {
                     **public,
                     **status,
@@ -364,6 +379,10 @@ class NodeRegistry:
                     "latency_ms": round((time.monotonic() - started) * 1000),
                     "last_seen": time.time(),
                 }
+                # The controller's durable registry is authoritative for the
+                # user-assigned display name. Agent status may briefly retain
+                # the prior local name after an offline rename.
+                result["name"] = public.get("name") or status.get("name")
                 result["status_message"] = "; ".join(issues) or None
             except Exception as exc:
                 previous = cached[1] if cached else {}

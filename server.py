@@ -192,6 +192,49 @@ async def _require_managed_agent_container(name: str, request: Request) -> None:
         raise HTTPException(404, "managed container not found")
 
 
+_STORAGE_PRIVATE_KEYS = {
+    "path", "cache_path", "snapshot_path", "blob_path", "agent_url",
+    "agent_token", "token", "hf_token", "authorization",
+}
+_STORAGE_INSTRUCTIONS = [
+    "Pair SparkDeck nodes over a cluster-private network such as Tailscale.",
+    "Only complete Hugging Face cache weights are shown and transferable.",
+    "Choose an online source and one or more online targets with enough free space.",
+]
+
+
+def _public_storage_payload(value):
+    """Defense-in-depth redaction for every virtual NAS HTTP response."""
+    if isinstance(value, dict):
+        return {
+            key: _public_storage_payload(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _STORAGE_PRIVATE_KEYS
+            and not str(key).casefold().endswith(("_path", "_token"))
+        }
+    if isinstance(value, list):
+        return [_public_storage_payload(item) for item in value]
+    return value
+
+
+def _require_virtual_nas_enabled() -> None:
+    if not manager.virtual_nas_enabled():
+        raise HTTPException(
+            409,
+            "Virtual NAS is disabled. Enable it in Storage settings before using it.",
+        )
+
+
+def _storage_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, FileExistsError):
+        return HTTPException(409, str(exc))
+    if isinstance(exc, LookupError):
+        return HTTPException(404, str(exc))
+    if isinstance(exc, RuntimeError):
+        return HTTPException(409, str(exc))
+    return HTTPException(400, str(exc))
+
+
 def _requested_node_ids(body: dict) -> list[str] | None:
     """Accept the versioned list field plus a scalar compatibility field."""
     raw = body.get("node_ids")
@@ -416,6 +459,49 @@ async def agent_remove_image(image_id: str, req: Request):
         return await manager.remove_image(image_id)
     except Exception as exc:
         raise HTTPException(500, str(exc)[:500]) from exc
+
+
+@app.get("/api/agent/virtual-nas/inventory")
+async def agent_virtual_nas_inventory(req: Request):
+    _require_agent(req)
+    return _public_storage_payload({"models": manager.virtual_nas.inventory()})
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/export")
+async def agent_virtual_nas_export(model_id: str, req: Request):
+    _require_agent(req)
+    try:
+        stream = manager.virtual_nas.export_model(model_id)
+        return StreamingResponse(stream, media_type="application/x-tar")
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.put("/api/agent/virtual-nas/models/{model_id:path}/import")
+async def agent_virtual_nas_import(model_id: str, req: Request):
+    _require_agent(req)
+    expected_header = req.headers.get("x-sparkdeck-expected-bytes")
+    try:
+        expected_bytes = int(expected_header) if expected_header is not None else None
+        if expected_bytes is not None and expected_bytes < 0:
+            raise ValueError("X-SparkDeck-Expected-Bytes must not be negative")
+        result = await manager.virtual_nas.import_model(
+            model_id, req.stream(), expected_bytes=expected_bytes,
+        )
+        return _public_storage_payload(result)
+    except (TypeError, ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.delete("/api/agent/virtual-nas/models/{model_id:path}")
+async def agent_virtual_nas_delete(model_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return _public_storage_payload(
+            await manager.delete_virtual_nas_model(LOCAL_NODE_ID, model_id)
+        )
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
 
 
 @app.post("/api/agent/inference/health")
@@ -1221,6 +1307,92 @@ async def v1_update_settings(req: Request):
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
     return values
+
+
+@app.get("/api/v1/storage")
+async def v1_storage():
+    try:
+        state = await manager.virtual_nas_inventory()
+        return _public_storage_payload({
+            "enabled": bool(state.get("enabled")),
+            "nodes": state.get("nodes", []),
+            "jobs": state.get("jobs", []),
+            "instructions": list(_STORAGE_INSTRUCTIONS),
+        })
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.put("/api/v1/storage/settings")
+async def v1_storage_settings(req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        raise HTTPException(400, "enabled must be a boolean")
+    await manager.update_settings({"virtual_nas_enabled": body["enabled"]})
+    return await v1_storage()
+
+
+@app.post("/api/v1/storage/transfers", status_code=202)
+async def v1_storage_transfer(req: Request):
+    _require_virtual_nas_enabled()
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        model_id = body.get("model_id")
+        source_node_id = body.get("source_node_id")
+        target_node_ids = body.get("target_node_ids")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("model_id must be a non-empty model ID")
+        if not isinstance(source_node_id, str) or not source_node_id.strip():
+            raise ValueError("source_node_id must be a non-empty node ID")
+        if (
+            not isinstance(target_node_ids, list)
+            or not target_node_ids
+            or any(not isinstance(item, str) or not item.strip() for item in target_node_ids)
+        ):
+            raise ValueError("target_node_ids must contain at least one node ID")
+        targets = [item.strip() for item in target_node_ids]
+        if len(set(targets)) != len(targets):
+            raise ValueError("target_node_ids must not contain duplicates")
+        result = await manager.queue_virtual_nas_transfer(
+            model_id.strip(), source_node_id.strip(),
+            targets,
+        )
+        return _public_storage_payload(result)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.delete("/api/v1/storage/transfers/{job_id}")
+async def v1_storage_cancel(job_id: str):
+    _require_virtual_nas_enabled()
+    if not job_id.strip():
+        raise HTTPException(400, "job_id must not be empty")
+    try:
+        return _public_storage_payload(
+            await manager.cancel_virtual_nas_transfer(job_id)
+        )
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.delete("/api/v1/storage/nodes/{node_id}/models/{model_id:path}")
+async def v1_storage_delete_model(node_id: str, model_id: str):
+    _require_virtual_nas_enabled()
+    if not node_id.strip() or not model_id.strip():
+        raise HTTPException(400, "node_id and model_id must not be empty")
+    try:
+        return _public_storage_payload(
+            await manager.delete_virtual_nas_model(node_id.strip(), model_id)
+        )
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
 
 
 @app.post("/api/v1/deployments", status_code=201)

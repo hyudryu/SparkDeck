@@ -174,6 +174,16 @@ class RecipeCompatibilityFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["recipes"], [{"id": "recipe-1"}])
         self.assertEqual(response.json()["recipe_launches"]["recipe-1"]["phase"], "ready")
 
+    def test_public_legacy_recipe_preserves_shape_while_removing_credentials(self):
+        self.assertEqual(server._public_legacy_recipe({"id": "recipe-1"}), {"id": "recipe-1"})
+        self.assertEqual(
+            server._public_legacy_recipe({
+                "id": "recipe-2",
+                "extra_args": ["--dtype", "auto", "--hf-token", "hf_secret"],
+            }),
+            {"id": "recipe-2", "extra_args": ["--dtype", "auto"]},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -326,21 +326,23 @@ async def onboarding_unregister(req: Request):
 
 
 # ---------- aggregate state ----------
+def _public_legacy_recipe(recipe: dict) -> dict:
+    """Remove embedded credentials without changing the legacy recipe shape."""
+    public = dict(recipe)
+    if "extra_args" in public:
+        public["extra_args"] = manager._without_hf_cli_credentials(
+            public.get("extra_args") or []
+        )
+    return public
+
+
 @app.get("/api/state")
 async def get_state():
     state = await manager.get_state()
     # The MCP compatibility client still discovers recipes through this
     # aggregate endpoint. Keep these durable recipe records available while
     # the new SparkDeck UI uses the versioned application API.
-    state["recipes"] = [
-        {
-            **recipe,
-            "extra_args": manager._without_hf_cli_credentials(
-                recipe.get("extra_args") or []
-            ),
-        }
-        for recipe in manager.recipes
-    ]
+    state["recipes"] = [_public_legacy_recipe(recipe) for recipe in manager.recipes]
     state["recipe_launches"] = dict(manager.recipe_launches)
     state["supported_runtimes"] = list(sparkdeck.registry.kinds)
     return state

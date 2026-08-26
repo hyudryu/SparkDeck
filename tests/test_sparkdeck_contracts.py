@@ -76,8 +76,8 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             "choices": [{"message": {"content": "ok"}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 20},
         }
-        self.manager._vllm_chat.side_effect = lambda *args: dict(completion)
-        self.manager._vllm_completions.side_effect = lambda *args: dict(completion)
+        self.manager._vllm_chat.side_effect = lambda *args, **kwargs: dict(completion)
+        self.manager._vllm_completions.side_effect = lambda *args, **kwargs: dict(completion)
         cases = (
             ("vllm-chat", RuntimeKind.VLLM, "chat/completions", self.manager._vllm_chat),
             ("vllm-completion", RuntimeKind.VLLM, "completions", self.manager._vllm_completions),

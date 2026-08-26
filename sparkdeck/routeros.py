@@ -121,15 +121,27 @@ def parse_mndp_packet(data: bytes, source_address: str = "") -> dict[str, Any] |
 
 def normalize_routeros_url(value: Any) -> str:
     text = str(value or "").strip().rstrip("/")
-    parsed = urlsplit(text)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    try:
+        parsed = urlsplit(text)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("RouterOS URL has an invalid hostname or port") from exc
+    if parsed.scheme not in {"http", "https"} or not hostname:
         raise ValueError("RouterOS URL must be an http(s) URL with a hostname")
+    if port == 0:
+        raise ValueError("RouterOS URL has an invalid hostname or port")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("RouterOS URL cannot contain credentials, query parameters, or fragments")
     path = parsed.path.rstrip("/")
     if path not in {"", "/rest"}:
         raise ValueError("RouterOS URL must point to the device root or /rest")
-    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    normalized = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    try:
+        httpx.URL(normalized)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("RouterOS URL has an invalid hostname or port") from exc
+    return normalized
 
 
 def _allowed_routeros_ip(value: str) -> bool:
@@ -460,10 +472,19 @@ class RouterOSService:
         return {**self.presence(), "connected": False}
 
     async def overview(self) -> dict[str, Any]:
-        presence = self.presence()
         config = self._load_config()
+        return await self._overview_with_config(config)
+
+    async def _overview_with_config(
+        self, config: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        presence = self.presence()
         if not config:
             return {**presence, "connected": False, "health": [], "interfaces": []}
+        # A caller holding an explicit snapshot must report that snapshot
+        # consistently even if connect/disconnect changes the durable file
+        # while its read/write/read transaction is in flight.
+        presence = {**presence, "detected": True, "configured": True}
         try:
             resource = _single(await self._request("GET", "system/resource", config=config))
             if str(resource.get("platform") or "").casefold() != "mikrotik":
@@ -577,12 +598,18 @@ class RouterOSService:
         return result
 
     async def update_fan_settings(self, body: Any) -> dict[str, Any]:
-        current = await self.overview()
+        config = self._load_config()
+        if not config:
+            raise RuntimeError("RouterOS switch is not connected")
+        current = await self._overview_with_config(config)
         if not current.get("connected"):
             raise RuntimeError(str(current.get("error") or "RouterOS switch is not connected"))
         supported = set(current.get("fan_capabilities") or [])
         if not supported:
             raise ValueError("manual fan control is unavailable on this RouterOS device")
         validated = self.validate_fan_settings(body, supported)
-        await self._request("POST", "system/health/settings/set", json_body=validated)
-        return await self.overview()
+        await self._request(
+            "POST", "system/health/settings/set",
+            config=config, json_body=validated,
+        )
+        return await self._overview_with_config(config)

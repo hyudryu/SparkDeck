@@ -348,11 +348,17 @@ class SparkDeckStore:
 
 
 def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
+    hardware = json.loads(row["hardware_json"])
+    # Normalize records written before the public benchmark contract settled on
+    # ``hardware_class`` so local history remains useful without leaking any
+    # additional machine identity.
+    if "hardware_class" not in hardware and "device_class" in hardware:
+        hardware["hardware_class"] = hardware.pop("device_class")
     value = {
         "id": row["id"], "created_at": row["created_at"],
         "deployment_id": row["deployment_id"], "model": json.loads(row["model_json"]),
         "runtime": row["runtime"], "runtime_version": row["runtime_version"],
-        "hardware": json.loads(row["hardware_json"]),
+        "hardware": hardware,
         "configuration": json.loads(row["configuration_json"]),
         "input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"],
         "latency_ms": row["latency_ms"], "ttft_ms": row["ttft_ms"],

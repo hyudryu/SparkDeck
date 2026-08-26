@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -73,6 +74,51 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot["hardware_class"], "dgx-spark")
         self.assertNotIn("device_class", snapshot)
+
+    async def test_remote_primary_benchmark_uses_serving_node_hardware(self):
+        self.manager._cluster_primary_member = lambda _: (
+            {"id": "manager-deployment"},
+            {"node_id": "worker-1", "container_name": "rank-0"},
+        )
+        self.manager.node_registry = SimpleNamespace(request=AsyncMock(return_value={
+            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
+        }))
+        self.manager.proxy_cluster_inference = AsyncMock(return_value={
+            "usage": {"prompt_tokens": 24, "completion_tokens": 20},
+        })
+        deployment = {
+            "id": "dep-remote", "alias": "remote-model", "kind": "managed",
+            "runtime": "vllm", "model": {"repository": "org/model"},
+            "settings": {"manager_deployment_id": "manager-deployment"},
+        }
+
+        await self.service._proxy_managed(
+            deployment, {"model": "remote-model", "stream": False},
+            "chat/completions", None,
+        )
+
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(items[0]["hardware"]["hardware_class"], "dgx-spark")
+        self.assertEqual(items[0]["hardware"]["gpus"][0]["model"], "NVIDIA GB10")
+        self.assertTrue(items[0]["eligible_for_community"])
+        self.manager.node_registry.request.assert_awaited_once_with(
+            "worker-1", "GET", "/api/agent/stats", timeout=5,
+        )
+
+    async def test_unknown_endpoint_hardware_stays_local_only(self):
+        self.service.store.set_setting("community_consent", True)
+
+        self.service._record_response(
+            "external", "org/model", "vllm", {}, time.monotonic() - 0.2,
+            {"usage": {"prompt_tokens": 24, "completion_tokens": 20}},
+            hardware=self.service._unknown_hardware_snapshot(),
+            hardware_verified=False,
+        )
+
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(items[0]["hardware"]["hardware_class"], "unknown")
+        self.assertFalse(items[0]["eligible_for_community"])
+        self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_short_sample_remains_local_and_is_not_queued(self):
         self.service.store.set_setting("community_consent", True)

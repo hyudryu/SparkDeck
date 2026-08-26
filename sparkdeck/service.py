@@ -17,7 +17,7 @@ import httpx
 
 from .catalog import HuggingFaceCatalog
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from .runtimes import RuntimeRegistry, launch_managed_container
+from .runtimes import RuntimeRegistry, launch_managed_container, safe_container_name
 from .storage import SparkDeckStore
 
 
@@ -35,6 +35,7 @@ class SparkDeckService:
         self.store = SparkDeckStore(Path(data_dir) / "sparkdeck.sqlite3")
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(manager.http)
+        self._deployment_create_lock = asyncio.Lock()
 
     async def close(self) -> None:
         self.store.close()
@@ -106,10 +107,12 @@ class SparkDeckService:
     async def deployments(self) -> list[dict[str, Any]]:
         registered = self.store.deployments(include_private=True)
         by_container = {item.get("container_name"): item for item in registered}
+        docker_unavailable = False
         try:
             containers = await self.manager.list_containers()
         except Exception:
             containers = []
+            docker_unavailable = True
         seen: set[str] = set()
         for container in containers:
             runtime = self._container_runtime(container)
@@ -125,21 +128,18 @@ class SparkDeckService:
             model = container.get("model") or container.get("served_model")
             if not model:
                 continue
-            generated_id = container.get("deployment_id") or f"container:{container.get('name')}"
-            registered.append({
-                "id": generated_id,
-                "alias": container.get("alias") or container.get("served_model") or model,
-                "runtime": runtime,
-                "kind": "managed" if container.get("managed") else "external",
-                "model": {"repository": model, "revision": None,
-                          "artifact": None, "quantization": container.get("variant")},
-                "status": _deployment_status(container.get("status")),
-                "container_name": container.get("name"),
-                "settings": self._safe_configuration(container.get("load_settings") or {}),
-                "base_url_set": bool(container.get("port")),
-                "port": container.get("port"),
-                "managed": bool(container.get("managed")),
-            })
+            registered.append(self._discovered_deployment(container, runtime, model))
+        for deployment in registered:
+            if (
+                deployment.get("kind") == DeploymentKind.MANAGED.value
+                and deployment.get("id") not in seen
+                and not str(deployment.get("id") or "").startswith("container:")
+            ):
+                deployment["status"] = "missing"
+                deployment["last_error"] = (
+                    "Docker is unavailable" if docker_unavailable
+                    else "Managed container is missing"
+                )
         async def probe_external(deployment: dict[str, Any]) -> None:
             if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
                 return
@@ -187,33 +187,56 @@ class SparkDeckService:
             model=identity, settings=self._safe_configuration(settings),
             base_url_set=bool(body.get("base_url")),
         )
-        # Force uniqueness before a potentially expensive container launch.
-        if self.store.deployment(alias):
-            raise ValueError(f"deployment alias '{alias}' is already in use")
-        if kind is DeploymentKind.EXTERNAL:
-            base_url = self._validate_base_url(body.get("base_url"))
-            credential_ref = self._store_credential(deployment_id, body.get("api_key"))
-            self.store.add_deployment(deployment, base_url, credential_ref)
-            return (self.store.deployment(deployment_id) or deployment.to_dict())
+        # A launch can take minutes, but serializing creation is intentional:
+        # alias uniqueness must be established before Docker is mutated.
+        async with self._deployment_create_lock:
+            if self.store.deployment(alias):
+                raise ValueError(f"deployment alias '{alias}' is already in use")
+            if kind is DeploymentKind.EXTERNAL:
+                base_url = self._validate_base_url(body.get("base_url"))
+                credential_ref = self._store_credential(deployment_id, body.get("api_key"))
+                try:
+                    self.store.add_deployment(deployment, base_url, credential_ref)
+                except Exception:
+                    self._delete_credential(deployment_id, credential_ref)
+                    raise
+                return (self.store.deployment(deployment_id) or deployment.to_dict())
 
-        adapter = self.registry.get(runtime)
-        launched = await launch_managed_container(
-            self.manager, adapter, deployment_id, alias, model,
-            {**settings, "artifact": identity.artifact},
-        )
-        deployment.container_name = launched.get("name")
-        port = launched.get("port")
-        if not deployment.container_name or not port:
-            raise RuntimeError("runtime launched without a discoverable container endpoint")
-        self.store.add_deployment(
-            deployment, f"http://127.0.0.1:{int(port)}", None
-        )
-        result = self.store.deployment(deployment_id) or deployment.to_dict()
-        result.update({"status": launched.get("status", "running"), "port": int(port)})
-        return result
+            adapter = self.registry.get(runtime)
+            cleanup_name = safe_container_name(alias, deployment_id)
+            try:
+                launched = await launch_managed_container(
+                    self.manager, adapter, deployment_id, alias, model,
+                    {**settings, "artifact": identity.artifact},
+                )
+                deployment.container_name = launched.get("name")
+                port = launched.get("port")
+                if not deployment.container_name or not port:
+                    raise RuntimeError("runtime launched without a discoverable container endpoint")
+                cleanup_name = deployment.container_name
+                self.store.add_deployment(
+                    deployment, f"http://127.0.0.1:{int(port)}", None
+                )
+            except Exception:
+                try:
+                    await self.manager.remove_container(cleanup_name)
+                except Exception:
+                    pass
+                raise
+            result = self.store.deployment(deployment_id) or deployment.to_dict()
+            result.update({"status": launched.get("status", "running"), "port": int(port)})
+            return result
 
     async def deployment_action(self, deployment_id: str, action: str) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
+        discovered = None
+        if not deployment and deployment_id.startswith("container:"):
+            discovered = await self._resolve_discovered_container(deployment_id)
+            deployment = self._discovered_deployment(
+                discovered,
+                self._container_runtime(discovered),
+                discovered.get("model") or discovered.get("served_model"),
+            )
         if not deployment:
             raise LookupError("deployment not found")
         if deployment["kind"] != DeploymentKind.MANAGED.value:
@@ -221,6 +244,17 @@ class SparkDeckService:
         container = deployment.get("container_name")
         if not container:
             raise LookupError("managed container not found")
+        if discovered is None:
+            try:
+                current = next(
+                    (item for item in await self.manager.list_containers()
+                     if item.get("name") == container),
+                    None,
+                )
+            except Exception as exc:
+                raise LookupError("managed container is unavailable") from exc
+            if current is None:
+                raise LookupError("managed container not found")
         if action == "start":
             await self.manager.start_container(container)
         elif action == "stop":
@@ -233,13 +267,59 @@ class SparkDeckService:
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
+        discovered = False
+        if not deployment and deployment_id.startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            deployment = self._discovered_deployment(
+                container, self._container_runtime(container),
+                container.get("model") or container.get("served_model"),
+            )
+            discovered = True
         if not deployment:
             raise LookupError("deployment not found")
         if deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
             await self.manager.remove_container(deployment["container_name"])
-        self._delete_credential(deployment_id, deployment.get("_credential_ref"))
-        self.store.delete_deployment(deployment_id)
+        if not discovered:
+            self._delete_credential(deployment_id, deployment.get("_credential_ref"))
+            self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
+
+    async def _resolve_discovered_container(self, deployment_id: str) -> dict[str, Any]:
+        name = deployment_id.removeprefix("container:")
+        try:
+            container = next(
+                (item for item in await self.manager.list_containers()
+                 if item.get("name") == name),
+                None,
+            )
+        except Exception as exc:
+            raise LookupError("managed container is unavailable") from exc
+        if container is None or self._container_runtime(container) not in self.registry.kinds:
+            raise LookupError("managed container not found")
+        return container
+
+    def _discovered_deployment(
+        self, container: dict[str, Any], runtime: str, model: str
+    ) -> dict[str, Any]:
+        return {
+            # Synthetic IDs intentionally key by container name. A cluster
+            # deployment ID may be shared by several ranks and cannot identify
+            # an individual legacy container action safely.
+            "id": f"container:{container.get('name')}",
+            "alias": container.get("alias") or container.get("served_model") or model,
+            "runtime": runtime,
+            "kind": "managed" if container.get("managed") else "external",
+            "model": {
+                "repository": model, "revision": None, "artifact": None,
+                "quantization": container.get("variant"),
+            },
+            "status": _deployment_status(container.get("status")),
+            "container_name": container.get("name"),
+            "settings": self._safe_configuration(container.get("load_settings") or {}),
+            "base_url_set": bool(container.get("port")),
+            "port": container.get("port"),
+            "managed": bool(container.get("managed")),
+        }
 
     async def models(self) -> dict[str, Any]:
         data = []

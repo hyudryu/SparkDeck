@@ -18,6 +18,9 @@ class FakeManager:
         self.remove_container = AsyncMock(return_value={"ok": True})
         self._vllm_chat = AsyncMock()
         self._vllm_completions = AsyncMock()
+        self.proxy_chat_completions = AsyncMock()
+        self.proxy_completions = AsyncMock()
+        self._unsloth_loaded_model = AsyncMock(return_value=None)
 
 
 class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +68,22 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmanaged_discovered_container_remove_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "user-container", "model": "org/model", "engine": "vllm",
+                "managed": False, "status": "running", "port": 8000,
+            }]
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(ValueError, "unmanaged discovered containers"):
+                await service.delete_deployment("container:user-container")
+
+            manager.remove_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_missing_container_is_still_deleted_from_local_store(self):
         class NotFound(Exception):
             pass
@@ -118,6 +137,57 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ClientAbort):
                 await request
             self.assertTrue(closed.is_set())
+            await service.close()
+
+    async def test_external_stream_status_is_raised_before_iteration(self):
+        def unavailable(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="backend unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            await manager.http.aclose()
+            manager.http = httpx.AsyncClient(transport=httpx.MockTransport(unavailable))
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="external-stream", alias="external-stream",
+                runtime=RuntimeKind.LLAMA_CPP, kind=DeploymentKind.EXTERNAL,
+                model=ModelIdentity("local/model"), base_url_set=True,
+            ), "http://127.0.0.1:8080")
+
+            with self.assertRaises(httpx.HTTPStatusError) as raised:
+                await service.proxy(
+                    {"model": "external-stream", "messages": [], "stream": True},
+                    "chat/completions",
+                )
+
+            self.assertEqual(raised.exception.response.status_code, 503)
+            await manager.http.aclose()
+            await service.close()
+
+
+class NativeLlamaRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_adopted_native_llama_is_listed_and_uses_manager_router(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager._unsloth_loaded_model.return_value = "org/native-gguf"
+            manager.proxy_chat_completions.return_value = {
+                "model": "org/native-gguf", "choices": [], "usage": {},
+            }
+            service = SparkDeckService(manager, Path(directory))
+
+            models = await service.models()
+            response = await service.proxy(
+                {"model": "org/native-gguf", "messages": [], "stream": False},
+                "chat/completions",
+            )
+
+            native = next(item for item in models["data"] if item["id"] == "org/native-gguf")
+            self.assertEqual(native["runtime"], "llama.cpp")
+            self.assertEqual(native["owned_by"], "llama.cpp")
+            manager.proxy_chat_completions.assert_awaited_once()
+            manager._vllm_chat.assert_not_awaited()
+            self.assertEqual(response["model"], "org/native-gguf")
+            await manager.http.aclose()
             await service.close()
 
 

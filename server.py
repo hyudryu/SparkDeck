@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import urlsplit
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,12 +27,14 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
+from sparkdeck.updater import CONFIRMATION, UpdateService
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 onboarding = OnboardingService(manager, data_dir=ROOT / "data", port=7878)
+updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
@@ -417,6 +420,26 @@ async def agent_pair(req: Request):
 async def agent_status(req: Request):
     _require_agent(req)
     return await manager.agent_status()
+
+
+@app.get("/api/agent/system-update")
+async def agent_system_update(req: Request):
+    _require_agent(req)
+    return updater.agent_status()
+
+
+@app.post("/api/agent/system-update", status_code=202)
+async def agent_start_system_update(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"tag", "revision"}:
+            raise ValueError("request must contain only tag and revision")
+        return await updater.start_local(str(body["tag"]), str(body["revision"]))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.patch("/api/agent/node")
@@ -1418,6 +1441,36 @@ async def v1_update_settings(req: Request):
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
     return values
+
+
+def _require_same_origin_or_forwarded(req: Request) -> None:
+    if any(req.headers.get(name) for name in FORWARD_HEADERS):
+        return
+    origin = req.headers.get("origin")
+    if not origin:
+        return
+    parsed = urlsplit(origin)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != req.headers.get("host", "").casefold():
+        raise HTTPException(403, "system updates require a same-origin request")
+
+
+@app.get("/api/v1/system-update")
+async def system_update_overview():
+    return await updater.overview()
+
+
+@app.post("/api/v1/system-update", status_code=202)
+async def start_system_update(req: Request):
+    _require_same_origin_or_forwarded(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"confirm"}:
+            raise ValueError("request must contain only confirm")
+        return await updater.start_cluster(str(body.get("confirm") or ""))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/v1/storage")

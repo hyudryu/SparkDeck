@@ -189,6 +189,46 @@ export interface AppSettings {
   [key: string]: unknown
 }
 
+export interface SystemUpdateRelease {
+  tag: string
+  revision: string
+  name: string
+  url?: string
+  published_at?: string
+}
+
+export interface SystemUpdateNode {
+  id: string
+  name: string
+  local: boolean
+  online: boolean
+  current_revision?: string
+  phase?: string
+  error?: string
+  blockers: string[]
+}
+
+export interface SystemUpdateJob {
+  id: string
+  active: boolean
+  phase: string
+  message?: string
+  error?: string
+  target_tag: string
+  target_revision: string
+  nodes: SystemUpdateNode[]
+}
+
+export interface SystemUpdateOverview {
+  repository: string
+  current_revision?: string
+  latest_release?: SystemUpdateRelease | null
+  can_update: boolean
+  blockers: string[]
+  nodes: SystemUpdateNode[]
+  job?: SystemUpdateJob | null
+}
+
 export interface LogEntry {
   timestamp?: string
   level?: string

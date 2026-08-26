@@ -11,7 +11,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
@@ -308,6 +308,8 @@ class NodeRegistry:
         path: str,
         *,
         json_body: dict | None = None,
+        content: AsyncIterator[bytes] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = 600,
     ) -> httpx.Response:
         """Open an authenticated agent stream; the caller must close it."""
@@ -316,12 +318,16 @@ class NodeRegistry:
             raise ValueError("remote node not found")
         if not node.get("enabled", True):
             raise ValueError(f"node {node.get('name', node_id)} is disabled")
+        request_headers = dict(headers or {})
+        request_headers["Authorization"] = f"Bearer {node['agent_token']}"
+        payload: dict[str, Any] = {}
+        if content is not None:
+            payload["content"] = content
+        elif json_body is not None:
+            payload["json"] = json_body
         request = self.http.build_request(
-            method,
-            f"{node['agent_url']}{path}",
-            headers={"Authorization": f"Bearer {node['agent_token']}"},
-            json=json_body,
-            timeout=timeout,
+            method, f"{node['agent_url']}{path}", headers=request_headers,
+            timeout=timeout, **payload,
         )
         try:
             return await self.http.send(request, stream=True)

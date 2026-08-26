@@ -30,6 +30,7 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
+from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -56,6 +57,8 @@ DEFAULT_SETTINGS = {
     # Exchange per-node lifetime/hourly token counters with paired nodes.
     # Per-origin revisions make repeated pull/push cycles idempotent.
     "sync_token_usage": False,
+    # Opt-in model cache replication across authenticated cluster nodes.
+    "virtual_nas_enabled": False,
     # Cluster management uses the normal LAN/Tailscale address while model
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
@@ -370,6 +373,12 @@ class Manager:
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(self.data_dir, self.http)
+        self.virtual_nas = VirtualNAS(
+            self.data_dir,
+            lambda: Path(self.settings.get("hf_cache") or "") / "hub",
+            self.node_registry,
+            lambda: bool(self.settings.get("virtual_nas_enabled", False)),
+        )
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
@@ -518,6 +527,7 @@ class Manager:
 
     async def adopt_worker_role(self) -> None:
         """Stop controller-only schedulers after a successful live join."""
+        await self.virtual_nas.stop()
         for field in (
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
@@ -535,10 +545,12 @@ class Manager:
     def adopt_controller_role(self) -> None:
         """Resume controller schedulers after leaving a controller."""
         self._start_controller_tasks()
+        self.virtual_nas.start()
 
     async def start(self):
         if not self.is_joined_worker():
             self._start_controller_tasks()
+            self.virtual_nas.start()
         self.inference_nudger_task = asyncio.create_task(
             self._inference_nudger_loop()
         )
@@ -548,6 +560,7 @@ class Manager:
         self._start_mem_bw_monitor()
 
     async def stop(self):
+        await self.virtual_nas.stop()
         for t in (
             self.worker_task,
             self.idle_task,
@@ -866,6 +879,154 @@ class Manager:
             names = [available[node_id].get("name", node_id) for node_id in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
         return [available[node_id] for node_id in requested]
+
+    def virtual_nas_enabled(self) -> bool:
+        return bool(self.settings.get("virtual_nas_enabled", False))
+
+    async def virtual_nas_inventory(self) -> dict:
+        instructions = [
+            "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
+            "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
+        ]
+        if not self.virtual_nas_enabled():
+            return {
+                "enabled": False, "nodes": [], "jobs": [],
+                "instructions": instructions,
+            }
+        cluster_nodes = await self.cluster_nodes()
+
+        async def inventory_for(node: dict) -> dict:
+            models: list[dict] = []
+            online = bool(node.get("online"))
+            if online:
+                try:
+                    if node.get("id") == LOCAL_NODE_ID:
+                        models = await asyncio.to_thread(self.virtual_nas.inventory)
+                    else:
+                        payload = await self.node_registry.request(
+                            node["id"], "GET", "/api/agent/virtual-nas/inventory",
+                            timeout=30,
+                        )
+                        models = list((payload or {}).get("models") or [])
+                except Exception:
+                    online = False
+            return {
+                "id": node.get("id"), "name": node.get("name"),
+                "online": online,
+                "total_size": max(0, int(
+                    (node.get("disk") or {}).get("total")
+                    or (node.get("disk") or {}).get("total_bytes")
+                    or 0
+                )),
+                "free_size": max(0, int(
+                    (node.get("disk") or {}).get("free")
+                    or (node.get("disk") or {}).get("free_bytes")
+                    or 0
+                )),
+                "models": models,
+            }
+
+        nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
+        return {
+            "enabled": True, "nodes": nodes,
+            "jobs": self.virtual_nas_transfers()["items"],
+            "instructions": instructions,
+        }
+
+    async def queue_virtual_nas_transfer(
+        self, model_id: str, source_node_id: str,
+        target_node_ids: list[str],
+    ) -> dict:
+        result = await self.virtual_nas.queue_transfer(
+            model_id, source_node_id, target_node_ids,
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
+    def virtual_nas_transfers(self) -> dict:
+        return {
+            "items": [
+                self._public_virtual_nas_job(job)
+                for job in self.virtual_nas.list_transfers()["items"]
+            ]
+        }
+
+    async def cancel_virtual_nas_transfer(self, job_id: str) -> dict:
+        return self._public_virtual_nas_job(
+            await self.virtual_nas.cancel_transfer(job_id)
+        )
+
+    def _public_virtual_nas_job(self, job: dict) -> dict:
+        def node_name(node_id: str) -> str:
+            if node_id == LOCAL_NODE_ID:
+                return str(self.settings.get("cluster_node_name") or "This node")
+            node = self.node_registry.get(node_id) or {}
+            return str(node.get("name") or node_id)
+
+        total = max(0, int(job.get("bytes_total") or 0))
+        transferred = max(0, int(job.get("bytes_transferred") or 0))
+        progress = (
+            min(1.0, transferred / total) if total
+            else (1.0 if job.get("status") == "completed" else 0.0)
+        )
+        return {
+            **job,
+            "source_node_name": node_name(job["source_node_id"]),
+            "target_node_name": node_name(job["target_node_id"]),
+            "progress": progress,
+            "finished_at": job.get("completed_at"),
+        }
+
+    async def delete_virtual_nas_model(self, node_id: str, model_id: str) -> dict:
+        model_id = validate_model_id(model_id)
+        node_id = str(node_id or "")
+        if self.virtual_nas.model_in_transfer(model_id, node_id):
+            raise RuntimeError("model is in use by a virtual NAS transfer")
+        if node_id != LOCAL_NODE_ID:
+            node = self.node_registry.get(node_id)
+            if not node:
+                raise ValueError(f"unknown node_id '{node_id}'")
+            status = await self.node_registry.probe(node, force=True)
+            if not status.get("online"):
+                raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
+            result = await self.node_registry.request(
+                node_id, "DELETE",
+                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}",
+                timeout=600,
+            )
+            return {**(result or {}), "node_id": node_id, "model_id": model_id}
+        if await self._local_model_uses_cache(model_id):
+            raise RuntimeError("model is in use by a local deployment")
+        return {
+            **self.virtual_nas.delete_model(model_id),
+            "node_id": LOCAL_NODE_ID,
+        }
+
+    async def _local_model_uses_cache(self, model_id: str) -> bool:
+        active_container_states = {"created", "restarting", "running", "paused"}
+        try:
+            for container in await self.list_containers():
+                if str(container.get("status") or "").lower() not in active_container_states:
+                    continue
+                ids = set(self._container_model_ids(container))
+                ids.add(str(container.get("model") or ""))
+                if model_id in ids:
+                    return True
+        except Exception:
+            # A Docker outage is not evidence that a model is unused. Fail
+            # closed so cache deletion cannot break an opaque running process.
+            raise RuntimeError("cannot verify whether the model is in use")
+        if await self._unsloth_loaded_model() == model_id:
+            return True
+        for deployment in self.deployments:
+            if deployment.get("model") != model_id:
+                continue
+            if deployment.get("status") in {"stopped", "error", "removed"}:
+                continue
+            members = deployment.get("members") or []
+            if not members or any(member.get("node_id") == LOCAL_NODE_ID for member in members):
+                return True
+        return False
 
     async def pair_node(self, body: dict) -> dict:
         return await self.node_registry.pair_remote(
@@ -3478,6 +3639,10 @@ class Manager:
                         continue
                     self.settings[k] = v
             self._save_settings()
+        if self.settings.get("virtual_nas_enabled") and not self.is_joined_worker():
+            self.virtual_nas.start()
+        elif not self.settings.get("virtual_nas_enabled"):
+            await self.virtual_nas.stop()
         return self.public_settings()
 
     # ---------- lifetime token stats ----------

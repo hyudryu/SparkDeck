@@ -116,6 +116,58 @@ describe('model discovery', () => {
     expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
     expect(screen.getByRole('textbox', { name: 'Display name' })).toHaveValue('chosen-model')
   })
+
+  it('merges late saved defaults into untouched fields in a catalog deployment', async () => {
+    let resolveSettings!: (response: Response) => void
+    const settingsResponse = new Promise<Response>((resolve) => { resolveSettings = resolve })
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/settings')) return settingsResponse
+      const body = path.includes('/api/v1/nodes')
+        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
+        : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
+    resolveSettings(new Response(JSON.stringify({
+      default_runtime: 'sglang',
+      default_context_length: 32768,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('sglang')
+      expect(screen.getByRole('spinbutton', { name: 'Context length' })).toHaveValue(32768)
+    })
+  })
+
+  it('does not overwrite deployment fields edited before saved defaults load', async () => {
+    const user = userEvent.setup()
+    let resolveSettings!: (response: Response) => void
+    const settingsResponse = new Promise<Response>((resolve) => { resolveSettings = resolve })
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/settings')) return settingsResponse
+      const body = path.includes('/api/v1/nodes')
+        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
+        : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
+
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+    const contextLength = screen.getByRole('spinbutton', { name: 'Context length' })
+    resolveSettings(new Response(JSON.stringify({
+      default_runtime: 'sglang',
+      default_context_length: 32768,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await waitFor(() => expect(contextLength).toHaveValue(32768))
+    expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('llama.cpp')
+  })
 })
 
 describe('model deployments', () => {

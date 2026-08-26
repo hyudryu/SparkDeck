@@ -135,7 +135,9 @@ export interface RouterOSHealthItem {
 }
 
 export interface RouterOSNodeOverview extends RouterOSPresenceNode {
-  discovery: RouterOSDiscoveryCandidate[]
+  discovery?: RouterOSDiscoveryCandidate[]
+  base_url?: string
+  verify_tls?: boolean
   error?: string
   device?: Record<string, unknown>
   health: RouterOSHealthItem[] | null

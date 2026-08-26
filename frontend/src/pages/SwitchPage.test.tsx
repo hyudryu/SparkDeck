@@ -66,6 +66,41 @@ describe('SwitchPage', () => {
     })))
   })
 
+  it('keeps manual setup available when a node has no discovery payload', async () => {
+    const withoutDiscovery = {
+      detected: false,
+      nodes: [{
+        node_id: 'offline-node', node_name: 'Offline Spark', detected: false,
+        configured: false, connected: false, health: [], interfaces: [],
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(withoutDiscovery)))
+
+    render(<SwitchPage />)
+
+    expect(await screen.findByText('Offline Spark')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: /^RouterOS URL/ })).toHaveValue('')
+    expect(screen.queryByLabelText(/Discovered RouterOS candidates/)).not.toBeInTheDocument()
+  })
+
+  it('initializes connection edits from saved values before discovery defaults', async () => {
+    const configured = {
+      detected: true,
+      nodes: [{
+        ...connected.nodes[0],
+        base_url: 'https://router.example.internal',
+        verify_tls: false,
+        discovery: [{ address: '192.168.88.1', identity: 'Different Switch' }],
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(configured)))
+
+    render(<SwitchPage />)
+
+    expect(await screen.findByRole('textbox', { name: /^RouterOS URL/ })).toHaveValue('https://router.example.internal')
+    expect(screen.getByRole('checkbox', { name: /Verify TLS certificate/ })).not.toBeChecked()
+  })
+
   it('renders RouterOS telemetry and updates supported fan settings', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => init?.method === 'PATCH' ? json(connected.nodes[0]) : json(connected))
     vi.stubGlobal('fetch', fetchMock)

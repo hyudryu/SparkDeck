@@ -34,7 +34,7 @@ from cluster import (
 )
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
-from sparkdeck.routeros import RouterOSService
+from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -155,6 +155,12 @@ VLLM_MAX_CONCURRENCY_RE = re.compile(
 FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
 FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
 FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
+
+# A fan update performs two RouterOS overviews around the settings write. Each
+# overview has three sequential request phases (resource, gathered details,
+# then traffic), so the remote controller request must cover seven RouterOS
+# timeout windows plus agent transport/serialization overhead.
+ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS = ROUTEROS_TIMEOUT_SECONDS * 7 + 10.0
 
 # CPU/GPU chart history.  Thirty-second samples keep the payload small while
 # retaining enough detail for a useful two-hour view (including both ends of
@@ -1045,7 +1051,7 @@ class Manager:
             return await self.routeros.update_fan_settings(body)
         return await self.node_registry.request(
             node["id"], "PATCH", "/api/agent/routeros/fan-settings",
-            json_body=body, timeout=20,
+            json_body=body, timeout=ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS,
         )
 
     async def rename_cluster_node(self, node_id: str, name: Any) -> dict:

@@ -1,4 +1,5 @@
 import json
+import socket
 import tempfile
 import time
 import unittest
@@ -7,8 +8,12 @@ from unittest import mock
 
 import httpx
 
-from manager import Manager
-from sparkdeck.routeros import RouterOSService, parse_mndp_packet
+from manager import Manager, ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS
+from sparkdeck.routeros import (
+    ROUTEROS_TIMEOUT_SECONDS,
+    RouterOSService,
+    parse_mndp_packet,
+)
 
 
 def _tlv(kind: int, value: bytes) -> bytes:
@@ -162,6 +167,145 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
             })
         self.assertFalse(service.config_path.exists())
 
+    async def test_authenticated_request_pins_validated_hostname_resolution(self) -> None:
+        requests = []
+        resolutions = []
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            address = "192.168.88.10" if len(resolutions) == 1 else "8.8.8.8"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[{"platform": "MikroTik"}], request=request)
+
+        service = RouterOSService(
+            Path(self.directory.name), transport=httpx.MockTransport(handler),
+        )
+        config = {
+            "base_url": "https://switch.private.example:8443",
+            "username": "sparkdeck", "password": "secret", "verify_tls": True,
+        }
+        with mock.patch(
+            "sparkdeck.routeros.socket.getaddrinfo", side_effect=resolve,
+        ):
+            result = await service._request("GET", "system/resource", config=config)
+
+        self.assertEqual(result, [{"platform": "MikroTik"}])
+        self.assertEqual(resolutions, [("switch.private.example", 8443)])
+        self.assertEqual(
+            str(requests[0].url),
+            "https://192.168.88.10:8443/rest/system/resource",
+        )
+        self.assertEqual(requests[0].headers["host"], "switch.private.example:8443")
+        self.assertEqual(
+            requests[0].extensions["sni_hostname"], "switch.private.example",
+        )
+        self.assertTrue(requests[0].headers["authorization"].startswith("Basic "))
+
+    async def test_each_request_rejects_hostname_that_rebinds_public(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            address = "192.168.88.10" if resolution_count == 1 else "8.8.8.8"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[], request=request)
+
+        service = RouterOSService(
+            Path(self.directory.name), transport=httpx.MockTransport(handler),
+        )
+        config = {
+            "base_url": "http://switch.private.example:8080",
+            "username": "sparkdeck", "password": "secret", "verify_tls": True,
+        }
+        with mock.patch(
+            "sparkdeck.routeros.socket.getaddrinfo", side_effect=resolve,
+        ):
+            await service._request("GET", "system/resource", config=config)
+            with self.assertRaisesRegex(RuntimeError, "Could not communicate"):
+                await service._request("GET", "system/resource", config=config)
+
+        self.assertEqual(resolution_count, 2)
+        self.assertEqual(len(requests), 1)
+
+    async def test_request_tries_each_pinned_private_address_on_connect_failure(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.10", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.11", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address unavailable", request=request)
+            return httpx.Response(200, json=[], request=request)
+
+        service = RouterOSService(
+            Path(self.directory.name), transport=httpx.MockTransport(handler),
+        )
+        config = {
+            "base_url": "https://switch.private.example",
+            "username": "sparkdeck", "password": "secret", "verify_tls": True,
+        }
+        with mock.patch(
+            "sparkdeck.routeros.socket.getaddrinfo", side_effect=resolve,
+        ):
+            result = await service._request("POST", "system/health", config=config)
+
+        self.assertEqual(result, [])
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://10.0.0.10/rest/system/health",
+            "https://10.0.0.11/rest/system/health",
+        ])
+        self.assertTrue(all(
+            request.headers["host"] == "switch.private.example"
+            and request.extensions["sni_hostname"] == "switch.private.example"
+            and request.headers["authorization"].startswith("Basic ")
+            for request in requests
+        ))
+
+    async def test_authenticated_request_does_not_follow_redirects(self) -> None:
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                307,
+                headers={"location": "https://attacker.example/collect"},
+                request=request,
+            )
+
+        service = RouterOSService(
+            Path(self.directory.name), transport=httpx.MockTransport(handler),
+        )
+        with self.assertRaisesRegex(RuntimeError, "HTTP 307"):
+            await service._request("GET", "system/resource", config={
+                "base_url": "http://10.0.0.10", "username": "sparkdeck",
+                "password": "secret", "verify_tls": True,
+            })
+
+        self.assertEqual(len(requests), 1)
+
     def test_fan_validation_rejects_unknown_unavailable_and_out_of_range_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported"):
             self.service.validate_fan_settings({"script": "anything"})
@@ -174,6 +318,29 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_fan_update_timeout_covers_worker_request_budget(self) -> None:
+        manager = Manager.__new__(Manager)
+        manager._routeros_target = mock.AsyncMock(return_value={"id": "worker-1"})
+        manager.node_registry = mock.Mock()
+        manager.node_registry.request = mock.AsyncMock(return_value={"connected": True})
+        body = {"fan-target-temp": 55}
+
+        result = await manager.update_routeros_fan_settings("worker-1", body)
+
+        self.assertTrue(result["connected"])
+        manager.node_registry.request.assert_awaited_once_with(
+            "worker-1",
+            "PATCH",
+            "/api/agent/routeros/fan-settings",
+            json_body=body,
+            timeout=ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS,
+        )
+        # update_fan_settings has two three-phase overviews plus one write.
+        self.assertGreater(
+            ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS,
+            ROUTEROS_TIMEOUT_SECONDS * 7,
+        )
+
     async def test_remote_only_discovery_enables_cluster_presence(self) -> None:
         manager = Manager.__new__(Manager)
         manager.cluster_nodes = mock.AsyncMock(return_value=[

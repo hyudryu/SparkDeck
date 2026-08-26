@@ -16,6 +16,8 @@ class FakeManager:
         self.list_containers = AsyncMock(return_value=[])
         self.start_container = AsyncMock(return_value={"status": "running"})
         self.stop_container = AsyncMock(return_value={"status": "exited"})
+        self._vllm_chat = AsyncMock()
+        self._vllm_completions = AsyncMock()
 
 
 class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
@@ -52,6 +54,10 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_deployment_action_returns_a_wire_deployment(self):
+        self.manager.list_containers.return_value = [{
+            "name": "sparkdeck-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
         self.service.store.add_deployment(Deployment(
             id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
@@ -64,6 +70,34 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["model"]["repository"], "org/model")
         self.assertEqual(result["status"], "running")
         self.assertNotIn("_base_url", result)
+
+    async def test_registered_managed_runtimes_keep_manager_admission_proxy(self):
+        completion = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 20},
+        }
+        self.manager._vllm_chat.side_effect = lambda *args: dict(completion)
+        self.manager._vllm_completions.side_effect = lambda *args: dict(completion)
+        cases = (
+            ("vllm-chat", RuntimeKind.VLLM, "chat/completions", self.manager._vllm_chat),
+            ("vllm-completion", RuntimeKind.VLLM, "completions", self.manager._vllm_completions),
+            ("sglang-chat", RuntimeKind.SGLANG, "chat/completions", self.manager._vllm_chat),
+            ("sglang-completion", RuntimeKind.SGLANG, "completions", self.manager._vllm_completions),
+        )
+        for index, (alias, runtime, endpoint, expected_proxy) in enumerate(cases):
+            with self.subTest(alias=alias):
+                self.service.store.add_deployment(Deployment(
+                    id=f"dep-{index}", alias=alias, runtime=runtime,
+                    kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity(f"org/model-{index}", revision=f"rev-{index}"),
+                    container_name=f"container-{index}",
+                ), f"http://127.0.0.1:{8000 + index}")
+                result = await self.service.proxy(
+                    {"model": alias, "messages": [], "stream": False}, endpoint,
+                )
+                self.assertEqual(result["model"], alias)
+                self.assertEqual(expected_proxy.await_args.args[0], f"org/model-{index}")
+
 
 
 if __name__ == "__main__":

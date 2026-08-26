@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/chat', '/compare', '/benchmarks', '/images', '/storage', '/settings', '/logs']
+const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
@@ -8,6 +8,18 @@ test.beforeEach(async ({ page }) => {
     const path = new URL(route.request().url()).pathname
     let body: unknown = {}
     if (path.includes('/catalog/models')) body = { items: [], total: 0, next_cursor: null }
+    else if (path === '/api/token-stats') body = {
+      models: { 'org/test-model': { input: 1500, cached: 500, output: 750, requests: 12, gen_time_s: 25 } },
+      total: { input: 1500, cached: 500, output: 750, requests: 12 },
+      groups: [{
+        key: 'model:org/test-model', label: 'Test workload', merge_group: null, route_target: 'org/test-model', models: ['org/test-model'],
+        members: [{ model: 'org/test-model', alias: 'Test workload', merge_group: null, routed_to: null }],
+        stats: { input: 1500, input_miss: 1000, cached: 500, measured_cached: 500, estimated_cached: 0, output: 750, requests: 12, gen_tokens: 750, gen_time_s: 25 },
+        speed: { tokens: 750, active_time_s: 25, tok_s: 30, legacy: false }, total_cost: 1.25, cost_estimated: false,
+      }],
+    }
+    else if (path === '/api/token-stats/hourly') body = [{ hour: '2026-08-26T11', input: 600, cached: 200, output: 250, requests: 2 }]
+    else if (path === '/api/token-stats/daily') body = [{ date: '2026-08-26', input: 600, cached: 200, output: 250, requests: 2 }]
     else if (path.endsWith('/stats')) body = { cpu_pct: 24, cpu_temp_c: 52, gpus: [{ index: 0, name: 'Test GPU', util: 48, mem_used_mib: 8192, mem_total_mib: 32768, temp: 61 }], active_requests: { 'test-model': { connections: 2, output_tok_s: 18.4, queued: 3 } }, ts: 1787724000 }
     else if (path.endsWith('/inference-queue')) body = { 'dep-1': { model: 'test-model', running: 2, queued: 3, oldest_wait_seconds: 1.5 } }
     else if (path.endsWith('/deployments')) body = { items: [{ id: 'dep-1', alias: 'Test model', runtime: 'vllm', kind: 'managed', model: { repository: 'org/test-model' }, status: 'running', settings: {} }] }
@@ -45,6 +57,18 @@ test('keeps every primary route within the viewport', async ({ page }) => {
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     expect(overflow, `${route} has horizontal overflow`).toBeLessThanOrEqual(1)
   }
+})
+
+test('renders lifetime and analysis usage without horizontal overflow', async ({ page }) => {
+  await page.goto('/usage')
+  await expect(page.getByRole('heading', { name: 'Usage' })).toBeVisible()
+  await expect(page.getByRole('table', { name: 'Lifetime model usage' })).toContainText('Test workload')
+  await expect(page.getByLabel('Lifetime totals')).toContainText('$1.25')
+  await page.getByRole('tab', { name: 'Analysis' }).click()
+  await expect(page.getByRole('img', { name: 'Hourly input and output token activity' })).toBeVisible()
+  await expect(page.getByText('Aug 26')).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
 })
 
 test('uses Dashboard as home and keeps Explore on its own route', async ({ page }) => {

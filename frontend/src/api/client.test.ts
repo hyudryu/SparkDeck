@@ -148,4 +148,21 @@ describe('API client adapters', () => {
       { level: 'info', message: 'plain legacy message' },
     ])
   })
+
+  it('loads persisted lifetime and hourly usage from the existing controller APIs', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ models: {}, groups: [], total: { input: 0, output: 0, cached: 0, requests: 0 } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ hour: '2026-08-26T10', input: 10, output: 4, cached: 3, requests: 1 }]), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ date: '2026-08-26', input: 10, output: 4, cached: 3, requests: 1 }]), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.usage.get()
+    await api.usage.analysis('2026-08-01', '2026-08-26')
+
+    expect(fetchMock.mock.calls.map(([path]) => String(path))).toEqual([
+      '/api/token-stats',
+      '/api/token-stats/hourly?start=2026-08-01&end=2026-08-26',
+      '/api/token-stats/daily?start=2026-08-01&end=2026-08-26',
+    ])
+  })
 })

@@ -14,6 +14,7 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
     def test_cluster_route_is_in_direct_refresh_allowlist(self):
         self.assertIn("/cluster", SPA_PATHS)
         self.assertIn("/storage", SPA_PATHS)
+        self.assertIn("/usage", SPA_PATHS)
 
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

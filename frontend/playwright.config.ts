@@ -13,7 +13,7 @@ export default defineConfig({
   retries: 0,
   reporter: 'list',
   use: {
-    baseURL: 'http://127.0.0.1:4173/static/app/',
+    baseURL: 'http://127.0.0.1:4173/',
     colorScheme: 'light',
   },
   projects: viewports.map(({ name, width, height }) => ({
@@ -21,8 +21,8 @@ export default defineConfig({
     use: { viewport: { width, height } },
   })),
   webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 4173',
-    url: 'http://127.0.0.1:4173/static/app/',
+    command: 'npm run dev -- --host 127.0.0.1 --port 4173 --base /',
+    url: 'http://127.0.0.1:4173/',
     reuseExistingServer: true,
   },
 })

@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-const routes = ['/', '/explore', '/models', '/chat', '/compare', '/benchmarks', '/images', '/settings', '/logs']
+const routes = ['/', '/dashboard', '/explore', '/models', '/chat', '/compare', '/benchmarks', '/images', '/settings', '/logs']
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
@@ -26,7 +26,7 @@ test.beforeEach(async ({ page }) => {
 
 test('keeps every primary route within the viewport', async ({ page }) => {
   for (const route of routes) {
-    await page.goto(`http://127.0.0.1:4173/static/app/#${route}`)
+    await page.goto(`http://127.0.0.1:4173${route}`)
     await expect(page.locator('main')).toBeVisible()
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     expect(overflow, `${route} has horizontal overflow`).toBeLessThanOrEqual(1)
@@ -34,18 +34,18 @@ test('keeps every primary route within the viewport', async ({ page }) => {
 })
 
 test('uses Dashboard as home and keeps Explore on its own route', async ({ page }) => {
-  await page.goto('http://127.0.0.1:4173/static/app/#/')
+  await page.goto('http://127.0.0.1:4173/')
   await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
   await expect(page.getByText('52.0°C')).toBeVisible()
   await expect(page.getByText('2 active · 3 queued requests')).toBeVisible()
   await expect(page.getByText('Test model')).toBeVisible()
-  await page.goto('http://127.0.0.1:4173/static/app/#/explore')
-  await expect(page).toHaveURL(/#\/explore$/)
+  await page.goto('http://127.0.0.1:4173/explore')
+  await expect(page).toHaveURL(/\/explore$/)
   await expect(page.getByRole('heading', { name: 'Find the right model for your hardware' })).toBeVisible()
 })
 
 test('keeps a saved theme after reload', async ({ page }) => {
-  await page.goto('http://127.0.0.1:4173/static/app/#/settings')
+  await page.goto('http://127.0.0.1:4173/settings')
   await page.getByRole('combobox', { name: 'Appearance' }).selectOption('dark')
   await page.getByRole('button', { name: 'Save settings' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
@@ -55,7 +55,7 @@ test('keeps a saved theme after reload', async ({ page }) => {
 })
 
 test('uses a drawer on mobile and a persistent sidebar on desktop', async ({ page }) => {
-  await page.goto('http://127.0.0.1:4173/static/app/#/')
+  await page.goto('http://127.0.0.1:4173/')
   const menu = page.getByRole('button', { name: 'Open navigation' })
   const sidebar = page.getByRole('complementary', { name: 'Primary navigation' })
 

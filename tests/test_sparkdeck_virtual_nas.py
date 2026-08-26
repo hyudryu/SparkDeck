@@ -62,7 +62,10 @@ class FakeRegistry:
         return self.nodes.get(node_id)
 
     async def probe(self, node, force=False):
-        return {**node, "online": True}
+        return {
+            **node, "online": True,
+            "disk": {"free": 10 * 1024 * 1024 * 1024},
+        }
 
     async def request(self, node_id, method, path, **_kwargs):
         return {"models": []}
@@ -264,6 +267,34 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
         await nas.stop()
+
+    async def test_insufficient_target_capacity_is_rejected_without_jobs(self):
+        registry = FakeRegistry()
+
+        async def low_capacity(node, force=False):
+            return {**node, "online": True, "disk": {"free": 1}}
+
+        registry.probe = low_capacity
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "insufficient free disk space"):
+            await nas.queue_transfer("org/model", "local", ["worker-a"])
+
+        self.assertEqual(nas.jobs, [])
+
+    async def test_unknown_target_capacity_fails_closed(self):
+        registry = FakeRegistry()
+
+        async def unknown_capacity(node, force=False):
+            return {**node, "online": True}
+
+        registry.probe = unknown_capacity
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "did not report free disk capacity"):
+            await nas.queue_transfer("org/model", "local", ["worker-a"])
+
+        self.assertEqual(nas.jobs, [])
 
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):

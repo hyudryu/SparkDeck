@@ -128,6 +128,35 @@ describe('settings page', () => {
     expect(save).toBeEnabled()
   })
 
+  it('explicitly removes a saved Hugging Face key after confirmation', async () => {
+    let configured = true
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'DELETE') configured = false
+      return new Response(JSON.stringify({
+        theme: 'system', hf_token_configured: configured, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const appearance = await screen.findByRole('combobox', { name: 'Appearance' })
+    await user.selectOptions(appearance, 'dark')
+    await user.click(await screen.findByRole('button', { name: 'Remove saved key' }))
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/entire cluster/i))
+    await screen.findByText('Not configured')
+    expect(appearance).toHaveValue('dark')
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Remove saved key' })).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/settings/hf-token', expect.objectContaining({
+      method: 'DELETE',
+    }))
+  })
+
   it('confirms and starts one cluster-wide release update', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

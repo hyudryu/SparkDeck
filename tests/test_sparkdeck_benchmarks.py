@@ -50,6 +50,60 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
 
+    async def test_configured_community_aggregates_are_fetched_and_sanitized(self):
+        requested = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            return httpx.Response(200, json={"items": [{
+                "model_id": "org/community-model",
+                "context_window_size": 8192,
+                "inference_tokens_per_second": 42.5,
+                "sample_count": 12,
+                "private_remote_field": "discard-me",
+            }]}, request=request)
+
+        await self.manager.http.aclose()
+        self.manager.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api/v1/community",
+        )
+
+        result = await self.service.community_aggregates()
+
+        self.assertEqual(
+            requested, ["https://community.example/api/v1/community/aggregates"],
+        )
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["items"], [{
+            "model_id": "org/community-model",
+            "context_window_size": 8192,
+            "inference_tokens_per_second": 42.5,
+            "sample_count": 12,
+        }])
+        self.assertEqual(
+            result["evidence_policy"]["exact_match_dimensions"],
+            ["model_id", "context_window_size"],
+        )
+
+    async def test_invalid_configured_community_response_fails_visibly(self):
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"items": [{
+                "model_id": "org/model",
+                "context_window_size": 4096,
+                "inference_tokens_per_second": float("nan"),
+                "sample_count": 10,
+            }]}, request=request)
+
+        await self.manager.http.aclose()
+        self.manager.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/aggregates",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
     async def test_cluster_routing_identifiers_never_enter_benchmark_configuration(self):
         self.service._record_response(
             "dep-1", "org/model", "vllm",

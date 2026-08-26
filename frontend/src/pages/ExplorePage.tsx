@@ -9,6 +9,7 @@ import { formatBytes } from '../utils/format'
 
 type CatalogTab = 'hugging-face' | 'community'
 type FitTone = 'easy' | 'tight' | 'no-fit' | 'unknown'
+type DisplayCatalogModel = CatalogModel & { communityEvidenceSource?: 'community' | 'local' }
 
 const MIB = 1024 ** 2
 
@@ -29,11 +30,11 @@ function nodeMemoryBytes(node: NodeInventoryItem) {
   return Number.isFinite(unifiedTotal) && unifiedTotal > 0 ? unifiedTotal : undefined
 }
 
-function clusterMemory(nodes: NodeInventoryItem[]) {
+function deployableMemory(nodes: NodeInventoryItem[]) {
   const capacities = nodes.map(nodeMemoryBytes).filter((value): value is number => value !== undefined)
-  if (capacities.length === 0) return { total: 0, measuredNodes: 0 }
+  if (capacities.length === 0) return { capacity: 0, measuredNodes: 0 }
   return {
-    total: capacities.reduce((sum, value) => sum + value, 0),
+    capacity: Math.max(...capacities),
     measuredNodes: capacities.length,
   }
 }
@@ -63,7 +64,7 @@ function ModelRow({
   expanded,
   onToggle,
 }: {
-  model: CatalogModel
+  model: DisplayCatalogModel
   capacity: number
   expanded: boolean
   onToggle: () => void
@@ -94,7 +95,7 @@ function ModelRow({
         <div>
           <span className="detail-label">Cluster fit</span>
           <strong className={`fit-${tone}`}>{fitLabel(tone)} · {model.weight_size_bytes ? formatBytes(model.weight_size_bytes) : 'Weight size unavailable'}</strong>
-          <p>{capacity > 0 ? `${formatBytes(capacity)} total measured cluster memory. ` : 'Cluster memory telemetry is unavailable. '}Weight residency only; context, KV cache, and per-node shard balance can increase runtime memory.</p>
+          <p>{capacity > 0 ? `${formatBytes(capacity)} on the largest measured node. ` : 'Cluster memory telemetry is unavailable. '}Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights; context and KV cache can increase runtime memory.</p>
         </div>
         <div>
           <span className="detail-label">Compatibility</span>
@@ -106,9 +107,9 @@ function ModelRow({
         </div>
       </div>
       {model.community && <div className="community-estimate" aria-label={`Community inference-speed estimate for ${model.id}`}>
-        <div><span>Sampled from other SparkDeck users</span><strong>{formatRate(model.community.inference_tokens_per_second)}</strong></div>
-        <p>Inference-speed estimate at a {formatNumber(model.community.context_window_size)}-token context window · {formatNumber(model.community.sample_count)} shared samples</p>
-        <small>Aggregated benchmark evidence only — an estimate, not a guarantee for your system.</small>
+        <div><span>{model.communityEvidenceSource === 'local' ? 'Aggregated from benchmarks on this controller' : 'Sampled from other SparkDeck users'}</span><strong>{formatRate(model.community.inference_tokens_per_second)}</strong></div>
+        <p>Inference-speed estimate at a {formatNumber(model.community.context_window_size)}-token context window · {formatNumber(model.community.sample_count)} {model.communityEvidenceSource === 'local' ? 'local' : 'shared'} samples</p>
+        <small>{model.communityEvidenceSource === 'local' ? 'Local benchmark evidence only' : 'Aggregated community benchmark evidence only'} — an estimate, not a guarantee for your system.</small>
       </div>}
       <div className="catalog-model-actions">
         <a className="button" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Hugging Face</a>
@@ -138,7 +139,7 @@ export function ExplorePage() {
     return () => window.clearTimeout(timeout)
   }, [draft])
 
-  const memory = useMemo(() => clusterMemory(nodes.data ?? []), [nodes.data])
+  const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate[]>()
@@ -149,28 +150,38 @@ export function ExplorePage() {
       if (model.community) evidence.set(model.id, [...(evidence.get(model.id) ?? []), model.community])
     }
     const catalogById = new Map(catalogItems.map((model) => [model.id, model]))
-    const withEvidence: CatalogModel[] = catalogItems.map((model) => ({
-      ...model,
-      community: model.community ?? bestCommunityEstimate(evidence.get(model.id) ?? []),
-    }))
-    const communityModels: CatalogModel[] = [...evidence.entries()].map(([modelId, samples]) => ({
-      ...(catalogById.get(modelId) ?? { id: modelId, name: modelId.split('/').at(-1) }),
-      community: bestCommunityEstimate(samples),
-    }))
+    const aggregateSource = aggregates.data?.availability === 'local' ? 'local' : 'community'
+    const withEvidence: DisplayCatalogModel[] = catalogItems.map((model) => {
+      const aggregate = bestCommunityEstimate(evidence.get(model.id) ?? [])
+      return {
+        ...model,
+        community: model.community ?? aggregate,
+        communityEvidenceSource: model.community ? 'community' : aggregate ? aggregateSource : undefined,
+      }
+    })
+    const communityModels: DisplayCatalogModel[] = [...evidence.entries()].map(([modelId, samples]) => {
+      const catalogModel = catalogById.get(modelId)
+      const community = bestCommunityEstimate(samples)
+      return {
+        ...(catalogModel ?? { id: modelId, name: modelId.split('/').at(-1) }),
+        community,
+        communityEvidenceSource: catalogModel?.community === community ? 'community' : aggregateSource,
+      }
+    })
     let visible = tab === 'community' ? communityModels : withEvidence
     if (tab === 'community' && query) {
       const folded = query.toLowerCase()
       visible = visible.filter((model) => model.id.toLowerCase().includes(folded))
     }
     if (communityOnly || tab === 'community') visible = visible.filter((model) => Boolean(model.community))
-    if (fitsOnly) visible = visible.filter((model) => ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, memory.total)))
+    if (fitsOnly) visible = visible.filter((model) => ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, memory.capacity)))
     if (fitsOnly) {
       visible = [...visible].sort((left, right) => Number(right.weight_size_bytes ?? 0) - Number(left.weight_size_bytes ?? 0))
     } else if (tab === 'community') {
       visible = [...visible].sort((left, right) => Number(right.community?.sample_count ?? 0) - Number(left.community?.sample_count ?? 0))
     }
     return visible
-  }, [aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory.total, query, tab])
+  }, [aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory.capacity, query, tab])
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -220,7 +231,7 @@ export function ExplorePage() {
           <button className="button button-primary" type="submit">Search</button>
         </form>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={memory.total <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.total > 0 ? `${formatBytes(memory.total)} total across ${memory.measuredNodes} ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
           <label><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
@@ -245,7 +256,7 @@ export function ExplorePage() {
       )}
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span><span>Downloads</span><span>Likes</span><span /></div>
-        {models.map((model) => <ModelRow key={model.id} model={model} capacity={memory.total} expanded={expandedIds.has(model.id)} onToggle={() => toggleExpanded(model.id)} />)}
+        {models.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} onToggle={() => toggleExpanded(model.id)} />)}
       </section>}
     </div>
   )

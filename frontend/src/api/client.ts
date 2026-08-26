@@ -367,6 +367,7 @@ export const api = {
         return request<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(settings) })
       }
     },
+    clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
     overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),

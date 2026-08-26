@@ -30,7 +30,6 @@ from sparkdeck.onboarding import (
     forward_management_request,
     is_forwardable_path,
 )
-from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.updater import CONFIRMATION, UpdateService, current_revision
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
@@ -1555,6 +1554,17 @@ async def v1_update_settings(req: Request):
     return values
 
 
+@app.delete("/api/v1/settings/hf-token")
+async def v1_clear_hf_token():
+    await manager.clear_hf_token()
+    values = {
+        key: sparkdeck.store.get_setting(key, default)
+        for key, default in _APP_SETTING_DEFAULTS.items()
+    }
+    values["hf_token_configured"] = bool(manager._resolved_hf_token())
+    return values
+
+
 def _require_same_origin_or_forwarded(req: Request) -> None:
     if any(req.headers.get(name) for name in FORWARD_HEADERS):
         return
@@ -1762,11 +1772,10 @@ async def v1_community_pairing():
 
 @app.get("/api/v1/community/aggregates")
 async def v1_community_aggregates():
-    return {
-        "items": [],
-        "availability": "not_configured",
-        "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
-    }
+    try:
+        return await sparkdeck.community_aggregates()
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # ---------- OpenAI-compatible /v1 proxy ----------

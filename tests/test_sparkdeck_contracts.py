@@ -1,0 +1,70 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import httpx
+
+from sparkdeck.catalog import HuggingFaceCatalog
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from sparkdeck.service import SparkDeckService
+
+
+class FakeManager:
+    def __init__(self):
+        self.http = httpx.AsyncClient()
+        self.list_containers = AsyncMock(return_value=[])
+        self.start_container = AsyncMock(return_value={"status": "running"})
+        self.stop_container = AsyncMock(return_value={"status": "exited"})
+
+
+class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.manager = FakeManager()
+        self.service = SparkDeckService(self.manager, Path(self.temp.name))
+
+    async def asyncTearDown(self):
+        await self.manager.http.aclose()
+        await self.service.close()
+        self.temp.cleanup()
+
+    async def test_catalog_shape_filter_and_local_ids_match_frontend_contract(self):
+        remote = HuggingFaceCatalog._public_item({
+            "id": "org/model", "author": "org", "tags": ["transformers", "safetensors"],
+        })
+        self.service.catalog.search = AsyncMock(return_value=[remote])
+        self.service.store.add_deployment(Deployment(
+            id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            container_name="sparkdeck-model",
+        ))
+
+        result = await self.service.catalog_search("model", 24, "vllm")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["local_deployment_ids"], ["dep-1"])
+        compatibility = result["items"][0]["runtime_compatibility"]
+        self.assertIsInstance(compatibility, list)
+        self.assertTrue(any(item == {"runtime": "vllm", "supported": True} for item in compatibility))
+        self.assertEqual(
+            (await self.service.catalog_search("model", 24, "llama.cpp"))["items"], []
+        )
+
+    async def test_deployment_action_returns_a_wire_deployment(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            container_name="sparkdeck-model",
+        ), "http://127.0.0.1:8000")
+
+        result = await self.service.deployment_action("dep-1", "start")
+
+        self.assertEqual(result["id"], "dep-1")
+        self.assertEqual(result["model"]["repository"], "org/model")
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("_base_url", result)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -61,13 +61,12 @@ DEFAULT_SETTINGS = {
     "cluster_node_name": socket.gethostname(),
     "cluster_fabric_ip": "",
     "cluster_fabric_interface": "",
-    "ollama_base_url": "http://localhost:11434",
     # llama-server launcher (GGUF models from the local HF cache). One server
     # at a time, bound to localhost and proxied via /v1.
-    "llama_server_bin": "~/.unsloth/llama.cpp/llama-server",
+    "llama_server_bin": "~/.local/share/llama.cpp/llama-server",
     "llama_server_host": "127.0.0.1",
     "llama_server_port": 8100,
-    "llama_rpc_server_bin": "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server",
+    "llama_rpc_server_bin": "~/.local/share/llama.cpp/ggml-rpc-server",
     "llama_rpc_port": 50052,
     # Flagship model pricing: input/output cost per 1M tokens (USD).
     # Editable from the Usage tab; used for opportunity-cost comparison
@@ -7060,7 +7059,7 @@ class Manager:
         """Resolve the ggml RPC worker next to the configured llama-server."""
         configured = Path(
             self.settings.get("llama_rpc_server_bin")
-            or "~/.unsloth/llama.cpp/build-rpc/bin/ggml-rpc-server"
+            or "~/.local/share/llama.cpp/ggml-rpc-server"
         ).expanduser()
         llama_bin = Path(self.settings["llama_server_bin"]).expanduser()
         candidates = [

@@ -59,3 +59,20 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 0
         )
+
+    async def test_local_artifact_and_private_image_never_enter_outbox(self):
+        self.service.store.set_setting("community_consent", True)
+        self.service._record_response(
+            None, "models/customer.gguf", "llama.cpp",
+            {"image": "registry.private/team/runtime:latest", "context_length": 4096},
+            time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(items[0]["model"]["repository"], "local-model")
+        self.assertNotIn("image", items[0]["configuration"])
+        self.assertFalse(items[0]["eligible_for_community"])
+        self.assertEqual(self.service.store.outbox_batch(), [])

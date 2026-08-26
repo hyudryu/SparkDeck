@@ -21,7 +21,8 @@ SparkDeck is under active development. The management API is not hardened for di
 ### Requirements
 
 - Linux with Docker and the NVIDIA Container Toolkit
-- Python 3.10 or newer
+- Python 3.11 or newer
+- Node.js 20 or newer with npm (for the web app build)
 - An NVIDIA GPU for GPU-backed runtimes
 - A Hugging Face account for gated models
 
@@ -95,7 +96,7 @@ Example Codex configuration:
 url = "http://127.0.0.1:7878/mcp"
 ```
 
-Set `VLLM_MCP_TOKEN` to require a bearer token and `VLLM_MCP_PUBLIC_URL` when the externally visible MCP URL differs from the local default. These environment names are retained for compatibility. Bearer authentication does not provide TLS; keep the endpoint private or place it behind a secure reverse proxy.
+Set `SPARKDECK_MCP_TOKEN` to require a bearer token and `SPARKDECK_MCP_PUBLIC_URL` when the externally visible MCP URL differs from the local default. Older `VLLM_MCP_TOKEN` and `VLLM_MCP_PUBLIC_URL` values are accepted only as migration fallbacks. Bearer authentication does not provide TLS; keep the endpoint private or place it behind a secure reverse proxy.
 
 MCP-created deployments use the current `managed_by=sparkdeck-mcp` marker. SparkDeck continues to recognize the legacy `managed_by=vllm-controller-mcp` marker solely so deployments created by older releases can still be managed safely.
 

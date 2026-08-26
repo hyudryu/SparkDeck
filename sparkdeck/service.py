@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import platform
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -20,10 +22,10 @@ from .storage import SparkDeckStore
 
 
 _SAFE_CONFIGURATION_KEYS = {
-    "context_size", "context_length", "max_model_len", "parallel",
-    "gpu_layers", "split_mode", "tensor_split", "tensor_parallel_size",
+    "context_size", "context_length", "max_model_len", "parallel", "parallel_slots",
+    "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
-    "max_running_requests", "mem_fraction_static", "image", "runtime_version",
+    "max_running_requests", "mem_fraction_static", "runtime_version",
 }
 
 
@@ -37,16 +39,72 @@ class SparkDeckService:
     async def close(self) -> None:
         self.store.close()
 
-    async def catalog_search(self, query: str, limit: int) -> dict[str, Any]:
-        items = await self.catalog.search(query, limit)
-        local = {item["model"]["repository"]: item for item in await self.deployments()}
-        for item in items:
-            if item["id"] in local:
-                item["local_deployment"] = local[item["id"]]
-        return {"items": items, "next_cursor": None}
+    async def catalog_search(
+        self, query: str, limit: int, runtime: str | None = None
+    ) -> dict[str, Any]:
+        if runtime is not None:
+            self.registry.get(runtime)
+        deployments = await self.deployments()
+        local: dict[str, list[dict[str, Any]]] = {}
+        for deployment in deployments:
+            repository = deployment["model"]["repository"]
+            local.setdefault(repository, []).append(deployment)
+
+        # Hugging Face enriches the catalog when online, while local models
+        # remain searchable when the public catalog cannot be reached.
+        try:
+            remote_items = await self.catalog.search(query, limit)
+        except httpx.HTTPError:
+            remote_items = []
+
+        items_by_id = {
+            item["id"]: item for item in remote_items if item.get("id")
+        }
+        folded_query = query.strip().casefold()
+        for repository, matches in local.items():
+            if folded_query and folded_query not in repository.casefold() and not any(
+                folded_query in str(item.get("alias") or "").casefold()
+                for item in matches
+            ):
+                continue
+            item = items_by_id.setdefault(
+                repository,
+                {
+                    "id": repository,
+                    "name": repository.split("/")[-1],
+                    "author": repository.split("/", 1)[0] if "/" in repository else None,
+                    "downloads": None,
+                    "likes": None,
+                    "tags": [],
+                    "runtime_compatibility": [],
+                    "community": None,
+                },
+            )
+            item["local_deployment_ids"] = [match["id"] for match in matches]
+            compatibility = {
+                entry["runtime"]: entry
+                for entry in item.get("runtime_compatibility") or []
+            }
+            for match in matches:
+                compatibility[match["runtime"]] = {
+                    "runtime": match["runtime"], "supported": True,
+                }
+            item["runtime_compatibility"] = list(compatibility.values())
+
+        items = list(items_by_id.values())
+        if runtime:
+            items = [
+                item for item in items
+                if any(
+                    entry.get("runtime") == runtime and entry.get("supported")
+                    for entry in item.get("runtime_compatibility") or []
+                )
+            ]
+        items = items[: min(100, max(1, int(limit)))]
+        return {"items": items, "total": len(items), "next_cursor": None}
 
     async def deployments(self) -> list[dict[str, Any]]:
-        registered = self.store.deployments()
+        registered = self.store.deployments(include_private=True)
         by_container = {item.get("container_name"): item for item in registered}
         try:
             containers = await self.manager.list_containers()
@@ -59,7 +117,7 @@ class SparkDeckService:
                 continue
             stored = by_container.get(container.get("name"))
             if stored:
-                stored["status"] = container.get("status", "unknown")
+                stored["status"] = _deployment_status(container.get("status"))
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -75,13 +133,37 @@ class SparkDeckService:
                 "kind": "managed" if container.get("managed") else "external",
                 "model": {"repository": model, "revision": None,
                           "artifact": None, "quantization": container.get("variant")},
-                "status": container.get("status", "unknown"),
+                "status": _deployment_status(container.get("status")),
                 "container_name": container.get("name"),
                 "settings": self._safe_configuration(container.get("load_settings") or {}),
                 "base_url_set": bool(container.get("port")),
                 "port": container.get("port"),
                 "managed": bool(container.get("managed")),
             })
+        async def probe_external(deployment: dict[str, Any]) -> None:
+            if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
+                return
+            try:
+                adapter = self.registry.get(deployment["runtime"])
+                await asyncio.wait_for(
+                    adapter.health(
+                        self.manager.http,
+                        deployment.get("_base_url") or "",
+                        self._get_credential(
+                            deployment["id"], deployment.get("_credential_ref")
+                        ),
+                    ),
+                    timeout=3,
+                )
+                deployment["status"] = "running"
+            except Exception:
+                deployment["status"] = "error"
+                deployment["last_error"] = "Endpoint health check failed"
+
+        await asyncio.gather(*(probe_external(item) for item in registered))
+        for deployment in registered:
+            deployment.pop("_base_url", None)
+            deployment.pop("_credential_ref", None)
         return registered
 
     async def create_deployment(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -140,12 +222,14 @@ class SparkDeckService:
         if not container:
             raise LookupError("managed container not found")
         if action == "start":
-            result = await self.manager.start_container(container)
+            await self.manager.start_container(container)
         elif action == "stop":
-            result = await self.manager.stop_container(container)
+            await self.manager.stop_container(container)
         else:
             raise ValueError("action must be start or stop")
-        return {"ok": True, "deployment_id": deployment_id, "action": action, "result": result}
+        current = self.store.deployment(deployment_id) or deployment
+        current["status"] = "running" if action == "start" else "stopped"
+        return current
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
@@ -338,9 +422,7 @@ class SparkDeckService:
             deployment_id=deployment_id,
             model=ModelIdentity(repository=public_model, quantization=quantization),
             runtime=runtime_kind,
-            runtime_version=_optional_string(
-                safe_settings.get("runtime_version") or safe_settings.get("image")
-            ),
+            runtime_version=_optional_string(safe_settings.get("runtime_version")),
             hardware=self._hardware_snapshot(),
             configuration=safe_settings, input_tokens=input_tokens,
             output_tokens=output_tokens, latency_ms=round(latency * 1000, 3),
@@ -433,6 +515,19 @@ def _optional_string(value: Any) -> str | None:
     return text or None
 
 
+def _deployment_status(value: Any) -> str:
+    status = str(value or "unknown").casefold()
+    if status in ("running", "ready"):
+        return "running"
+    if status in ("created", "restarting", "launching", "starting"):
+        return "starting"
+    if status in ("exited", "dead", "removed", "stopped"):
+        return "stopped"
+    if status in ("error", "unhealthy"):
+        return "error"
+    return "unknown"
+
+
 def _positive_float(value: Any) -> float | None:
     try:
         number = float(value)
@@ -444,7 +539,17 @@ def _positive_float(value: Any) -> float | None:
 def _public_model_id(value: str) -> str:
     """Exclude endpoint URLs and local paths from persistent benchmark identity."""
     text = str(value or "").strip()
-    if not text or urlparse(text).scheme or Path(text).is_absolute() or text.startswith(("./", "../", "~")):
+    if (
+        not text
+        or urlparse(text).scheme
+        or Path(text).is_absolute()
+        or text.startswith(("./", "../", "~"))
+        or "\\" in text
+        or text.casefold().endswith((".gguf", ".bin", ".safetensors", ".pt", ".pth"))
+        or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", text
+        )
+    ):
         return "local-model"
     return text
 

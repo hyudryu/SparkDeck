@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -47,6 +47,23 @@ describe('SparkDeck application shell', () => {
 })
 
 describe('model discovery', () => {
+  it('renders the real catalog compatibility and local deployment shape', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [{
+        id: 'org/model', author: 'org', name: 'model', downloads: 1200,
+        runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+        local_deployment_ids: ['dep-1'], community: null,
+      }],
+      total: 1,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    expect(await screen.findByRole('heading', { name: 'model' })).toBeInTheDocument()
+    expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
+    expect(screen.getByText('Local')).toBeInTheDocument()
+  })
+
   it('sends the search term and runtime filter to the versioned catalog API', async () => {
     const user = userEvent.setup()
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)

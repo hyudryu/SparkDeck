@@ -38,4 +38,15 @@ describe('API client adapters', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ enabled: true })
     expect(status).toEqual(expect.objectContaining({ sharing_enabled: true, account_paired: true, pending_count: 2, synced_count: 7 }))
   })
+
+  it('normalizes the refreshed deployment returned by an action', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      id: 'dep-1', alias: 'reasoner', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'running', settings: {},
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(api.deployments.action('dep-1', 'start')).resolves.toEqual(
+      expect.objectContaining({ id: 'dep-1', model_id: 'org/model', status: 'running' }),
+    )
+  })
 })

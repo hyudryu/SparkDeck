@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -25,9 +26,14 @@ sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
-    token=os.environ.get("SPARKDECK_MCP_TOKEN"),
-    public_url=os.environ.get(
-        "SPARKDECK_MCP_PUBLIC_URL", "http://127.0.0.1:7878/mcp"
+    token=(
+        os.environ.get("SPARKDECK_MCP_TOKEN")
+        or os.environ.get("VLLM_MCP_TOKEN")
+    ),
+    public_url=(
+        os.environ.get("SPARKDECK_MCP_PUBLIC_URL")
+        or os.environ.get("VLLM_MCP_PUBLIC_URL")
+        or "http://127.0.0.1:7878/mcp"
     ),
 )
 mcp_http_app = mcp_control.streamable_http_app(
@@ -73,10 +79,24 @@ class _DequeHandler(logging.Handler):
     """Appends formatted log records to the in-memory deque."""
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = self.format(record)
+            msg = _redact_log(self.format(record))
             _log_buffer.append(msg)
         except Exception:
             pass
+
+
+_LOG_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)([?&](?:token|key|api_key|access_token)=)[^&\s]+"),
+)
+
+
+def _redact_log(message: str) -> str:
+    redacted = str(message)
+    for pattern in _LOG_SECRET_PATTERNS:
+        redacted = pattern.sub(r"\1[REDACTED]", redacted)
+    return redacted
 
 
 def _install_log_capture():
@@ -151,8 +171,6 @@ async def _require_managed_agent_container(name: str, request: Request) -> None:
 @app.get("/api/state")
 async def get_state():
     state = await manager.get_state()
-    for legacy_key in ("ollama", "unsloth", "sparkrun_targets", "spark_launches", "spark_runs"):
-        state.pop(legacy_key, None)
     state["supported_runtimes"] = list(sparkdeck.registry.kinds)
     return state
 
@@ -745,6 +763,76 @@ async def pull_image(req: Request):
     )
 
 
+async def _v1_image_items() -> list[dict]:
+    raw_images, containers = await asyncio.gather(
+        manager.list_images(), manager.list_containers()
+    )
+    used_images = {str(item.get("image") or "") for item in containers}
+    items = []
+    for raw in raw_images:
+        tags = raw.get("tags") or []
+        first_tag = tags[0] if tags else None
+        repository = first_tag
+        tag = None
+        if first_tag and ":" in first_tag.rsplit("/", 1)[-1]:
+            repository, tag = first_tag.rsplit(":", 1)
+        folded = " ".join(tags).casefold()
+        runtimes = []
+        if raw.get("is_vllm") or "vllm" in folded:
+            runtimes.append("vllm")
+        if "sglang" in folded:
+            runtimes.append("sglang")
+        if "llama.cpp" in folded or "ggml-org/llama" in folded:
+            runtimes.append("llama.cpp")
+        items.append({
+            **raw,
+            "repository": repository,
+            "tag": tag,
+            "created_at": raw.get("created"),
+            "runtimes": runtimes,
+            "in_use": raw.get("id") in used_images or any(
+                image in used_images for image in tags
+            ),
+        })
+    return items
+
+
+@app.get("/api/v1/images")
+async def v1_list_images():
+    return {"items": await _v1_image_items()}
+
+
+@app.post("/api/v1/images/pull", status_code=201)
+async def v1_pull_image(req: Request):
+    image = str((await req.json()).get("image") or "").strip()
+    if not image:
+        raise HTTPException(400, "image is required")
+    error = None
+    async for event in manager.pull_image_stream(image):
+        try:
+            payload = json.loads(event.removeprefix("data:").strip())
+        except json.JSONDecodeError:
+            continue
+        if payload.get("error"):
+            error = str(payload["error"])
+    if error:
+        raise HTTPException(502, error[:500])
+    return {"ok": True, "image": image}
+
+
+@app.delete("/api/v1/images/{image_id:path}")
+async def v1_remove_image(image_id: str):
+    selected = next(
+        (item for item in await _v1_image_items() if item["id"] == image_id), None
+    )
+    if selected and selected.get("in_use"):
+        raise HTTPException(409, "image is used by a deployment")
+    try:
+        return await manager.remove_image(image_id)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.delete("/api/images/{image_id:path}")
 async def remove_image(image_id: str):
     try:
@@ -794,9 +882,11 @@ async def clear_finished():
 
 # ---------- versioned SparkDeck application API ----------
 @app.get("/api/v1/catalog/models")
-async def catalog_models(q: str = "", limit: int = 24):
+async def catalog_models(q: str = "", runtime: str | None = None, limit: int = 24):
     try:
-        return await sparkdeck.catalog_search(q, limit)
+        return await sparkdeck.catalog_search(q, limit, runtime)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except httpx.HTTPStatusError as e:
         raise HTTPException(e.response.status_code, "model catalog request failed")
     except httpx.HTTPError as e:
@@ -806,6 +896,59 @@ async def catalog_models(q: str = "", limit: int = 24):
 @app.get("/api/v1/deployments")
 async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
+
+
+_APP_SETTING_DEFAULTS = {
+    "theme": "system",
+    "default_runtime": "vllm",
+    "default_context_length": 8192,
+    "community_api_url": "",
+}
+
+
+@app.get("/api/v1/settings")
+async def v1_settings():
+    return {
+        key: sparkdeck.store.get_setting(key, default)
+        for key, default in _APP_SETTING_DEFAULTS.items()
+    }
+
+
+@app.put("/api/v1/settings")
+async def v1_update_settings(req: Request):
+    body = await req.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "settings must be an object")
+    theme = body.get("theme", _APP_SETTING_DEFAULTS["theme"])
+    runtime = body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"])
+    try:
+        sparkdeck.registry.get(runtime)
+        context_length = int(body.get(
+            "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
+        ))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, str(e))
+    if theme not in ("system", "light", "dark"):
+        raise HTTPException(400, "theme must be system, light, or dark")
+    if context_length < 256:
+        raise HTTPException(400, "default_context_length must be at least 256")
+    community_api_url = str(body.get("community_api_url") or "").strip().rstrip("/")
+    if community_api_url:
+        try:
+            parsed = httpx.URL(community_api_url)
+        except Exception as e:
+            raise HTTPException(400, "community_api_url must be a valid URL") from e
+        if parsed.scheme not in ("http", "https") or not parsed.host:
+            raise HTTPException(400, "community_api_url must be an http or https URL")
+    values = {
+        "theme": theme,
+        "default_runtime": runtime,
+        "default_context_length": context_length,
+        "community_api_url": community_api_url,
+    }
+    for key, value in values.items():
+        sparkdeck.store.set_setting(key, value)
+    return values
 
 
 @app.post("/api/v1/deployments", status_code=201)
@@ -865,7 +1008,7 @@ async def v1_community_consent(req: Request):
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    sparkdeck.store.set_setting("community_consent", enabled)
+    sparkdeck.store.set_community_consent(enabled)
     return sparkdeck.store.sync_status()
 
 
@@ -999,7 +1142,11 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 async def index():
     if (FRONTEND_DIST / "index.html").exists():
         return FileResponse(FRONTEND_DIST / "index.html")
-    return FileResponse(ROOT / "static" / "index.html")
+    return Response(
+        "SparkDeck's web app has not been built. Run ./run.sh or npm --prefix frontend run build.",
+        status_code=503,
+        media_type="text/plain",
+    )
 
 
 @app.get("/disk-manager")

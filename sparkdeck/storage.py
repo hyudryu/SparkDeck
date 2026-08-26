@@ -209,7 +209,10 @@ class SparkDeckStore:
         with self._lock:
             total = self._connection.execute("SELECT COUNT(*) FROM benchmark_samples").fetchone()[0]
             rows = self._connection.execute(
-                "SELECT * FROM benchmark_samples ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                """SELECT benchmark_samples.*, upload_outbox.status AS sync_state
+                   FROM benchmark_samples
+                   LEFT JOIN upload_outbox ON upload_outbox.sample_id = benchmark_samples.id
+                   ORDER BY benchmark_samples.created_at DESC LIMIT ? OFFSET ?""",
                 (limit, offset),
             ).fetchall()
         items = [_benchmark_row(row) for row in rows]
@@ -252,7 +255,7 @@ class SparkDeckStore:
                 f"SELECT * FROM benchmark_samples WHERE id IN ({marks})",
                 tuple(wanted),
             ).fetchall()
-        by_id = {row["id"]: _benchmark_row(row) for row in sample_rows}
+        by_id = {row["id"]: _upload_row(row) for row in sample_rows}
         return [by_id[sample_id] for sample_id in wanted if sample_id in by_id]
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
@@ -308,9 +311,23 @@ class SparkDeckStore:
             "cloud_endpoint_configured": bool(self.get_setting("community_api_url", None)),
         }
 
+    def set_community_consent(self, enabled: bool) -> None:
+        """Persist consent and queue eligible local samples only after opt-in."""
+        self.set_setting("community_consent", enabled)
+        if not enabled:
+            return
+        pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+        status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT OR IGNORE INTO upload_outbox(sample_id, status, created_at)
+                   SELECT id, ?, created_at FROM benchmark_samples WHERE eligible = 1""",
+                (status,),
+            )
+
 
 def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    value = {
         "id": row["id"], "created_at": row["created_at"],
         "deployment_id": row["deployment_id"], "model": json.loads(row["model_json"]),
         "runtime": row["runtime"], "runtime_version": row["runtime_version"],
@@ -323,3 +340,30 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
         "cold_start": None if row["cold_start"] is None else bool(row["cold_start"]),
         "eligible_for_community": bool(row["eligible"]),
     }
+    if "sync_state" in row.keys():
+        value["sync_state"] = row["sync_state"] or "local"
+    return value
+
+
+def _upload_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Build the strict future cloud payload, separate from the local record."""
+    value = _benchmark_row(row)
+    payload = {
+        key: value[key]
+        for key in (
+            "id", "created_at", "runtime", "runtime_version",
+            "hardware", "configuration", "input_tokens", "output_tokens",
+            "latency_ms", "ttft_ms", "generation_tokens_per_second",
+            "prompt_tokens_per_second", "cold_start",
+        )
+    }
+    model = value["model"]
+    payload["model"] = {
+        key: model.get(key)
+        for key in ("repository", "revision", "quantization")
+        if model.get(key) is not None
+    }
+    version = str(payload.get("runtime_version") or "")
+    if "/" in version or "\\" in version or "://" in version:
+        payload["runtime_version"] = None
+    return payload

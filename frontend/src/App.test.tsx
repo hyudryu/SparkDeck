@@ -10,6 +10,7 @@ const fetchMock = vi.fn<typeof fetch>()
 
 beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
+  fetchMock.mockClear()
   fetchMock.mockImplementation(async () => new Response(JSON.stringify({ items: [], total: 0 }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
@@ -51,7 +52,7 @@ describe('SparkDeck application shell', () => {
 
   it('persists the sidebar theme toggle locally and through settings', async () => {
     const user = userEvent.setup()
-    let settings = { theme: 'light', default_runtime: 'sglang', default_context_length: 32768, community_api_url: 'https://community.example' }
+    let settings = { theme: 'light', hf_token: '', hf_token_configured: false, community_api_url: 'https://community.example' }
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
@@ -136,11 +137,9 @@ describe('model discovery', () => {
   it('opens deployment with the selected catalog model prefilled', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
-      const body = path.includes('/api/v1/settings')
-        ? { default_runtime: 'vllm', default_context_length: 8192 }
-        : path.includes('/api/v1/nodes')
-          ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
-          : { items: [] }
+      const body = path.includes('/api/v1/nodes')
+        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
+        : { items: [] }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
@@ -149,58 +148,9 @@ describe('model discovery', () => {
     expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
     expect(screen.getByRole('textbox', { name: 'Display name' })).toHaveValue('chosen-model')
-  })
-
-  it('merges late saved defaults into untouched fields in a catalog deployment', async () => {
-    let resolveSettings!: (response: Response) => void
-    const settingsResponse = new Promise<Response>((resolve) => { resolveSettings = resolve })
-    fetchMock.mockImplementation(async (input) => {
-      const path = String(input)
-      if (path.includes('/api/v1/settings')) return settingsResponse
-      const body = path.includes('/api/v1/nodes')
-        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
-        : { items: [] }
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
-    })
-
-    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
-
-    expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
-    resolveSettings(new Response(JSON.stringify({
-      default_runtime: 'sglang',
-      default_context_length: 32768,
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
-
-    await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('sglang')
-      expect(screen.getByRole('spinbutton', { name: 'Context length' })).toHaveValue(32768)
-    })
-  })
-
-  it('does not overwrite deployment fields edited before saved defaults load', async () => {
-    const user = userEvent.setup()
-    let resolveSettings!: (response: Response) => void
-    const settingsResponse = new Promise<Response>((resolve) => { resolveSettings = resolve })
-    fetchMock.mockImplementation(async (input) => {
-      const path = String(input)
-      if (path.includes('/api/v1/settings')) return settingsResponse
-      const body = path.includes('/api/v1/nodes')
-        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
-        : { items: [] }
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
-    })
-
-    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
-
-    await user.selectOptions(await screen.findByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
-    const contextLength = screen.getByRole('spinbutton', { name: 'Context length' })
-    resolveSettings(new Response(JSON.stringify({
-      default_runtime: 'sglang',
-      default_context_length: 32768,
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
-
-    await waitFor(() => expect(contextLength).toHaveValue(32768))
-    expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('llama.cpp')
+    expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('vllm')
+    expect(screen.getByRole('spinbutton', { name: 'Context length' })).toHaveValue(8192)
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v1/settings'))).toBe(false)
   })
 })
 
@@ -229,7 +179,7 @@ describe('model deployments', () => {
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
         { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true },
-      ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+      ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
@@ -276,7 +226,7 @@ describe('model deployments', () => {
       }] } : path.includes('/api/v1/deployments') ? { items: [] }
         : path.includes('/api/v1/nodes') ? { items: [
           { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
-        ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+        ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
@@ -320,7 +270,7 @@ describe('model deployments', () => {
         : path.includes('/api/v1/nodes') ? { items: [
           { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
           { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
-        ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+        ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
@@ -352,8 +302,7 @@ describe('model deployments', () => {
       const body = path.includes('/api/v1/deployments') ? { items: [] }
         : path.includes('/api/v1/nodes') ? { items: [{ id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true }] }
           : path.includes('/api/v1/model-cache') ? { nodes: [] }
-            : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 }
-              : {}
+            : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
@@ -364,14 +313,10 @@ describe('model deployments', () => {
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
   })
 
-  it('retains the saved context length when switching runtimes', async () => {
+  it('retains the deployment context length when switching runtimes', async () => {
     const user = userEvent.setup()
-    fetchMock.mockImplementation(async (input) => {
-      const path = String(input)
-      const body = path.includes('/api/v1/settings')
-        ? { default_runtime: 'vllm', default_context_length: 32768 }
-        : { items: [] }
-      return new Response(JSON.stringify(body), {
+    fetchMock.mockImplementation(async () => {
+      return new Response(JSON.stringify({ items: [] }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -382,6 +327,8 @@ describe('model deployments', () => {
 
     const contextLength = screen.getByRole('spinbutton', { name: 'Context length' })
     const runtime = screen.getByRole('combobox', { name: 'Runtime' })
+    await user.clear(contextLength)
+    await user.type(contextLength, '32768')
     expect(contextLength).toHaveValue(32768)
 
     await user.selectOptions(runtime, 'llama.cpp')

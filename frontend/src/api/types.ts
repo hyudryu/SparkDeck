@@ -180,9 +180,8 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
-  huggingface_token_configured?: boolean
-  default_runtime?: RuntimeKind
-  default_context_length?: number
+  hf_token?: string
+  hf_token_configured?: boolean
   community_api_url?: string
   telemetry_interval_seconds?: number
   [key: string]: unknown

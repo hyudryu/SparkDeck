@@ -32,6 +32,7 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
+from sparkdeck.onboarding import validate_control_url
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 
 DEFAULT_SETTINGS = {
@@ -87,6 +88,30 @@ DEFAULT_SETTINGS = {
 }
 
 logger = logging.getLogger(__name__)
+HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
+
+
+def _atomic_private_json_write(path: Path, value: Any) -> None:
+    """Write sensitive controller state without a permissive first-write window."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
 
 # The official SGLang image exposes ``python3`` rather than a ``python``
 # executable. Keep this separate from the vLLM setting because SGLang recipes
@@ -319,6 +344,8 @@ class Manager:
         self.settings = self._load_settings()
         self.recipes_path = self.data_dir / "recipes.json"
         self.recipes: list[dict] = self._load_recipes()
+        if self._migrate_recipe_hf_credentials():
+            self._save_recipes()
         # Ephemeral launch phase for Saved Models.  This is returned with
         # /api/state so an image pull remains visible after a browser refresh.
         self.recipe_launches: dict[str, dict] = {}
@@ -406,7 +433,11 @@ class Manager:
         self._rebuild_synced_token_usage()
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
-        if self._migrate_vllm_prompt_token_details():
+        deployments_changed = self._migrate_deployment_hf_credentials()
+        deployments_changed = (
+            self._migrate_vllm_prompt_token_details() or deployments_changed
+        )
+        if deployments_changed:
             self._save_deployments()
         self.container_aliases_path = self.data_dir / "container_aliases.json"
         self.container_aliases: dict[str, str] = self._load_container_aliases()
@@ -1252,9 +1283,7 @@ class Manager:
             return []
 
     def _save_deployments(self) -> None:
-        tmp = self.deployments_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.deployments, indent=2), encoding="utf-8")
-        tmp.replace(self.deployments_path)
+        _atomic_private_json_write(self.deployments_path, self.deployments)
 
     @staticmethod
     def _with_vllm_prompt_token_details(args: list[Any]) -> list[Any]:
@@ -1284,6 +1313,21 @@ class Manager:
             settings["extra_args"] = updated
             deployment["settings_dirty"] = True
             changed = True
+        return changed
+
+    def _migrate_deployment_hf_credentials(self) -> bool:
+        """Discard legacy CLI credentials from durable deployment records."""
+        changed = False
+        for deployment in self.deployments:
+            settings = deployment.get("launch_settings")
+            if not isinstance(settings, dict):
+                continue
+            original = list(settings.get("extra_args") or [])
+            sanitized = self._without_hf_cli_credentials(original)
+            if sanitized != original:
+                settings["extra_args"] = sanitized
+                deployment["settings_dirty"] = True
+                changed = True
         return changed
 
     def _load_container_aliases(self) -> dict[str, str]:
@@ -1551,7 +1595,9 @@ class Manager:
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
         engine = body.get("engine") or "vllm"
-        extra_args = list(body.get("extra_args") or [])
+        extra_args = cls._without_hf_cli_credentials(
+            list(body.get("extra_args") or [])
+        )
         if engine == "vllm":
             extra_args = cls._with_vllm_prompt_token_details(extra_args)
         return {
@@ -1726,6 +1772,8 @@ class Manager:
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""
+        if "extra_args" in body:
+            self._reject_hf_cli_credentials(body.get("extra_args"))
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -1894,6 +1942,20 @@ class Manager:
             result.append(value)
             i += 1
         return result
+
+    @classmethod
+    def _without_hf_cli_credentials(cls, args: list[Any]) -> list[str]:
+        return cls._without_cli_options(
+            [str(value) for value in (args or [])], HF_CREDENTIAL_CLI_OPTIONS,
+        )
+
+    @classmethod
+    def _reject_hf_cli_credentials(cls, args: list[Any] | None) -> None:
+        original = [str(value) for value in (args or [])]
+        if cls._without_hf_cli_credentials(original) != original:
+            raise ValueError(
+                "configure Hugging Face credentials in Settings, not launch arguments"
+            )
 
     @staticmethod
     def _cli_option(args: list[str], names: set[str], cast=None):
@@ -2086,6 +2148,14 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
+        if payload.get("hf_token"):
+            node = self.node_registry.get(node_id)
+            if not node:
+                raise ValueError("remote node not found")
+            # Re-resolve the destination immediately before transmitting a
+            # cluster credential. This prevents stale or rebound hostnames
+            # from turning an authenticated agent request into secret egress.
+            await validate_control_url(node.get("agent_url"))
         return await self.node_registry.request(
             node_id,
             "POST",
@@ -2206,6 +2276,7 @@ class Manager:
 
     async def create_deployment(self, body: dict) -> dict:
         body = dict(body)
+        self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
@@ -3517,8 +3588,12 @@ class Manager:
 
     def _resolved_hf_token(self, explicit: str | None = None) -> str:
         """Resolve an HF credential without exposing it through public state."""
+        # A controller-supplied value is authoritative, including an empty
+        # value. Remote workers must never silently substitute a different
+        # local account when the controller has no credential configured.
+        if explicit is not None:
+            return explicit.strip() if isinstance(explicit, str) else ""
         candidates = [
-            explicit,
             self.settings.get("hf_token"),
             os.environ.get("HF_TOKEN"),
             os.environ.get("HUGGING_FACE_HUB_TOKEN"),
@@ -3535,6 +3610,13 @@ class Manager:
             except OSError:
                 pass
         return ""
+
+    def _redact_hf_secret(self, value: Any, explicit: str | None = None) -> str:
+        redacted = str(value)
+        token = self._resolved_hf_token(explicit)
+        if token:
+            redacted = redacted.replace(token, "[REDACTED]")
+        return redacted
 
     def _container_hf_environment(self, explicit: str | None = None) -> dict[str, str]:
         token = self._resolved_hf_token(explicit)
@@ -3725,8 +3807,7 @@ class Manager:
         return dict(DEFAULT_SETTINGS)
 
     def _save_settings(self):
-        self.settings_path.write_text(json.dumps(self.settings, indent=2))
-        self.settings_path.chmod(0o600)
+        _atomic_private_json_write(self.settings_path, self.settings)
 
     def public_settings(self) -> dict:
         public = {k: v for k, v in self.settings.items() if k != "hf_token"}
@@ -5629,8 +5710,19 @@ class Manager:
                 pass
         return []
 
+    def _migrate_recipe_hf_credentials(self) -> bool:
+        """Discard legacy CLI credentials so they cannot re-enter public state."""
+        changed = False
+        for recipe in self.recipes:
+            original = list(recipe.get("extra_args") or [])
+            sanitized = self._without_hf_cli_credentials(original)
+            if sanitized != original:
+                recipe["extra_args"] = sanitized
+                changed = True
+        return changed
+
     def _save_recipes(self):
-        self.recipes_path.write_text(json.dumps(self.recipes, indent=2))
+        _atomic_private_json_write(self.recipes_path, self.recipes)
 
     @staticmethod
     def _recipe_key(model: str, image: str | None, extra_args: list | None,
@@ -5661,6 +5753,7 @@ class Manager:
         launch_controls: dict | None = None,
         force_new: bool = False,
     ) -> dict:
+        self._reject_hf_cli_credentials(extra_args)
         if not model:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
@@ -5770,6 +5863,8 @@ class Manager:
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported recipe field(s): {', '.join(unknown)}")
+        if "extra_args" in changes:
+            self._reject_hf_cli_credentials(changes.get("extra_args"))
         async with self.lock:
             recipe = next((r for r in self.recipes if r.get("id") == rid), None)
             if not recipe:
@@ -6599,6 +6694,7 @@ class Manager:
         hf_token: str | None = None,
         sparkdeck_deployment_id: str | None = None,
     ) -> dict:
+        self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
         distributed_member = bool(
@@ -6753,11 +6849,12 @@ class Manager:
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:
+                safe_error = self._redact_hf_secret(exc, hf_token)
                 self._cluster_launch_update(
-                    name, "error", f"Launch failed: {exc}",
-                    model=model, cluster_member=cluster_member, error=str(exc),
+                    name, "error", f"Launch failed: {safe_error}",
+                    model=model, cluster_member=cluster_member, error=safe_error,
                 )
-                raise
+                raise RuntimeError(safe_error) from exc
         else:
             # vLLM path — VRAM-aware multi-model
             image = image or self.settings["vllm_image"]
@@ -6902,11 +6999,12 @@ class Manager:
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:
+                safe_error = self._redact_hf_secret(exc, hf_token)
                 self._cluster_launch_update(
-                    name, "error", f"Launch failed: {exc}",
-                    model=model, cluster_member=cluster_member, error=str(exc),
+                    name, "error", f"Launch failed: {safe_error}",
+                    model=model, cluster_member=cluster_member, error=safe_error,
                 )
-                raise
+                raise RuntimeError(safe_error) from exc
 
     async def start_container(self, name: str) -> dict:
         # VRAM-aware: evict only if the GPU is full.

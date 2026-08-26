@@ -130,6 +130,7 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.manager, "recipes", [recipe]),
             patch.object(server.manager, "recipe_launches", {}),
             patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "get_state", AsyncMock(return_value={})),
             patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
             patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=[{
                 "id": "local", "models": [{"model_id": "org/model", "size_bytes": 12}],
@@ -137,17 +138,20 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.sparkdeck, "create_deployment", AsyncMock(return_value=created)) as create,
         ):
             listed = await self.client.get("/api/v1/recipes")
+            state = await self.client.get("/api/state")
             launched = await self.client.post("/api/v1/recipes/recipe-1/deploy")
 
         self.assertEqual(listed.json()["items"][0]["node_ids"], ["local"])
         self.assertEqual(listed.json()["items"][0]["engine"], "vllm")
         self.assertEqual(listed.json()["items"][0]["required_node_count"], 1)
-        self.assertEqual(listed.json()["items"][0]["extra_args_count"], 4)
+        self.assertEqual(listed.json()["items"][0]["extra_args_count"], 2)
         self.assertNotIn("secret", listed.text)
+        self.assertNotIn("secret", state.text)
+        self.assertEqual(state.json()["recipes"][0]["extra_args"], ["--dtype", "auto"])
         self.assertEqual(launched.status_code, 201)
         self.assertEqual(
             create.await_args.args[0]["settings"]["extra_args"],
-            ["--dtype", "auto", "--hf-token", "secret"],
+            ["--dtype", "auto"],
         )
         self.assertEqual(create.await_args.args[0]["recipe_id"], "recipe-1")
 

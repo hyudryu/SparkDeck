@@ -5556,10 +5556,21 @@ class Manager:
     # ---------- recipes ----------
     def recipe_deployment_contract(self, recipe: dict) -> dict:
         """Return the node-count contract for a persisted launch recipe."""
+        def positive_parallelism(value) -> int:
+            try:
+                return max(1, int(value or 1))
+            except (TypeError, ValueError):
+                return 1
+
         engine = str(recipe.get("engine") or "vllm")
         args = list(recipe.get("extra_args") or [])
         if engine == "sglang":
             tensor_parallel = recipe.get("sg_tp_size")
+            if tensor_parallel is not None:
+                try:
+                    tensor_parallel = int(tensor_parallel)
+                except (TypeError, ValueError):
+                    tensor_parallel = None
             if tensor_parallel is None:
                 tensor_parallel = self._cli_option(args, {"--tp-size"}, int)
             pipeline_parallel = 1
@@ -5570,16 +5581,17 @@ class Manager:
             pipeline_parallel = self._cli_option(
                 args, {"--pipeline-parallel-size", "-pp"}, int
             )
-        tensor_parallel = max(1, int(tensor_parallel or 1))
-        pipeline_parallel = max(1, int(pipeline_parallel or 1))
+        tensor_parallel = positive_parallelism(tensor_parallel)
+        pipeline_parallel = positive_parallelism(pipeline_parallel)
         parallel_nodes = tensor_parallel * pipeline_parallel
-        mode = str(recipe.get("deployment_mode") or "single")
+        persisted_mode = recipe.get("deployment_mode")
+        mode = str(persisted_mode or "single")
         saved_nodes = list(dict.fromkeys(recipe.get("node_ids") or [LOCAL_NODE_ID]))
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
             required_nodes = parallel_nodes if parallel_nodes > 1 else max(2, len(saved_nodes))
-        elif parallel_nodes > 1:
+        elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.
             mode = "sharded"

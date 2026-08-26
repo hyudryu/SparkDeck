@@ -290,9 +290,10 @@ export function ModelsPage() {
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const coordinatorReady = recipe.deployment_mode !== 'sharded' || Boolean(localNodeId && nodeIds.includes(localNodeId))
         const ready = !nodes.loading && !nodes.error && !modelCache.loading && !modelCache.error && exactCount && allEligible && coordinatorReady
-        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setRecipeDeployment(undefined)}>
+        const recipeBusy = busy === `recipe:${recipe.id}`
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
-            <div className="modal-heading"><div><p className="eyebrow">Saved cluster configuration</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
+            <div className="modal-heading"><div><p className="eyebrow">Saved cluster configuration</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights are disabled.</p>
             {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
             {modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
@@ -304,7 +305,7 @@ export function ModelsPage() {
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload() }}
               multiple={recipe.required_node_count > 1}
-              disabled={busy === `recipe:${recipe.id}`}
+              disabled={recipeBusy}
               requiredIds={localRequired}
               allowedIds={allowedIds}
               unavailableReasons={unavailableReasons}
@@ -317,7 +318,7 @@ export function ModelsPage() {
             />
             {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
-            <div className="modal-actions"><Button type="button" onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || busy === `recipe:${recipe.id}`} onClick={() => void deployRecipe()}><Play size={15} /> {busy === `recipe:${recipe.id}` ? 'Deploying…' : `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}`}</Button></div>
+            <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || recipeBusy} onClick={() => void deployRecipe()}><Play size={15} /> {recipeBusy ? 'Deploying…' : `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

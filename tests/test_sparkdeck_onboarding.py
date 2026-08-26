@@ -223,7 +223,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             }, "http://127.0.0.1:7878", "127.0.0.2")
         await manager.http.aclose()
 
-    async def test_worker_verifies_controller_then_persists_assignment(self):
+    async def test_normal_remote_join_verifies_controller_then_persists_assignment(self):
         requests = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -263,6 +263,36 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         manager.adopt_worker_role.assert_awaited_once()
         posted = json.loads(requests[1].content)
         self.assertEqual(posted["pairing_code"], manager.agent_credentials.data["pairing_code"])
+        await http.aclose()
+
+    async def test_join_rejects_localhost_alias_when_identity_is_this_node(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={
+                "role": "controller",
+                "node": {
+                    "id": manager.agent_credentials.node_id,
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                },
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "resolves to this node"):
+            await service.join({
+                "controller_url": "http://localhost:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+                "name": "Worker",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual([request.method for request in requests], ["GET"])
+        self.assertIsNone(service.assignment.load())
+        manager.adopt_worker_role.assert_not_awaited()
         await http.aclose()
 
     async def test_join_rejects_saved_sqlite_deployments_before_contacting_controller(self):

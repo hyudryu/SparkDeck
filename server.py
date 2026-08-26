@@ -172,6 +172,11 @@ async def _require_managed_agent_container(name: str, request: Request) -> None:
 @app.get("/api/state")
 async def get_state():
     state = await manager.get_state()
+    # The MCP compatibility client still discovers recipes through this
+    # aggregate endpoint. Keep these durable recipe records available while
+    # the new SparkDeck UI uses the versioned application API.
+    state["recipes"] = list(manager.recipes)
+    state["recipe_launches"] = dict(manager.recipe_launches)
     state["supported_runtimes"] = list(sparkdeck.registry.kinds)
     return state
 
@@ -879,6 +884,44 @@ async def cancel_job(job_id: str):
 @app.post("/api/queue/clear")
 async def clear_finished():
     return await manager.clear_finished()
+
+
+# ---------- recipe compatibility API ----------
+@app.post("/api/recipes")
+async def create_recipe(req: Request):
+    body = await req.json()
+    if not body.get("model"):
+        raise HTTPException(400, "model is required")
+    try:
+        return await manager.add_recipe(
+            model=body["model"],
+            name=body.get("name"),
+            image=body.get("image"),
+            extra_args=body.get("extra_args"),
+            gpu_memory_utilization=body.get("gpu_memory_utilization"),
+            gpu_memory_gb=body.get("gpu_memory_gb"),
+            engine=body.get("engine", "vllm"),
+            sg_tp_size=body.get("sg_tp_size"),
+            sg_context_length=body.get("sg_context_length"),
+            sg_max_running_requests=body.get("sg_max_running_requests"),
+            sg_mem_fraction=body.get("sg_mem_fraction"),
+            sg_image=body.get("sg_image"),
+            deployment_mode=body.get("deployment_mode", "single"),
+            node_ids=body.get("node_ids") or [LOCAL_NODE_ID],
+            launch_controls=body.get("launch_controls"),
+            force_new=bool(body.get("force_new")),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/recipes/{rid}")
+async def update_recipe(rid: str, req: Request):
+    try:
+        return await manager.update_recipe(rid, await req.json())
+    except ValueError as exc:
+        status = 404 if str(exc) == "recipe not found" else 400
+        raise HTTPException(status, str(exc)) from exc
 
 
 # ---------- versioned SparkDeck application API ----------

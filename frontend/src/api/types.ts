@@ -1,0 +1,153 @@
+export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
+export type DeploymentStatus = 'registered' | 'running' | 'starting' | 'stopped' | 'error' | 'unknown'
+
+export interface RuntimeCompatibility {
+  runtime: RuntimeKind
+  supported: boolean
+  reason?: string
+}
+
+export interface BenchmarkAggregate {
+  model_id: string
+  model_revision?: string
+  runtime: RuntimeKind
+  quantization?: string
+  hardware_class?: string
+  context_length?: number
+  median_tokens_per_second?: number
+  p25_tokens_per_second?: number
+  p75_tokens_per_second?: number
+  median_ttft_ms?: number
+  sample_count: number
+  distinct_device_count: number
+  community_proven?: boolean
+}
+
+export interface CatalogModel {
+  id: string
+  author?: string
+  name?: string
+  revision?: string
+  downloads?: number
+  likes?: number
+  parameter_count?: number
+  tags?: string[]
+  runtime_compatibility?: RuntimeCompatibility[]
+  local_deployment_ids?: string[]
+  community?: BenchmarkAggregate | null
+}
+
+export interface CatalogResponse {
+  items: CatalogModel[]
+  total?: number
+  next_cursor?: string | null
+}
+
+export interface DeploymentSettings {
+  context_length?: number
+  tensor_parallel_size?: number
+  data_parallel_size?: number
+  pipeline_parallel_size?: number
+  gpu_layers?: number
+  parallel_slots?: number
+  gpu_split?: string
+  quantization?: string
+  dtype?: string
+  port?: number
+  extra_args?: string[]
+}
+
+export interface Deployment {
+  id: string
+  alias: string
+  model_id: string
+  model_revision?: string
+  runtime: RuntimeKind
+  status: DeploymentStatus
+  managed: boolean
+  endpoint_url?: string
+  runtime_version?: string
+  image?: string
+  settings: DeploymentSettings
+  last_error?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CreateDeploymentInput {
+  alias: string
+  model_id: string
+  runtime: RuntimeKind
+  endpoint_url?: string
+  managed: boolean
+  settings: DeploymentSettings
+}
+
+export interface BenchmarkSample {
+  id: string
+  deployment_id?: string
+  model_id: string
+  model_revision?: string
+  runtime: RuntimeKind
+  quantization?: string
+  hardware_class?: string
+  input_tokens?: number
+  output_tokens?: number
+  latency_ms: number
+  ttft_ms?: number
+  tokens_per_second?: number
+  cold_start?: boolean
+  upload_eligible?: boolean
+  sync_state?: 'local' | 'pending' | 'synced' | 'failed' | 'waiting_for_account'
+  created_at: string
+}
+
+export interface SyncStatus {
+  sharing_enabled: boolean
+  account_paired: boolean
+  pending_count: number
+  synced_count: number
+  failed_count: number
+  last_sync_at?: string | null
+  last_error?: string | null
+}
+
+export interface ContainerImage {
+  id: string
+  repository?: string
+  tag?: string
+  size?: number
+  created_at?: string
+  runtimes?: RuntimeKind[]
+  in_use?: boolean
+  tags?: string[]
+  created?: string
+  is_vllm?: boolean
+}
+
+export interface AppSettings {
+  theme?: 'system' | 'light' | 'dark'
+  huggingface_token_configured?: boolean
+  default_runtime?: RuntimeKind
+  default_context_length?: number
+  community_api_url?: string
+  telemetry_interval_seconds?: number
+  [key: string]: unknown
+}
+
+export interface LogEntry {
+  timestamp?: string
+  level?: string
+  source?: string
+  message: string
+}
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatCompletionResponse {
+  choices: Array<{ message: ChatMessage }>
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+}

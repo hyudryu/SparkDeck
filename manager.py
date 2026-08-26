@@ -33,6 +33,7 @@ from cluster import (
     NodeRegistry,
 )
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
+from sparkdeck.updater import CAPABILITY, current_revision
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -778,6 +779,9 @@ class Manager:
             "name": self.settings.get("cluster_node_name") or socket.gethostname(),
             "hostname": socket.gethostname(),
             "protocol_version": AGENT_PROTOCOL_VERSION,
+            "capabilities": [CAPABILITY],
+            "update_protocol": 1,
+            "app_revision": current_revision(Path(__file__).parent),
             "status": "online" if docker_ready else "degraded",
             "online": True,
             "status_message": None if docker_ready else "Docker is unavailable",

@@ -40,4 +40,29 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Spark Three')).toBeInTheDocument()
     expect(screen.getByText(/2 of 3 nodes online/)).toBeInTheDocument()
   })
+
+  it('keeps local telemetry visible when cluster inventory fails', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({
+        cpu_pct: 20, cpu_temp_c: 54,
+        mem: { used: 64 * 1024 ** 3, total: 128 * 1024 ** 3, pct: 50 },
+        gpus: [], active_requests: {}, ts: 1_777_000_000,
+      })
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return new Response(JSON.stringify({ detail: 'node probe failed' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('54.0°C')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Cluster nodes' })).toBeInTheDocument()
+    expect(screen.getByText(/0 of 0 nodes online/)).toBeInTheDocument()
+    expect(screen.queryByText('node probe failed')).not.toBeInTheDocument()
+  })
 })

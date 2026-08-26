@@ -1,0 +1,1 @@
+export const SPARKDECK_VERSION = __SPARKDECK_VERSION__

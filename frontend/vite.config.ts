@@ -1,9 +1,44 @@
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+function commandOutput(command: string, args: string[]) {
+  try {
+    return execFileSync(command, args, {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch {
+    return undefined
+  }
+}
+
+function buildVersion() {
+  const trackedChanges = commandOutput('git', ['status', '--porcelain', '--untracked-files=no'])
+  const dirty = trackedChanges !== undefined && trackedChanges !== ''
+  const explicitVersion = process.env.SPARKDECK_VERSION?.trim()
+  if (explicitVersion && !dirty) return explicitVersion
+
+  if (process.env.GITHUB_REF_TYPE === 'tag' && !dirty) {
+    const githubTag = process.env.GITHUB_REF_NAME?.trim()
+    if (githubTag) return githubTag
+  }
+
+  const exactTag = commandOutput('git', ['describe', '--tags', '--exact-match', 'HEAD'])
+  if (exactTag && !dirty) return exactTag
+
+  const revision = (process.env.GITHUB_SHA?.trim() || commandOutput('git', ['rev-parse', '--short=8', 'HEAD']) || '').slice(0, 8)
+  return revision ? `dev-${revision}${dirty ? '-dirty' : ''}` : 'development'
+}
 
 export default defineConfig({
   base: '/static/app/',
   plugins: [react()],
+  define: {
+    __SPARKDECK_VERSION__: JSON.stringify(buildVersion()),
+  },
   server: {
     host: '127.0.0.1',
     port: 5173,

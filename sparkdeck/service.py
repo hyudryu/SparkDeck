@@ -204,7 +204,7 @@ class SparkDeckService:
                 continue
             stored = by_container.get(container.get("name"))
             if stored:
-                stored["status"] = _deployment_status(container.get("status"))
+                stored["status"] = _managed_container_status(container)
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -516,7 +516,7 @@ class SparkDeckService:
                 "repository": model, "revision": None, "artifact": None,
                 "quantization": container.get("variant"),
             },
-            "status": _deployment_status(container.get("status")),
+            "status": _managed_container_status(container),
             "container_name": container.get("name"),
             "settings": self._safe_configuration(container.get("load_settings") or {}),
             "base_url_set": bool(container.get("port")),
@@ -905,6 +905,14 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy"):
         return "error"
     return "unknown"
+
+
+def _managed_container_status(container: dict[str, Any]) -> str:
+    status = _deployment_status(container.get("status"))
+    if status != "running":
+        return status
+    phase = container.get("phase") or {}
+    return "running" if phase.get("phase") == "ready" else "starting"
 
 
 def _positive_float(value: Any) -> float | None:

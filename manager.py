@@ -2013,8 +2013,11 @@ class Manager:
                 # implement SupportsPP can explicitly request TP=nnodes, PP=1.
                 vllm_parallel_layout = (1, len(node_ids))
         requested_port = body.get("port")
-        if requested_port is None:
-            requested_port = await self._allocate_port()
+        local_port = requested_port
+        if LOCAL_NODE_ID in node_ids and local_port is None:
+            # A controller port is meaningful only for the controller member.
+            # Remote agents allocate against their own Docker/host namespace.
+            local_port = await self._allocate_port()
         master_ip, _ = self._inferred_fabric(
             available[LOCAL_NODE_ID],
             self.settings.get("cluster_fabric_ip"),
@@ -2084,12 +2087,13 @@ class Manager:
         member_specs = []
         for rank, node_id in enumerate(node_ids):
             node = available[node_id]
+            member_port = local_port if node_id == LOCAL_NODE_ID else None
             fabric_ip, fabric_interface = fabrics[node_id]
             safe_model = re.sub(r"[^a-zA-Z0-9_.-]+", "-", model).strip("-").lower()
             name = f"cluster-{deployment_id}-r{rank}-{safe_model[:36]}"
             payload = dict(base)
             payload.update({
-                "port": requested_port,
+                "port": member_port,
                 "name": name,
                 "cluster_member": {
                     "deployment_id": deployment_id,
@@ -2097,7 +2101,7 @@ class Manager:
                     "rank": rank,
                     "nnodes": len(node_ids),
                     "mode": mode,
-                    "serve_port": requested_port,
+                    "serve_port": member_port,
                     "fabric_ip": fabric_ip,
                     "fabric_interface": fabric_interface,
                 },
@@ -2141,6 +2145,7 @@ class Manager:
                 "rank": rank,
                 "container_name": name,
                 "fabric_ip": fabric_ip,
+                "port": member_port,
                 "status": "queued",
                 "phase": {
                     "phase": "queued",
@@ -2153,11 +2158,13 @@ class Manager:
         # can take many minutes, and the logs UI needs the names immediately
         # so it can ask every node for controller-side launch progress.
         deployment["members"] = member_specs
-        deployment["api_port"] = requested_port
+        deployment["api_port"] = member_specs[0].get("port")
         deployment["launch_settings"] = self._deployment_launch_settings({
             **body,
             "deployment_name": deployment["name"],
             "node_ids": node_ids,
+            # Persist only a user-requested fixed port. Automatically chosen
+            # ports must be reallocated by each owning node on rebuild.
             "port": requested_port,
         })
         self._save_deployments()
@@ -2172,6 +2179,8 @@ class Manager:
             else:
                 spec["status"] = result.get("status", "starting")
                 spec["container_id"] = result.get("id")
+                spec["port"] = result.get("port") or spec.get("port")
+        deployment["api_port"] = member_specs[0].get("port") if member_specs else None
         deployment["status"] = "error" if errors else "starting"
         if errors:
             deployment["error"] = "; ".join(errors)
@@ -6271,7 +6280,7 @@ class Manager:
             extra = list(extra_args or [])
             sg_cmd = ["-m", "sglang.launch_server", "--model-path", model]
             sg_cmd += ["--host", "0.0.0.0"]
-            serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
+            serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             sg_cmd += ["--port", str(serve_port)]
             if sg_tp_size and sg_tp_size > 0:
                 sg_cmd += ["--tp-size", str(sg_tp_size)]
@@ -6341,7 +6350,10 @@ class Manager:
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
                             str(serve_port)
-                            if distributed_member and int(cluster_member.get("rank", 0)) == 0
+                            if distributed_member and (
+                                cluster_member.get("mode") != "sharded"
+                                or int(cluster_member.get("rank", 0)) == 0
+                            )
                             else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
@@ -6420,7 +6432,7 @@ class Manager:
                 list(extra_args or [])
             )
 
-            serve_port = int(cluster_member.get("serve_port", port or 8000)) if distributed_member else 8000
+            serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             cmd = [
                 "vllm", "serve", model,
                 "--host", "0.0.0.0",
@@ -6485,7 +6497,10 @@ class Manager:
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
                             str(serve_port)
-                            if distributed_member and int(cluster_member.get("rank", 0)) == 0
+                            if distributed_member and (
+                                cluster_member.get("mode") != "sharded"
+                                or int(cluster_member.get("rank", 0)) == 0
+                            )
                             else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),

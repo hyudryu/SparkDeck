@@ -208,6 +208,10 @@ class SparkDeckService:
                 for node_id in stored["node_ids"] if node_id in cluster_nodes
             ]
             seen.add(stored["id"])
+        # Reconciliation can replace a local primary container name. Refresh
+        # ownership before scanning Docker so the replacement is not appended
+        # again as a synthetic legacy deployment.
+        by_container = {item.get("container_name"): item for item in registered}
         for container in containers:
             runtime = self._container_runtime(container)
             if runtime not in self.registry.kinds:
@@ -344,11 +348,28 @@ class SparkDeckService:
                         "sg_max_running_requests": settings.get("max_running_requests"),
                         "sg_mem_fraction": settings.get("mem_fraction_static"),
                     })
+                    if (
+                        settings.get("data_parallel_size") is not None
+                        and not any(
+                            str(arg) == "--dp-size"
+                            or str(arg).startswith("--dp-size=")
+                            for arg in launch_body["extra_args"]
+                        )
+                    ):
+                        launch_body["extra_args"] += [
+                            "--dp-size", str(settings["data_parallel_size"]),
+                        ]
                     if settings.get("quantization") is not None:
                         launch_body["extra_args"] += [
                             "--quantization", str(settings["quantization"]),
                         ]
-                cluster = await self.manager.create_deployment(launch_body)
+                try:
+                    cluster = await self.manager.create_deployment(launch_body)
+                except Exception:
+                    await self._recover_failed_cluster_launch(
+                        deployment, settings, mode, requested_node_ids,
+                    )
+                    raise
                 manager_id = cluster.get("id")
                 members = cluster.get("members") or []
                 primary = members[0] if members else {}
@@ -361,6 +382,9 @@ class SparkDeckService:
                 })
                 port = cluster.get("api_port")
                 if not manager_id or not deployment.container_name or not port:
+                    await self._recover_failed_cluster_launch(
+                        deployment, settings, mode, requested_node_ids,
+                    )
                     raise RuntimeError("cluster runtime launched without a discoverable endpoint")
                 try:
                     self.store.add_deployment(
@@ -408,6 +432,51 @@ class SparkDeckService:
             result = self.store.deployment(deployment_id) or deployment.to_dict()
             result.update({"status": launched.get("status", "running"), "port": int(port)})
             return result
+
+    async def _recover_failed_cluster_launch(
+        self, deployment: Deployment, settings: dict[str, Any],
+        mode: str, node_ids: list[str],
+    ) -> None:
+        """Remove, or durably adopt, a Manager record created before failure."""
+        failed = next(
+            (
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict)
+                and item.get("sparkdeck_record_id") == deployment.id
+            ),
+            None,
+        )
+        if not failed or not failed.get("id"):
+            return
+        try:
+            removed = await self.manager.deployment_action(failed["id"], "remove")
+            if removed.get("ok"):
+                return
+        except Exception:
+            pass
+
+        # If cleanup cannot reach every selected node, retain an actionable
+        # SparkDeck record instead of leaving an invisible Manager orphan.
+        members = failed.get("members") or []
+        primary = members[0] if members else {}
+        deployment.container_name = primary.get("container_name")
+        deployment.settings = self._local_configuration({
+            **settings,
+            "deployment_mode": mode,
+            "node_ids": node_ids,
+            "manager_deployment_id": failed["id"],
+        })
+        try:
+            port = failed.get("api_port")
+            self.store.add_deployment(
+                deployment,
+                f"http://127.0.0.1:{int(port)}" if port else None,
+                None,
+            )
+        except Exception:
+            # Preserve the original launch error. Manager still retains its
+            # diagnostic record if even local SQLite adoption fails.
+            pass
 
     async def deployment_action(self, deployment_id: str, action: str) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)

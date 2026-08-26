@@ -48,6 +48,22 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
 
+    async def test_cluster_routing_identifiers_never_enter_benchmark_configuration(self):
+        self.service._record_response(
+            "dep-1", "org/model", "vllm",
+            {
+                "context_length": 4096,
+                "node_ids": ["private-worker-id"],
+                "manager_deployment_id": "private-cluster-uuid",
+                "deployment_mode": "single",
+            },
+            time.monotonic() - 0.2,
+            {"usage": {"prompt_tokens": 32, "completion_tokens": 24}},
+        )
+
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(items[0]["configuration"], {"context_length": 4096})
+
     async def test_short_sample_remains_local_and_is_not_queued(self):
         self.service.store.set_setting("community_consent", True)
         self.service._record_response(

@@ -31,8 +31,8 @@ _SAFE_CONFIGURATION_KEYS = {
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "max_running_requests", "mem_fraction_static", "runtime_version",
-    "deployment_mode", "node_ids", "manager_deployment_id",
 }
+_LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 
 
 class SparkDeckService:
@@ -116,10 +116,26 @@ class SparkDeckService:
     async def deployments(self) -> list[dict[str, Any]]:
         registered = self.store.deployments(include_private=True)
         by_container = {item.get("container_name"): item for item in registered}
+        cluster_state: dict[str, Any] = {}
+        if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
+            try:
+                cluster_state = await self.manager.get_state()
+            except Exception:
+                cluster_state = {}
+        raw_manager_deployments = getattr(self.manager, "deployments", [])
+        manager_deployments = (
+            cluster_state.get("deployments")
+            or raw_manager_deployments
+        )
         cluster_by_id = {
             item.get("id"): item
-            for item in getattr(self.manager, "deployments", [])
+            for item in manager_deployments
             if isinstance(item, dict) and item.get("id")
+        }
+        cluster_by_record = {
+            item.get("sparkdeck_record_id"): item
+            for item in manager_deployments
+            if isinstance(item, dict) and item.get("sparkdeck_record_id")
         }
         cluster_nodes: dict[str, dict[str, Any]] = {}
         if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
@@ -138,9 +154,41 @@ class SparkDeckService:
         seen: set[str] = set()
         for stored in registered:
             manager_id = stored.get("settings", {}).get("manager_deployment_id")
-            cluster = cluster_by_id.get(manager_id)
+            cluster = cluster_by_id.get(manager_id) or cluster_by_record.get(stored["id"])
             if not cluster:
                 continue
+            if not cluster.get("sparkdeck_record_id") and cluster.get("id") == manager_id:
+                cluster["sparkdeck_record_id"] = stored["id"]
+                durable_cluster = next(
+                    (
+                        item for item in raw_manager_deployments
+                        if isinstance(item, dict) and item.get("id") == manager_id
+                    ),
+                    cluster,
+                )
+                durable_cluster["sparkdeck_record_id"] = stored["id"]
+                launch_settings = durable_cluster.get("launch_settings")
+                if isinstance(launch_settings, dict):
+                    launch_settings["sparkdeck_record_id"] = stored["id"]
+                save_deployments = getattr(self.manager, "_save_deployments", None)
+                if save_deployments is not None:
+                    save_deployments()
+            if cluster.get("id") != manager_id:
+                settings = self._local_configuration({
+                    **(stored.get("settings") or {}),
+                    "manager_deployment_id": cluster.get("id"),
+                    "node_ids": list(cluster.get("node_ids") or []),
+                })
+                primary = (cluster.get("members") or [{}])[0]
+                container_name = primary.get("container_name") or stored.get("container_name")
+                port = cluster.get("api_port")
+                self.store.update_managed_routing(
+                    stored["id"], settings, container_name,
+                    f"http://127.0.0.1:{int(port)}" if port else stored.get("_base_url"),
+                )
+                stored["settings"] = settings
+                stored["container_name"] = container_name
+                manager_id = cluster.get("id")
             stored["status"] = _deployment_status(cluster.get("status"))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
@@ -224,7 +272,7 @@ class SparkDeckService:
         )
         deployment = Deployment(
             id=deployment_id, alias=alias, runtime=runtime, kind=kind,
-            model=identity, settings=self._safe_configuration(settings),
+            model=identity, settings=self._local_configuration(settings),
             base_url_set=bool(body.get("base_url")),
         )
         # A launch can take minutes, but serializing creation is intentional:
@@ -277,6 +325,7 @@ class SparkDeckService:
                     "node_ids": requested_node_ids,
                     "extra_args": extra_args,
                     "managed_by": "sparkdeck",
+                    "sparkdeck_record_id": deployment_id,
                 }
                 if runtime is RuntimeKind.SGLANG:
                     launch_body.update({
@@ -294,7 +343,7 @@ class SparkDeckService:
                 members = cluster.get("members") or []
                 primary = members[0] if members else {}
                 deployment.container_name = primary.get("container_name")
-                deployment.settings = self._safe_configuration({
+                deployment.settings = self._local_configuration({
                     **settings,
                     "deployment_mode": mode,
                     "node_ids": requested_node_ids,
@@ -369,9 +418,22 @@ class SparkDeckService:
             result = await self.manager.deployment_action(manager_id, action)
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
+            replacement = result.get("deployment") if isinstance(result, dict) else None
+            if isinstance(replacement, dict) and replacement.get("id"):
+                primary = (replacement.get("members") or [{}])[0]
+                settings = self._local_configuration({
+                    **(deployment.get("settings") or {}),
+                    "manager_deployment_id": replacement["id"],
+                    "node_ids": list(replacement.get("node_ids") or []),
+                })
+                self.store.update_managed_routing(
+                    deployment_id, settings,
+                    primary.get("container_name") or deployment.get("container_name"),
+                    f"http://127.0.0.1:{int(replacement['api_port'])}",
+                )
             current = self.store.deployment(deployment_id) or deployment
             current["status"] = "running" if action == "start" else "stopped"
-            current["node_ids"] = list(deployment.get("settings", {}).get("node_ids") or [])
+            current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
             return current
         container = deployment.get("container_name")
         if not container:
@@ -740,6 +802,13 @@ class SparkDeckService:
     @staticmethod
     def _safe_configuration(settings: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in settings.items() if key in _SAFE_CONFIGURATION_KEYS}
+
+    @staticmethod
+    def _local_configuration(settings: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value for key, value in settings.items()
+            if key in _SAFE_CONFIGURATION_KEYS | _LOCAL_ROUTING_KEYS
+        }
 
     def _hardware_snapshot(self) -> dict[str, Any]:
         stats = getattr(self.manager, "_stats_cache", {}) or {}

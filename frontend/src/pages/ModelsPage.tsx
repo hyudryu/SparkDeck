@@ -1,8 +1,8 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Plus, Server, Trash2 } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -18,6 +18,29 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
+type DefaultFieldEdits = { runtime: boolean; contextLength: boolean }
+
+function mergeSavedDefaults(
+  current: CreateDeploymentInput,
+  defaults: AppSettings,
+  edits: DefaultFieldEdits,
+): CreateDeploymentInput {
+  const runtime = edits.runtime ? current.runtime : defaults.default_runtime ?? 'vllm'
+  const contextLength = edits.contextLength
+    ? current.settings.context_length ?? 8192
+    : defaults.default_context_length ?? 8192
+  const runtimeChanged = runtime !== current.runtime
+  return {
+    ...current,
+    runtime,
+    settings: runtimeChanged
+      ? runtime === 'llama.cpp'
+        ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
+        : { context_length: contextLength, tensor_parallel_size: 1 }
+      : { ...current.settings, context_length: contextLength },
+  }
+}
+
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const resource = useResource((signal) => api.deployments.list(signal))
@@ -30,18 +53,25 @@ export function ModelsPage() {
   const [formError, setFormError] = useState<string>()
   const [actionError, setActionError] = useState<string>()
   const [actionNotice, setActionNotice] = useState<string>()
+  const defaultFieldEdits = useRef<DefaultFieldEdits>({ runtime: false, contextLength: false })
 
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
-    setForm((current) => ({
-      ...current,
-      model_id: modelId,
-      alias: current.alias || modelId.split('/').at(-1) || modelId,
-    }))
+    defaultFieldEdits.current = { runtime: false, contextLength: false }
+    setForm((current) => {
+      const prefilled = {
+        ...current,
+        model_id: modelId,
+        alias: current.alias || modelId.split('/').at(-1) || modelId,
+      }
+      return defaults.data
+        ? mergeSavedDefaults(prefilled, defaults.data, defaultFieldEdits.current)
+        : prefilled
+    })
     setCreating(true)
     setSearchParams({}, { replace: true })
-  }, [searchParams, setSearchParams])
+  }, [defaults.data, searchParams, setSearchParams])
 
   useEffect(() => {
     const inventory = nodes.data
@@ -62,17 +92,18 @@ export function ModelsPage() {
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   useEffect(() => {
-    if (!defaults.data || creating) return
-    const runtime = defaults.data.default_runtime ?? 'vllm'
-    const contextLength = defaults.data.default_context_length ?? 8192
-    setForm((current) => ({
-      ...current,
-      runtime,
-      settings: runtime === 'llama.cpp'
-        ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-        : { context_length: contextLength, tensor_parallel_size: 1 },
-    }))
-  }, [creating, defaults.data])
+    if (!defaults.data) return
+    const savedDefaults = defaults.data
+    setForm((current) => mergeSavedDefaults(current, savedDefaults, defaultFieldEdits.current))
+  }, [defaults.data])
+
+  const openCreator = () => {
+    defaultFieldEdits.current = { runtime: false, contextLength: false }
+    setForm((current) => defaults.data
+      ? mergeSavedDefaults(current, defaults.data, defaultFieldEdits.current)
+      : current)
+    setCreating(true)
+  }
 
   const create = async (event: FormEvent) => {
     event.preventDefault()
@@ -108,6 +139,7 @@ export function ModelsPage() {
   }
 
   const updateRuntime = (runtime: RuntimeKind) => {
+    defaultFieldEdits.current.runtime = true
     setForm((current) => {
       const contextLength = current.settings.context_length ?? defaults.data?.default_context_length ?? 8192
       const localId = localNodeId ?? 'local'
@@ -130,14 +162,14 @@ export function ModelsPage() {
         eyebrow="Local runtimes"
         title="Models"
         description="Manage model servers across vLLM, llama.cpp, and SGLang from one place."
-        actions={<Button variant="primary" onClick={() => setCreating(true)}><Plus size={16} /> Add model</Button>}
+        actions={<Button variant="primary" onClick={openCreator}><Plus size={16} /> Add model</Button>}
       />
       {resource.loading && <LoadingState label="Loading deployments" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
       {!resource.loading && !resource.error && resource.data?.length === 0 && (
-        <EmptyState title="No model servers yet" description="Launch a managed runtime or connect an existing OpenAI-compatible endpoint." action={<Button variant="primary" onClick={() => setCreating(true)}>Add your first model</Button>} />
+        <EmptyState title="No model servers yet" description="Launch a managed runtime or connect an existing OpenAI-compatible endpoint." action={<Button variant="primary" onClick={openCreator}>Add your first model</Button>} />
       )}
       {resource.data && resource.data.length > 0 && (
         <Panel className="table-panel">
@@ -196,7 +228,10 @@ export function ModelsPage() {
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
               <div className="field-grid">
-                <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => setForm({ ...form, settings: { ...form.settings, context_length: Number(event.target.value) } })} /></label>
+                <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
+                  defaultFieldEdits.current.contextLength = true
+                  setForm({ ...form, settings: { ...form.settings, context_length: Number(event.target.value) } })
+                }} /></label>
                 {form.runtime === 'llama.cpp' ? (
                   <label className="field"><span>Parallel slots</span><input type="number" min="1" value={form.settings.parallel_slots} onChange={(event) => setForm({ ...form, settings: { ...form.settings, parallel_slots: Number(event.target.value) } })} /></label>
                 ) : (

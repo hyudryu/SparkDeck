@@ -128,23 +128,27 @@ class AgentCredentials:
         _atomic_json_write(self.path, value)
         self.data = value
 
-    def pair(self, pairing_code: str) -> dict:
+    def validate_pairing_code(self, pairing_code: str) -> None:
         if not pairing_code or not secrets.compare_digest(
             str(pairing_code), str(self.data.get("pairing_code", ""))
         ):
             raise ValueError("invalid pairing code")
-        response = {
+
+    def pair(self, pairing_code: str) -> dict:
+        self.validate_pairing_code(pairing_code)
+        # One-time pairing codes prevent another controller from replaying a
+        # code seen in logs. Rotating the bearer makes coordinator ownership
+        # exclusive, so a previously paired cluster cannot keep reading or
+        # relaying this node's usage after it joins a different cluster.
+        self.data["agent_token"] = secrets.token_urlsafe(32)
+        self.data["pairing_code"] = f"{secrets.randbelow(1_000_000):06d}"
+        self.data["paired_at"] = time.time()
+        _atomic_json_write(self.path, self.data)
+        return {
             "node_id": self.node_id,
             "agent_token": self.data["agent_token"],
             "protocol_version": AGENT_PROTOCOL_VERSION,
         }
-        # One-time pairing codes prevent another controller from replaying a
-        # code seen in logs.  The durable agent token is not rotated because a
-        # previously paired coordinator may still be managing deployments.
-        self.data["pairing_code"] = f"{secrets.randbelow(1_000_000):06d}"
-        self.data["paired_at"] = time.time()
-        _atomic_json_write(self.path, self.data)
-        return response
 
 
 class NodeRegistry:
@@ -182,12 +186,18 @@ class NodeRegistry:
         name: str | None = None,
         fabric_ip: str | None = None,
         fabric_interface: str | None = None,
+        usage_epoch: Any = None,
+        usage_model_epochs: dict | None = None,
     ) -> dict:
         url = normalize_agent_url(agent_url)
         try:
             response = await self.http.post(
                 f"{url}/api/agent/pair",
-                json={"pairing_code": str(pairing_code or "")},
+                json={
+                    "pairing_code": str(pairing_code or ""),
+                    "usage_epoch": usage_epoch,
+                    "usage_model_epochs": usage_model_epochs or {},
+                },
                 timeout=10,
             )
             response.raise_for_status()

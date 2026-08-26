@@ -157,6 +157,8 @@ export interface ContainerImage {
   tags?: string[]
   created?: string
   is_vllm?: boolean
+  node_ids?: string[]
+  selected_nodes?: NodeSummary[]
 }
 
 export interface ImagePullResult {

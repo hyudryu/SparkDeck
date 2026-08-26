@@ -4,23 +4,24 @@ import { api } from '../api/client'
 import type { AppSettings, RuntimeKind } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { applyTheme, persistTheme, storedTheme } from '../theme'
 
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
-  const [form, setForm] = useState<AppSettings>({ theme: 'system', default_runtime: 'vllm', default_context_length: 8192 })
+  const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), default_runtime: 'vllm', default_context_length: 8192 })
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
 
   useEffect(() => {
-    if (resource.data) setForm((current) => ({ ...current, ...resource.data }))
+    if (resource.data) {
+      setForm((current) => ({ ...current, ...resource.data }))
+      persistTheme(resource.data.theme ?? storedTheme())
+    }
   }, [resource.data])
 
   useEffect(() => {
-    const selected = form.theme ?? 'system'
-    const dark = selected === 'dark' || (selected === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light'
-    localStorage.setItem('sparkdeck.theme', selected)
+    applyTheme(form.theme ?? 'system')
   }, [form.theme])
 
   const save = async (event: FormEvent) => {
@@ -29,7 +30,9 @@ export function SettingsPage() {
     setSaved(false)
     setError(undefined)
     try {
-      setForm(await api.settings.update(form))
+      const savedSettings = await api.settings.update(form)
+      setForm((current) => ({ ...current, ...savedSettings }))
+      persistTheme(savedSettings.theme ?? form.theme ?? 'system')
       setSaved(true)
       window.setTimeout(() => setSaved(false), 2400)
     } catch (reason) {

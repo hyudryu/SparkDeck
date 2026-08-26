@@ -6,6 +6,7 @@ import {
   Cpu,
   GitCompareArrows,
   Images,
+  LayoutDashboard,
   Menu,
   MessageSquareText,
   Search,
@@ -15,7 +16,8 @@ import {
 import { NavLink, useLocation } from 'react-router-dom'
 
 const navigation = [
-  { to: '/', label: 'Explore', icon: Search, end: true },
+  { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
+  { to: '/explore', label: 'Explore', icon: Search },
   { to: '/models', label: 'Models', icon: Cpu },
   { to: '/chat', label: 'Chat', icon: MessageSquareText },
   { to: '/compare', label: 'Compare', icon: GitCompareArrows },

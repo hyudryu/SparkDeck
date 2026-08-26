@@ -780,6 +780,7 @@ class Manager:
             "hostname": socket.gethostname(),
             "protocol_version": AGENT_PROTOCOL_VERSION,
             "capabilities": [CAPABILITY],
+            "update_protocol": 1,
             "app_revision": current_revision(Path(__file__).parent),
             "status": "online" if docker_ready else "degraded",
             "online": True,

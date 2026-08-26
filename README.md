@@ -124,11 +124,11 @@ Adjust the template if your checkout lives elsewhere. Never place tokens directl
 
 ### Cluster-wide release updates
 
-After installing the bundled user service, open **Settings → Software update** to check the official GitHub repository for its latest published release. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
+After installing the bundled user service, open **Settings → Software update** to choose from the official GitHub repository's published releases. Select the newest release to upgrade, or an older compatible release to roll back. An install started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
 
 Self-update is intentionally release-only: it never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled `sparkdeck.service`, and already support the update protocol. A dirty, offline, divergent, or unsupported node blocks the rollout before any node changes. Because older installations do not expose this protocol, install the release containing this feature manually on every node once; later releases can update the whole cluster from the Settings button.
 
-Publish a GitHub Release with a tag whose commit is a fast-forward from the installed version. SparkDeck resolves that tag to an immutable commit, stages the Python and frontend builds in a temporary worktree, fast-forwards the live checkout, and restarts through systemd. If no release exists, Settings reports that honestly and does not fall back to `main`.
+SparkDeck resolves the selected release tag to an immutable commit, verifies its updater/data compatibility manifest, and stages the Python and frontend builds in a temporary worktree. Upgrades fast-forward the installed checkout; downgrades use a detached checkout so the user's branch pointer is preserved. Only releases in the same linear history are accepted. After restarting through systemd, SparkDeck verifies the selected revision is healthy and automatically restores the previous revision if that health check fails. If no release exists, Settings reports that honestly and does not fall back to `main`.
 
 ## Development
 

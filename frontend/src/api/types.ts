@@ -191,10 +191,11 @@ export interface AppSettings {
 
 export interface SystemUpdateRelease {
   tag: string
-  revision: string
+  revision?: string
   name: string
   url?: string
   published_at?: string
+  prerelease?: boolean
 }
 
 export interface SystemUpdateNode {
@@ -222,6 +223,8 @@ export interface SystemUpdateJob {
 export interface SystemUpdateOverview {
   repository: string
   current_revision?: string
+  current_release_tag?: string | null
+  releases: SystemUpdateRelease[]
   latest_release?: SystemUpdateRelease | null
   can_update: boolean
   blockers: string[]

@@ -108,10 +108,16 @@ describe('theme persistence', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('system-update')) return new Response(JSON.stringify(init?.method === 'POST' ? {
-        id: 'job-1', active: true, phase: 'preflight', target_tag: 'v1.0.0', target_revision: 'b'.repeat(40), nodes: [],
+        id: 'job-1', active: true, phase: 'preflight', target_tag: 'v0.9.0', target_revision: 'b'.repeat(40), nodes: [],
       } : {
         repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
-        latest_release: { tag: 'v1.0.0', revision: 'b'.repeat(40), name: 'v1.0.0' },
+        current_release_tag: 'v1.0.0',
+        releases: [
+          { tag: 'v1.1.0', name: 'Version 1.1' },
+          { tag: 'v1.0.0', name: 'Version 1.0' },
+          { tag: 'v0.9.0', name: 'Version 0.9' },
+        ],
+        latest_release: { tag: 'v1.1.0', name: 'Version 1.1' },
         can_update: true, blockers: [], nodes: [{ id: 'local', name: 'Controller', local: true, online: true, blockers: [] }],
       }), { status: init?.method === 'POST' ? 202 : 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({ theme: 'system', default_runtime: 'vllm', default_context_length: 8192 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -121,11 +127,15 @@ describe('theme persistence', () => {
     const user = userEvent.setup()
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    await user.click(await screen.findByRole('button', { name: 'Update all nodes' }))
+    const release = await screen.findByRole('combobox', { name: 'Release version' })
+    expect(release).toHaveValue('v1.1.0')
+    expect(screen.getByRole('option', { name: /Version 1.0.*installed/ })).toBeInTheDocument()
+    await user.selectOptions(release, 'v0.9.0')
+    await user.click(screen.getByRole('button', { name: 'Install on all nodes' }))
 
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('controller restarts last'))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/v0\.9\.0.*may upgrade or downgrade.*controller restarts last/i))
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/system-update', expect.objectContaining({
-      method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster' }),
+      method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', tag: 'v0.9.0' }),
     }))
   })
 })

@@ -101,6 +101,18 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertFalse(contract["supported"])
         self.assertIn("unsupported persisted deployment mode", contract["error"])
 
+    def test_unhashable_saved_node_id_marks_only_that_recipe_unsupported(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "deployment_mode": "replicated",
+            "node_ids": ["local", {"id": "node-2"}, ["node-3"]],
+            "extra_args": [],
+        })
+
+        self.assertEqual(contract["deployment_mode"], "replicated")
+        self.assertEqual(contract["required_node_count"], 2)
+        self.assertFalse(contract["supported"])
+        self.assertIn("node_ids", contract["error"])
+
 
 class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -169,6 +181,27 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.json()["items"]], ["bad-tp", "valid"])
         self.assertEqual(response.json()["items"][0]["tensor_parallel_size"], 1)
+
+    async def test_unhashable_node_id_does_not_hide_other_saved_configurations(self):
+        recipes = [
+            {
+                "id": "bad-nodes", "model": "org/bad", "engine": "vllm",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", {"id": "node-2"}, ["node-3"]],
+            },
+            {"id": "valid", "model": "org/valid", "engine": "vllm", "extra_args": []},
+        ]
+        with (
+            patch.object(server.manager, "recipes", recipes),
+            patch.object(server.manager, "recipe_launches", {}),
+        ):
+            response = await self.client.get("/api/v1/recipes")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.json()["items"]], ["bad-nodes", "valid"])
+        self.assertFalse(response.json()["items"][0]["supported"])
+        self.assertIn("node_ids", response.json()["items"][0]["error"])
+        self.assertTrue(response.json()["items"][1]["supported"])
 
     async def test_unknown_deployment_mode_is_listed_as_unsupported_and_rejected(self):
         recipe = {

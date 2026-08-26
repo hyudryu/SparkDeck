@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Plus, Server, Trash2 } from 'lucide-react'
+import { Bookmark, HardDrive, Play, Plus, Server, Trash2 } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
+import { formatBytes } from '../utils/format'
 
 const initialForm: CreateDeploymentInput = {
   alias: '',
@@ -47,6 +48,8 @@ export function ModelsPage() {
   const defaults = useResource((signal) => api.settings.get(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
+  const modelCache = useResource((signal) => api.modelCache.get(signal))
+  const recipes = useResource((signal) => api.recipes.list(signal))
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<CreateDeploymentInput>(initialForm)
   const [busy, setBusy] = useState<string>()
@@ -138,6 +141,36 @@ export function ModelsPage() {
     }
   }
 
+  const deployRecipe = async (id: string) => {
+    setBusy(`recipe:${id}`)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      const deployment = await api.recipes.deploy(id)
+      setActionNotice(`Deployed saved configuration ${deployment.alias}.`)
+      resource.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not deploy saved configuration')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const modelStorage = (deployment: Deployment) => {
+    const locations = (modelCache.data?.nodes ?? []).flatMap((node) =>
+      node.models
+        .filter((model) => model.model_id === deployment.model_id)
+        .map((model) => ({ ...model, nodeName: node.name })),
+    )
+    if (!locations.length) return 'Disk size unavailable'
+    const total = locations.reduce((sum, location) => sum + location.size_bytes, 0)
+    if (locations.length === 1) return `${formatBytes(total)} on ${locations[0].nodeName}`
+    const perCopy = locations.every((location) => location.size_bytes === locations[0].size_bytes)
+      ? `${formatBytes(locations[0].size_bytes)} each · `
+      : ''
+    return `${perCopy}${formatBytes(total)} total on ${locations.length} nodes`
+  }
+
   const updateRuntime = (runtime: RuntimeKind) => {
     defaultFieldEdits.current.runtime = true
     setForm((current) => {
@@ -166,8 +199,31 @@ export function ModelsPage() {
       />
       {resource.loading && <LoadingState label="Loading deployments" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
+      {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
+      {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">
+        <div className="section-heading"><div><h2 id="saved-configurations-title">Saved cluster configurations</h2><p>Existing saved recipes are preserved and deploy through SparkDeck.</p></div></div>
+        <div className="saved-configuration-grid">
+          {recipes.data.map((recipe) => {
+            const targets = (recipe.node_ids?.length ? recipe.node_ids : ['local']).map((id) => nodes.data?.find((node) => node.id === id))
+            const targetNames = targets.map((node, index) => node?.name ?? recipe.node_ids?.[index] ?? 'This device')
+            const unavailable = targets.some((node) => !node || !isNodeSelectable(node))
+            const disabled = recipe.supported === false || unavailable
+            return <Panel className="saved-configuration-card" key={recipe.id}>
+              <div className="saved-configuration-heading"><span className="panel-icon"><Bookmark size={17} /></span><div><h3>{recipe.name || recipe.model}</h3><p>{recipe.model}</p></div></div>
+              <dl>
+                <div><dt>Runtime</dt><dd><RuntimeMark runtime={recipe.engine || 'vllm'} /></dd></div>
+                <div><dt>Layout</dt><dd>{recipe.deployment_mode || 'single'} · {targetNames.length} {targetNames.length === 1 ? 'node' : 'nodes'}</dd></div>
+                <div><dt>Targets</dt><dd>{targetNames.join(', ')}</dd></div>
+                <div><dt>Arguments</dt><dd>{recipe.extra_args_count ?? 0} saved</dd></div>
+              </dl>
+              {(recipe.error || unavailable) && <p className="saved-configuration-warning">{recipe.error || 'One or more saved nodes are missing, offline, or not ready.'}</p>}
+              <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => void deployRecipe(recipe.id)}><Play size={15} /> {busy === `recipe:${recipe.id}` ? 'Deploying…' : 'Deploy saved config'}</Button>
+            </Panel>
+          })}
+        </div>
+      </section>}
       {!resource.loading && !resource.error && resource.data?.length === 0 && (
         <EmptyState title="No model servers yet" description="Launch a managed runtime or connect an existing OpenAI-compatible endpoint." action={<Button variant="primary" onClick={openCreator}>Add your first model</Button>} />
       )}
@@ -179,7 +235,7 @@ export function ModelsPage() {
             </div>
             {resource.data.map((deployment) => (
               <div className="table-row" role="row" key={deployment.id} tabIndex={0}>
-                <div role="cell" data-label="Model"><strong>{deployment.alias}</strong><small>{deployment.model_id}</small></div>
+                <div role="cell" data-label="Model"><strong>{deployment.alias}</strong><small>{deployment.model_id}</small><small className="model-disk-usage"><HardDrive size={12} /> {modelStorage(deployment)}</small></div>
                 <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                 <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                 <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>

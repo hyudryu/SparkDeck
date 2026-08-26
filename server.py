@@ -1299,6 +1299,74 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
+@app.get("/api/v1/recipes")
+async def v1_recipes():
+    """Expose durable legacy recipes in the SparkDeck Models UI."""
+    return {
+        "items": [
+            {
+                "id": recipe.get("id"),
+                "name": recipe.get("name") or recipe.get("model"),
+                "model": recipe.get("model"),
+                "engine": recipe.get("engine") or "vllm",
+                "image": recipe.get("image"),
+                "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
+                "gpu_memory_gb": recipe.get("gpu_memory_gb"),
+                "sg_tp_size": recipe.get("sg_tp_size"),
+                "sg_context_length": recipe.get("sg_context_length"),
+                "sg_max_running_requests": recipe.get("sg_max_running_requests"),
+                "sg_mem_fraction": recipe.get("sg_mem_fraction"),
+                "sg_image": recipe.get("sg_image"),
+                "deployment_mode": recipe.get("deployment_mode") or "single",
+                "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
+                "extra_args_count": len(recipe.get("extra_args") or []),
+                "supported": recipe.get("supported", True),
+                "error": recipe.get("error"),
+                "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
+            }
+            for recipe in manager.recipes
+        ]
+    }
+
+
+@app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
+async def v1_deploy_recipe(recipe_id: str):
+    recipe = await manager.get_recipe(recipe_id)
+    if not recipe:
+        raise HTTPException(404, "saved configuration not found")
+    if recipe.get("supported") is False:
+        raise HTTPException(400, recipe.get("error") or "saved runtime is unsupported")
+    settings = {
+        "extra_args": list(recipe.get("extra_args") or []),
+        "image": recipe.get("image"),
+        "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
+        "gpu_memory_gb": recipe.get("gpu_memory_gb"),
+    }
+    if str(recipe.get("engine") or "vllm") == "sglang":
+        settings.update({
+            "tensor_parallel_size": recipe.get("sg_tp_size"),
+            "context_length": recipe.get("sg_context_length"),
+            "max_running_requests": recipe.get("sg_max_running_requests"),
+            "mem_fraction_static": recipe.get("sg_mem_fraction"),
+            "image": recipe.get("sg_image") or recipe.get("image"),
+        })
+    try:
+        return await sparkdeck.create_deployment({
+            "model": recipe.get("model"),
+            "alias": recipe.get("name") or recipe.get("model"),
+            "runtime": recipe.get("engine") or "vllm",
+            "kind": "managed",
+            "settings": {key: value for key, value in settings.items() if value is not None},
+            "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
+            "deployment_mode": recipe.get("deployment_mode") or "single",
+            "recipe_id": recipe_id,
+        })
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "default_runtime": "vllm",
@@ -1361,6 +1429,17 @@ async def v1_storage():
             "nodes": state.get("nodes", []),
             "jobs": state.get("jobs", []),
             "instructions": list(_STORAGE_INSTRUCTIONS),
+        })
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.get("/api/v1/model-cache")
+async def v1_model_cache():
+    """Read-only per-node model disk usage; independent of Virtual NAS."""
+    try:
+        return _public_storage_payload({
+            "nodes": await manager.model_cache_inventory(),
         })
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc

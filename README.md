@@ -13,6 +13,7 @@ The long-term goal is a public community catalog where people can find a model t
 - Capture local benchmark measurements such as time to first token, output throughput, token counts, and latency.
 - Prepare eligible, redacted benchmark samples for future community sync.
 - Coordinate compatible SparkDeck nodes for distributed or replicated inference.
+- Copy Hugging Face cache weights between paired nodes with the opt-in virtual NAS.
 
 SparkDeck is under active development. The management API is not hardened for direct public-internet exposure. Run it on a trusted network or behind an authenticated reverse proxy.
 
@@ -82,6 +83,14 @@ Community results should be treated as evidence, not a guarantee. Hardware, runt
 ## Cluster and MCP automation
 
 SparkDeck nodes can be paired over a trusted management network for distributed and replicated deployments. Pairing credentials are stored locally beneath `data/`; do not commit or share that directory.
+
+### Virtual NAS model transfers
+
+Virtual NAS is an opt-in cluster feature for copying model weights that are already in the Hugging Face cache on one SparkDeck node to another. Open **Storage** in the app, enable virtual NAS, choose a source model, and select one or more online target nodes. A joined worker forwards its normal Storage view to the controller, so every node shows the same cluster-wide inventory and transfer jobs.
+
+Keep every node and transfer on a cluster-private network, preferably Tailscale. The transfer endpoints use the paired node-agent credentials, but SparkDeck is not a public file server and these routes should never be exposed directly to the internet. Pair the nodes first, confirm that their Tailscale addresses report online, and allow enough free space for a complete copy before starting a transfer.
+
+Only complete Hugging Face cache model weights are shown and transferable. Virtual NAS does not browse arbitrary directories, expose cache paths or Hugging Face tokens, or copy unrelated files. Deletion is similarly limited to an exact cached model ID and is refused while the model is serving or participating in an active transfer.
 
 The optional MCP endpoint is served on the application port:
 

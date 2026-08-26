@@ -17,7 +17,7 @@ from cluster import (
     normalize_agent_url,
 )
 from manager import Manager
-from sparkdeck.onboarding import resolve_control_connection
+from sparkdeck.onboarding import resolve_agent_connection
 
 
 class AgentCredentialsTests(unittest.TestCase):
@@ -119,12 +119,12 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             registry = NodeRegistry(
                 Path(directory), client, "controller",
-                connection_resolver=resolve_control_connection,
+                connection_resolver=resolve_agent_connection,
             )
             registry.nodes = [{
                 "id": "remote-1",
                 "name": "Spark 2",
-                "agent_url": "https://worker.tail.example:7878",
+                "agent_url": "https://worker.tail.example:7878/sparkdeck",
                 "agent_token": "agent-secret",
                 "enabled": True,
             }]
@@ -143,7 +143,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolutions, [("worker.tail.example", 7878)])
         self.assertEqual(
             str(requests[0].url),
-            "https://100.100.20.30:7878/api/agent/containers",
+            "https://100.100.20.30:7878/sparkdeck/api/agent/containers",
         )
         self.assertEqual(requests[0].headers["host"], "worker.tail.example:7878")
         self.assertEqual(requests[0].extensions["sni_hostname"], "worker.tail.example")
@@ -178,7 +178,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             registry = NodeRegistry(
                 Path(directory), client, "controller",
-                connection_resolver=resolve_control_connection,
+                connection_resolver=resolve_agent_connection,
             )
             registry.nodes = [{
                 "id": "remote-1", "name": "Spark 2", "enabled": True,
@@ -234,23 +234,26 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             registry = NodeRegistry(
                 Path(directory), client, "controller",
-                connection_resolver=resolve_control_connection,
+                connection_resolver=resolve_agent_connection,
             )
             try:
                 with mock.patch(
                     "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
                 ):
                     paired = await registry.pair_remote(
-                        "http://worker.tail.example:7878", "123456",
+                        "http://worker.tail.example:7878/sparkdeck/", "123456",
                     )
             finally:
                 await client.aclose()
 
         self.assertEqual(paired["id"], "remote-1")
+        self.assertEqual(
+            paired["agent_url"], "http://worker.tail.example:7878/sparkdeck"
+        )
         self.assertEqual(resolution_count, 1)
         self.assertEqual([str(request.url) for request in requests], [
-            "http://100.64.0.10:7878/api/agent/pair",
-            "http://100.64.0.11:7878/api/agent/pair",
+            "http://100.64.0.10:7878/sparkdeck/api/agent/pair",
+            "http://100.64.0.11:7878/sparkdeck/api/agent/pair",
         ])
         self.assertTrue(all(
             json.loads(request.content)["pairing_code"] == "123456"
@@ -280,11 +283,11 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             registry = NodeRegistry(
                 Path(directory), client, "controller",
-                connection_resolver=resolve_control_connection,
+                connection_resolver=resolve_agent_connection,
             )
             registry.nodes = [{
                 "id": "remote-1", "name": "Spark 2", "enabled": True,
-                "agent_url": "http://worker.tail.example:7878",
+                "agent_url": "http://worker.tail.example:7878/sparkdeck",
                 "agent_token": "agent-secret",
             }]
             try:
@@ -302,14 +305,29 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, b"stream")
         self.assertEqual(resolution_count, 1)
         self.assertEqual([str(request.url) for request in requests], [
-            "http://100.64.0.20:7878/api/agent/files",
-            "http://100.64.0.21:7878/api/agent/files",
+            "http://100.64.0.20:7878/sparkdeck/api/agent/files",
+            "http://100.64.0.21:7878/sparkdeck/api/agent/files",
         ])
         self.assertTrue(all(
             request.headers["authorization"] == "Bearer agent-secret"
             and request.headers["host"] == "worker.tail.example:7878"
             for request in requests
         ))
+
+    async def test_agent_connection_rejects_public_dns_with_base_path(self) -> None:
+        def resolve(host, port, **kwargs):
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("203.0.113.10", port),
+            )]
+
+        with mock.patch(
+            "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+        ):
+            with self.assertRaisesRegex(ValueError, "Tailscale or loopback"):
+                await resolve_agent_connection(
+                    "https://worker.example:7878/sparkdeck"
+                )
 
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:

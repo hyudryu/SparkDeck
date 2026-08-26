@@ -20,7 +20,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from cluster import AGENT_PROTOCOL_VERSION
+from cluster import AGENT_PROTOCOL_VERSION, normalize_agent_url
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json
 
 
@@ -57,7 +57,7 @@ def _allowed_control_ip(value: str) -> bool:
 
 @dataclass(frozen=True)
 class ControlConnection:
-    """Logical control URL plus the IP-pinned transport destination."""
+    """Logical SparkDeck URL plus its IP-pinned transport destinations."""
 
     url: str
     connect_urls: tuple[str, ...]
@@ -70,9 +70,7 @@ class ControlConnection:
         return self.connect_urls[0]
 
 
-async def resolve_control_connection(value: Any) -> ControlConnection:
-    """Resolve, validate, and pin one loopback/Tailscale control connection."""
-    url = normalize_control_url(value)
+async def _resolve_pinned_connection(url: str) -> ControlConnection:
     parsed = httpx.URL(url)
     host = parsed.raw_host.decode("ascii")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -111,8 +109,18 @@ async def resolve_control_connection(value: Any) -> ControlConnection:
     )
 
 
+async def resolve_control_connection(value: Any) -> ControlConnection:
+    """Resolve, validate, and pin one root-level controller connection."""
+    return await _resolve_pinned_connection(normalize_control_url(value))
+
+
+async def resolve_agent_connection(value: Any) -> ControlConnection:
+    """Resolve and pin an agent URL while preserving its accepted base path."""
+    return await _resolve_pinned_connection(normalize_agent_url(str(value or "")))
+
+
 async def validate_control_url(value: Any) -> str:
-    """Allow only loopback or Tailscale-reachable controller/agent URLs."""
+    """Allow only root-level, loopback or Tailscale-reachable controller URLs."""
     return (await resolve_control_connection(value)).url
 
 

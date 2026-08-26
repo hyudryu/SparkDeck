@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-const routes = ['/', '/dashboard', '/explore', '/models', '/chat', '/compare', '/benchmarks', '/images', '/settings', '/logs']
+const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/chat', '/compare', '/benchmarks', '/images', '/settings', '/logs']
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
@@ -12,6 +12,7 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/inference-queue')) body = { 'dep-1': { model: 'test-model', running: 2, queued: 3, oldest_wait_seconds: 1.5 } }
     else if (path.endsWith('/deployments')) body = { items: [{ id: 'dep-1', alias: 'Test model', runtime: 'vllm', kind: 'managed', model: { repository: 'org/test-model' }, status: 'running', settings: {} }] }
     else if (path.endsWith('/nodes')) body = { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, fabric_ready: true, selectable: true }, { id: 'spark-2', name: 'Studio Spark', local: false, online: true, docker_ready: true, fabric_ready: true, selectable: true }] }
+    else if (path.endsWith('/onboarding')) body = { role: 'controller', node: { id: 'local', name: 'Studio controller', port: 7878, access_urls: ['https://controller.tailnet.ts.net:7878'] }, controller_reachable: true, join_code: 'PAIR-123', instructions: [] }
     else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
     else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured' }
@@ -83,5 +84,8 @@ test('offers node targets for image pulls and deployments', async ({ page }) => 
   await page.goto('http://127.0.0.1:4173/models')
   await page.getByRole('button', { name: 'Add model' }).click()
   await expect(page.getByRole('checkbox', { name: /This device/ })).toBeChecked()
-  await expect(page.getByRole('checkbox', { name: /This device/ })).toBeDisabled()
+  await expect(page.getByRole('checkbox', { name: /This device/ })).toBeEnabled()
+  await page.getByRole('checkbox', { name: /Studio Spark/ }).check()
+  await page.getByRole('checkbox', { name: /This device/ }).uncheck()
+  await expect(page.getByText('Target:').locator('..')).toContainText('Studio Spark')
 })

@@ -39,4 +39,12 @@ describe('NodeSelector', () => {
     expect(coordinator).toBeDisabled()
     expect(coordinator).toHaveAccessibleName(/Required/)
   })
+
+  it('labels the controller and first replicated target in worker context', () => {
+    render(<NodeSelector nodes={inventory} selectedIds={['spark-2', 'local']} onChange={() => undefined} localLabel="Controller" primaryId="spark-2" />)
+
+    expect(screen.getByRole('checkbox', { name: /Controller/ })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /Studio Spark.*Primary/ })).toBeChecked()
+    expect(screen.getByText('Targets:').parentElement).toHaveTextContent('Targets: Studio Spark, Controller · Primary: Studio Spark')
+  })
 })

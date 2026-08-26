@@ -14,6 +14,7 @@ function formatBytes(bytes?: number) {
 export function ImagesPage() {
   const resource = useResource((signal) => api.images.list(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
+  const onboarding = useResource((signal) => api.onboarding.get(signal))
   const [image, setImage] = useState('')
   const [selectedNodeIds, setSelectedNodeIds] = useState(['local'])
   const [busy, setBusy] = useState(false)
@@ -32,6 +33,7 @@ export function ImagesPage() {
 
   const selectionReady = !nodes.loading && !nodes.error && selectedNodeIds.length > 0
     && selectedNodeIds.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+  const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   const pull = async (event: FormEvent) => {
     event.preventDefault()
@@ -50,8 +52,8 @@ export function ImagesPage() {
         resource.reload()
         return
       }
-      const selected = result.selected_nodes?.map((node) => node.name).join(', ')
-        || selectedNodeLabel(nodes.data ?? [], result.node_ids)
+      const selected = result.selected_nodes?.map((node) => node.id === 'local' ? localLabel : node.name).join(', ')
+        || selectedNodeLabel(nodes.data ?? [], result.node_ids, localLabel)
       setNotice(`Pulled ${requestedImage} on ${selected}.`)
       resource.reload()
     } catch (reason) {
@@ -69,7 +71,7 @@ export function ImagesPage() {
         <form onSubmit={(event) => void pull(event)}>
           <label className="field"><span>Container image</span><input value={image} onChange={(event) => setImage(event.target.value)} placeholder="vllm/vllm-openai:v0.10.0" /></label>
           <Button type="submit" variant="primary" disabled={busy || !image.trim() || !selectionReady}><Download size={16} /> {busy ? 'Pulling…' : `Pull on ${selectedNodeIds.length} ${selectedNodeIds.length === 1 ? 'node' : 'nodes'}`}</Button>
-          <NodeSelector nodes={nodes.data ?? []} selectedIds={selectedNodeIds} onChange={setSelectedNodeIds} loading={nodes.loading} error={nodes.error} onRetry={nodes.reload} disabled={busy} />
+          <NodeSelector nodes={nodes.data ?? []} selectedIds={selectedNodeIds} onChange={setSelectedNodeIds} loading={nodes.loading} error={nodes.error} onRetry={nodes.reload} disabled={busy} localLabel={localLabel} />
         </form>
         {error && <p className="inline-error" role="alert">{error}</p>}
         {notice && <p className="inline-success" role="status">{notice}</p>}

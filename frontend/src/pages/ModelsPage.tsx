@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Plus, Server, Trash2 } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
@@ -18,9 +19,11 @@ const initialForm: CreateDeploymentInput = {
 }
 
 export function ModelsPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
   const resource = useResource((signal) => api.deployments.list(signal))
   const defaults = useResource((signal) => api.settings.get(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
+  const onboarding = useResource((signal) => api.onboarding.get(signal))
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<CreateDeploymentInput>(initialForm)
   const [busy, setBusy] = useState<string>()
@@ -29,21 +32,34 @@ export function ModelsPage() {
   const [actionNotice, setActionNotice] = useState<string>()
 
   useEffect(() => {
+    const modelId = searchParams.get('model')?.trim()
+    if (!modelId) return
+    setForm((current) => ({
+      ...current,
+      model_id: modelId,
+      alias: current.alias || modelId.split('/').at(-1) || modelId,
+    }))
+    setCreating(true)
+    setSearchParams({}, { replace: true })
+  }, [searchParams, setSearchParams])
+
+  useEffect(() => {
     const inventory = nodes.data
     if (!inventory?.length) return
     setForm((current) => {
       const local = inventory.find((node) => node.local)
-      if (!local) return { ...current, node_ids: [], deployment_mode: 'single' }
-      const remotes = (current.node_ids ?? []).filter((id) => id !== local.id && inventory.some((node) => node.id === id && isNodeSelectable(node)))
-      const nodeIds = [local.id, ...remotes]
+      const available = (current.node_ids ?? []).filter((id) => inventory.some((node) => node.id === id && isNodeSelectable(node)))
+      const fallback = local && isNodeSelectable(local) ? local : inventory.find(isNodeSelectable)
+      const nodeIds = available.length ? available : fallback ? [fallback.id] : []
       return { ...current, node_ids: nodeIds, deployment_mode: nodeIds.length > 1 ? 'replicated' : 'single' }
     })
   }, [nodes.data])
 
   const localNodeId = nodes.data?.find((node) => node.local)?.id
-  const selectionReady = !nodes.loading && !nodes.error && Boolean(localNodeId)
-    && (form.node_ids?.length ?? 0) > 0
+  const selectionReady = !nodes.loading && !nodes.error && (form.node_ids?.length ?? 0) > 0
     && (form.node_ids ?? []).every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+    && (form.runtime !== 'llama.cpp' || (form.node_ids?.length === 1 && form.node_ids[0] === localNodeId))
+  const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   useEffect(() => {
     if (!defaults.data || creating) return
@@ -65,8 +81,8 @@ export function ModelsPage() {
     setActionNotice(undefined)
     try {
       const deployment = await api.deployments.create(form)
-      const selected = deployment.selected_nodes?.map((node) => node.name).join(', ')
-        || selectedNodeLabel(nodes.data ?? [], deployment.node_ids ?? form.node_ids ?? ['local'])
+      const selected = deployment.selected_nodes?.map((node) => node.id === 'local' ? localLabel : node.name).join(', ')
+        || selectedNodeLabel(nodes.data ?? [], deployment.node_ids ?? form.node_ids ?? ['local'], localLabel)
       setActionNotice(`Added ${deployment.alias} on ${selected}.`)
       setCreating(false)
       setForm(initialForm)
@@ -134,7 +150,7 @@ export function ModelsPage() {
                 <div role="cell" data-label="Model"><strong>{deployment.alias}</strong><small>{deployment.model_id}</small></div>
                 <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                 <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
-                <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node) => node.name).join(', ') || deployment.node_ids?.join(', ') || 'This device'}</span></div>
+                <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
                 <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
                 <div role="cell" data-label="Actions" className="row-actions">
                   {deployment.managed && (deployment.status === 'running'
@@ -173,7 +189,10 @@ export function ModelsPage() {
                 onRetry={nodes.reload}
                 multiple={form.runtime !== 'llama.cpp'}
                 disabled={busy === 'create'}
-                requiredIds={localNodeId ? [localNodeId] : []}
+                requiredIds={form.runtime === 'llama.cpp' && localNodeId ? [localNodeId] : []}
+                allowedIds={form.runtime === 'llama.cpp' && localNodeId ? [localNodeId] : undefined}
+                localLabel={localLabel}
+                primaryId={(form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
               <div className="field-grid">

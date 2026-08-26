@@ -27,7 +27,7 @@ describe('SparkDeck application shell', () => {
     render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
-    for (const label of ['Dashboard', 'Explore', 'Models', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Settings', 'Logs']) {
+    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
@@ -64,6 +64,7 @@ describe('model discovery', () => {
     expect(await screen.findByRole('heading', { name: 'model' })).toBeInTheDocument()
     expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
     expect(screen.getByText('Local')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')
   })
 
   it('sends the search term and runtime filter to the versioned catalog API', async () => {
@@ -81,6 +82,39 @@ describe('model discovery', () => {
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
+  })
+
+  it('debounces Hugging Face searches while typing', async () => {
+    const user = userEvent.setup()
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await screen.findByText('No models found')
+
+    await user.type(screen.getByRole('textbox', { name: 'Search models' }), 'Qwen coder')
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        expect.stringContaining('/api/v1/catalog/models?q=Qwen+coder'),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    }, { timeout: 1500 })
+  })
+
+  it('opens deployment with the selected catalog model prefilled', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/settings')
+        ? { default_runtime: 'vllm', default_context_length: 8192 }
+        : path.includes('/api/v1/nodes')
+          ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
+          : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
+    expect(screen.getByRole('textbox', { name: 'Display name' })).toHaveValue('chosen-model')
   })
 })
 

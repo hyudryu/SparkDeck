@@ -53,12 +53,18 @@ def _prepare_frontend_bundle(staged_dist: Path, live_dist: Path) -> Path:
 def _publish_frontend_bundle(live_dist: Path, swap_root: Path) -> bool:
     replacement = swap_root / "next"
     previous = swap_root / "previous"
+    if not (replacement / "index.html").is_file():
+        raise RuntimeError("Staged frontend bundle has no index.html")
     had_previous = live_dist.exists() or live_dist.is_symlink()
     if had_previous:
         os.replace(live_dist, previous)
     try:
         os.replace(replacement, live_dist)
+        # run.sh uses index.html as its freshness marker. Publishing happens
+        # after the target checkout, so refresh it to prevent a second build.
+        os.utime(live_dist / "index.html", None)
     except Exception:
+        _remove_path(live_dist)
         if had_previous:
             os.replace(previous, live_dist)
         raise

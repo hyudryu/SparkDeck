@@ -1,4 +1,6 @@
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -141,6 +143,12 @@ class UpdateHelperTests(unittest.TestCase):
             (live_dist / "old.js").write_text("old asset", encoding="utf-8")
             (staged_dist / "index.html").write_text("new release", encoding="utf-8")
             (staged_dist / "new.js").write_text("new asset", encoding="utf-8")
+            source_file = root / "frontend" / "src" / "App.tsx"
+            source_file.parent.mkdir()
+            source_file.write_text("new source", encoding="utf-8")
+            now = time.time()
+            os.utime(staged_dist / "index.html", (now - 120, now - 120))
+            os.utime(source_file, (now - 60, now - 60))
 
             swap_root = _prepare_frontend_bundle(staged_dist, live_dist)
             had_previous = _publish_frontend_bundle(live_dist, swap_root)
@@ -148,6 +156,10 @@ class UpdateHelperTests(unittest.TestCase):
             self.assertTrue(had_previous)
             self.assertEqual((live_dist / "index.html").read_text(encoding="utf-8"), "new release")
             self.assertFalse((live_dist / "old.js").exists())
+            self.assertGreater(
+                (live_dist / "index.html").stat().st_mtime_ns,
+                source_file.stat().st_mtime_ns,
+            )
 
             _restore_frontend_bundle(live_dist, swap_root, had_previous)
 

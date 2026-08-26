@@ -17,14 +17,14 @@ describe('theme persistence', () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         theme: 'dark',
-        default_runtime: 'vllm',
-        default_context_length: 8192,
+        hf_token: '',
+        hf_token_configured: false,
         community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         theme: 'light',
-        default_runtime: 'vllm',
-        default_context_length: 8192,
+        hf_token: '',
+        hf_token_configured: false,
         community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -55,27 +55,39 @@ describe('theme persistence', () => {
     }))
   })
 
-  it('enables save only while an editable value differs from the loaded settings', async () => {
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
-      theme: 'system',
-      default_runtime: 'vllm',
-      default_context_length: 8192,
-      community_api_url: '',
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+  it('keeps a configured Hugging Face key masked and saves a replacement write-only', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
     const save = await screen.findByRole('button', { name: 'Save settings' })
-    const contextLength = screen.getByRole('spinbutton', { name: /Default context length/ })
+    const credential = screen.getByLabelText('Hugging Face API key')
     expect(save).toBeDisabled()
+    expect(credential).toHaveValue('')
+    expect(screen.getByText('Configured')).toBeInTheDocument()
+    expect(screen.queryByText('Default runtime')).not.toBeInTheDocument()
+    expect(screen.queryByText('Default context length')).not.toBeInTheDocument()
 
-    await user.clear(contextLength)
-    await user.type(contextLength, '16384')
+    await user.type(credential, 'hf_replacement_secret')
     expect(save).toBeEnabled()
+    expect(screen.queryByText('hf_replacement_secret')).not.toBeInTheDocument()
+    await user.click(save)
 
-    await user.clear(contextLength)
-    await user.type(contextLength, '8192')
+    await screen.findByText('Saved')
+    const request = fetchMock.mock.calls.at(-1)
+    expect(request?.[0]).toBe('/api/v1/settings')
+    expect(JSON.parse(String(request?.[1]?.body))).toEqual(expect.objectContaining({
+      hf_token: 'hf_replacement_secret',
+    }))
+    expect(credential).toHaveValue('')
     expect(save).toBeDisabled()
   })
 
@@ -83,8 +95,8 @@ describe('theme persistence', () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         theme: 'system',
-        default_runtime: 'vllm',
-        default_context_length: 8192,
+        hf_token: '',
+        hf_token_configured: false,
         community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'save failed' }), {
@@ -96,12 +108,13 @@ describe('theme persistence', () => {
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    const runtime = await screen.findByRole('combobox', { name: 'Default runtime' })
+    const credential = await screen.findByLabelText('Hugging Face API key')
     const save = screen.getByRole('button', { name: 'Save settings' })
-    await user.selectOptions(runtime, 'sglang')
+    await user.type(credential, 'hf_retry_secret')
     await user.click(save)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('save failed')
+    expect(credential).toHaveValue('hf_retry_secret')
     expect(save).toBeEnabled()
   })
 })

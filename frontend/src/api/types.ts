@@ -33,7 +33,9 @@ export interface CatalogModel {
   revision?: string
   downloads?: number
   likes?: number
-  parameter_count?: number
+  parameter_count?: number | null
+  weight_size_bytes?: number | null
+  weight_size_source?: 'safetensors' | 'gguf' | null
   tags?: string[]
   runtime_compatibility?: RuntimeCompatibility[]
   local_deployment_ids?: string[]

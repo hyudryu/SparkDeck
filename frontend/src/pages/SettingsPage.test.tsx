@@ -72,7 +72,7 @@ describe('theme persistence', () => {
     const credential = screen.getByLabelText('Hugging Face API key')
     expect(save).toBeDisabled()
     expect(credential).toHaveValue('')
-    expect(screen.getByText('Configured')).toBeInTheDocument()
+    expect(await screen.findByText('Configured')).toBeInTheDocument()
     expect(screen.queryByText('Default runtime')).not.toBeInTheDocument()
     expect(screen.queryByText('Default context length')).not.toBeInTheDocument()
 

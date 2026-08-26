@@ -418,6 +418,20 @@ async def agent_status(req: Request):
     return await manager.agent_status()
 
 
+@app.patch("/api/agent/node")
+async def agent_rename_node(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        if set(body) != {"name"}:
+            raise ValueError("request body must contain only name")
+        return await manager.rename_cluster_node(LOCAL_NODE_ID, body.get("name"))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/agent/temperature-history")
 async def agent_temperature_history(req: Request):
     _require_agent(req)
@@ -680,9 +694,21 @@ async def pair_cluster_node(req: Request):
 @app.patch("/api/nodes/{node_id}")
 async def update_cluster_node(node_id: str, req: Request):
     try:
-        return manager.node_registry.update(node_id, await req.json())
-    except ValueError as exc:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        if set(body) == {"name"}:
+            return await manager.rename_cluster_node(node_id, body["name"])
+        # Preserve the legacy general registry editor for enabled/network
+        # configuration. Only its exact name-only form gains propagation.
+        try:
+            return manager.node_registry.update(node_id, body)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+    except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/nodes/{node_id}/refresh")
@@ -1121,6 +1147,21 @@ async def v1_list_images():
 async def v1_nodes():
     nodes = await manager.cluster_nodes()
     return {"items": [manager.public_target_node(node) for node in nodes]}
+
+
+@app.patch("/api/v1/nodes/{node_id}")
+async def v1_rename_node(node_id: str, req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        if set(body) != {"name"}:
+            raise ValueError("request body must contain only name")
+        return await manager.rename_cluster_node(node_id, body.get("name"))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/v1/images/pull", status_code=201)

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
@@ -279,6 +280,20 @@ CANCELED = "canceled"
 
 def _is_vllm_image(tag: str) -> bool:
     return "vllm" in (tag or "").lower()
+
+
+def _normalize_node_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("name must be a string")
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        raise ValueError("name must not contain control characters")
+    normalized = re.sub(r" {2,}", " ", normalized)
+    if not normalized:
+        raise ValueError("name must not be empty")
+    if len(normalized) > 80:
+        raise ValueError("name must be at most 80 characters")
+    return normalized
 
 
 def _is_atlas_serving_container(name: str, image: str) -> bool:
@@ -879,6 +894,53 @@ class Manager:
             names = [available[node_id].get("name", node_id) for node_id in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
         return [available[node_id] for node_id in requested]
+
+    async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
+        """Durably rename a local or paired node without exposing credentials.
+
+        The controller registry is authoritative for remote display names. An
+        online worker is also updated through its authenticated agent endpoint;
+        if that second write fails, the controller rename remains durable and
+        the response explicitly reports that worker synchronization is pending.
+        """
+        normalized = _normalize_node_name(name)
+        node_id = str(node_id or "").strip()
+        if node_id == LOCAL_NODE_ID:
+            async with self.lock:
+                self.settings["cluster_node_name"] = normalized
+                self._save_settings()
+            return {
+                **self.public_target_node({
+                    "id": LOCAL_NODE_ID, "name": normalized, "local": True,
+                    "enabled": True, "status": "online", "online": True,
+                    "docker_ready": True,
+                }),
+                "name_sync": "local",
+            }
+
+        if not self.node_registry.get(node_id):
+            raise LookupError("node not found")
+        updated = self.node_registry.update(node_id, {"name": normalized})
+        sync = "synchronized"
+        try:
+            await self.node_registry.request(
+                node_id, "PATCH", "/api/agent/node",
+                json_body={"name": normalized}, timeout=10,
+            )
+        except Exception:
+            # The controller-side name is already durable. Offline workers can
+            # be renamed safely without rolling that write back; their local UI
+            # keeps its prior name until an authenticated synchronization works.
+            sync = "pending"
+        self.node_registry._status_cache.pop(node_id, None)
+        return {
+            **self.public_target_node({
+                **updated, "name": normalized,
+                "status": "online" if sync == "synchronized" else "unreachable",
+                "online": sync == "synchronized",
+            }),
+            "name_sync": sync,
+        }
 
     def virtual_nas_enabled(self) -> bool:
         return bool(self.settings.get("virtual_nas_enabled", False))

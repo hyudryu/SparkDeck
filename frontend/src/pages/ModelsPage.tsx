@@ -199,6 +199,7 @@ export function ModelsPage() {
       />
       {resource.loading && <LoadingState label="Loading deployments" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
+      {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
       {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">

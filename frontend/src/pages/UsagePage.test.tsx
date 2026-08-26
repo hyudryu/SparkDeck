@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { UsagePage } from './UsagePage'
+import { activityHeatmapCalendar, UsagePage } from './UsagePage'
 
 const summary = {
   models: {
@@ -36,6 +36,14 @@ afterEach(() => {
 })
 
 describe('UsagePage', () => {
+  it('derives heatmap month labels and positions from the rendered dates', () => {
+    const calendar = activityHeatmapCalendar([], new Date('2026-01-15T12:00:00Z'))
+
+    expect(calendar.months[0]).toMatchObject({ key: '2025-01', label: 'Jan', column: 1 })
+    expect(calendar.months.at(-1)).toMatchObject({ key: '2026-01', label: 'Jan' })
+    expect(calendar.months.every((month, index) => index === 0 || month.column > calendar.months[index - 1].column)).toBe(true)
+  })
+
   it('restores lifetime model accounting and persisted hourly analysis', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -94,5 +102,24 @@ describe('UsagePage', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
     await user.click(screen.getByRole('button', { name: 'Reset lifetime' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
+  })
+
+  it('surfaces historical analysis failures independently with a retry', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly')) return json({ detail: 'history unavailable' }, 503)
+      if (path.includes('/api/token-stats/daily')) return json([])
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    render(<UsagePage />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Historical usage: history unavailable')
+    expect(screen.getByLabelText('Usage overview')).toHaveTextContent('2,250')
+    const callsBeforeRetry = fetchMock.mock.calls.length
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBeforeRetry))
   })
 })

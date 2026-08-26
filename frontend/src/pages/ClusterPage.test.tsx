@@ -42,7 +42,8 @@ describe('ClusterPage', () => {
     expect(screen.getByText(/tailscale serve --bg --https=443 http:\/\/127\.0\.0\.1:7878/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Join this node to another controller' }))
-    await user.type(screen.getByRole('textbox', { name: 'Controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
+    expect(screen.getByText(/Enter that controller’s URL and pairing code here—not this node’s URL/)).toBeInTheDocument()
+    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }))
     await user.type(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }), 'https://spark-2.tailnet.ts.net')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s name' }))
@@ -70,7 +71,7 @@ describe('ClusterPage', () => {
     render(<ClusterPage />)
 
     await user.click(await screen.findByRole('button', { name: 'Join this node to another controller' }))
-    await user.type(screen.getByRole('textbox', { name: 'Controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
+    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
     await user.type(screen.getByRole('textbox', { name: 'Pairing code' }), 'EXPIRED')
     await user.click(screen.getByRole('button', { name: 'Join controller' }))
 

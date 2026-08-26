@@ -244,6 +244,48 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(restarted._migrate_recipe_hf_credentials())
             self.assertFalse(restarted.recipes[0]["supported"])
 
+    async def test_malformed_deployment_args_are_isolated_across_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            deployments_path = path / "deployments.json"
+            deployments_path.write_text(json.dumps([
+                {
+                    "id": "malformed", "engine": "vllm", "status": "registered",
+                    "launch_settings": {"engine": "vllm", "extra_args": False},
+                },
+                {
+                    "id": "valid", "engine": "vllm", "status": "registered",
+                    "launch_settings": {
+                        "engine": "vllm",
+                        "extra_args": ["--dtype", "auto", "--hf-token", "hf_secret"],
+                    },
+                },
+            ]), encoding="utf-8")
+
+            with patch("manager.docker.from_env", return_value=Mock()):
+                first = Manager(path)
+                await first.http.aclose()
+
+            malformed, valid = first.deployments
+            self.assertEqual(malformed["launch_settings"]["extra_args"], [])
+            self.assertEqual(malformed["status"], "error")
+            self.assertIn("launch_settings.extra_args", malformed["error"])
+            self.assertNotEqual(valid.get("status"), "error")
+            self.assertNotIn(
+                "hf_secret", deployments_path.read_text(encoding="utf-8"),
+            )
+            first_persisted = deployments_path.read_text(encoding="utf-8")
+
+            with patch("manager.docker.from_env", return_value=Mock()):
+                restarted = Manager(path)
+                await restarted.http.aclose()
+
+            self.assertEqual(
+                deployments_path.read_text(encoding="utf-8"), first_persisted,
+            )
+            self.assertEqual(restarted.deployments[0]["status"], "error")
+            self.assertNotEqual(restarted.deployments[1].get("status"), "error")
+
     def test_explicit_empty_controller_credential_disables_worker_fallback(self):
         instance = Manager.__new__(Manager)
         instance.settings = {

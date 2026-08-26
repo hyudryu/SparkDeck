@@ -5586,6 +5586,7 @@ class Manager:
         parallel_nodes = tensor_parallel * pipeline_parallel
         persisted_mode = recipe.get("deployment_mode")
         mode = str(persisted_mode or "single")
+        mode_error = None
         saved_nodes = list(dict.fromkeys(recipe.get("node_ids") or [LOCAL_NODE_ID]))
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
@@ -5596,14 +5597,20 @@ class Manager:
             # a distributed launch even if its persisted mode defaulted to single.
             mode = "sharded"
             required_nodes = parallel_nodes
-        else:
-            mode = "single"
+        elif mode == "single":
             required_nodes = 1
+        else:
+            required_nodes = 1
+            mode_error = f"unsupported persisted deployment mode: {mode}"
+        model_revision = self._cli_option(args, {"--revision"})
         return {
             "required_node_count": required_nodes,
             "deployment_mode": mode,
             "tensor_parallel_size": tensor_parallel,
             "pipeline_parallel_size": pipeline_parallel,
+            "model_revision": str(model_revision).strip() if model_revision else None,
+            "supported": mode_error is None,
+            "error": mode_error,
         }
 
     def _load_recipes(self) -> list[dict]:
@@ -5658,6 +5665,14 @@ class Manager:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
+        deployment_mode = deployment_mode or "single"
+        if deployment_mode not in {"single", "sharded", "replicated"}:
+            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        node_ids = list(dict.fromkeys(node_ids or [LOCAL_NODE_ID]))
+        if deployment_mode == "single":
+            node_ids = node_ids[:1]
+        elif len(node_ids) < 2:
+            raise ValueError(f"{deployment_mode} deployment requires at least two nodes")
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")

@@ -145,14 +145,16 @@ export function ModelsPage() {
 
   const nodesWithWeights = (recipe: SavedConfiguration) => new Set(
     (modelCache.data?.nodes ?? [])
-      .filter((node) => node.models.some((model) => model.model_id === recipe.model))
+      .filter((node) => node.models.some((model) => model.model_id === recipe.model
+        && (!recipe.model_revision || model.revisions?.includes(recipe.model_revision))))
       .map((node) => node.id),
   )
 
   const openRecipeDeployment = (recipe: SavedConfiguration) => {
     const weighted = nodesWithWeights(recipe)
     const eligible = (nodes.data ?? []).filter((node) => weighted.has(node.id) && isNodeSelectable(node))
-    let preferred = recipe.node_ids.filter((id) => eligible.some((node) => node.id === id))
+    let preferred = [...new Set(recipe.node_ids)]
+      .filter((id) => eligible.some((node) => node.id === id))
     if (recipe.deployment_mode === 'sharded' && localNodeId && eligible.some((node) => node.id === localNodeId)) {
       preferred = [localNodeId, ...preferred.filter((id) => id !== localNodeId)]
     }

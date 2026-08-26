@@ -256,6 +256,7 @@ export interface StorageModel {
   size_bytes: number
   last_modified?: string
   revision?: string
+  revisions?: string[]
   file_count?: number
 }
 
@@ -309,10 +310,11 @@ export interface SavedConfiguration {
   sg_max_running_requests?: number | null
   sg_mem_fraction?: number | null
   sg_image?: string | null
-  deployment_mode: 'single' | 'replicated' | 'sharded'
+  deployment_mode: string
   required_node_count: number
   tensor_parallel_size: number
   pipeline_parallel_size: number
+  model_revision?: string | null
   node_ids: string[]
   supported?: boolean
   error?: string

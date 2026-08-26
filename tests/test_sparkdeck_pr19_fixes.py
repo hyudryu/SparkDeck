@@ -118,7 +118,8 @@ class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_llama_cpp_expands_home_path_before_mounting(self):
-        spec = LlamaCppAdapter().launch_spec("unused", {"artifact": "~/model.gguf"})
+        with patch.object(Path, "is_file", return_value=True):
+            spec = LlamaCppAdapter().launch_spec("unused", {"artifact": "~/model.gguf"})
 
         expected = str((Path.home() / "model.gguf").resolve())
         self.assertEqual(spec.volumes, {

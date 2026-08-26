@@ -88,3 +88,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("image", items[0]["configuration"])
         self.assertFalse(items[0]["eligible_for_community"])
         self.assertEqual(self.service.store.outbox_batch(), [])
+
+    async def test_repository_shaped_existing_relative_path_is_redacted(self):
+        self.service.store.set_setting("community_consent", True)
+        with tempfile.TemporaryDirectory(prefix="private-model-", dir="tests") as directory:
+            relative_model = Path(directory).as_posix()
+            self.service._record_response(
+                None, relative_model, "vllm", {}, time.monotonic() - 0.2,
+                {"usage": {"prompt_tokens": 24, "completion_tokens": 20}},
+            )
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(items[0]["model"]["repository"], "local-model")
+        self.assertFalse(items[0]["eligible_for_community"])
+        self.assertEqual(self.service.store.outbox_batch(), [])

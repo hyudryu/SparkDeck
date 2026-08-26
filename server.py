@@ -1333,7 +1333,7 @@ async def create_recipe(req: Request):
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
             deployment_mode=body.get("deployment_mode", "single"),
-            node_ids=body.get("node_ids") or [LOCAL_NODE_ID],
+            node_ids=body.get("node_ids"),
             launch_controls=body.get("launch_controls"),
             force_new=bool(body.get("force_new")),
         )

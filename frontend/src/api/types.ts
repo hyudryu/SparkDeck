@@ -290,3 +290,67 @@ export interface CreateStorageTransferInput {
   source_node_id: string
   target_node_ids: string[]
 }
+
+export interface UsageCounters {
+  input: number
+  output: number
+  cached: number
+  requests: number
+  input_miss?: number
+  measured_cached?: number
+  estimated_cached?: number
+  gen_tokens?: number
+  gen_time_s?: number
+}
+
+export interface UsageMember {
+  model: string
+  alias?: string | null
+  merge_group?: string | null
+  routed_to?: string | null
+}
+
+export interface UsageGroup {
+  key: string
+  label: string
+  merge_group?: string | null
+  route_target?: string | null
+  models: string[]
+  members: UsageMember[]
+  stats: UsageCounters
+  speed?: {
+    tokens?: number
+    active_time_s?: number
+    tok_s?: number | null
+    legacy?: boolean
+  }
+  total_cost: number
+  cost_estimated?: boolean
+}
+
+export interface UsageSummary {
+  models: Record<string, UsageCounters>
+  groups: UsageGroup[]
+  total: UsageCounters
+}
+
+export interface HourlyUsagePoint {
+  hour: string
+  input: number
+  output: number
+  cached: number
+  requests: number
+}
+
+export interface DailyUsagePoint {
+  date: string
+  input: number
+  output: number
+  cached: number
+  requests: number
+}
+
+export interface UsageAnalysis {
+  hourly: HourlyUsagePoint[]
+  daily: DailyUsagePoint[]
+}

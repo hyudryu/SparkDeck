@@ -29,7 +29,7 @@ describe('SparkDeck application shell', () => {
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
     expect(screen.queryByText('Local service')).not.toBeInTheDocument()
-    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Storage', 'Settings', 'Logs']) {
+    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Usage', 'Images', 'Storage', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()

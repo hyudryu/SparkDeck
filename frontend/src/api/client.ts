@@ -28,6 +28,10 @@ import type {
   UsageSummary,
   SystemUpdateOverview,
   SystemUpdateJob,
+  RouterOSConnectionInput,
+  RouterOSNodeOverview,
+  RouterOSOverview,
+  RouterOSPresence,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -220,6 +224,22 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(input),
     }),
+  },
+  routeros: {
+    presence: (signal?: AbortSignal) => request<RouterOSPresence>('/api/v1/routeros/presence', { signal }),
+    get: (signal?: AbortSignal) => request<RouterOSOverview>('/api/v1/routeros', { signal }),
+    connect: (nodeId: string, input: RouterOSConnectionInput) => request<RouterOSNodeOverview>(
+      `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/connection`,
+      { method: 'PUT', body: JSON.stringify(input) },
+    ),
+    disconnect: (nodeId: string) => request<void>(
+      `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/connection`,
+      { method: 'DELETE' },
+    ),
+    updateFanSettings: (nodeId: string, settings: Record<string, unknown>) => request<RouterOSNodeOverview>(
+      `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/fan-settings`,
+      { method: 'PATCH', body: JSON.stringify(settings) },
+    ),
   },
   onboarding: {
     get: (signal?: AbortSignal) => request<OnboardingStatus>('/api/v1/onboarding', { signal }),

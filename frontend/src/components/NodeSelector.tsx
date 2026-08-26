@@ -28,8 +28,11 @@ export function NodeSelector({
   disabled = false,
   requiredIds = [],
   allowedIds,
+  unavailableReasons,
   localLabel,
   primaryId,
+  legend = 'Target nodes',
+  help = 'This device is the default. Select more nodes to pull or deploy across the cluster.',
 }: {
   nodes: NodeInventoryItem[]
   selectedIds: string[]
@@ -41,8 +44,11 @@ export function NodeSelector({
   disabled?: boolean
   requiredIds?: string[]
   allowedIds?: string[]
+  unavailableReasons?: Record<string, string>
   localLabel?: string
   primaryId?: string
+  legend?: string
+  help?: string
 }) {
   const toggle = (nodeId: string) => {
     if (!multiple) {
@@ -56,8 +62,8 @@ export function NodeSelector({
 
   return (
     <fieldset className="node-selector" disabled={disabled}>
-      <legend>Target nodes</legend>
-      <p className="node-selector-help">This device is the default. Select more nodes to pull or deploy across the cluster.</p>
+      <legend>{legend}</legend>
+      <p className="node-selector-help">{help}</p>
       {loading && <p className="node-selector-state" role="status">Loading available nodes…</p>}
       {error && <div className="node-selector-state node-selector-error" role="alert"><span>Couldn’t load nodes.</span>{onRetry && <Button type="button" variant="tertiary" onClick={onRetry}><RotateCw size={14} /> Retry</Button>}</div>}
       {!loading && !error && (
@@ -66,7 +72,7 @@ export function NodeSelector({
           {nodes.map((node) => {
             const allowed = !allowedIds || allowedIds.includes(node.id)
             const ready = isNodeSelectable(node) && allowed
-            const status = !allowed ? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? 'Docker unavailable' : node.selectable === false ? 'Unavailable' : 'Ready'
+            const status = !allowed ? unavailableReasons?.[node.id] ?? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? 'Docker unavailable' : node.selectable === false ? 'Unavailable' : 'Ready'
             const required = requiredIds.includes(node.id)
             const displayName = nodeLabel(node, node.id, localLabel)
             const primary = primaryId === node.id

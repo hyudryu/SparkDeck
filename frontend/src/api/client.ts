@@ -204,9 +204,9 @@ export const api = {
       const data = await request<{ items: SavedConfiguration[] }>('/api/v1/recipes', { signal })
       return data.items
     },
-    deploy: (id: string) => request<WireDeployment>(
+    deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
-      { method: 'POST' },
+      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
     ).then(deploymentFromWire),
   },
   nodes: {

@@ -1299,43 +1299,92 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
-@app.get("/api/v1/recipes")
-async def v1_recipes():
-    """Expose durable legacy recipes in the SparkDeck Models UI."""
+def _public_recipe(recipe: dict) -> dict:
+    """Return the safe saved-configuration contract used by the Models UI."""
+    contract = manager.recipe_deployment_contract(recipe)
     return {
-        "items": [
-            {
-                "id": recipe.get("id"),
-                "name": recipe.get("name") or recipe.get("model"),
-                "model": recipe.get("model"),
-                "engine": recipe.get("engine") or "vllm",
-                "image": recipe.get("image"),
-                "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
-                "gpu_memory_gb": recipe.get("gpu_memory_gb"),
-                "sg_tp_size": recipe.get("sg_tp_size"),
-                "sg_context_length": recipe.get("sg_context_length"),
-                "sg_max_running_requests": recipe.get("sg_max_running_requests"),
-                "sg_mem_fraction": recipe.get("sg_mem_fraction"),
-                "sg_image": recipe.get("sg_image"),
-                "deployment_mode": recipe.get("deployment_mode") or "single",
-                "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
-                "extra_args_count": len(recipe.get("extra_args") or []),
-                "supported": recipe.get("supported", True),
-                "error": recipe.get("error"),
-                "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
-            }
-            for recipe in manager.recipes
-        ]
+        "id": recipe.get("id"),
+        "name": recipe.get("name") or recipe.get("model"),
+        "model": recipe.get("model"),
+        "engine": recipe.get("engine") or "vllm",
+        "image": recipe.get("image"),
+        "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
+        "gpu_memory_gb": recipe.get("gpu_memory_gb"),
+        "sg_tp_size": recipe.get("sg_tp_size"),
+        "sg_context_length": recipe.get("sg_context_length"),
+        "sg_max_running_requests": recipe.get("sg_max_running_requests"),
+        "sg_mem_fraction": recipe.get("sg_mem_fraction"),
+        "sg_image": recipe.get("sg_image"),
+        **contract,
+        "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
+        "extra_args_count": len(recipe.get("extra_args") or []),
+        "supported": recipe.get("supported", True),
+        "error": recipe.get("error"),
+        "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
     }
 
 
+@app.get("/api/v1/recipes")
+async def v1_recipes():
+    """Expose durable legacy recipes in the SparkDeck Models UI."""
+    return {"items": [_public_recipe(recipe) for recipe in manager.recipes]}
+
+
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
-async def v1_deploy_recipe(recipe_id: str):
+async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
     if not recipe:
         raise HTTPException(404, "saved configuration not found")
     if recipe.get("supported") is False:
         raise HTTPException(400, recipe.get("error") or "saved runtime is unsupported")
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    contract = manager.recipe_deployment_contract(recipe)
+    try:
+        selected_node_ids = _requested_node_ids(body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    selected_node_ids = list(selected_node_ids or recipe.get("node_ids") or [LOCAL_NODE_ID])
+    if len(selected_node_ids) != contract["required_node_count"]:
+        raise HTTPException(
+            400,
+            f"this saved configuration requires exactly {contract['required_node_count']} node(s)",
+        )
+    if contract["deployment_mode"] == "sharded":
+        if LOCAL_NODE_ID not in selected_node_ids:
+            raise HTTPException(
+                400, "sharded deployments must include the controller node"
+            )
+        selected_node_ids = [
+            LOCAL_NODE_ID,
+            *(node_id for node_id in selected_node_ids if node_id != LOCAL_NODE_ID),
+        ]
+    try:
+        await manager.selected_cluster_nodes(selected_node_ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    inventory = await manager.model_cache_inventory()
+    nodes_with_weights = {
+        node.get("id")
+        for node in inventory
+        if any(
+            model.get("model_id") == recipe.get("model")
+            for model in node.get("models") or []
+        )
+    }
+    missing_weights = [
+        node_id for node_id in selected_node_ids if node_id not in nodes_with_weights
+    ]
+    if missing_weights:
+        raise HTTPException(
+            409,
+            "model weights are not available on selected node(s): "
+            + ", ".join(missing_weights),
+        )
     settings = {
         "extra_args": list(recipe.get("extra_args") or []),
         "image": recipe.get("image"),
@@ -1357,8 +1406,8 @@ async def v1_deploy_recipe(recipe_id: str):
             "runtime": recipe.get("engine") or "vllm",
             "kind": "managed",
             "settings": {key: value for key, value in settings.items() if value is not None},
-            "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
-            "deployment_mode": recipe.get("deployment_mode") or "single",
+            "node_ids": selected_node_ids,
+            "deployment_mode": contract["deployment_mode"],
             "recipe_id": recipe_id,
         })
     except ValueError as exc:

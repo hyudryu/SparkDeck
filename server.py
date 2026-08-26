@@ -30,7 +30,6 @@ from sparkdeck.onboarding import (
     forward_management_request,
     is_forwardable_path,
 )
-from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.updater import CONFIRMATION, UpdateService, current_revision
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
@@ -103,7 +102,13 @@ class _DequeHandler(logging.Handler):
 
 _LOG_SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+"),
-    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(
+        r'''(?ix)
+        ((?:["']?(?:api[_-]?key|access[_-]?token|hf[_-]?token|
+        hugging[_-]?face[_-]?hub[_-]?token|password|secret)["']?)\s*[:=]\s*["']?)
+        [^"'\s,;}]+
+        ''',
+    ),
     re.compile(r"(?i)([?&](?:token|key|api_key|access_token)=)[^&\s]+"),
 )
 
@@ -112,6 +117,9 @@ def _redact_log(message: str) -> str:
     redacted = str(message)
     for pattern in _LOG_SECRET_PATTERNS:
         redacted = pattern.sub(r"\1[REDACTED]", redacted)
+    configured_token = manager._resolved_hf_token()
+    if configured_token:
+        redacted = redacted.replace(configured_token, "[REDACTED]")
     return redacted
 
 
@@ -317,13 +325,23 @@ async def onboarding_unregister(req: Request):
 
 
 # ---------- aggregate state ----------
+def _public_legacy_recipe(recipe: dict) -> dict:
+    """Remove embedded credentials without changing the legacy recipe shape."""
+    public = dict(recipe)
+    if "extra_args" in public:
+        public["extra_args"] = manager._without_hf_cli_credentials(
+            public.get("extra_args") or []
+        )
+    return public
+
+
 @app.get("/api/state")
 async def get_state():
     state = await manager.get_state()
     # The MCP compatibility client still discovers recipes through this
     # aggregate endpoint. Keep these durable recipe records available while
     # the new SparkDeck UI uses the versioned application API.
-    state["recipes"] = list(manager.recipes)
+    state["recipes"] = [_public_legacy_recipe(recipe) for recipe in manager.recipes]
     state["recipe_launches"] = dict(manager.recipe_launches)
     state["supported_runtimes"] = list(sparkdeck.registry.kinds)
     return state
@@ -732,7 +750,12 @@ async def agent_create_container(req: Request):
             hf_token=body.get("hf_token"),
         )
     except Exception as exc:
-        raise HTTPException(500, str(exc)) from exc
+        detail = str(exc)
+        credential = body.get("hf_token")
+        if isinstance(credential, str) and credential:
+            detail = detail.replace(credential, "[REDACTED]")
+        detail = _redact_log(detail)
+        raise HTTPException(500, detail) from exc
 
 
 @app.post("/api/agent/containers/{name}/start")
@@ -1349,7 +1372,7 @@ async def create_recipe(req: Request):
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
             deployment_mode=body.get("deployment_mode", "single"),
-            node_ids=body.get("node_ids") or [LOCAL_NODE_ID],
+            node_ids=body.get("node_ids"),
             launch_controls=body.get("launch_controls"),
             force_new=bool(body.get("force_new")),
         )
@@ -1384,52 +1407,120 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
-@app.get("/api/v1/recipes")
-async def v1_recipes():
-    """Expose durable legacy recipes in the SparkDeck Models UI."""
+def _public_recipe(recipe: dict) -> dict:
+    """Return the safe saved-configuration contract used by the Models UI."""
+    safe_recipe = {
+        **recipe,
+        "extra_args": manager._without_hf_cli_credentials(
+            recipe.get("extra_args") or []
+        ),
+    }
+    contract = manager.recipe_deployment_contract(safe_recipe)
+    supported = recipe.get("supported", True) is not False and contract["supported"]
     return {
-        "items": [
-            {
-                "id": recipe.get("id"),
-                "name": recipe.get("name") or recipe.get("model"),
-                "model": recipe.get("model"),
-                "engine": recipe.get("engine") or "vllm",
-                "image": recipe.get("image"),
-                "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
-                "gpu_memory_gb": recipe.get("gpu_memory_gb"),
-                "sg_tp_size": recipe.get("sg_tp_size"),
-                "sg_context_length": recipe.get("sg_context_length"),
-                "sg_max_running_requests": recipe.get("sg_max_running_requests"),
-                "sg_mem_fraction": recipe.get("sg_mem_fraction"),
-                "sg_image": recipe.get("sg_image"),
-                "deployment_mode": recipe.get("deployment_mode") or "single",
-                "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
-                "extra_args_count": len(recipe.get("extra_args") or []),
-                "supported": recipe.get("supported", True),
-                "error": recipe.get("error"),
-                "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
-            }
-            for recipe in manager.recipes
-        ]
+        "id": recipe.get("id"),
+        "name": recipe.get("name") or recipe.get("model"),
+        "model": recipe.get("model"),
+        "engine": recipe.get("engine") or "vllm",
+        "image": recipe.get("image"),
+        "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
+        "gpu_memory_gb": recipe.get("gpu_memory_gb"),
+        "sg_tp_size": recipe.get("sg_tp_size"),
+        "sg_context_length": recipe.get("sg_context_length"),
+        "sg_max_running_requests": recipe.get("sg_max_running_requests"),
+        "sg_mem_fraction": recipe.get("sg_mem_fraction"),
+        "sg_image": recipe.get("sg_image"),
+        **contract,
+        "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
+        "extra_args_count": len(safe_recipe.get("extra_args") or []),
+        "supported": supported,
+        "error": recipe.get("error") or contract.get("error"),
+        "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
     }
 
 
+@app.get("/api/v1/recipes")
+async def v1_recipes():
+    """Expose durable legacy recipes in the SparkDeck Models UI."""
+    return {"items": [_public_recipe(recipe) for recipe in manager.recipes]}
+
+
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
-async def v1_deploy_recipe(recipe_id: str):
+async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
     if not recipe:
         raise HTTPException(404, "saved configuration not found")
-    if recipe.get("supported") is False:
-        raise HTTPException(400, recipe.get("error") or "saved runtime is unsupported")
+    contract = manager.recipe_deployment_contract(recipe)
+    if recipe.get("supported") is False or contract["supported"] is False:
+        raise HTTPException(
+            400,
+            recipe.get("error") or contract.get("error") or "saved runtime is unsupported",
+        )
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    try:
+        selected_node_ids = _requested_node_ids(body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    selected_node_ids = list(selected_node_ids or recipe.get("node_ids") or [LOCAL_NODE_ID])
+    if len(selected_node_ids) != contract["required_node_count"]:
+        raise HTTPException(
+            400,
+            f"this saved configuration requires exactly {contract['required_node_count']} node(s)",
+        )
+    if contract["deployment_mode"] == "sharded":
+        if LOCAL_NODE_ID not in selected_node_ids:
+            raise HTTPException(
+                400, "sharded deployments must include the controller node"
+            )
+        selected_node_ids = [
+            LOCAL_NODE_ID,
+            *(node_id for node_id in selected_node_ids if node_id != LOCAL_NODE_ID),
+        ]
+    try:
+        await manager.selected_cluster_nodes(selected_node_ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    local_model_path = manager._resolve_local_path(str(recipe.get("model") or ""))
+    if local_model_path:
+        nodes_with_weights = {LOCAL_NODE_ID}
+    else:
+        inventory = await manager.model_cache_inventory()
+        requested_revision = contract.get("model_revision")
+        cached_revision = requested_revision or "main"
+        nodes_with_weights = {
+            node.get("id")
+            for node in inventory
+            if any(
+                model.get("model_id") == recipe.get("model")
+                and cached_revision in (model.get("revisions") or [])
+                for model in node.get("models") or []
+            )
+        }
+    missing_weights = [
+        node_id for node_id in selected_node_ids if node_id not in nodes_with_weights
+    ]
+    if missing_weights:
+        raise HTTPException(
+            409,
+            "model weights are not available on selected node(s): "
+            + ", ".join(missing_weights),
+        )
     settings = {
-        "extra_args": list(recipe.get("extra_args") or []),
+        "extra_args": manager._without_hf_cli_credentials(
+            recipe.get("extra_args") or []
+        ),
         "image": recipe.get("image"),
         "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
         "gpu_memory_gb": recipe.get("gpu_memory_gb"),
     }
     if str(recipe.get("engine") or "vllm") == "sglang":
         settings.update({
-            "tensor_parallel_size": recipe.get("sg_tp_size"),
+            "tensor_parallel_size": contract["tensor_parallel_size"],
             "context_length": recipe.get("sg_context_length"),
             "max_running_requests": recipe.get("sg_max_running_requests"),
             "mem_fraction_static": recipe.get("sg_mem_fraction"),
@@ -1442,8 +1533,8 @@ async def v1_deploy_recipe(recipe_id: str):
             "runtime": recipe.get("engine") or "vllm",
             "kind": "managed",
             "settings": {key: value for key, value in settings.items() if value is not None},
-            "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
-            "deployment_mode": recipe.get("deployment_mode") or "single",
+            "node_ids": selected_node_ids,
+            "deployment_mode": contract["deployment_mode"],
             "recipe_id": recipe_id,
         })
     except ValueError as exc:
@@ -1454,18 +1545,18 @@ async def v1_deploy_recipe(recipe_id: str):
 
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
-    "default_runtime": "vllm",
-    "default_context_length": 8192,
     "community_api_url": "",
 }
 
 
 @app.get("/api/v1/settings")
 async def v1_settings():
-    return {
+    values = {
         key: sparkdeck.store.get_setting(key, default)
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
+    values["hf_token_configured"] = bool(manager._resolved_hf_token())
+    return values
 
 
 @app.put("/api/v1/settings")
@@ -1474,18 +1565,8 @@ async def v1_update_settings(req: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "settings must be an object")
     theme = body.get("theme", _APP_SETTING_DEFAULTS["theme"])
-    runtime = body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"])
-    try:
-        sparkdeck.registry.get(runtime)
-        context_length = int(body.get(
-            "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
-        ))
-    except (TypeError, ValueError) as e:
-        raise HTTPException(400, str(e))
     if theme not in ("system", "light", "dark"):
         raise HTTPException(400, "theme must be system, light, or dark")
-    if context_length < 256:
-        raise HTTPException(400, "default_context_length must be at least 256")
     community_api_url = str(body.get("community_api_url") or "").strip().rstrip("/")
     if community_api_url:
         try:
@@ -1496,12 +1577,32 @@ async def v1_update_settings(req: Request):
             raise HTTPException(400, "community_api_url must be an http or https URL")
     values = {
         "theme": theme,
-        "default_runtime": runtime,
-        "default_context_length": context_length,
         "community_api_url": community_api_url,
     }
+    credential = body.get("hf_token")
+    if credential is not None:
+        if not isinstance(credential, str):
+            raise HTTPException(400, "hf_token must be a string")
+        credential = credential.strip()
+        if credential:
+            if len(credential) > 4096 or any(char.isspace() for char in credential):
+                raise HTTPException(400, "hf_token is not valid")
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
+    if credential:
+        await manager.update_settings({"hf_token": credential})
+    values["hf_token_configured"] = bool(manager._resolved_hf_token())
+    return values
+
+
+@app.delete("/api/v1/settings/hf-token")
+async def v1_clear_hf_token():
+    await manager.clear_hf_token()
+    values = {
+        key: sparkdeck.store.get_setting(key, default)
+        for key, default in _APP_SETTING_DEFAULTS.items()
+    }
+    values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
 
@@ -1761,11 +1862,10 @@ async def v1_community_pairing():
 
 @app.get("/api/v1/community/aggregates")
 async def v1_community_aggregates():
-    return {
-        "items": [],
-        "availability": "not_configured",
-        "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
-    }
+    try:
+        return await sparkdeck.community_aggregates()
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # ---------- OpenAI-compatible /v1 proxy ----------

@@ -165,7 +165,7 @@ export const api = {
   catalog: {
     search: (query = '', runtime?: string, cursor?: string, signal?: AbortSignal) =>
       request<CatalogResponse>(
-        `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 24 })}`,
+        `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 100 })}`,
         { signal },
       ),
     model: (id: string, signal?: AbortSignal) =>
@@ -210,9 +210,9 @@ export const api = {
       const data = await request<{ items: SavedConfiguration[] }>('/api/v1/recipes', { signal })
       return data.items
     },
-    deploy: (id: string) => request<WireDeployment>(
+    deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
-      { method: 'POST' },
+      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
     ).then(deploymentFromWire),
   },
   nodes: {
@@ -387,6 +387,7 @@ export const api = {
         return request<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(settings) })
       }
     },
+    clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
     overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),

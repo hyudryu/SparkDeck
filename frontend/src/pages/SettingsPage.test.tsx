@@ -32,8 +32,8 @@ describe('settings page', () => {
         theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
       } : {
         theme: 'dark',
-        default_runtime: 'vllm',
-        default_context_length: 8192,
+        hf_token: '',
+        hf_token_configured: false,
         community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -66,26 +66,38 @@ describe('settings page', () => {
     }))
   })
 
-  it('enables save only while an editable value differs from the loaded settings', async () => {
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => new Response(JSON.stringify(
-      String(input).includes('system-update')
-        ? { can_update: false, blockers: [], nodes: [] }
-        : { theme: 'system', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' },
-    ), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+  it('keeps a configured Hugging Face key masked and saves a replacement write-only', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
     const save = await screen.findByRole('button', { name: 'Save settings' })
-    const contextLength = screen.getByRole('spinbutton', { name: /Default context length/ })
+    const credential = screen.getByLabelText('Hugging Face API key')
     expect(save).toBeDisabled()
+    expect(credential).toHaveValue('')
+    expect(await screen.findByText('Configured')).toBeInTheDocument()
+    expect(screen.queryByText('Default runtime')).not.toBeInTheDocument()
+    expect(screen.queryByText('Default context length')).not.toBeInTheDocument()
 
-    await user.clear(contextLength)
-    await user.type(contextLength, '16384')
-    await waitFor(() => expect(save).toBeEnabled())
+    await user.type(credential, 'hf_replacement_secret')
+    expect(save).toBeEnabled()
+    expect(screen.queryByText('hf_replacement_secret')).not.toBeInTheDocument()
+    await user.click(save)
 
-    await user.clear(contextLength)
-    await user.type(contextLength, '8192')
+    await screen.findByText('Saved')
+    const request = fetchMock.mock.calls.at(-1)
+    expect(request?.[0]).toBe('/api/v1/settings')
+    expect(JSON.parse(String(request?.[1]?.body))).toEqual(expect.objectContaining({
+      hf_token: 'hf_replacement_secret',
+    }))
+    expect(credential).toHaveValue('')
     expect(save).toBeDisabled()
   })
 
@@ -97,8 +109,8 @@ describe('settings page', () => {
       })
       return new Response(JSON.stringify({
         theme: 'system',
-        default_runtime: 'vllm',
-        default_context_length: 8192,
+        hf_token: '',
+        hf_token_configured: false,
         community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -107,13 +119,43 @@ describe('settings page', () => {
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    const runtime = await screen.findByRole('combobox', { name: 'Default runtime' })
+    const credential = await screen.findByLabelText('Hugging Face API key')
     const save = screen.getByRole('button', { name: 'Save settings' })
-    await user.selectOptions(runtime, 'sglang')
+    await user.type(credential, 'hf_retry_secret')
     await user.click(save)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('save failed')
+    expect(credential).toHaveValue('hf_retry_secret')
     expect(save).toBeEnabled()
+  })
+
+  it('explicitly removes a saved Hugging Face key after confirmation', async () => {
+    let configured = true
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'DELETE') configured = false
+      return new Response(JSON.stringify({
+        theme: 'system', hf_token_configured: configured, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const appearance = await screen.findByRole('combobox', { name: 'Appearance' })
+    await user.selectOptions(appearance, 'dark')
+    await user.click(await screen.findByRole('button', { name: 'Remove saved key' }))
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/entire cluster/i))
+    await screen.findByText('Not configured')
+    expect(appearance).toHaveValue('dark')
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Remove saved key' })).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/settings/hf-token', expect.objectContaining({
+      method: 'DELETE',
+    }))
   })
 
   it('confirms and starts one cluster-wide release update', async () => {

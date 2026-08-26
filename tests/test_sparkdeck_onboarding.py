@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ class FakeManager:
         self.node_registry = Mock()
         self.node_registry.set_forward_token = Mock()
         self.node_registry.accepts_forward_token = Mock(return_value=True)
+        self.node_registry.remove = Mock(return_value=True)
         self.pair_node = AsyncMock(return_value={
             "id": "worker-id", "name": "Worker",
             "protocol_version": AGENT_PROTOCOL_VERSION,
@@ -41,6 +43,8 @@ class FakeManager:
         }])
         self.adopt_worker_role = AsyncMock()
         self.adopt_controller_role = Mock()
+        self.deployments = []
+        self.list_containers = AsyncMock(return_value=[])
 
     @staticmethod
     def _network_interfaces():
@@ -138,6 +142,23 @@ class JoinCredentialTests(unittest.TestCase):
             self.assertEqual(assignment.load()["forward_token"], "secret-forward-token")
             assignment.clear()
             self.assertIsNone(assignment.load())
+
+    def test_leave_rotation_revokes_agent_token_and_both_pairing_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = AgentCredentials(root)
+            old_token = credentials.data["agent_token"]
+            old_pairing = credentials.data["pairing_code"]
+            old_join = credentials.cluster_join_code
+
+            credentials.revoke_remote_access()
+
+            self.assertFalse(credentials.accepts_token(old_token))
+            self.assertNotEqual(credentials.data["pairing_code"], old_pairing)
+            self.assertNotEqual(credentials.cluster_join_code, old_join)
+            persisted = AgentCredentials(root)
+            self.assertEqual(persisted.data["agent_token"], credentials.data["agent_token"])
+            self.assertEqual(persisted.data["pairing_code"], credentials.data["pairing_code"])
 
 
 class UrlGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -244,6 +265,61 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted["pairing_code"], manager.agent_credentials.data["pairing_code"])
         await http.aclose()
 
+    async def test_join_rejects_saved_sqlite_deployments_before_contacting_controller(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        database = self.root / "sparkdeck.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE deployments (id TEXT PRIMARY KEY)")
+            connection.execute("INSERT INTO deployments(id) VALUES ('existing')")
+            connection.commit()
+        finally:
+            connection.close()
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "1 saved deployment record"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        manager.list_containers.assert_awaited_once()
+        await http.aclose()
+
+    async def test_join_rejects_managed_containers_before_contacting_controller(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.list_containers.return_value = [
+            {"name": "sparkdeck-model", "managed": True, "status": "exited"},
+            {"name": "unrelated", "managed": False, "status": "running"},
+        ]
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "1 managed container"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        await http.aclose()
+
     async def test_status_prefers_tailscale_and_never_exposes_credentials(self):
         manager = FakeManager(self.root)
         service = OnboardingService(manager, self.root)
@@ -258,7 +334,69 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("forward_token", json.dumps(status))
         await manager.http.aclose()
 
-    async def test_leave_returns_complete_controller_status(self):
+    async def test_leave_revokes_locally_then_unregisters_before_clearing_assignment(self):
+        requests = []
+        observed = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            observed["assignment_present"] = service.assignment.load() is not None
+            observed["old_agent_revoked"] = not manager.agent_credentials.accepts_token(old_token)
+            return httpx.Response(200, json={"ok": True})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+        old_pairing = manager.agent_credentials.data["pairing_code"]
+        old_join = manager.agent_credentials.cluster_join_code
+
+        left = await service.leave("http://127.0.0.1:7878")
+
+        self.assert_status_shape(left, "controller")
+        self.assertIn("join_code", left)
+        self.assertIsNone(service.assignment.load())
+        manager.adopt_controller_role.assert_called_once()
+        self.assertFalse(manager.agent_credentials.accepts_token(old_token))
+        self.assertNotEqual(manager.agent_credentials.data["pairing_code"], old_pairing)
+        self.assertNotEqual(manager.agent_credentials.cluster_join_code, old_join)
+        self.assertEqual(requests[0].url.path, "/api/v1/onboarding/unregister")
+        self.assertEqual(requests[0].headers[FORWARD_NODE_HEADER], manager.agent_credentials.node_id)
+        self.assertEqual(requests[0].headers[FORWARD_HOP_HEADER], "1")
+        self.assertEqual(requests[0].headers[FORWARD_TOKEN_HEADER], "secret")
+        self.assertEqual(observed, {
+            "assignment_present": True,
+            "old_agent_revoked": True,
+        })
+        await http.aclose()
+
+    async def test_offline_controller_cannot_prevent_durable_local_leave(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline", request=request)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        await service.leave("http://127.0.0.1:7878")
+
+        self.assertFalse(manager.agent_credentials.accepts_token(old_token))
+        self.assertIsNone(service.assignment.load())
+        manager.adopt_controller_role.assert_called_once()
+        await http.aclose()
+
+    async def test_leave_keeps_assignment_when_credential_rotation_is_not_durable(self):
         manager = FakeManager(self.root)
         service = OnboardingService(manager, self.root)
         service.assignment.save({
@@ -267,13 +405,28 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             "node_id": manager.agent_credentials.node_id,
         })
 
-        left = await service.leave("http://127.0.0.1:7878")
+        with patch("cluster._atomic_json_write", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await service.leave("http://127.0.0.1:7878")
 
-        self.assert_status_shape(left, "controller")
-        self.assertIn("join_code", left)
-        self.assertIsNone(service.assignment.load())
-        manager.adopt_controller_role.assert_called_once()
+        self.assertIsNotNone(service.assignment.load())
+        manager.adopt_controller_role.assert_not_called()
         await manager.http.aclose()
+
+    def test_controller_unregister_requires_one_hop_credential_and_removes_worker(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+
+        result = service.unregister({
+            FORWARD_HOP_HEADER: "1",
+            FORWARD_NODE_HEADER: "worker-id",
+            FORWARD_TOKEN_HEADER: "secret",
+        })
+
+        self.assertTrue(result["revoked"])
+        manager.node_registry.remove.assert_called_once_with("worker-id")
+        with self.assertRaises(PermissionError):
+            service.unregister({FORWARD_HOP_HEADER: "2"})
 
     async def test_join_registration_is_rate_limited(self):
         manager = FakeManager(self.root)

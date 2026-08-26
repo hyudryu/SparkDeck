@@ -108,6 +108,26 @@ class AgentCredentials:
             raise ValueError("invalid or expired cluster join code")
         self._rotate_cluster_join_code()
 
+    def revoke_remote_access(self) -> None:
+        """Durably invalidate every credential shared during cluster pairing.
+
+        Keep the stable node ID, but replace the agent bearer and both pairing
+        codes in one atomic write.  Updating ``self.data`` only after the write
+        succeeds ensures callers never clear a controller assignment based on
+        an in-memory-only revocation that would disappear after a restart.
+        """
+        value = {
+            **self.data,
+            "agent_token": secrets.token_urlsafe(32),
+            "pairing_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code_issued_at": time.time(),
+            "credentials_rotated_at": time.time(),
+        }
+        value.pop("paired_at", None)
+        _atomic_json_write(self.path, value)
+        self.data = value
+
     def pair(self, pairing_code: str) -> dict:
         if not pairing_code or not secrets.compare_digest(
             str(pairing_code), str(self.data.get("pairing_code", ""))

@@ -1,3 +1,4 @@
+import mimetypes
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,11 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from sparkdeck.web import SPA_PATHS, register_spa_routes
+from sparkdeck.web import (
+    SPA_PATHS,
+    configure_static_asset_mime_types,
+    register_spa_routes,
+)
 
 
 class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +91,16 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.get(path)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.text, expected)
+
+    async def test_javascript_assets_override_a_plain_text_host_mapping(self) -> None:
+        mimetypes.add_type("text/plain", ".js", strict=True)
+        self.addCleanup(configure_static_asset_mime_types)
+        configure_static_asset_mime_types()
+
+        response = await self.client.get("/static/app/bundle.js")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "text/javascript; charset=utf-8")
 
     async def test_missing_frontend_build_returns_actionable_503(self) -> None:
         app = FastAPI()

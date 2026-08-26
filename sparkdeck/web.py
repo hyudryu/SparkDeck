@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
 
 from fastapi import FastAPI, Response
@@ -23,6 +24,19 @@ SPA_PATHS = (
     "/settings",
     "/logs",
 )
+
+
+def configure_static_asset_mime_types() -> None:
+    """Keep browser module assets executable across host MIME registries.
+
+    Windows can register ``.js`` as ``text/plain``. Starlette delegates static
+    response types to :mod:`mimetypes`, and browsers reject ES modules served
+    with that type. Register the web-standard types after Python has loaded the
+    host registry so SparkDeck behaves consistently on every platform.
+    """
+    mimetypes.add_type("text/javascript", ".js", strict=True)
+    mimetypes.add_type("text/javascript", ".mjs", strict=True)
+    mimetypes.add_type("application/wasm", ".wasm", strict=True)
 
 
 def register_spa_routes(app: FastAPI, frontend_dist: Path) -> None:

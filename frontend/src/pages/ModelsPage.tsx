@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Bookmark, HardDrive, Play, Plus, Server, Trash2 } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, CreateDeploymentInput, Deployment, RuntimeKind } from '../api/types'
+import type { CreateDeploymentInput, Deployment, RuntimeKind, SavedConfiguration } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -19,33 +19,11 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
-type DefaultFieldEdits = { runtime: boolean; contextLength: boolean }
-
-function mergeSavedDefaults(
-  current: CreateDeploymentInput,
-  defaults: AppSettings,
-  edits: DefaultFieldEdits,
-): CreateDeploymentInput {
-  const runtime = edits.runtime ? current.runtime : defaults.default_runtime ?? 'vllm'
-  const contextLength = edits.contextLength
-    ? current.settings.context_length ?? 8192
-    : defaults.default_context_length ?? 8192
-  const runtimeChanged = runtime !== current.runtime
-  return {
-    ...current,
-    runtime,
-    settings: runtimeChanged
-      ? runtime === 'llama.cpp'
-        ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-        : { context_length: contextLength, tensor_parallel_size: 1 }
-      : { ...current.settings, context_length: contextLength },
-  }
-}
+const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
 
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const resource = useResource((signal) => api.deployments.list(signal))
-  const defaults = useResource((signal) => api.settings.get(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
   const modelCache = useResource((signal) => api.modelCache.get(signal))
@@ -56,25 +34,20 @@ export function ModelsPage() {
   const [formError, setFormError] = useState<string>()
   const [actionError, setActionError] = useState<string>()
   const [actionNotice, setActionNotice] = useState<string>()
-  const defaultFieldEdits = useRef<DefaultFieldEdits>({ runtime: false, contextLength: false })
+  const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
+  const [recipeError, setRecipeError] = useState<string>()
 
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
-    defaultFieldEdits.current = { runtime: false, contextLength: false }
-    setForm((current) => {
-      const prefilled = {
-        ...current,
-        model_id: modelId,
-        alias: current.alias || modelId.split('/').at(-1) || modelId,
-      }
-      return defaults.data
-        ? mergeSavedDefaults(prefilled, defaults.data, defaultFieldEdits.current)
-        : prefilled
-    })
+    setForm((current) => ({
+      ...current,
+      model_id: modelId,
+      alias: current.alias || modelId.split('/').at(-1) || modelId,
+    }))
     setCreating(true)
     setSearchParams({}, { replace: true })
-  }, [defaults.data, searchParams, setSearchParams])
+  }, [searchParams, setSearchParams])
 
   useEffect(() => {
     const inventory = nodes.data
@@ -94,17 +67,7 @@ export function ModelsPage() {
     && (form.runtime !== 'llama.cpp' || (form.node_ids?.length === 1 && form.node_ids[0] === localNodeId))
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
-  useEffect(() => {
-    if (!defaults.data) return
-    const savedDefaults = defaults.data
-    setForm((current) => mergeSavedDefaults(current, savedDefaults, defaultFieldEdits.current))
-  }, [defaults.data])
-
   const openCreator = () => {
-    defaultFieldEdits.current = { runtime: false, contextLength: false }
-    setForm((current) => defaults.data
-      ? mergeSavedDefaults(current, defaults.data, defaultFieldEdits.current)
-      : current)
     setCreating(true)
   }
 
@@ -141,16 +104,45 @@ export function ModelsPage() {
     }
   }
 
-  const deployRecipe = async (id: string) => {
-    setBusy(`recipe:${id}`)
+  const nodesWithWeights = (recipe: SavedConfiguration) => {
+    if (isLocalModelPath(recipe.model)) {
+      return new Set(localNodeId ? [localNodeId] : [])
+    }
+    return new Set((modelCache.data?.nodes ?? [])
+      .filter((node) => node.models.some((model) => model.model_id === recipe.model
+        && model.revisions?.includes(recipe.model_revision ?? 'main')))
+      .map((node) => node.id))
+  }
+
+  const openRecipeDeployment = (recipe: SavedConfiguration) => {
+    const weighted = nodesWithWeights(recipe)
+    const eligible = (nodes.data ?? []).filter((node) => weighted.has(node.id) && isNodeSelectable(node))
+    let preferred = [...new Set(recipe.node_ids)]
+      .filter((id) => eligible.some((node) => node.id === id))
+    if (recipe.deployment_mode === 'sharded' && localNodeId && eligible.some((node) => node.id === localNodeId)) {
+      preferred = [localNodeId, ...preferred.filter((id) => id !== localNodeId)]
+    }
+    const nodeIds = [...preferred, ...eligible.map((node) => node.id).filter((id) => !preferred.includes(id))]
+      .slice(0, recipe.required_node_count)
+    setRecipeError(undefined)
+    setRecipeDeployment({ recipe, nodeIds })
+  }
+
+  const deployRecipe = async () => {
+    if (!recipeDeployment) return
+    const { recipe, nodeIds } = recipeDeployment
+    setBusy(`recipe:${recipe.id}`)
     setActionError(undefined)
     setActionNotice(undefined)
+    setRecipeError(undefined)
     try {
-      const deployment = await api.recipes.deploy(id)
-      setActionNotice(`Deployed saved configuration ${deployment.alias}.`)
+      const deployment = await api.recipes.deploy(recipe.id, nodeIds)
+      const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
+      setActionNotice(`Deployed saved configuration ${deployment.alias} on ${selected}.`)
+      setRecipeDeployment(undefined)
       resource.reload()
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : 'Could not deploy saved configuration')
+      setRecipeError(reason instanceof Error ? reason.message : 'Could not deploy saved configuration')
     } finally {
       setBusy(undefined)
     }
@@ -172,9 +164,8 @@ export function ModelsPage() {
   }
 
   const updateRuntime = (runtime: RuntimeKind) => {
-    defaultFieldEdits.current.runtime = true
     setForm((current) => {
-      const contextLength = current.settings.context_length ?? defaults.data?.default_context_length ?? 8192
+      const contextLength = current.settings.context_length ?? 8192
       const localId = localNodeId ?? 'local'
       const nodeIds = runtime === 'llama.cpp' ? [localId] : current.node_ids
       return {
@@ -209,17 +200,17 @@ export function ModelsPage() {
             const targets = (recipe.node_ids?.length ? recipe.node_ids : ['local']).map((id) => nodes.data?.find((node) => node.id === id))
             const targetNames = targets.map((node, index) => node?.name ?? recipe.node_ids?.[index] ?? 'This device')
             const unavailable = targets.some((node) => !node || !isNodeSelectable(node))
-            const disabled = recipe.supported === false || unavailable
+            const disabled = recipe.supported === false
             return <Panel className="saved-configuration-card" key={recipe.id}>
               <div className="saved-configuration-heading"><span className="panel-icon"><Bookmark size={17} /></span><div><h3>{recipe.name || recipe.model}</h3><p>{recipe.model}</p></div></div>
               <dl>
                 <div><dt>Runtime</dt><dd><RuntimeMark runtime={recipe.engine || 'vllm'} /></dd></div>
-                <div><dt>Layout</dt><dd>{recipe.deployment_mode || 'single'} · {targetNames.length} {targetNames.length === 1 ? 'node' : 'nodes'}</dd></div>
+                <div><dt>Layout</dt><dd>{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} · ` : ''}{recipe.deployment_mode || 'single'} · {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'}</dd></div>
                 <div><dt>Targets</dt><dd>{targetNames.join(', ')}</dd></div>
                 <div><dt>Arguments</dt><dd>{recipe.extra_args_count ?? 0} saved</dd></div>
               </dl>
               {(recipe.error || unavailable) && <p className="saved-configuration-warning">{recipe.error || 'One or more saved nodes are missing, offline, or not ready.'}</p>}
-              <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => void deployRecipe(recipe.id)}><Play size={15} /> {busy === `recipe:${recipe.id}` ? 'Deploying…' : 'Deploy saved config'}</Button>
+              <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => openRecipeDeployment(recipe)}><Play size={15} /> Choose nodes &amp; deploy</Button>
             </Panel>
           })}
         </div>
@@ -254,6 +245,50 @@ export function ModelsPage() {
         </Panel>
       )}
 
+      {recipeDeployment && (() => {
+        const { recipe, nodeIds } = recipeDeployment
+        const localPath = isLocalModelPath(recipe.model)
+        const weighted = nodesWithWeights(recipe)
+        const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
+        const localRequired = recipe.deployment_mode === 'sharded' && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
+        const exactCount = nodeIds.length === recipe.required_node_count
+        const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+        const coordinatorReady = recipe.deployment_mode !== 'sharded' || Boolean(localNodeId && nodeIds.includes(localNodeId))
+        const ready = !nodes.loading && !nodes.error && (localPath || (!modelCache.loading && !modelCache.error)) && exactCount && allEligible && coordinatorReady
+        const recipeBusy = busy === `recipe:${recipe.id}`
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
+            <div className="modal-heading"><div><p className="eyebrow">Saved cluster configuration</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights are disabled.</p>
+            {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
+            {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={nodeIds}
+              onChange={(next) => setRecipeDeployment({ recipe, nodeIds: next.length <= recipe.required_node_count ? next : nodeIds })}
+              loading={nodes.loading || (!localPath && modelCache.loading)}
+              error={nodes.error}
+              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              multiple={recipe.required_node_count > 1}
+              disabled={recipeBusy}
+              requiredIds={localRequired}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={recipe.deployment_mode === 'sharded'
+                ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
+                : nodeIds[0]}
+              legend="Deployment nodes"
+              help={localPath ? 'Local model paths can run only on the controller.' : `Only nodes with ${recipe.model} already cached can be selected.`}
+            />
+            {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
+            {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
+            <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || recipeBusy} onClick={() => void deployRecipe()}><Play size={15} /> {recipeBusy ? 'Deploying…' : `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
       {creating && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setCreating(false)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-deployment-title">
@@ -285,7 +320,6 @@ export function ModelsPage() {
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
-                  defaultFieldEdits.current.contextLength = true
                   setForm({ ...form, settings: { ...form.settings, context_length: Number(event.target.value) } })
                 }} /></label>
                 {form.runtime === 'llama.cpp' ? (

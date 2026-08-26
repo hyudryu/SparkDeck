@@ -22,7 +22,7 @@ export interface CommunityEvidencePolicy {
 
 export interface CommunityAggregatesResponse {
   items: BenchmarkAggregate[]
-  availability: string
+  availability: 'available' | 'local' | 'not_configured'
   evidence_policy: CommunityEvidencePolicy
 }
 
@@ -33,7 +33,9 @@ export interface CatalogModel {
   revision?: string
   downloads?: number
   likes?: number
-  parameter_count?: number
+  parameter_count?: number | null
+  weight_size_bytes?: number | null
+  weight_size_source?: 'safetensors' | 'gguf' | null
   tags?: string[]
   runtime_compatibility?: RuntimeCompatibility[]
   local_deployment_ids?: string[]
@@ -181,9 +183,8 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
-  huggingface_token_configured?: boolean
-  default_runtime?: RuntimeKind
-  default_context_length?: number
+  hf_token?: string
+  hf_token_configured?: boolean
   community_api_url?: string
   telemetry_interval_seconds?: number
   [key: string]: unknown
@@ -300,6 +301,7 @@ export interface StorageModel {
   size_bytes: number
   last_modified?: string
   revision?: string
+  revisions?: string[]
   file_count?: number
 }
 
@@ -353,7 +355,11 @@ export interface SavedConfiguration {
   sg_max_running_requests?: number | null
   sg_mem_fraction?: number | null
   sg_image?: string | null
-  deployment_mode: 'single' | 'replicated' | 'sharded'
+  deployment_mode: string
+  required_node_count: number
+  tensor_parallel_size: number
+  pipeline_parallel_size: number
+  model_revision?: string | null
   node_ids: string[]
   supported?: boolean
   error?: string

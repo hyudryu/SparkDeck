@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from cluster import LOCAL_NODE_ID
+
 from .catalog import HuggingFaceCatalog
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtimes import (
@@ -31,6 +33,7 @@ _SAFE_CONFIGURATION_KEYS = {
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "max_running_requests", "mem_fraction_static", "runtime_version",
+    "deployment_mode", "node_ids", "manager_deployment_id",
 }
 
 
@@ -112,6 +115,19 @@ class SparkDeckService:
     async def deployments(self) -> list[dict[str, Any]]:
         registered = self.store.deployments(include_private=True)
         by_container = {item.get("container_name"): item for item in registered}
+        cluster_by_id = {
+            item.get("id"): item
+            for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        cluster_nodes: dict[str, dict[str, Any]] = {}
+        if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
+            try:
+                cluster_nodes = {
+                    node["id"]: node for node in await self.manager.cluster_nodes()
+                }
+            except Exception:
+                cluster_nodes = {}
         docker_unavailable = False
         try:
             containers = await self.manager.list_containers()
@@ -119,6 +135,20 @@ class SparkDeckService:
             containers = []
             docker_unavailable = True
         seen: set[str] = set()
+        for stored in registered:
+            manager_id = stored.get("settings", {}).get("manager_deployment_id")
+            cluster = cluster_by_id.get(manager_id)
+            if not cluster:
+                continue
+            stored["status"] = _deployment_status(cluster.get("status"))
+            stored["port"] = cluster.get("api_port")
+            stored["managed"] = True
+            stored["node_ids"] = list(cluster.get("node_ids") or [])
+            stored["selected_nodes"] = [
+                self.manager.public_target_node(cluster_nodes[node_id])
+                for node_id in stored["node_ids"] if node_id in cluster_nodes
+            ]
+            seen.add(stored["id"])
         for container in containers:
             runtime = self._container_runtime(container)
             if runtime not in self.registry.kinds:
@@ -181,6 +211,10 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        requested_node_ids = _requested_node_ids(body)
+        deployment_mode = str(body.get("deployment_mode") or "").strip() or None
+        if requested_node_ids is not None and kind is DeploymentKind.EXTERNAL:
+            raise ValueError("node_ids are only supported for managed deployments")
         deployment_id = str(uuid.uuid4())
         identity = ModelIdentity(
             repository=model, revision=_optional_string(body.get("revision")),
@@ -206,6 +240,89 @@ class SparkDeckService:
                     self._delete_credential(deployment_id, credential_ref)
                     raise
                 return (self.store.deployment(deployment_id) or deployment.to_dict())
+
+            if requested_node_ids is not None:
+                if runtime is RuntimeKind.LLAMA_CPP:
+                    raise ValueError(
+                        "explicit node selection currently supports managed vLLM and SGLang deployments"
+                    )
+                if LOCAL_NODE_ID not in requested_node_ids:
+                    raise ValueError(
+                        "the coordinator node must be included in managed deployment targets"
+                    )
+                selected = await self.manager.selected_cluster_nodes(requested_node_ids)
+                mode = deployment_mode or (
+                    "replicated" if len(requested_node_ids) > 1 else "single"
+                )
+                if mode == "single" and len(requested_node_ids) != 1:
+                    raise ValueError("single deployment requires exactly one node")
+                extra_args = list(settings.get("extra_args") or [])
+                if runtime is RuntimeKind.VLLM:
+                    for key, flag in (
+                        ("tensor_parallel_size", "--tensor-parallel-size"),
+                        ("pipeline_parallel_size", "--pipeline-parallel-size"),
+                        ("quantization", "--quantization"),
+                        ("dtype", "--dtype"),
+                    ):
+                        if settings.get(key) is not None:
+                            extra_args += [flag, str(settings[key])]
+                    context_length = settings.get("max_model_len") or settings.get("context_length")
+                    if context_length is not None:
+                        extra_args += ["--max-model-len", str(context_length)]
+                if identity.revision:
+                    extra_args += ["--revision", identity.revision]
+                launch_body = {
+                    **settings,
+                    "model": model,
+                    "deployment_name": alias,
+                    "engine": runtime.value,
+                    "deployment_mode": mode,
+                    "node_ids": requested_node_ids,
+                    "extra_args": extra_args,
+                    "managed_by": "sparkdeck",
+                }
+                if runtime is RuntimeKind.SGLANG:
+                    launch_body.update({
+                        "sg_tp_size": settings.get("tensor_parallel_size"),
+                        "sg_context_length": settings.get("context_length"),
+                        "sg_max_running_requests": settings.get("max_running_requests"),
+                        "sg_mem_fraction": settings.get("mem_fraction_static"),
+                    })
+                    if settings.get("quantization") is not None:
+                        launch_body["extra_args"] += [
+                            "--quantization", str(settings["quantization"]),
+                        ]
+                cluster = await self.manager.create_deployment(launch_body)
+                manager_id = cluster.get("id")
+                members = cluster.get("members") or []
+                primary = members[0] if members else {}
+                deployment.container_name = primary.get("container_name")
+                deployment.settings = self._safe_configuration({
+                    **settings,
+                    "deployment_mode": mode,
+                    "node_ids": requested_node_ids,
+                    "manager_deployment_id": manager_id,
+                })
+                port = cluster.get("api_port")
+                if not manager_id or not deployment.container_name or not port:
+                    raise RuntimeError("cluster runtime launched without a discoverable endpoint")
+                try:
+                    self.store.add_deployment(
+                        deployment, f"http://127.0.0.1:{int(port)}", None
+                    )
+                except Exception:
+                    await self.manager.deployment_action(manager_id, "remove")
+                    raise
+                result = self.store.deployment(deployment_id) or deployment.to_dict()
+                result.update({
+                    "status": _deployment_status(cluster.get("status")),
+                    "port": int(port),
+                    "node_ids": requested_node_ids,
+                    "selected_nodes": [
+                        self.manager.public_target_node(node) for node in selected
+                    ],
+                })
+                return result
 
             adapter = self.registry.get(runtime)
             cleanup_name = safe_container_name(alias, deployment_id)
@@ -250,6 +367,15 @@ class SparkDeckService:
             raise LookupError("deployment not found")
         if deployment["kind"] != DeploymentKind.MANAGED.value:
             raise ValueError("external endpoints cannot be started or stopped by SparkDeck")
+        manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        if manager_id:
+            result = await self.manager.deployment_action(manager_id, action)
+            if not result.get("ok"):
+                raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
+            current = self.store.deployment(deployment_id) or deployment
+            current["status"] = "running" if action == "start" else "stopped"
+            current["node_ids"] = list(deployment.get("settings", {}).get("node_ids") or [])
+            return current
         container = deployment.get("container_name")
         if not container:
             raise LookupError("managed container not found")
@@ -286,7 +412,12 @@ class SparkDeckService:
             discovered = True
         if not deployment:
             raise LookupError("deployment not found")
-        if deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
+        manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        if manager_id:
+            result = await self.manager.deployment_action(manager_id, "remove")
+            if not result.get("ok"):
+                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
+        elif deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
             await self.manager.remove_container(deployment["container_name"])
         if not discovered:
             self._delete_credential(deployment_id, deployment.get("_credential_ref"))
@@ -646,6 +777,28 @@ class SparkDeckService:
 def _optional_string(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _requested_node_ids(body: dict[str, Any]) -> list[str] | None:
+    raw = body.get("node_ids")
+    scalar = body.get("node_id")
+    if raw is None and scalar is None:
+        return None
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise ValueError("node_ids must be an array")
+    values = [*raw, scalar] if scalar is not None else list(raw)
+    result = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("node_ids must contain non-empty node IDs")
+        node_id = value.strip()
+        if node_id not in result:
+            result.append(node_id)
+    if not result:
+        raise ValueError("node_ids must contain at least one node ID")
+    return result
 
 
 def _deployment_status(value: Any) -> str:

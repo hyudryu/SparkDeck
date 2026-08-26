@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
 import { THEME_STORAGE_KEY } from '../theme'
+import { SPARKDECK_VERSION } from '../buildInfo'
 
 afterEach(() => {
   cleanup()
@@ -12,7 +13,17 @@ afterEach(() => {
   delete document.documentElement.dataset.theme
 })
 
-describe('theme persistence', () => {
+describe('settings page', () => {
+  it('shows the version embedded when the frontend was built', () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({
+      theme: 'system', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(screen.getByLabelText('SparkDeck version')).toHaveTextContent(`Version ${SPARKDECK_VERSION}`)
+  })
+
   it('restores the saved theme and only persists a new selection after save', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

@@ -26,6 +26,8 @@ import type {
   SavedConfiguration,
   UsageAnalysis,
   UsageSummary,
+  SystemUpdateOverview,
+  SystemUpdateJob,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -365,6 +367,13 @@ export const api = {
         return request<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(settings) })
       }
     },
+  },
+  updates: {
+    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),
+    start: () => request<SystemUpdateJob>('/api/v1/system-update', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: 'update-entire-cluster' }),
+    }),
   },
   logs: {
     list: async (signal?: AbortSignal): Promise<LogEntry[]> => {

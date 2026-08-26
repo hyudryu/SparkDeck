@@ -17,6 +17,9 @@ import type {
   ImagePullResult,
   OnboardingStatus,
   JoinClusterInput,
+  CreateStorageTransferInput,
+  StorageState,
+  StorageTransferJob,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -289,6 +292,24 @@ export const api = {
     },
     remove: (id: string) =>
       requestWithFallback<void>(`/api/v1/images/${encodeURIComponent(id)}`, `/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
+  storage: {
+    get: (signal?: AbortSignal) => request<StorageState>('/api/v1/storage', { signal }),
+    setEnabled: (enabled: boolean) => request<{ enabled: boolean }>('/api/v1/storage/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
+    transfer: (input: CreateStorageTransferInput) => request<StorageTransferJob | { jobs: StorageTransferJob[] }>('/api/v1/storage/transfers', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+    cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+    removeModel: (nodeId: string, modelId: string) => request<void>(
+      `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}`,
+      { method: 'DELETE' },
+    ),
   },
   settings: {
     get: (signal?: AbortSignal) => requestWithFallback<AppSettings>('/api/v1/settings', '/api/settings', { signal }),

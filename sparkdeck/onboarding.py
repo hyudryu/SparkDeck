@@ -234,7 +234,7 @@ class OnboardingService:
                 "repair sparkdeck.sqlite3 and retry"
             ) from exc
 
-    async def _assert_joinable(self) -> None:
+    async def _assert_no_owned_workloads(self, action: str) -> None:
         saved = self._saved_deployment_count()
         legacy = len([
             deployment for deployment in getattr(self.manager, "deployments", [])
@@ -257,11 +257,20 @@ class OnboardingService:
             details.append(f"{legacy} legacy deployment record{'s' if legacy != 1 else ''}")
         if managed:
             details.append(f"{len(managed)} managed container{'s' if len(managed) != 1 else ''}")
+        if action == "leave":
+            raise ValueError(
+                "cannot leave while this node still hosts " + ", ".join(details) + ". "
+                "Stop and remove them from the current controller, then retry so "
+                "the deployment remains manageable."
+            )
         raise ValueError(
             "cannot join while this node still owns " + ", ".join(details) + ". "
             "Migrate or remove every local deployment and managed container, then retry; "
             "joining never discards workloads automatically."
         )
+
+    async def _assert_joinable(self) -> None:
+        await self._assert_no_owned_workloads("join")
 
     async def register(
         self, body: dict[str, Any], request_origin: str, client_id: str,
@@ -370,11 +379,11 @@ class OnboardingService:
             result["ok"] = True
             return result
 
-        # Revoke the credential the former controller uses to reach this
-        # worker before deleting the only durable record of that controller.
-        # If the atomic credential write fails, leave controller.json intact
-        # so the user can retry and the process cannot report a false leave.
-        self.manager.agent_credentials.revoke_remote_access()
+        # A worker must remain paired while it hosts any managed member. This
+        # local check protects offline-controller recovery; unregister below
+        # performs the controller's authoritative deployment check.
+        await self._assert_no_owned_workloads("leave")
+
         try:
             controller_url = await validate_control_url(assignment["controller_url"])
             response = await self.manager.http.post(
@@ -387,10 +396,37 @@ class OnboardingService:
                 timeout=5,
             )
             response.raise_for_status()
-        except (httpx.HTTPError, ValueError, KeyError):
-            # Local agent-token rotation already revoked an offline or stale
-            # controller. Controller-side inventory cleanup is best effort.
+        except httpx.HTTPStatusError as exc:
+            try:
+                detail = str(exc.response.json().get("detail") or "")
+            except (ValueError, AttributeError):
+                detail = exc.response.text[:300]
+            if exc.response.status_code == 404 and detail == "worker is not registered":
+                pass
+            elif exc.response.status_code == 409:
+                raise ValueError(
+                    "cannot leave while the controller still has a deployment "
+                    f"on this node: {detail or 'remove the deployment first'}"
+                ) from exc
+            else:
+                raise ValueError(
+                    "controller could not authorize this node to leave; "
+                    "restore controller access and retry"
+                ) from exc
+        except httpx.RequestError:
+            # An offline controller cannot acknowledge removal. The local
+            # workload check and durable rotation still allow safe recovery.
             pass
+        except (ValueError, KeyError):
+            # A no-longer-resolvable saved URL is equivalent to an offline
+            # controller. Local revocation remains authoritative on this node.
+            pass
+
+        # Revoke the credential the former controller uses to reach this
+        # worker before deleting the only durable record of that controller.
+        # If the atomic credential write fails, leave controller.json intact
+        # so the user can retry and the process cannot report a false leave.
+        self.manager.agent_credentials.revoke_remote_access()
         self.assignment.clear()
         adopt_controller = getattr(self.manager, "adopt_controller_role", None)
         if adopt_controller is not None:
@@ -405,7 +441,7 @@ class OnboardingService:
         if not valid:
             raise PermissionError(detail)
         node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
-        if not self.manager.node_registry.remove(node_id):
+        if not self.manager.remove_cluster_node(node_id):
             raise ValueError("worker is not registered")
         return {"ok": True, "node_id": node_id, "revoked": True}
 

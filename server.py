@@ -258,7 +258,8 @@ async def onboarding_unregister(req: Request):
     except PermissionError as exc:
         raise HTTPException(401, str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        status = 409 if "still used by" in str(exc) else 404
+        raise HTTPException(status, str(exc)) from exc
 
 
 # ---------- aggregate state ----------
@@ -406,6 +407,15 @@ async def agent_images(req: Request):
         manager.list_images(), manager.list_containers(),
     )
     return {"images": images, "containers": containers}
+
+
+@app.delete("/api/agent/images/{image_id:path}")
+async def agent_remove_image(image_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return await manager.remove_image(image_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)[:500]) from exc
 
 
 @app.post("/api/agent/inference/health")
@@ -1045,10 +1055,14 @@ async def v1_remove_image(image_id: str):
     selected = next(
         (item for item in await _v1_image_items() if item["id"] == image_id), None
     )
-    if selected and selected.get("in_use"):
+    if not selected:
+        raise HTTPException(404, "image not found in cluster inventory")
+    if selected.get("in_use"):
         raise HTTPException(409, "image is used by a deployment")
     try:
-        return await manager.remove_image(image_id)
+        return await manager.remove_image_on_nodes(image_id, selected.get("node_ids") or [])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except Exception as e:
         raise HTTPException(500, str(e))
 

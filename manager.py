@@ -18,6 +18,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import docker
 import httpx
@@ -6934,7 +6935,56 @@ class Manager:
         def _do():
             self.client.images.remove(image_id, force=True)
         await asyncio.to_thread(_do)
-        return {"ok": True}
+        self._images_cache = []
+        self._images_ts = 0
+        return {"ok": True, "image": image_id}
+
+    async def remove_image_on_nodes(
+        self, image_id: str, node_ids: list[str],
+    ) -> dict:
+        """Remove an image from every recorded owner without failing fast."""
+        image_id = str(image_id or "").strip()
+        requested = list(dict.fromkeys(str(value).strip() for value in node_ids))
+        if not image_id:
+            raise ValueError("image ID is required")
+        if not requested or any(not value for value in requested):
+            raise ValueError("image owners are required")
+
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+
+        async def remove(node_id: str) -> Any:
+            node = available.get(node_id)
+            if not node:
+                raise RuntimeError("owning node is no longer registered")
+            if node_id == LOCAL_NODE_ID:
+                return await self.remove_image(image_id)
+            return await self.node_registry.request(
+                node_id, "DELETE",
+                f"/api/agent/images/{quote(image_id, safe='')}", timeout=120,
+            )
+
+        removed = await asyncio.gather(
+            *(remove(node_id) for node_id in requested), return_exceptions=True,
+        )
+        results = []
+        for node_id, result in zip(requested, removed):
+            node = available.get(node_id) or {"id": node_id, "name": node_id}
+            item = {
+                "node_id": node_id,
+                "node_name": node.get("name") or node_id,
+                "ok": not isinstance(result, Exception),
+            }
+            if isinstance(result, Exception):
+                item["error"] = str(result)
+            results.append(item)
+        selected = [available[node_id] for node_id in requested if node_id in available]
+        return {
+            "ok": all(item["ok"] for item in results),
+            "image": image_id,
+            "node_ids": requested,
+            "selected_nodes": [self.public_target_node(node) for node in selected],
+            "results": results,
+        }
 
     async def pull_image_stream(self, image: str):
         loop = asyncio.get_running_loop()

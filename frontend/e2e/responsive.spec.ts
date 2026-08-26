@@ -11,6 +11,7 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/stats')) body = { cpu_pct: 24, cpu_temp_c: 52, gpus: [{ index: 0, name: 'Test GPU', util: 48, mem_used_mib: 8192, mem_total_mib: 32768, temp: 61 }], active_requests: { 'test-model': { connections: 2, output_tok_s: 18.4, queued: 3 } }, ts: 1787724000 }
     else if (path.endsWith('/inference-queue')) body = { 'dep-1': { model: 'test-model', running: 2, queued: 3, oldest_wait_seconds: 1.5 } }
     else if (path.endsWith('/deployments')) body = { items: [{ id: 'dep-1', alias: 'Test model', runtime: 'vllm', kind: 'managed', model: { repository: 'org/test-model' }, status: 'running', settings: {} }] }
+    else if (path.endsWith('/nodes')) body = { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, fabric_ready: true, selectable: true }, { id: 'spark-2', name: 'Studio Spark', local: false, online: true, docker_ready: true, fabric_ready: true, selectable: true }] }
     else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
     else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured' }
@@ -71,4 +72,16 @@ test('uses a drawer on mobile and a persistent sidebar on desktop', async ({ pag
     await expect(sidebar).toBeVisible()
     await expect(sidebar.getByRole('link', { name: 'Benchmarks' })).toBeVisible()
   }
+})
+
+test('offers node targets for image pulls and deployments', async ({ page }) => {
+  await page.goto('http://127.0.0.1:4173/images')
+  await expect(page.getByRole('checkbox', { name: /This device/ })).toBeChecked()
+  await page.getByRole('checkbox', { name: /Studio Spark/ }).check()
+  await expect(page.getByText('Targets:').locator('..')).toContainText('This device, Studio Spark')
+
+  await page.goto('http://127.0.0.1:4173/models')
+  await page.getByRole('button', { name: 'Add model' }).click()
+  await expect(page.getByRole('checkbox', { name: /This device/ })).toBeChecked()
+  await expect(page.getByRole('checkbox', { name: /This device/ })).toBeDisabled()
 })

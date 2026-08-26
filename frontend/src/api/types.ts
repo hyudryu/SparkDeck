@@ -9,18 +9,21 @@ export interface RuntimeCompatibility {
 
 export interface BenchmarkAggregate {
   model_id: string
-  model_revision?: string
-  runtime: RuntimeKind
-  quantization?: string
-  hardware_class?: string
-  context_length?: number
-  median_tokens_per_second?: number
-  p25_tokens_per_second?: number
-  p75_tokens_per_second?: number
-  median_ttft_ms?: number
+  context_window_size: number
+  inference_tokens_per_second: number
   sample_count: number
-  distinct_device_count: number
-  community_proven?: boolean
+}
+
+export interface CommunityEvidencePolicy {
+  minimum_samples: number
+  exact_match_dimensions: Array<'model_id' | 'context_window_size'>
+  metric: 'inference_tokens_per_second'
+}
+
+export interface CommunityAggregatesResponse {
+  items: BenchmarkAggregate[]
+  availability: string
+  evidence_policy: CommunityEvidencePolicy
 }
 
 export interface CatalogModel {

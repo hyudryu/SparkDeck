@@ -27,7 +27,7 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/onboarding')) body = { role: 'controller', node: { id: 'local', name: 'Studio controller', port: 7878, access_urls: ['https://controller.tailnet.ts.net:7878'] }, controller_reachable: true, join_code: 'PAIR-123', instructions: [] }
     else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
-    else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured' }
+    else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured', evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' } }
     else if (path.endsWith('/images')) body = { items: [{ id: 'sha256:remote', repository: 'org/remote-runtime', tag: 'v1', size: 2147483648, runtimes: ['vllm'], node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }] }
     else if (path.endsWith('/storage/settings')) body = { enabled: true }
     else if (path.endsWith('/storage/transfers')) body = { id: 'job-new', status: 'queued' }
@@ -148,6 +148,37 @@ test('renames remote cluster nodes without horizontal overflow', async ({ page }
   await page.getByRole('button', { name: 'Save' }).click()
   await expect(page.getByRole('button', { name: 'Edit name for Render Spark' })).toBeVisible()
   await expect(page.getByRole('status').filter({ hasText: 'Renamed Studio Spark to Render Spark.' })).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+})
+
+test('keeps community sharing disclosure and estimates clear on every viewport', async ({ page }) => {
+  await page.route('**/api/v1/community/sync', (route) => route.fulfill({ json: { consent: false, pairing: { status: 'paired' }, outbox: { pending: 0, synced: 4 } } }))
+  await page.route('**/api/v1/community/aggregates', (route) => route.fulfill({ json: {
+    items: [{ model_id: 'org/test-model', context_window_size: 8192, inference_tokens_per_second: 37.2, sample_count: 12 }],
+    availability: 'available',
+    evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+  } }))
+  await page.route('**/api/v1/catalog/models*', (route) => route.fulfill({ json: {
+    items: [{ id: 'org/test-model', author: 'org', downloads: 1200, likes: 42, runtime_compatibility: [], community: { model_id: 'org/test-model', context_window_size: 8192, inference_tokens_per_second: 37.2, sample_count: 12 } }],
+    total: 1,
+    next_cursor: null,
+  } }))
+
+  await page.goto('/benchmarks')
+  await expect(page.getByRole('heading', { name: 'Community estimates' })).toBeVisible()
+  await expect(page.getByText('37.2 tok/s')).toBeVisible()
+  await page.getByRole('button', { name: 'Review & enable' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Enable community sharing?' })
+  await expect(dialog).toContainText('Only shared: model name, context window size, and measured inference tok/s.')
+  await expect(dialog).toContainText('Not shared: prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.')
+  await page.getByRole('button', { name: 'Close dialog' }).click()
+
+  await page.goto('/explore')
+  const estimate = page.getByLabel('Community inference-speed estimate for org/test-model')
+  await expect(estimate).toContainText('37.2 tok/s')
+  await expect(estimate).toContainText('8,192-token context window')
+  await expect(estimate).toContainText('estimate, not a guarantee')
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)
 })

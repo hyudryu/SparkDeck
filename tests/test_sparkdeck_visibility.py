@@ -113,6 +113,14 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertFalse(contract["supported"])
         self.assertIn("node_ids", contract["error"])
 
+    def test_malformed_saved_extra_args_marks_only_that_recipe_unsupported(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "extra_args": True,
+        })
+
+        self.assertFalse(contract["supported"])
+        self.assertIn("extra_args", contract["error"])
+
 
 class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

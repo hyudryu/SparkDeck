@@ -1,3 +1,4 @@
+import socket
 import tempfile
 import time
 import unittest
@@ -15,6 +16,14 @@ class FakeManager:
     def __init__(self):
         self.http = httpx.AsyncClient()
         self.list_containers = AsyncMock(return_value=[])
+        self.community_http_transport = None
+        self.community_resolver = lambda host, port, **kwargs: [(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("8.8.8.8", port),
+        )]
 
 
 class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
@@ -54,7 +63,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         requested = []
 
         def respond(request: httpx.Request) -> httpx.Response:
-            requested.append(str(request.url))
+            requested.append(request)
             return httpx.Response(200, json={"items": [{
                 "model_id": "org/community-model",
                 "context_window_size": 8192,
@@ -63,8 +72,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "private_remote_field": "discard-me",
             }]}, request=request)
 
-        await self.manager.http.aclose()
-        self.manager.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.manager.community_http_transport = httpx.MockTransport(respond)
         self.service.store.set_setting(
             "community_api_url", "https://community.example/api/v1/community",
         )
@@ -72,7 +80,12 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.community_aggregates()
 
         self.assertEqual(
-            requested, ["https://community.example/api/v1/community/aggregates"],
+            [str(request.url) for request in requested],
+            ["https://8.8.8.8/api/v1/community/aggregates"],
+        )
+        self.assertEqual(requested[0].headers["host"], "community.example")
+        self.assertEqual(
+            requested[0].extensions["sni_hostname"], "community.example",
         )
         self.assertEqual(result["availability"], "available")
         self.assertEqual(result["items"], [{
@@ -95,14 +108,106 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "sample_count": 10,
             }]}, request=request)
 
-        await self.manager.http.aclose()
-        self.manager.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.manager.community_http_transport = httpx.MockTransport(respond)
         self.service.store.set_setting(
             "community_api_url", "https://community.example/aggregates",
         )
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()
+
+    async def test_community_aggregates_reject_private_literal_without_connecting(self):
+        requests = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200),
+        )
+        self.service.store.set_setting(
+            "community_api_url", "http://169.254.169.254/latest/meta-data",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(requests, [])
+
+    async def test_community_aggregates_reject_mixed_public_private_dns(self):
+        requests = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200),
+        )
+        self.manager.community_resolver = lambda host, port, **kwargs: [
+            (
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("8.8.8.8", port),
+            ),
+            (
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("127.0.0.1", port),
+            ),
+        ]
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(requests, [])
+
+    async def test_community_redirect_to_private_address_is_rejected(self):
+        requests = []
+
+        def redirect(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                302,
+                headers={"location": "http://127.0.0.1/admin"},
+                request=request,
+            )
+
+        self.manager.community_http_transport = httpx.MockTransport(redirect)
+        self.service.store.set_setting(
+            "community_api_url", "https://community.example/api",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+            await self.service.community_aggregates()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(str(requests[0].url), "https://8.8.8.8/api/aggregates")
+
+    async def test_community_dns_result_is_pinned_before_connection(self):
+        resolver_calls = []
+        requests = []
+
+        def rebind(host, port, **kwargs):
+            resolver_calls.append((host, port))
+            address = "8.8.4.4" if len(resolver_calls) == 1 else "127.0.0.1"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"items": []}, request=request)
+
+        self.manager.community_resolver = rebind
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting(
+            "community_api_url",
+            "https://community.example/api?next=/aggregates",
+        )
+
+        result = await self.service.community_aggregates()
+
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(resolver_calls, [("community.example", 443)])
+        self.assertEqual(
+            str(requests[0].url),
+            "https://8.8.4.4/api/aggregates?next=/aggregates",
+        )
+        self.assertEqual(requests[0].headers["host"], "community.example")
 
     async def test_cluster_routing_identifiers_never_enter_benchmark_configuration(self):
         self.service._record_response(

@@ -121,4 +121,30 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
   })
+
+  it('pages large community result sets instead of rendering every model at once', async () => {
+    const user = userEvent.setup()
+    const items = Array.from({ length: 120 }, (_, index) => ({
+      model_id: `community/model-${index}`,
+      context_window_size: 8192,
+      inference_tokens_per_second: 20 + index,
+      sample_count: 10,
+    }))
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [], total: 0 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      return json({ items, availability: 'available', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
+
+    expect(await screen.findAllByRole('button', { name: /^Expand community\/model-/ })).toHaveLength(50)
+    const loadMore = screen.getByRole('button', { name: 'Load more community models (70 remaining)' })
+    await user.click(loadMore)
+
+    expect(screen.getAllByRole('button', { name: /^Expand community\/model-/ })).toHaveLength(100)
+    expect(screen.getByRole('button', { name: 'Load more community models (20 remaining)' })).toBeInTheDocument()
+  })
 })

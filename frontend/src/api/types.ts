@@ -114,6 +114,7 @@ export interface OnboardingStatus {
   role: 'controller' | 'worker'
   node: { id: string; name: string; port: number; access_urls: string[] }
   controller_url?: string
+  controller_node_id?: string
   controller_reachable: boolean
   join_code?: string
   instructions?: string[]

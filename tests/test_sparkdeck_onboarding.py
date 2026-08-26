@@ -266,6 +266,69 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted["pairing_code"], manager.agent_credentials.data["pairing_code"])
         await http.aclose()
 
+    async def test_join_through_worker_verifies_referral_and_registers_directly(self):
+        requests = []
+        worker_url = "http://100.100.20.31:7878"
+        controller_url = "http://100.100.20.30:7878"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if str(request.url).startswith(worker_url):
+                return httpx.Response(200, json={
+                    "role": "worker",
+                    "node": {
+                        "id": "entry-worker-id",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                    "controller_url": controller_url,
+                    "controller_node_id": "controller-id",
+                    "controller_reachable": True,
+                    "join_code": "654321",
+                })
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "role": "controller",
+                    "node": {
+                        "id": "controller-id",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                })
+            return httpx.Response(200, json={
+                "ok": True,
+                "role": "controller",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "forward_token": "forward-secret",
+                "node": {"id": "worker-id", "name": "Worker"},
+                "cluster": {"nodes": []},
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+
+        joined = await service.join({
+            "controller_url": worker_url,
+            "join_code": "654321",
+            "advertise_url": "http://100.100.20.32:7878",
+            "name": "Third Worker",
+        }, "http://127.0.0.1:7878")
+
+        assignment = service.assignment.load()
+        self.assertEqual(joined["role"], "worker")
+        self.assertEqual(assignment["controller_url"], controller_url)
+        self.assertEqual(assignment["controller_node_id"], "controller-id")
+        self.assertEqual(assignment["forward_token"], "forward-secret")
+        self.assertEqual(
+            [(request.method, str(request.url)) for request in requests],
+            [
+                ("GET", f"{worker_url}/api/v1/onboarding"),
+                ("GET", f"{controller_url}/api/v1/onboarding"),
+                ("POST", f"{controller_url}/api/v1/onboarding/register"),
+                ("GET", f"{controller_url}/api/v1/onboarding"),
+            ],
+        )
+        await http.aclose()
+
     async def test_join_rejects_localhost_alias_when_identity_is_this_node(self):
         requests = []
 
@@ -388,6 +451,63 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             "http://100.100.20.30:7878",
         ])
         await manager.http.aclose()
+
+    async def test_worker_status_exposes_verified_controller_join_code(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "role": "controller",
+                "node": {
+                    "id": "controller-id",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                },
+                "join_code": "654321",
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://100.100.20.40:7878",
+            "controller_node_id": "controller-id",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+
+        status = await service.status("http://127.0.0.1:7878")
+
+        self.assertEqual(status["role"], "worker")
+        self.assertTrue(status["controller_reachable"])
+        self.assertEqual(status["controller_node_id"], "controller-id")
+        self.assertEqual(status["join_code"], "654321")
+        self.assertNotIn("forward_token", json.dumps(status))
+        await http.aclose()
+
+    async def test_worker_status_rejects_join_code_from_unpinned_controller(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "role": "controller",
+                "node": {
+                    "id": "unexpected-controller-id",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                },
+                "join_code": "attacker-code",
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://100.100.20.40:7878",
+            "controller_node_id": "controller-id",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+
+        status = await service.status("http://127.0.0.1:7878")
+
+        self.assertFalse(status["controller_reachable"])
+        self.assertNotIn("join_code", status)
+        await http.aclose()
 
     async def test_leave_unregisters_then_revokes_before_clearing_assignment(self):
         requests = []
@@ -644,6 +764,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
     def test_exclusions_and_controller_token_validation(self):
         self.assertFalse(is_forwardable_path("/api/agent/status"))
         self.assertFalse(is_forwardable_path("/api/v1/onboarding"))
+        self.assertFalse(is_forwardable_path("/api/v1/onboarding/register"))
         self.assertTrue(is_forwardable_path("/api/state"))
         self.assertTrue(is_forwardable_path("/v1/chat/completions"))
         self.assertTrue(is_forwardable_path("/mcp"))

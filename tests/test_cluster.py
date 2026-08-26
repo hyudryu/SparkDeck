@@ -439,7 +439,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         root: Path, node_id: str, token_stats: dict, hourly: dict,
     ) -> Manager:
         instance = Manager.__new__(Manager)
-        instance.settings = {"sync_token_usage": True}
+        instance.settings = {}
         instance.agent_credentials = mock.Mock(node_id=node_id)
         instance.token_stats = json.loads(json.dumps(token_stats))
         instance.hourly_token_stats = json.loads(json.dumps(hourly))
@@ -643,6 +643,70 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             before = json.loads(json.dumps(node1.token_stats))
             self.assertFalse(node1.merge_token_usage_sync(union))
             self.assertEqual(node1.token_stats, before)
+
+    async def test_token_usage_sync_always_pulls_every_paired_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller",
+                {"model/a": {"input": 10, "output": 2, "requests": 1}},
+                {"2026-08-26T18": {"model/a": {"input": 10, "output": 2}}},
+            )
+            worker = self._usage_sync_manager(
+                root, "worker",
+                {"model/b": {"input": 20, "output": 4, "requests": 1}},
+                {"2026-08-26T18": {"model/b": {"input": 20, "output": 4}}},
+            )
+            requests = []
+
+            class Registry:
+                nodes = [{"id": "worker", "name": "Worker", "enabled": True}]
+
+                async def request(self, node_id, method, path, **kwargs):
+                    requests.append((node_id, method, path, kwargs))
+                    if method == "GET":
+                        # Older workers reported this hidden opt-in as false,
+                        # but their ledger is still valid and must be counted.
+                        return {
+                            **worker.token_usage_sync_snapshot(),
+                            "enabled": False,
+                        }
+                    worker.merge_token_usage_sync(kwargs["json_body"])
+                    return {"enabled": True, "changed": True}
+
+            controller.node_registry = Registry()
+            controller._token_usage_sync_status = {
+                "enabled": False, "last_sync_at": None,
+                "peers": 0, "error": None,
+            }
+
+            status = await controller.sync_token_usage_once()
+
+            self.assertTrue(status["enabled"])
+            self.assertEqual(status["peers"], 1)
+            self.assertIsNone(status["error"])
+            self.assertEqual(controller.token_stats["model/a"]["input"], 10)
+            self.assertEqual(controller.token_stats["model/b"]["input"], 20)
+            self.assertEqual(worker.token_stats["model/a"]["input"], 10)
+            self.assertEqual(
+                [(method, path) for _, method, path, _ in requests],
+                [("GET", "/api/agent/token-usage"),
+                 ("POST", "/api/agent/token-usage")],
+            )
+
+    def test_legacy_usage_sync_opt_out_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "sync_token_usage": False,
+                "max_retries": 7,
+            }))
+
+            settings = instance._load_settings()
+
+        self.assertNotIn("sync_token_usage", settings)
+        self.assertEqual(settings["max_retries"], 7)
 
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

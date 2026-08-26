@@ -610,6 +610,7 @@ class SparkDeckService:
             deployment["id"], deployment["model"]["repository"],
             deployment["runtime"], deployment.get("settings") or {}, started, data,
             revision=deployment["model"].get("revision"),
+            hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
         )
         data["model"] = deployment["alias"]
         return data
@@ -623,6 +624,7 @@ class SparkDeckService:
         started = time.monotonic()
         settings = deployment.get("settings") or {}
         manager_id = settings.get("manager_deployment_id")
+        hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
         result = (
             await self.manager.proxy_cluster_inference(
                 manager_id, model, upstream_body, endpoint, cancel,
@@ -647,10 +649,12 @@ class SparkDeckService:
             return self._observe_stream(
                 result, deployment["id"], model, deployment["runtime"], settings,
                 started, revision=revision, response_model=deployment["alias"],
+                hardware=hardware, hardware_verified=hardware_verified,
             )
         self._record_response(
             deployment["id"], model, deployment["runtime"], settings, started,
-            result, revision=revision,
+            result, revision=revision, hardware=hardware,
+            hardware_verified=hardware_verified,
         )
         if isinstance(result, dict):
             result["model"] = deployment["alias"]
@@ -705,12 +709,15 @@ class SparkDeckService:
                 deployment["runtime"], deployment.get("settings") or {}, started,
                 usage, first_token_at,
                 revision=deployment["model"].get("revision"),
+                hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
             )
 
     async def _observe_stream(self, stream: AsyncIterator[str], deployment_id: str | None,
                               model: str, runtime: str, settings: dict[str, Any],
                               started: float, revision: str | None = None,
-                              response_model: str | None = None) -> AsyncIterator[str]:
+                              response_model: str | None = None,
+                              hardware: dict[str, Any] | None = None,
+                              hardware_verified: bool = True) -> AsyncIterator[str]:
         first_token_at = None
         usage = None
         async for chunk in stream:
@@ -727,12 +734,15 @@ class SparkDeckService:
         if usage:
             self._record_usage(
                 deployment_id, model, runtime, settings, started, usage,
-                first_token_at, revision=revision,
+                first_token_at, revision=revision, hardware=hardware,
+                hardware_verified=hardware_verified,
             )
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
                          settings: dict[str, Any], started: float, data: dict[str, Any],
-                         revision: str | None = None) -> None:
+                         revision: str | None = None,
+                         hardware: dict[str, Any] | None = None,
+                         hardware_verified: bool = True) -> None:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict):
             timings = data.get("timings") or {}
@@ -741,6 +751,7 @@ class SparkDeckService:
                 native_generation_tps=_positive_float(timings.get("predicted_per_second")),
                 native_prompt_tps=_positive_float(timings.get("prompt_per_second")),
                 revision=revision,
+                hardware=hardware, hardware_verified=hardware_verified,
             )
 
     def _record_usage(self, deployment_id: str | None, model: str, runtime: str,
@@ -748,7 +759,9 @@ class SparkDeckService:
                       first_token_at: float | None,
                       native_generation_tps: float | None = None,
                       native_prompt_tps: float | None = None,
-                      revision: str | None = None) -> None:
+                      revision: str | None = None,
+                      hardware: dict[str, Any] | None = None,
+                      hardware_verified: bool = True) -> None:
         completed = time.monotonic()
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -772,6 +785,7 @@ class SparkDeckService:
             public_model != "local-model" and input_tokens > 0 and output_tokens >= 16 and latency > 0
             and generation_tps is not None
             and runtime_kind.value in self.registry.kinds
+            and hardware_verified
         )
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
@@ -783,7 +797,7 @@ class SparkDeckService:
             ),
             runtime=runtime_kind,
             runtime_version=_optional_string(safe_settings.get("runtime_version")),
-            hardware=self._hardware_snapshot(),
+            hardware=hardware if hardware is not None else self._hardware_snapshot(),
             configuration=safe_settings, input_tokens=input_tokens,
             output_tokens=output_tokens, latency_ms=round(latency * 1000, 3),
             ttft_ms=None if first_token_at is None else round((first_token_at - started) * 1000, 3),
@@ -820,8 +834,34 @@ class SparkDeckService:
             if key in _SAFE_CONFIGURATION_KEYS | _LOCAL_ROUTING_KEYS
         }
 
-    def _hardware_snapshot(self) -> dict[str, Any]:
-        stats = getattr(self.manager, "_stats_cache", {}) or {}
+    async def _managed_hardware_snapshot(
+        self, deployment: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Resolve benchmark hardware from the cluster member that serves requests."""
+        manager_id = (deployment.get("settings") or {}).get("manager_deployment_id")
+        if not manager_id:
+            return self._hardware_snapshot(), True
+        try:
+            _, primary = self.manager._cluster_primary_member(manager_id)
+            node_id = primary.get("node_id")
+            if node_id == "local":
+                return self._hardware_snapshot(), True
+            if not node_id:
+                return self._unknown_hardware_snapshot(), False
+            stats = await self.manager.node_registry.request(
+                node_id, "GET", "/api/agent/stats", timeout=5,
+            )
+            if not isinstance(stats, dict):
+                return self._unknown_hardware_snapshot(), False
+            return self._hardware_snapshot(stats), True
+        except Exception:
+            # Hardware collection must never make an otherwise valid inference
+            # fail. Unknown remote hardware remains local-only evidence.
+            return self._unknown_hardware_snapshot(), False
+
+    def _hardware_snapshot(self, stats: dict[str, Any] | None = None) -> dict[str, Any]:
+        if stats is None:
+            stats = getattr(self.manager, "_stats_cache", {}) or {}
         gpus = stats.get("gpus") or []
         public_gpus = [
             {"model": gpu.get("name"), "memory_mib": gpu.get("mem_total_mib")}
@@ -834,6 +874,10 @@ class SparkDeckService:
             "gpu_count": len(public_gpus),
             "gpus": public_gpus,
         }
+
+    @staticmethod
+    def _unknown_hardware_snapshot() -> dict[str, Any]:
+        return {"hardware_class": "unknown", "gpu_count": None, "gpus": []}
 
     @staticmethod
     def _validate_base_url(value: Any) -> str:

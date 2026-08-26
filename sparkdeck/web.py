@@ -18,6 +18,7 @@ SPA_PATHS = (
     "/cluster",
     "/storage",
     "/benchmarks",
+    "/usage",
     "/images",
     "/settings",
     "/logs",

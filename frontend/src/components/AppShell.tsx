@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
+  Activity,
   Boxes,
   ChevronLeft,
   ClipboardList,
@@ -29,6 +30,7 @@ const navigation = [
   { to: '/chat', label: 'Chat', icon: MessageSquareText },
   { to: '/compare', label: 'Compare', icon: GitCompareArrows },
   { to: '/benchmarks', label: 'Benchmarks', icon: ClipboardList },
+  { to: '/usage', label: 'Usage', icon: Activity },
   { to: '/images', label: 'Images', icon: Images },
   { to: '/storage', label: 'Storage', icon: HardDrive },
   { to: '/settings', label: 'Settings', icon: Settings },

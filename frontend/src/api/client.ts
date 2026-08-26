@@ -21,6 +21,8 @@ import type {
   CreateStorageTransferInput,
   StorageState,
   StorageTransferJob,
+  UsageAnalysis,
+  UsageSummary,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -313,6 +315,27 @@ export const api = {
     }),
     removeModel: (nodeId: string, modelId: string) => request<void>(
       `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}`,
+      { method: 'DELETE' },
+    ),
+  },
+  usage: {
+    get: (signal?: AbortSignal) => request<UsageSummary>('/api/token-stats', { signal }),
+    analysis: async (start = '', end = '', signal?: AbortSignal): Promise<UsageAnalysis> => {
+      const query = queryString({ start, end })
+      const [hourly, daily] = await Promise.all([
+        request<UsageAnalysis['hourly']>(`/api/token-stats/hourly${query}`, { signal }),
+        request<UsageAnalysis['daily']>(`/api/token-stats/daily${query}`, { signal }),
+      ])
+      return { hourly, daily }
+    },
+    reset: () => request<UsageSummary>('/api/token-stats/reset', { method: 'POST' }),
+    updateAlias: (model: string, alias: string | null, merge_group: string | null) =>
+      request<void>('/api/token-stats/alias', {
+        method: 'PUT',
+        body: JSON.stringify({ model, alias, merge_group }),
+      }),
+    erase: (model: string) => request<void>(
+      `/api/token-stats/${encodeURIComponent(model)}`,
       { method: 'DELETE' },
     ),
   },

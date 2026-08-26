@@ -258,6 +258,29 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted.status_code, 200)
         delete.assert_awaited_once_with("local", "org/model")
 
+    async def test_agent_inventory_runs_recursive_scan_off_event_loop(self):
+        inventory_scan = Mock(return_value=[{
+            "model_id": "org/model", "size_bytes": 9,
+        }])
+        virtual_nas = SimpleNamespace(inventory=inventory_scan)
+        delegated = AsyncMock(return_value=inventory_scan.return_value)
+        with (
+            patch.object(
+                server.manager.agent_credentials, "accepts_token", return_value=True,
+            ),
+            patch.object(server.manager, "virtual_nas", virtual_nas, create=True),
+            patch.object(server.asyncio, "to_thread", delegated),
+        ):
+            response = await self.client.get(
+                "/api/agent/virtual-nas/inventory",
+                headers={"authorization": "Bearer paired-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["models"][0]["model_id"], "org/model")
+        delegated.assert_awaited_once_with(inventory_scan)
+        inventory_scan.assert_not_called()
+
     async def test_agent_export_reports_missing_model_before_stream_headers(self):
         virtual_nas = SimpleNamespace(
             export_model=Mock(side_effect=LookupError("cached model not found")),

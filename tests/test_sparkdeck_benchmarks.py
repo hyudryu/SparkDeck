@@ -31,6 +31,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         response = {
             "choices": [{"message": {"content": "generated secret"}}],
             "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+            "timings": {"predicted_per_second": 96.0, "prompt_per_second": 128.0},
         }
         self.service._record_response(
             None, "org/model", "vllm", {"context_size": 4096, "api_key": "secret"},
@@ -58,4 +59,3 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 0
         )
-

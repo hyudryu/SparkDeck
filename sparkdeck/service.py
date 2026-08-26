@@ -231,25 +231,44 @@ class SparkDeckService:
                            cancel: Any) -> AsyncIterator[str]:
         first_token_at: float | None = None
         usage: dict[str, Any] | None = None
-        async with self.manager.http.stream(
-            "POST", url, json=body, headers=headers, timeout=None
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if cancel is not None and cancel.is_set():
-                    return
-                if not line:
+        upstream_body = dict(body)
+        retried_without_stream_options = False
+        while True:
+            async with self.manager.http.stream(
+                "POST", url, json=upstream_body, headers=headers, timeout=None
+            ) as response:
+                if (
+                    response.status_code == 400
+                    and upstream_body.get("stream_options")
+                    and not retried_without_stream_options
+                ):
+                    # Older llama-server/SGLang releases may not support this
+                    # OpenAI extension. Streaming still works; only terminal
+                    # usage-based benchmark capture is unavailable for that run.
+                    await response.aread()
+                    upstream_body = {
+                        key: value for key, value in upstream_body.items()
+                        if key != "stream_options"
+                    }
+                    retried_without_stream_options = True
                     continue
-                parsed = _parse_sse(line)
-                if parsed:
-                    if parsed.get("usage"):
-                        usage = parsed["usage"]
-                    if first_token_at is None and _chunk_has_output(parsed):
-                        first_token_at = time.monotonic()
-                    if parsed.get("model"):
-                        parsed["model"] = deployment["alias"]
-                        line = "data: " + json.dumps(parsed, separators=(",", ":"))
-                yield f"{line}\n\n"
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if cancel is not None and cancel.is_set():
+                        return
+                    if not line:
+                        continue
+                    parsed = _parse_sse(line)
+                    if parsed:
+                        if parsed.get("usage"):
+                            usage = parsed["usage"]
+                        if first_token_at is None and _chunk_has_output(parsed):
+                            first_token_at = time.monotonic()
+                        if parsed.get("model"):
+                            parsed["model"] = deployment["alias"]
+                            line = "data: " + json.dumps(parsed, separators=(",", ":"))
+                    yield f"{line}\n\n"
+                break
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
@@ -278,11 +297,18 @@ class SparkDeckService:
                          settings: dict[str, Any], started: float, data: dict[str, Any]) -> None:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict):
-            self._record_usage(deployment_id, model, runtime, settings, started, usage, None)
+            timings = data.get("timings") or {}
+            self._record_usage(
+                deployment_id, model, runtime, settings, started, usage, None,
+                native_generation_tps=_positive_float(timings.get("predicted_per_second")),
+                native_prompt_tps=_positive_float(timings.get("prompt_per_second")),
+            )
 
     def _record_usage(self, deployment_id: str | None, model: str, runtime: str,
                       settings: dict[str, Any], started: float, usage: dict[str, Any],
-                      first_token_at: float | None) -> None:
+                      first_token_at: float | None,
+                      native_generation_tps: float | None = None,
+                      native_prompt_tps: float | None = None) -> None:
         completed = time.monotonic()
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -291,9 +317,20 @@ class SparkDeckService:
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
         quantization = _optional_string(safe_settings.get("quantization"))
+        observed_generation_tps = (
+            round(output_tokens / generation_seconds, 3)
+            if first_token_at is not None and output_tokens else None
+        )
+        observed_prompt_tps = (
+            round(input_tokens / max(0.000001, first_token_at - started), 3)
+            if first_token_at is not None and input_tokens else None
+        )
+        generation_tps = native_generation_tps or observed_generation_tps
+        prompt_tps = native_prompt_tps or observed_prompt_tps
         public_model = _public_model_id(model)
         eligible = bool(
             public_model != "local-model" and input_tokens > 0 and output_tokens >= 16 and latency > 0
+            and generation_tps is not None
             and runtime_kind.value in self.registry.kinds
         )
         sample = BenchmarkSample(
@@ -308,10 +345,8 @@ class SparkDeckService:
             configuration=safe_settings, input_tokens=input_tokens,
             output_tokens=output_tokens, latency_ms=round(latency * 1000, 3),
             ttft_ms=None if first_token_at is None else round((first_token_at - started) * 1000, 3),
-            generation_tokens_per_second=(round(output_tokens / generation_seconds, 3)
-                                          if output_tokens else None),
-            prompt_tokens_per_second=(round(input_tokens / max(0.000001, (first_token_at or completed) - started), 3)
-                                      if input_tokens else None),
+            generation_tokens_per_second=generation_tps,
+            prompt_tokens_per_second=prompt_tps,
             cold_start=None, eligible_for_community=eligible,
         )
         consent = bool(self.store.get_setting("community_consent", False))
@@ -396,6 +431,14 @@ class SparkDeckService:
 def _optional_string(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _public_model_id(value: str) -> str:

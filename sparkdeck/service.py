@@ -26,7 +26,11 @@ from .runtimes import (
     normalize_openai_base_url,
     safe_container_name,
 )
-from .storage import SparkDeckStore, community_context_window
+from .storage import (
+    COMMUNITY_EVIDENCE_POLICY,
+    SparkDeckStore,
+    community_context_window,
+)
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -37,6 +41,57 @@ _SAFE_CONFIGURATION_KEYS = {
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
+
+
+def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
+    """Validate and bound the public response from a configured aggregator."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise ValueError("community aggregate response must contain an items array")
+    if len(payload["items"]) > 10_000:
+        raise ValueError("community aggregate response is too large")
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for raw in payload["items"]:
+        if not isinstance(raw, dict):
+            raise ValueError("community aggregate item must be an object")
+        model_id = str(raw.get("model_id") or "").strip()
+        context_window = raw.get("context_window_size")
+        speed = raw.get("inference_tokens_per_second")
+        sample_count = raw.get("sample_count")
+        if (
+            not model_id
+            or len(model_id) > 500
+            or any(ord(char) < 32 for char in model_id)
+            or isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+            or isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or isinstance(speed, bool)
+            or not isinstance(speed, (int, float))
+        ):
+            raise ValueError("community aggregate item is invalid")
+        speed = float(speed)
+        if (
+            context_window <= 0
+            or context_window > 100_000_000
+            or sample_count <= 0
+            or sample_count > 1_000_000_000
+            or not math.isfinite(speed)
+            or speed <= 0
+        ):
+            raise ValueError("community aggregate item is invalid")
+        key = (model_id, context_window)
+        if key in seen:
+            raise ValueError("community aggregate response contains duplicate evidence")
+        seen.add(key)
+        result.append({
+            "model_id": model_id,
+            "context_window_size": context_window,
+            "inference_tokens_per_second": speed,
+            "sample_count": sample_count,
+        })
+    return result
 
 
 class SparkDeckService:
@@ -52,6 +107,35 @@ class SparkDeckService:
 
     async def close(self) -> None:
         self.store.close()
+
+    async def community_aggregates(self) -> dict[str, Any]:
+        """Return configured community evidence or privacy-safe local evidence."""
+        endpoint = str(
+            self.store.get_setting("community_api_url", "") or ""
+        ).strip().rstrip("/")
+        if not endpoint:
+            items = self.store.community_aggregates()
+            return {
+                "items": items,
+                "availability": "local" if items else "not_configured",
+                "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
+            }
+
+        aggregate_url = (
+            endpoint if endpoint.endswith("/aggregates")
+            else f"{endpoint}/aggregates"
+        )
+        try:
+            response = await self.manager.http.get(aggregate_url, timeout=15)
+            response.raise_for_status()
+            items = _public_community_aggregates(response.json())
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            raise RuntimeError("community aggregate service is unavailable") from exc
+        return {
+            "items": items,
+            "availability": "available",
+            "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
+        }
 
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None

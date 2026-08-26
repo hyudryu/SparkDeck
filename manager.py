@@ -33,6 +33,7 @@ from cluster import (
     NodeRegistry,
 )
 from sparkdeck.onboarding import validate_control_url
+from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
 
@@ -88,28 +89,6 @@ DEFAULT_SETTINGS = {
 logger = logging.getLogger(__name__)
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
 
-
-def _atomic_private_json_write(path: Path, value: Any) -> None:
-    """Write sensitive controller state without a permissive first-write window."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            temporary.chmod(0o600)
-        except OSError:
-            pass
-        temporary.replace(path)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-    finally:
-        temporary.unlink(missing_ok=True)
 
 # The official SGLang image exposes ``python3`` rather than a ``python``
 # executable. Keep this separate from the vLLM setting because SGLang recipes
@@ -3831,6 +3810,12 @@ class Manager:
         public["hf_token"] = ""
         public["hf_token_configured"] = bool(self._resolved_hf_token())
         return public
+
+    async def clear_hf_token(self) -> dict:
+        async with self.lock:
+            self.settings["hf_token"] = ""
+            self._save_settings()
+        return self.public_settings()
 
     async def update_settings(self, data: dict) -> dict:
         async with self.lock:

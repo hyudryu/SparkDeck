@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -118,6 +119,22 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()["hf_token_configured"])
         update_settings.assert_not_awaited()
 
+    async def test_explicit_clear_removes_the_saved_credential(self):
+        clear_hf_token = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck.store, "get_setting",
+                side_effect=lambda key, default: default,
+            ),
+            patch.object(server.manager, "clear_hf_token", clear_hf_token),
+            patch.object(server.manager, "_resolved_hf_token", return_value=""),
+        ):
+            response = await self.client.delete("/api/v1/settings/hf-token")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["hf_token_configured"])
+        clear_hf_token.assert_awaited_once_with()
+
     async def test_agent_launch_errors_redact_forwarded_credential(self):
         sentinel = "hf_agent_sentinel_secret"
         with (
@@ -204,6 +221,32 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(Path(f"{instance.settings_path}.tmp").exists())
             if os.name != "nt":
                 self.assertEqual(instance.settings_path.stat().st_mode & 0o777, 0o600)
+
+    def test_private_json_temporary_file_is_created_with_mode_0600(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings = {"hf_token": "hf_private_secret"}
+
+            with patch("sparkdeck.private_json.os.open", wraps=os.open) as secure_open:
+                instance._save_settings()
+
+            self.assertEqual(secure_open.call_args.args[2], 0o600)
+            self.assertTrue(secure_open.call_args.args[1] & os.O_EXCL)
+
+    async def test_manager_explicitly_clears_saved_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings = {"hf_token": "hf_private_secret"}
+            instance.virtual_nas = Mock()
+            instance.virtual_nas.stop = AsyncMock()
+
+            result = await instance.clear_hf_token()
+
+            self.assertEqual(instance.settings["hf_token"], "")
+            self.assertFalse(result["hf_token_configured"])
 
     async def test_remote_credential_destination_is_revalidated_before_send(self):
         instance = Manager.__new__(Manager)

@@ -145,6 +145,28 @@ export function SettingsPage() {
     }
   }
 
+  const clearHuggingFaceKey = async () => {
+    if (!window.confirm('Remove the saved Hugging Face API key for the entire cluster?')) return
+    setSaving(true)
+    setSaved(false)
+    setError(undefined)
+    try {
+      const savedSettings = await api.settings.clearHfToken()
+      setForm((current) => ({
+        ...current,
+        hf_token: '',
+        hf_token_configured: savedSettings.hf_token_configured,
+      }))
+      setHuggingFaceApiKey('')
+      setSaved(true)
+      window.setTimeout(() => setSaved(false), 2400)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not remove the saved Hugging Face API key')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const hasUnsavedChanges = savedFingerprint !== undefined
     && (editableSettingsFingerprint(form) !== savedFingerprint || Boolean(huggingFaceApiKey.trim()))
 
@@ -169,7 +191,7 @@ export function SettingsPage() {
           <div className="settings-heading"><span><KeyRound size={18} /></span><div><h2>Hugging Face access</h2><p>Use one credential for gated and private models across the cluster.</p></div></div>
           <div className="settings-fields">
             <label className="field wide-field"><span>Hugging Face API key</span><input aria-label="Hugging Face API key" type="password" autoComplete="new-password" value={huggingFaceApiKey} onChange={(event) => setHuggingFaceApiKey(event.target.value)} placeholder={form.hf_token_configured ? 'Enter a new key to replace the saved key' : 'hf_…'} /><small>The controller stores this key privately and sends it only over authenticated cluster channels when selected nodes start Hugging Face models. Leave blank to keep the current key.</small></label>
-            <div className="credential-state"><KeyRound size={17} /><div><strong>Cluster credential</strong><Status status={form.hf_token_configured ? 'running' : 'stopped'}>{form.hf_token_configured ? 'Configured' : 'Not configured'}</Status></div></div>
+            <div className="credential-state"><KeyRound size={17} /><div><strong>Cluster credential</strong><Status status={form.hf_token_configured ? 'running' : 'stopped'}>{form.hf_token_configured ? 'Configured' : 'Not configured'}</Status></div>{form.hf_token_configured && <Button type="button" variant="danger" disabled={saving} onClick={() => void clearHuggingFaceKey()}>Remove saved key</Button>}</div>
           </div>
         </Panel>
         <Panel className="settings-section">

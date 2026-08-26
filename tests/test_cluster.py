@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -12,14 +13,16 @@ from manager import Manager
 
 
 class AgentCredentialsTests(unittest.TestCase):
-    def test_pairing_code_is_one_time_and_token_is_durable(self) -> None:
+    def test_pairing_code_and_previous_controller_token_are_rotated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             credentials = AgentCredentials(Path(directory))
             code = credentials.data["pairing_code"]
+            previous_token = credentials.data["agent_token"]
 
             paired = credentials.pair(code)
 
             self.assertTrue(credentials.accepts_token(paired["agent_token"]))
+            self.assertFalse(credentials.accepts_token(previous_token))
             self.assertNotEqual(credentials.data["pairing_code"], code)
             with self.assertRaisesRegex(ValueError, "invalid pairing code"):
                 credentials.pair(code)
@@ -66,6 +69,11 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.path, "/api/agent/pair")
+            self.assertEqual(json.loads(request.content), {
+                "pairing_code": "123456",
+                "usage_epoch": [4, "controller"],
+                "usage_model_epochs": {"model/a": [2, "controller"]},
+            })
             return httpx.Response(200, json={
                 "node_id": "remote-1",
                 "agent_token": "durable-secret",
@@ -78,7 +86,9 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             try:
                 registry = NodeRegistry(Path(directory), client)
                 public = await registry.pair_remote(
-                    "http://spark-2:7878", "123456", fabric_ip="169.254.10.2"
+                    "http://spark-2:7878", "123456", fabric_ip="169.254.10.2",
+                    usage_epoch=[4, "controller"],
+                    usage_model_epochs={"model/a": [2, "controller"]},
                 )
             finally:
                 await client.aclose()
@@ -734,6 +744,97 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             # Lifetime reset preserves historical hourly analysis counters.
             self.assertIn("model/a", node2.hourly_token_stats["2026-08-15T07"])
             self.assertIn("model/b", node2.hourly_token_stats["2026-08-15T07"])
+
+    def test_pairing_rebases_preexisting_reset_without_erasing_either_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model/a": {"input": 10}},
+                {"2026-08-15T07": {"model/a": {"input": 10}}},
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model/b": {"input": 20}},
+                {"2026-08-15T07": {"model/b": {"input": 20}}},
+            )
+            worker._reset_synced_token_usage()
+            worker._record_local_synced_tokens(
+                "model/b", 20, 0, 0, None, None, "2026-08-15T07"
+            )
+            worker._rebuild_synced_token_usage()
+
+            worker.rebase_token_usage_for_pairing(
+                controller.token_usage_sync["epoch"],
+                controller.token_usage_sync["model_epochs"],
+            )
+            controller.merge_token_usage_sync(worker.token_usage_sync_snapshot())
+
+            self.assertEqual(controller.token_stats["model/a"]["input"], 10)
+            self.assertEqual(controller.token_stats["model/b"]["input"], 20)
+
+    def test_pairing_drops_usage_learned_from_a_previous_cluster(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_controller = self._usage_sync_manager(
+                root, "old-controller", {"private/model": {"input": 99}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"local/model": {"input": 20}}, {}
+            )
+            worker.merge_token_usage_sync(
+                old_controller.token_usage_sync_snapshot()
+            )
+
+            worker.rebase_token_usage_for_pairing([0, ""], {})
+
+            self.assertEqual(set(worker.token_usage_sync["origins"]), {"worker"})
+            self.assertEqual(set(worker.token_stats), {"local/model"})
+
+    def test_rolling_speed_combines_samples_from_every_cluster_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model": {"output": 100}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model": {"output": 200}}, {}
+            )
+            controller.token_usage_sync["origins"]["controller"][
+                "speed_samples"
+            ] = {"model": [{
+                "tokens": 100, "started_at": 1000, "ended_at": 1010,
+            }]}
+            worker.token_usage_sync["origins"]["worker"]["speed_samples"] = {
+                "model": [{
+                    "tokens": 200, "started_at": 1000, "ended_at": 1010,
+                }]
+            }
+            controller.merge_token_usage_sync(worker.token_usage_sync_snapshot())
+
+            speed = controller.rolling_generation_speed(["model"])
+
+            self.assertEqual(speed["tokens"], 300)
+            self.assertAlmostEqual(speed["active_time_s"], 10.0)
+            self.assertAlmostEqual(speed["tok_s"], 30.0)
+
+    def test_hourly_usage_is_utc_and_bounded_to_activity_window(self) -> None:
+        with mock.patch("manager.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 8, 26, 18)
+            self.assertEqual(Manager._usage_hour_key(), "2026-08-26T18")
+            mocked_datetime.now.assert_called_once_with(timezone.utc)
+
+        hourly = {
+            "2025-08-20T00": {"model": {"input": 1}},
+            "2025-08-22T00": {"model": {"input": 2}},
+            "2026-08-26T18": {"model": {"input": 3}},
+        }
+        changed = Manager._prune_hourly_usage(
+            hourly, datetime(2026, 8, 26, 18, tzinfo=timezone.utc)
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("2025-08-20T00", hourly)
+        self.assertIn("2025-08-22T00", hourly)
+        self.assertIn("2026-08-26T18", hourly)
 
     def test_usage_merge_group_combines_counters_cost_and_concurrent_speed(self) -> None:
         instance = Manager.__new__(Manager)

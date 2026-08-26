@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import ipaddress
 import json
 import math
 import platform
 import re
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
@@ -41,6 +43,119 @@ _SAFE_CONFIGURATION_KEYS = {
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
+_COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_COMMUNITY_MAX_REDIRECTS = 5
+
+
+async def _public_connection_url(
+    url: httpx.URL, resolver: Any = socket.getaddrinfo,
+) -> tuple[httpx.URL, str, str]:
+    """Resolve and pin a public destination for one outbound connection.
+
+    The returned URL contains the selected IP address, so the HTTP transport
+    cannot perform a second, attacker-controlled DNS lookup after validation.
+    The caller must use the returned host header and SNI hostname so HTTPS
+    authentication still applies to the configured service name.
+    """
+    if url.scheme not in {"http", "https"} or not url.host:
+        raise ValueError("community aggregate URL must use HTTP or HTTPS")
+    if url.userinfo:
+        raise ValueError("community aggregate URL must not include credentials")
+
+    hostname = url.raw_host.decode("ascii")
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            answers = await asyncio.to_thread(
+                resolver, hostname, port, type=socket.SOCK_STREAM,
+            )
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("community aggregate host could not be resolved") from exc
+        addresses = []
+        for answer in answers:
+            try:
+                address = ipaddress.ip_address(answer[4][0])
+            except (IndexError, TypeError, ValueError):
+                raise ValueError("community aggregate host returned an invalid address")
+            if address not in addresses:
+                addresses.append(address)
+
+    # Reject the entire DNS answer if any address is unsafe. This prevents a
+    # resolver or attacker from influencing which member of a mixed answer the
+    # transport chooses, and covers loopback, private, link-local, multicast,
+    # unspecified, reserved, and shared address space.
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("community aggregate host must resolve only to public addresses")
+
+    return url.copy_with(host=str(addresses[0])), url.netloc.decode("ascii"), hostname
+
+
+async def _get_public_community_url(
+    url: str | httpx.URL, *, transport: httpx.AsyncBaseTransport | None = None,
+    resolver: Any = socket.getaddrinfo,
+) -> httpx.Response:
+    """GET a public URL with per-hop DNS pinning and redirect validation."""
+    try:
+        current = httpx.URL(url)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community aggregate URL is invalid") from exc
+
+    for redirect_count in range(_COMMUNITY_MAX_REDIRECTS + 1):
+        pinned, host_header, sni_hostname = await _public_connection_url(
+            current, resolver,
+        )
+        # A fresh client for every hop prevents an IP-keyed pooled TLS
+        # connection from being reused after a cross-host redirect.
+        async with httpx.AsyncClient(
+            transport=transport,
+            trust_env=False,
+            follow_redirects=False,
+            timeout=15,
+        ) as client:
+            request = client.build_request(
+                "GET",
+                pinned,
+                headers={"Host": host_header, "Connection": "close"},
+                extensions={"sni_hostname": sni_hostname},
+            )
+            response = await client.send(request)
+
+        if (
+            response.status_code in _COMMUNITY_REDIRECT_STATUSES
+            and response.headers.get("location") is not None
+        ):
+            if redirect_count >= _COMMUNITY_MAX_REDIRECTS:
+                raise httpx.TooManyRedirects(
+                    "community aggregate service redirected too many times",
+                    request=response.request,
+                )
+            try:
+                current = current.join(response.headers["location"])
+            except (TypeError, httpx.InvalidURL) as exc:
+                raise ValueError("community aggregate redirect is invalid") from exc
+            continue
+        return response
+
+    raise AssertionError("unreachable")
+
+
+def _community_aggregate_url(endpoint: str) -> httpx.URL:
+    """Append the aggregate route to the URL path, never its query string."""
+    try:
+        url = httpx.URL(endpoint)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community aggregate URL is invalid") from exc
+    path = url.path.rstrip("/")
+    if not path.endswith("/aggregates"):
+        path = f"{path}/aggregates"
+    return url.copy_with(path=path or "/aggregates", fragment=None)
 
 
 def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
@@ -121,12 +236,15 @@ class SparkDeckService:
                 "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
             }
 
-        aggregate_url = (
-            endpoint if endpoint.endswith("/aggregates")
-            else f"{endpoint}/aggregates"
-        )
         try:
-            response = await self.manager.http.get(aggregate_url, timeout=15)
+            aggregate_url = _community_aggregate_url(endpoint)
+            response = await _get_public_community_url(
+                aggregate_url,
+                transport=getattr(self.manager, "community_http_transport", None),
+                resolver=getattr(
+                    self.manager, "community_resolver", socket.getaddrinfo,
+                ),
+            )
             response.raise_for_status()
             items = _public_community_aggregates(response.json())
         except (httpx.HTTPError, TypeError, ValueError) as exc:

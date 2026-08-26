@@ -145,7 +145,10 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.manager, "get_state", AsyncMock(return_value={})),
             patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
             patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=[{
-                "id": "local", "models": [{"model_id": "org/model", "size_bytes": 12}],
+                "id": "local", "models": [{
+                    "model_id": "org/model", "size_bytes": 12,
+                    "revisions": ["main"],
+                }],
             }])),
             patch.object(server.sparkdeck, "create_deployment", AsyncMock(return_value=created)) as create,
         ):
@@ -283,6 +286,47 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             ["--revision=release-b"],
         )
 
+    async def test_recipe_without_revision_requires_cached_main_ref(self):
+        recipe = {
+            "id": "default-revision", "model": "org/model", "engine": "vllm",
+            "extra_args": [],
+        }
+        created = {
+            "id": "dep-main", "alias": "org/model", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/model"},
+            "status": "starting", "settings": {},
+        }
+        inventory = AsyncMock(side_effect=[[{
+            "id": "local", "models": [{
+                "model_id": "org/model", "size_bytes": 12,
+                "revisions": ["unrelated-snapshot"],
+            }],
+        }], [{
+            "id": "local", "models": [{
+                "model_id": "org/model", "size_bytes": 12,
+                "revisions": ["main", "main-snapshot"],
+            }],
+        }]])
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
+            patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(
+                server.sparkdeck, "create_deployment", AsyncMock(return_value=created),
+            ) as create,
+        ):
+            missing_main = await self.client.post(
+                "/api/v1/recipes/default-revision/deploy"
+            )
+            cached_main = await self.client.post(
+                "/api/v1/recipes/default-revision/deploy"
+            )
+
+        self.assertEqual(missing_main.status_code, 409)
+        self.assertIn("local", missing_main.text)
+        self.assertEqual(cached_main.status_code, 201)
+        create.assert_awaited_once()
+
     async def test_tp2_recipe_requires_two_nodes_with_cached_weights(self):
         recipe = {
             "id": "recipe-tp2", "name": "DeepSeek TP2", "model": "deepseek/model",
@@ -296,8 +340,14 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             "status": "starting", "settings": {},
         }
         inventory = [
-            {"id": "local", "models": [{"model_id": "deepseek/model", "size_bytes": 12}]},
-            {"id": "node-2", "models": [{"model_id": "deepseek/model", "size_bytes": 12}]},
+            {"id": "local", "models": [{
+                "model_id": "deepseek/model", "size_bytes": 12,
+                "revisions": ["main"],
+            }]},
+            {"id": "node-2", "models": [{
+                "model_id": "deepseek/model", "size_bytes": 12,
+                "revisions": ["main"],
+            }]},
             {"id": "node-3", "models": []},
         ]
         with (

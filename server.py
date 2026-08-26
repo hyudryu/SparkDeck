@@ -1448,15 +1448,13 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
         raise HTTPException(400, str(exc)) from exc
     inventory = await manager.model_cache_inventory()
     requested_revision = contract.get("model_revision")
+    cached_revision = requested_revision or "main"
     nodes_with_weights = {
         node.get("id")
         for node in inventory
         if any(
             model.get("model_id") == recipe.get("model")
-            and (
-                not requested_revision
-                or requested_revision in (model.get("revisions") or [])
-            )
+            and cached_revision in (model.get("revisions") or [])
             for model in node.get("models") or []
         )
     }

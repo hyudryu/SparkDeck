@@ -12,6 +12,7 @@ type FitTone = 'easy' | 'tight' | 'no-fit' | 'unknown'
 type DisplayCatalogModel = CatalogModel & { communityEvidenceSource?: 'community' | 'local' }
 
 const MIB = 1024 ** 2
+const COMMUNITY_PAGE_SIZE = 50
 
 function formatParameters(value?: number | null) {
   if (!Number.isFinite(value) || Number(value) <= 0) return '—'
@@ -126,6 +127,7 @@ export function ExplorePage() {
   const [tab, setTab] = useState<CatalogTab>('hugging-face')
   const [fitsOnly, setFitsOnly] = useState(false)
   const [communityOnly, setCommunityOnly] = useState(false)
+  const [communityLimit, setCommunityLimit] = useState(COMMUNITY_PAGE_SIZE)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const catalog = useResource(
     (signal) => api.catalog.search(query, runtime || undefined, undefined, signal),
@@ -138,6 +140,10 @@ export function ExplorePage() {
     const timeout = window.setTimeout(() => setQuery(draft.trim()), 350)
     return () => window.clearTimeout(timeout)
   }, [draft])
+
+  useEffect(() => {
+    setCommunityLimit(COMMUNITY_PAGE_SIZE)
+  }, [aggregates.data?.items, communityOnly, fitsOnly, query, tab])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
   const models = useMemo(() => {
@@ -182,6 +188,8 @@ export function ExplorePage() {
     }
     return visible
   }, [aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory.capacity, query, tab])
+  const displayedModels = tab === 'community' ? models.slice(0, communityLimit) : models
+  const remainingCommunityModels = tab === 'community' ? models.length - displayedModels.length : 0
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -256,7 +264,8 @@ export function ExplorePage() {
       )}
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span><span>Downloads</span><span>Likes</span><span /></div>
-        {models.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} onToggle={() => toggleExpanded(model.id)} />)}
+        {displayedModels.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} onToggle={() => toggleExpanded(model.id)} />)}
+        {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}
     </div>
   )

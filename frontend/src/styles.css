@@ -165,6 +165,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .catalog-filters input { width: 16px; height: 16px; flex: 0 0 auto; margin: 0; accent-color: var(--accent); }
 .catalog-filters label > span { min-width: 0; display: grid; gap: 1px; }.catalog-filters strong { color: var(--text-primary); font-size: 12px; }.catalog-filters small { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .catalog-model-list { overflow: hidden; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 10px; }
+.catalog-load-more { display: flex; justify-content: center; padding: 14px; background: var(--bg-subtle); border-top: 1px solid var(--border-subtle); }
 .catalog-model-header, .catalog-model-summary { display: grid; grid-template-columns: minmax(230px, 1.5fr) 105px 135px 110px 90px 24px; align-items: center; gap: 14px; }
 .catalog-model-header { min-height: 38px; padding: 9px 14px; color: var(--text-secondary); background: var(--bg-subtle); border-bottom: 1px solid var(--border-subtle); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
 .catalog-model-row { border-bottom: 1px solid var(--border-subtle); }.catalog-model-row:last-child { border-bottom: 0; }

@@ -66,13 +66,16 @@ export function ModelsPage() {
   }
 
   const updateRuntime = (runtime: RuntimeKind) => {
-    setForm((current) => ({
-      ...current,
-      runtime,
-      settings: runtime === 'llama.cpp'
-        ? { context_length: 8192, parallel_slots: 1, gpu_layers: 99 }
-        : { context_length: 8192, tensor_parallel_size: 1 },
-    }))
+    setForm((current) => {
+      const contextLength = current.settings.context_length ?? defaults.data?.default_context_length ?? 8192
+      return {
+        ...current,
+        runtime,
+        settings: runtime === 'llama.cpp'
+          ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
+          : { context_length: contextLength, tensor_parallel_size: 1 },
+      }
+    })
   }
 
   return (

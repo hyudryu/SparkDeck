@@ -59,6 +59,19 @@ async function requestWithFallback<T>(primary: string, fallback: string, init?: 
   }
 }
 
+function normalizeLegacyLog(message: string): LogEntry {
+  const match = message.match(/^(?:(\d{2}:\d{2}:\d{2})\s+)?(debug|info|warn(?:ing)?|error|critical|fatal)\b\s*(.*)$/i)
+  if (!match) return { level: 'info', message }
+
+  const [, timestamp, rawLevel, remainder] = match
+  const level = rawLevel.toLowerCase() === 'warn' ? 'warning' : rawLevel.toLowerCase()
+  return {
+    ...(timestamp ? { timestamp } : {}),
+    level,
+    message: remainder || message,
+  }
+}
+
 interface WireDeployment {
   id: string
   alias: string
@@ -264,7 +277,7 @@ export const api = {
       )
       if (Array.isArray(data)) return data
       if (data.entries) return data.entries
-      return (data.logs ?? []).map((message) => ({ message }))
+      return (data.logs ?? []).map(normalizeLegacyLog)
     },
   },
 }

@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
 import { BenchmarksPage } from './pages/BenchmarksPage'
 import { ChatPage } from './pages/ChatPage'
+import { ClusterPage } from './pages/ClusterPage'
 import { ComparePage } from './pages/ComparePage'
 import { DashboardPage } from './pages/DashboardPage'
 import { ExplorePage } from './pages/ExplorePage'
@@ -18,6 +19,7 @@ export default function App() {
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/explore" element={<ExplorePage />} />
         <Route path="/models" element={<ModelsPage />} />
+        <Route path="/cluster" element={<ClusterPage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/compare" element={<ComparePage />} />
         <Route path="/benchmarks" element={<BenchmarksPage />} />

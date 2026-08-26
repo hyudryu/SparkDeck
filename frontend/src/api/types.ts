@@ -101,6 +101,22 @@ export interface NodeInventoryItem extends NodeSummary {
   selectable?: boolean
 }
 
+export interface OnboardingStatus {
+  role: 'controller' | 'worker'
+  node: { id: string; name: string; port: number; access_urls: string[] }
+  controller_url?: string
+  controller_reachable: boolean
+  join_code?: string
+  instructions?: string[]
+}
+
+export interface JoinClusterInput {
+  controller_url: string
+  join_code: string
+  advertise_url: string
+  name: string
+}
+
 export interface BenchmarkSample {
   id: string
   deployment_id?: string

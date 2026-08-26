@@ -2,8 +2,13 @@ import { HardDrive, RotateCw } from 'lucide-react'
 import type { NodeInventoryItem } from '../api/types'
 import { Button } from './ui'
 
-export function selectedNodeLabel(nodes: NodeInventoryItem[], selectedIds: string[]) {
-  const names = selectedIds.map((id) => nodes.find((node) => node.id === id)?.name ?? (id === 'local' ? 'This device' : id))
+function nodeLabel(node: NodeInventoryItem | undefined, id: string, localLabel?: string) {
+  if (id === 'local' && localLabel) return localLabel
+  return node?.name ?? (id === 'local' ? 'This device' : id)
+}
+
+export function selectedNodeLabel(nodes: NodeInventoryItem[], selectedIds: string[], localLabel?: string) {
+  const names = selectedIds.map((id) => nodeLabel(nodes.find((node) => node.id === id), id, localLabel))
   if (names.length === 0) return 'No target selected'
   return names.join(', ')
 }
@@ -22,6 +27,9 @@ export function NodeSelector({
   multiple = true,
   disabled = false,
   requiredIds = [],
+  allowedIds,
+  localLabel,
+  primaryId,
 }: {
   nodes: NodeInventoryItem[]
   selectedIds: string[]
@@ -32,6 +40,9 @@ export function NodeSelector({
   multiple?: boolean
   disabled?: boolean
   requiredIds?: string[]
+  allowedIds?: string[]
+  localLabel?: string
+  primaryId?: string
 }) {
   const toggle = (nodeId: string) => {
     if (!multiple) {
@@ -53,9 +64,12 @@ export function NodeSelector({
         <div className="node-options">
           {nodes.length === 0 && <p className="node-selector-state">No nodes are available.</p>}
           {nodes.map((node) => {
-            const ready = isNodeSelectable(node)
-            const status = node.online === false ? 'Offline' : node.docker_ready === false ? 'Docker unavailable' : node.selectable === false ? 'Unavailable' : 'Ready'
+            const allowed = !allowedIds || allowedIds.includes(node.id)
+            const ready = isNodeSelectable(node) && allowed
+            const status = !allowed ? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? 'Docker unavailable' : node.selectable === false ? 'Unavailable' : 'Ready'
             const required = requiredIds.includes(node.id)
+            const displayName = nodeLabel(node, node.id, localLabel)
+            const primary = primaryId === node.id
             return (
               <label className={`node-option${selectedIds.includes(node.id) ? ' selected' : ''}${!ready ? ' unavailable' : ''}`} key={node.id}>
                 <input
@@ -66,13 +80,13 @@ export function NodeSelector({
                   onChange={() => toggle(node.id)}
                 />
                 <HardDrive size={17} aria-hidden="true" />
-                <span><strong>{node.name}</strong><small>{node.local ? 'This device' : node.id} · {status}{required ? ' · Required' : ''}</small></span>
+                <span><strong>{displayName}</strong><small>{displayName !== node.name ? `${node.name} · ` : node.local ? 'This device · ' : `${node.id} · `}{status}{required ? ' · Required' : ''}{primary ? ' · Primary' : ''}</small></span>
               </label>
             )
           })}
         </div>
       )}
-      <p className="node-selection-summary" aria-live="polite"><strong>{selectedIds.length === 1 ? 'Target' : 'Targets'}:</strong> {selectedNodeLabel(nodes, selectedIds)}</p>
+      <p className="node-selection-summary" aria-live="polite"><strong>{selectedIds.length === 1 ? 'Target' : 'Targets'}:</strong> {selectedNodeLabel(nodes, selectedIds, localLabel)}{primaryId && selectedIds.length > 1 ? ` · Primary: ${selectedNodeLabel(nodes, [primaryId], localLabel)}` : ''}</p>
     </fieldset>
   )
 }

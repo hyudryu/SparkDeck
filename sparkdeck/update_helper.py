@@ -25,11 +25,59 @@ def write_state(path: Path, **changes) -> None:
     os.replace(temporary, path)
 
 
-def run(root: Path, *args: str, timeout: int = 600) -> str:
-    result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=timeout, check=False)
+def run(root: Path, *args: str, timeout: int = 600, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=timeout, check=False, env=env)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip()[:500] or f"{' '.join(args)} failed")
     return result.stdout.strip()
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _prepare_frontend_bundle(staged_dist: Path, live_dist: Path) -> Path:
+    """Copy a verified build beside the live bundle for a same-filesystem swap."""
+    swap_root = Path(tempfile.mkdtemp(prefix=".sparkdeck-dist-swap-", dir=live_dist.parent))
+    try:
+        shutil.copytree(staged_dist, swap_root / "next")
+    except Exception:
+        shutil.rmtree(swap_root, ignore_errors=True)
+        raise
+    return swap_root
+
+
+def _publish_frontend_bundle(live_dist: Path, swap_root: Path) -> bool:
+    replacement = swap_root / "next"
+    previous = swap_root / "previous"
+    if not (replacement / "index.html").is_file():
+        raise RuntimeError("Staged frontend bundle has no index.html")
+    had_previous = live_dist.exists() or live_dist.is_symlink()
+    if had_previous:
+        os.replace(live_dist, previous)
+    try:
+        os.replace(replacement, live_dist)
+        # run.sh uses index.html as its freshness marker. Publishing happens
+        # after the target checkout, so refresh it to prevent a second build.
+        os.utime(live_dist / "index.html", None)
+    except Exception:
+        _remove_path(live_dist)
+        if had_previous:
+            os.replace(previous, live_dist)
+        raise
+    return had_previous
+
+
+def _restore_frontend_bundle(live_dist: Path, swap_root: Path, had_previous: bool) -> None:
+    _remove_path(live_dist)
+    if had_previous:
+        previous = swap_root / "previous"
+        if not previous.exists() and not previous.is_symlink():
+            raise RuntimeError("Previous frontend bundle is unavailable for rollback")
+        os.replace(previous, live_dist)
 
 
 def install_revision(root: Path, revision: str) -> str:
@@ -68,6 +116,9 @@ def wait_for_revision(revision: str, timeout: int = 90) -> bool:
 def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
     time.sleep(1.0)  # Let the accepting HTTP response leave the process first.
     stage_dir: Path | None = None
+    frontend_swap: Path | None = None
+    frontend_published = False
+    had_previous_frontend = False
     previous_revision: str | None = None
     applied = False
     try:
@@ -95,12 +146,20 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
         if (stage_dir / "frontend" / "package-lock.json").exists():
             run(stage_dir, "npm", "--prefix", "frontend", "ci", "--ignore-scripts")
-            run(stage_dir, "npm", "--prefix", "frontend", "run", "build")
+            build_environment = os.environ.copy()
+            build_environment["SPARKDECK_VERSION"] = tag
+            run(stage_dir, "npm", "--prefix", "frontend", "run", "build", env=build_environment)
+            frontend_swap = _prepare_frontend_bundle(
+                stage_dir / "frontend" / "dist", root / "frontend" / "dist",
+            )
         run(root, "git", "worktree", "remove", "--force", str(stage_dir))
         shutil.rmtree(stage_dir, ignore_errors=True)
         stage_dir = None
         install_revision(root, revision)
         applied = True
+        if frontend_swap:
+            had_previous_frontend = _publish_frontend_bundle(root / "frontend" / "dist", frontend_swap)
+            frontend_published = True
         write_state(state_path, phase="restarting", message="Release installed; restarting SparkDeck")
         run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
         if not wait_for_revision(revision):
@@ -111,6 +170,10 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
             try:
                 write_state(state_path, phase="rolling_back", error=str(exc)[:500], message="Health check failed; restoring the previous release")
                 run(root, "git", "checkout", "--detach", previous_revision)
+                if frontend_published and frontend_swap:
+                    _restore_frontend_bundle(
+                        root / "frontend" / "dist", frontend_swap, had_previous_frontend,
+                    )
                 run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
                 if not wait_for_revision(previous_revision):
                     raise RuntimeError("previous release did not become healthy")
@@ -127,6 +190,8 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         if stage_dir:
             subprocess.run(["git", "worktree", "remove", "--force", str(stage_dir)], cwd=root, capture_output=True)
             shutil.rmtree(stage_dir, ignore_errors=True)
+        if frontend_swap:
+            shutil.rmtree(frontend_swap, ignore_errors=True)
 
 
 def main() -> None:

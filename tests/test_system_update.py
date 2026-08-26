@@ -99,6 +99,30 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["phase"], "failed")
         self.service.start_local.assert_not_awaited()
 
+    async def test_interrupted_local_helper_becomes_retryable(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "staging", "target_revision": "b" * 40,
+            "helper_pid": 999999, "boot_id": "old-boot",
+        })
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = self.service.agent_status()
+        self.assertEqual(status["phase"], "failed")
+        self.assertIn("interrupted", status["error"].lower())
+
+    async def test_interrupted_controller_job_is_unblocked(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "stale", "active": True, "phase": "preflight",
+            "target_revision": "b" * 40, "nodes": [],
+        })
+        self.manager.http.get.return_value = response(404, {"message": "Not Found"})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._run", return_value=""):
+            overview = await self.service.overview()
+        self.assertFalse(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "failed")
+
 
 class UpdateHelperTests(unittest.TestCase):
     @patch("sparkdeck.update_helper.run")

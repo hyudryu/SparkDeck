@@ -92,7 +92,7 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         update_source = stage_dir / "sparkdeck" / "updater.py"
         if not update_source.exists() or CAPABILITY not in update_source.read_text(encoding="utf-8"):
             raise RuntimeError("Selected release does not support safe cluster updates")
-        run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", "server.py", "sparkdeck")
+        run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
         if (stage_dir / "frontend" / "package-lock.json").exists():
             run(stage_dir, "npm", "--prefix", "frontend", "ci", "--ignore-scripts")
             run(stage_dir, "npm", "--prefix", "frontend", "run", "build")

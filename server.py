@@ -396,8 +396,12 @@ async def agent_inference_health(req: Request):
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
+    container_name = body.pop("_sparkdeck_container_name", None)
+    deployment_id = body.pop("_sparkdeck_deployment_id", None)
     try:
-        container = await manager._resolve_vllm_target(model)
+        container = await manager._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         return {"ready": await manager._check_ready(container), "model": model}
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -412,14 +416,22 @@ async def agent_inference(endpoint: str, req: Request):
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
+    container_name = body.pop("_sparkdeck_container_name", None)
+    deployment_id = body.pop("_sparkdeck_deployment_id", None)
     cancel = asyncio.Event()
     watcher = _watch_disconnect(req, cancel)
     stream = False
     try:
         result = (
-            await manager._vllm_chat(model, body, bool(body.get("stream")), cancel)
+            await manager._vllm_chat(
+                model, body, bool(body.get("stream")), cancel,
+                container_name=container_name, deployment_id=deployment_id,
+            )
             if endpoint == "chat/completions"
-            else await manager._vllm_completions(model, body, bool(body.get("stream")), cancel)
+            else await manager._vllm_completions(
+                model, body, bool(body.get("stream")), cancel,
+                container_name=container_name, deployment_id=deployment_id,
+            )
         )
         stream = hasattr(result, "__aiter__")
     except ClientAbort:

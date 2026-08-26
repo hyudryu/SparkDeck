@@ -1848,9 +1848,17 @@ class Manager:
         node_id = primary.get("node_id")
         if node_id == LOCAL_NODE_ID:
             return (
-                await self._vllm_chat(model, body, bool(body.get("stream")), cancel)
+                await self._vllm_chat(
+                    model, body, bool(body.get("stream")), cancel,
+                    container_name=primary.get("container_name"),
+                    deployment_id=deployment_id,
+                )
                 if endpoint == "chat/completions"
-                else await self._vllm_completions(model, body, bool(body.get("stream")), cancel)
+                else await self._vllm_completions(
+                    model, body, bool(body.get("stream")), cancel,
+                    container_name=primary.get("container_name"),
+                    deployment_id=deployment_id,
+                )
             )
         if not node_id:
             raise LookupError("cluster primary node is unavailable")
@@ -1864,11 +1872,16 @@ class Manager:
         }
         admission = await self._acquire_inference_slot(admission_container, model, cancel)
         path = f"/api/agent/inference/{endpoint}"
+        remote_body = {
+            **body,
+            "_sparkdeck_container_name": primary.get("container_name"),
+            "_sparkdeck_deployment_id": deployment_id,
+        }
         if body.get("stream"):
             try:
                 response = await self._await_or_cancel(
                     self.node_registry.open_stream(
-                        node_id, "POST", path, json_body=body, timeout=600,
+                        node_id, "POST", path, json_body=remote_body, timeout=600,
                     ),
                     cancel,
                 )
@@ -1894,7 +1907,7 @@ class Manager:
         try:
             return await self._await_or_cancel(
                 self.node_registry.request(
-                    node_id, "POST", path, json_body=body, timeout=600,
+                    node_id, "POST", path, json_body=remote_body, timeout=600,
                 ),
                 cancel,
             )
@@ -1906,11 +1919,18 @@ class Manager:
         _, primary = self._cluster_primary_member(deployment_id)
         node_id = primary.get("node_id")
         if node_id == LOCAL_NODE_ID:
-            container = await self._resolve_vllm_target(model)
+            container = await self._resolve_vllm_target(
+                model, container_name=primary.get("container_name"),
+                deployment_id=deployment_id,
+            )
             return await self._check_ready(container)
         result = await self.node_registry.request(
             node_id, "POST", "/api/agent/inference/health",
-            json_body={"model": model}, timeout=10,
+            json_body={
+                "model": model,
+                "_sparkdeck_container_name": primary.get("container_name"),
+                "_sparkdeck_deployment_id": deployment_id,
+            }, timeout=10,
         )
         return bool((result or {}).get("ready"))
 
@@ -4499,6 +4519,9 @@ class Manager:
         model: str,
         cancel: asyncio.Event | None,
         container: dict | None = None,
+        *,
+        container_name: str | None = None,
+        deployment_id: str | None = None,
     ) -> tuple[dict, str | None]:
         """Acquire admission and re-resolve runtime state before forwarding.
 
@@ -4507,12 +4530,17 @@ class Manager:
         if the admission identity or limit changed, release the old grant and
         queue against the new target instead.
         """
-        current = container or await self._resolve_vllm_target(model)
+        current = container or await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         while True:
             key = current.get("stats_key") or model
             admission = await self._acquire_inference_slot(current, key, cancel)
             try:
-                fresh = await self._resolve_vllm_target(model)
+                fresh = await self._resolve_vllm_target(
+                    model, container_name=container_name,
+                    deployment_id=deployment_id,
+                )
             except BaseException:
                 self._release_inference_slot(admission)
                 raise
@@ -8101,9 +8129,13 @@ class Manager:
         return await self._vllm_completions(model, body, stream, cancel)
 
     async def _vllm_chat(self, model: str, body: dict, stream: bool,
-                         cancel: asyncio.Event | None = None):
+                         cancel: asyncio.Event | None = None, *,
+                         container_name: str | None = None,
+                         deployment_id: str | None = None):
         """Route /v1/chat/completions to the appropriate vLLM container."""
-        container = await self._resolve_vllm_target(model)
+        container = await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         port = container["port"]
         key = container.get("stats_key") or model
         body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8111,11 +8143,13 @@ class Manager:
         if stream:
             return self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
+                container_name=container_name, deployment_id=deployment_id,
             )
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
-                model, cancel, container
+                model, cancel, container, container_name=container_name,
+                deployment_id=deployment_id,
             )
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8136,9 +8170,13 @@ class Manager:
                 self._release_inference_slot(admission)
 
     async def _vllm_completions(self, model: str, body: dict, stream: bool,
-                                cancel: asyncio.Event | None = None):
+                                cancel: asyncio.Event | None = None, *,
+                                container_name: str | None = None,
+                                deployment_id: str | None = None):
         """Route /v1/completions to the appropriate vLLM container."""
-        container = await self._resolve_vllm_target(model)
+        container = await self._resolve_vllm_target(
+            model, container_name=container_name, deployment_id=deployment_id,
+        )
         port = container["port"]
         key = container.get("stats_key") or model
         body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8146,11 +8184,13 @@ class Manager:
         if stream:
             return self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
+                container_name=container_name, deployment_id=deployment_id,
             )
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
-                model, cancel, container
+                model, cancel, container, container_name=container_name,
+                deployment_id=deployment_id,
             )
             key = container.get("stats_key") or model
             body = {**body, "model": self._upstream_model_id(container, model)}
@@ -8350,7 +8390,10 @@ class Manager:
             pass
         return out
 
-    async def _resolve_vllm_target(self, model: str) -> dict:
+    async def _resolve_vllm_target(
+        self, model: str, *, container_name: str | None = None,
+        deployment_id: str | None = None,
+    ) -> dict:
         """Find or start a running vLLM container for the given model."""
         # A capacity-triggered replacement briefly has no container for the
         # intended deployment. Do not let ensure_loaded wake an older stopped
@@ -8361,6 +8404,13 @@ class Manager:
         containers = await self.list_containers()
         # Look for a running container with this model
         for c in containers:
+            if container_name and c.get("name") != container_name:
+                continue
+            if (
+                deployment_id and c.get("deployment_id")
+                and c.get("deployment_id") != deployment_id
+            ):
+                continue
             if model in self._container_model_ids(c) and c["status"] == "running":
                 ready = await self._check_ready(c)
                 if ready:
@@ -8368,7 +8418,10 @@ class Manager:
                     return c
         # Try ensure_loaded to start/swap the container
         try:
-            return await self.ensure_loaded(model)
+            return await self.ensure_loaded(
+                model, container_name=container_name,
+                deployment_id=deployment_id,
+            )
         except LookupError:
             raise LookupError(f"No managed container found for model '{model}'")
         except TimeoutError:
@@ -8377,7 +8430,9 @@ class Manager:
     async def _vllm_stream(self, url: str, body: dict, key: str,
                            cancel: asyncio.Event | None = None,
                            container: dict | None = None,
-                           requested_model: str | None = None):
+                           requested_model: str | None = None, *,
+                           container_name: str | None = None,
+                           deployment_id: str | None = None):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
         as generation begins, allowing the live prefill rate to be populated
@@ -8411,7 +8466,8 @@ class Manager:
                     else "/v1/completions"
                 )
                 container, admission = await self._admit_vllm_target(
-                    requested_model, cancel, container
+                    requested_model, cancel, container,
+                    container_name=container_name, deployment_id=deployment_id,
                 )
                 key = container.get("stats_key") or requested_model
                 body["model"] = self._upstream_model_id(
@@ -8576,7 +8632,9 @@ class Manager:
                     if container is None or requested_model is None:
                         return
                     container, admission = await self._admit_vllm_target(
-                        requested_model, cancel, container
+                        requested_model, cancel, container,
+                        container_name=container_name,
+                        deployment_id=deployment_id,
                     )
                     key = container.get("stats_key") or requested_model
                     body["model"] = self._upstream_model_id(
@@ -9621,7 +9679,11 @@ class Manager:
             return self._container_summary(c)
         return await asyncio.to_thread(_do)
 
-    async def ensure_loaded(self, model: str, timeout: float = 300.0) -> dict:
+    async def ensure_loaded(
+        self, model: str, timeout: float = 300.0, *,
+        container_name: str | None = None,
+        deployment_id: str | None = None,
+    ) -> dict:
         """
         Make a managed container for `model` running and ready. Uses VRAM-aware
         eviction: if the GPU is full (total − used − 10 GB buffer < estimated
@@ -9634,6 +9696,13 @@ class Manager:
             containers = await self.list_containers()
             target = None
             for c in containers:
+                if container_name and c.get("name") != container_name:
+                    continue
+                if (
+                    deployment_id and c.get("deployment_id")
+                    and c.get("deployment_id") != deployment_id
+                ):
+                    continue
                 if not c.get("managed") or model not in self._container_model_ids(c):
                     continue
                 # Prefer a running candidate if there are duplicates.

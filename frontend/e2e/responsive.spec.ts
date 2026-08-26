@@ -16,7 +16,7 @@ test.beforeEach(async ({ page }) => {
     else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
     else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured' }
-    else if (path.endsWith('/images')) body = []
+    else if (path.endsWith('/images')) body = { items: [{ id: 'sha256:remote', repository: 'org/remote-runtime', tag: 'v1', size: 2147483648, runtimes: ['vllm'], node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }] }
     else if (path.endsWith('/logs') || path.endsWith('/server-logs')) body = { entries: [] }
     else if (path.endsWith('/settings')) {
       if (route.request().method() === 'PUT') settings = route.request().postDataJSON() as typeof settings
@@ -77,6 +77,8 @@ test('uses a drawer on mobile and a persistent sidebar on desktop', async ({ pag
 
 test('offers node targets for image pulls and deployments', async ({ page }) => {
   await page.goto('http://127.0.0.1:4173/images')
+  await expect(page.getByLabel('Available on Studio Spark')).toContainText('Studio Spark')
+  await expect(page.getByLabel('Available on Studio Spark')).not.toContainText('This device')
   await expect(page.getByRole('checkbox', { name: /This device/ })).toBeChecked()
   await page.getByRole('checkbox', { name: /Studio Spark/ }).check()
   await expect(page.getByText('Targets:').locator('..')).toContainText('This device, Studio Spark')

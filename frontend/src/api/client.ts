@@ -276,6 +276,7 @@ export const api = {
           tag: item.tag ?? (separator > 0 ? firstTag?.slice(separator + 1) : undefined),
           created_at: item.created_at ?? item.created,
           runtimes: item.runtimes ?? (item.is_vllm ? ['vllm'] : undefined),
+          node_ids: item.node_ids ?? item.selected_nodes?.map((node) => node.id) ?? ['local'],
         }
       })
     },

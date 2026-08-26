@@ -83,6 +83,18 @@ describe('API client adapters', () => {
     })
   })
 
+  it('preserves remote image availability and defaults legacy inventory to local', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [
+      { id: 'remote-image', repository: 'org/remote', node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] },
+      { id: 'legacy-image', repository: 'org/legacy' },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(api.images.list()).resolves.toEqual([
+      expect.objectContaining({ id: 'remote-image', node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }),
+      expect.objectContaining({ id: 'legacy-image', node_ids: ['local'] }),
+    ])
+  })
+
   it('parses legacy log levels and defaults unstructured lines to info', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response('{}', { status: 404, statusText: 'Not Found', headers: { 'Content-Type': 'application/json' } }))

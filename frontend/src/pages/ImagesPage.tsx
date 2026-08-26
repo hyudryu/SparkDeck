@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Box, Download, HardDrive, Trash2 } from 'lucide-react'
+import { Box, Download, HardDrive, Server, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
+import type { ContainerImage, NodeInventoryItem } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -9,6 +10,16 @@ function formatBytes(bytes?: number) {
   if (bytes === undefined) return 'Size unavailable'
   const gb = bytes / 1024 / 1024 / 1024
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(bytes / 1024 / 1024).toFixed(0)} MB`
+}
+
+export function imageNodeLabels(image: ContainerImage, nodes: NodeInventoryItem[], localLabel: string) {
+  const ids = image.node_ids ?? image.selected_nodes?.map((node) => node.id) ?? ['local']
+  return ids.map((id) => {
+    if (id === 'local') return localLabel
+    return image.selected_nodes?.find((node) => node.id === id)?.name
+      ?? nodes.find((node) => node.id === id)?.name
+      ?? id
+  })
 }
 
 export function ImagesPage() {
@@ -65,7 +76,7 @@ export function ImagesPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="Runtime storage" title="Images" description="Manage the container images used by local model servers." />
+      <PageHeader eyebrow="Runtime storage" title="Images" description="See and manage the container images available across your SparkDeck nodes." />
       <Panel className="pull-panel">
         <div><h2>Pull an image</h2><p>Use a trusted registry reference with an explicit version or digest.</p></div>
         <form onSubmit={(event) => void pull(event)}>
@@ -76,13 +87,24 @@ export function ImagesPage() {
         {error && <p className="inline-error" role="alert">{error}</p>}
         {notice && <p className="inline-success" role="status">{notice}</p>}
       </Panel>
-      <div className="section-heading"><div><h2>Local images</h2><p>Images currently available to managed deployments.</p></div></div>
+      <div className="section-heading"><div><h2>Cluster images</h2><p>Image availability is tracked per node.</p></div></div>
       {resource.loading && <LoadingState label="Loading images" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {!resource.loading && !resource.error && resource.data?.length === 0 && <EmptyState title="No runtime images" description="Pull an image above or launch a managed model to get started." />}
-      {resource.data && resource.data.length > 0 && <div className="image-list">{resource.data.map((item) => <Panel className="image-row" key={item.id}>
-        <span className="image-icon"><Box size={18} /></span><div className="image-main"><h2>{item.repository ?? item.id}{item.tag ? `:${item.tag}` : ''}</h2><p className="mono">{item.id}</p><div className="runtime-row">{item.runtimes?.map((runtime) => <RuntimeMark runtime={runtime} key={runtime} />)}</div></div><div className="image-size"><HardDrive size={14} /> {formatBytes(item.size)}</div><Button variant="tertiary" disabled={item.in_use} title={item.in_use ? 'Stop deployments using this image first' : 'Remove image'} aria-label={`Remove ${item.repository ?? item.id}`} onClick={() => void api.images.remove(item.id).then(resource.reload)}><Trash2 size={16} /></Button>
-      </Panel>)}</div>}
+      {resource.data && resource.data.length > 0 && <div className="image-list">{resource.data.map((item) => {
+        const nodeLabels = imageNodeLabels(item, nodes.data ?? [], localLabel)
+        return <Panel className="image-row" key={item.id}>
+          <span className="image-icon"><Box size={18} /></span>
+          <div className="image-main">
+            <h2>{item.repository ?? item.id}{item.tag ? `:${item.tag}` : ''}</h2>
+            <p className="mono">{item.id}</p>
+            <div className="runtime-row">{item.runtimes?.map((runtime) => <RuntimeMark runtime={runtime} key={runtime} />)}</div>
+            <div className="image-nodes" aria-label={`Available on ${nodeLabels.join(', ')}`}><span className="availability-label"><Server size={13} /> Available on</span>{nodeLabels.map((label, index) => <span className="image-node-chip" key={`${item.id}-${item.node_ids?.[index] ?? label}`}>{label}</span>)}</div>
+          </div>
+          <div className="image-size"><HardDrive size={14} /> {formatBytes(item.size)}</div>
+          <Button variant="tertiary" disabled={item.in_use} title={item.in_use ? 'Stop deployments using this image first' : 'Remove image'} aria-label={`Remove ${item.repository ?? item.id}`} onClick={() => void api.images.remove(item.id).then(resource.reload)}><Trash2 size={16} /></Button>
+        </Panel>
+      })}</div>}
     </div>
   )
 }

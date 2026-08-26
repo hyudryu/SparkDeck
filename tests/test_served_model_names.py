@@ -126,6 +126,20 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in result["data"]], [BACKING_MODEL])
 
+    async def test_models_endpoint_reads_adopted_llama_server_directly(self) -> None:
+        manager = Manager.__new__(Manager)
+        manager.get_state = mock.AsyncMock(return_value={
+            "containers": [], "sparkrun_targets": {},
+        })
+        manager._unsloth_loaded_model = mock.AsyncMock(return_value="org/native-gguf")
+
+        result = await manager.proxy_models()
+
+        self.assertEqual(result["data"], [{
+            "id": "org/native-gguf", "object": "model",
+            "owned_by": "llama.cpp", "type": "local",
+        }])
+
     async def test_backing_model_request_is_rewritten_for_vllm(self) -> None:
         manager = Manager.__new__(Manager)
         container = self.container_summary()

@@ -14,6 +14,7 @@ import type {
   LogEntry,
   SyncStatus,
   NodeInventoryItem,
+  RenameNodeInput,
   ImagePullResult,
   OnboardingStatus,
   JoinClusterInput,
@@ -196,6 +197,10 @@ export const api = {
       const data = await request<{ items: NodeInventoryItem[] }>('/api/v1/nodes', { signal })
       return data.items
     },
+    rename: (id: string, input: RenameNodeInput) => request<NodeInventoryItem>(`/api/v1/nodes/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
   },
   onboarding: {
     get: (signal?: AbortSignal) => request<OnboardingStatus>('/api/v1/onboarding', { signal }),

@@ -1,20 +1,36 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Check, Clipboard, Link2, Network, Server, ShieldCheck, Unlink } from 'lucide-react'
+import { Check, Clipboard, Edit3, Link2, Network, RefreshCw, Server, ShieldCheck, Unlink } from 'lucide-react'
 import { api } from '../api/client'
-import type { JoinClusterInput } from '../api/types'
+import type { JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 
 const emptyJoin: JoinClusterInput = { controller_url: '', join_code: '', advertise_url: '', name: '' }
+const maximumNodeNameLength = 80
+
+function isCurrentEntryNode(node: NodeInventoryItem, onboarding: OnboardingStatus) {
+  return onboarding.role === 'controller' ? node.local === true : node.id === onboarding.node.id
+}
+
+function nodeRole(node: NodeInventoryItem, onboarding: OnboardingStatus) {
+  if (isCurrentEntryNode(node, onboarding)) return `${onboarding.role === 'controller' ? 'Controller' : 'Worker node'} · Current entry node`
+  if (node.id === 'local' || node.local) return 'Controller'
+  return 'Worker node'
+}
 
 export function ClusterPage() {
   const resource = useResource((signal) => api.onboarding.get(signal))
+  const nodes = useResource((signal) => api.nodes.list(signal))
   const [joining, setJoining] = useState(false)
   const [form, setForm] = useState(emptyJoin)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [copied, setCopied] = useState<string>()
+  const [editingNodeId, setEditingNodeId] = useState<string>()
+  const [nodeName, setNodeName] = useState('')
+  const [renamingNodeId, setRenamingNodeId] = useState<string>()
+  const [nodeError, setNodeError] = useState<{ id: string; message: string }>()
 
   useEffect(() => {
     if (!resource.data) return
@@ -74,6 +90,54 @@ export function ClusterPage() {
     }
   }
 
+  const editNode = (node: NodeInventoryItem) => {
+    setEditingNodeId(node.id)
+    setNodeName(node.name)
+    setNodeError(undefined)
+    setNotice(undefined)
+  }
+
+  const cancelNodeEdit = () => {
+    setEditingNodeId(undefined)
+    setNodeName('')
+    setNodeError(undefined)
+  }
+
+  const renameNode = async (event: FormEvent, node: NodeInventoryItem) => {
+    event.preventDefault()
+    const name = nodeName.trim()
+    if (!name) {
+      setNodeError({ id: node.id, message: 'Enter a node name.' })
+      return
+    }
+    if (name.length > maximumNodeNameLength) {
+      setNodeError({ id: node.id, message: `Node names must be ${maximumNodeNameLength} characters or fewer.` })
+      return
+    }
+    if (name === node.name) {
+      cancelNodeEdit()
+      return
+    }
+
+    setRenamingNodeId(node.id)
+    setNodeError(undefined)
+    setNotice(undefined)
+    try {
+      const updated = await api.nodes.rename(node.id, { name })
+      nodes.setData((nodes.data ?? []).map((item) => item.id === node.id ? { ...item, ...updated } : item))
+      if (resource.data && isCurrentEntryNode(node, resource.data)) {
+        resource.setData({ ...resource.data, node: { ...resource.data.node, name: updated.name } })
+      }
+      setEditingNodeId(undefined)
+      setNodeName('')
+      setNotice(`Renamed ${node.name} to ${updated.name}.`)
+    } catch (reason) {
+      setNodeError({ id: node.id, message: reason instanceof Error ? reason.message : 'Could not rename this node' })
+    } finally {
+      setRenamingNodeId(undefined)
+    }
+  }
+
   const status = resource.data
   const controller = status?.role === 'controller'
 
@@ -90,6 +154,38 @@ export function ClusterPage() {
           <Panel><span className="panel-icon"><Server size={17} /></span><div><small>This node</small><strong>{status.node.name}</strong><p>{status.node.id}</p></div></Panel>
           <Panel><span className="panel-icon"><Network size={17} /></span><div><small>Role</small><strong>{controller ? 'Controller' : 'Worker node'}</strong><Status status={controller || status.controller_reachable ? 'running' : 'error'}>{controller ? 'Ready for nodes' : status.controller_reachable ? 'Controller online' : 'Controller unreachable'}</Status></div></Panel>
           <Panel><span className="panel-icon"><Link2 size={17} /></span><div><small>Local port</small><strong>{status.node.port}</strong><p>{status.node.access_urls.length} access {status.node.access_urls.length === 1 ? 'URL' : 'URLs'}</p></div></Panel>
+        </section>
+
+        <section className="node-management" aria-labelledby="node-management-title">
+          <div className="section-heading">
+            <div><h2 id="node-management-title">Cluster nodes</h2><p>Use a recognizable name for each system. Runtime status and node identity are unchanged.</p></div>
+            <Button type="button" variant="tertiary" onClick={nodes.reload} disabled={nodes.loading || Boolean(renamingNodeId)}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
+          </div>
+          {nodes.loading && <LoadingState label="Loading cluster nodes" />}
+          {nodes.error && <ErrorState message={nodes.error} onRetry={nodes.reload} />}
+          {!nodes.loading && !nodes.error && nodes.data?.length === 0 && <p className="node-management-empty">No cluster nodes are registered yet.</p>}
+          {!nodes.loading && !nodes.error && Boolean(nodes.data?.length) && <ul className="node-management-list">
+            {nodes.data?.map((node) => {
+              const editing = editingNodeId === node.id
+              const saving = renamingNodeId === node.id
+              return <li key={node.id} className="node-management-row" aria-busy={saving}>
+                <div className="node-management-icon" aria-hidden="true"><Server size={17} /></div>
+                <div className="node-management-identity">
+                  <strong>{node.name}</strong>
+                  <span className="mono">{node.id}</span>
+                </div>
+                <div className="node-management-state">
+                  <span>{nodeRole(node, status)}</span>
+                  <Status status={node.online === false ? 'error' : 'running'}>{node.online === false ? 'Offline' : 'Online'}</Status>
+                </div>
+                {editing ? <form className="node-rename-form" noValidate onSubmit={(event) => void renameNode(event, node)}>
+                  <label className="field"><span className="sr-only">New name for {node.name}</span><input autoFocus required maxLength={maximumNodeNameLength} value={nodeName} disabled={saving} onChange={(event) => setNodeName(event.target.value)} aria-invalid={nodeError?.id === node.id} aria-describedby={nodeError?.id === node.id ? `node-error-${node.id}` : undefined} /></label>
+                  <div className="node-rename-actions"><Button type="submit" variant="primary" disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button><Button type="button" disabled={saving} onClick={cancelNodeEdit}>Cancel</Button></div>
+                  {nodeError?.id === node.id && <p id={`node-error-${node.id}`} className="inline-error" role="alert">{nodeError.message}</p>}
+                </form> : <Button type="button" className="node-edit-button" onClick={() => editNode(node)} disabled={Boolean(renamingNodeId)} aria-label={`Edit name for ${node.name}`}><Edit3 size={15} aria-hidden="true" /> Edit</Button>}
+              </li>
+            })}
+          </ul>}
         </section>
 
         <Panel className="tailnet-note">

@@ -174,14 +174,6 @@ TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
 
-# Marker shown on Ollama-sourced model ids in /v1/models. Clients must
-# echo this prefix back in the `model` field of /v1 requests for the
-# proxy to route them to Ollama instead of a vLLM container.
-# Marker shown on Ollama-sourced model ids in /v1/models. Clients must
-# echo this prefix back in the `model` field of /v1 requests for the
-# proxy to route them to Ollama instead of a vLLM container.
-OLLAMA_PREFIX = "CLOUD "
-
 FAN_MODE_DEFAULTS = {
     "curve": {
         "curve_points": [[40.0, 0.0], [60.0, 30.0], [75.0, 60.0], [90.0, 100.0]],
@@ -790,6 +782,51 @@ class Manager:
             self._record_remote_temperature_sample(node)
         return nodes
 
+    @staticmethod
+    def public_target_node(node: dict) -> dict:
+        """Return the stable, credential-free node selector contract."""
+        return {
+            key: node.get(key)
+            for key in (
+                "id", "name", "local", "enabled", "status", "online",
+                "last_seen", "protocol_version", "docker_ready", "fabric_ready",
+                "stats", "disk",
+            )
+        } | {
+            "selectable": bool(
+                node.get("enabled", True)
+                and node.get("online")
+                and node.get("docker_ready")
+            )
+        }
+
+    async def selected_cluster_nodes(self, node_ids: list[str] | None = None) -> list[dict]:
+        """Resolve and validate an ordered target set, defaulting to this node."""
+        raw = node_ids or [LOCAL_NODE_ID]
+        if not raw or any(not isinstance(value, str) or not value.strip() for value in raw):
+            raise ValueError("node_ids must contain non-empty node IDs")
+        requested = list(dict.fromkeys(value.strip() for value in raw))
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        missing = [node_id for node_id in requested if node_id not in available]
+        if missing:
+            raise ValueError(f"unknown cluster node(s): {', '.join(missing)}")
+        offline = [
+            node_id for node_id in requested
+            if not available[node_id].get("enabled", True)
+            or not available[node_id].get("online")
+        ]
+        if offline:
+            names = [available[node_id].get("name", node_id) for node_id in offline]
+            raise ValueError(f"cluster node(s) are offline: {', '.join(names)}")
+        docker_unready = [
+            node_id for node_id in requested
+            if not available[node_id].get("docker_ready")
+        ]
+        if docker_unready:
+            names = [available[node_id].get("name", node_id) for node_id in docker_unready]
+            raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
+        return [available[node_id] for node_id in requested]
+
     async def pair_node(self, body: dict) -> dict:
         return await self.node_registry.pair_remote(
             body.get("agent_url") or "",
@@ -897,7 +934,14 @@ class Manager:
             return []
         try:
             value = json.loads(self.deployments_path.read_text(encoding="utf-8"))
-            return value if isinstance(value, list) else []
+            if not isinstance(value, list):
+                return []
+            for deployment in value:
+                engine = str(deployment.get("engine") or "vllm")
+                if engine not in {"vllm", "sglang"}:
+                    deployment["status"] = "error"
+                    deployment["error"] = f"unsupported persisted runtime: {engine}"
+            return value
         except Exception:
             return []
 
@@ -1745,11 +1789,13 @@ class Manager:
 
     async def create_deployment(self, body: dict) -> dict:
         body = dict(body)
+        engine = str(body.get("engine") or "vllm")
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         controls = body.get("launch_controls")
         if controls is not None:
             if not isinstance(controls, dict):
                 raise ValueError("launch_controls must be an object")
-            engine = body.get("engine") or "vllm"
             controls = {
                 **self._deployment_launch_controls(
                     self._deployment_launch_settings(body)
@@ -1790,7 +1836,6 @@ class Manager:
             names = [available[n].get("name", n) for n in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
 
-        engine = body.get("engine", "vllm")
         model = body.get("model") or ""
         if not model:
             raise ValueError("model is required")
@@ -1990,7 +2035,12 @@ class Manager:
         self._save_deployments()
         if errors:
             raise RuntimeError(deployment["error"])
-        return deployment
+        return {
+            **deployment,
+            "selected_nodes": [
+                self.public_target_node(available[node_id]) for node_id in node_ids
+            ],
+        }
 
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
@@ -2058,6 +2108,11 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
+        if (
+            action == "start"
+            and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
+        ):
+            raise ValueError("persisted deployment runtime is no longer supported")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
 
@@ -3234,6 +3289,9 @@ class Manager:
         if self.settings_path.exists():
             try:
                 data = json.loads(self.settings_path.read_text())
+                # Removed runtimes must not remain advertised through a stale
+                # persisted setting after upgrade.
+                data.pop("ollama_base_url", None)
                 return {**DEFAULT_SETTINGS, **data}
             except Exception:
                 pass
@@ -3264,8 +3322,7 @@ class Manager:
     # ---------- lifetime token stats ----------
     # Counters are keyed by model id plus a variant tag (quant/dtype) so the
     # same repo served at Q4 vs bf16 gets separate entries, e.g.
-    # "Qwen/Qwen3-8B [awq]" vs "Qwen/Qwen3-8B [bfloat16]". Ollama models keep
-    # their "CLOUD " prefix. Persisted on every update so they survive
+    # "Qwen/Qwen3-8B [awq]" vs "Qwen/Qwen3-8B [bfloat16]". Persisted on every update so they survive
     # restarts; only the reset endpoint clears them.
     #
     # Speed fields (gen_tokens / gen_time_s) are retained for compatibility.
@@ -5051,7 +5108,15 @@ class Manager:
     def _load_recipes(self) -> list[dict]:
         if self.recipes_path.exists():
             try:
-                return json.loads(self.recipes_path.read_text())
+                value = json.loads(self.recipes_path.read_text())
+                if not isinstance(value, list):
+                    return []
+                for recipe in value:
+                    engine = str(recipe.get("engine") or "vllm")
+                    if engine not in {"vllm", "sglang"}:
+                        recipe["supported"] = False
+                        recipe["error"] = f"unsupported persisted runtime: {engine}"
+                return value
             except Exception:
                 pass
         return []
@@ -5090,6 +5155,8 @@ class Manager:
     ) -> dict:
         if not model:
             raise ValueError("model is required")
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")
@@ -6016,6 +6083,8 @@ class Manager:
         hf_token: str | None = None,
         sparkdeck_deployment_id: str | None = None,
     ) -> dict:
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("engine must be vllm or sglang")
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
@@ -6677,117 +6746,55 @@ class Manager:
                 break
             yield f"data: {json.dumps(item)}\n\n"
 
-    # ---------- ollama ----------
-    def _ollama_url(self, path: str) -> str:
-        base = (self.settings.get("ollama_base_url") or "").rstrip("/")
-        return f"{base}{path}"
-
-    async def list_ollama_models(self) -> dict:
-        """
-        Returns {"reachable": bool, "models": [...], "error": str|None}.
-        Always succeeds — when Ollama is unreachable, returns reachable=False
-        so the UI can show that state instead of crashing the state poll.
-        """
-        try:
-            r = await self.http.get(self._ollama_url("/api/tags"), timeout=3)
-            r.raise_for_status()
-            data = r.json() or {}
-            models = []
-            for m in data.get("models") or []:
-                models.append({
-                    "name": m.get("name") or m.get("model"),
-                    "size": m.get("size"),
-                    "modified_at": m.get("modified_at"),
-                    "details": m.get("details") or {},
-                })
-            return {"reachable": True, "models": models, "error": None}
-        except Exception as e:
-            return {"reachable": False, "models": [], "error": str(e)}
-
-    async def _ollama_loaded_models(self) -> list[str]:
-        """
-        Names of models currently loaded in Ollama's VRAM, via GET /api/ps.
-        Returns [] when Ollama is unreachable (so eviction is a no-op).
-        """
-        try:
-            r = await self.http.get(self._ollama_url("/api/ps"), timeout=3)
-            if r.status_code != 200:
-                return []
-            return [
-                m.get("name") or m.get("model")
-                for m in (r.json().get("models") or [])
-                if m.get("name") or m.get("model")
-            ]
-        except Exception:
-            return []
-
-    async def _stop_ollama_models(self) -> list[str]:
-        """
-        Release Ollama's VRAM by running `ollama stop <name>` for each
-        currently loaded model. Uses the CLI (per project preference) so
-        it works regardless of which API version is installed. Best-effort:
-        logs failures but never raises, so a missing CLI or unreachable
-        daemon doesn't block the calling action.
-        """
-        names = await self._ollama_loaded_models()
-        stopped: list[str] = []
-        for name in names:
+    async def pull_image_result(self, image: str) -> dict:
+        """Pull one image locally and collapse Docker progress into a result."""
+        error = None
+        async for event in self.pull_image_stream(image):
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ollama", "stop", name,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    stopped.append(name)
-                else:
-                    err = (stderr or b"").decode("utf-8", errors="replace").strip()
-                    print(f"[evict] ollama stop {name} failed (rc={proc.returncode}): {err[:200]}")
-            except FileNotFoundError:
-                # `ollama` binary not on PATH — fall back to keep_alive:0 via API.
-                try:
-                    await self.http.post(
-                        self._ollama_url("/api/generate"),
-                        json={"model": name, "keep_alive": 0}, timeout=15,
-                    )
-                    stopped.append(name)
-                except Exception as e:
-                    print(f"[evict] ollama keep_alive:0 fallback failed for {name}: {e}")
-            except Exception as e:
-                print(f"[evict] ollama stop {name} raised: {e}")
-        return stopped
+                payload = json.loads(event.removeprefix("data:").strip())
+            except (AttributeError, json.JSONDecodeError):
+                continue
+            if payload.get("error"):
+                error = str(payload["error"])
+        if error:
+            raise RuntimeError(error)
+        return {"ok": True, "image": image}
 
-    async def pull_ollama_model_stream(self, name: str):
-        """SSE-style generator. Re-emits Ollama's pull progress as `data: {...}`."""
-        url = self._ollama_url("/api/pull")
-        try:
-            async with self.http.stream(
-                "POST", url, json={"name": name, "stream": True}, timeout=None,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode("utf-8", errors="replace")
-                    yield f"data: {json.dumps({'error': f'HTTP {r.status_code}: {detail[:300]}'})}\n\n"
-                    return
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        obj = {"status": line}
-                    yield f"data: {json.dumps(obj)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        yield "data: {\"done\": true}\n\n"
+    async def pull_image_on_nodes(
+        self, image: str, node_ids: list[str] | None = None,
+    ) -> dict:
+        """Pull a Docker image concurrently on exactly the selected nodes."""
+        image = str(image or "").strip()
+        if not image:
+            raise ValueError("image is required")
+        selected = await self.selected_cluster_nodes(node_ids)
 
-    async def delete_ollama_model(self, name: str) -> dict:
-        url = self._ollama_url("/api/delete")
-        # Ollama's delete uses DELETE with a JSON body; httpx supports content on DELETE.
-        r = await self.http.request("DELETE", url, json={"name": name}, timeout=10)
-        if r.status_code not in (200, 204):
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-        return {"ok": True}
+        async def pull(node: dict) -> dict:
+            if node["id"] == LOCAL_NODE_ID:
+                return await self.pull_image_result(image)
+            return await self.node_registry.request(
+                node["id"], "POST", "/api/agent/images/pull",
+                json_body={"image": image}, timeout=1800,
+            )
+
+        pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)
+        results = []
+        for node, result in zip(selected, pulled):
+            item = {
+                "node_id": node["id"],
+                "node_name": node.get("name") or node["id"],
+                "ok": not isinstance(result, Exception),
+            }
+            if isinstance(result, Exception):
+                item["error"] = str(result)
+            results.append(item)
+        return {
+            "ok": all(item["ok"] for item in results),
+            "image": image,
+            "node_ids": [node["id"] for node in selected],
+            "selected_nodes": [self.public_target_node(node) for node in selected],
+            "results": results,
+        }
 
     # ---------- llama-server (GGUF) launcher ----------
     # The controller scans the local HF cache for GGUF repos and launches
@@ -7737,8 +7744,8 @@ class Manager:
 
         async with self._llama_lock:
             # A different model may be running — stop it first. Then free the
-            # GPU: stop vLLM containers and Ollama models. protect="unsloth"
-            # so the eviction doesn't stop the server we just want to swap.
+            # Release other managed GPU runtimes while retaining the
+            # llama-server process this path is about to replace.
             await self._stop_llama_server()
             if tensor_parallel:
                 await self._stop_running_cluster_deployments()
@@ -7906,7 +7913,7 @@ class Manager:
 
     # ---------- /v1 proxy ----------
     async def proxy_models(self) -> dict:
-        """Return OpenAI-compatible /v1/models combining vLLM, Ollama, and Unsloth models."""
+        """Return OpenAI-compatible models from supported local runtimes."""
         data = await self.get_state()
         models = []
         for c in data.get("containers", []):
@@ -7919,15 +7926,6 @@ class Manager:
                     "object": "model",
                     "owned_by": "vllm",
                     "type": "local",
-                })
-        for m in (data.get("ollama", {}).get("models") or []):
-            name = m.get("name") or m.get("model")
-            if name:
-                models.append({
-                    "id": f"{OLLAMA_PREFIX}{name}",
-                    "object": "model",
-                    "owned_by": "ollama",
-                    "type": "cloud",
                 })
         # llama-server runs one model at a time; surface the loaded one so
         # OpenAI clients can target it. The controller forwards requests to
@@ -7954,14 +7952,9 @@ class Manager:
         return {"object": "list", "data": models}
 
     async def proxy_chat_completions(self, body: dict, cancel: asyncio.Event | None = None):
-        """Route /v1/chat/completions to the right backend (Ollama, Unsloth, or vLLM)."""
+        """Route /v1/chat/completions to a supported managed backend."""
         model = body.get("model", "")
-        is_ollama = model.startswith(OLLAMA_PREFIX)
         stream = body.get("stream", False)
-
-        if is_ollama:
-            ollama_model = model[len(OLLAMA_PREFIX):]
-            return await self._ollama_chat(ollama_model, body, stream, cancel)
 
         loaded_unsloth = await self._unsloth_loaded_model()
         if loaded_unsloth and loaded_unsloth == model:
@@ -7970,180 +7963,15 @@ class Manager:
         return await self._vllm_chat(model, body, stream, cancel)
 
     async def proxy_completions(self, body: dict, cancel: asyncio.Event | None = None):
-        """Route /v1/completions to the right backend (Ollama, Unsloth, or vLLM)."""
+        """Route /v1/completions to a supported managed backend."""
         model = body.get("model", "")
-        is_ollama = model.startswith(OLLAMA_PREFIX)
         stream = body.get("stream", False)
-
-        if is_ollama:
-            ollama_model = model[len(OLLAMA_PREFIX):]
-            # Convert completions format to chat format for Ollama
-            prompt = body.get("prompt", "")
-            messages = [{"role": "user", "content": prompt}]
-            if body.get("system"):
-                messages.insert(0, {"role": "system", "content": body["system"]})
-            chat_body = {**body, "messages": messages}
-            del chat_body["prompt"]
-            if "system" in chat_body:
-                del chat_body["system"]
-            return await self._ollama_chat(ollama_model, chat_body, stream, cancel)
 
         loaded_unsloth = await self._unsloth_loaded_model()
         if loaded_unsloth and loaded_unsloth == model:
             return await self._unsloth_completions(model, body, stream, cancel)
 
         return await self._vllm_completions(model, body, stream, cancel)
-
-    async def _ollama_chat(self, model: str, body: dict, stream: bool,
-                           cancel: asyncio.Event | None = None):
-        """Call Ollama's /api/chat and convert response to OpenAI format."""
-        url = self._ollama_url("/api/chat")
-        messages = body.get("messages", [])
-        ollama_body = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
-        # Map OpenAI params to Ollama params
-        options = {}
-        if "temperature" in body:
-            options["temperature"] = body["temperature"]
-        if "top_p" in body:
-            options["top_p"] = body["top_p"]
-        if "max_tokens" in body:
-            options["num_predict"] = body["max_tokens"]
-        if "seed" in body:
-            options["seed"] = body["seed"]
-        if options:
-            ollama_body["options"] = options
-
-        if stream:
-            return self._ollama_chat_stream(url, ollama_body, model, cancel)
-        else:
-            rid = self._track_start(f"{OLLAMA_PREFIX}{model}")
-            try:
-                r = await self._await_or_cancel(
-                    self.http.post(url, json=ollama_body, timeout=600), cancel
-                )
-                if r.status_code != 200:
-                    detail = r.text[:500]
-                    raise httpx.HTTPStatusError(
-                        f"HTTP {r.status_code}: {detail}",
-                        request=r.request,
-                        response=r,
-                    )
-                data = r.json()
-                self._record_tokens(
-                    f"{OLLAMA_PREFIX}{model}",
-                    data.get("prompt_eval_count") or 0,
-                    data.get("eval_count") or 0,
-                    # eval_duration is Ollama's decode-only time, in nanoseconds.
-                    (data.get("eval_duration") or 0) / 1e9 or None,
-                    pp_time_s=(
-                        (data.get("prompt_eval_duration") or 0) / 1e9 or None
-                    ),
-                )
-                content = (data.get("message") or {}).get("content", "")
-                return self._ollama_to_openai_response(model, content, data)
-            finally:
-                self._track_end(rid)
-
-    async def _ollama_chat_stream(self, url: str, body: dict, model: str,
-                                  cancel: asyncio.Event | None = None):
-        """Stream Ollama /api/chat NDJSON as OpenAI SSE."""
-        import time as _time
-        created = int(_time.time())
-        rid = self._track_start(f"{OLLAMA_PREFIX}{model}", streaming=True)
-        try:
-            async with self.http.stream(
-                "POST", url, json=body, timeout=None,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode("utf-8", errors="replace")
-                    yield f"data: {json.dumps({'error': {'message': f'HTTP {r.status_code}: {detail[:300]}', 'type': 'upstream_error', 'code': r.status_code}})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                async for line in self._aiter_lines_cancellable(r, cancel):
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    done = obj.get("done", False)
-                    delta = (obj.get("message") or {}).get("content", "")
-                    if delta:
-                        self._track_output(rid, time.monotonic(), "output")
-                        chunk = {
-                            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": f"{OLLAMA_PREFIX}{model}",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": delta},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    if done:
-                        prompt_tokens = obj.get("prompt_eval_count") or 0
-                        pp_time_s = (
-                            (obj.get("prompt_eval_duration") or 0) / 1e9
-                            or None
-                        )
-                        if pp_time_s:
-                            self._track_prompt_processing(
-                                rid, int(prompt_tokens), pp_time_s
-                            )
-                        self._record_tokens(
-                            f"{OLLAMA_PREFIX}{model}",
-                            prompt_tokens,
-                            obj.get("eval_count") or 0,
-                            (obj.get("eval_duration") or 0) / 1e9 or None,
-                            pp_time_s=pp_time_s,
-                        )
-                        chunk = {
-                            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": f"{OLLAMA_PREFIX}{model}",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-        except Exception as e:
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error'}})}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            self._track_end(rid)
-
-    def _ollama_to_openai_response(self, model: str, content: str, ollama_data: dict) -> dict:
-        """Convert Ollama /api/chat response to OpenAI /v1/chat/completions format."""
-        import time as _time
-        prompt_eval = ollama_data.get("prompt_eval_count") or 0
-        eval_count = ollama_data.get("eval_count") or 0
-        return {
-            "id": f"chatcmpl-ollama-{_time.time_ns():x}",
-            "object": "chat.completion",
-            "created": int(_time.time()),
-            "model": f"{OLLAMA_PREFIX}{model}",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_eval,
-                "completion_tokens": eval_count,
-                "total_tokens": prompt_eval + eval_count,
-            },
-        }
 
     async def _vllm_chat(self, model: str, body: dict, stream: bool,
                          cancel: asyncio.Event | None = None):
@@ -9884,6 +9712,11 @@ class Manager:
                 if deployment["served_models"]
                 else deployment.get("model")
             )
+            deployment["selected_nodes"] = [
+                self.public_target_node(node_by_id[node_id])
+                for node_id in deployment.get("node_ids") or []
+                if node_id in node_by_id
+            ]
             deployment["stats_key"] = (
                 primary_container.get("stats_key")
                 if primary_container

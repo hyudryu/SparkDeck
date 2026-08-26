@@ -168,6 +168,30 @@ async def _require_managed_agent_container(name: str, request: Request) -> None:
         raise HTTPException(404, "managed container not found")
 
 
+def _requested_node_ids(body: dict) -> list[str] | None:
+    """Accept the versioned list field plus a scalar compatibility field."""
+    raw = body.get("node_ids")
+    scalar = body.get("node_id")
+    if raw is None and scalar is None:
+        return None
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise ValueError("node_ids must be an array")
+    if scalar is not None:
+        raw = [*raw, scalar]
+    result = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("node_ids must contain non-empty node IDs")
+        node_id = value.strip()
+        if node_id not in result:
+            result.append(node_id)
+    if not result:
+        raise ValueError("node_ids must contain at least one node ID")
+    return result
+
+
 # ---------- aggregate state ----------
 @app.get("/api/state")
 async def get_state():
@@ -291,6 +315,19 @@ async def agent_temperature_history(req: Request):
 async def agent_stats(req: Request):
     _require_agent(req)
     return await manager.get_stats()
+
+
+@app.post("/api/agent/images/pull")
+async def agent_pull_image(req: Request):
+    _require_agent(req)
+    body = await req.json()
+    image = str(body.get("image") or "").strip()
+    if not image:
+        raise HTTPException(400, "image is required")
+    try:
+        return await manager.pull_image_result(image)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)[:500]) from exc
 
 
 @app.get("/api/agent/token-usage")
@@ -762,6 +799,22 @@ async def pull_image(req: Request):
     image = body.get("image")
     if not image:
         raise HTTPException(400, "image is required")
+    try:
+        node_ids = _requested_node_ids(body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if node_ids is not None:
+        async def selected_pull_events():
+            try:
+                result = await manager.pull_image_on_nodes(image, node_ids)
+                yield f"data: {json.dumps(result)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            yield "data: {\"done\": true}\n\n"
+        return StreamingResponse(
+            selected_pull_events(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     return StreamingResponse(
         manager.pull_image_stream(image),
         media_type="text/event-stream",
@@ -808,22 +861,24 @@ async def v1_list_images():
     return {"items": await _v1_image_items()}
 
 
+@app.get("/api/v1/nodes")
+async def v1_nodes():
+    nodes = await manager.cluster_nodes()
+    return {"items": [manager.public_target_node(node) for node in nodes]}
+
+
 @app.post("/api/v1/images/pull", status_code=201)
 async def v1_pull_image(req: Request):
-    image = str((await req.json()).get("image") or "").strip()
+    body = await req.json()
+    image = str(body.get("image") or "").strip()
     if not image:
         raise HTTPException(400, "image is required")
-    error = None
-    async for event in manager.pull_image_stream(image):
-        try:
-            payload = json.loads(event.removeprefix("data:").strip())
-        except json.JSONDecodeError:
-            continue
-        if payload.get("error"):
-            error = str(payload["error"])
-    if error:
-        raise HTTPException(502, error[:500])
-    return {"ok": True, "image": image}
+    try:
+        return await manager.pull_image_on_nodes(image, _requested_node_ids(body))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, str(exc)[:500]) from exc
 
 
 @app.delete("/api/v1/images/{image_id:path}")

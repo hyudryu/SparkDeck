@@ -92,11 +92,18 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "members": [{"rank": 0, "node_id": "worker-1", "container_name": "new-rank"}],
         }
         self.manager.get_state = AsyncMock(return_value={"deployments": [replacement]})
+        self.manager.list_containers.return_value = [{
+            "name": "new-rank", "model": "org/model", "runtime": "vllm",
+            "managed": True, "status": "running", "port": 8010,
+            "phase": {"phase": "ready"},
+        }]
 
         listed = await self.service.deployments()
         models = await self.service.models()
 
         self.assertEqual(listed[0]["status"], "running")
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["id"], "record-1")
         self.assertEqual(models["data"][0]["id"], "friendly")
         stored = self.service.store.deployment("record-1", include_private=True)
         self.assertEqual(stored["settings"]["manager_deployment_id"], "new-manager")

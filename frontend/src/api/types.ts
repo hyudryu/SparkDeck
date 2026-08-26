@@ -152,3 +152,48 @@ export interface ChatCompletionResponse {
   choices: Array<{ message: ChatMessage }>
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
 }
+
+export interface GpuStats {
+  index: number
+  name?: string
+  util?: number | null
+  mem_used_mib?: number | null
+  mem_total_mib?: number | null
+  temp?: number | null
+  error?: string
+}
+
+export interface ActiveRequestStats {
+  connections: number
+  queued?: number
+  decoded_tokens?: number
+  thinking_tok_s?: number
+  output_tok_s?: number
+  pp_tok_s?: number | null
+  admission_limit?: number
+}
+
+export interface SystemStats {
+  cpu_pct?: number | null
+  cpu_temp_c?: number | null
+  mem?: { total?: number; used?: number; available?: number; pct?: number }
+  gpus?: GpuStats[]
+  active_requests?: Record<string, ActiveRequestStats>
+  ts?: number
+}
+
+export interface AdmissionStats {
+  model?: string
+  limit?: number | null
+  effective_limit?: number
+  running: number
+  queued: number
+  oldest_wait_seconds?: number
+}
+
+export interface DashboardData {
+  stats: SystemStats
+  admission: Record<string, AdmissionStats>
+  deployments: Deployment[]
+  sync: SyncStatus
+}

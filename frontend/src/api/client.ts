@@ -8,6 +8,9 @@ import type {
   ContainerImage,
   CreateDeploymentInput,
   Deployment,
+  DashboardData,
+  SystemStats,
+  AdmissionStats,
   LogEntry,
   SyncStatus,
 } from './types'
@@ -110,6 +113,17 @@ function queryString(values: Record<string, string | number | undefined>) {
 }
 
 export const api = {
+  dashboard: {
+    load: async (signal?: AbortSignal): Promise<DashboardData> => {
+      const [stats, admission, deployments, sync] = await Promise.all([
+        request<SystemStats>('/api/stats', { signal }),
+        request<Record<string, AdmissionStats>>('/api/inference-queue', { signal }),
+        api.deployments.list(signal),
+        api.benchmarks.syncStatus(signal),
+      ])
+      return { stats, admission, deployments, sync }
+    },
+  },
   catalog: {
     search: (query = '', runtime?: string, cursor?: string, signal?: AbortSignal) =>
       request<CatalogResponse>(

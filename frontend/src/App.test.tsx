@@ -9,7 +9,7 @@ const fetchMock = vi.fn<typeof fetch>()
 
 beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
-  fetchMock.mockResolvedValue(new Response(JSON.stringify({ items: [], total: 0 }), {
+  fetchMock.mockImplementation(async () => new Response(JSON.stringify({ items: [], total: 0 }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   }))
@@ -26,10 +26,11 @@ describe('SparkDeck application shell', () => {
     render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
-    for (const label of ['Explore', 'Models', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Settings', 'Logs']) {
+    for (const label of ['Dashboard', 'Explore', 'Models', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
-    expect(await screen.findByText('No models found')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'System overview' })).toBeInTheDocument()
   })
 
   it('opens and closes the mobile navigation with accessible controls', async () => {

@@ -316,6 +316,14 @@ class OnboardingService:
             identity = identity_response.json()
         except httpx.HTTPError as exc:
             raise ValueError(f"controller is unreachable: {exc}") from exc
+        controller_node_id = str(identity.get("node", {}).get("id") or "")
+        if not controller_node_id:
+            raise ValueError("controller identity is missing a node ID")
+        if controller_node_id == self.manager.agent_credentials.node_id:
+            raise ValueError(
+                "controller_url resolves to this node; enter another controller's "
+                "Tailscale URL"
+            )
         if identity.get("role") != "controller":
             raise ValueError("controller_url points to a worker")
         if int(identity.get("node", {}).get("protocol_version") or 0) != AGENT_PROTOCOL_VERSION:
@@ -340,9 +348,6 @@ class OnboardingService:
             or not joined.get("forward_token")
         ):
             raise ValueError("controller returned an invalid join response")
-        controller_node_id = str(identity.get("node", {}).get("id") or "")
-        if not controller_node_id:
-            raise ValueError("controller identity is missing a node ID")
         self.assignment.save({
             "controller_url": controller_url,
             "forward_token": str(joined["forward_token"]),

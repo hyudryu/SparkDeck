@@ -1,6 +1,10 @@
 import unittest
+from unittest.mock import AsyncMock, Mock
 
-from sparkdeck.runtimes import LlamaCppAdapter, RuntimeRegistry, SglangAdapter, VllmAdapter
+from sparkdeck.runtimes import (
+    LlamaCppAdapter, RuntimeRegistry, SglangAdapter, VllmAdapter,
+    launch_managed_container,
+)
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -9,7 +13,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_vllm_launch_settings(self):
         command = VllmAdapter().launch_spec("org/model", {
-            "tensor_parallel_size": 2, "max_model_len": 8192, "quantization": "awq",
+            "tensor_parallel_size": 2, "context_length": 8192, "quantization": "awq",
         }).command
         self.assertEqual(command[:3], ["vllm", "serve", "org/model"])
         self.assertIn("--tensor-parallel-size", command)
@@ -17,7 +21,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_llama_server_uses_real_gguf_flags(self):
         spec = LlamaCppAdapter().launch_spec("model.gguf", {
-            "context_size": 4096, "parallel": 4, "gpu_layers": 99,
+            "context_length": 4096, "parallel_slots": 4, "gpu_layers": 99,
             "split_mode": "layer", "tensor_split": "1,1",
         })
         self.assertIn("--model", spec.command)
@@ -35,3 +39,16 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertIn("--dp-size", command)
         self.assertIn("--context-length", command)
 
+
+class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sglang_bridge_keeps_data_parallelism_and_quantization(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(return_value={"name": "sparkdeck-model", "port": 8000})
+
+        await launch_managed_container(
+            manager, SglangAdapter(), "dep-1", "model", "org/model",
+            {"data_parallel_size": 2, "quantization": "fp8"},
+        )
+
+        extra = manager.create_container.await_args.kwargs["extra_args"]
+        self.assertEqual(extra, ["--dp-size", "2", "--quantization", "fp8"])

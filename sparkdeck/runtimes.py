@@ -58,8 +58,9 @@ class VllmAdapter(RuntimeAdapter):
             command += ["--gpu-memory-utilization", str(settings["gpu_memory_utilization"])]
         if settings.get("tensor_parallel_size"):
             command += ["--tensor-parallel-size", str(settings["tensor_parallel_size"])]
-        if settings.get("max_model_len"):
-            command += ["--max-model-len", str(settings["max_model_len"])]
+        max_model_len = settings.get("max_model_len") or settings.get("context_length")
+        if max_model_len:
+            command += ["--max-model-len", str(max_model_len)]
         if settings.get("quantization"):
             command += ["--quantization", str(settings["quantization"])]
         command.extend(str(item) for item in settings.get("extra_args", []))
@@ -78,10 +79,12 @@ class LlamaCppAdapter(RuntimeAdapter):
             volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
             artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]
-        if settings.get("context_size"):
-            command += ["--ctx-size", str(settings["context_size"])]
-        if settings.get("parallel"):
-            command += ["--parallel", str(settings["parallel"])]
+        context_size = settings.get("context_size") or settings.get("context_length")
+        if context_size:
+            command += ["--ctx-size", str(context_size)]
+        parallel = settings.get("parallel") or settings.get("parallel_slots")
+        if parallel:
+            command += ["--parallel", str(parallel)]
         if settings.get("gpu_layers") is not None:
             command += ["--n-gpu-layers", str(settings["gpu_layers"])]
         if settings.get("split_mode"):
@@ -145,7 +148,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             extra: list[str] = []
             for key, flag in (
                 ("tensor_parallel_size", "--tensor-parallel-size"),
-                ("max_model_len", "--max-model-len"),
+                ("context_length", "--max-model-len"),
                 ("quantization", "--quantization"),
             ):
                 if settings.get(key) is not None:
@@ -158,12 +161,18 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
                 name=safe_container_name(alias, deployment_id),
                 sparkdeck_deployment_id=deployment_id,
             )
+        extra = []
+        if settings.get("data_parallel_size") is not None:
+            extra += ["--dp-size", str(settings["data_parallel_size"])]
+        if settings.get("quantization") is not None:
+            extra += ["--quantization", str(settings["quantization"])]
+        extra.extend(str(item) for item in settings.get("extra_args", []))
         return await manager.create_container(
             model=model, engine="sglang", sg_image=settings.get("image"),
             sg_tp_size=settings.get("tensor_parallel_size"),
             sg_context_length=settings.get("context_length"),
             sg_mem_fraction=settings.get("mem_fraction_static"),
-            extra_args=[str(item) for item in settings.get("extra_args", [])],
+            extra_args=extra,
             name=safe_container_name(alias, deployment_id),
             sparkdeck_deployment_id=deployment_id,
         )

@@ -54,3 +54,27 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.retry_outbox(), 1)
         self.assertEqual(self.store.mark_outbox_synced(["sample-2"]), 1)
         self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
+
+    def test_consent_queues_existing_samples_and_upload_drops_artifact(self):
+        sample = BenchmarkSample(
+            id="sample-private", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id="private-deployment",
+            model=ModelIdentity(
+                "org/model", revision="abc123", artifact="C:/private/model.gguf"
+            ),
+            runtime=RuntimeKind.LLAMA_CPP, runtime_version="registry.local/team/image:1",
+            hardware={"architecture": "aarch64"}, configuration={"context_length": 4096},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=300, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.add_benchmark(sample, queue=False)
+        self.store.set_community_consent(True)
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.retry_outbox()
+        rows = self.store.outbox_batch()
+        self.assertEqual([item["id"] for item in rows], ["sample-private"])
+        self.assertNotIn("artifact", rows[0]["model"])
+        self.assertIsNone(rows[0]["runtime_version"])
+        local, _ = self.store.benchmarks()
+        self.assertEqual(local[0]["sync_state"], "pending")

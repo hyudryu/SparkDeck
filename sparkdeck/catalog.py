@@ -44,14 +44,16 @@ class HuggingFaceCatalog:
         formats = []
         if any(tag.casefold() == "gguf" for tag in tags):
             formats.append("gguf")
-        runtime_compatibility = {
-            "vllm": "compatible" if any(tag in tags for tag in ("transformers", "safetensors")) else "unknown",
-            "llama.cpp": "compatible" if "gguf" in formats else "unknown",
-            "sglang": "compatible" if any(tag in tags for tag in ("transformers", "safetensors")) else "unknown",
-        }
+        transformer_model = any(tag in tags for tag in ("transformers", "safetensors"))
+        runtime_compatibility = [
+            {"runtime": "vllm", "supported": transformer_model},
+            {"runtime": "llama.cpp", "supported": "gguf" in formats},
+            {"runtime": "sglang", "supported": transformer_model},
+        ]
         return {
             "id": item.get("id") or item.get("modelId"),
             "author": item.get("author"),
+            "name": str(item.get("id") or item.get("modelId") or "").split("/")[-1],
             "downloads": item.get("downloads", 0),
             "likes": item.get("likes", 0),
             "pipeline_tag": item.get("pipeline_tag"),

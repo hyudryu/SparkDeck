@@ -9,12 +9,14 @@ export function BenchmarksPage() {
   const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const [syncBusy, setSyncBusy] = useState(false)
+  const [reviewingConsent, setReviewingConsent] = useState(false)
 
   const toggleSharing = async () => {
     if (!sync.data) return
     setSyncBusy(true)
     try {
       sync.setData(await api.benchmarks.setConsent(!sync.data.sharing_enabled))
+      setReviewingConsent(false)
     } finally {
       setSyncBusy(false)
     }
@@ -45,7 +47,7 @@ export function BenchmarksPage() {
           {sync.error && <p className="inline-error">{sync.error}</p>}
           {sync.data && <>
             <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? 'Sharing enabled' : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
-            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => void toggleSharing()}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
+            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
           </>}
         </Panel>
         <Panel className="privacy-panel">
@@ -83,6 +85,7 @@ export function BenchmarksPage() {
           <div role="cell" data-label="Actions"><Button variant="tertiary" aria-label={`Delete benchmark for ${sample.model_id}`} onClick={() => void remove(sample.id)}><Trash2 size={15} /></Button></div>
         </div>)}
       </div></Panel>}
+      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p>SparkDeck will queue benchmark timing, model revision, runtime, hardware class, and deployment settings for upload after you pair an account.</p><p><strong>Never included:</strong> prompts, generated text, credentials, endpoint URLs, hostnames, IP addresses, or local paths.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
     </div>
   )
 }

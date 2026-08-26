@@ -387,16 +387,7 @@ class VirtualNAS:
         destination = self._hub() / archive_name
         if destination.exists():
             raise FileExistsError("cached model already exists on target node")
-        for attempt in range(4):
-            try:
-                os.replace(extracted, destination)
-                break
-            except PermissionError:
-                # Windows file scanners can briefly retain a handle after
-                # tarfile closes. Keep the finalization atomic and bounded.
-                if os.name != "nt" or attempt == 3:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
+        os.replace(extracted, destination)
 
     def delete_model(self, model_id: str) -> dict[str, Any]:
         model_id = validate_model_id(model_id)

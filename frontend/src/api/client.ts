@@ -159,7 +159,7 @@ export const api = {
   catalog: {
     search: (query = '', runtime?: string, cursor?: string, signal?: AbortSignal) =>
       request<CatalogResponse>(
-        `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 24 })}`,
+        `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 100 })}`,
         { signal },
       ),
     model: (id: string, signal?: AbortSignal) =>

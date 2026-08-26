@@ -85,18 +85,31 @@ describe('SparkDeck application shell', () => {
 
 describe('model discovery', () => {
   it('renders the real catalog compatibility and local deployment shape', async () => {
-    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
-      items: [{
-        id: 'org/model', author: 'org', name: 'model', downloads: 1200,
-        runtime_compatibility: [{ runtime: 'vllm', supported: true }],
-        local_deployment_ids: ['dep-1'], community: null,
-      }],
-      total: 1,
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/catalog/models') ? {
+        items: [{
+          id: 'org/model', author: 'org', name: 'model', downloads: 1200,
+          parameter_count: 7_000_000_000, weight_size_bytes: 14 * 1024 ** 3,
+          runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+          local_deployment_ids: ['dep-1'], community: null,
+        }],
+        total: 1,
+      } : path.includes('/api/v1/nodes') ? { items: [{
+        id: 'local', name: 'Spark', online: true, docker_ready: true, selectable: true,
+        stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] },
+      }] } : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
-    expect(await screen.findByRole('heading', { name: 'model' })).toBeInTheDocument()
+    const user = userEvent.setup()
+    const row = await screen.findByRole('button', { name: 'Expand org/model' })
+    expect(row).toHaveTextContent('7B')
+    expect(row).toHaveTextContent('14 GB')
+    expect(screen.queryByLabelText('Compatible runtimes')).not.toBeInTheDocument()
+    await user.click(row)
     expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
     expect(screen.getByText('Local')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')

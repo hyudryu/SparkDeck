@@ -1,7 +1,8 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Box, Download, HardDrive, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark } from '../components/ui'
+import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
 
 function formatBytes(bytes?: number) {
@@ -12,18 +13,46 @@ function formatBytes(bytes?: number) {
 
 export function ImagesPage() {
   const resource = useResource((signal) => api.images.list(signal))
+  const nodes = useResource((signal) => api.nodes.list(signal))
   const [image, setImage] = useState('')
+  const [selectedNodeIds, setSelectedNodeIds] = useState(['local'])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const [notice, setNotice] = useState<string>()
+
+  useEffect(() => {
+    const inventory = nodes.data
+    if (!inventory?.length) return
+    setSelectedNodeIds((current) => {
+      const available = current.filter((id) => inventory.some((node) => node.id === id && isNodeSelectable(node)))
+      const fallback = inventory.find((node) => node.local && isNodeSelectable(node)) ?? inventory.find(isNodeSelectable)
+      return available.length ? available : fallback ? [fallback.id] : []
+    })
+  }, [nodes.data])
+
+  const selectionReady = !nodes.loading && !nodes.error && selectedNodeIds.length > 0
+    && selectedNodeIds.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
 
   const pull = async (event: FormEvent) => {
     event.preventDefault()
     if (!image.trim()) return
     setBusy(true)
     setError(undefined)
+    setNotice(undefined)
     try {
-      await api.images.pull(image.trim())
+      const requestedImage = image.trim()
+      const result = await api.images.pull(requestedImage, selectedNodeIds)
       setImage('')
+      const failures = result.results?.filter((item) => !item.ok) ?? []
+      if (!result.ok || failures.length > 0) {
+        const detail = failures.map((item) => `${item.node_name}: ${item.error ?? 'pull failed'}`).join('; ')
+        setError(detail || 'The image could not be pulled on every selected node.')
+        resource.reload()
+        return
+      }
+      const selected = result.selected_nodes?.map((node) => node.name).join(', ')
+        || selectedNodeLabel(nodes.data ?? [], result.node_ids)
+      setNotice(`Pulled ${requestedImage} on ${selected}.`)
       resource.reload()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not pull image')
@@ -37,8 +66,13 @@ export function ImagesPage() {
       <PageHeader eyebrow="Runtime storage" title="Images" description="Manage the container images used by local model servers." />
       <Panel className="pull-panel">
         <div><h2>Pull an image</h2><p>Use a trusted registry reference with an explicit version or digest.</p></div>
-        <form onSubmit={(event) => void pull(event)}><label className="field"><span>Container image</span><input value={image} onChange={(event) => setImage(event.target.value)} placeholder="vllm/vllm-openai:v0.10.0" /></label><Button type="submit" variant="primary" disabled={busy || !image.trim()}><Download size={16} /> {busy ? 'Pulling…' : 'Pull image'}</Button></form>
+        <form onSubmit={(event) => void pull(event)}>
+          <label className="field"><span>Container image</span><input value={image} onChange={(event) => setImage(event.target.value)} placeholder="vllm/vllm-openai:v0.10.0" /></label>
+          <Button type="submit" variant="primary" disabled={busy || !image.trim() || !selectionReady}><Download size={16} /> {busy ? 'Pulling…' : `Pull on ${selectedNodeIds.length} ${selectedNodeIds.length === 1 ? 'node' : 'nodes'}`}</Button>
+          <NodeSelector nodes={nodes.data ?? []} selectedIds={selectedNodeIds} onChange={setSelectedNodeIds} loading={nodes.loading} error={nodes.error} onRetry={nodes.reload} disabled={busy} />
+        </form>
         {error && <p className="inline-error" role="alert">{error}</p>}
+        {notice && <p className="inline-success" role="status">{notice}</p>}
       </Panel>
       <div className="section-heading"><div><h2>Local images</h2><p>Images currently available to managed deployments.</p></div></div>
       {resource.loading && <LoadingState label="Loading images" />}

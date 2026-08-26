@@ -50,6 +50,39 @@ describe('API client adapters', () => {
     )
   })
 
+  it('sends selected node IDs and mode when creating a deployment', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      id: 'dep-2', alias: 'distributed', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'starting', settings: {},
+      node_ids: ['local', 'spark-2'],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.deployments.create({
+      alias: 'distributed', model_id: 'org/model', runtime: 'vllm', managed: true,
+      settings: { context_length: 16384 }, node_ids: ['local', 'spark-2'], deployment_mode: 'replicated',
+    })
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({
+      node_ids: ['local', 'spark-2'],
+      deployment_mode: 'replicated',
+    }))
+  })
+
+  it('sends selected node IDs when pulling an image', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      ok: true, image: 'vllm/vllm-openai:v1', node_ids: ['local', 'spark-2'], results: [],
+    }), { status: 201, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.images.pull('vllm/vllm-openai:v1', ['local', 'spark-2'])
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      image: 'vllm/vllm-openai:v1',
+      node_ids: ['local', 'spark-2'],
+    })
+  })
+
   it('parses legacy log levels and defaults unstructured lines to info', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response('{}', { status: 404, statusText: 'Not Found', headers: { 'Content-Type': 'application/json' } }))

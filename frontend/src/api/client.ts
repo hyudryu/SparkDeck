@@ -13,6 +13,8 @@ import type {
   AdmissionStats,
   LogEntry,
   SyncStatus,
+  NodeInventoryItem,
+  ImagePullResult,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -83,6 +85,8 @@ interface WireDeployment {
   settings?: Deployment['settings']
   base_url_set?: boolean
   port?: number
+  node_ids?: string[]
+  selected_nodes?: Deployment['selected_nodes']
 }
 
 interface WireBenchmark {
@@ -113,6 +117,8 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     status: item.status,
     managed: item.kind === 'managed',
     settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    node_ids: item.node_ids,
+    selected_nodes: item.selected_nodes,
   }
 }
 
@@ -166,6 +172,8 @@ export const api = {
           api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
+          node_ids: input.managed ? input.node_ids : undefined,
+          deployment_mode: input.managed ? input.deployment_mode : undefined,
         }),
       })
       return deploymentFromWire(data)
@@ -176,6 +184,12 @@ export const api = {
       }
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
       return deploymentFromWire(data)
+    },
+  },
+  nodes: {
+    list: async (signal?: AbortSignal): Promise<NodeInventoryItem[]> => {
+      const data = await request<{ items: NodeInventoryItem[] }>('/api/v1/nodes', { signal })
+      return data.items
     },
   },
   chat: (model: string, messages: ChatMessage[], signal?: AbortSignal) =>
@@ -252,8 +266,13 @@ export const api = {
         }
       })
     },
-    pull: (image: string) =>
-      requestWithFallback<void>('/api/v1/images/pull', '/api/images/pull', { method: 'POST', body: JSON.stringify({ image }) }),
+    pull: async (image: string, nodeIds?: string[]): Promise<ImagePullResult> => {
+      const result = await requestWithFallback<ImagePullResult>('/api/v1/images/pull', '/api/images/pull', {
+        method: 'POST',
+        body: JSON.stringify({ image, node_ids: nodeIds }),
+      })
+      return result ?? { ok: true, image, node_ids: nodeIds ?? ['local'], results: [] }
+    },
     remove: (id: string) =>
       requestWithFallback<void>(`/api/v1/images/${encodeURIComponent(id)}`, `/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },

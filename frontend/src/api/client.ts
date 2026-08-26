@@ -22,6 +22,8 @@ import type {
   CreateStorageTransferInput,
   StorageState,
   StorageTransferJob,
+  ModelCacheState,
+  SavedConfiguration,
   UsageAnalysis,
   UsageSummary,
 } from './types'
@@ -143,13 +145,14 @@ function queryString(values: Record<string, string | number | undefined>) {
 export const api = {
   dashboard: {
     load: async (signal?: AbortSignal): Promise<DashboardData> => {
-      const [stats, admission, deployments, sync] = await Promise.all([
+      const [stats, admission, deployments, sync, nodes] = await Promise.all([
         request<SystemStats>('/api/stats', { signal }),
         request<Record<string, AdmissionStats>>('/api/inference-queue', { signal }),
         api.deployments.list(signal),
         api.benchmarks.syncStatus(signal),
+        api.nodes.list(signal),
       ])
-      return { stats, admission, deployments, sync }
+      return { stats, admission, deployments, sync, nodes }
     },
   },
   catalog: {
@@ -194,6 +197,16 @@ export const api = {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
       return deploymentFromWire(data)
     },
+  },
+  recipes: {
+    list: async (signal?: AbortSignal) => {
+      const data = await request<{ items: SavedConfiguration[] }>('/api/v1/recipes', { signal })
+      return data.items
+    },
+    deploy: (id: string) => request<WireDeployment>(
+      `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
+      { method: 'POST' },
+    ).then(deploymentFromWire),
   },
   nodes: {
     list: async (signal?: AbortSignal): Promise<NodeInventoryItem[]> => {
@@ -316,6 +329,9 @@ export const api = {
       `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}`,
       { method: 'DELETE' },
     ),
+  },
+  modelCache: {
+    get: (signal?: AbortSignal) => request<ModelCacheState>('/api/v1/model-cache', { signal }),
   },
   usage: {
     get: (signal?: AbortSignal) => request<UsageSummary>('/api/token-stats', { signal }),

@@ -44,7 +44,7 @@ describe('UsagePage', () => {
         { hour: '2026-08-26T11', input: 600, cached: 200, output: 250, requests: 2 },
       ])
       if (path.includes('/api/token-stats/daily')) return json([
-        { date: '2026-08-26', input: 1800, cached: 500, output: 650, requests: 6 },
+        { date: '2026-08-26', input: 1800, cached: 500, output: 650, requests: 6, models: { 'org/model': { input: 1800, cached: 500, output: 650, requests: 6 } } },
       ])
       return json(summary)
     })
@@ -52,18 +52,18 @@ describe('UsagePage', () => {
     const user = userEvent.setup()
     render(<UsagePage />)
 
-    expect(await screen.findByRole('heading', { name: 'Usage' })).toBeInTheDocument()
-    expect(await screen.findByText('Workload')).toBeInTheDocument()
-    expect(screen.getByLabelText('Lifetime totals')).toHaveTextContent('1,000')
-    expect(screen.getByLabelText('Lifetime totals')).toHaveTextContent('500')
+    expect(await screen.findByRole('heading', { name: 'Usage stats' })).toBeInTheDocument()
+    expect((await screen.findAllByText('Workload')).length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('Usage overview')).toHaveTextContent('2,250')
+    expect(screen.getByLabelText('Usage overview')).toHaveTextContent('2,450')
     expect(screen.getByRole('table', { name: 'Lifetime model usage' })).toHaveTextContent('30.0 tok/s')
     expect(screen.getByRole('table', { name: 'Lifetime model usage' })).toHaveTextContent('$1.25')
-
-    await user.click(screen.getByRole('tab', { name: 'Analysis' }))
-    expect(await screen.findByRole('img', { name: 'Hourly input and output token activity' })).toBeInTheDocument()
-    expect(screen.getByText('Aug 26')).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/hourly', expect.objectContaining({ signal: expect.any(AbortSignal) }))
-    expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/daily', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(screen.getByRole('img', { name: 'Daily token activity for the last year' })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: 'Daily model token trend for the last 30 days' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Last 7 days' }))
+    expect(screen.getByRole('img', { name: 'Daily model token trend for the last 7 days' })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/token-stats/hourly?start='), expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/token-stats/daily?start='), expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('keeps alias, erase, and lifetime reset controls connected to the old APIs', async () => {

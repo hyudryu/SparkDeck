@@ -102,6 +102,8 @@ export interface NodeInventoryItem extends NodeSummary {
   docker_ready?: boolean
   fabric_ready?: boolean
   selectable?: boolean
+  stats?: SystemStats
+  disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
 
 export interface RenameNodeInput {
@@ -246,6 +248,7 @@ export interface DashboardData {
   admission: Record<string, AdmissionStats>
   deployments: Deployment[]
   sync: SyncStatus
+  nodes: NodeInventoryItem[]
 }
 
 export interface StorageModel {
@@ -286,6 +289,31 @@ export interface StorageState {
   nodes: StorageNode[]
   jobs: StorageTransferJob[]
   instructions: string[]
+}
+
+export interface ModelCacheState {
+  nodes: StorageNode[]
+}
+
+export interface SavedConfiguration {
+  id: string
+  name: string
+  model: string
+  engine: 'vllm' | 'sglang'
+  image?: string | null
+  extra_args_count?: number
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
+  sg_tp_size?: number | null
+  sg_context_length?: number | null
+  sg_max_running_requests?: number | null
+  sg_mem_fraction?: number | null
+  sg_image?: string | null
+  deployment_mode: 'single' | 'replicated' | 'sharded'
+  node_ids: string[]
+  supported?: boolean
+  error?: string
+  launch?: { phase?: string; image?: string }
 }
 
 export interface CreateStorageTransferInput {
@@ -351,6 +379,7 @@ export interface DailyUsagePoint {
   output: number
   cached: number
   requests: number
+  models?: Record<string, UsageCounters>
 }
 
 export interface UsageAnalysis {

@@ -92,6 +92,15 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertEqual(contract["required_node_count"], 2)
         self.assertEqual(contract["tensor_parallel_size"], 2)
 
+    def test_unknown_persisted_mode_is_not_rewritten_to_single(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "deployment_mode": "shardded", "extra_args": [],
+        })
+
+        self.assertEqual(contract["deployment_mode"], "shardded")
+        self.assertFalse(contract["supported"])
+        self.assertIn("unsupported persisted deployment mode", contract["error"])
+
 
 class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -156,6 +165,86 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.json()["items"]], ["bad-tp", "valid"])
         self.assertEqual(response.json()["items"][0]["tensor_parallel_size"], 1)
+
+    async def test_unknown_deployment_mode_is_listed_as_unsupported_and_rejected(self):
+        recipe = {
+            "id": "bad-mode", "model": "org/model", "engine": "vllm",
+            "deployment_mode": "shardded", "extra_args": [],
+        }
+        valid = {"id": "valid", "model": "org/valid", "engine": "vllm", "extra_args": []}
+        create = AsyncMock()
+        selected = AsyncMock()
+        inventory = AsyncMock()
+        with (
+            patch.object(server.manager, "recipes", [recipe, valid]),
+            patch.object(server.manager, "recipe_launches", {}),
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "selected_cluster_nodes", selected),
+            patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(server.sparkdeck, "create_deployment", create),
+        ):
+            listed = await self.client.get("/api/v1/recipes")
+            launched = await self.client.post("/api/v1/recipes/bad-mode/deploy")
+
+        item = listed.json()["items"][0]
+        self.assertEqual([entry["id"] for entry in listed.json()["items"]], ["bad-mode", "valid"])
+        self.assertEqual(item["deployment_mode"], "shardded")
+        self.assertFalse(item["supported"])
+        self.assertIn("unsupported persisted deployment mode", item["error"])
+        self.assertTrue(listed.json()["items"][1]["supported"])
+        self.assertEqual(launched.status_code, 400)
+        selected.assert_not_awaited()
+        inventory.assert_not_awaited()
+        create.assert_not_awaited()
+
+    async def test_recipe_creation_rejects_unknown_deployment_mode(self):
+        response = await self.client.post("/api/recipes", json={
+            "model": "org/model", "deployment_mode": "shardded",
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("deployment_mode must be", response.text)
+
+    async def test_revision_pinned_recipe_requires_the_exact_cached_revision(self):
+        recipe = {
+            "id": "revision-b", "model": "org/model", "engine": "vllm",
+            "extra_args": ["--revision=release-b"],
+        }
+        created = {
+            "id": "dep-revision", "alias": "org/model", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/model"},
+            "status": "starting", "settings": {},
+        }
+        inventory = AsyncMock(side_effect=[[{
+            "id": "local", "models": [{
+                "model_id": "org/model", "size_bytes": 12,
+                "revisions": ["release-a", "revision-a"],
+            }],
+        }], [{
+            "id": "local", "models": [{
+                "model_id": "org/model", "size_bytes": 12,
+                "revisions": ["release-b", "revision-b"],
+            }],
+        }]])
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
+            patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(
+                server.sparkdeck, "create_deployment", AsyncMock(return_value=created),
+            ) as create,
+        ):
+            mismatch = await self.client.post("/api/v1/recipes/revision-b/deploy")
+            matched = await self.client.post("/api/v1/recipes/revision-b/deploy")
+
+        self.assertEqual(mismatch.status_code, 409)
+        self.assertIn("local", mismatch.text)
+        self.assertEqual(matched.status_code, 201)
+        create.assert_awaited_once()
+        self.assertEqual(
+            create.await_args.args[0]["settings"]["extra_args"],
+            ["--revision=release-b"],
+        )
 
     async def test_tp2_recipe_requires_two_nodes_with_cached_weights(self):
         recipe = {

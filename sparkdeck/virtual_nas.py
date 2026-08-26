@@ -253,10 +253,29 @@ class VirtualNAS:
                     size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
+            snapshot_root = repository / "snapshots"
+            snapshot_revisions = {
+                item.name for item in snapshot_root.iterdir()
+                if item.is_dir() and not item.is_symlink()
+                and any(child.is_file() for child in item.rglob("*"))
+            }
+            revisions = set(snapshot_revisions)
+            refs_root = repository / "refs"
+            if refs_root.is_dir() and not refs_root.is_symlink():
+                for ref in refs_root.rglob("*"):
+                    try:
+                        if not ref.is_file() or ref.is_symlink() or ref.stat().st_size > 4096:
+                            continue
+                        target = ref.read_text(encoding="utf-8").strip()
+                        if target in snapshot_revisions:
+                            revisions.add(ref.relative_to(refs_root).as_posix())
+                    except (OSError, UnicodeError, ValueError):
+                        continue
             models.append({
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
+                "revisions": sorted(revisions),
                 "last_modified": (
                     datetime.fromtimestamp(last_modified, timezone.utc).isoformat()
                     if last_modified else None

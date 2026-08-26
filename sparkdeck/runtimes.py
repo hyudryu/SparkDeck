@@ -169,6 +169,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
         )
 
     spec = adapter.launch_spec(model, settings)
+    await manager.evict_other_backends(protect=adapter.kind.value)
     port = int(settings.get("port") or await manager._allocate_port())
     name = safe_container_name(alias, deployment_id)
 

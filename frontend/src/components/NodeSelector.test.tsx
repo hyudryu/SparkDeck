@@ -40,6 +40,21 @@ describe('NodeSelector', () => {
     expect(coordinator).toHaveAccessibleName(/Required/)
   })
 
+  it('allows an asynchronously discovered required coordinator to be selected', async () => {
+    const user = userEvent.setup()
+    function RequiredHarness() {
+      const [selected, setSelected] = useState<string[]>([])
+      return <NodeSelector nodes={inventory} selectedIds={selected} onChange={setSelected} requiredIds={['local']} />
+    }
+    render(<RequiredHarness />)
+
+    const coordinator = screen.getByRole('checkbox', { name: /Coordinator/ })
+    expect(coordinator).not.toBeDisabled()
+    await user.click(coordinator)
+    expect(coordinator).toBeChecked()
+    expect(coordinator).toBeDisabled()
+  })
+
   it('labels the controller and first replicated target in worker context', () => {
     render(<NodeSelector nodes={inventory} selectedIds={['spark-2', 'local']} onChange={() => undefined} localLabel="Controller" primaryId="spark-2" />)
 

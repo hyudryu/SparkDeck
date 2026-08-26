@@ -101,6 +101,21 @@ describe('API client adapters', () => {
     })
   })
 
+  it('encodes the node ID and sends only the validated name when renaming', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      id: 'spark/2', name: 'Render Spark', online: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.nodes.rename('spark/2', { name: 'Render Spark' })).resolves.toEqual(
+      expect.objectContaining({ id: 'spark/2', name: 'Render Spark' }),
+    )
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes/spark%2F2', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ name: 'Render Spark' }),
+    }))
+  })
+
   it('preserves remote image availability and defaults legacy inventory to local', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [
       { id: 'remote-image', repository: 'org/remote', node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] },

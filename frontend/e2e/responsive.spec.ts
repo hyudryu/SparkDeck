@@ -105,6 +105,29 @@ test('uses a drawer on mobile and a persistent sidebar on desktop', async ({ pag
   }
 })
 
+test('renames remote cluster nodes without horizontal overflow', async ({ page }) => {
+  let remoteName = 'Studio Spark'
+  await page.route('**/api/v1/nodes/*', async (route) => {
+    const request = route.request()
+    if (request.method() !== 'PATCH') return route.fallback()
+    remoteName = (request.postDataJSON() as { name: string }).name
+    await route.fulfill({ json: { id: 'spark-2', name: remoteName, online: true, docker_ready: true, fabric_ready: true, selectable: true } })
+  })
+  await page.route('**/api/v1/nodes', async (route) => {
+    await route.fulfill({ json: { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, fabric_ready: true, selectable: true }, { id: 'spark-2', name: remoteName, online: true, docker_ready: true, fabric_ready: true, selectable: true }] } })
+  })
+  await page.goto('/cluster')
+
+  await page.getByRole('button', { name: 'Edit name for Studio Spark' }).click()
+  const input = page.getByRole('textbox', { name: 'New name for Studio Spark' })
+  await input.fill('Render Spark')
+  await page.getByRole('button', { name: 'Save' }).click()
+  await expect(page.getByRole('button', { name: 'Edit name for Render Spark' })).toBeVisible()
+  await expect(page.getByRole('status').filter({ hasText: 'Renamed Studio Spark to Render Spark.' })).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+})
+
 test('offers node targets for image pulls and deployments', async ({ page }) => {
   await page.goto('/images')
   await expect(page.getByLabel('Available on Studio Spark')).toContainText('Studio Spark')

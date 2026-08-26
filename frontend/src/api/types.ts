@@ -101,6 +101,10 @@ export interface NodeInventoryItem extends NodeSummary {
   selectable?: boolean
 }
 
+export interface RenameNodeInput {
+  name: string
+}
+
 export interface OnboardingStatus {
   role: 'controller' | 'worker'
   node: { id: string; name: string; port: number; access_urls: string[] }

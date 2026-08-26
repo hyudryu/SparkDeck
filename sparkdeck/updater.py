@@ -53,6 +53,24 @@ def current_revision(root: Path) -> str | None:
         return None
 
 
+def _boot_id() -> str | None:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _helper_alive(state: dict) -> bool:
+    pid = state.get("helper_pid")
+    if not isinstance(pid, int) or pid <= 0 or state.get("boot_id") != _boot_id():
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def local_blockers(root: Path) -> list[str]:
     blockers: list[str] = []
     if platform.system() != "Linux":
@@ -112,6 +130,11 @@ class UpdateService:
             if revision and revision == state.get("target_revision"):
                 state["phase"] = "succeeded"
                 state["message"] = "Updated and restarted successfully"
+                self._write(self.agent_path, state)
+            elif not _helper_alive(state):
+                state["phase"] = "failed"
+                state["error"] = "The local update helper was interrupted"
+                state["message"] = "Interrupted update can be retried"
                 self._write(self.agent_path, state)
         return {
             "capability": CAPABILITY,
@@ -193,10 +216,25 @@ class UpdateService:
     async def overview(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.cluster_path)
-        if state.get("active") and state.get("phase") == "updating_controller":
-            if revision == state.get("target_revision"):
+        task_live = self._task is not None and not self._task.done()
+        if state.get("active") and not task_live:
+            if state.get("phase") == "updating_controller" and revision == state.get("target_revision"):
                 state.update(active=False, phase="succeeded", message="Cluster update completed")
-                self._write(self.cluster_path, state)
+            elif state.get("phase") == "updating_controller" and _helper_alive(self._read(self.agent_path)):
+                pass
+            else:
+                changed = any(
+                    node.get("phase") == "succeeded"
+                    or node.get("current_revision") == state.get("target_revision")
+                    for node in state.get("nodes", []) if not node.get("local")
+                )
+                state.update(
+                    active=False,
+                    phase="partial" if changed else "failed",
+                    error="The controller rollout task was interrupted",
+                    message="Interrupted rollout can be retried",
+                )
+            self._write(self.cluster_path, state)
         releases, release_error = await self.published_releases()
         release_tags = {item["tag"] for item in releases}
         try:
@@ -251,6 +289,11 @@ class UpdateService:
             release, release_error = await self.resolve_release(tag, force=True)
             if release_error or not release:
                 raise ValueError(release_error or "Selected release is unavailable")
+            if overview["nodes"] and all(
+                node.get("current_revision") == release["revision"]
+                for node in overview["nodes"]
+            ):
+                raise RuntimeError("Selected release is already installed on every node")
             nodes = [{
                 "id": node["id"], "name": node["name"], "local": node["local"],
                 "phase": "pending", "current_revision": node.get("current_revision"),
@@ -292,7 +335,7 @@ class UpdateService:
                 await self.manager.node_registry.request(
                     node["id"], "POST", "/api/agent/system-update",
                     json_body={"tag": state["target_tag"], "revision": state["target_revision"]},
-                    timeout=20,
+                    timeout=120,
                 )
                 deadline = time.monotonic() + 600
                 while time.monotonic() < deadline:
@@ -374,10 +417,12 @@ class UpdateService:
                 return state
             state = {"phase": "accepted", "target_tag": tag, "target_revision": revision.lower(), "message": "Update accepted"}
             self._write(self.agent_path, state)
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
                  "--state", str(self.agent_path), "--tag", tag, "--revision", revision.lower()],
                 cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )
+            state.update(helper_pid=process.pid, boot_id=_boot_id())
+            self._write(self.agent_path, state)
             return state

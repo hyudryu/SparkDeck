@@ -57,6 +57,11 @@ function SoftwareUpdatePanel() {
   const nodes = data?.job?.nodes ?? data?.nodes ?? []
   const releases = data?.releases ?? []
   const selectedRelease = releases.find((release) => release.tag === selectedTag)
+  const selectedEverywhere = Boolean(
+    data?.current_release_tag === selectedTag
+    && data.nodes?.length
+    && data.nodes.every((node) => node.current_revision === data.current_revision),
+  )
   return (
     <Panel className="settings-section software-update-section">
       <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Install or roll back to a published GitHub release across the entire cluster.</p></div></div>
@@ -70,7 +75,7 @@ function SoftwareUpdatePanel() {
               <strong>{data.current_release_tag ? `Running ${data.current_release_tag}` : `Running ${shortRevision(data.current_revision)}`}</strong>
               <span className="muted">Latest {data.latest_release?.tag ?? 'unavailable'} · {data.nodes?.length ?? 0} cluster node{data.nodes?.length === 1 ? '' : 's'}</span>
             </div>
-            <Button type="button" variant="primary" disabled={!data.can_update || !selectedTag || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Installing…' : 'Install on all nodes'}</Button>
+            <Button type="button" variant="primary" disabled={!data.can_update || !selectedTag || selectedEverywhere || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Installing…' : selectedEverywhere ? 'Installed on all nodes' : 'Install on all nodes'}</Button>
           </div>
           {releases.length > 0 && <label className="field wide-field"><span>Release</span><select aria-label="Release version" value={selectedTag} disabled={active} onChange={(event) => setSelectedTag(event.target.value)}>{releases.map((release, index) => <option value={release.tag} key={release.tag}>{release.name} ({release.tag}){index === 0 ? ' — latest' : ''}{release.tag === data.current_release_tag ? ' — installed' : ''}{release.prerelease ? ' — prerelease' : ''}</option>)}</select><small>{selectedRelease?.published_at ? `Published ${new Date(selectedRelease.published_at).toLocaleDateString()}. ` : ''}Choosing an older release performs a cluster-wide rollback.</small></label>}
           {(data.job?.message || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || data.job?.message}</p>}

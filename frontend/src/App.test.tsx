@@ -260,6 +260,44 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
+  it('keeps a pending saved deployment open so late failures remain visible', async () => {
+    const user = userEvent.setup()
+    let resolveDeploy: (response: Response) => void = () => undefined
+    const deployResponse = new Promise<Response>((resolve) => { resolveDeploy = resolve })
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return deployResponse
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved local', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved local' })
+    await user.click(within(dialog).getByRole('button', { name: 'Deploy on 1 node' }))
+
+    expect(within(dialog).getByRole('button', { name: 'Close dialog' })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    fireEvent.mouseDown(dialog.parentElement as HTMLElement)
+    expect(screen.getByRole('dialog', { name: 'Deploy Saved local' })).toBeInTheDocument()
+
+    resolveDeploy(new Response(JSON.stringify({ detail: 'launch failed' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('launch failed')
+    expect(within(dialog).getByRole('button', { name: 'Close dialog' })).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeEnabled()
+  })
+
   it('surfaces saved-configuration failures without hiding deployment state', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

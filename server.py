@@ -1393,7 +1393,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
     }
     if str(recipe.get("engine") or "vllm") == "sglang":
         settings.update({
-            "tensor_parallel_size": recipe.get("sg_tp_size"),
+            "tensor_parallel_size": contract["tensor_parallel_size"],
             "context_length": recipe.get("sg_context_length"),
             "max_running_requests": recipe.get("sg_max_running_requests"),
             "mem_fraction_static": recipe.get("sg_mem_fraction"),

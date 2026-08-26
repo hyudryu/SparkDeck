@@ -72,6 +72,26 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertEqual(contract["tensor_parallel_size"], 2)
         self.assertEqual(contract["pipeline_parallel_size"], 1)
 
+    def test_explicit_single_mode_keeps_multi_gpu_parallelism_on_one_node(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "deployment_mode": "single",
+            "extra_args": ["--tensor-parallel-size", "4"],
+        })
+
+        self.assertEqual(contract["deployment_mode"], "single")
+        self.assertEqual(contract["required_node_count"], 1)
+        self.assertEqual(contract["tensor_parallel_size"], 4)
+
+    def test_malformed_sglang_parallelism_does_not_hide_saved_recipes(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "sglang", "sg_tp_size": "not-a-number",
+            "extra_args": ["--tp-size", "2"],
+        })
+
+        self.assertEqual(contract["deployment_mode"], "sharded")
+        self.assertEqual(contract["required_node_count"], 2)
+        self.assertEqual(contract["tensor_parallel_size"], 2)
+
 
 class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -121,6 +141,21 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             ["--dtype", "auto", "--hf-token", "secret"],
         )
         self.assertEqual(create.await_args.args[0]["recipe_id"], "recipe-1")
+
+    async def test_malformed_parallelism_does_not_hide_other_saved_configurations(self):
+        recipes = [
+            {"id": "bad-tp", "model": "org/bad", "engine": "sglang", "sg_tp_size": "bad"},
+            {"id": "valid", "model": "org/valid", "engine": "vllm", "extra_args": []},
+        ]
+        with (
+            patch.object(server.manager, "recipes", recipes),
+            patch.object(server.manager, "recipe_launches", {}),
+        ):
+            response = await self.client.get("/api/v1/recipes")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.json()["items"]], ["bad-tp", "valid"])
+        self.assertEqual(response.json()["items"][0]["tensor_parallel_size"], 1)
 
     async def test_tp2_recipe_requires_two_nodes_with_cached_weights(self):
         recipe = {

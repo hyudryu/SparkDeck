@@ -82,7 +82,7 @@ export function NodeSelector({
                   type={multiple ? 'checkbox' : 'radio'}
                   name={multiple ? undefined : 'target-node'}
                   checked={selectedIds.includes(node.id)}
-                  disabled={disabled || !ready || required}
+                  disabled={disabled || !ready || (required && selectedIds.includes(node.id))}
                   onChange={() => toggle(node.id)}
                 />
                 <HardDrive size={17} aria-hidden="true" />

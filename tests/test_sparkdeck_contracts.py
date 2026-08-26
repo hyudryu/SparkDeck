@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -97,6 +97,40 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result["model"], alias)
                 self.assertEqual(expected_proxy.await_args.args[0], f"org/model-{index}")
+
+    async def test_external_v1_base_url_is_not_duplicated_for_inference(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "model": "org/model",
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+        }
+        self.manager.http.post = AsyncMock(return_value=response)
+        self.service.store.add_deployment(Deployment(
+            id="external-1", alias="external", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            base_url_set=True,
+        ), "https://example.test/openai/v1")
+
+        await self.service.proxy({"model": "external", "messages": []}, "chat/completions")
+
+        self.assertEqual(
+            self.manager.http.post.await_args.args[0],
+            "https://example.test/openai/v1/chat/completions",
+        )
+
+    async def test_managed_revision_reaches_runtime_launch_settings(self):
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-model", "port": 8000, "status": "running",
+        })
+        with patch("sparkdeck.service.launch_managed_container", launch):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "revision-model", "runtime": "vllm",
+                "revision": "revision-abc",
+            })
+
+        self.assertEqual(launch.await_args.args[5]["revision"], "revision-abc")
 
 
 

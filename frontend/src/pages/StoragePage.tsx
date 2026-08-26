@@ -213,8 +213,8 @@ export function StoragePage() {
               onDrop={(event) => dropModel(event, node)}
             >
               <div className="storage-node-heading"><HardDrive size={18} /><div><h3>{node.name}</h3><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div></div>
-              <div className="storage-capacity"><span>{formatBytes(used)} cataloged</span><span>{formatBytes(node.total_size)} total</span></div>
-              <div className="storage-capacity-track" aria-label={`${node.name} cataloged model storage`}><span style={{ width: `${node.total_size > 0 ? Math.min(100, (used / node.total_size) * 100) : 0}%` }} /></div>
+              <div className="storage-capacity"><span>{formatBytes(used)} used</span><span>{formatBytes(node.total_size)} total</span></div>
+              <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${node.total_size > 0 ? Math.min(100, (used / node.total_size) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>
               {node.models.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
                 {node.models.map((model) => <li

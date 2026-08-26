@@ -140,6 +140,7 @@ export function ClusterPage() {
 
   const status = resource.data
   const controller = status?.role === 'controller'
+  const canRegisterWorkers = Boolean(status?.join_code) && Boolean(controller || status?.controller_reachable)
 
   return (
     <div className="page cluster-page">
@@ -190,7 +191,7 @@ export function ClusterPage() {
 
         <Panel className="tailnet-note">
           <ShieldCheck size={20} aria-hidden="true" />
-          <div><strong>Prefer a Tailscale HTTPS address</strong><p>Keep SparkDeck on <code>127.0.0.1:7878</code>, run <code>tailscale serve --bg --https=443 http://127.0.0.1:7878</code>, and join with the resulting <code>https://machine.tailnet.ts.net</code> URL. Tailnet grants or ACLs still control who can connect. A direct <code>http://100.x.x.x:7878</code> URL is WireGuard-encrypted but is a browser-insecure origin, so use it only when HTTPS is unavailable. Never use Tailscale Funnel or expose a raw <code>0.0.0.0</code> bind.</p><p>Joined nodes are alternate private entry points, not automatic failover. If the controller is offline, running models continue but cluster management is unavailable; local onboarding remains available for recovery.</p></div>
+          <div><strong>Use a private Tailscale address</strong><p>A direct <code>http://100.x.x.x:7878</code> URL works when both machines are on the same tailnet. Tailscale encrypts the connection and tailnet grants or ACLs control who can reach it. Include <code>http://</code> because SparkDeck expects a complete URL. A Tailscale Serve <code>https://machine.tailnet.ts.net</code> URL also works when Serve is configured. Never use Tailscale Funnel or expose SparkDeck to the public internet.</p><p>Joined nodes are alternate private entry points, not automatic failover. If the controller is offline, running models continue but cluster management is unavailable; local onboarding remains available for recovery.</p></div>
         </Panel>
 
         <div className="role-grid">
@@ -198,9 +199,9 @@ export function ClusterPage() {
           <Panel><p className="eyebrow">Joined node</p><h2>Runs assigned work</h2><p>A worker advertises its private Tailscale URL and provides another private entry point to the same controller. It does not become a standby controller.</p></Panel>
         </div>
 
-        {controller && !joining && <div className="onboarding-grid">
+        {canRegisterWorkers && !joining && <div className="onboarding-grid">
           <Panel className="onboarding-panel">
-            <div className="section-heading"><div><h2>Create from this controller</h2><p>This node is already a controller by default—no creation step is required. Use these details on the DGX Spark you want to join.</p></div></div>
+            <div className="section-heading"><div><h2>{controller ? 'Add a node from this controller' : 'Add a node through this worker'}</h2><p>{controller ? 'Use these details on the DGX Spark you want to join.' : 'This worker refers the joining node directly to the existing controller. Use this worker’s details on the DGX Spark you want to join.'}</p></div></div>
             <ol className="setup-steps">
               {(status.instructions?.length ? status.instructions : [
                 'Connect both systems to the same Tailscale tailnet.',
@@ -209,21 +210,21 @@ export function ClusterPage() {
               ]).map((instruction, index) => <li key={instruction}><span>{index + 1}</span><p>{instruction}</p></li>)}
             </ol>
             <div className="access-list">
-              <h3>Controller access URLs</h3>
-              {status.node.access_urls.length === 0 && <p className="muted">No private access URL detected. Configure Tailscale Serve, then refresh this page.</p>}
+              <h3>{controller ? 'Controller access URLs' : 'Worker entry URLs'}</h3>
+              {status.node.access_urls.length === 0 && <p className="muted">No private Tailscale URL detected. Confirm Tailscale is connected, then refresh this page.</p>}
               {status.node.access_urls.map((url) => <div className="copy-row" key={url}><code>{url}</code><Button type="button" variant="tertiary" aria-label={`Copy ${url}`} onClick={() => void copy(url, url)}>{copied === url ? <Check size={15} /> : <Clipboard size={15} />}{copied === url ? 'Copied' : 'Copy'}</Button></div>)}
             </div>
             <div className="join-code"><span>One-time pairing code</span><div><code>{status.join_code ?? 'Unavailable'}</code>{status.join_code && <Button type="button" variant="tertiary" onClick={() => void copy(status.join_code!, 'code')}>{copied === 'code' ? <Check size={15} /> : <Clipboard size={15} />}{copied === 'code' ? 'Copied' : 'Copy'}</Button>}</div><small>Share this only with the node you are joining. It may expire after use.</small></div>
-            <Button type="button" onClick={() => setJoining(true)}>Join this node to another controller</Button>
+            {controller && <Button type="button" onClick={() => setJoining(true)}>Join this node to another controller</Button>}
           </Panel>
         </div>}
 
         {controller && joining && <Panel className="join-panel">
-          <div><p className="eyebrow">Join an existing controller</p><h2>Connect this DGX Spark</h2><p>Choose the SparkDeck machine that will remain the controller. If one machine already owns workloads, choose that machine. Enter that controller’s URL and pairing code here—not this node’s URL.</p></div>
+          <div><p className="eyebrow">Join an existing cluster</p><h2>Connect this DGX Spark</h2><p>Enter the URL and pairing code shown by either the controller or an online worker in the cluster. The controller remains authoritative.</p></div>
           <form onSubmit={(event) => void join(event)}>
-            <div className="field"><label htmlFor="controller-tailnet-url">Chosen controller Tailscale URL</label><input id="controller-tailnet-url" type="url" required aria-describedby="controller-tailnet-url-help" value={form.controller_url} onChange={(event) => setForm({ ...form, controller_url: event.target.value })} placeholder="https://controller.your-tailnet.ts.net" /><small id="controller-tailnet-url-help">Use the HTTPS URL printed by Tailscale Serve on the chosen controller.</small></div>
+            <div className="field"><label htmlFor="controller-tailnet-url">Existing cluster entry URL</label><input id="controller-tailnet-url" type="url" required aria-describedby="controller-tailnet-url-help" value={form.controller_url} onChange={(event) => setForm({ ...form, controller_url: event.target.value })} placeholder="http://100.x.x.x:7878" /><small id="controller-tailnet-url-help">Use a private Tailscale URL shown by the controller or an online worker, such as <code>http://100.x.x.x:7878</code>.</small></div>
             <label className="field"><span>Pairing code</span><input required autoComplete="one-time-code" value={form.join_code} onChange={(event) => setForm({ ...form, join_code: event.target.value })} /></label>
-            <div className="field"><label htmlFor="advertised-tailnet-url">This node’s advertised Tailscale URL</label><input id="advertised-tailnet-url" type="url" required aria-describedby="advertised-tailnet-url-help" value={form.advertise_url} onChange={(event) => setForm({ ...form, advertise_url: event.target.value })} placeholder="https://spark-2.your-tailnet.ts.net" /><small id="advertised-tailnet-url-help">Use this node’s own Tailscale Serve HTTPS URL.</small></div>
+            <div className="field"><label htmlFor="advertised-tailnet-url">This node’s advertised Tailscale URL</label><input id="advertised-tailnet-url" type="url" required aria-describedby="advertised-tailnet-url-help" value={form.advertise_url} onChange={(event) => setForm({ ...form, advertise_url: event.target.value })} placeholder="http://100.x.x.x:7878" /><small id="advertised-tailnet-url-help">Use this node’s own private Tailscale URL, such as <code>http://100.x.x.x:7878</code>.</small></div>
             <label className="field"><span>This node’s name</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Studio Spark" /></label>
             <div className="modal-actions"><Button type="button" onClick={() => setJoining(false)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy}>{busy ? 'Joining…' : 'Join controller'}</Button></div>
           </form>

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.service import SparkDeckService
 
 
@@ -131,6 +132,43 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager.node_registry.request.assert_awaited_once_with(
             "worker-1", "GET", "/api/agent/stats", timeout=5,
         )
+
+    async def test_managed_llama_uses_local_hardware_but_external_stays_unknown(self):
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "model": "org/model", "choices": [],
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 80.0},
+            }, request=request)
+
+        await self.manager.http.aclose()
+        self.manager.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.manager._stats_cache = {
+            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
+        }
+        for deployment_id, alias, kind in (
+            ("managed-llama", "managed", DeploymentKind.MANAGED),
+            ("external-llama", "external", DeploymentKind.EXTERNAL),
+        ):
+            self.service.store.add_deployment(Deployment(
+                id=deployment_id, alias=alias, runtime=RuntimeKind.LLAMA_CPP,
+                kind=kind, model=ModelIdentity("org/model"), base_url_set=True,
+            ), "http://127.0.0.1:8080")
+            await self.service.proxy(
+                {"model": alias, "messages": [], "stream": False},
+                "chat/completions",
+            )
+
+        items, _ = self.service.store.benchmarks()
+        by_deployment = {item["deployment_id"]: item for item in items}
+        managed = by_deployment["managed-llama"]
+        external = by_deployment["external-llama"]
+
+        self.assertEqual(managed["hardware"]["hardware_class"], "dgx-spark")
+        self.assertEqual(managed["hardware"]["gpus"][0]["model"], "NVIDIA GB10")
+        self.assertTrue(managed["eligible_for_community"])
+        self.assertEqual(external["hardware"]["hardware_class"], "unknown")
+        self.assertFalse(external["eligible_for_community"])
 
     async def test_unknown_endpoint_hardware_stays_local_only(self):
         self.service.store.set_setting("community_consent", True)

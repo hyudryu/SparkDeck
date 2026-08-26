@@ -135,6 +135,37 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["container_name"], "replacement-rank")
         self.assertEqual(stored["_base_url"], "http://127.0.0.1:8020")
 
+    async def test_remote_first_replica_does_not_duplicate_later_local_member(self):
+        self.service.store.update_container("record-1", "remote-rank-0")
+        deployment = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": "ready", "api_port": 8000,
+            "node_ids": ["worker-1", "local"],
+            "members": [
+                {
+                    "rank": 0, "node_id": "worker-1",
+                    "container_name": "remote-rank-0",
+                },
+                {
+                    "rank": 1, "node_id": "local",
+                    "container_name": "local-rank-1",
+                },
+            ],
+        }
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+        self.manager.list_containers.return_value = [{
+            "name": "local-rank-1", "model": "org/model", "runtime": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+            "phase": {"phase": "ready"},
+        }]
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["id"], "record-1")
+        self.assertEqual(listed[0]["status"], "running")
+        self.assertFalse(any(item["id"] == "container:local-rank-1" for item in listed))
+
 
 class WorkerSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_joined_worker_keeps_local_inference_nudger(self):

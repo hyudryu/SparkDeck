@@ -82,7 +82,7 @@ Community results should be treated as evidence, not a guarantee. Hardware, runt
 
 ## Cluster and MCP automation
 
-SparkDeck nodes can be paired over a trusted management network for distributed and replicated deployments. Pairing credentials are stored locally beneath `data/`; do not commit or share that directory.
+SparkDeck nodes can be paired over a trusted management network for distributed and replicated deployments. Pairing credentials are stored locally beneath `data/`; do not commit or share that directory. The controller is the authoritative cluster registry, but every online worker can also display the controller's current one-time pairing code and act as an onboarding entry point at its own Tailscale URL. The joining node verifies the worker's pinned controller referral, registers directly with that controller, and then uses the controller directly for normal management traffic.
 
 ### Virtual NAS model transfers
 

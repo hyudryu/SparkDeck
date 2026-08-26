@@ -142,8 +142,9 @@ class OnboardingService:
     @staticmethod
     def _instructions() -> list[str]:
         return [
-            "Workers use their assigned controller while it is reachable.",
-            "There is no automatic controller failover or leader election.",
+            "Connect the joining system and this entry node to the same Tailscale tailnet.",
+            "Open Cluster onboarding on the system you want to join.",
+            "Enter one of this node's access URLs and the one-time pairing code.",
         ]
 
     def _access_urls(self, request_origin: str) -> list[str]:
@@ -185,6 +186,8 @@ class OnboardingService:
         role = "worker" if assignment else "controller"
         controller_url = assignment.get("controller_url") if assignment else None
         reachable = role == "controller"
+        controller_node_id = assignment.get("controller_node_id") if assignment else None
+        join_code = None
         if controller_url:
             try:
                 response = await self.manager.http.get(
@@ -192,11 +195,16 @@ class OnboardingService:
                 )
                 response.raise_for_status()
                 remote = response.json()
+                remote_node_id = str(remote.get("node", {}).get("id") or "")
                 reachable = (
                     remote.get("role") == "controller"
                     and int(remote.get("node", {}).get("protocol_version") or 0)
                     == AGENT_PROTOCOL_VERSION
+                    and bool(controller_node_id)
+                    and secrets.compare_digest(remote_node_id, str(controller_node_id))
                 )
+                if reachable:
+                    join_code = remote.get("join_code")
             except Exception:
                 reachable = False
         result = {
@@ -209,14 +217,17 @@ class OnboardingService:
                 "access_urls": self._access_urls(request_origin),
             },
             "controller_url": controller_url,
+            "controller_node_id": controller_node_id,
             "controller_reachable": reachable,
             "automatic_failover": False,
             "instructions": self._instructions(),
         }
         if role == "controller":
-            result["join_code"] = self.manager.agent_credentials.current_cluster_join_code(
+            join_code = self.manager.agent_credentials.current_cluster_join_code(
                 JOIN_CODE_TTL_SECONDS
             )
+        if join_code:
+            result["join_code"] = join_code
         return result
 
     def _check_join_rate(self, client_id: str) -> None:
@@ -333,30 +344,70 @@ class OnboardingService:
         if self.assignment.load():
             raise ValueError("this node is already joined to a controller")
         await self._assert_joinable()
-        controller_url = await validate_control_url(body.get("controller_url"))
+        entry_url = await validate_control_url(body.get("controller_url"))
         advertise_url = await validate_control_url(body.get("advertise_url"))
-        if controller_url == advertise_url:
+        if entry_url == advertise_url:
             raise ValueError("controller_url and advertise_url must identify different nodes")
         try:
             identity_response = await self.manager.http.get(
-                f"{controller_url}/api/v1/onboarding", timeout=5,
+                f"{entry_url}/api/v1/onboarding", timeout=5,
             )
             identity_response.raise_for_status()
             identity = identity_response.json()
         except httpx.HTTPError as exc:
             raise ValueError(f"controller is unreachable: {exc}") from exc
-        controller_node_id = str(identity.get("node", {}).get("id") or "")
-        if not controller_node_id:
-            raise ValueError("controller identity is missing a node ID")
-        if controller_node_id == self.manager.agent_credentials.node_id:
+        entry_node_id = str(identity.get("node", {}).get("id") or "")
+        if not entry_node_id:
+            raise ValueError("cluster entry identity is missing a node ID")
+        if entry_node_id == self.manager.agent_credentials.node_id:
             raise ValueError(
                 "controller_url resolves to this node; enter another controller's "
                 "Tailscale URL"
             )
-        if identity.get("role") != "controller":
-            raise ValueError("controller_url points to a worker")
         if int(identity.get("node", {}).get("protocol_version") or 0) != AGENT_PROTOCOL_VERSION:
-            raise ValueError("controller protocol version mismatch")
+            raise ValueError("cluster entry protocol version mismatch")
+        if identity.get("role") == "controller":
+            controller_url = entry_url
+            controller_node_id = entry_node_id
+        elif identity.get("role") == "worker":
+            if not identity.get("controller_reachable"):
+                raise ValueError("worker entry point cannot reach its controller")
+            controller_url = await validate_control_url(identity.get("controller_url"))
+            controller_node_id = str(identity.get("controller_node_id") or "")
+            if not controller_node_id:
+                raise ValueError("worker entry point is missing its controller identity")
+            if controller_url == advertise_url:
+                raise ValueError("worker entry point refers back to this joining node")
+            controller_host = (urlsplit(controller_url).hostname or "").casefold()
+            try:
+                controller_is_loopback = ipaddress.ip_address(controller_host).is_loopback
+            except ValueError:
+                controller_is_loopback = controller_host == "localhost"
+            if controller_is_loopback:
+                raise ValueError("worker entry point advertised a loopback controller URL")
+            try:
+                controller_response = await self.manager.http.get(
+                    f"{controller_url}/api/v1/onboarding", timeout=5,
+                )
+                controller_response.raise_for_status()
+                controller_identity = controller_response.json()
+            except httpx.HTTPError as exc:
+                raise ValueError(f"worker's controller is unreachable: {exc}") from exc
+            actual_controller_node_id = str(
+                controller_identity.get("node", {}).get("id") or ""
+            )
+            if (
+                controller_identity.get("role") != "controller"
+                or int(controller_identity.get("node", {}).get("protocol_version") or 0)
+                != AGENT_PROTOCOL_VERSION
+                or not actual_controller_node_id
+                or not secrets.compare_digest(
+                    actual_controller_node_id, controller_node_id,
+                )
+            ):
+                raise ValueError("worker entry point returned an invalid controller referral")
+        else:
+            raise ValueError("controller_url is not a SparkDeck cluster entry point")
 
         response = await self.manager.http.post(
             f"{controller_url}/api/v1/onboarding/register",

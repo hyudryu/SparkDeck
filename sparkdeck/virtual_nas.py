@@ -25,6 +25,10 @@ LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
+# Imports hold both the received tar and the extracted repository until the
+# final atomic rename. Reserve additional room for tar headers, metadata, and
+# filesystem allocation rounding rather than admitting at an exact 2x edge.
+_TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 
 
 class TransferCanceled(Exception):
@@ -383,7 +387,16 @@ class VirtualNAS:
         destination = self._hub() / archive_name
         if destination.exists():
             raise FileExistsError("cached model already exists on target node")
-        os.replace(extracted, destination)
+        for attempt in range(4):
+            try:
+                os.replace(extracted, destination)
+                break
+            except PermissionError:
+                # Windows file scanners can briefly retain a handle after
+                # tarfile closes. Keep the finalization atomic and bounded.
+                if os.name != "nt" or attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def delete_model(self, model_id: str) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
@@ -412,8 +425,9 @@ class VirtualNAS:
         if not targets:
             raise ValueError("target_node_ids must contain at least one node")
         await self._validate_online_node(source_node_id)
+        target_statuses: dict[str, dict[str, Any]] = {}
         for target in targets:
-            await self._validate_online_node(target)
+            target_statuses[target] = await self._validate_online_node(target)
             if target == source_node_id:
                 raise ValueError("source and target nodes must be different")
         source_inventory = await self._node_inventory(source_node_id)
@@ -423,6 +437,9 @@ class VirtualNAS:
         )
         if source_model is None:
             raise LookupError("cached source model not found")
+        model_size = _nonnegative_int(source_model.get("size_bytes"))
+        if model_size <= 0:
+            raise RuntimeError("source node did not report a usable cached model size")
         existing_targets: list[str] = []
         for target in targets:
             duplicate = next((
@@ -445,6 +462,19 @@ class VirtualNAS:
             raise FileExistsError(
                 f"cached model already exists on target node(s): {', '.join(existing_targets)}"
             )
+        required_free = model_size * 2 + _TRANSFER_STAGING_RESERVE_BYTES
+        for target, status in target_statuses.items():
+            free_bytes = _disk_free_bytes(status.get("disk"))
+            if free_bytes is None:
+                raise RuntimeError(
+                    f"target node '{target}' did not report free disk capacity"
+                )
+            if free_bytes < required_free:
+                raise RuntimeError(
+                    f"target node '{target}' has insufficient free disk space "
+                    f"({free_bytes} bytes available; {required_free} bytes required "
+                    "for archive staging and extraction)"
+                )
 
         created = time.time()
         jobs = []
@@ -453,7 +483,7 @@ class VirtualNAS:
                 "id": str(uuid.uuid4()), "model_id": model_id,
                 "source_node_id": source_node_id, "target_node_id": target,
                 "status": "queued",
-                "bytes_total": _nonnegative_int(source_model.get("size_bytes")),
+                "bytes_total": model_size,
                 "bytes_transferred": 0, "created_at": created,
                 "started_at": None,
                 "completed_at": None, "error": None,
@@ -515,14 +545,18 @@ class VirtualNAS:
         if not node.get("enabled", True):
             raise ValueError(f"node_id '{node_id}' is disabled")
 
-    async def _validate_online_node(self, node_id: str) -> None:
+    async def _validate_online_node(self, node_id: str) -> dict[str, Any]:
         self._validate_node(node_id)
         if node_id == LOCAL_NODE_ID:
-            return
+            return {
+                "id": LOCAL_NODE_ID, "online": True,
+                "disk": {"free": _local_free_bytes(self._hub())},
+            }
         node = self.node_registry.get(node_id)
         status = await self.node_registry.probe(node, force=True)
         if not status.get("online"):
             raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
+        return status
 
     async def _node_inventory(self, node_id: str) -> list[dict[str, Any]]:
         if node_id == LOCAL_NODE_ID:
@@ -681,6 +715,29 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _disk_free_bytes(disk: Any) -> int | None:
+    if not isinstance(disk, dict):
+        return None
+    value = disk.get("free")
+    if value is None:
+        value = disk.get("free_bytes")
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
+
+
+def _local_free_bytes(path: Path) -> int:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    try:
+        return int(shutil.disk_usage(candidate).free)
+    except OSError as exc:
+        raise RuntimeError("local node free disk capacity is unavailable") from exc
 
 
 def _is_complete_repository(repository: Path) -> bool:

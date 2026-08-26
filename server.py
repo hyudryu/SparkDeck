@@ -19,6 +19,7 @@ from manager import Manager, ClientAbort, FanSettingsConflict
 from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
+from sparkdeck.web import register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
@@ -1136,17 +1137,7 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 if FRONTEND_DIST.exists():
     app.mount("/static/app", StaticFiles(directory=FRONTEND_DIST), name="sparkdeck-app")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
-
-
-@app.get("/")
-async def index():
-    if (FRONTEND_DIST / "index.html").exists():
-        return FileResponse(FRONTEND_DIST / "index.html")
-    return Response(
-        "SparkDeck's web app has not been built. Run ./run.sh or npm --prefix frontend run build.",
-        status_code=503,
-        media_type="text/plain",
-    )
+register_spa_routes(app, FRONTEND_DIST)
 
 
 @app.get("/disk-manager")

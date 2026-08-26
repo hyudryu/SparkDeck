@@ -15,6 +15,7 @@ export default function App() {
     <AppShell>
       <Routes>
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/explore" element={<ExplorePage />} />
         <Route path="/models" element={<ModelsPage />} />
         <Route path="/chat" element={<ChatPage />} />

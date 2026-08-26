@@ -1446,18 +1446,22 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
         await manager.selected_cluster_nodes(selected_node_ids)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    inventory = await manager.model_cache_inventory()
-    requested_revision = contract.get("model_revision")
-    cached_revision = requested_revision or "main"
-    nodes_with_weights = {
-        node.get("id")
-        for node in inventory
-        if any(
-            model.get("model_id") == recipe.get("model")
-            and cached_revision in (model.get("revisions") or [])
-            for model in node.get("models") or []
-        )
-    }
+    local_model_path = manager._resolve_local_path(str(recipe.get("model") or ""))
+    if local_model_path:
+        nodes_with_weights = {LOCAL_NODE_ID}
+    else:
+        inventory = await manager.model_cache_inventory()
+        requested_revision = contract.get("model_revision")
+        cached_revision = requested_revision or "main"
+        nodes_with_weights = {
+            node.get("id")
+            for node in inventory
+            if any(
+                model.get("model_id") == recipe.get("model")
+                and cached_revision in (model.get("revisions") or [])
+                for model in node.get("models") or []
+            )
+        }
     missing_weights = [
         node_id for node_id in selected_node_ids if node_id not in nodes_with_weights
     ]

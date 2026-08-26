@@ -11,6 +11,7 @@ import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -54,27 +55,58 @@ def _allowed_control_ip(value: str) -> bool:
     return address.is_loopback or address in _TAILSCALE_V4 or address in _TAILSCALE_V6
 
 
-async def validate_control_url(value: Any) -> str:
-    """Allow only loopback or Tailscale-reachable controller/agent URLs."""
+@dataclass(frozen=True)
+class ControlConnection:
+    """Logical control URL plus the IP-pinned transport destination."""
+
+    url: str
+    connect_url: str
+    host_header: str
+    sni_hostname: str
+
+
+async def resolve_control_connection(value: Any) -> ControlConnection:
+    """Resolve, validate, and pin one loopback/Tailscale control connection."""
     url = normalize_control_url(value)
-    host = urlsplit(url).hostname or ""
-    if host.casefold() == "localhost":
-        return url
+    parsed = httpx.URL(url)
+    host = parsed.raw_host.decode("ascii")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        if _allowed_control_ip(host):
-            return url
-        raise ValueError("URL must resolve only to Tailscale or loopback addresses")
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
         try:
             rows = await asyncio.to_thread(
-                socket.getaddrinfo, host, None, type=socket.SOCK_STREAM
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
             )
         except OSError as exc:
             raise ValueError("URL hostname could not be resolved") from exc
-        addresses = {row[4][0].split("%", 1)[0] for row in rows}
+        addresses = []
+        for row in rows:
+            address = row[4][0].split("%", 1)[0]
+            if address not in addresses:
+                addresses.append(address)
         if not addresses or not all(_allowed_control_ip(address) for address in addresses):
-            raise ValueError("URL must resolve only to Tailscale or loopback addresses") from literal_error
-        return url
+            raise ValueError(
+                "URL must resolve only to Tailscale or loopback addresses"
+            ) from literal_error
+    else:
+        if not _allowed_control_ip(str(literal)):
+            raise ValueError("URL must resolve only to Tailscale or loopback addresses")
+        addresses = [str(literal)]
+
+    # The transport connects to this numeric address, so it cannot repeat DNS
+    # after validation. Host and SNI retain the logical paired-node identity.
+    return ControlConnection(
+        url=url,
+        connect_url=str(parsed.copy_with(host=addresses[0])),
+        host_header=parsed.netloc.decode("ascii"),
+        sni_hostname=host,
+    )
+
+
+async def validate_control_url(value: Any) -> str:
+    """Allow only loopback or Tailscale-reachable controller/agent URLs."""
+    return (await resolve_control_connection(value)).url
 
 
 class ControllerAssignment:

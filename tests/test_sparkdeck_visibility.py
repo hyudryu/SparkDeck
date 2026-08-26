@@ -327,6 +327,32 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached_main.status_code, 201)
         create.assert_awaited_once()
 
+    async def test_valid_local_path_recipe_skips_hub_cache_preflight(self):
+        recipe = {
+            "id": "local-path", "model": "/models/local", "engine": "vllm",
+            "extra_args": [],
+        }
+        created = {
+            "id": "dep-local", "alias": "/models/local", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "/models/local"},
+            "status": "starting", "settings": {},
+        }
+        inventory = AsyncMock()
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
+            patch.object(server.manager, "_resolve_local_path", return_value="/models/local"),
+            patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(
+                server.sparkdeck, "create_deployment", AsyncMock(return_value=created),
+            ) as create,
+        ):
+            response = await self.client.post("/api/v1/recipes/local-path/deploy")
+
+        self.assertEqual(response.status_code, 201)
+        inventory.assert_not_awaited()
+        create.assert_awaited_once()
+
     async def test_tp2_recipe_requires_two_nodes_with_cached_weights(self):
         recipe = {
             "id": "recipe-tp2", "name": "DeepSeek TP2", "model": "deepseek/model",

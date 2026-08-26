@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,9 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 
+from cluster import NodeRegistry
 from manager import Manager
+from sparkdeck.onboarding import resolve_control_connection
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -249,23 +252,53 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["hf_token_configured"])
 
     async def test_remote_credential_destination_is_revalidated_before_send(self):
-        instance = Manager.__new__(Manager)
-        instance.node_registry = Mock()
-        instance.node_registry.get.return_value = {
-            "id": "worker-1",
-            "agent_url": "http://rebound.example:7878",
-        }
-        instance.node_registry.request = AsyncMock()
+        requests = []
+        resolutions = []
 
-        with patch(
-            "manager.validate_control_url",
-            AsyncMock(side_effect=ValueError("unsafe destination")),
-        ) as validate:
-            with self.assertRaisesRegex(ValueError, "unsafe destination"):
-                await instance._create_member("worker-1", {
-                    "model": "org/private-model",
-                    "hf_token": "hf_forwarded_secret",
-                })
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            address = "100.100.20.30" if len(resolutions) == 1 else "198.51.100.20"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
 
-        validate.assert_awaited_once_with("http://rebound.example:7878")
-        instance.node_registry.request.assert_not_awaited()
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"name": "container"}, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_control_connection,
+            )
+            registry.nodes = [{
+                "id": "worker-1", "name": "Worker",
+                "agent_url": "http://rebound.example:7878",
+                "agent_token": "agent-secret", "enabled": True,
+            }]
+            instance = Manager.__new__(Manager)
+            instance.node_registry = registry
+            try:
+                with patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    result = await instance._create_member("worker-1", {
+                        "model": "org/private-model",
+                        "hf_token": "hf_forwarded_secret",
+                    })
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"name": "container"})
+        self.assertEqual(resolutions, [("rebound.example", 7878)])
+        self.assertEqual(
+            str(requests[0].url),
+            "http://100.100.20.30:7878/api/agent/containers",
+        )
+        self.assertEqual(requests[0].headers["host"], "rebound.example:7878")
+        self.assertEqual(requests[0].headers["authorization"], "Bearer agent-secret")
+        self.assertEqual(
+            json.loads(requests[0].content)["hf_token"], "hf_forwarded_secret",
+        )

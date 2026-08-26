@@ -137,6 +137,17 @@ class SparkDeckStore:
                 (container_name, base_url, deployment_id),
             )
 
+    def update_managed_routing(
+        self, deployment_id: str, settings: dict[str, Any],
+        container_name: str | None, base_url: str | None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET settings_json = ?, container_name = ?, base_url = ? "
+                "WHERE id = ?",
+                (json.dumps(settings), container_name, base_url, deployment_id),
+            )
+
     def delete_deployment(self, deployment_id: str) -> None:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM deployments WHERE id = ?", (deployment_id,))

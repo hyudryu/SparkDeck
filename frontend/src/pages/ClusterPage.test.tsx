@@ -42,8 +42,8 @@ describe('ClusterPage', () => {
     expect(screen.getByText(/tailscale serve --bg --https=443 http:\/\/127\.0\.0\.1:7878/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Join this node to another controller' }))
-    expect(screen.getByText(/Enter that controller’s URL and pairing code here—not this node’s URL/)).toBeInTheDocument()
-    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
+    expect(screen.getByText(/shown by either the controller or an online worker/)).toBeInTheDocument()
+    await user.type(screen.getByRole('textbox', { name: 'Existing cluster entry URL' }), 'https://controller.tailnet.ts.net')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }))
     await user.type(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }), 'https://spark-2.tailnet.ts.net')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s name' }))
@@ -61,6 +61,31 @@ describe('ClusterPage', () => {
     expect(screen.getByText('Joined https://controller.tailnet.ts.net as Studio Spark.')).toHaveAttribute('role', 'status')
   })
 
+  it('lets an online worker invite another node into the existing cluster', async () => {
+    const workerStatus = {
+      role: 'worker',
+      node: { id: 'spark-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] },
+      controller_url: 'https://controller.tailnet.ts.net',
+      controller_node_id: 'controller-credential-id',
+      controller_reachable: true,
+      join_code: 'PAIR-456',
+      instructions: ['Enter this worker entry URL and the one-time pairing code.'],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(workerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<ClusterPage />)
+
+    expect(await screen.findByRole('heading', { name: 'Add a node through this worker' })).toBeInTheDocument()
+    expect(screen.getByText('PAIR-456')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Worker entry URLs' })).toBeInTheDocument()
+    expect(screen.getByText('https://spark-2.tailnet.ts.net')).toBeInTheDocument()
+    expect(screen.getByText('https://controller.tailnet.ts.net')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Join this node to another controller' })).not.toBeInTheDocument()
+  })
+
   it('keeps the join form open and exposes backend errors', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -71,7 +96,7 @@ describe('ClusterPage', () => {
     render(<ClusterPage />)
 
     await user.click(await screen.findByRole('button', { name: 'Join this node to another controller' }))
-    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
+    await user.type(screen.getByRole('textbox', { name: 'Existing cluster entry URL' }), 'https://controller.tailnet.ts.net')
     await user.type(screen.getByRole('textbox', { name: 'Pairing code' }), 'EXPIRED')
     await user.click(screen.getByRole('button', { name: 'Join controller' }))
 

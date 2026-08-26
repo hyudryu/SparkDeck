@@ -310,6 +310,9 @@ export interface SavedConfiguration {
   sg_mem_fraction?: number | null
   sg_image?: string | null
   deployment_mode: 'single' | 'replicated' | 'sharded'
+  required_node_count: number
+  tensor_parallel_size: number
+  pipeline_parallel_size: number
   node_ids: string[]
   supported?: boolean
   error?: string

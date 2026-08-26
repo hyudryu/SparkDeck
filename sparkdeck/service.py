@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import math
 import platform
@@ -552,6 +553,10 @@ class SparkDeckService:
             discovered = True
         if not deployment:
             raise LookupError("deployment not found")
+        if discovered and deployment["kind"] != DeploymentKind.MANAGED.value:
+            raise ValueError(
+                "unmanaged discovered containers cannot be removed by SparkDeck"
+            )
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         if manager_id:
             result = await self.manager.deployment_action(manager_id, "remove")
@@ -620,6 +625,16 @@ class SparkDeckService:
                 "owned_by": "sparkdeck", "runtime": deployment["runtime"],
                 "deployment_id": deployment["id"], "model": deployment["model"],
             })
+        loaded_llama = await self._native_llama_model()
+        if loaded_llama and loaded_llama not in seen:
+            data.append({
+                "id": loaded_llama, "object": "model", "created": 0,
+                "owned_by": "llama.cpp", "runtime": RuntimeKind.LLAMA_CPP.value,
+                "model": {
+                    "repository": loaded_llama, "revision": None,
+                    "artifact": None, "quantization": None,
+                },
+            })
         return {"object": "list", "data": data}
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
@@ -633,9 +648,9 @@ class SparkDeckService:
         started = time.monotonic()
         stream = bool(body.get("stream"))
         result = (
-            await self.manager._vllm_chat(requested_model, body, stream, cancel)
+            await self.manager.proxy_chat_completions(body, cancel)
             if endpoint == "chat/completions"
-            else await self.manager._vllm_completions(requested_model, body, stream, cancel)
+            else await self.manager.proxy_completions(body, cancel)
         )
         runtime = await self._runtime_for_legacy_model(requested_model)
         if hasattr(result, "__aiter__"):
@@ -662,7 +677,7 @@ class SparkDeckService:
             upstream_body["stream_options"] = {
                 **(upstream_body.get("stream_options") or {}), "include_usage": True,
             }
-            return self._http_stream(
+            return await self._http_stream(
                 f"{base_url}/v1/{endpoint}", upstream_body, headers,
                 deployment, started, cancel,
             )
@@ -734,46 +749,81 @@ class SparkDeckService:
     async def _http_stream(self, url: str, body: dict[str, Any], headers: dict[str, str],
                            deployment: dict[str, Any], started: float,
                            cancel: Any) -> AsyncIterator[str]:
-        first_token_at: float | None = None
-        usage: dict[str, Any] | None = None
         upstream_body = dict(body)
         retried_without_stream_options = False
         while True:
-            async with self.manager.http.stream(
+            response_context = self.manager.http.stream(
                 "POST", url, json=upstream_body, headers=headers, timeout=None
-            ) as response:
-                if (
-                    response.status_code == 400
-                    and upstream_body.get("stream_options")
-                    and not retried_without_stream_options
-                ):
-                    # Older llama-server/SGLang releases may not support this
-                    # OpenAI extension. Streaming still works; only terminal
-                    # usage-based benchmark capture is unavailable for that run.
+            )
+            enter = response_context.__aenter__()
+            response = (
+                await self.manager._await_or_cancel(enter, cancel)
+                if cancel is not None
+                else await enter
+            )
+            if (
+                response.status_code == 400
+                and upstream_body.get("stream_options")
+                and not retried_without_stream_options
+            ):
+                # Older llama-server/SGLang releases may not support this
+                # OpenAI extension. Streaming still works; only terminal
+                # usage-based benchmark capture is unavailable for that run.
+                try:
                     await response.aread()
-                    upstream_body = {
-                        key: value for key, value in upstream_body.items()
-                        if key != "stream_options"
-                    }
-                    retried_without_stream_options = True
-                    continue
+                finally:
+                    await response_context.__aexit__(None, None, None)
+                upstream_body = {
+                    key: value for key, value in upstream_body.items()
+                    if key != "stream_options"
+                }
+                retried_without_stream_options = True
+                continue
+            try:
+                # Validate while the route can still return the real upstream
+                # status. Deferring this until iteration would cause FastAPI's
+                # StreamingResponse to commit a misleading HTTP 200 first.
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if cancel is not None and cancel.is_set():
-                        return
-                    if not line:
-                        continue
-                    parsed = _parse_sse(line)
-                    if parsed:
-                        if parsed.get("usage"):
-                            usage = parsed["usage"]
-                        if first_token_at is None and _chunk_has_output(parsed):
-                            first_token_at = time.monotonic()
-                        if parsed.get("model"):
-                            parsed["model"] = deployment["alias"]
-                            line = "data: " + json.dumps(parsed, separators=(",", ":"))
-                    yield f"{line}\n\n"
-                break
+            except BaseException as exc:
+                await response_context.__aexit__(type(exc), exc, exc.__traceback__)
+                raise
+            return self._consume_http_stream(
+                response_context, response, deployment, started, cancel,
+            )
+
+    async def _consume_http_stream(
+        self, response_context: Any, response: Any, deployment: dict[str, Any],
+        started: float, cancel: Any,
+    ) -> AsyncIterator[str]:
+        first_token_at: float | None = None
+        usage: dict[str, Any] | None = None
+        stream_error: BaseException | None = None
+        try:
+            async for line in response.aiter_lines():
+                if cancel is not None and cancel.is_set():
+                    return
+                if not line:
+                    continue
+                parsed = _parse_sse(line)
+                if parsed:
+                    if parsed.get("usage"):
+                        usage = parsed["usage"]
+                    if first_token_at is None and _chunk_has_output(parsed):
+                        first_token_at = time.monotonic()
+                    if parsed.get("model"):
+                        parsed["model"] = deployment["alias"]
+                        line = "data: " + json.dumps(parsed, separators=(",", ":"))
+                yield f"{line}\n\n"
+        except BaseException as exc:
+            stream_error = exc
+            raise
+        finally:
+            if stream_error is None:
+                await response_context.__aexit__(None, None, None)
+            else:
+                await response_context.__aexit__(
+                    type(stream_error), stream_error, stream_error.__traceback__,
+                )
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
@@ -880,6 +930,8 @@ class SparkDeckService:
         self.store.add_benchmark(sample, queue=eligible and consent)
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
+        if await self._native_llama_model() == model:
+            return RuntimeKind.LLAMA_CPP.value
         try:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
@@ -888,6 +940,15 @@ class SparkDeckService:
         except Exception:
             pass
         return RuntimeKind.VLLM.value
+
+    async def _native_llama_model(self) -> str | None:
+        loaded_model = getattr(self.manager, "_unsloth_loaded_model", None)
+        if loaded_model is None:
+            return None
+        result = loaded_model()
+        if not inspect.isawaitable(result):
+            return None
+        return await result
 
     @staticmethod
     def _container_runtime(container: dict[str, Any]) -> str:

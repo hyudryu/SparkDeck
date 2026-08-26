@@ -1251,6 +1251,8 @@ async def v1_delete_deployment(deployment_id: str):
         return await sparkdeck.delete_deployment(deployment_id)
     except LookupError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 

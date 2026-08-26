@@ -8192,8 +8192,7 @@ class Manager:
         # llama-server runs one model at a time; surface the loaded one so
         # OpenAI clients can target it. The controller forwards requests to
         # the llama-server process it launched on localhost.
-        unsloth = data.get("unsloth", {})
-        loaded = unsloth.get("loaded_model")
+        loaded = await self._unsloth_loaded_model()
         if loaded:
             models.append({
                 "id": loaded,

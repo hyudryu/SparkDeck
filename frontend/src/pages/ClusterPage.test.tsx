@@ -39,7 +39,7 @@ describe('ClusterPage', () => {
     expect(await screen.findByText('PAIR-123')).toBeInTheDocument()
     expect(screen.getByText('Controller · Current entry node')).toBeInTheDocument()
     expect(screen.getByText('https://controller.tailnet.ts.net')).toBeInTheDocument()
-    expect(screen.getByText(/tailscale serve --bg --https=443 localhost:7878/)).toBeInTheDocument()
+    expect(screen.getByText(/tailscale serve --bg --https=443 http:\/\/127\.0\.0\.1:7878/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Join this node to another controller' }))
     await user.type(screen.getByRole('textbox', { name: 'Controller Tailscale URL' }), 'https://controller.tailnet.ts.net')

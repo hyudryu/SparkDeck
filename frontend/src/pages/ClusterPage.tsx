@@ -190,7 +190,7 @@ export function ClusterPage() {
 
         <Panel className="tailnet-note">
           <ShieldCheck size={20} aria-hidden="true" />
-          <div><strong>Keep SparkDeck inside your tailnet</strong><p>Use tailnet grants or ACLs and either a Tailscale-IP-only bind or <code>tailscale serve --bg --https=443 localhost:7878</code>. This makes SparkDeck available only inside the tailnet. Do not expose a raw <code>0.0.0.0</code> bind to the public internet.</p><p>Joined nodes are alternate private entry points, not automatic failover. If the controller is offline, running models continue but cluster management is unavailable; local onboarding remains available for recovery.</p></div>
+          <div><strong>Prefer a Tailscale HTTPS address</strong><p>Keep SparkDeck on <code>127.0.0.1:7878</code>, run <code>tailscale serve --bg --https=443 http://127.0.0.1:7878</code>, and join with the resulting <code>https://machine.tailnet.ts.net</code> URL. Tailnet grants or ACLs still control who can connect. A direct <code>http://100.x.x.x:7878</code> URL is WireGuard-encrypted but is a browser-insecure origin, so use it only when HTTPS is unavailable. Never use Tailscale Funnel or expose a raw <code>0.0.0.0</code> bind.</p><p>Joined nodes are alternate private entry points, not automatic failover. If the controller is offline, running models continue but cluster management is unavailable; local onboarding remains available for recovery.</p></div>
         </Panel>
 
         <div className="role-grid">
@@ -221,9 +221,9 @@ export function ClusterPage() {
         {controller && joining && <Panel className="join-panel">
           <div><p className="eyebrow">Join an existing controller</p><h2>Connect this DGX Spark</h2><p>Enter details from the other controller. The browser sends them only to this node’s local SparkDeck service.</p></div>
           <form onSubmit={(event) => void join(event)}>
-            <label className="field"><span>Controller Tailscale URL</span><input type="url" required value={form.controller_url} onChange={(event) => setForm({ ...form, controller_url: event.target.value })} placeholder="https://controller.your-tailnet.ts.net:7878" /></label>
+            <label className="field"><span>Controller Tailscale URL</span><input type="url" required value={form.controller_url} onChange={(event) => setForm({ ...form, controller_url: event.target.value })} placeholder="https://controller.your-tailnet.ts.net" /><small>Recommended: use the HTTPS URL printed by Tailscale Serve.</small></label>
             <label className="field"><span>Pairing code</span><input required autoComplete="one-time-code" value={form.join_code} onChange={(event) => setForm({ ...form, join_code: event.target.value })} /></label>
-            <label className="field"><span>This node’s advertised Tailscale URL</span><input type="url" required value={form.advertise_url} onChange={(event) => setForm({ ...form, advertise_url: event.target.value })} placeholder="https://spark-2.your-tailnet.ts.net:7878" /></label>
+            <label className="field"><span>This node’s advertised Tailscale URL</span><input type="url" required value={form.advertise_url} onChange={(event) => setForm({ ...form, advertise_url: event.target.value })} placeholder="https://spark-2.your-tailnet.ts.net" /><small>Use this node’s own Tailscale Serve HTTPS URL.</small></label>
             <label className="field"><span>This node’s name</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Studio Spark" /></label>
             <div className="modal-actions"><Button type="button" onClick={() => setJoining(false)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy}>{busy ? 'Joining…' : 'Join controller'}</Button></div>
           </form>

@@ -27,7 +27,7 @@ describe('SparkDeck application shell', () => {
     render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
-    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Settings', 'Logs']) {
+    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Images', 'Storage', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()

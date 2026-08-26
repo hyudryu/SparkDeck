@@ -10,6 +10,7 @@ import { ImagesPage } from './pages/ImagesPage'
 import { LogsPage } from './pages/LogsPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { StoragePage } from './pages/StoragePage'
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
         <Route path="/compare" element={<ComparePage />} />
         <Route path="/benchmarks" element={<BenchmarksPage />} />
         <Route path="/images" element={<ImagesPage />} />
+        <Route path="/storage" element={<StoragePage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/logs" element={<LogsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

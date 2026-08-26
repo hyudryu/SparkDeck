@@ -5,6 +5,7 @@ import {
   ClipboardList,
   Cpu,
   GitCompareArrows,
+  HardDrive,
   Images,
   LayoutDashboard,
   Menu,
@@ -25,6 +26,7 @@ const navigation = [
   { to: '/compare', label: 'Compare', icon: GitCompareArrows },
   { to: '/benchmarks', label: 'Benchmarks', icon: ClipboardList },
   { to: '/images', label: 'Images', icon: Images },
+  { to: '/storage', label: 'Storage', icon: HardDrive },
   { to: '/settings', label: 'Settings', icon: Settings },
   { to: '/logs', label: 'Logs', icon: Boxes },
 ]

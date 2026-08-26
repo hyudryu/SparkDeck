@@ -240,3 +240,49 @@ export interface DashboardData {
   deployments: Deployment[]
   sync: SyncStatus
 }
+
+export interface StorageModel {
+  model_id: string
+  size_bytes: number
+  last_modified?: string
+  revision?: string
+  file_count?: number
+}
+
+export interface StorageNode {
+  id: string
+  name: string
+  online: boolean
+  total_size: number
+  models: StorageModel[]
+}
+
+export interface StorageTransferJob {
+  id: string
+  model_id: string
+  source_node_id: string
+  source_node_name: string
+  target_node_id: string
+  target_node_name: string
+  status: string
+  bytes_total: number
+  bytes_transferred: number
+  progress?: number
+  created_at: string | number
+  started_at?: string | number
+  completed_at?: string | number
+  error?: string
+}
+
+export interface StorageState {
+  enabled: boolean
+  nodes: StorageNode[]
+  jobs: StorageTransferJob[]
+  instructions: string[]
+}
+
+export interface CreateStorageTransferInput {
+  model_id: string
+  source_node_id: string
+  target_node_ids: string[]
+}

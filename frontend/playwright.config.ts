@@ -6,6 +6,8 @@ const viewports = [
   { name: 'tablet-768', width: 768, height: 1024 },
   { name: 'desktop-1440', width: 1440, height: 960 },
 ]
+const port = process.env.PLAYWRIGHT_PORT ?? '4173'
+const baseURL = `http://127.0.0.1:${port}/`
 
 export default defineConfig({
   testDir: './e2e',
@@ -13,7 +15,7 @@ export default defineConfig({
   retries: 0,
   reporter: 'list',
   use: {
-    baseURL: 'http://127.0.0.1:4173/',
+    baseURL,
     colorScheme: 'light',
   },
   projects: viewports.map(({ name, width, height }) => ({
@@ -21,8 +23,8 @@ export default defineConfig({
     use: { viewport: { width, height } },
   })),
   webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 4173 --base /',
-    url: 'http://127.0.0.1:4173/',
+    command: `npm run dev -- --host 127.0.0.1 --port ${port} --base /`,
+    url: baseURL,
     reuseExistingServer: true,
   },
 })

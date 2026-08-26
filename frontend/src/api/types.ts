@@ -72,6 +72,8 @@ export interface Deployment {
   last_error?: string
   created_at?: string
   updated_at?: string
+  node_ids?: string[]
+  selected_nodes?: NodeSummary[]
 }
 
 export interface CreateDeploymentInput {
@@ -82,6 +84,21 @@ export interface CreateDeploymentInput {
   api_key?: string
   managed: boolean
   settings: DeploymentSettings
+  node_ids?: string[]
+  deployment_mode?: 'single' | 'replicated' | 'sharded'
+}
+
+export interface NodeSummary {
+  id: string
+  name: string
+  local?: boolean
+}
+
+export interface NodeInventoryItem extends NodeSummary {
+  online?: boolean
+  docker_ready?: boolean
+  fabric_ready?: boolean
+  selectable?: boolean
 }
 
 export interface BenchmarkSample {
@@ -124,6 +141,14 @@ export interface ContainerImage {
   tags?: string[]
   created?: string
   is_vllm?: boolean
+}
+
+export interface ImagePullResult {
+  ok: boolean
+  image: string
+  node_ids: string[]
+  selected_nodes?: NodeSummary[]
+  results?: Array<{ node_id: string; node_name: string; ok: boolean; error?: string }>
 }
 
 export interface AppSettings {

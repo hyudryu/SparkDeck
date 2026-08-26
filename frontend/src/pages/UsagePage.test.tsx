@@ -61,6 +61,8 @@ describe('UsagePage', () => {
     render(<UsagePage />)
 
     expect(await screen.findByRole('heading', { name: 'Usage stats' })).toBeInTheDocument()
+    expect(screen.getByText('Cluster inference accounting')).toBeInTheDocument()
+    expect(screen.getByText('Combined token activity and model share from every paired SparkDeck node.')).toBeInTheDocument()
     expect((await screen.findAllByText('Workload')).length).toBeGreaterThan(0)
     expect(screen.getByLabelText('Usage overview')).toHaveTextContent('2,250')
     expect(screen.getByLabelText('Usage overview')).toHaveTextContent('2,450')

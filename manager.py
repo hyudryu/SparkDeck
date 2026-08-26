@@ -56,9 +56,6 @@ DEFAULT_SETTINGS = {
     # Trust vLLM's startup KV-capacity report and lower --max-num-seqs with a
     # coordinated redeploy when the configured full-context concurrency is unsafe.
     "vllm_auto_adjust_concurrency": True,
-    # Exchange per-node lifetime/hourly token counters with paired nodes.
-    # Per-origin revisions make repeated pull/push cycles idempotent.
-    "sync_token_usage": False,
     # Opt-in model cache replication across authenticated cluster nodes.
     "virtual_nas_enabled": False,
     # Cluster management uses the normal LAN/Tailscale address while model
@@ -398,7 +395,7 @@ class Manager:
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
-            "enabled": bool(self.settings.get("sync_token_usage")),
+            "enabled": True,
             "last_sync_at": None,
             "peers": 0,
             "error": None,
@@ -1144,13 +1141,9 @@ class Manager:
 
     async def sync_token_usage_once(self) -> dict:
         """Pull per-origin counters from peers, merge, then fan out the union."""
-        enabled = bool(self.settings.get("sync_token_usage"))
         status = getattr(self, "_token_usage_sync_status", {})
-        status.update({"enabled": enabled, "error": None})
+        status.update({"enabled": True, "error": None})
         self._token_usage_sync_status = status
-        if not enabled:
-            status["peers"] = 0
-            return dict(status)
 
         nodes = [
             node for node in self.node_registry.nodes
@@ -1168,7 +1161,7 @@ class Manager:
             if isinstance(result, Exception):
                 errors.append(f"{node.get('name', node['id'])}: {result}")
                 continue
-            if not isinstance(result, dict) or not result.get("enabled"):
+            if not isinstance(result, dict):
                 continue
             try:
                 self.merge_token_usage_sync(result)
@@ -1198,8 +1191,7 @@ class Manager:
     async def _token_usage_sync_loop(self) -> None:
         while True:
             try:
-                if self.settings.get("sync_token_usage"):
-                    await self.sync_token_usage_once()
+                await self.sync_token_usage_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3719,6 +3711,10 @@ class Manager:
                 # Removed runtimes must not remain advertised through a stale
                 # persisted setting after upgrade.
                 data.pop("ollama_base_url", None)
+                # Cluster usage is always combined. Discard the retired
+                # opt-out so an older settings file cannot silently leave a
+                # node out of Usage totals.
+                data.pop("sync_token_usage", None)
                 return {**DEFAULT_SETTINGS, **data}
             except Exception:
                 pass
@@ -3941,7 +3937,7 @@ class Manager:
 
     def token_usage_sync_snapshot(self) -> dict:
         return {
-            "enabled": bool(self.settings.get("sync_token_usage")),
+            "enabled": True,
             "ledger": copy.deepcopy(self.token_usage_sync),
         }
 

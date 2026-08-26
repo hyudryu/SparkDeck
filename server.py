@@ -589,8 +589,6 @@ async def agent_token_usage(req: Request):
 @app.post("/api/agent/token-usage")
 async def agent_merge_token_usage(req: Request):
     _require_agent(req)
-    if not manager.settings.get("sync_token_usage"):
-        return {"enabled": False, "changed": False}
     try:
         changed = manager.merge_token_usage_sync(await req.json())
     except ValueError as exc:

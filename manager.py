@@ -386,7 +386,9 @@ class Manager:
         self._capacity_redeploying_models: set[str] = set()
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
-        self.node_registry = NodeRegistry(self.data_dir, self.http)
+        self.node_registry = NodeRegistry(
+            self.data_dir, self.http, self.agent_credentials.node_id
+        )
         self.virtual_nas = VirtualNAS(
             self.data_dir,
             lambda: Path(self.settings.get("hf_cache") or "") / "hub",
@@ -1138,10 +1140,6 @@ class Manager:
             name=body.get("name"),
             fabric_ip=body.get("fabric_ip"),
             fabric_interface=body.get("fabric_interface"),
-            usage_epoch=copy.deepcopy(self.token_usage_sync.get("epoch")),
-            usage_model_epochs=copy.deepcopy(
-                self.token_usage_sync.get("model_epochs") or {}
-            ),
         )
 
     async def sync_token_usage_once(self) -> dict:
@@ -1161,6 +1159,7 @@ class Manager:
             for node in nodes
         ), return_exceptions=True)
         participating: list[dict] = []
+        reconciling: set[str] = set()
         errors: list[str] = []
         for node, result in zip(nodes, pulls):
             if isinstance(result, Exception):
@@ -1169,7 +1168,11 @@ class Manager:
             if not isinstance(result, dict):
                 continue
             try:
-                self.merge_token_usage_sync(result)
+                if node.get("usage_reconciled") is True:
+                    self.merge_token_usage_sync(result)
+                else:
+                    self.reconcile_token_usage_sync(result, node["id"])
+                    reconciling.add(node["id"])
                 participating.append(node)
             except (OSError, ValueError) as exc:
                 errors.append(f"{node.get('name', node['id'])}: {exc}")
@@ -1178,13 +1181,22 @@ class Manager:
         pushes = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "POST", "/api/agent/token-usage",
-                json_body=snapshot, timeout=5,
+                json_body={
+                    **snapshot,
+                    **(
+                        {"reconcile_origin": node["id"]}
+                        if node["id"] in reconciling else {}
+                    ),
+                },
+                timeout=5,
             )
             for node in participating
         ), return_exceptions=True)
         for node, result in zip(participating, pushes):
             if isinstance(result, Exception):
                 errors.append(f"{node.get('name', node['id'])}: {result}")
+            elif node["id"] in reconciling:
+                self.node_registry.mark_usage_reconciled(node["id"])
 
         status.update({
             "last_sync_at": time.time(),
@@ -3820,14 +3832,17 @@ class Manager:
     def _prune_usage_ledger(cls, ledger: Any) -> bool:
         if not isinstance(ledger, dict):
             return False
-        changed = False
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=USAGE_HOURLY_RETENTION_DAYS)
+        ).replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H")
+        if ledger.get("hourly_retention_cutoff") == cutoff:
+            return False
         for component in (ledger.get("origins") or {}).values():
             if not isinstance(component, dict):
                 continue
-            changed = cls._prune_hourly_usage(
-                component.get("hourly_token_stats")
-            ) or changed
-        return changed
+            cls._prune_hourly_usage(component.get("hourly_token_stats"))
+        ledger["hourly_retention_cutoff"] = cutoff
+        return True
 
     def _load_token_usage_sync(self) -> dict:
         path = self.token_usage_sync_path
@@ -3948,10 +3963,10 @@ class Manager:
         pp_time_s: float | None,
         hour_key: str,
         ended_at: float | None = None,
-    ) -> None:
+    ) -> bool:
         ledger = getattr(self, "token_usage_sync", None)
         if not isinstance(ledger, dict):
-            return
+            return False
         node_id = self._local_usage_node_id()
         origins = ledger.setdefault("origins", {})
         component = origins.setdefault(node_id, {
@@ -3999,12 +4014,13 @@ class Manager:
             gen_time_s,
             ended_at,
         )
-        self._prune_hourly_usage(component.get("hourly_token_stats"))
+        prune_aggregate = self._prune_usage_ledger(ledger)
         component["revision"] = int(component.get("revision") or 0) + 1
         try:
             self._save_token_usage_sync()
         except Exception:
             pass
+        return prune_aggregate
 
     def token_usage_sync_snapshot(self) -> dict:
         if self._prune_usage_ledger(self.token_usage_sync):
@@ -4016,6 +4032,142 @@ class Manager:
             "ledger": copy.deepcopy(self.token_usage_sync),
         }
 
+    def _visible_usage_component(self, ledger: dict, component: Any) -> dict | None:
+        if not isinstance(component, dict):
+            return None
+        visible = copy.deepcopy(component)
+        visible.setdefault("token_stats", {})
+        visible.setdefault("hourly_token_stats", {})
+        visible.setdefault("speed_samples", {})
+        component_epochs = visible.setdefault("model_epochs", {})
+        global_epochs = ledger.get("model_epochs") or {}
+        models = set(visible["token_stats"]) | set(visible["speed_samples"])
+        for hourly_models in visible["hourly_token_stats"].values():
+            if isinstance(hourly_models, dict):
+                models.update(str(model) for model in hourly_models)
+        for model in models:
+            if self._usage_version_key(component_epochs.get(model)) == (
+                self._usage_version_key(global_epochs.get(model))
+            ):
+                continue
+            visible["token_stats"].pop(model, None)
+            visible["speed_samples"].pop(model, None)
+            for hourly_models in visible["hourly_token_stats"].values():
+                if isinstance(hourly_models, dict):
+                    hourly_models.pop(model, None)
+            component_epochs.pop(model, None)
+        for hour_key in list(visible["hourly_token_stats"]):
+            if not visible["hourly_token_stats"][hour_key]:
+                visible["hourly_token_stats"].pop(hour_key, None)
+        return visible
+
+    @staticmethod
+    def _usage_component_models(component: dict) -> set[str]:
+        models = set(str(model) for model in (component.get("token_stats") or {}))
+        models.update(str(model) for model in (component.get("speed_samples") or {}))
+        for hourly_models in (component.get("hourly_token_stats") or {}).values():
+            if isinstance(hourly_models, dict):
+                models.update(str(model) for model in hourly_models)
+        return models
+
+    @staticmethod
+    def _usage_component_revision(component: Any) -> int:
+        try:
+            return max(0, int((component or {}).get("revision") or 0))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def reconcile_token_usage_sync(
+        self, payload: Any, remote_origin_id: str,
+    ) -> None:
+        """Join an existing peer without honoring its pre-cluster resets."""
+        remote = payload.get("ledger") if isinstance(payload, dict) else None
+        if (
+            not isinstance(remote, dict)
+            or remote.get("version") != 1
+            or not isinstance(remote.get("origins"), dict)
+        ):
+            raise ValueError("invalid token usage sync payload")
+        remote = copy.deepcopy(remote)
+        self._prune_usage_ledger(remote)
+        local = self.token_usage_sync
+        self._prune_usage_ledger(local)
+        origins: dict[str, dict] = {}
+        for origin, component in (local.get("origins") or {}).items():
+            visible = self._visible_usage_component(local, component)
+            if visible is not None:
+                origins[str(origin)] = visible
+        remote_component = self._visible_usage_component(
+            remote, (remote.get("origins") or {}).get(remote_origin_id)
+        )
+        if remote_component is None:
+            raise ValueError("peer usage ledger is missing its local origin")
+        current = origins.get(remote_origin_id)
+        if current is None or self._usage_component_revision(
+            remote_component
+        ) >= self._usage_component_revision(current):
+            origins[str(remote_origin_id)] = remote_component
+
+        node_id = self._local_usage_node_id()
+        epoch_counter = max(
+            self._usage_version_key(local.get("epoch"))[0],
+            self._usage_version_key(remote.get("epoch"))[0],
+        ) + 1
+        model_epochs = {
+            str(model): list(self._usage_version_key(version))
+            for model, version in (local.get("model_epochs") or {}).items()
+        }
+        component_models = {
+            origin: self._usage_component_models(component)
+            for origin, component in origins.items()
+        }
+        active_models: set[str] = set()
+        for models in component_models.values():
+            active_models.update(models)
+        for model in active_models:
+            max_counter = self._usage_version_key(model_epochs.get(model))[0]
+            for component in origins.values():
+                max_counter = max(
+                    max_counter,
+                    self._usage_version_key(
+                        (component.get("model_epochs") or {}).get(model)
+                    )[0],
+                )
+            model_epochs[model] = [max_counter + 1, node_id]
+            for origin, component in origins.items():
+                if model in component_models[origin]:
+                    component.setdefault("model_epochs", {})[model] = list(
+                        model_epochs[model]
+                    )
+        self.token_usage_sync = {
+            "version": 1,
+            "epoch": [epoch_counter, node_id],
+            "model_epochs": model_epochs,
+            "origins": origins,
+        }
+        self._prune_usage_ledger(self.token_usage_sync)
+        self._rebuild_synced_token_usage()
+        self._save_token_usage_sync()
+        self._save_token_stats()
+        self._save_hourly_token_stats()
+
+    def _preserve_local_origin_during_reconciliation(self, remote: dict) -> dict:
+        local_node_id = self._local_usage_node_id()
+        local_component = self._visible_usage_component(
+            self.token_usage_sync,
+            (self.token_usage_sync.get("origins") or {}).get(local_node_id),
+        )
+        if local_component is None:
+            return remote
+        remote_epochs = remote.setdefault("model_epochs", {})
+        for model in self._usage_component_models(local_component):
+            remote_epochs.setdefault(model, [0, ""])
+            local_component.setdefault("model_epochs", {})[model] = list(
+                self._usage_version_key(remote_epochs[model])
+            )
+        remote.setdefault("origins", {})[local_node_id] = local_component
+        return remote
+
     def merge_token_usage_sync(self, payload: Any) -> bool:
         remote = payload.get("ledger") if isinstance(payload, dict) else None
         if (
@@ -4025,6 +4177,8 @@ class Manager:
         ):
             raise ValueError("invalid token usage sync payload")
         remote = copy.deepcopy(remote)
+        if payload.get("reconcile_origin") == self._local_usage_node_id():
+            remote = self._preserve_local_origin_during_reconciliation(remote)
         self._prune_usage_ledger(remote)
         local = self.token_usage_sync
         changed = self._prune_usage_ledger(local)
@@ -4087,53 +4241,6 @@ class Manager:
             self._save_token_stats()
             self._save_hourly_token_stats()
         return changed
-
-    def rebase_token_usage_for_pairing(
-        self, epoch: Any, model_epochs: Any,
-    ) -> None:
-        """Start an exclusive pairing in the coordinator's reset domain.
-
-        Only this node's source component crosses the cluster boundary. This
-        prevents usage learned from an old coordinator from being relayed to a
-        new one, while rebasing pre-membership resets so neither side can wipe
-        the other's current counters during the first synchronization.
-        """
-        ledger = getattr(self, "token_usage_sync", {})
-        node_id = self._local_usage_node_id()
-        component = copy.deepcopy(
-            (ledger.get("origins") or {}).get(node_id) or {}
-        )
-        component.setdefault("revision", 0)
-        component.setdefault("token_stats", {})
-        component.setdefault("hourly_token_stats", {})
-        component.setdefault(
-            "speed_samples", copy.deepcopy(getattr(self, "speed_samples", {}))
-        )
-        supplied_model_epochs = model_epochs if isinstance(model_epochs, dict) else {}
-        normalized_model_epochs: dict[str, list[Any]] = {}
-        component_models = set(component["token_stats"]) | set(
-            component["speed_samples"]
-        )
-        for hourly_models in component["hourly_token_stats"].values():
-            if isinstance(hourly_models, dict):
-                component_models.update(str(model) for model in hourly_models)
-        for model in component_models:
-            normalized_model_epochs[str(model)] = list(
-                self._usage_version_key(supplied_model_epochs.get(model))
-            )
-        component["model_epochs"] = copy.deepcopy(normalized_model_epochs)
-        component["revision"] = int(component.get("revision") or 0) + 1
-        self._prune_hourly_usage(component["hourly_token_stats"])
-        self.token_usage_sync = {
-            "version": 1,
-            "epoch": list(self._usage_version_key(epoch)),
-            "model_epochs": copy.deepcopy(normalized_model_epochs),
-            "origins": {node_id: component},
-        }
-        self._rebuild_synced_token_usage()
-        self._save_token_usage_sync()
-        self._save_token_stats()
-        self._save_hourly_token_stats()
 
     def _load_speed_samples(self) -> dict[str, list[dict]]:
         if self.speed_samples_path.exists():
@@ -4227,13 +4334,12 @@ class Manager:
         )
 
     def rolling_generation_speed(self, models: list[str]) -> dict:
-        """Aggregate decode throughput over the newest 1M output tokens.
+        """Aggregate per-origin decode rates without comparing host clocks.
 
-        Active-time intervals are unioned instead of summed. Consequently,
-        five overlapping 10 tok/s requests report about 50 tok/s, while idle
-        gaps between requests do not dilute inference throughput.
+        Intervals are unioned within each node's own clock domain. The node
+        rates are then summed, so wall-clock skew between hosts cannot turn
+        concurrent cluster work into apparently sequential requests.
         """
-        samples = []
         sample_maps: list[dict] = []
         ledger = getattr(self, "token_usage_sync", None)
         if isinstance(ledger, dict):
@@ -4251,8 +4357,10 @@ class Manager:
                 sample_maps.append(eligible)
         if not any(mapping.get(model) for mapping in sample_maps for model in models):
             sample_maps = [getattr(self, "speed_samples", {})]
-        for model in models:
-            for sample_map in sample_maps:
+        origin_speeds = []
+        for sample_map in sample_maps:
+            samples = []
+            for model in models:
                 for raw in sample_map.get(model, []):
                     try:
                         tokens = float(raw.get("tokens") or 0)
@@ -4263,7 +4371,24 @@ class Manager:
                     if tokens <= 0 or ended_at <= started_at:
                         continue
                     samples.append((ended_at, started_at, tokens))
+            speed = self._rolling_speed_for_samples(samples)
+            if speed["tok_s"] is not None:
+                origin_speeds.append(speed)
 
+        if not origin_speeds:
+            return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
+        selected_tokens = sum(speed["tokens"] for speed in origin_speeds)
+        aggregate_rate = sum(speed["tok_s"] for speed in origin_speeds)
+        return {
+            "tokens": selected_tokens,
+            "active_time_s": (
+                selected_tokens / aggregate_rate if aggregate_rate > 0 else 0.0
+            ),
+            "tok_s": aggregate_rate or None,
+        }
+
+    @staticmethod
+    def _rolling_speed_for_samples(samples: list[tuple[float, float, float]]) -> dict:
         if not samples:
             return {"tokens": 0, "active_time_s": 0.0, "tok_s": None}
 
@@ -4420,7 +4545,7 @@ class Manager:
             cached_tokens = prompt_tokens
         hour_key = self._usage_hour_key()
         ended_at = time.time()
-        self._record_local_synced_tokens(
+        prune_aggregate = self._record_local_synced_tokens(
             model,
             prompt_tokens,
             completion_tokens,
@@ -4460,7 +4585,8 @@ class Manager:
         if pp_time_s and pp_time_s > 0 and pp_tokens > 0:
             hrec["pp_tokens"] = hrec.get("pp_tokens", 0) + pp_tokens
             hrec["pp_time_s"] = hrec.get("pp_time_s", 0.0) + pp_time_s
-        self._prune_hourly_usage(self.hourly_token_stats)
+        if prune_aggregate:
+            self._prune_hourly_usage(self.hourly_token_stats)
         try:
             self._save_token_stats()
         except Exception:
@@ -5552,6 +5678,10 @@ class Manager:
             "model_epochs": copy.deepcopy(ledger.get("model_epochs") or {}),
             "origins": origins,
         }
+        if ledger.get("hourly_retention_cutoff"):
+            self.token_usage_sync["hourly_retention_cutoff"] = ledger[
+                "hourly_retention_cutoff"
+            ]
         self._save_token_usage_sync()
 
     def _erase_synced_usage_model(self, model: str) -> None:

@@ -16,7 +16,11 @@ import httpx
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import Manager, ClientAbort, FanSettingsConflict
-from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
+from cluster import (
+    AGENT_PROTOCOL_VERSION,
+    COORDINATOR_ID_HEADER,
+    LOCAL_NODE_ID,
+)
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
 from sparkdeck.onboarding import (
@@ -183,7 +187,10 @@ async def security_headers(request: Request, call_next):
 def _require_agent(request: Request) -> None:
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not manager.agent_credentials.accepts_token(token):
+    controller_id = request.headers.get(COORDINATOR_ID_HEADER, "")
+    if scheme.lower() != "bearer" or not manager.agent_credentials.authorize_controller(
+        token, controller_id
+    ):
         raise HTTPException(401, "invalid node-agent token")
 
 
@@ -407,11 +414,9 @@ async def agent_pair(req: Request):
     body = await req.json()
     try:
         pairing_code = body.get("pairing_code") or ""
-        manager.agent_credentials.validate_pairing_code(pairing_code)
-        manager.rebase_token_usage_for_pairing(
-            body.get("usage_epoch"), body.get("usage_model_epochs")
+        result = manager.agent_credentials.pair(
+            pairing_code, body.get("controller_id") or ""
         )
-        result = manager.agent_credentials.pair(pairing_code)
     except ValueError as exc:
         raise HTTPException(403, str(exc)) from exc
     result["name"] = manager.settings.get("cluster_node_name")

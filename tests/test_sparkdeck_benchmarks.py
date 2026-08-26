@@ -117,7 +117,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         deployment = {
             "id": "dep-remote", "alias": "remote-model", "kind": "managed",
             "runtime": "vllm", "model": {"repository": "org/model"},
-            "settings": {"manager_deployment_id": "manager-deployment"},
+            "settings": {
+                "manager_deployment_id": "manager-deployment",
+                "context_length": 4096,
+            },
         }
 
         await self.service._proxy_managed(
@@ -153,6 +156,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.add_deployment(Deployment(
                 id=deployment_id, alias=alias, runtime=RuntimeKind.LLAMA_CPP,
                 kind=kind, model=ModelIdentity("org/model"), base_url_set=True,
+                settings={"context_length": 4096},
             ), "http://127.0.0.1:8080")
             await self.service.proxy(
                 {"model": alias, "messages": [], "stream": False},

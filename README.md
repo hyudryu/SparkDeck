@@ -76,7 +76,7 @@ Requests made through SparkDeck can be queued, measured, and used to refresh the
 
 SparkDeck records successful proxied inference measurements locally. Benchmark records may include the model revision and artifact, quantization, runtime and version, hardware class, deployment settings, token counts, latency, time to first token, and generation throughput.
 
-SparkDeck does **not** include prompts, generated text, API keys, endpoint URLs, hostnames, IP addresses, or local filesystem paths in community upload payloads. Community sharing is off by default. When cloud support becomes available, enabling it will require explicit consent, and queued samples will remain reviewable and deletable locally.
+Community upload payloads contain exactly three fields: `model_id`, `context_window_size`, and `inference_tokens_per_second`. Richer benchmark details remain local; SparkDeck does **not** upload prompts, generated text, API keys, endpoint URLs, hostnames, IP addresses, hardware details, runtime settings, token counts, revisions, quantization, latency, or local filesystem paths. Community sharing is off by default. When cloud support becomes available, enabling it will require explicit consent, and queued samples will remain reviewable and deletable locally.
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
 

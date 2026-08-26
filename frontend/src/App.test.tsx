@@ -217,15 +217,18 @@ describe('model deployments', () => {
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Spark One', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
         { id: 'node-2', name: 'Spark Two', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
+        { id: 'node-3', name: 'Spark Three', online: true, total_size: 100 * gib, models: [] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{
         id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
-        deployment_mode: 'replicated', node_ids: ['local', 'node-2'], extra_args_count: 2,
+        deployment_mode: 'sharded', required_node_count: 2, tensor_parallel_size: 2,
+        pipeline_parallel_size: 1, node_ids: ['local', 'node-2'], extra_args_count: 2,
       }] } : path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
         model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local', 'node-2'],
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true },
       ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -235,8 +238,26 @@ describe('model deployments', () => {
     expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Saved cluster configurations' })).toBeInTheDocument()
     expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Deploy saved config' }))
-    expect(await screen.findByText('Deployed saved configuration Saved cluster.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved cluster' })
+    expect(dialog).toHaveTextContent('TP2 requires exactly 2 nodes')
+    expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
+    const secondNode = within(dialog).getByRole('checkbox', { name: /Spark Two/ })
+    expect(secondNode).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Three/ })).toBeDisabled()
+    expect(dialog).toHaveTextContent('Model weights not cached')
+
+    await user.click(secondNode)
+    expect(within(dialog).getByRole('button', { name: 'Deploy on 2 nodes' })).toBeDisabled()
+    expect(dialog).toHaveTextContent('Select exactly 2 nodes to continue')
+    await user.click(secondNode)
+    await user.click(within(dialog).getByRole('button', { name: 'Deploy on 2 nodes' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-1/deploy',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['local', 'node-2'] }) }),
+    ))
+    expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
   it('surfaces saved-configuration failures without hiding deployment state', async () => {

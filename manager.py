@@ -488,22 +488,59 @@ class Manager:
         self._online_users_ts = 0.0
 
     # ---------- lifecycle ----------
-    async def start(self):
-        self.worker_task = asyncio.create_task(self._worker_loop())
-        self.idle_task = asyncio.create_task(self._idle_monitor_loop())
-        self.cluster_health_task = asyncio.create_task(self._cluster_health_monitor_loop())
-        self.deployment_capacity_task = asyncio.create_task(
-            self._deployment_capacity_monitor_loop()
+    def is_joined_worker(self) -> bool:
+        """Return whether this process has a durable controller assignment."""
+        path = self.data_dir / "controller.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return bool(
+                value.get("controller_url")
+                and value.get("forward_token")
+                and value.get("node_id")
+            )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return False
+
+    def _start_controller_tasks(self) -> None:
+        task_factories = (
+            ("worker_task", self._worker_loop),
+            ("idle_task", self._idle_monitor_loop),
+            ("cluster_health_task", self._cluster_health_monitor_loop),
+            ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
+            ("fan_cluster_task", self._fan_cluster_monitor_loop),
+            ("inference_nudger_task", self._inference_nudger_loop),
+            ("token_usage_sync_task", self._token_usage_sync_loop),
         )
-        self.fan_cluster_task = asyncio.create_task(self._fan_cluster_monitor_loop())
+        for field, factory in task_factories:
+            current = getattr(self, field, None)
+            if current is None or current.done():
+                setattr(self, field, asyncio.create_task(factory()))
+
+    async def adopt_worker_role(self) -> None:
+        """Stop controller-only schedulers after a successful live join."""
+        for field in (
+            "worker_task", "idle_task", "cluster_health_task",
+            "deployment_capacity_task", "fan_cluster_task",
+            "inference_nudger_task", "token_usage_sync_task",
+        ):
+            task = getattr(self, field, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            setattr(self, field, None)
+
+    def adopt_controller_role(self) -> None:
+        """Resume controller schedulers after leaving a controller."""
+        self._start_controller_tasks()
+
+    async def start(self):
+        if not self.is_joined_worker():
+            self._start_controller_tasks()
         self.temperature_history_task = asyncio.create_task(
             self._temperature_history_monitor_loop()
-        )
-        self.inference_nudger_task = asyncio.create_task(
-            self._inference_nudger_loop()
-        )
-        self.token_usage_sync_task = asyncio.create_task(
-            self._token_usage_sync_loop()
         )
         self._start_mem_bw_monitor()
 
@@ -1786,6 +1823,96 @@ class Manager:
             json_body=payload,
             timeout=1800,
         )
+
+    def _cluster_primary_member(self, deployment_id: str) -> tuple[dict, dict]:
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise LookupError("cluster deployment not found")
+        members = sorted(
+            deployment.get("members") or [], key=lambda member: int(member.get("rank") or 0)
+        )
+        if not members:
+            raise LookupError("cluster deployment has no inference member")
+        return deployment, members[0]
+
+    async def proxy_cluster_inference(
+        self,
+        deployment_id: str,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None = None,
+    ):
+        """Proxy through the selected primary member without bypassing admission."""
+        deployment, primary = self._cluster_primary_member(deployment_id)
+        node_id = primary.get("node_id")
+        if node_id == LOCAL_NODE_ID:
+            return (
+                await self._vllm_chat(model, body, bool(body.get("stream")), cancel)
+                if endpoint == "chat/completions"
+                else await self._vllm_completions(model, body, bool(body.get("stream")), cancel)
+            )
+        if not node_id:
+            raise LookupError("cluster primary node is unavailable")
+
+        controls = self._deployment_launch_controls(deployment.get("launch_settings") or {})
+        admission_container = {
+            "deployment_id": deployment_id,
+            "name": primary.get("container_name"),
+            "stats_key": model,
+            "load_settings": {"max_concurrency": controls.get("max_concurrency")},
+        }
+        admission = await self._acquire_inference_slot(admission_container, model, cancel)
+        path = f"/api/agent/inference/{endpoint}"
+        if body.get("stream"):
+            try:
+                response = await self._await_or_cancel(
+                    self.node_registry.open_stream(
+                        node_id, "POST", path, json_body=body, timeout=600,
+                    ),
+                    cancel,
+                )
+                if response.status_code >= 400:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")
+                    await response.aclose()
+                    raise RuntimeError(f"remote inference failed: HTTP {response.status_code}: {detail[:500]}")
+            except BaseException:
+                self._release_inference_slot(admission)
+                raise
+
+            async def stream_remote():
+                try:
+                    async for line in self._aiter_lines_cancellable(response, cancel):
+                        if line:
+                            yield f"{line}\n\n"
+                finally:
+                    await response.aclose()
+                    self._release_inference_slot(admission)
+
+            return stream_remote()
+
+        try:
+            return await self._await_or_cancel(
+                self.node_registry.request(
+                    node_id, "POST", path, json_body=body, timeout=600,
+                ),
+                cancel,
+            )
+        finally:
+            self._release_inference_slot(admission)
+
+    async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
+        """Check the selected primary member through its authenticated agent."""
+        _, primary = self._cluster_primary_member(deployment_id)
+        node_id = primary.get("node_id")
+        if node_id == LOCAL_NODE_ID:
+            container = await self._resolve_vllm_target(model)
+            return await self._check_ready(container)
+        result = await self.node_registry.request(
+            node_id, "POST", "/api/agent/inference/health",
+            json_body={"model": model}, timeout=10,
+        )
+        return bool((result or {}).get("ready"))
 
     async def create_deployment(self, body: dict) -> dict:
         body = dict(body)

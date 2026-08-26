@@ -83,6 +83,10 @@ class FakeServiceManager:
             ],
         })
         self.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.proxy_cluster_inference = AsyncMock(return_value={
+            "choices": [{"message": {"content": "remote"}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 20},
+        })
         self.list_containers = AsyncMock(return_value=[])
         self.remove_container = AsyncMock(return_value={"ok": True})
 
@@ -135,12 +139,32 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listed["node_ids"], ["local", "remote-1"])
         self.assertEqual([item["id"] for item in listed["selected_nodes"]], ["local", "remote-1"])
 
-    async def test_remote_only_run_is_rejected_until_coordinator_proxy_exists(self):
-        with self.assertRaisesRegex(ValueError, "coordinator node must be included"):
-            await self.service.create_deployment({
-                "model": "org/model", "runtime": "sglang", "node_id": "remote-1",
-            })
-        self.manager.create_deployment.assert_not_awaited()
+    async def test_remote_only_run_launches_and_uses_agent_inference_tunnel(self):
+        self.manager.create_deployment.return_value = {
+            "id": "remote-cluster", "status": "starting", "api_port": 8010,
+            "node_ids": ["remote-1"],
+            "members": [{
+                "node_id": "remote-1", "node_name": "Worker",
+                "container_name": "remote-rank-0",
+            }],
+        }
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "remote-model",
+            "runtime": "sglang", "node_id": "remote-1",
+        })
+
+        response = await self.service.proxy({
+            "model": "remote-model", "messages": [], "stream": False,
+        }, "chat/completions")
+
+        self.assertEqual(created["node_ids"], ["remote-1"])
+        self.assertEqual(created["selected_nodes"][0]["id"], "remote-1")
+        self.assertEqual(response["model"], "remote-model")
+        self.manager.proxy_cluster_inference.assert_awaited_once()
+        self.assertEqual(
+            self.manager.proxy_cluster_inference.await_args.args[:2],
+            ("remote-cluster", "org/model"),
+        )
 
     async def test_cluster_lifecycle_dispatches_to_owning_manager_deployment(self):
         await self.service.create_deployment({
@@ -161,6 +185,79 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
 
 def result_id_for(service: SparkDeckService, alias: str) -> str:
     return service.store.deployment(alias)["id"]
+
+
+class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
+    def manager(self):
+        manager = Manager.__new__(Manager)
+        manager.deployments = [{
+            "id": "remote-cluster", "model": "org/model",
+            "launch_settings": {},
+            "members": [{
+                "rank": 0, "node_id": "remote-1", "container_name": "rank-0",
+            }],
+        }]
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(return_value={"choices": [], "usage": {}})
+        manager._acquire_inference_slot = AsyncMock(return_value="remote-cluster")
+        manager._release_inference_slot = Mock()
+        return manager
+
+    async def test_remote_nonstream_uses_authenticated_agent_and_admission(self):
+        manager = self.manager()
+        body = {"model": "org/model", "messages": [], "stream": False}
+
+        result = await manager.proxy_cluster_inference(
+            "remote-cluster", "org/model", body, "chat/completions",
+        )
+
+        self.assertEqual(result, {"choices": [], "usage": {}})
+        manager._acquire_inference_slot.assert_awaited_once()
+        manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "POST", "/api/agent/inference/chat/completions",
+            json_body=body, timeout=600,
+        )
+        manager._release_inference_slot.assert_called_once_with("remote-cluster")
+
+    async def test_remote_health_uses_selected_primary_agent(self):
+        manager = self.manager()
+        manager.node_registry.request.return_value = {"ready": True}
+
+        ready = await manager.cluster_deployment_health("remote-cluster", "org/model")
+
+        self.assertTrue(ready)
+        manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "POST", "/api/agent/inference/health",
+            json_body={"model": "org/model"}, timeout=10,
+        )
+
+    async def test_remote_stream_releases_admission_after_agent_stream(self):
+        class Response:
+            status_code = 200
+
+            def __init__(self):
+                self.closed = False
+
+            async def aiter_lines(self):
+                yield 'data: {"choices": []}'
+                yield "data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        manager = self.manager()
+        response = Response()
+        manager.node_registry.open_stream = AsyncMock(return_value=response)
+        body = {"model": "org/model", "messages": [], "stream": True}
+
+        stream = await manager.proxy_cluster_inference(
+            "remote-cluster", "org/model", body, "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertTrue(response.closed)
+        manager._release_inference_slot.assert_called_once_with("remote-cluster")
 
 
 class RemovedOllamaTests(unittest.IsolatedAsyncioTestCase):

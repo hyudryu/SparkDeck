@@ -15,8 +15,6 @@ from urllib.parse import urlparse
 
 import httpx
 
-from cluster import LOCAL_NODE_ID
-
 from .catalog import HuggingFaceCatalog
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtimes import (
@@ -42,7 +40,10 @@ class SparkDeckService:
         self.manager = manager
         self.store = SparkDeckStore(Path(data_dir) / "sparkdeck.sqlite3")
         self.registry = RuntimeRegistry()
-        self.catalog = HuggingFaceCatalog(manager.http)
+        self.catalog = HuggingFaceCatalog(
+            manager.http,
+            token_provider=lambda: getattr(manager, "_resolved_hf_token", lambda: "")(),
+        )
         self._deployment_create_lock = asyncio.Lock()
 
     async def close(self) -> None:
@@ -63,7 +64,7 @@ class SparkDeckService:
         # remain searchable when the public catalog cannot be reached.
         try:
             remote_items = await self.catalog.search(query, limit)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError, TypeError):
             remote_items = []
 
         items_by_id = {
@@ -245,10 +246,6 @@ class SparkDeckService:
                 if runtime is RuntimeKind.LLAMA_CPP:
                     raise ValueError(
                         "explicit node selection currently supports managed vLLM and SGLang deployments"
-                    )
-                if LOCAL_NODE_ID not in requested_node_ids:
-                    raise ValueError(
-                        "the coordinator node must be included in managed deployment targets"
                     )
                 selected = await self.manager.selected_cluster_nodes(requested_node_ids)
                 mode = deployment_mode or (
@@ -543,12 +540,19 @@ class SparkDeckService:
         upstream_body = {**body, "model": model}
         stream = bool(upstream_body.get("stream"))
         started = time.monotonic()
-        result = (
-            await self.manager._vllm_chat(model, upstream_body, stream, cancel)
-            if endpoint == "chat/completions"
-            else await self.manager._vllm_completions(model, upstream_body, stream, cancel)
-        )
         settings = deployment.get("settings") or {}
+        manager_id = settings.get("manager_deployment_id")
+        result = (
+            await self.manager.proxy_cluster_inference(
+                manager_id, model, upstream_body, endpoint, cancel,
+            )
+            if manager_id
+            else (
+                await self.manager._vllm_chat(model, upstream_body, stream, cancel)
+                if endpoint == "chat/completions"
+                else await self.manager._vllm_completions(model, upstream_body, stream, cancel)
+            )
+        )
         revision = deployment["model"].get("revision")
         if hasattr(result, "__aiter__"):
             return self._observe_stream(

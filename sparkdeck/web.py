@@ -15,6 +15,7 @@ SPA_PATHS = (
     "/models",
     "/chat",
     "/compare",
+    "/cluster",
     "/benchmarks",
     "/images",
     "/settings",

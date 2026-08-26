@@ -2,31 +2,64 @@ import asyncio
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 import httpx
 
-from cluster import AgentCredentials, NodeRegistry, normalize_agent_url
+from cluster import (
+    COORDINATOR_ID_HEADER,
+    AgentCredentials,
+    NodeRegistry,
+    normalize_agent_url,
+)
 from manager import Manager
 
 
 class AgentCredentialsTests(unittest.TestCase):
-    def test_pairing_code_is_one_time_and_token_is_durable(self) -> None:
+    def test_pairing_code_and_previous_controller_token_are_rotated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             credentials = AgentCredentials(Path(directory))
             code = credentials.data["pairing_code"]
+            previous_token = credentials.data["agent_token"]
 
-            paired = credentials.pair(code)
+            paired = credentials.pair(code, "controller-a")
 
             self.assertTrue(credentials.accepts_token(paired["agent_token"]))
+            self.assertFalse(credentials.accepts_token(previous_token))
             self.assertNotEqual(credentials.data["pairing_code"], code)
             with self.assertRaisesRegex(ValueError, "invalid pairing code"):
-                credentials.pair(code)
+                credentials.pair(code, "controller-a")
             self.assertEqual(
                 oct((Path(directory) / "agent.json").stat().st_mode & 0o777),
                 "0o600",
             )
+
+    def test_pairing_does_not_activate_credentials_before_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = AgentCredentials(Path(directory))
+            original = dict(credentials.data)
+
+            with mock.patch(
+                "cluster._atomic_json_write", side_effect=OSError("disk full")
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    credentials.pair(original["pairing_code"], "controller-a")
+
+            self.assertEqual(credentials.data, original)
+            self.assertTrue(credentials.accepts_token(original["agent_token"]))
+
+    def test_legacy_token_is_claimed_by_only_one_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = AgentCredentials(Path(directory))
+            token = credentials.data["agent_token"]
+
+            self.assertTrue(credentials.authorize_controller(token, "controller-a"))
+            self.assertTrue(credentials.authorize_controller(token, "controller-a"))
+            self.assertFalse(credentials.authorize_controller(token, "controller-b"))
+            reloaded = AgentCredentials(Path(directory))
+            self.assertFalse(reloaded.authorize_controller(token, "controller-b"))
 
     def test_agent_url_rejects_embedded_credentials(self) -> None:
         self.assertEqual(normalize_agent_url("http://spark-2:7878/"), "http://spark-2:7878")
@@ -66,6 +99,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.path, "/api/agent/pair")
+            self.assertEqual(json.loads(request.content), {
+                "pairing_code": "123456",
+                "controller_id": "controller",
+            })
             return httpx.Response(200, json={
                 "node_id": "remote-1",
                 "agent_token": "durable-secret",
@@ -76,9 +113,9 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             try:
-                registry = NodeRegistry(Path(directory), client)
+                registry = NodeRegistry(Path(directory), client, "controller")
                 public = await registry.pair_remote(
-                    "http://spark-2:7878", "123456", fabric_ip="169.254.10.2"
+                    "http://spark-2:7878", "123456", fabric_ip="169.254.10.2",
                 )
             finally:
                 await client.aclose()
@@ -86,12 +123,14 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads((Path(directory) / "nodes.json").read_text())
             self.assertEqual(saved[0]["agent_token"], "durable-secret")
             self.assertEqual(saved[0]["fabric_ip"], "169.254.10.2")
+            self.assertFalse(saved[0]["usage_reconciled"])
 
     async def test_probe_distinguishes_online_and_degraded_nodes(self) -> None:
         docker_ready = True
 
         async def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.headers["authorization"], "Bearer secret")
+            self.assertEqual(request.headers[COORDINATOR_ID_HEADER], "controller")
             return httpx.Response(200, json={
                 "node_id": "remote-1",
                 "protocol_version": 1,
@@ -105,7 +144,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             try:
-                registry = NodeRegistry(Path(directory), client)
+                registry = NodeRegistry(Path(directory), client, "controller")
                 node = {
                     "id": "remote-1", "name": "Spark 2",
                     "agent_url": "http://spark-2:7878", "agent_token": "secret",
@@ -439,7 +478,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         root: Path, node_id: str, token_stats: dict, hourly: dict,
     ) -> Manager:
         instance = Manager.__new__(Manager)
-        instance.settings = {"sync_token_usage": True}
+        instance.settings = {}
         instance.agent_credentials = mock.Mock(node_id=node_id)
         instance.token_stats = json.loads(json.dumps(token_stats))
         instance.hourly_token_stats = json.loads(json.dumps(hourly))
@@ -644,6 +683,79 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(node1.merge_token_usage_sync(union))
             self.assertEqual(node1.token_stats, before)
 
+    async def test_token_usage_sync_always_pulls_every_paired_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller",
+                {"model/a": {"input": 10, "output": 2, "requests": 1}},
+                {"2026-08-26T18": {"model/a": {"input": 10, "output": 2}}},
+            )
+            worker = self._usage_sync_manager(
+                root, "worker",
+                {"model/b": {"input": 20, "output": 4, "requests": 1}},
+                {"2026-08-26T18": {"model/b": {"input": 20, "output": 4}}},
+            )
+            worker._reset_synced_token_usage()
+            worker._record_local_synced_tokens(
+                "model/b", 20, 4, 0, None, None, "2026-08-26T18"
+            )
+            worker._rebuild_synced_token_usage()
+            requests = []
+
+            class Registry:
+                nodes = [{"id": "worker", "name": "Worker", "enabled": True}]
+
+                async def request(self, node_id, method, path, **kwargs):
+                    requests.append((node_id, method, path, kwargs))
+                    if method == "GET":
+                        # Older workers reported this hidden opt-in as false,
+                        # but their ledger is still valid and must be counted.
+                        return {
+                            **worker.token_usage_sync_snapshot(),
+                            "enabled": False,
+                        }
+                    worker.merge_token_usage_sync(kwargs["json_body"])
+                    return {"enabled": True, "changed": True}
+
+                def mark_usage_reconciled(self, node_id):
+                    self.nodes[0]["usage_reconciled"] = True
+
+            controller.node_registry = Registry()
+            controller._token_usage_sync_status = {
+                "enabled": False, "last_sync_at": None,
+                "peers": 0, "error": None,
+            }
+
+            status = await controller.sync_token_usage_once()
+
+            self.assertTrue(status["enabled"])
+            self.assertEqual(status["peers"], 1)
+            self.assertIsNone(status["error"])
+            self.assertEqual(controller.token_stats["model/a"]["input"], 10)
+            self.assertEqual(controller.token_stats["model/b"]["input"], 20)
+            self.assertEqual(worker.token_stats["model/a"]["input"], 10)
+            self.assertTrue(controller.node_registry.nodes[0]["usage_reconciled"])
+            self.assertEqual(
+                [(method, path) for _, method, path, _ in requests],
+                [("GET", "/api/agent/token-usage"),
+                 ("POST", "/api/agent/token-usage")],
+            )
+
+    def test_legacy_usage_sync_opt_out_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "sync_token_usage": False,
+                "max_retries": 7,
+            }))
+
+            settings = instance._load_settings()
+
+        self.assertNotIn("sync_token_usage", settings)
+        self.assertEqual(settings["max_retries"], 7)
+
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -670,6 +782,220 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             # Lifetime reset preserves historical hourly analysis counters.
             self.assertIn("model/a", node2.hourly_token_stats["2026-08-15T07"])
             self.assertIn("model/b", node2.hourly_token_stats["2026-08-15T07"])
+
+    def test_first_sync_reconciles_reset_without_erasing_either_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model/a": {"input": 10}},
+                {"2026-08-15T07": {"model/a": {"input": 10}}},
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model/b": {"input": 20}},
+                {"2026-08-15T07": {"model/b": {"input": 20}}},
+            )
+            worker._reset_synced_token_usage()
+            worker._record_local_synced_tokens(
+                "model/b", 20, 0, 0, None, None, "2026-08-15T07"
+            )
+            worker._rebuild_synced_token_usage()
+
+            controller.reconcile_token_usage_sync(
+                worker.token_usage_sync_snapshot(), "worker"
+            )
+
+            self.assertEqual(controller.token_stats["model/a"]["input"], 10)
+            self.assertEqual(controller.token_stats["model/b"]["input"], 20)
+
+    def test_reconciliation_preserves_usage_recorded_during_first_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model/a": {"input": 10}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model/b": {"input": 20}}, {}
+            )
+            controller.reconcile_token_usage_sync(
+                worker.token_usage_sync_snapshot(), "worker"
+            )
+            union = {
+                **controller.token_usage_sync_snapshot(),
+                "reconcile_origin": "worker",
+            }
+            worker._record_local_synced_tokens(
+                "model/b", 5, 0, 0, None, None, "2026-08-26T19"
+            )
+            worker._rebuild_synced_token_usage()
+
+            worker.merge_token_usage_sync(union)
+
+            self.assertEqual(worker.token_stats["model/a"]["input"], 10)
+            self.assertEqual(worker.token_stats["model/b"]["input"], 25)
+
+    def test_reconciliation_preserves_coordinator_model_tombstones(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model/a": {"input": 10}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model/b": {"input": 20}}, {}
+            )
+            controller.token_usage_sync["model_epochs"]["future/model"] = [
+                4, "controller",
+            ]
+            controller.reconcile_token_usage_sync(
+                worker.token_usage_sync_snapshot(), "worker"
+            )
+            union = {
+                **controller.token_usage_sync_snapshot(),
+                "reconcile_origin": "worker",
+            }
+
+            worker._record_local_synced_tokens(
+                "future/model", 7, 0, 0, None, None, "2026-08-26T19"
+            )
+            worker._rebuild_synced_token_usage()
+            worker.merge_token_usage_sync(union)
+
+            self.assertEqual(
+                worker.token_usage_sync["model_epochs"]["future/model"],
+                [4, "controller"],
+            )
+            self.assertEqual(
+                worker.token_usage_sync["origins"]["worker"]["model_epochs"][
+                    "future/model"
+                ],
+                [4, "controller"],
+            )
+            self.assertEqual(worker.token_stats["future/model"]["input"], 7)
+
+    def test_reconciliation_drops_usage_learned_from_a_previous_cluster(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_controller = self._usage_sync_manager(
+                root, "old-controller", {"private/model": {"input": 99}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"local/model": {"input": 20}}, {}
+            )
+            worker.merge_token_usage_sync(
+                old_controller.token_usage_sync_snapshot()
+            )
+            new_controller = self._usage_sync_manager(
+                root, "new-controller", {"new/model": {"input": 5}}, {}
+            )
+
+            new_controller.reconcile_token_usage_sync(
+                worker.token_usage_sync_snapshot(), "worker"
+            )
+
+            self.assertEqual(
+                set(new_controller.token_usage_sync["origins"]),
+                {"new-controller", "worker"},
+            )
+            self.assertEqual(
+                set(new_controller.token_stats), {"new/model", "local/model"}
+            )
+
+    def test_rolling_speed_combines_samples_from_every_cluster_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model": {"output": 100}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model": {"output": 200}}, {}
+            )
+            controller.token_usage_sync["origins"]["controller"][
+                "speed_samples"
+            ] = {"model": [{
+                "tokens": 100, "started_at": 1000, "ended_at": 1010,
+            }]}
+            worker.token_usage_sync["origins"]["worker"]["speed_samples"] = {
+                "model": [{
+                    "tokens": 200, "started_at": 1000, "ended_at": 1010,
+                }]
+            }
+            controller.merge_token_usage_sync(worker.token_usage_sync_snapshot())
+
+            speed = controller.rolling_generation_speed(["model"])
+
+            self.assertEqual(speed["tokens"], 300)
+            self.assertAlmostEqual(speed["active_time_s"], 10.0)
+            self.assertAlmostEqual(speed["tok_s"], 30.0)
+
+    def test_cluster_speed_is_independent_of_remote_wall_clock_skew(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._usage_sync_manager(
+                root, "controller", {"model": {"output": 100}}, {}
+            )
+            worker = self._usage_sync_manager(
+                root, "worker", {"model": {"output": 200}}, {}
+            )
+            controller.token_usage_sync["origins"]["controller"][
+                "speed_samples"
+            ] = {"model": [{
+                "tokens": 100, "started_at": 1000, "ended_at": 1010,
+            }]}
+            worker.token_usage_sync["origins"]["worker"]["speed_samples"] = {
+                "model": [{
+                    "tokens": 200, "started_at": 1060, "ended_at": 1070,
+                }]
+            }
+            controller.merge_token_usage_sync(worker.token_usage_sync_snapshot())
+
+            speed = controller.rolling_generation_speed(["model"])
+
+            self.assertEqual(speed["tokens"], 300)
+            self.assertAlmostEqual(speed["tok_s"], 30.0)
+
+    def test_hourly_usage_is_utc_and_bounded_to_activity_window(self) -> None:
+        with mock.patch("manager.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 8, 26, 18)
+            self.assertEqual(Manager._usage_hour_key(), "2026-08-26T18")
+            mocked_datetime.now.assert_called_once_with(timezone.utc)
+
+        hourly = {
+            "2025-08-20T00": {"model": {"input": 1}},
+            "2025-08-22T00": {"model": {"input": 2}},
+            "2026-08-26T18": {"model": {"input": 3}},
+        }
+        changed = Manager._prune_hourly_usage(
+            hourly, datetime(2026, 8, 26, 18, tzinfo=timezone.utc)
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("2025-08-20T00", hourly)
+        self.assertIn("2025-08-22T00", hourly)
+        self.assertIn("2026-08-26T18", hourly)
+
+    def test_hourly_ledger_pruning_scans_at_most_once_per_utc_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self._usage_sync_manager(
+                Path(directory), "worker", {"model": {"input": 1}},
+                {"2026-08-26T18": {"model": {"input": 1}}},
+            )
+            instance.token_usage_sync["hourly_retention_cutoff"] = "stale"
+
+            with mock.patch.object(
+                Manager,
+                "_prune_hourly_usage",
+                wraps=Manager._prune_hourly_usage,
+            ) as prune:
+                instance._record_local_synced_tokens(
+                    "model", 1, 0, 0, None, None, "2026-08-26T19"
+                )
+                first_count = prune.call_count
+                instance._record_local_synced_tokens(
+                    "model", 1, 0, 0, None, None, "2026-08-26T19"
+                )
+                instance.token_usage_sync_snapshot()
+
+            self.assertEqual(first_count, 1)
+            self.assertEqual(prune.call_count, 1)
 
     def test_usage_merge_group_combines_counters_cost_and_concurrent_speed(self) -> None:
         instance = Manager.__new__(Manager)

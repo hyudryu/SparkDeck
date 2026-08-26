@@ -183,7 +183,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_storage_routes_require_a_paired_node_token(self):
         with patch.object(
-            server.manager.agent_credentials, "accepts_token", return_value=False,
+            server.manager.agent_credentials, "authorize_controller", return_value=False,
         ):
             responses = [
                 await self.client.get("/api/agent/virtual-nas/inventory"),
@@ -225,7 +225,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         })
         with (
             patch.object(
-                server.manager.agent_credentials, "accepts_token", return_value=True,
+                server.manager.agent_credentials, "authorize_controller", return_value=True,
             ),
             patch.object(server.manager, "virtual_nas", virtual_nas, create=True),
             patch.object(server.manager, "delete_virtual_nas_model", delete),
@@ -266,7 +266,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         delegated = AsyncMock(return_value=inventory_scan.return_value)
         with (
             patch.object(
-                server.manager.agent_credentials, "accepts_token", return_value=True,
+                server.manager.agent_credentials, "authorize_controller", return_value=True,
             ),
             patch.object(server.manager, "virtual_nas", virtual_nas, create=True),
             patch.object(server.asyncio, "to_thread", delegated),
@@ -287,7 +287,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(
-                server.manager.agent_credentials, "accepts_token", return_value=True,
+                server.manager.agent_credentials, "authorize_controller", return_value=True,
             ),
             patch.object(server.manager, "virtual_nas", virtual_nas, create=True),
         ):

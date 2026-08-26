@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
 import { THEME_STORAGE_KEY } from '../theme'
+import { SPARKDECK_VERSION } from '../buildInfo'
 
 afterEach(() => {
   cleanup()
@@ -12,21 +13,30 @@ afterEach(() => {
   delete document.documentElement.dataset.theme
 })
 
-describe('theme persistence', () => {
+describe('settings page', () => {
+  it('shows the version embedded when the frontend was built', () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({
+      theme: 'system', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(screen.getByLabelText('SparkDeck version')).toHaveTextContent(`Version ${SPARKDECK_VERSION}`)
+  })
+
   it('restores the saved theme and only persists a new selection after save', async () => {
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: ['No published GitHub release is available'], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(init?.method === 'PUT' ? {
+        theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
+      } : {
         theme: 'dark',
         hf_token: '',
         hf_token_configured: false,
         community_api_url: '',
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        theme: 'light',
-        hf_token: '',
-        hf_token_configured: false,
-        community_api_url: '',
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
@@ -56,13 +66,12 @@ describe('theme persistence', () => {
   })
 
   it('keeps a configured Hugging Face key masked and saves a replacement write-only', async () => {
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
         theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
@@ -92,17 +101,18 @@ describe('theme persistence', () => {
   })
 
   it('keeps save enabled when the update fails', async () => {
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'PUT') return new Response(JSON.stringify({ detail: 'save failed' }), {
+        status: 500, headers: { 'Content-Type': 'application/json' },
+      })
+      return new Response(JSON.stringify({
         theme: 'system',
         hf_token: '',
         hf_token_configured: false,
         community_api_url: '',
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'save failed' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      }))
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
@@ -116,5 +126,42 @@ describe('theme persistence', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('save failed')
     expect(credential).toHaveValue('hf_retry_secret')
     expect(save).toBeEnabled()
+  })
+
+  it('confirms and starts one cluster-wide release update', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('system-update')) return new Response(JSON.stringify(init?.method === 'POST' ? {
+        id: 'job-1', active: true, phase: 'preflight', target_tag: 'v0.9.0', target_revision: 'b'.repeat(40), nodes: [],
+      } : {
+        repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
+        current_release_tag: 'v1.0.0',
+        releases: [
+          { tag: 'v1.1.0', name: 'Version 1.1' },
+          { tag: 'v1.0.0', name: 'Version 1.0' },
+          { tag: 'v0.9.0', name: 'Version 0.9' },
+        ],
+        latest_release: { tag: 'v1.1.0', name: 'Version 1.1' },
+        can_update: true, blockers: [], nodes: [{ id: 'local', name: 'Controller', local: true, online: true, current_revision: 'a'.repeat(40), blockers: [] }],
+      }), { status: init?.method === 'POST' ? 202 : 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ theme: 'system', default_runtime: 'vllm', default_context_length: 8192 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const release = await screen.findByRole('combobox', { name: 'Release version' })
+    expect(release).toHaveValue('v1.1.0')
+    expect(screen.getByRole('option', { name: /Version 1.0.*installed/ })).toBeInTheDocument()
+    await user.selectOptions(release, 'v1.0.0')
+    expect(screen.getByRole('button', { name: 'Installed on all nodes' })).toBeDisabled()
+    await user.selectOptions(release, 'v0.9.0')
+    await user.click(screen.getByRole('button', { name: 'Install on all nodes' }))
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/v0\.9\.0.*may upgrade or downgrade.*controller restarts last/i))
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/system-update', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', tag: 'v0.9.0' }),
+    }))
   })
 })

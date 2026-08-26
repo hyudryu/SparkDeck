@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -72,10 +71,11 @@ class LlamaCppAdapter(RuntimeAdapter):
     default_image = "ghcr.io/ggml-org/llama.cpp:server-cuda"
 
     def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
-        artifact = settings.get("artifact") or model
+        artifact = str(settings.get("artifact") or model)
         volumes = None
-        if os.path.isabs(artifact):
-            resolved = str(Path(artifact).expanduser().resolve())
+        artifact_path = Path(artifact).expanduser()
+        if artifact_path.is_absolute():
+            resolved = str(artifact_path.resolve())
             volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
             artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]
@@ -171,6 +171,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             model=model, engine="sglang", sg_image=settings.get("image"),
             sg_tp_size=settings.get("tensor_parallel_size"),
             sg_context_length=settings.get("context_length"),
+            sg_max_running_requests=settings.get("max_running_requests"),
             sg_mem_fraction=settings.get("mem_fraction_static"),
             extra_args=extra,
             name=safe_container_name(alias, deployment_id),

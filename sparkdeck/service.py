@@ -165,6 +165,7 @@ class SparkDeckService:
             containers = []
             docker_unavailable = True
         seen: set[str] = set()
+        local_cluster_members: dict[str, dict[str, Any]] = {}
         for stored in registered:
             manager_id = stored.get("settings", {}).get("manager_deployment_id")
             cluster = cluster_by_id.get(manager_id) or cluster_by_record.get(stored["id"])
@@ -210,11 +211,18 @@ class SparkDeckService:
                 self.manager.public_target_node(cluster_nodes[node_id])
                 for node_id in stored["node_ids"] if node_id in cluster_nodes
             ]
+            for member in cluster.get("members") or []:
+                if not isinstance(member, dict) or member.get("node_id") != "local":
+                    continue
+                container_name = member.get("container_name")
+                if container_name:
+                    local_cluster_members[container_name] = stored
             seen.add(stored["id"])
         # Reconciliation can replace a local primary container name. Refresh
         # ownership before scanning Docker so the replacement is not appended
         # again as a synthetic legacy deployment.
         by_container = {item.get("container_name"): item for item in registered}
+        by_container.update(local_cluster_members)
         for container in containers:
             runtime = self._container_runtime(container)
             if runtime not in self.registry.kinds:
@@ -692,11 +700,16 @@ class SparkDeckService:
         )
         response.raise_for_status()
         data = response.json()
+        managed = deployment.get("kind") == DeploymentKind.MANAGED.value
         self._record_response(
             deployment["id"], deployment["model"]["repository"],
             deployment["runtime"], deployment.get("settings") or {}, started, data,
             revision=deployment["model"].get("revision"),
-            hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
+            hardware=(
+                self._hardware_snapshot()
+                if managed else self._unknown_hardware_snapshot()
+            ),
+            hardware_verified=managed,
         )
         data["model"] = deployment["alias"]
         return data

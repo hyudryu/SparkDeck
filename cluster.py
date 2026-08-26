@@ -16,18 +16,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+from sparkdeck.private_json import atomic_private_json_write as _atomic_json_write
+
 
 LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 1
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
-
-
-def _atomic_json_write(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
 
 
 def normalize_agent_url(value: str) -> str:

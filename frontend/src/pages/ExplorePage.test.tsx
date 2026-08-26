@@ -58,9 +58,9 @@ describe('ExplorePage model rows', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models')) return json({ items: [
-        { id: 'org/easy', name: 'easy', parameter_count: 50_000_000_000, weight_size_bytes: 100 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', context_window_size: 8192, inference_tokens_per_second: 40, sample_count: 10 } },
-        { id: 'org/tight', name: 'tight', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
-        { id: 'org/large', name: 'large', parameter_count: 150_000_000_000, weight_size_bytes: 300 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
+        { id: 'org/easy', name: 'easy', parameter_count: 40_000_000_000, weight_size_bytes: 80 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', context_window_size: 8192, inference_tokens_per_second: 40, sample_count: 10 } },
+        { id: 'org/tight', name: 'tight', parameter_count: 60_000_000_000, weight_size_bytes: 120 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
+        { id: 'org/large', name: 'large', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
         { id: 'org/unknown', name: 'unknown', downloads: 5, likes: 0, runtime_compatibility: [] },
       ], total: 4 })
       if (path.endsWith('/api/v1/nodes')) return json({ items: [
@@ -73,10 +73,14 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     expect(await screen.findByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
-    expect(screen.getByText('100 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
-    expect(screen.getByText('300 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
-    expect(screen.getByText('256 GB total across 2 nodes')).toBeInTheDocument()
+    expect(screen.getByText('80 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(screen.getByText('120 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
+    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Expand org/large' }))
+    expect(screen.getByText(/128 GB on the largest measured node/)).toBeInTheDocument()
+    expect(screen.getByText(/every replica must hold the full model weights/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
@@ -101,7 +105,7 @@ describe('ExplorePage model rows', () => {
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({
         items: [{ model_id: 'community/model', context_window_size: 32768, inference_tokens_per_second: 18.5, sample_count: 22 }],
-        availability: 'available',
+        availability: 'local',
         evidence_policy: {},
       })
     }))
@@ -113,5 +117,8 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByText('Hugging Face unavailable')).not.toBeInTheDocument()
     expect(screen.getByText('Based on aggregated benchmark samples—not live session tracking.')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Expand community/model' }))
+    expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
+    expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
   })
 })

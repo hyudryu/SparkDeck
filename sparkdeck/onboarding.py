@@ -20,6 +20,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cluster import AGENT_PROTOCOL_VERSION
+from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json
 
 
 FORWARD_NODE_HEADER = "x-sparkdeck-forward-node"
@@ -34,21 +35,6 @@ PROXY_DISCONNECT_POLL_SECONDS = 0.1
 
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-
-
-def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    try:
-        temporary.chmod(0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
 
 
 def normalize_control_url(value: Any) -> str:

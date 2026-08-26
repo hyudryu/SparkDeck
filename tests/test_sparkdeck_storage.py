@@ -182,6 +182,56 @@ class SparkDeckStoreTests(unittest.TestCase):
             "metric": "inference_tokens_per_second",
         })
 
+    def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
+        sample = BenchmarkSample(
+            id="eligible-1", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id="private-deployment", model=ModelIdentity(
+                "org/model", revision="private-revision",
+                artifact="C:/private/model.gguf",
+            ),
+            runtime=RuntimeKind.VLLM, runtime_version="private/image:latest",
+            hardware={"hardware_class": "private-device"},
+            configuration={"context_length": 4096, "api_key": "private"},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=80, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.add_benchmark(sample, queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="eligible-2", generation_tokens_per_second=100,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="ineligible", eligible_for_community=False,
+            generation_tokens_per_second=1000,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="other-context", configuration={"max_model_len": 8192},
+            generation_tokens_per_second=40,
+        ), queue=False)
+
+        aggregates = self.store.community_aggregates()
+
+        self.assertEqual(aggregates, [
+            {
+                "model_id": "org/model",
+                "context_window_size": 4096,
+                "inference_tokens_per_second": 90.0,
+                "sample_count": 2,
+            },
+            {
+                "model_id": "org/model",
+                "context_window_size": 8192,
+                "inference_tokens_per_second": 40.0,
+                "sample_count": 1,
+            },
+        ])
+        serialized = str(aggregates)
+        for private_value in (
+            "private-deployment", "private-revision", "private/image",
+            "private-device", "C:/private", "api_key",
+        ):
+            self.assertNotIn(private_value, serialized)
+
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(
             id="legacy-invalid", created_at="2026-08-25T00:00:00+00:00",

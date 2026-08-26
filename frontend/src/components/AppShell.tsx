@@ -10,12 +10,16 @@ import {
   LayoutDashboard,
   Menu,
   MessageSquareText,
+  Moon,
   Network,
   Search,
   Settings,
+  Sun,
   X,
 } from 'lucide-react'
 import { NavLink, useLocation } from 'react-router-dom'
+import { api } from '../api/client'
+import { persistTheme, storedTheme } from '../theme'
 
 const navigation = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -31,15 +35,43 @@ const navigation = [
   { to: '/logs', label: 'Logs', icon: Boxes },
 ]
 
+type ResolvedTheme = 'light' | 'dark'
+
+function resolvedTheme(): ResolvedTheme {
+  return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('sparkdeck.sidebar') === 'collapsed')
+  const [theme, setTheme] = useState<ResolvedTheme>(resolvedTheme)
+  const [themeSyncing, setThemeSyncing] = useState(false)
+  const [themeStatus, setThemeStatus] = useState('')
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
+  const themeInteractedRef = useRef(false)
   const location = useLocation()
   const current = navigation.find((item) => (item.end ? location.pathname === '/' : location.pathname.startsWith(item.to)))
 
   useEffect(() => setDrawerOpen(false), [location.pathname])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    api.settings.get(controller.signal).then((settings) => {
+      if (themeInteractedRef.current) return
+      persistTheme(settings.theme ?? storedTheme())
+      setTheme(resolvedTheme())
+    }).catch(() => {
+      // The locally stored preference remains authoritative while offline.
+    })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const observer = new MutationObserver(() => setTheme(resolvedTheme()))
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => {
     if (!drawerOpen) return
@@ -63,6 +95,25 @@ export function AppShell({ children }: { children: ReactNode }) {
       localStorage.setItem('sparkdeck.sidebar', value ? 'expanded' : 'collapsed')
       return !value
     })
+  }
+
+  const toggleTheme = async () => {
+    const next: ResolvedTheme = theme === 'dark' ? 'light' : 'dark'
+    themeInteractedRef.current = true
+    persistTheme(next)
+    setTheme(next)
+    setThemeSyncing(true)
+    setThemeStatus('')
+    try {
+      const settings = await api.settings.get()
+      const saved = await api.settings.update({ ...settings, theme: next })
+      persistTheme(saved.theme ?? next)
+      setThemeStatus(`${next === 'dark' ? 'Dark' : 'Light'} mode saved.`)
+    } catch {
+      setThemeStatus(`${next === 'dark' ? 'Dark' : 'Light'} mode saved on this device; server sync failed.`)
+    } finally {
+      setThemeSyncing(false)
+    }
   }
 
   return (
@@ -94,10 +145,17 @@ export function AppShell({ children }: { children: ReactNode }) {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="local-status">
-            <span className="status-dot status-running" aria-hidden="true" />
-            <span>Local service</span>
-          </div>
+          <button
+            className="theme-toggle"
+            onClick={() => void toggleTheme()}
+            disabled={themeSyncing}
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            title={collapsed ? `${theme === 'dark' ? 'Light' : 'Dark'} mode` : undefined}
+          >
+            {theme === 'dark' ? <Sun size={17} aria-hidden="true" /> : <Moon size={17} aria-hidden="true" />}
+            <span>{theme === 'dark' ? 'Light mode' : 'Dark mode'}</span>
+          </button>
+          <span className="sr-only" role="status" aria-live="polite">{themeStatus}</span>
           <button className="collapse-button" onClick={toggleCollapsed} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
             <ChevronLeft size={17} aria-hidden="true" />
             <span>Collapse</span>

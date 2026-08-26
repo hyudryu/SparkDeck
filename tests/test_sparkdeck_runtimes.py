@@ -15,11 +15,13 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_vllm_launch_settings(self):
         command = VllmAdapter().launch_spec("org/model", {
-            "tensor_parallel_size": 2, "context_length": 8192,
+            "tensor_parallel_size": 2, "pipeline_parallel_size": 3,
+            "context_length": 8192,
             "quantization": "awq", "revision": "release-1",
         }).command
         self.assertEqual(command[:3], ["vllm", "serve", "org/model"])
         self.assertIn("--tensor-parallel-size", command)
+        self.assertEqual(command[command.index("--pipeline-parallel-size") + 1], "3")
         self.assertIn("--max-model-len", command)
         self.assertEqual(command[command.index("--revision") + 1], "release-1")
 
@@ -85,6 +87,21 @@ class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         extra = manager.create_container.await_args.kwargs["extra_args"]
         self.assertEqual(extra, ["--dp-size", "2", "--quantization", "fp8"])
+
+    async def test_vllm_bridge_keeps_pipeline_parallelism(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(return_value={"name": "sparkdeck-model", "port": 8000})
+
+        await launch_managed_container(
+            manager, VllmAdapter(), "dep-1", "model", "org/model",
+            {"tensor_parallel_size": 2, "pipeline_parallel_size": 3},
+        )
+
+        extra = manager.create_container.await_args.kwargs["extra_args"]
+        self.assertEqual(extra, [
+            "--tensor-parallel-size", "2",
+            "--pipeline-parallel-size", "3",
+        ])
 
     async def test_managed_launches_keep_requested_revision(self):
         for adapter in (VllmAdapter(), SglangAdapter()):

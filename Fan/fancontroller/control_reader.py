@@ -1,6 +1,6 @@
 """Read short-lived control overrides written by external dashboards.
 
-VLLMController (or any other tool) can drop a JSON file at
+SparkDeck (or any other tool) can drop a JSON file at
 ``~/.local/state/fancontroller/control.json``.  ``max_speed`` forces 100 %
 duty, while ``temperature_override`` supplies an expiring external sensor
 reading.  The latter is combined with local sensors using ``max()`` so an

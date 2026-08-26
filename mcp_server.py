@@ -1,4 +1,4 @@
-"""HTTP MCP control plane for automated VLLMController experiments."""
+"""HTTP MCP control plane for automated SparkDeck experiments."""
 
 from __future__ import annotations
 
@@ -23,7 +23,10 @@ from starlette.responses import JSONResponse
 
 
 ROOT = Path(__file__).resolve().parent
-OWNER = "vllm-controller-mcp"
+OWNER = "sparkdeck-mcp"
+# Keep recognizing deployments created before the SparkDeck rename so users can
+# safely stop or remove them through the same ownership guard.
+LEGACY_OWNERS = frozenset({"vllm-controller-mcp"})
 DEFAULT_CONTROLLER_URL = "http://127.0.0.1:7878"
 DEFAULT_PROMPTS = [
     "Explain why speculative decoding can improve language-model serving throughput.",
@@ -45,7 +48,7 @@ class StaticTokenVerifier:
             return None
         return AccessToken(
             token=token,
-            client_id="vllm-controller-agent",
+            client_id="sparkdeck-agent",
             scopes=["cluster:control"],
             subject="automation-agent",
         )
@@ -204,7 +207,7 @@ class ControllerClient:
     ) -> dict[str, Any]:
         if require_owned:
             deployment = await self.deployment(deployment_id)
-            if deployment.get("managed_by") != OWNER:
+            if deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}:
                 raise ControllerError(
                     f"refusing to {action} deployment {deployment_id}: it was not created by this MCP server"
                 )
@@ -416,8 +419,8 @@ def build_server(
         verifier = StaticTokenVerifier(token)
 
     server = MCPServer(
-        name="vllm-controller",
-        title="VLLMController Cluster Automation",
+        name="sparkdeck",
+        title="SparkDeck Cluster Automation",
         description="Create, tune, benchmark, compare, stop, and remove clustered model deployments.",
         instructions=(
             "Prefer recipe IDs and deployment IDs. Run A/B variants sequentially unless the "

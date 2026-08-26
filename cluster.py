@@ -6,6 +6,7 @@ tokens server-side and exposes sanitized node state for the UI.
 from __future__ import annotations
 
 import json
+import hashlib
 import secrets
 import time
 import uuid
@@ -50,6 +51,13 @@ class AgentCredentials:
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
                 if value.get("agent_token") and value.get("pairing_code"):
+                    if not value.get("cluster_join_code"):
+                        value["cluster_join_code"] = f"{secrets.randbelow(1_000_000):06d}"
+                        value["cluster_join_code_issued_at"] = time.time()
+                        _atomic_json_write(self.path, value)
+                    elif not value.get("cluster_join_code_issued_at"):
+                        value["cluster_join_code_issued_at"] = time.time()
+                        _atomic_json_write(self.path, value)
                     return value
             except Exception:
                 pass
@@ -57,6 +65,8 @@ class AgentCredentials:
             "node_id": uuid.uuid4().hex,
             "agent_token": secrets.token_urlsafe(32),
             "pairing_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code": f"{secrets.randbelow(1_000_000):06d}",
+            "cluster_join_code_issued_at": time.time(),
             "created_at": time.time(),
         }
         _atomic_json_write(self.path, value)
@@ -74,6 +84,29 @@ class AgentCredentials:
         return bool(token) and secrets.compare_digest(
             token, self.data.get("agent_token", "")
         )
+
+    @property
+    def cluster_join_code(self) -> str:
+        return str(self.data["cluster_join_code"])
+
+    def current_cluster_join_code(self, ttl_seconds: float = 600.0) -> str:
+        issued_at = float(self.data.get("cluster_join_code_issued_at") or 0)
+        if time.time() - issued_at > ttl_seconds:
+            self._rotate_cluster_join_code()
+        return self.cluster_join_code
+
+    def _rotate_cluster_join_code(self) -> None:
+        self.data["cluster_join_code"] = f"{secrets.randbelow(1_000_000):06d}"
+        self.data["cluster_join_code_issued_at"] = time.time()
+        _atomic_json_write(self.path, self.data)
+
+    def consume_cluster_join_code(self, join_code: str) -> None:
+        """Consume the controller's one-time cluster join code and rotate it."""
+        if not join_code or not secrets.compare_digest(
+            str(join_code), self.current_cluster_join_code()
+        ):
+            raise ValueError("invalid or expired cluster join code")
+        self._rotate_cluster_join_code()
 
     def pair(self, pairing_code: str) -> dict:
         if not pairing_code or not secrets.compare_digest(
@@ -188,7 +221,29 @@ class NodeRegistry:
 
     @staticmethod
     def public_config(node: dict) -> dict:
-        return {k: v for k, v in node.items() if k != "agent_token"}
+        return {
+            k: v for k, v in node.items()
+            if k not in {"agent_token", "forward_token", "forward_token_hash"}
+        }
+
+    def set_forward_token(self, node_id: str, token: str) -> None:
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID:
+            raise ValueError("remote node not found")
+        node.pop("forward_token", None)
+        node["forward_token_hash"] = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+        self._save()
+
+    def accepts_forward_token(self, node_id: str, token: str) -> bool:
+        node = self.get(node_id)
+        candidate = hashlib.sha256(str(token).encode("utf-8")).hexdigest() if token else ""
+        return bool(
+            node
+            and node_id != LOCAL_NODE_ID
+            and node.get("enabled", True)
+            and token
+            and secrets.compare_digest(candidate, str(node.get("forward_token_hash") or ""))
+        )
 
     async def request(
         self,
@@ -221,6 +276,35 @@ class NodeRegistry:
             raise RuntimeError(
                 f"{node.get('name', node_id)} agent error: {detail}"
             ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"could not contact {node.get('name', node_id)}: {exc}"
+            ) from exc
+
+    async def open_stream(
+        self,
+        node_id: str,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        timeout: float = 600,
+    ) -> httpx.Response:
+        """Open an authenticated agent stream; the caller must close it."""
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID:
+            raise ValueError("remote node not found")
+        if not node.get("enabled", True):
+            raise ValueError(f"node {node.get('name', node_id)} is disabled")
+        request = self.http.build_request(
+            method,
+            f"{node['agent_url']}{path}",
+            headers={"Authorization": f"Bearer {node['agent_token']}"},
+            json=json_body,
+            timeout=timeout,
+        )
+        try:
+            return await self.http.send(request, stream=True)
         except httpx.HTTPError as exc:
             raise RuntimeError(
                 f"could not contact {node.get('name', node_id)}: {exc}"

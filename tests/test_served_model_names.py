@@ -85,7 +85,6 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
         manager = Manager.__new__(Manager)
         manager.get_state = mock.AsyncMock(return_value={
             "containers": [self.container_summary()],
-            "ollama": {"models": []},
             "unsloth": {},
             "sparkrun_targets": {},
         })
@@ -102,7 +101,6 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.get_state = mock.AsyncMock(return_value={
             "containers": [container],
-            "ollama": {"models": []},
             "unsloth": {},
             "sparkrun_targets": {},
         })
@@ -120,7 +118,6 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.get_state = mock.AsyncMock(return_value={
             "containers": [container],
-            "ollama": {"models": []},
             "unsloth": {},
             "sparkrun_targets": {},
         })

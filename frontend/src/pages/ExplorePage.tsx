@@ -81,14 +81,18 @@ export function ExplorePage() {
                 ))}
                 {(!model.runtime_compatibility || model.runtime_compatibility.length === 0) && <span className="muted">Compatibility unknown</span>}
               </div>
+              {model.community ? <div className="community-estimate" aria-label={`Community inference-speed estimate for ${model.id}`}>
+                <div><span>Community inference-speed estimate</span><strong>{formatRate(model.community.inference_tokens_per_second)}</strong></div>
+                <p>At a {formatNumber(model.community.context_window_size)}-token context window · {formatNumber(model.community.sample_count)} samples</p>
+                <small>Community evidence only — an estimate, not a guarantee for your system.</small>
+              </div> : <div className="community-estimate community-estimate-empty"><span>Community inference-speed estimate</span><p>No estimate is available for a specific context window yet.</p></div>}
               <dl className="model-metrics">
                 <div><dt><Download size={14} /> Downloads</dt><dd>{formatNumber(model.downloads)}</dd></div>
-                <div><dt><Users size={14} /> Samples</dt><dd>{formatNumber(model.community?.sample_count)}</dd></div>
-                <div><dt>Median speed</dt><dd>{formatRate(model.community?.median_tokens_per_second)}</dd></div>
+                <div><dt><Users size={14} /> Likes</dt><dd>{formatNumber(model.likes)}</dd></div>
               </dl>
               <div className="model-card-footer">
-                {model.community?.community_proven ? (
-                  <span className="proven"><Check size={14} /> Community proven</span>
+                {model.community ? (
+                  <span className="proven"><Check size={14} /> Community evidence available</span>
                 ) : (
                   <span className="muted">More community data needed</span>
                 )}

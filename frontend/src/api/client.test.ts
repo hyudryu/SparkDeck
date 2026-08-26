@@ -39,6 +39,17 @@ describe('API client adapters', () => {
     expect(status).toEqual(expect.objectContaining({ sharing_enabled: true, account_paired: true, pending_count: 2, synced_count: 7 }))
   })
 
+  it('preserves aggregate evidence dimensions without adding device or runtime fields', async () => {
+    const response = {
+      items: [{ model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 28.5, sample_count: 11 }],
+      availability: 'available',
+      evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(response), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(api.benchmarks.aggregates()).resolves.toEqual(response)
+  })
+
   it('normalizes the refreshed deployment returned by an action', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       id: 'dep-1', alias: 'reasoner', runtime: 'vllm', kind: 'managed',

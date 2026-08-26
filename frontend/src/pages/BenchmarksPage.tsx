@@ -10,6 +10,7 @@ export function BenchmarksPage() {
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const [syncBusy, setSyncBusy] = useState(false)
   const [reviewingConsent, setReviewingConsent] = useState(false)
+  const aggregateResponse = aggregates.data
 
   const toggleSharing = async () => {
     if (!sync.data) return
@@ -42,7 +43,7 @@ export function BenchmarksPage() {
       <PageHeader eyebrow="Performance evidence" title="Benchmarks" description="Review measurements captured from SparkDeck requests and compare them with privacy-preserving community results." />
       <div className="benchmark-summary-grid">
         <Panel className="sync-panel">
-          <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Upload timing, model, runtime, and hardware metadata automatically.</p></div></div>
+          <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Share only model name, context window size, and measured inference tok/s.</p></div></div>
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
           {sync.data && <>
@@ -53,22 +54,23 @@ export function BenchmarksPage() {
         <Panel className="privacy-panel">
           <p className="eyebrow">Always private</p>
           <h2>Your content stays local</h2>
-          <p>Prompts, responses, endpoints, hostnames, paths, and credentials are never recorded or uploaded.</p>
+          <p>Prompts and outputs, runtime, revision, quantization, hardware, settings, host or network identity, and paths are not shared.</p>
           <span><Check size={15} /> Sharing is off until you opt in</span>
         </Panel>
       </div>
 
-      <div className="section-heading"><div><h2>Community comparison</h2><p>Matching model, runtime, hardware, quantization, and context.</p></div></div>
+      <div className="section-heading"><div><h2>Community estimates</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
       {aggregates.loading && <LoadingState label="Loading community aggregates" />}
       {aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
-      {!aggregates.loading && !aggregates.error && aggregates.data?.length === 0 && <EmptyState title="No matching community results" description="Community comparisons will appear as eligible samples are contributed." />}
-      {aggregates.data && aggregates.data.length > 0 && <div className="aggregate-grid">{aggregates.data.map((item, index) => (
-        <Panel className="aggregate-item" key={`${item.model_id}-${item.runtime}-${index}`}>
-          <div><p className="aggregate-model">{item.model_id}</p><RuntimeMark runtime={item.runtime} /></div>
-          <dl><div><dt>Median speed</dt><dd>{formatRate(item.median_tokens_per_second)}</dd></div><div><dt>Median TTFT</dt><dd>{formatDuration(item.median_ttft_ms)}</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} runs · {item.distinct_device_count} devices</dd></div></dl>
-          {item.community_proven ? <span className="proven"><Check size={14} /> Community proven</span> : <span className="muted">Collecting more evidence</span>}
+      {!aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
+      {aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
+        <Panel className="aggregate-item" key={`${item.model_id}-${item.context_window_size}`}>
+          <div><p className="aggregate-model">{item.model_id}</p><span className="estimate-label">Community estimate</span></div>
+          <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Context window</dt><dd>{item.context_window_size.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
+          {item.sample_count >= aggregateResponse.evidence_policy.minimum_samples ? <span className="proven"><Check size={14} /> Evidence threshold met</span> : <span className="muted">Collecting more evidence</span>}
         </Panel>
       ))}</div>}
+      {aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is a community estimate and may differ on your system.</p>}
 
       <div className="section-heading"><div><h2>Local history</h2><p>Successful proxied runs are captured automatically.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}
@@ -85,7 +87,7 @@ export function BenchmarksPage() {
           <div role="cell" data-label="Actions"><Button variant="tertiary" aria-label={`Delete benchmark for ${sample.model_id}`} onClick={() => void remove(sample.id)}><Trash2 size={15} /></Button></div>
         </div>)}
       </div></Panel>}
-      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p>SparkDeck will queue benchmark timing, model revision, runtime, hardware class, and deployment settings for upload after you pair an account.</p><p><strong>Never included:</strong> prompts, generated text, credentials, endpoint URLs, hostnames, IP addresses, or local paths.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
+      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Only shared:</strong> model name, context window size, and measured inference tok/s.</p><p><strong>Not shared:</strong> prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
     </div>
   )
 }

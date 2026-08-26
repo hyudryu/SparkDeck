@@ -1,6 +1,7 @@
 import type {
   AppSettings,
   BenchmarkAggregate,
+  CommunityAggregatesResponse,
   BenchmarkSample,
   CatalogResponse,
   ChatCompletionResponse,
@@ -243,10 +244,8 @@ export const api = {
         created_at: item.created_at,
       }))
     },
-    aggregates: async (signal?: AbortSignal): Promise<BenchmarkAggregate[]> => {
-      const data = await request<{ items: BenchmarkAggregate[] }>('/api/v1/community/aggregates', { signal })
-      return data.items
-    },
+    aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
+      request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
       const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number> }>('/api/v1/community/sync', { signal })
       return {

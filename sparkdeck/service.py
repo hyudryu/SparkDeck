@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import platform
 import re
 import time
@@ -31,7 +32,8 @@ _SAFE_CONFIGURATION_KEYS = {
     "context_size", "context_length", "max_model_len", "parallel", "parallel_slots",
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
-    "max_running_requests", "mem_fraction_static", "runtime_version",
+    "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
+    "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 
@@ -894,14 +896,29 @@ class SparkDeckService:
 
     @staticmethod
     def _safe_configuration(settings: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in settings.items() if key in _SAFE_CONFIGURATION_KEYS}
+        configuration = {
+            key: value
+            for key, value in settings.items()
+            if key in _SAFE_CONFIGURATION_KEYS and key != "gpu_memory_utilization"
+        }
+        utilization = settings.get("gpu_memory_utilization")
+        if (
+            isinstance(utilization, (int, float))
+            and not isinstance(utilization, bool)
+            and math.isfinite(float(utilization))
+            and 0 < float(utilization) <= 1
+        ):
+            configuration["gpu_memory_utilization"] = float(utilization)
+        return configuration
 
     @staticmethod
     def _local_configuration(settings: dict[str, Any]) -> dict[str, Any]:
-        return {
+        configuration = SparkDeckService._safe_configuration(settings)
+        configuration.update({
             key: value for key, value in settings.items()
-            if key in _SAFE_CONFIGURATION_KEYS | _LOCAL_ROUTING_KEYS
-        }
+            if key in _LOCAL_ROUTING_KEYS
+        })
+        return configuration
 
     async def _managed_hardware_snapshot(
         self, deployment: dict[str, Any]

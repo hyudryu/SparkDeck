@@ -65,6 +65,32 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         items, _ = self.service.store.benchmarks()
         self.assertEqual(items[0]["configuration"], {"context_length": 4096})
 
+    async def test_gpu_memory_utilization_is_safely_persisted_and_benchmarked(self):
+        settings = {
+            "gpu_memory_utilization": 0.82,
+            "api_key": "secret",
+        }
+
+        persisted = self.service._local_configuration(settings)
+        self.service._record_response(
+            "dep-1", "org/model", "vllm", settings,
+            time.monotonic() - 0.2,
+            {"usage": {"prompt_tokens": 32, "completion_tokens": 24}},
+        )
+        items, _ = self.service.store.benchmarks()
+
+        self.assertEqual(persisted, {"gpu_memory_utilization": 0.82})
+        self.assertEqual(
+            items[0]["configuration"], {"gpu_memory_utilization": 0.82},
+        )
+        for unsafe in ("0.82", True, float("nan"), 0, 1.01):
+            self.assertNotIn(
+                "gpu_memory_utilization",
+                self.service._local_configuration({
+                    "gpu_memory_utilization": unsafe,
+                }),
+            )
+
     async def test_hardware_snapshot_uses_public_hardware_class_contract(self):
         self.manager._stats_cache = {
             "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}]

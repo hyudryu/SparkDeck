@@ -91,6 +91,21 @@ HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
 PERSISTED_RECIPE_ARGS_ERROR = (
     "unsupported persisted extra_args: expected an array of strings"
 )
+PERSISTED_DEPLOYMENT_ARGS_ERROR = (
+    "unsupported persisted launch_settings.extra_args: expected an array of strings"
+)
+
+
+def _append_persisted_error(existing: Any, marker: str) -> str:
+    current = str(existing or "").strip()
+    return current if marker in current else "; ".join(filter(None, [current, marker]))
+
+
+def _remove_persisted_error(existing: Any, marker: str) -> str:
+    return "; ".join(
+        part.strip() for part in str(existing or "").split(";")
+        if part.strip() and part.strip() != marker
+    )
 
 
 # The official SGLang image exposes ``python3`` rather than a ``python``
@@ -1297,6 +1312,12 @@ class Manager:
         """Mark saved vLLM deployments for a reporting-capable rebuild."""
         changed = False
         for deployment in self.deployments:
+            if (
+                deployment.get("status") == "error"
+                and PERSISTED_DEPLOYMENT_ARGS_ERROR
+                in str(deployment.get("error") or "")
+            ):
+                continue
             settings = deployment.get("launch_settings")
             if not isinstance(settings, dict):
                 continue
@@ -1318,7 +1339,22 @@ class Manager:
             settings = deployment.get("launch_settings")
             if not isinstance(settings, dict):
                 continue
-            original = list(settings.get("extra_args") or [])
+            raw_args = settings.get("extra_args")
+            if raw_args is None:
+                original = []
+            elif not isinstance(raw_args, list) or any(
+                not isinstance(value, str) for value in raw_args
+            ):
+                settings["extra_args"] = []
+                deployment["status"] = "error"
+                deployment["error"] = _append_persisted_error(
+                    deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                )
+                deployment["settings_dirty"] = True
+                changed = True
+                continue
+            else:
+                original = list(raw_args)
             sanitized = self._without_hf_cli_credentials(original)
             if sanitized != original:
                 settings["extra_args"] = sanitized
@@ -6044,12 +6080,9 @@ class Manager:
             elif not isinstance(raw_args, list) or any(
                 not isinstance(value, str) for value in raw_args
             ):
-                existing = str(recipe.get("error") or "").strip()
                 recipe["supported"] = False
-                recipe["error"] = (
-                    existing
-                    if PERSISTED_RECIPE_ARGS_ERROR in existing
-                    else "; ".join(filter(None, [existing, PERSISTED_RECIPE_ARGS_ERROR]))
+                recipe["error"] = _append_persisted_error(
+                    recipe.get("error"), PERSISTED_RECIPE_ARGS_ERROR,
                 )
                 # Replace the corrupt launch input so every public/listing
                 # path remains safe while the durable unsupported marker keeps
@@ -6269,6 +6302,19 @@ class Manager:
             merged["engine"] = engine
             merged["deployment_mode"] = mode
             merged["extra_args"] = list(merged.get("extra_args") or [])
+            if "extra_args" in changes:
+                had_args_error = PERSISTED_RECIPE_ARGS_ERROR in str(
+                    merged.get("error") or ""
+                )
+                remaining_error = _remove_persisted_error(
+                    merged.get("error"), PERSISTED_RECIPE_ARGS_ERROR,
+                )
+                if remaining_error:
+                    merged["error"] = remaining_error
+                    merged["supported"] = False
+                elif had_args_error:
+                    merged.pop("error", None)
+                    merged.pop("supported", None)
             merged["updated_at"] = time.time()
             recipe.clear()
             recipe.update(merged)

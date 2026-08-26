@@ -1,5 +1,6 @@
 import sqlite3
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from sparkdeck.storage import (
     COMMUNITY_EVIDENCE_POLICY,
     COMMUNITY_UPLOAD_FIELDS,
     SparkDeckStore,
+    _COMMUNITY_AGGREGATE_BATCH_SIZE,
 )
 
 
@@ -231,6 +233,46 @@ class SparkDeckStoreTests(unittest.TestCase):
             "private-device", "C:/private", "api_key",
         ):
             self.assertNotIn(private_value, serialized)
+
+    def test_local_community_aggregates_scan_large_history_in_bounded_batches(self):
+        row_count = _COMMUNITY_AGGREGATE_BATCH_SIZE * 20 + 17
+        rows = [{
+            "model_json": '{"repository":"org/model"}',
+            "configuration_json": '{"context_length":4096}',
+            "generation_tps": 80.0,
+        } for _ in range(row_count)]
+
+        class BatchCursor:
+            def __init__(self):
+                self.offset = 0
+                self.batch_sizes = []
+
+            def fetchmany(self, size):
+                self.batch_sizes.append(size)
+                batch = rows[self.offset:self.offset + size]
+                self.offset += len(batch)
+                return batch
+
+            def fetchall(self):
+                raise AssertionError("community aggregation must not buffer all rows")
+
+        cursor = BatchCursor()
+        store = SparkDeckStore.__new__(SparkDeckStore)
+        store._lock = threading.RLock()
+        store._connection = type("Connection", (), {
+            "execute": lambda self, _query: cursor,
+        })()
+
+        aggregates = store.community_aggregates()
+
+        self.assertEqual(aggregates, [{
+            "model_id": "org/model",
+            "context_window_size": 4096,
+            "inference_tokens_per_second": 80.0,
+            "sample_count": row_count,
+        }])
+        self.assertGreater(len(cursor.batch_sizes), 20)
+        self.assertEqual(set(cursor.batch_sizes), {_COMMUNITY_AGGREGATE_BATCH_SIZE})
 
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(

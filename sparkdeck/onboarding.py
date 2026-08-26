@@ -481,7 +481,16 @@ async def forward_management_request(
 ):
     if any(request.headers.get(name) for name in FORWARD_HEADERS):
         return JSONResponse({"detail": "forwarded request chains are not allowed"}, status_code=508)
-    controller_url = normalize_control_url(assignment["controller_url"])
+    try:
+        # Revalidate the saved destination on every forwarded request. A
+        # hostname that was safe during onboarding must not be able to rebind
+        # before a write-only cluster credential is forwarded.
+        controller_url = await validate_control_url(assignment["controller_url"])
+    except ValueError as exc:
+        return JSONResponse(
+            {"detail": f"controller URL is no longer safe: {exc}"},
+            status_code=502,
+        )
     request_origin = normalize_control_url(str(request.base_url))
     if controller_url == request_origin:
         return JSONResponse({"detail": "controller URL points back to this worker"}, status_code=508)

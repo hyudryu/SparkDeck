@@ -178,11 +178,20 @@ FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
 FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
 FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
 
-# A fan update performs two RouterOS overviews around the settings write. Each
-# overview has three sequential request phases (resource, gathered details,
-# then traffic), so the remote controller request must cover seven RouterOS
-# timeout windows plus agent transport/serialization overhead.
-ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS = ROUTEROS_TIMEOUT_SECONDS * 7 + 10.0
+# Remote controller calls must cover each worker-side RouterOS request phase
+# plus agent transport/serialization overhead. An overview has three phases
+# (resource, gathered details, then traffic); connection setup adds device
+# validation; and a fan update wraps its write in two complete overviews.
+ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS = 10.0
+ROUTEROS_OVERVIEW_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 3 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
+ROUTEROS_CONNECT_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 4 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
+ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 7 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
 
 # CPU/GPU chart history.  Thirty-second samples keep the payload small while
 # retaining enough detail for a useful two-hour view (including both ends of
@@ -1027,7 +1036,8 @@ class Manager:
                     result = await self.routeros.overview()
                 else:
                     result = await self.node_registry.request(
-                        node_id, "GET", "/api/agent/routeros", timeout=15,
+                        node_id, "GET", "/api/agent/routeros",
+                        timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
                     )
                 return {**result, "node_id": node_id, "node_name": node_name}
             except Exception as exc:
@@ -1061,10 +1071,15 @@ class Manager:
         node = await self._routeros_target(node_id)
         if node["id"] == LOCAL_NODE_ID:
             return await self.routeros.connect(body)
-        return await self.node_registry.request(
+        result = await self.node_registry.request(
             node["id"], "PUT", "/api/agent/routeros/connection",
-            json_body=body, timeout=20,
+            json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
         )
+        # _routeros_target() just populated the four-second agent-status cache.
+        # Drop that pre-connection snapshot so the immediate UI reload probes
+        # the worker and observes its newly configured RouterOS state.
+        self.node_registry._status_cache.pop(node["id"], None)
+        return result
 
     async def disconnect_routeros(self, node_id: str) -> dict:
         node = await self._routeros_target(node_id)

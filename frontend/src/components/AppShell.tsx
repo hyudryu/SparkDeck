@@ -75,15 +75,30 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     let disposed = false
     let controller: AbortController | undefined
+    let latestRequest = 0
     const refreshPresence = () => {
       controller?.abort()
-      controller = new AbortController()
-      api.routeros.presence(controller.signal)
+      const requestController = new AbortController()
+      const requestId = ++latestRequest
+      controller = requestController
+      api.routeros.presence(requestController.signal)
         .then((presence) => {
-          if (!disposed) setSwitchDetected(Boolean(presence.detected))
+          if (
+            !disposed
+            && requestId === latestRequest
+            && !requestController.signal.aborted
+          ) {
+            setSwitchDetected(Boolean(presence.detected))
+          }
         })
         .catch(() => {
-          if (!disposed && !controller?.signal.aborted) setSwitchDetected(false)
+          if (
+            !disposed
+            && requestId === latestRequest
+            && !requestController.signal.aborted
+          ) {
+            setSwitchDetected(false)
+          }
         })
     }
     refreshPresence()
@@ -91,6 +106,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     window.addEventListener('sparkdeck:routeros-presence-changed', refreshPresence)
     return () => {
       disposed = true
+      latestRequest += 1
       controller?.abort()
       window.clearInterval(interval)
       window.removeEventListener('sparkdeck:routeros-presence-changed', refreshPresence)

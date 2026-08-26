@@ -5,7 +5,7 @@ import { ClusterPage } from './ClusterPage'
 
 const controllerStatus = {
   role: 'controller',
-  node: { id: 'controller-credential-id', name: 'Studio controller', port: 7878, access_urls: ['https://controller.tailnet.ts.net'] },
+  node: { id: 'controller-credential-id', name: 'Studio controller', port: 7878, access_urls: ['http://100.64.0.10:7878'] },
   controller_reachable: true,
   join_code: 'PAIR-123',
   instructions: ['Connect both nodes to Tailscale.'],
@@ -28,7 +28,7 @@ describe('ClusterPage', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
       const body = init?.method === 'POST'
-        ? { role: 'worker', node: { id: 'worker-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] }, controller_url: 'https://controller.tailnet.ts.net', controller_reachable: true }
+        ? { role: 'worker', node: { id: 'worker-2', name: 'Studio Spark', port: 7878, access_urls: ['http://100.64.0.11:7878'] }, controller_url: 'http://100.64.0.10:7878', controller_reachable: true }
         : controllerStatus
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -38,14 +38,15 @@ describe('ClusterPage', () => {
 
     expect(await screen.findByText('PAIR-123')).toBeInTheDocument()
     expect(screen.getByText('Controller · Current entry node')).toBeInTheDocument()
-    expect(screen.getByText('https://controller.tailnet.ts.net')).toBeInTheDocument()
-    expect(screen.getByText(/tailscale serve --bg --https=443 http:\/\/127\.0\.0\.1:7878/)).toBeInTheDocument()
+    expect(screen.getByText('http://100.64.0.10:7878')).toBeInTheDocument()
+    expect(screen.getByText('Use a private Tailscale address')).toBeInTheDocument()
+    expect(screen.getByText('http://100.x.x.x:7878')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Join this node to another controller' }))
     expect(screen.getByText(/Enter that controller’s URL and pairing code here—not this node’s URL/)).toBeInTheDocument()
-    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'https://controller.tailnet.ts.net')
+    await user.type(screen.getByRole('textbox', { name: 'Chosen controller Tailscale URL' }), 'http://100.64.0.10:7878')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }))
-    await user.type(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }), 'https://spark-2.tailnet.ts.net')
+    await user.type(screen.getByRole('textbox', { name: 'This node’s advertised Tailscale URL' }), 'http://100.64.0.11:7878')
     await user.clear(screen.getByRole('textbox', { name: 'This node’s name' }))
     await user.type(screen.getByRole('textbox', { name: 'This node’s name' }), 'Studio Spark')
     await user.type(screen.getByRole('textbox', { name: 'Pairing code' }), 'PAIR-123')
@@ -53,12 +54,12 @@ describe('ClusterPage', () => {
 
     await waitFor(() => expect(screen.getByText('Worker node', { selector: '.cluster-summary strong' })).toBeInTheDocument())
     expect(JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body))).toEqual({
-      controller_url: 'https://controller.tailnet.ts.net',
+      controller_url: 'http://100.64.0.10:7878',
       join_code: 'PAIR-123',
-      advertise_url: 'https://spark-2.tailnet.ts.net',
+      advertise_url: 'http://100.64.0.11:7878',
       name: 'Studio Spark',
     })
-    expect(screen.getByText('Joined https://controller.tailnet.ts.net as Studio Spark.')).toHaveAttribute('role', 'status')
+    expect(screen.getByText('Joined http://100.64.0.10:7878 as Studio Spark.')).toHaveAttribute('role', 'status')
   })
 
   it('keeps the join form open and exposes backend errors', async () => {

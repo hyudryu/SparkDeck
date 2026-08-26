@@ -11,24 +11,26 @@ function commandOutput(command: string, args: string[]) {
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim()
   } catch {
-    return ''
+    return undefined
   }
 }
 
 function buildVersion() {
+  const trackedChanges = commandOutput('git', ['status', '--porcelain', '--untracked-files=no'])
+  const dirty = trackedChanges !== undefined && trackedChanges !== ''
   const explicitVersion = process.env.SPARKDECK_VERSION?.trim()
-  if (explicitVersion) return explicitVersion
+  if (explicitVersion && !dirty) return explicitVersion
 
-  if (process.env.GITHUB_REF_TYPE === 'tag') {
+  if (process.env.GITHUB_REF_TYPE === 'tag' && !dirty) {
     const githubTag = process.env.GITHUB_REF_NAME?.trim()
     if (githubTag) return githubTag
   }
 
   const exactTag = commandOutput('git', ['describe', '--tags', '--exact-match', 'HEAD'])
-  if (exactTag) return exactTag
+  if (exactTag && !dirty) return exactTag
 
-  const revision = (process.env.GITHUB_SHA?.trim() || commandOutput('git', ['rev-parse', '--short=8', 'HEAD'])).slice(0, 8)
-  return revision ? `dev-${revision}` : 'development'
+  const revision = (process.env.GITHUB_SHA?.trim() || commandOutput('git', ['rev-parse', '--short=8', 'HEAD']) || '').slice(0, 8)
+  return revision ? `dev-${revision}${dirty ? '-dirty' : ''}` : 'development'
 }
 
 export default defineConfig({

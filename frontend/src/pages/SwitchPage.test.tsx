@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SwitchPage } from './SwitchPage'
@@ -113,7 +113,8 @@ describe('SwitchPage', () => {
     expect(screen.getByText('ether2')).toBeInTheDocument()
     const minimumSpeed = screen.getByRole('spinbutton', { name: /^Minimum fan speed/ })
     expect(minimumSpeed).toHaveAttribute('step', '1')
-    fireEvent.change(minimumSpeed, { target: { value: '45' } })
+    await user.clear(minimumSpeed)
+    await user.type(minimumSpeed, '45')
     await user.click(screen.getByRole('button', { name: 'Save fan settings' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/routeros/nodes/node-2/fan-settings', expect.objectContaining({

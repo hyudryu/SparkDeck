@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -9,12 +10,14 @@ from unittest import mock
 import httpx
 
 from cluster import (
+    AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
     AgentCredentials,
     NodeRegistry,
     normalize_agent_url,
 )
-from manager import Manager
+from manager import Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
+from sparkdeck.onboarding import resolve_agent_connection
 
 
 class AgentCredentialsTests(unittest.TestCase):
@@ -96,6 +99,236 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_request_pins_validated_agent_address(self) -> None:
+        requests = []
+        resolutions = []
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            address = "100.100.20.30" if len(resolutions) == 1 else "203.0.113.10"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_agent_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1",
+                "name": "Spark 2",
+                "agent_url": "https://worker.tail.example:7878/sparkdeck",
+                "agent_token": "agent-secret",
+                "enabled": True,
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    result = await registry.request(
+                        "remote-1", "POST", "/api/agent/containers",
+                        json_body={"hf_token": "hf-secret"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(resolutions, [("worker.tail.example", 7878)])
+        self.assertEqual(
+            str(requests[0].url),
+            "https://100.100.20.30:7878/sparkdeck/api/agent/containers",
+        )
+        self.assertEqual(requests[0].headers["host"], "worker.tail.example:7878")
+        self.assertEqual(requests[0].extensions["sni_hostname"], "worker.tail.example")
+        self.assertEqual(requests[0].headers["authorization"], "Bearer agent-secret")
+        self.assertEqual(json.loads(requests[0].content)["hf_token"], "hf-secret")
+
+    async def test_authenticated_request_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (
+                    socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("fd7a:115c:a1e0::10", port, 0, 0),
+                ),
+                (
+                    socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("100.100.20.30", port),
+                ),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("IPv6 unavailable", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_agent_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    result = await registry.request(
+                        "remote-1", "POST", "/api/agent/containers",
+                        json_body={"hf_token": "hf-secret"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://[fd7a:115c:a1e0::10]:7878/api/agent/containers",
+            "https://100.100.20.30:7878/api/agent/containers",
+        ])
+        self.assertTrue(all(
+            request.headers["authorization"] == "Bearer agent-secret"
+            and request.headers["host"] == "worker.tail.example:7878"
+            and request.extensions["sni_hostname"] == "worker.tail.example"
+            for request in requests
+        ))
+
+    async def test_pairing_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.10", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.11", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectTimeout("first address timed out", request=request)
+            return httpx.Response(200, json={
+                "node_id": "remote-1", "agent_token": "agent-secret",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+            }, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_agent_connection,
+            )
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    paired = await registry.pair_remote(
+                        "http://worker.tail.example:7878/sparkdeck/", "123456",
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(paired["id"], "remote-1")
+        self.assertEqual(
+            paired["agent_url"], "http://worker.tail.example:7878/sparkdeck"
+        )
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "http://100.64.0.10:7878/sparkdeck/api/agent/pair",
+            "http://100.64.0.11:7878/sparkdeck/api/agent/pair",
+        ])
+        self.assertTrue(all(
+            json.loads(request.content)["pairing_code"] == "123456"
+            and request.headers["host"] == "worker.tail.example:7878"
+            for request in requests
+        ))
+
+    async def test_open_stream_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.20", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.21", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address refused", request=request)
+            return httpx.Response(200, content=b"stream", request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_agent_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://worker.tail.example:7878/sparkdeck",
+                "agent_token": "agent-secret",
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    response = await registry.open_stream(
+                        "remote-1", "GET", "/api/agent/files",
+                    )
+                    body = await response.aread()
+                    await response.aclose()
+            finally:
+                await client.aclose()
+
+        self.assertEqual(body, b"stream")
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "http://100.64.0.20:7878/sparkdeck/api/agent/files",
+            "http://100.64.0.21:7878/sparkdeck/api/agent/files",
+        ])
+        self.assertTrue(all(
+            request.headers["authorization"] == "Bearer agent-secret"
+            and request.headers["host"] == "worker.tail.example:7878"
+            for request in requests
+        ))
+
+    async def test_agent_connection_rejects_public_dns_with_base_path(self) -> None:
+        def resolve(host, port, **kwargs):
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                ("203.0.113.10", port),
+            )]
+
+        with mock.patch(
+            "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+        ):
+            with self.assertRaisesRegex(ValueError, "Tailscale or loopback"):
+                await resolve_agent_connection(
+                    "https://worker.example:7878/sparkdeck"
+                )
+
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.path, "/api/agent/pair")
@@ -2250,6 +2483,130 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(removed, [("old-r0", "remove"), ("old-r1", "remove")])
             self.assertEqual(launched[0]["port"], 8000)
             self.assertEqual([d["id"] for d in instance.deployments], ["deployment-new"])
+
+    async def test_sanitized_malformed_deployment_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [{"node_id": "local", "container_name": "old-r0"}],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+
+            stopped = await instance.deployment_action("deployment-bad", "stop")
+            with self.assertRaisesRegex(ValueError, "edit extra_args"):
+                await instance.deployment_action("deployment-bad", "start")
+
+            self.assertTrue(stopped["ok"])
+            instance._member_action.assert_awaited_once_with(
+                deployment["members"][0], "stop",
+            )
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(deployment["status"], "stopped")
+            self.assertEqual(
+                deployment["launch_settings_error"],
+                PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
+
+    async def test_explicit_extra_args_repair_allows_dirty_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }]
+
+            with self.assertRaisesRegex(ValueError, "explicitly repaired"):
+                instance.update_deployment_settings(
+                    "deployment-bad", {"deployment_name": "Still unsafe"},
+                )
+            with self.assertRaisesRegex(ValueError, "explicitly repaired"):
+                instance.update_deployment_settings(
+                    "deployment-bad", {"extra_args": None},
+                )
+            updated = instance.update_deployment_settings(
+                "deployment-bad", {"extra_args": ["--max-model-len", "8192"]},
+            )
+
+            self.assertEqual(updated["status"], "stopped")
+            self.assertNotIn("launch_settings_error", updated)
+            self.assertIsNone(updated["error"])
+            self.assertIn("--max-model-len", updated["launch_settings"]["extra_args"])
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertNotIn("launch_settings_error", persisted[0])
+
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+
+            async def create_deployment(body):
+                replacement = {
+                    "id": "deployment-new", "status": "starting", "members": [],
+                }
+                instance.deployments.append(replacement)
+                return replacement
+
+            instance.create_deployment = mock.AsyncMock(side_effect=create_deployment)
+            result = await instance.deployment_action("deployment-bad", "start")
+
+            self.assertTrue(result["ok"])
+            instance.create_deployment.assert_awaited_once()
+            launch_body = instance.create_deployment.await_args.args[0]
+            self.assertIn("--max-model-len", launch_body["extra_args"])
+            self.assertEqual(
+                [deployment["id"] for deployment in instance.deployments],
+                ["deployment-new"],
+            )
+
+    def test_explicit_args_repair_preserves_unrelated_deployment_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-bad", "name": "Unsafe", "model": "example/Model",
+                "engine": "vllm", "mode": "single", "node_ids": ["local"],
+                "status": "error", "settings_dirty": True,
+                "error": (
+                    "worker unavailable; " + PERSISTED_DEPLOYMENT_ARGS_ERROR
+                ),
+                "launch_settings_error": PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                "members": [],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }]
+
+            updated = instance.update_deployment_settings(
+                "deployment-bad", {"extra_args": ["--max-model-len", "8192"]},
+            )
+
+            self.assertEqual(updated["status"], "error")
+            self.assertEqual(updated["error"], "worker unavailable")
+            self.assertNotIn("launch_settings_error", updated)
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(persisted[0]["error"], "worker unavailable")
 
     async def test_idle_monitor_never_stops_one_cluster_member(self) -> None:
         instance = Manager.__new__(Manager)

@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react'
 import { Cable, Check, Cloud, DownloadCloud, KeyRound, MonitorCog, Network, RefreshCw, Save } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, RuntimeKind } from '../api/types'
+import type { AppSettings } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
@@ -91,15 +91,14 @@ function SoftwareUpdatePanel() {
 function editableSettingsFingerprint(settings: AppSettings) {
   return JSON.stringify({
     theme: settings.theme ?? 'system',
-    default_runtime: settings.default_runtime ?? 'vllm',
-    default_context_length: settings.default_context_length ?? 8192,
     community_api_url: settings.community_api_url ?? '',
   })
 }
 
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
-  const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), default_runtime: 'vllm', default_context_length: 8192 })
+  const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), community_api_url: '' })
+  const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -122,14 +121,19 @@ export function SettingsPage() {
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
-    if (savedFingerprint === undefined || editableSettingsFingerprint(form) === savedFingerprint) return
+    if (savedFingerprint === undefined
+      || (editableSettingsFingerprint(form) === savedFingerprint && !huggingFaceApiKey.trim())) return
     setSaving(true)
     setSaved(false)
     setError(undefined)
     try {
-      const savedSettings = await api.settings.update(form)
-      const savedForm = { ...form, ...savedSettings }
+      const savedSettings = await api.settings.update({
+        ...form,
+        hf_token: huggingFaceApiKey.trim() || undefined,
+      })
+      const savedForm = { ...form, ...savedSettings, hf_token: '' }
       setForm(savedForm)
+      setHuggingFaceApiKey('')
       setSavedFingerprint(editableSettingsFingerprint(savedForm))
       persistTheme(savedSettings.theme ?? form.theme ?? 'system')
       setSaved(true)
@@ -141,27 +145,54 @@ export function SettingsPage() {
     }
   }
 
+  const clearHuggingFaceKey = async () => {
+    if (!window.confirm('Remove the saved Hugging Face API key for the entire cluster?')) return
+    setSaving(true)
+    setSaved(false)
+    setError(undefined)
+    try {
+      const savedSettings = await api.settings.clearHfToken()
+      setForm((current) => ({
+        ...current,
+        hf_token: '',
+        hf_token_configured: savedSettings.hf_token_configured,
+      }))
+      setHuggingFaceApiKey('')
+      setSaved(true)
+      window.setTimeout(() => setSaved(false), 2400)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not remove the saved Hugging Face API key')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const hasUnsavedChanges = savedFingerprint !== undefined
-    && editableSettingsFingerprint(form) !== savedFingerprint
+    && (editableSettingsFingerprint(form) !== savedFingerprint || Boolean(huggingFaceApiKey.trim()))
 
   return (
     <div className="page settings-page">
-      <PageHeader eyebrow="Preferences" title="Settings" description="Configure local defaults, community connectivity, and the SparkDeck interface." actions={<span className="build-version" aria-label="SparkDeck version">Version {SPARKDECK_VERSION}</span>} />
+      <PageHeader eyebrow="Preferences" title="Settings" description="Configure cluster credentials, community connectivity, and the SparkDeck interface." actions={<span className="build-version" aria-label="SparkDeck version">Version {SPARKDECK_VERSION}</span>} />
       {resource.loading && <LoadingState label="Loading settings" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {!resource.loading && <form onSubmit={(event) => void save(event)}>
         {error && <p className="form-error" role="alert">{error}</p>}
         <Panel className="settings-section">
-          <div className="settings-heading"><span><MonitorCog size={18} /></span><div><h2>Interface and defaults</h2><p>Preferences used when creating local model servers.</p></div></div>
+          <div className="settings-heading"><span><MonitorCog size={18} /></span><div><h2>Interface</h2><p>Choose how SparkDeck looks on this browser.</p></div></div>
           <div className="settings-fields">
             <label className="field"><span>Appearance</span><select value={form.theme} onChange={(event) => setForm({ ...form, theme: event.target.value as AppSettings['theme'] })}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
-            <label className="field"><span>Default runtime</span><select value={form.default_runtime} onChange={(event) => setForm({ ...form, default_runtime: event.target.value as RuntimeKind })}><option value="vllm">vLLM</option><option value="llama.cpp">llama.cpp</option><option value="sglang">SGLang</option></select></label>
-            <label className="field"><span>Default context length</span><input type="number" min="256" value={form.default_context_length} onChange={(event) => setForm({ ...form, default_context_length: Number(event.target.value) })} /><small>Applied as a starting value; each deployment can override it.</small></label>
           </div>
         </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><Network size={18} /></span><div><h2>DGX Spark cluster</h2><p>Connect nodes privately over Tailscale for targeted pulls and deployments.</p></div></div>
           <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster onboarding</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
+        </Panel>
+        <Panel className="settings-section">
+          <div className="settings-heading"><span><KeyRound size={18} /></span><div><h2>Hugging Face access</h2><p>Use one credential for gated and private models across the cluster.</p></div></div>
+          <div className="settings-fields">
+            <label className="field wide-field"><span>Hugging Face API key</span><input aria-label="Hugging Face API key" type="password" autoComplete="new-password" value={huggingFaceApiKey} onChange={(event) => setHuggingFaceApiKey(event.target.value)} placeholder={form.hf_token_configured ? 'Enter a new key to replace the saved key' : 'hf_…'} /><small>The controller stores this key privately and sends it only over authenticated cluster channels when selected nodes start Hugging Face models. Leave blank to keep the current key.</small></label>
+            <div className="credential-state"><KeyRound size={17} /><div><strong>Cluster credential</strong><Status status={form.hf_token_configured ? 'running' : 'stopped'}>{form.hf_token_configured ? 'Configured' : 'Not configured'}</Status></div>{form.hf_token_configured && <Button type="button" variant="danger" disabled={saving} onClick={() => void clearHuggingFaceKey()}>Remove saved key</Button>}</div>
+          </div>
         </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><Cable size={18} /></span><div><h2>RouterOS switch</h2><p>Connect and manage a MikroTik switch from a SparkDeck node.</p></div></div>

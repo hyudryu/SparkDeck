@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import ipaddress
 import json
 import math
 import platform
 import re
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,7 +28,11 @@ from .runtimes import (
     normalize_openai_base_url,
     safe_container_name,
 )
-from .storage import SparkDeckStore, community_context_window
+from .storage import (
+    COMMUNITY_EVIDENCE_POLICY,
+    SparkDeckStore,
+    community_context_window,
+)
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -37,6 +43,224 @@ _SAFE_CONFIGURATION_KEYS = {
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
+_COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_COMMUNITY_MAX_REDIRECTS = 5
+_COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+async def _public_connection_urls(
+    url: httpx.URL, resolver: Any = socket.getaddrinfo,
+) -> tuple[tuple[httpx.URL, ...], str, str]:
+    """Resolve and pin every public destination for one outbound request.
+
+    Each returned URL contains a validated IP address, so the HTTP transport
+    cannot perform a second, attacker-controlled DNS lookup after validation.
+    The caller must use the returned host header and SNI hostname so HTTPS
+    authentication still applies to the configured service name.
+    """
+    if url.scheme not in {"http", "https"} or not url.host:
+        raise ValueError("community aggregate URL must use HTTP or HTTPS")
+    if url.userinfo:
+        raise ValueError("community aggregate URL must not include credentials")
+
+    hostname = url.raw_host.decode("ascii")
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            answers = await asyncio.to_thread(
+                resolver, hostname, port, type=socket.SOCK_STREAM,
+            )
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("community aggregate host could not be resolved") from exc
+        addresses = []
+        for answer in answers:
+            try:
+                address = ipaddress.ip_address(answer[4][0])
+            except (IndexError, TypeError, ValueError):
+                raise ValueError("community aggregate host returned an invalid address")
+            if address not in addresses:
+                addresses.append(address)
+
+    # Reject the entire DNS answer if any address is unsafe. This prevents a
+    # resolver or attacker from influencing which member of a mixed answer the
+    # transport chooses, and covers loopback, private, link-local, multicast,
+    # unspecified, reserved, and shared address space.
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("community aggregate host must resolve only to public addresses")
+
+    return (
+        tuple(url.copy_with(host=str(address)) for address in addresses),
+        url.netloc.decode("ascii"),
+        hostname,
+    )
+
+
+async def _read_bounded_community_response(response: httpx.Response) -> bytes:
+    """Read decoded response bytes without permitting an aggregate memory bomb."""
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise ValueError("community aggregate response has invalid length") from exc
+        if declared_length < 0:
+            raise ValueError("community aggregate response has invalid length")
+        if declared_length > _COMMUNITY_MAX_RESPONSE_BYTES:
+            raise ValueError("community aggregate response is too large")
+
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(content) + len(chunk) > _COMMUNITY_MAX_RESPONSE_BYTES:
+            raise ValueError("community aggregate response is too large")
+        content.extend(chunk)
+    return bytes(content)
+
+
+async def _get_public_community_url(
+    url: str | httpx.URL, *, transport: httpx.AsyncBaseTransport | None = None,
+    resolver: Any = socket.getaddrinfo,
+) -> httpx.Response:
+    """GET a public URL with per-hop DNS pinning and redirect validation."""
+    try:
+        current = httpx.URL(url)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community aggregate URL is invalid") from exc
+
+    for redirect_count in range(_COMMUNITY_MAX_REDIRECTS + 1):
+        pinned_urls, host_header, sni_hostname = await _public_connection_urls(
+            current, resolver,
+        )
+        response: httpx.Response | None = None
+        last_connect_error: httpx.HTTPError | None = None
+        for pinned in pinned_urls:
+            # A fresh client for every candidate prevents IP-keyed pooled TLS
+            # connections from crossing logical hosts or redirect hops.
+            async with httpx.AsyncClient(
+                transport=transport,
+                trust_env=False,
+                follow_redirects=False,
+                timeout=15,
+            ) as client:
+                request = client.build_request(
+                    "GET",
+                    pinned,
+                    headers={"Host": host_header, "Connection": "close"},
+                    extensions={"sni_hostname": sni_hostname},
+                )
+                try:
+                    streamed = await client.send(request, stream=True)
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_connect_error = exc
+                    continue
+                try:
+                    if (
+                        streamed.status_code not in _COMMUNITY_REDIRECT_STATUSES
+                        or streamed.headers.get("location") is None
+                    ):
+                        content = await _read_bounded_community_response(streamed)
+                    else:
+                        content = b""
+                    response = httpx.Response(
+                        streamed.status_code,
+                        headers=streamed.headers,
+                        content=content,
+                        request=streamed.request,
+                        extensions=streamed.extensions,
+                    )
+                finally:
+                    await streamed.aclose()
+                break
+        if response is None:
+            assert last_connect_error is not None
+            raise last_connect_error
+
+        if (
+            response.status_code in _COMMUNITY_REDIRECT_STATUSES
+            and response.headers.get("location") is not None
+        ):
+            if redirect_count >= _COMMUNITY_MAX_REDIRECTS:
+                raise httpx.TooManyRedirects(
+                    "community aggregate service redirected too many times",
+                    request=response.request,
+                )
+            try:
+                current = current.join(response.headers["location"])
+            except (TypeError, httpx.InvalidURL) as exc:
+                raise ValueError("community aggregate redirect is invalid") from exc
+            continue
+        return response
+
+    raise AssertionError("unreachable")
+
+
+def _community_aggregate_url(endpoint: str) -> httpx.URL:
+    """Append the aggregate route to the URL path, never its query string."""
+    try:
+        url = httpx.URL(endpoint)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community aggregate URL is invalid") from exc
+    path = url.path.rstrip("/")
+    if not path.endswith("/aggregates"):
+        path = f"{path}/aggregates"
+    return url.copy_with(path=path or "/aggregates", fragment=None)
+
+
+def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
+    """Validate and bound the public response from a configured aggregator."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise ValueError("community aggregate response must contain an items array")
+    if len(payload["items"]) > 10_000:
+        raise ValueError("community aggregate response is too large")
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for raw in payload["items"]:
+        if not isinstance(raw, dict):
+            raise ValueError("community aggregate item must be an object")
+        model_id = str(raw.get("model_id") or "").strip()
+        context_window = raw.get("context_window_size")
+        speed = raw.get("inference_tokens_per_second")
+        sample_count = raw.get("sample_count")
+        if (
+            not model_id
+            or len(model_id) > 500
+            or any(ord(char) < 32 for char in model_id)
+            or isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+            or isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or isinstance(speed, bool)
+            or not isinstance(speed, (int, float))
+        ):
+            raise ValueError("community aggregate item is invalid")
+        speed = float(speed)
+        if (
+            context_window <= 0
+            or context_window > 100_000_000
+            or sample_count <= 0
+            or sample_count > 1_000_000_000
+            or not math.isfinite(speed)
+            or speed <= 0
+        ):
+            raise ValueError("community aggregate item is invalid")
+        key = (model_id, context_window)
+        if key in seen:
+            raise ValueError("community aggregate response contains duplicate evidence")
+        seen.add(key)
+        result.append({
+            "model_id": model_id,
+            "context_window_size": context_window,
+            "inference_tokens_per_second": speed,
+            "sample_count": sample_count,
+        })
+    return result
 
 
 class SparkDeckService:
@@ -52,6 +276,40 @@ class SparkDeckService:
 
     async def close(self) -> None:
         self.store.close()
+
+    async def community_aggregates(self) -> dict[str, Any]:
+        """Return configured community evidence or privacy-safe local evidence."""
+        endpoint = str(
+            await asyncio.to_thread(
+                self.store.get_setting, "community_api_url", ""
+            ) or ""
+        ).strip().rstrip("/")
+        if not endpoint:
+            items = await asyncio.to_thread(self.store.community_aggregates)
+            return {
+                "items": items,
+                "availability": "local" if items else "not_configured",
+                "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
+            }
+
+        try:
+            aggregate_url = _community_aggregate_url(endpoint)
+            response = await _get_public_community_url(
+                aggregate_url,
+                transport=getattr(self.manager, "community_http_transport", None),
+                resolver=getattr(
+                    self.manager, "community_resolver", socket.getaddrinfo,
+                ),
+            )
+            response.raise_for_status()
+            items = _public_community_aggregates(response.json())
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            raise RuntimeError("community aggregate service is unavailable") from exc
+        return {
+            "items": items,
+            "availability": "available",
+            "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
+        }
 
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None

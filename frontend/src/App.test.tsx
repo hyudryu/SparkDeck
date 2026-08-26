@@ -239,6 +239,28 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster.')).toBeInTheDocument()
   })
 
+  it('surfaces saved-configuration failures without hiding deployment state', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/recipes')) return new Response(JSON.stringify({ detail: 'saved configurations unavailable' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const body = path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [{ id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true }] }
+          : path.includes('/api/v1/model-cache') ? { nodes: [] }
+            : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 }
+              : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Saved configurations: saved configurations unavailable')
+    expect(screen.getByText('No model servers yet')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
   it('retains the saved context length when switching runtimes', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

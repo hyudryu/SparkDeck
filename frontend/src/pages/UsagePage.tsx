@@ -55,19 +55,38 @@ function usageStreaks(points: DailyUsagePoint[]) {
   return { activeDays: active.length, current, longest }
 }
 
-function ActivityHeatmap({ points }: { points: DailyUsagePoint[] }) {
+export function activityHeatmapCalendar(points: DailyUsagePoint[], reference = new Date()) {
   const byDate = new Map(points.map((point) => [point.date, totalTokens(point)]))
-  const end = new Date(`${daysAgo(0)}T00:00:00Z`)
+  const end = new Date(reference)
+  end.setUTCHours(0, 0, 0, 0)
   const start = new Date(end)
   start.setUTCDate(end.getUTCDate() - 364 - end.getUTCDay())
   const cells = Array.from({ length: 371 }, (_, index) => {
     const date = new Date(start); date.setUTCDate(start.getUTCDate() + index)
     const key = isoDate(date); return { date: key, value: byDate.get(key) ?? 0 }
   })
+  const months: Array<{ key: string; label: string; column: number }> = []
+  let previousMonth = ''
+  cells.forEach((cell, index) => {
+    const date = new Date(`${cell.date}T00:00:00Z`)
+    const key = cell.date.slice(0, 7)
+    if (key === previousMonth) return
+    previousMonth = key
+    months.push({
+      key,
+      label: date.toLocaleDateString(undefined, { month: 'short', timeZone: 'UTC' }),
+      column: Math.floor(index / 7) + 1,
+    })
+  })
+  return { cells, months }
+}
+
+function ActivityHeatmap({ points }: { points: DailyUsagePoint[] }) {
+  const { cells, months } = activityHeatmapCalendar(points)
   const maximum = Math.max(1, ...cells.map((cell) => cell.value))
   return <div className="usage-heatmap-scroll" role="img" aria-label="Daily token activity for the last year"><div className="usage-heatmap">
     {cells.map((cell) => { const ratio = cell.value / maximum; const level = cell.value === 0 ? 0 : ratio < .08 ? 1 : ratio < .25 ? 2 : ratio < .55 ? 3 : 4; return <span key={cell.date} className={`usage-heatmap-cell level-${level}`} title={`${cell.date}: ${formatTokens(cell.value)} tokens`} /> })}
-  </div><div className="usage-heatmap-months"><span>Sep</span><span>Nov</span><span>Jan</span><span>Mar</span><span>May</span><span>Jul</span><span>Aug</span></div></div>
+  </div><div className="usage-heatmap-months" aria-hidden="true">{months.map((month) => <span key={month.key} style={{ gridColumn: `${month.column} / span 4` }}>{month.label}</span>)}</div></div>
 }
 
 function TrendChart({ points, range }: { points: DailyUsagePoint[]; range: RangeDays }) {
@@ -119,6 +138,7 @@ export function UsagePage() {
   return <div className="page usage-page"><PageHeader eyebrow="Local inference accounting" title="Usage stats" description="Token activity and model share recorded locally across SparkDeck." actions={<><Button onClick={reload}><RefreshCw size={15} /> Refresh</Button><Button variant="danger" disabled={busy === 'reset'} onClick={() => void reset()}><RotateCcw size={15} /> Reset lifetime</Button></>} />
     {actionError && <p className="inline-error" role="alert">{actionError}</p>}{notice && <p className="inline-success" role="status">{notice}</p>}
     {(summary.loading || analysis.loading) && !summary.data && <LoadingState label="Loading usage stats" />}{summary.error && !summary.data && <ErrorState message={summary.error} onRetry={reload} />}
+    {analysis.error && <ErrorState message={`Historical usage: ${analysis.error}`} onRetry={analysis.reload} />}
     {summary.data && <><Panel className="usage-overview-metrics" aria-label="Usage overview"><div><strong>{formatTokens(totals.input + totals.cached + totals.output)}</strong><span>Total tokens</span></div><div><strong>{formatTokens(peak)}</strong><span>Peak day</span></div><div><strong>{streaks.activeDays}</strong><span>Active days</span></div><div><strong>{streaks.current} d</strong><span>Current streak</span></div><div><strong>{streaks.longest} d</strong><span>Longest streak</span></div></Panel>
       <Panel className="usage-activity-panel"><div className="usage-panel-heading"><div><h2>Token activity</h2><p>Daily usage over the last year</p></div></div><ActivityHeatmap points={daily} /></Panel>
       <div className="usage-time-heading"><h2>Time range</h2><div className="segmented-control" aria-label="Usage time range"><button aria-pressed={range === 7} onClick={() => setRange(7)}>Last 7 days</button><button aria-pressed={range === 30} onClick={() => setRange(30)}>Last 30 days</button></div></div>

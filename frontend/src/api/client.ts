@@ -145,12 +145,13 @@ function queryString(values: Record<string, string | number | undefined>) {
 export const api = {
   dashboard: {
     load: async (signal?: AbortSignal): Promise<DashboardData> => {
+      const nodeInventory = api.nodes.list(signal).catch(() => [])
       const [stats, admission, deployments, sync, nodes] = await Promise.all([
         request<SystemStats>('/api/stats', { signal }),
         request<Record<string, AdmissionStats>>('/api/inference-queue', { signal }),
         api.deployments.list(signal),
         api.benchmarks.syncStatus(signal),
-        api.nodes.list(signal),
+        nodeInventory,
       ])
       return { stats, admission, deployments, sync, nodes }
     },

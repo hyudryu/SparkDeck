@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -18,6 +19,15 @@ SPARKDECK_LABEL = "io.sparkdeck.managed"
 SPARKDECK_MODEL_LABEL = "io.sparkdeck.model"
 SPARKDECK_RUNTIME_LABEL = "io.sparkdeck.runtime"
 SPARKDECK_DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
+
+
+def normalize_openai_base_url(base_url: str) -> str:
+    """Return an endpoint root so callers can append exactly one ``/v1``."""
+    parsed = urlsplit(str(base_url or "").strip().rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if path.rsplit("/", 1)[-1].casefold() == "v1":
+        path = path.rsplit("/", 1)[0]
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)).rstrip("/")
 
 
 @dataclass(slots=True)
@@ -41,7 +51,8 @@ class RuntimeAdapter(ABC):
     async def health(self, http: httpx.AsyncClient, base_url: str,
                      api_key: str | None = None) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        response = await http.get(f"{base_url.rstrip('/')}/v1/models", headers=headers, timeout=5)
+        root = normalize_openai_base_url(base_url)
+        response = await http.get(f"{root}/v1/models", headers=headers, timeout=5)
         response.raise_for_status()
         data = response.json()
         return {"reachable": True, "models": data.get("data", [])}
@@ -62,6 +73,8 @@ class VllmAdapter(RuntimeAdapter):
             command += ["--max-model-len", str(max_model_len)]
         if settings.get("quantization"):
             command += ["--quantization", str(settings["quantization"])]
+        if settings.get("revision"):
+            command += ["--revision", str(settings["revision"])]
         command.extend(str(item) for item in settings.get("extra_args", []))
         return LaunchSpec(settings.get("image") or self.default_image, command, 8000, entrypoint=[])
 
@@ -71,13 +84,15 @@ class LlamaCppAdapter(RuntimeAdapter):
     default_image = "ghcr.io/ggml-org/llama.cpp:server-cuda"
 
     def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
-        artifact = str(settings.get("artifact") or model)
-        volumes = None
+        artifact = str(settings.get("artifact") or model).strip()
         artifact_path = Path(artifact).expanduser()
-        if artifact_path.is_absolute():
-            resolved = str(artifact_path.resolve())
-            volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
-            artifact = "/models/model.gguf"
+        if artifact_path.suffix.casefold() != ".gguf" or not artifact_path.is_file():
+            raise ValueError(
+                "llama.cpp managed deployments require an existing local GGUF artifact"
+            )
+        resolved = str(artifact_path.resolve())
+        volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
+        artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]
         context_size = settings.get("context_size") or settings.get("context_length")
         if context_size:
@@ -110,6 +125,8 @@ class SglangAdapter(RuntimeAdapter):
             command += ["--context-length", str(settings["context_length"])]
         if settings.get("quantization"):
             command += ["--quantization", str(settings["quantization"])]
+        if settings.get("revision"):
+            command += ["--revision", str(settings["revision"])]
         if settings.get("mem_fraction_static"):
             command += ["--mem-fraction-static", str(settings["mem_fraction_static"])]
         command.extend(str(item) for item in settings.get("extra_args", []))
@@ -150,6 +167,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
                 ("tensor_parallel_size", "--tensor-parallel-size"),
                 ("context_length", "--max-model-len"),
                 ("quantization", "--quantization"),
+                ("revision", "--revision"),
             ):
                 if settings.get(key) is not None:
                     extra += [flag, str(settings[key])]
@@ -166,6 +184,8 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             extra += ["--dp-size", str(settings["data_parallel_size"])]
         if settings.get("quantization") is not None:
             extra += ["--quantization", str(settings["quantization"])]
+        if settings.get("revision") is not None:
+            extra += ["--revision", str(settings["revision"])]
         extra.extend(str(item) for item in settings.get("extra_args", []))
         return await manager.create_container(
             model=model, engine="sglang", sg_image=settings.get("image"),

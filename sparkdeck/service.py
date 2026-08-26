@@ -17,7 +17,12 @@ import httpx
 
 from .catalog import HuggingFaceCatalog
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from .runtimes import RuntimeRegistry, launch_managed_container, safe_container_name
+from .runtimes import (
+    RuntimeRegistry,
+    launch_managed_container,
+    normalize_openai_base_url,
+    safe_container_name,
+)
 from .storage import SparkDeckStore
 
 
@@ -207,7 +212,11 @@ class SparkDeckService:
             try:
                 launched = await launch_managed_container(
                     self.manager, adapter, deployment_id, alias, model,
-                    {**settings, "artifact": identity.artifact},
+                    {
+                        **settings,
+                        "artifact": identity.artifact,
+                        "revision": identity.revision,
+                    },
                 )
                 deployment.container_name = launched.get("name")
                 port = launched.get("port")
@@ -366,7 +375,7 @@ class SparkDeckService:
             and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
         ):
             return await self._proxy_managed(deployment, body, endpoint, cancel)
-        base_url = deployment.get("_base_url")
+        base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
             raise LookupError("deployment endpoint is unavailable")
         api_key = self._get_credential(deployment["id"], deployment.get("_credential_ref"))
@@ -379,11 +388,11 @@ class SparkDeckService:
                 **(upstream_body.get("stream_options") or {}), "include_usage": True,
             }
             return self._http_stream(
-                f"{base_url.rstrip('/')}/v1/{endpoint}", upstream_body, headers,
+                f"{base_url}/v1/{endpoint}", upstream_body, headers,
                 deployment, started, cancel,
             )
         response = await self.manager.http.post(
-            f"{base_url.rstrip('/')}/v1/{endpoint}", json=upstream_body,
+            f"{base_url}/v1/{endpoint}", json=upstream_body,
             headers=headers, timeout=600,
         )
         response.raise_for_status()
@@ -600,7 +609,7 @@ class SparkDeckService:
             raise ValueError("base_url must be an http or https URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("base_url must not contain credentials, query parameters, or fragments")
-        return text
+        return normalize_openai_base_url(text)
 
     @staticmethod
     def _store_credential(deployment_id: str, api_key: Any) -> str | None:
@@ -668,6 +677,7 @@ def _public_model_id(value: str) -> str:
         or urlparse(text).scheme
         or Path(text).is_absolute()
         or text.startswith(("./", "../", "~"))
+        or Path(text).expanduser().exists()
         or "\\" in text
         or text.casefold().endswith((".gguf", ".bin", ".safetensors", ".pt", ".pth"))
         or not re.fullmatch(

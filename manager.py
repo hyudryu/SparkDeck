@@ -508,7 +508,6 @@ class Manager:
             ("cluster_health_task", self._cluster_health_monitor_loop),
             ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
             ("fan_cluster_task", self._fan_cluster_monitor_loop),
-            ("inference_nudger_task", self._inference_nudger_loop),
             ("token_usage_sync_task", self._token_usage_sync_loop),
         )
         for field, factory in task_factories:
@@ -521,7 +520,7 @@ class Manager:
         for field in (
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
-            "inference_nudger_task", "token_usage_sync_task",
+            "token_usage_sync_task",
         ):
             task = getattr(self, field, None)
             if task and not task.done():
@@ -539,6 +538,9 @@ class Manager:
     async def start(self):
         if not self.is_joined_worker():
             self._start_controller_tasks()
+        self.inference_nudger_task = asyncio.create_task(
+            self._inference_nudger_loop()
+        )
         self.temperature_history_task = asyncio.create_task(
             self._temperature_history_monitor_loop()
         )
@@ -1301,6 +1303,7 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "input_cost_per_1m": cls._pricing_value(
                 body.get("input_cost_per_1m"), "input_cost_per_1m"
             ),
@@ -2046,6 +2049,7 @@ class Manager:
             "created_at": time.time(),
             "recipe_id": body.get("recipe_id"),
             "managed_by": body.get("managed_by"),
+            "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "automation_run_id": body.get("automation_run_id"),
             "settings_dirty": False,
         }
@@ -6872,6 +6876,44 @@ class Manager:
         self._images_cache = await asyncio.to_thread(_do)
         self._images_ts = now
         return self._images_cache
+
+    async def cluster_image_inventory(self) -> dict:
+        """Return image/container inventory from each enabled cluster node."""
+        nodes = [
+            node for node in await self.cluster_nodes()
+            if node.get("local") or node.get("enabled", True)
+        ]
+
+        async def fetch(node: dict) -> dict:
+            if node.get("local"):
+                images, containers = await asyncio.gather(
+                    self.list_images(), self.list_containers(),
+                )
+                payload = {"images": images, "containers": containers}
+            else:
+                payload = await self.node_registry.request(
+                    node["id"], "GET", "/api/agent/images", timeout=15,
+                )
+            if not isinstance(payload, dict):
+                raise RuntimeError("node returned an invalid image inventory")
+            return {
+                "node": self.public_target_node(node),
+                "images": payload.get("images") or [],
+                "containers": payload.get("containers") or [],
+            }
+
+        fetched = await asyncio.gather(*(fetch(node) for node in nodes), return_exceptions=True)
+        results = []
+        errors = []
+        for node, result in zip(nodes, fetched):
+            if isinstance(result, Exception):
+                errors.append({
+                    "node": self.public_target_node(node),
+                    "error": str(result)[:500],
+                })
+            else:
+                results.append(result)
+        return {"results": results, "errors": errors, "partial": bool(errors)}
 
     async def remove_image(self, image_id: str) -> dict:
         def _do():

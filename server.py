@@ -399,6 +399,15 @@ async def agent_pull_image(req: Request):
         raise HTTPException(502, str(exc)[:500]) from exc
 
 
+@app.get("/api/agent/images")
+async def agent_images(req: Request):
+    _require_agent(req)
+    images, containers = await asyncio.gather(
+        manager.list_images(), manager.list_containers(),
+    )
+    return {"images": images, "containers": containers}
+
+
 @app.post("/api/agent/inference/health")
 async def agent_inference_health(req: Request):
     _require_agent(req)
@@ -951,43 +960,64 @@ async def pull_image(req: Request):
     )
 
 
-async def _v1_image_items() -> list[dict]:
-    raw_images, containers = await asyncio.gather(
-        manager.list_images(), manager.list_containers()
-    )
+def _v1_image_item(raw: dict, containers: list[dict]) -> dict:
     used_images = {str(item.get("image") or "") for item in containers}
-    items = []
-    for raw in raw_images:
-        tags = raw.get("tags") or []
-        first_tag = tags[0] if tags else None
-        repository = first_tag
-        tag = None
-        if first_tag and ":" in first_tag.rsplit("/", 1)[-1]:
-            repository, tag = first_tag.rsplit(":", 1)
-        folded = " ".join(tags).casefold()
-        runtimes = []
-        if raw.get("is_vllm") or "vllm" in folded:
-            runtimes.append("vllm")
-        if "sglang" in folded:
-            runtimes.append("sglang")
-        if "llama.cpp" in folded or "ggml-org/llama" in folded:
-            runtimes.append("llama.cpp")
-        items.append({
-            **raw,
-            "repository": repository,
-            "tag": tag,
-            "created_at": raw.get("created"),
-            "runtimes": runtimes,
-            "in_use": raw.get("id") in used_images or any(
-                image in used_images for image in tags
-            ),
-        })
-    return items
+    tags = raw.get("tags") or []
+    first_tag = tags[0] if tags else None
+    repository = first_tag
+    tag = None
+    if first_tag and ":" in first_tag.rsplit("/", 1)[-1]:
+        repository, tag = first_tag.rsplit(":", 1)
+    folded = " ".join(tags).casefold()
+    runtimes = []
+    if raw.get("is_vllm") or "vllm" in folded:
+        runtimes.append("vllm")
+    if "sglang" in folded:
+        runtimes.append("sglang")
+    if "llama.cpp" in folded or "ggml-org/llama" in folded:
+        runtimes.append("llama.cpp")
+    return {
+        **raw,
+        "repository": repository,
+        "tag": tag,
+        "created_at": raw.get("created"),
+        "runtimes": runtimes,
+        "in_use": raw.get("id") in used_images or any(
+            image in used_images for image in tags
+        ),
+    }
+
+
+async def _v1_image_inventory() -> dict:
+    inventory = await manager.cluster_image_inventory()
+    merged: dict[str, dict] = {}
+    for result in inventory["results"]:
+        node = result["node"]
+        for raw in result["images"]:
+            item = _v1_image_item(raw, result["containers"])
+            key = str(item.get("id") or (item.get("tags") or [""])[0])
+            if not key:
+                continue
+            current = merged.setdefault(key, {
+                **item, "node_ids": [], "selected_nodes": [],
+            })
+            current["in_use"] = bool(current.get("in_use") or item.get("in_use"))
+            current["node_ids"].append(node["id"])
+            current["selected_nodes"].append(node)
+    return {
+        "items": list(merged.values()),
+        "partial": inventory["partial"],
+        "errors": inventory["errors"],
+    }
+
+
+async def _v1_image_items() -> list[dict]:
+    return (await _v1_image_inventory())["items"]
 
 
 @app.get("/api/v1/images")
 async def v1_list_images():
-    return {"items": await _v1_image_items()}
+    return await _v1_image_inventory()
 
 
 @app.get("/api/v1/nodes")

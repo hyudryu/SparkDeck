@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+
+
+COMMUNITY_UPLOAD_FIELDS = frozenset({
+    "model_id", "context_window_size", "inference_tokens_per_second",
+})
+COMMUNITY_EVIDENCE_POLICY = {
+    "minimum_samples": 10,
+    "exact_match_dimensions": ["model_id", "context_window_size"],
+    "metric": "inference_tokens_per_second",
+}
 
 
 class SparkDeckStore:
@@ -89,6 +100,36 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
             )
+            # Older versions considered samples uploadable without the two
+            # measurements required by the public aggregate. Fail closed when
+            # opening an existing database and discard only their unsent upload
+            # instructions; the full benchmark rows remain local.
+            invalid_sample_ids: list[str] = []
+            for row in self._connection.execute(
+                "SELECT id, configuration_json, generation_tps "
+                "FROM benchmark_samples WHERE eligible = 1"
+            ).fetchall():
+                try:
+                    configuration = json.loads(row["configuration_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    configuration = {}
+                if (
+                    not isinstance(configuration, dict)
+                    or community_context_window(configuration) is None
+                    or _positive_speed(row["generation_tps"]) is None
+                ):
+                    invalid_sample_ids.append(row["id"])
+            if invalid_sample_ids:
+                self._connection.executemany(
+                    "UPDATE benchmark_samples SET eligible = 0 WHERE id = ?",
+                    ((sample_id,) for sample_id in invalid_sample_ids),
+                )
+                marks = ",".join("?" for _ in invalid_sample_ids)
+                self._connection.execute(
+                    f"DELETE FROM upload_outbox WHERE sample_id IN ({marks}) "
+                    "AND status IN ('pending', 'failed', 'waiting_for_account')",
+                    tuple(invalid_sample_ids),
+                )
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         with self._lock:
@@ -189,6 +230,11 @@ class SparkDeckStore:
 
     def add_benchmark(self, sample: BenchmarkSample, queue: bool) -> None:
         value = sample.to_dict()
+        community_eligible = bool(
+            sample.eligible_for_community
+            and community_context_window(sample.configuration) is not None
+            and _positive_speed(sample.generation_tokens_per_second) is not None
+        )
         with self._lock, self._connection:
             self._connection.execute(
                 """INSERT INTO benchmark_samples VALUES (
@@ -203,10 +249,10 @@ class SparkDeckStore:
                     sample.generation_tokens_per_second,
                     sample.prompt_tokens_per_second,
                     None if sample.cold_start is None else int(sample.cold_start),
-                    int(sample.eligible_for_community),
+                    int(community_eligible),
                 ),
             )
-            if queue:
+            if queue and community_eligible:
                 pairing = self.get_setting("device_pairing", {"status": "not_paired"})
                 status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
                 self._connection.execute(
@@ -266,7 +312,11 @@ class SparkDeckStore:
                 f"SELECT * FROM benchmark_samples WHERE id IN ({marks})",
                 tuple(wanted),
             ).fetchall()
-        by_id = {row["id"]: _upload_row(row) for row in sample_rows}
+        by_id = {
+            row["id"]: payload
+            for row in sample_rows
+            if (payload := _upload_row(row)) is not None
+        }
         return [by_id[sample_id] for sample_id in wanted if sample_id in by_id]
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
@@ -372,25 +422,42 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
     return value
 
 
-def _upload_row(row: sqlite3.Row) -> dict[str, Any]:
-    """Build the strict future cloud payload, separate from the local record."""
+def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    """Build the exact three-field cloud payload, separate from local history."""
     value = _benchmark_row(row)
+    context_window = community_context_window(value["configuration"])
+    speed = _positive_speed(value["generation_tokens_per_second"])
+    model_id = str(value.get("model", {}).get("repository") or "").strip()
+    if not model_id or context_window is None or speed is None:
+        return None
     payload = {
-        key: value[key]
-        for key in (
-            "id", "created_at", "runtime", "runtime_version",
-            "hardware", "configuration", "input_tokens", "output_tokens",
-            "latency_ms", "ttft_ms", "generation_tokens_per_second",
-            "prompt_tokens_per_second", "cold_start",
-        )
+        "model_id": model_id,
+        "context_window_size": context_window,
+        "inference_tokens_per_second": speed,
     }
-    model = value["model"]
-    payload["model"] = {
-        key: model.get(key)
-        for key in ("repository", "revision", "quantization")
-        if model.get(key) is not None
-    }
-    version = str(payload.get("runtime_version") or "")
-    if "/" in version or "\\" in version or "://" in version:
-        payload["runtime_version"] = None
+    assert set(payload) == COMMUNITY_UPLOAD_FIELDS
     return payload
+
+
+def community_context_window(configuration: dict[str, Any]) -> int | None:
+    for key in ("max_model_len", "context_length", "context_size"):
+        value = configuration.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _positive_speed(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 and math.isfinite(parsed) else None

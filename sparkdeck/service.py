@@ -26,7 +26,7 @@ from .runtimes import (
     normalize_openai_base_url,
     safe_container_name,
 )
-from .storage import SparkDeckStore
+from .storage import SparkDeckStore, community_context_window
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -918,6 +918,7 @@ class SparkDeckService:
         eligible = bool(
             public_model != "local-model" and input_tokens > 0 and output_tokens >= 16 and latency > 0
             and generation_tps is not None
+            and community_context_window(safe_settings) is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
         )

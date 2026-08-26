@@ -25,6 +25,7 @@ from sparkdeck.onboarding import (
     forward_management_request,
     is_forwardable_path,
 )
+from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.web import register_spa_routes
 
 ROOT = Path(__file__).parent
@@ -1518,14 +1519,7 @@ async def v1_community_aggregates():
     return {
         "items": [],
         "availability": "not_configured",
-        "evidence_policy": {
-            "minimum_samples": 10,
-            "minimum_distinct_devices": 3,
-            "exact_match_dimensions": [
-                "model_revision", "quantization", "runtime", "hardware_class",
-                "tensor_parallel_size", "context_group",
-            ],
-        },
+        "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
     }
 
 

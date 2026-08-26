@@ -1,10 +1,15 @@
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from sparkdeck.models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from sparkdeck.storage import SparkDeckStore
+from sparkdeck.storage import (
+    COMMUNITY_EVIDENCE_POLICY,
+    COMMUNITY_UPLOAD_FIELDS,
+    SparkDeckStore,
+)
 
 
 class SparkDeckStoreTests(unittest.TestCase):
@@ -34,7 +39,8 @@ class SparkDeckStoreTests(unittest.TestCase):
             id="sample-1", created_at="2026-08-25T00:00:00+00:00",
             deployment_id=None, model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version=None,
-            hardware={"architecture": "x86_64"}, configuration={},
+            hardware={"architecture": "x86_64"},
+            configuration={"context_length": 4096},
             input_tokens=20, output_tokens=30, latency_ms=100,
             ttft_ms=10, generation_tokens_per_second=300,
             prompt_tokens_per_second=200, cold_start=False,
@@ -48,7 +54,11 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 1)
         self.store.set_setting("device_pairing", {"status": "paired", "device_id": "device-1"})
         self.assertEqual(self.store.retry_outbox(), 1)
-        self.assertEqual([item["id"] for item in self.store.outbox_batch()], ["sample-2"])
+        self.assertEqual(self.store.outbox_batch(), [{
+            "model_id": "org/model",
+            "context_window_size": 4096,
+            "inference_tokens_per_second": 300.0,
+        }])
         self.assertEqual(self.store.mark_outbox_failed(["sample-2"], "offline"), 1)
         self.assertEqual(self.store.outbox_batch(), [])
         self.assertEqual(self.store.retry_outbox(), 1)
@@ -73,10 +83,17 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_setting("device_pairing", {"status": "paired"})
         self.store.retry_outbox()
         rows = self.store.outbox_batch()
-        self.assertEqual([item["id"] for item in rows], ["sample-private"])
-        self.assertNotIn("artifact", rows[0]["model"])
-        self.assertIsNone(rows[0]["runtime_version"])
+        self.assertEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertEqual(rows, [{
+            "model_id": "org/model",
+            "context_window_size": 4096,
+            "inference_tokens_per_second": 300.0,
+        }])
         local, _ = self.store.benchmarks()
+        self.assertEqual(local[0]["model"]["artifact"], "C:/private/model.gguf")
+        self.assertEqual(local[0]["model"]["revision"], "abc123")
+        self.assertEqual(local[0]["runtime_version"], "registry.local/team/image:1")
+        self.assertEqual(local[0]["hardware"], {"architecture": "aarch64"})
         self.assertEqual(local[0]["sync_state"], "pending")
 
     def test_withdrawing_consent_removes_unsent_uploads_but_keeps_samples(self):
@@ -84,7 +101,8 @@ class SparkDeckStoreTests(unittest.TestCase):
             id="pending", created_at="2026-08-25T00:00:00+00:00",
             deployment_id=None, model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version=None,
-            hardware={}, configuration={}, input_tokens=20, output_tokens=30,
+            hardware={}, configuration={"context_length": 4096},
+            input_tokens=20, output_tokens=30,
             latency_ms=100, ttft_ms=10, generation_tokens_per_second=300,
             prompt_tokens_per_second=200, cold_start=False,
             eligible_for_community=True,
@@ -105,16 +123,17 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertTrue(all(item["sync_state"] == "local" for item in local))
 
         self.store.set_community_consent(True)
-        self.assertEqual(
-            {item["id"] for item in self.store.outbox_batch()}, {"pending", "failed"}
-        )
+        uploads = self.store.outbox_batch()
+        self.assertEqual(len(uploads), 2)
+        self.assertTrue(all(set(item) == COMMUNITY_UPLOAD_FIELDS for item in uploads))
 
     def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
         sample = BenchmarkSample(
             id="legacy-hardware", created_at="2026-08-25T00:00:00+00:00",
             deployment_id=None, model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version=None,
-            hardware={"device_class": "dgx-spark"}, configuration={},
+            hardware={"device_class": "dgx-spark"},
+            configuration={"context_length": 4096},
             input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
             generation_tokens_per_second=300, prompt_tokens_per_second=200,
             cold_start=False, eligible_for_community=True,
@@ -127,4 +146,74 @@ class SparkDeckStoreTests(unittest.TestCase):
         upload = self.store.outbox_batch()
 
         self.assertEqual(local[0]["hardware"], {"hardware_class": "dgx-spark"})
-        self.assertEqual(upload[0]["hardware"], {"hardware_class": "dgx-spark"})
+        self.assertEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertNotIn("hardware", upload[0])
+
+    def test_context_and_speed_are_required_at_the_upload_boundary(self):
+        base = BenchmarkSample(
+            id="missing-context", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id="dep-private", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version="1.2.3",
+            hardware={"hardware_class": "dgx-spark"}, configuration={},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=300, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.set_community_consent(True)
+        self.store.add_benchmark(base, queue=True)
+        self.store.add_benchmark(replace(
+            base,
+            id="missing-speed",
+            configuration={"max_model_len": 8192},
+            generation_tokens_per_second=None,
+        ), queue=True)
+
+        local, total = self.store.benchmarks()
+        self.assertEqual(total, 2)
+        self.assertTrue(all(not row["eligible_for_community"] for row in local))
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.sync_status()["outbox"]["pending"], 0)
+
+    def test_community_evidence_policy_uses_only_upload_dimensions(self):
+        self.assertEqual(COMMUNITY_EVIDENCE_POLICY, {
+            "minimum_samples": 10,
+            "exact_match_dimensions": ["model_id", "context_window_size"],
+            "metric": "inference_tokens_per_second",
+        })
+
+    def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
+        sample = BenchmarkSample(
+            id="legacy-invalid", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=20, output_tokens=30,
+            latency_ms=100, ttft_ms=10, generation_tokens_per_second=300,
+            prompt_tokens_per_second=200, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.add_benchmark(sample, queue=False)
+        database = self.store.path
+        self.store.close()
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "UPDATE benchmark_samples SET eligible = 1 WHERE id = ?",
+                (sample.id,),
+            )
+            connection.execute(
+                "INSERT INTO upload_outbox(sample_id, status, created_at) "
+                "VALUES (?, 'pending', ?)",
+                (sample.id, sample.created_at),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.store = SparkDeckStore(database)
+
+        local, total = self.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertFalse(local[0]["eligible_for_community"])
+        self.assertEqual(local[0]["configuration"], {})
+        self.assertEqual(self.store.sync_status()["outbox"]["pending"], 0)

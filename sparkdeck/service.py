@@ -841,7 +841,7 @@ class SparkDeckService:
         quantization = _optional_string(safe_settings.get("quantization"))
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
-            if output_tokens else None
+            if output_tokens and first_token_at is not None else None
         )
         observed_prompt_tps = (
             round(input_tokens / max(0.000001, first_token_at - started), 3)

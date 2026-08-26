@@ -415,7 +415,11 @@ class SparkDeckService:
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
         elif deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
-            await self.manager.remove_container(deployment["container_name"])
+            try:
+                await self.manager.remove_container(deployment["container_name"])
+            except Exception as exc:
+                if not _is_missing_container_error(exc):
+                    raise
         if not discovered:
             self._delete_credential(deployment_id, deployment.get("_credential_ref"))
             self.store.delete_deployment(deployment_id)
@@ -519,9 +523,14 @@ class SparkDeckService:
                 f"{base_url}/v1/{endpoint}", upstream_body, headers,
                 deployment, started, cancel,
             )
-        response = await self.manager.http.post(
+        upstream = self.manager.http.post(
             f"{base_url}/v1/{endpoint}", json=upstream_body,
             headers=headers, timeout=600,
+        )
+        response = (
+            await self.manager._await_or_cancel(upstream, cancel)
+            if cancel is not None
+            else await upstream
         )
         response.raise_for_status()
         data = response.json()
@@ -548,16 +557,24 @@ class SparkDeckService:
             )
             if manager_id
             else (
-                await self.manager._vllm_chat(model, upstream_body, stream, cancel)
+                await self.manager._vllm_chat(
+                    model, upstream_body, stream, cancel,
+                    container_name=deployment.get("container_name"),
+                    deployment_id=deployment["id"],
+                )
                 if endpoint == "chat/completions"
-                else await self.manager._vllm_completions(model, upstream_body, stream, cancel)
+                else await self.manager._vllm_completions(
+                    model, upstream_body, stream, cancel,
+                    container_name=deployment.get("container_name"),
+                    deployment_id=deployment["id"],
+                )
             )
         )
         revision = deployment["model"].get("revision")
         if hasattr(result, "__aiter__"):
             return self._observe_stream(
                 result, deployment["id"], model, deployment["runtime"], settings,
-                started, revision=revision,
+                started, revision=revision, response_model=deployment["alias"],
             )
         self._record_response(
             deployment["id"], model, deployment["runtime"], settings, started,
@@ -620,18 +637,21 @@ class SparkDeckService:
 
     async def _observe_stream(self, stream: AsyncIterator[str], deployment_id: str | None,
                               model: str, runtime: str, settings: dict[str, Any],
-                              started: float, revision: str | None = None) -> AsyncIterator[str]:
+                              started: float, revision: str | None = None,
+                              response_model: str | None = None) -> AsyncIterator[str]:
         first_token_at = None
         usage = None
         async for chunk in stream:
             text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+            if response_model:
+                text = _rewrite_sse_model(text, response_model)
             for line in text.splitlines():
                 parsed = _parse_sse(line)
                 if parsed and parsed.get("usage"):
                     usage = parsed["usage"]
                 if parsed and first_token_at is None and _chunk_has_output(parsed):
                     first_token_at = time.monotonic()
-            yield chunk
+            yield text.encode("utf-8") if isinstance(chunk, bytes) else text
         if usage:
             self._record_usage(
                 deployment_id, model, runtime, settings, started, usage,
@@ -826,6 +846,15 @@ def _positive_float(value: Any) -> float | None:
     return number if number > 0 else None
 
 
+def _is_missing_container_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ == "NotFound":
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 404
+
+
 def _public_model_id(value: str) -> str:
     """Exclude endpoint URLs and local paths from persistent benchmark identity."""
     text = str(value or "").strip()
@@ -856,6 +885,20 @@ def _parse_sse(line: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _rewrite_sse_model(text: str, alias: str) -> str:
+    """Rewrite model identities without disturbing SSE framing or event types."""
+    output = []
+    for framed_line in text.splitlines(keepends=True):
+        line = framed_line.rstrip("\r\n")
+        ending = framed_line[len(line):]
+        parsed = _parse_sse(line)
+        if parsed is not None and "model" in parsed:
+            parsed["model"] = alias
+            line = "data: " + json.dumps(parsed, separators=(",", ":"))
+        output.append(line + ending)
+    return "".join(output)
 
 
 def _chunk_has_output(chunk: dict[str, Any]) -> bool:

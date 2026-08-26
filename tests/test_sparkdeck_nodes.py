@@ -215,7 +215,11 @@ class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
         manager._acquire_inference_slot.assert_awaited_once()
         manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/inference/chat/completions",
-            json_body=body, timeout=600,
+            json_body={
+                **body,
+                "_sparkdeck_container_name": "rank-0",
+                "_sparkdeck_deployment_id": "remote-cluster",
+            }, timeout=600,
         )
         manager._release_inference_slot.assert_called_once_with("remote-cluster")
 
@@ -228,7 +232,11 @@ class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready)
         manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/inference/health",
-            json_body={"model": "org/model"}, timeout=10,
+            json_body={
+                "model": "org/model",
+                "_sparkdeck_container_name": "rank-0",
+                "_sparkdeck_deployment_id": "remote-cluster",
+            }, timeout=10,
         )
 
     async def test_remote_stream_releases_admission_after_agent_stream(self):

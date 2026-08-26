@@ -174,8 +174,8 @@ export const api = {
           api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
-          node_ids: input.managed ? input.node_ids : undefined,
-          deployment_mode: input.managed ? input.deployment_mode : undefined,
+          node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
+          deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
         }),
       })
       return deploymentFromWire(data)

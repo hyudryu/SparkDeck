@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import platform
 import re
@@ -52,6 +53,7 @@ class SparkDeckService:
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None
     ) -> dict[str, Any]:
+        bounded_limit = min(100, max(1, int(limit)))
         if runtime is not None:
             self.registry.get(runtime)
         deployments = await self.deployments()
@@ -63,20 +65,23 @@ class SparkDeckService:
         # Hugging Face enriches the catalog when online, while local models
         # remain searchable when the public catalog cannot be reached.
         try:
-            remote_items = await self.catalog.search(query, limit)
+            remote_items = await self.catalog.search(query, bounded_limit)
         except (httpx.HTTPError, ValueError, TypeError):
             remote_items = []
 
         items_by_id = {
-            item["id"]: item for item in remote_items if item.get("id")
+            item["id"]: copy.deepcopy(item)
+            for item in remote_items if item.get("id")
         }
         folded_query = query.strip().casefold()
+        matching_local_ids: list[str] = []
         for repository, matches in local.items():
             if folded_query and folded_query not in repository.casefold() and not any(
                 folded_query in str(item.get("alias") or "").casefold()
                 for item in matches
             ):
                 continue
+            matching_local_ids.append(repository)
             item = items_by_id.setdefault(
                 repository,
                 {
@@ -101,7 +106,12 @@ class SparkDeckService:
                 }
             item["runtime_compatibility"] = list(compatibility.values())
 
-        items = list(items_by_id.values())
+        matching_local = set(matching_local_ids)
+        items = [items_by_id[item_id] for item_id in matching_local_ids]
+        items.extend(
+            item for item_id, item in items_by_id.items()
+            if item_id not in matching_local
+        )
         if runtime:
             items = [
                 item for item in items
@@ -110,7 +120,7 @@ class SparkDeckService:
                     for entry in item.get("runtime_compatibility") or []
                 )
             ]
-        items = items[: min(100, max(1, int(limit)))]
+        items = items[:bounded_limit]
         return {"items": items, "total": len(items), "next_cursor": None}
 
     async def deployments(self) -> list[dict[str, Any]]:

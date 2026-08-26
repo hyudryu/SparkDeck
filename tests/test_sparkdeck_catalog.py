@@ -69,6 +69,70 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CatalogFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matching_local_models_are_reserved_inside_catalog_limit(self):
+        class Manager:
+            def __init__(self):
+                self.http = httpx.AsyncClient()
+                self.list_containers = AsyncMock(return_value=[])
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager()
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="local-1", alias="Local model", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("local/Model"),
+                container_name="sparkdeck-local",
+            ))
+            service.catalog.search = AsyncMock(return_value=[
+                {"id": "remote/One", "runtime_compatibility": []},
+                {"id": "remote/Two", "runtime_compatibility": []},
+            ])
+
+            result = await service.catalog_search("", 2)
+
+            self.assertEqual(
+                [item["id"] for item in result["items"]],
+                ["local/Model", "remote/One"],
+            )
+            self.assertEqual(result["items"][0]["local_deployment_ids"], ["local-1"])
+            await service.close()
+            await manager.http.aclose()
+
+    async def test_local_enrichment_does_not_mutate_cached_remote_results(self):
+        class Manager:
+            def __init__(self):
+                self.http = httpx.AsyncClient()
+                self.list_containers = AsyncMock(return_value=[])
+
+        cached_item = {
+            "id": "org/Model",
+            "runtime_compatibility": [{"runtime": "vllm", "supported": False}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager()
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="local-1", alias="Local model", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/Model"),
+                container_name="sparkdeck-local",
+            ))
+            service.catalog.search = AsyncMock(return_value=[cached_item])
+
+            enriched = await service.catalog_search("model", 10)
+            service.store.delete_deployment("local-1")
+            refreshed = await service.catalog_search("model", 10)
+
+            self.assertEqual(enriched["items"][0]["local_deployment_ids"], ["local-1"])
+            self.assertTrue(enriched["items"][0]["runtime_compatibility"][0]["supported"])
+            self.assertNotIn("local_deployment_ids", refreshed["items"][0])
+            self.assertFalse(refreshed["items"][0]["runtime_compatibility"][0]["supported"])
+            self.assertEqual(cached_item, {
+                "id": "org/Model",
+                "runtime_compatibility": [{"runtime": "vllm", "supported": False}],
+            })
+            await service.close()
+            await manager.http.aclose()
+
     async def test_hugging_face_outage_keeps_matching_local_models_searchable(self):
         class Manager:
             def __init__(self):

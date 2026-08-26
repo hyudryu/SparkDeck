@@ -1,6 +1,4 @@
-"""
-VLLMController - container + queue + telemetry manager.
-"""
+"""SparkDeck container, queue, cluster, and telemetry manager."""
 import asyncio
 import codecs
 import copy
@@ -90,14 +88,35 @@ logger = logging.getLogger(__name__)
 # should not fall back to the configured vLLM image.
 DEFAULT_SGLANG_IMAGE = "lmsysorg/sglang:latest"
 
-CONTROLLER_LABEL = "vllm-controller"
-MODEL_LABEL = "vllm-model"
-DEPLOYMENT_LABEL = "vllm-controller.deployment"
-NODE_LABEL = "vllm-controller.node"
-RANK_LABEL = "vllm-controller.rank"
-SERVICE_PORT_LABEL = "vllm-controller.service-port"
-MODE_LABEL = "vllm-controller.deployment-mode"
-NNODES_LABEL = "vllm-controller.nnodes"
+CONTROLLER_LABEL = "io.sparkdeck.managed"
+MODEL_LABEL = "io.sparkdeck.model"
+ENGINE_LABEL = "io.sparkdeck.runtime"
+DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
+NODE_LABEL = "io.sparkdeck.node"
+RANK_LABEL = "io.sparkdeck.rank"
+SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
+MODE_LABEL = "io.sparkdeck.deployment-mode"
+NNODES_LABEL = "io.sparkdeck.nnodes"
+
+# Containers created by earlier releases remain discoverable and manageable.
+LEGACY_LABELS = {
+    CONTROLLER_LABEL: "vllm-controller",
+    MODEL_LABEL: "vllm-model",
+    ENGINE_LABEL: "vllm-controller.engine",
+    DEPLOYMENT_LABEL: "vllm-controller.deployment",
+    NODE_LABEL: "vllm-controller.node",
+    RANK_LABEL: "vllm-controller.rank",
+    SERVICE_PORT_LABEL: "vllm-controller.service-port",
+    MODE_LABEL: "vllm-controller.deployment-mode",
+    NNODES_LABEL: "vllm-controller.nnodes",
+}
+
+
+def _label_value(labels: dict, key: str, default: Any = None) -> Any:
+    value = labels.get(key)
+    if value is None:
+        value = labels.get(LEGACY_LABELS[key])
+    return default if value is None else value
 
 # Distributed workers form one rendezvous generation.  Checking every two
 # minutes catches a split rank well before the default 601-second TCPStore
@@ -5636,8 +5655,8 @@ class Manager:
             raise ValueError(f"Container '{name}' not found")
 
         labels = c.labels or {}
-        model = labels.get(MODEL_LABEL, "")
-        engine = labels.get("vllm-controller.engine", "vllm")
+        model = _label_value(labels, MODEL_LABEL, "")
+        engine = _label_value(labels, ENGINE_LABEL, "vllm")
         attrs = c.attrs or {}
         image_tag = attrs.get("Config", {}).get("Image") or attrs.get("Image") or None
 
@@ -5796,14 +5815,14 @@ class Manager:
             or attrs.get("Image", "")
         )
 
-        is_managed = labels.get(CONTROLLER_LABEL) == "1"
-        engine_label = labels.get("vllm-controller.engine", "vllm")
+        is_managed = _label_value(labels, CONTROLLER_LABEL) == "1"
+        engine_label = _label_value(labels, ENGINE_LABEL, "vllm")
         is_atlas_serving = _is_atlas_serving_container(c.name, image_tag)
         if not is_managed and not _is_vllm_image(image_tag) and not is_atlas_serving:
             return None
 
         # parse model from cmd or label
-        model = labels.get(MODEL_LABEL, "")
+        model = _label_value(labels, MODEL_LABEL, "")
         cmd = c.attrs.get("Config", {}).get("Cmd") or []
         if not model:
             if engine_label == "sglang":
@@ -5831,9 +5850,9 @@ class Manager:
                     break
                 except Exception:
                     pass
-        if host_port is None and labels.get(SERVICE_PORT_LABEL):
+        if host_port is None and _label_value(labels, SERVICE_PORT_LABEL):
             try:
-                host_port = int(labels[SERVICE_PORT_LABEL])
+                host_port = int(_label_value(labels, SERVICE_PORT_LABEL))
             except (TypeError, ValueError):
                 pass
 
@@ -5864,13 +5883,13 @@ class Manager:
             "started_at": (c.attrs.get("State") or {}).get("StartedAt"),
             "restart_count": c.attrs.get("RestartCount", 0),
         }
-        if labels.get(DEPLOYMENT_LABEL):
+        if _label_value(labels, DEPLOYMENT_LABEL):
             summary.update({
-                "deployment_id": labels.get(DEPLOYMENT_LABEL),
-                "node_id": labels.get(NODE_LABEL),
-                "rank": int(labels.get(RANK_LABEL, "0")),
-                "deployment_mode": labels.get(MODE_LABEL, "single"),
-                "nnodes": int(labels.get(NNODES_LABEL, "1")),
+                "deployment_id": _label_value(labels, DEPLOYMENT_LABEL),
+                "node_id": _label_value(labels, NODE_LABEL),
+                "rank": int(_label_value(labels, RANK_LABEL, "0")),
+                "deployment_mode": _label_value(labels, MODE_LABEL, "single"),
+                "nnodes": int(_label_value(labels, NNODES_LABEL, "1")),
             })
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
@@ -6027,6 +6046,7 @@ class Manager:
         recipe_id: str | None = None,
         cluster_member: dict | None = None,
         hf_token: str | None = None,
+        sparkdeck_deployment_id: str | None = None,
     ) -> dict:
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
@@ -6114,8 +6134,10 @@ class Manager:
                     })
                 labels = {
                     CONTROLLER_LABEL: "1", MODEL_LABEL: model,
-                    "vllm-controller.engine": "sglang",
+                    ENGINE_LABEL: "sglang",
                 }
+                if sparkdeck_deployment_id:
+                    labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
                 if cluster_member:
                     labels.update({
                         DEPLOYMENT_LABEL: cluster_member["deployment_id"],
@@ -6254,7 +6276,12 @@ class Manager:
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
                 )
-                labels = {CONTROLLER_LABEL: "1", MODEL_LABEL: model}
+                labels = {
+                    CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                    ENGINE_LABEL: "vllm",
+                }
+                if sparkdeck_deployment_id:
+                    labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
                 if cluster_member:
                     labels.update({
                         DEPLOYMENT_LABEL: cluster_member["deployment_id"],
@@ -6327,13 +6354,13 @@ class Manager:
         # Estimate VRAM from the container's model label.
         try:
             c = self.client.containers.get(name)
-            model = (c.labels or {}).get(MODEL_LABEL, "")
+            model = _label_value(c.labels or {}, MODEL_LABEL, "")
             params_b, bpp = self._estimate_params_and_quant(model)
             if params_b > 0:
                 need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
                 labels = c.labels or {}
-                if labels.get(MODE_LABEL) == "sharded":
-                    need_gb /= max(1, int(labels.get(NNODES_LABEL, "1")))
+                if _label_value(labels, MODE_LABEL) == "sharded":
+                    need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
             else:
                 need_gb = 30.0  # conservative fallback
             self._try_fit_new_model(need_gb, protect_name=name)
@@ -6518,13 +6545,13 @@ class Manager:
             container = await asyncio.to_thread(self.client.containers.get, name)
             container.reload()
             labels = container.labels or {}
-            if labels.get(DEPLOYMENT_LABEL):
+            if _label_value(labels, DEPLOYMENT_LABEL):
                 raise ValueError("edit the deployment recipe instead of one cluster member")
             attrs = copy.deepcopy(container.attrs or {})
             config = copy.deepcopy(attrs.get("Config") or {})
             cmd = config.get("Cmd") or []
-            engine = labels.get("vllm-controller.engine", "vllm")
-            model = labels.get(MODEL_LABEL, "")
+            engine = _label_value(labels, ENGINE_LABEL, "vllm")
+            model = _label_value(labels, MODEL_LABEL, "")
             new_cmd = self._updated_container_command(cmd, engine, model, settings)
             was_running = container.status in {"running", "restarting", "paused"}
             backup_name = f"{name}.settings-backup-{uuid.uuid4().hex[:8]}"
@@ -6566,7 +6593,7 @@ class Manager:
     async def is_managed_container(self, name: str) -> bool:
         def _check():
             container = self.client.containers.get(name)
-            return (container.labels or {}).get(CONTROLLER_LABEL) == "1"
+            return _label_value(container.labels or {}, CONTROLLER_LABEL) == "1"
         try:
             return await asyncio.to_thread(_check)
         except Exception:
@@ -8416,10 +8443,6 @@ class Manager:
                 if ready:
                     self._mark_active(c["name"])
                     return c
-        # Fallback to sparkrun-managed containers (host-network mode).
-        sparkrun = await self._sparkrun_targets()
-        if model in sparkrun:
-            return sparkrun[model]
         # Try ensure_loaded to start/swap the container
         try:
             return await self.ensure_loaded(model)
@@ -8957,9 +8980,10 @@ class Manager:
 
         # Need to evict — find managed running containers, sorted by LRU.
         try:
-            containers = self.client.containers.list(
-                filters={"label": CONTROLLER_LABEL}
-            )
+            containers = [
+                container for container in self.client.containers.list()
+                if _label_value(container.labels or {}, CONTROLLER_LABEL) == "1"
+            ]
             running = []
             for c in containers:
                 if c.status == "running" and c.name != protect_name:
@@ -9809,26 +9833,11 @@ class Manager:
 
     # ---------- aggregate state ----------
     async def get_state(self) -> dict:
-        containers, images, stats, ollama, unsloth, sparkrun_targets = await asyncio.gather(
+        containers, images, stats = await asyncio.gather(
             self.list_containers(),
             self.list_images(),
             self.get_stats(),
-            self.list_ollama_models(),
-            self.list_unsloth_models(),
-            self._sparkrun_targets(),
         )
-        # Enrich Atlas Serving containers with their served model name. Atlas
-        # runs are SparkRun containers in host-network mode.
-        sparkrun_models_by_port: dict[int, str] = {
-            target.get("port"): model
-            for model, target in sparkrun_targets.items()
-        }
-        for c in containers:
-            if c.get("source") == "atlas-serving":
-                if not c.get("model"):
-                    # Atlas containers currently run in host-network mode on
-                    # their recipe's port; default is 8000.
-                    c["model"] = sparkrun_models_by_port.get(8000)
         nodes = await self.cluster_nodes(stats)
         containers_by_node: dict[str, dict[str, dict]] = {
             LOCAL_NODE_ID: {c.get("name"): c for c in containers},
@@ -9927,17 +9936,11 @@ class Manager:
         running_models = [c for c in containers if c["status"] == "running"]
         # Token-stats key of the model currently holding the GPU, so the UI
         # can auto-select the right per-variant entry on model switches.
-        unsloth_loaded = unsloth.get("loaded_model")
-        if unsloth_loaded:
-            loaded_stats_key = self._stats_key(
-                unsloth_loaded, self._unsloth_variant(unsloth_loaded)
-            )
-        else:
-            loaded_stats_key = next(
-                (c.get("stats_key") or c["model"]
-                 for c in running_models if c.get("model")),
-                None,
-            )
+        loaded_stats_key = next(
+            (c.get("stats_key") or c["model"]
+             for c in running_models if c.get("model")),
+            None,
+        )
         return {
             "containers": containers,
             "images": images,
@@ -9946,8 +9949,6 @@ class Manager:
             "token_usage_sync": dict(self._token_usage_sync_status),
             "nodes": nodes,
             "deployments": public_deployments,
-            "recipes": list(self.recipes),
-            "recipe_launches": dict(self.recipe_launches),
             "token_stats": self.token_stats,
             "token_costs": {
                 model: self.calculate_cost(model, model_stats)
@@ -9961,16 +9962,6 @@ class Manager:
             "session_token_stats": self.session_token_stats,
             "active_requests": self.active_requests(),
             "inference_admission": self.inference_admission(),
-            "ollama": ollama,
-            "unsloth": unsloth,
-            "spark_launches": list(self.spark_launches),
-            "spark_runs": self._public_spark_runs(),
-            # Preserve the public model -> port shape; internal discovery
-            # keeps richer load settings for admission control.
-            "sparkrun_targets": {
-                model: target.get("port")
-                for model, target in sparkrun_targets.items()
-            },
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {
                 "running_models": len(running_models),
@@ -9981,15 +9972,7 @@ class Manager:
                     "used_gb": round(((stats.get("gpus") or [{}])[0].get("mem_used_mib") or 0) / 1024.0, 1),
                 },
                 "total_containers": len(containers),
-                "saved_recipes": len(self.recipes),
-                "ollama_models": len(ollama.get("models") or []),
-                "ollama_reachable": ollama.get("reachable", False),
-                "unsloth_models": len(unsloth.get("models") or []),
-                "unsloth_reachable": unsloth.get("reachable", False),
-                "unsloth_loaded": unsloth.get("loaded_model"),
                 "loaded_stats_key": loaded_stats_key,
-                "spark_launches": len(self.spark_launches),
-                "spark_runs": sum(1 for r in self._public_spark_runs() if r.get("status") == "running"),
                 "cluster_nodes": len(nodes),
                 "cluster_nodes_online": sum(1 for n in nodes if n.get("online")),
                 "cluster_deployments": len(public_deployments),

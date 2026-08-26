@@ -69,6 +69,24 @@ describe('API client adapters', () => {
     }))
   })
 
+  it('keeps llama.cpp local in the UI without sending cluster target fields', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      id: 'dep-llama', alias: 'local-gguf', runtime: 'llama.cpp', kind: 'managed',
+      model: { repository: 'models/local.gguf' }, status: 'registered', settings: {},
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.deployments.create({
+      alias: 'local-gguf', model_id: 'models/local.gguf', runtime: 'llama.cpp', managed: true,
+      settings: { context_length: 8192, gpu_layers: 99 }, node_ids: ['local'], deployment_mode: 'single',
+    })
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>
+    expect(body).not.toHaveProperty('node_ids')
+    expect(body).not.toHaveProperty('selected_nodes')
+    expect(body).not.toHaveProperty('deployment_mode')
+  })
+
   it('sends selected node IDs when pulling an image', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       ok: true, image: 'vllm/vllm-openai:v1', node_ids: ['local', 'spark-2'], results: [],

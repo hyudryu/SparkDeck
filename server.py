@@ -19,11 +19,18 @@ from manager import Manager, ClientAbort, FanSettingsConflict
 from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
+from sparkdeck.onboarding import (
+    FORWARD_HEADERS,
+    OnboardingService,
+    forward_management_request,
+    is_forwardable_path,
+)
 from sparkdeck.web import register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
+onboarding = OnboardingService(manager, data_dir=ROOT / "data", port=7878)
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
@@ -142,7 +149,24 @@ app = FastAPI(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    if is_forwardable_path(request.url.path):
+        assignment = onboarding.assignment.load()
+        forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
+        if assignment:
+            response = await forward_management_request(request, manager, assignment)
+        elif forwarded:
+            valid, detail = onboarding.validate_forward_headers(request.headers)
+            if not valid:
+                response = Response(
+                    json.dumps({"detail": detail}), status_code=401,
+                    media_type="application/json",
+                )
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+    else:
+        response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
@@ -190,6 +214,41 @@ def _requested_node_ids(body: dict) -> list[str] | None:
     if not result:
         raise ValueError("node_ids must contain at least one node ID")
     return result
+
+
+# ---------- shared controller onboarding ----------
+@app.get("/api/v1/onboarding")
+async def onboarding_status(req: Request):
+    return await onboarding.status(str(req.base_url))
+
+
+@app.post("/api/v1/onboarding/join")
+async def onboarding_join(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return await onboarding.join(body, str(req.base_url))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/onboarding/register")
+async def onboarding_register(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        client_id = req.client.host if req.client else "unknown"
+        return await onboarding.register(body, str(req.base_url), client_id)
+    except (ValueError, json.JSONDecodeError) as exc:
+        status = 429 if "too many join attempts" in str(exc) else 400
+        raise HTTPException(status, str(exc)) from exc
+
+
+@app.post("/api/v1/onboarding/leave")
+async def onboarding_leave(req: Request):
+    return await onboarding.leave(str(req.base_url))
 
 
 # ---------- aggregate state ----------
@@ -328,6 +387,54 @@ async def agent_pull_image(req: Request):
         return await manager.pull_image_result(image)
     except Exception as exc:
         raise HTTPException(502, str(exc)[:500]) from exc
+
+
+@app.post("/api/agent/inference/health")
+async def agent_inference_health(req: Request):
+    _require_agent(req)
+    body = await req.json()
+    model = str(body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "model is required")
+    try:
+        container = await manager._resolve_vllm_target(model)
+        return {"ready": await manager._check_ready(container), "model": model}
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/agent/inference/{endpoint:path}")
+async def agent_inference(endpoint: str, req: Request):
+    _require_agent(req)
+    if endpoint not in {"chat/completions", "completions"}:
+        raise HTTPException(404, "inference endpoint not found")
+    body = await req.json()
+    model = str(body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "model is required")
+    cancel = asyncio.Event()
+    watcher = _watch_disconnect(req, cancel)
+    stream = False
+    try:
+        result = (
+            await manager._vllm_chat(model, body, bool(body.get("stream")), cancel)
+            if endpoint == "chat/completions"
+            else await manager._vllm_completions(model, body, bool(body.get("stream")), cancel)
+        )
+        stream = hasattr(result, "__aiter__")
+    except ClientAbort:
+        return Response(status_code=499)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    finally:
+        if not stream:
+            watcher.cancel()
+    if stream:
+        return StreamingResponse(
+            _guard_stream(result, watcher), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return result
 
 
 @app.get("/api/agent/token-usage")

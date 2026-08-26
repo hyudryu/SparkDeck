@@ -1,0 +1,99 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import httpx
+
+from sparkdeck.catalog import HuggingFaceCatalog
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from sparkdeck.service import SparkDeckService
+
+
+class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_forwards_query_limit_sort_and_private_token(self):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json=[{
+                "id": "org/Model",
+                "author": "org",
+                "downloads": "42",
+                "likes": -5,
+                "tags": ["Transformers", "safetensors", 123],
+                "pipeline_tag": "text-generation",
+                "lastModified": "2026-01-01T00:00:00Z",
+                "private": False,
+                "gated": "auto",
+            }, {
+                "id": "org/private-model", "private": True,
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http, token_provider=lambda: "hf_private_secret")
+
+        items = await catalog.search("  qwen coder  ", 999)
+
+        request = captured[0]
+        self.assertEqual(str(request.url.copy_with(query=None)), "https://huggingface.co/api/models")
+        self.assertEqual(request.url.params["search"], "qwen coder")
+        self.assertEqual(request.url.params["limit"], "100")
+        self.assertEqual(request.url.params["sort"], "downloads")
+        self.assertEqual(request.url.params["direction"], "-1")
+        self.assertEqual(request.headers["authorization"], "Bearer hf_private_secret")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], "org/Model")
+        self.assertEqual(items[0]["downloads"], 42)
+        self.assertEqual(items[0]["likes"], 0)
+        self.assertEqual(items[0]["tags"], ["Transformers", "safetensors"])
+        self.assertTrue(next(
+            item["supported"] for item in items[0]["runtime_compatibility"]
+            if item["runtime"] == "vllm"
+        ))
+        self.assertNotIn("hf_private_secret", str(items))
+        await http.aclose()
+
+    async def test_public_search_omits_authorization(self):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json=[])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await HuggingFaceCatalog(http).search("model", 5)
+
+        self.assertNotIn("authorization", captured[0].headers)
+        await http.aclose()
+
+
+class CatalogFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hugging_face_outage_keeps_matching_local_models_searchable(self):
+        class Manager:
+            def __init__(self):
+                self.http = httpx.AsyncClient()
+                self.list_containers = AsyncMock(return_value=[])
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager()
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="local-1", alias="Local Qwen", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/Qwen-Local"),
+                container_name="sparkdeck-local",
+            ))
+            service.catalog.search = AsyncMock(
+                side_effect=httpx.ConnectError("Hugging Face unavailable")
+            )
+
+            result = await service.catalog_search("qwen", 24, "vllm")
+
+            self.assertEqual([item["id"] for item in result["items"]], ["org/Qwen-Local"])
+            self.assertEqual(result["items"][0]["local_deployment_ids"], ["local-1"])
+            await service.close()
+            await manager.http.aclose()
+
+
+if __name__ == "__main__":
+    unittest.main()

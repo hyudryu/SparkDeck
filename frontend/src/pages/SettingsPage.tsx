@@ -6,6 +6,7 @@ import type { AppSettings, RuntimeKind } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
+import { SPARKDECK_VERSION } from '../buildInfo'
 
 function shortRevision(value?: string) {
   return value ? value.slice(0, 8) : 'Unknown'
@@ -145,7 +146,7 @@ export function SettingsPage() {
 
   return (
     <div className="page settings-page">
-      <PageHeader eyebrow="Preferences" title="Settings" description="Configure local defaults, community connectivity, and the SparkDeck interface." />
+      <PageHeader eyebrow="Preferences" title="Settings" description="Configure local defaults, community connectivity, and the SparkDeck interface." actions={<span className="build-version" aria-label="SparkDeck version">Version {SPARKDECK_VERSION}</span>} />
       {resource.loading && <LoadingState label="Loading settings" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {!resource.loading && <form onSubmit={(event) => void save(event)}>

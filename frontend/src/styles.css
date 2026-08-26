@@ -121,7 +121,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .form-error { margin-bottom: 16px; }
 
 .field, .search-field, .select-field { display: grid; gap: 6px; min-width: 0; }
-.field > span { color: var(--text-primary); font-size: 12px; font-weight: 600; }
+.field > span, .field > label { color: var(--text-primary); font-size: 12px; font-weight: 600; }
 .field small { color: var(--text-secondary); font-size: 12px; }
 .field input, .field select, .field textarea, .search-field input, .select-field select { width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid var(--border-strong); border-radius: 8px; outline: none; background: var(--bg-surface); color: var(--text-primary); }
 .field textarea { min-height: 92px; resize: vertical; }

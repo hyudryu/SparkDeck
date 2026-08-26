@@ -25,8 +25,8 @@ def write_state(path: Path, **changes) -> None:
     os.replace(temporary, path)
 
 
-def run(root: Path, *args: str, timeout: int = 600) -> str:
-    result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=timeout, check=False)
+def run(root: Path, *args: str, timeout: int = 600, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=timeout, check=False, env=env)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip()[:500] or f"{' '.join(args)} failed")
     return result.stdout.strip()
@@ -95,7 +95,9 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
         if (stage_dir / "frontend" / "package-lock.json").exists():
             run(stage_dir, "npm", "--prefix", "frontend", "ci", "--ignore-scripts")
-            run(stage_dir, "npm", "--prefix", "frontend", "run", "build")
+            build_environment = os.environ.copy()
+            build_environment["SPARKDECK_VERSION"] = tag
+            run(stage_dir, "npm", "--prefix", "frontend", "run", "build", env=build_environment)
         run(root, "git", "worktree", "remove", "--force", str(stage_dir))
         shutil.rmtree(stage_dir, ignore_errors=True)
         stage_dir = None

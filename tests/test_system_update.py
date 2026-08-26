@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from sparkdeck.updater import CAPABILITY, CONFIRMATION, UpdateService
-from sparkdeck.update_helper import install_revision
+from sparkdeck.update_helper import (
+    _prepare_frontend_bundle,
+    _publish_frontend_bundle,
+    _restore_frontend_bundle,
+    install_revision,
+)
 
 
 class FakeManager:
@@ -125,6 +130,31 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpdateHelperTests(unittest.TestCase):
+    def test_frontend_bundle_publish_and_rollback_preserve_correct_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_dist = root / "frontend" / "dist"
+            staged_dist = root / "staged-dist"
+            live_dist.mkdir(parents=True)
+            staged_dist.mkdir()
+            (live_dist / "index.html").write_text("old release", encoding="utf-8")
+            (live_dist / "old.js").write_text("old asset", encoding="utf-8")
+            (staged_dist / "index.html").write_text("new release", encoding="utf-8")
+            (staged_dist / "new.js").write_text("new asset", encoding="utf-8")
+
+            swap_root = _prepare_frontend_bundle(staged_dist, live_dist)
+            had_previous = _publish_frontend_bundle(live_dist, swap_root)
+
+            self.assertTrue(had_previous)
+            self.assertEqual((live_dist / "index.html").read_text(encoding="utf-8"), "new release")
+            self.assertFalse((live_dist / "old.js").exists())
+
+            _restore_frontend_bundle(live_dist, swap_root, had_previous)
+
+            self.assertEqual((live_dist / "index.html").read_text(encoding="utf-8"), "old release")
+            self.assertTrue((live_dist / "old.js").exists())
+            self.assertFalse((live_dist / "new.js").exists())
+
     @patch("sparkdeck.update_helper.run")
     @patch("sparkdeck.update_helper.subprocess.run")
     def test_downgrade_uses_detached_checkout_without_reset(self, process_run, command_run):

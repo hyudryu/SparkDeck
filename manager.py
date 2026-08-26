@@ -1336,6 +1336,16 @@ class Manager:
         """Discard legacy CLI credentials from durable deployment records."""
         changed = False
         for deployment in self.deployments:
+            if (
+                PERSISTED_DEPLOYMENT_ARGS_ERROR
+                in str(deployment.get("error") or "")
+                and deployment.get("launch_settings_error")
+                != PERSISTED_DEPLOYMENT_ARGS_ERROR
+            ):
+                deployment["launch_settings_error"] = (
+                    PERSISTED_DEPLOYMENT_ARGS_ERROR
+                )
+                changed = True
             settings = deployment.get("launch_settings")
             if not isinstance(settings, dict):
                 continue
@@ -1349,6 +1359,9 @@ class Manager:
                 deployment["status"] = "error"
                 deployment["error"] = _append_persisted_error(
                     deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                )
+                deployment["launch_settings_error"] = (
+                    PERSISTED_DEPLOYMENT_ARGS_ERROR
                 )
                 deployment["settings_dirty"] = True
                 changed = True
@@ -1809,8 +1822,23 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
-        if deployment.get("status") != "stopped":
+        persisted_args_error = bool(
+            deployment.get("launch_settings_error")
+            or PERSISTED_DEPLOYMENT_ARGS_ERROR
+            in str(deployment.get("error") or "")
+        )
+        if deployment.get("status") != "stopped" and not (
+            deployment.get("status") == "error" and persisted_args_error
+        ):
             raise ValueError("stop the cluster before changing its launch settings")
+        if persisted_args_error and (
+            "extra_args" not in body
+            or not isinstance(body.get("extra_args"), list)
+        ):
+            raise ValueError(
+                "extra_args must be explicitly repaired with an array before "
+                "this deployment can start"
+            )
 
         current = deployment.get("launch_settings") or {
             "deployment_name": deployment.get("name"),
@@ -1864,6 +1892,12 @@ class Manager:
         # Preserve the assigned API port unless the editor explicitly changes it.
         if settings.get("port") is None:
             settings["port"] = deployment.get("api_port")
+        remaining_error = (
+            _remove_persisted_error(
+                deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
+            if persisted_args_error else ""
+        )
         deployment.update({
             "name": settings.get("deployment_name") or settings["model"],
             "model": settings["model"],
@@ -1872,8 +1906,12 @@ class Manager:
             "node_ids": settings["node_ids"],
             "launch_settings": settings,
             "settings_dirty": True,
-            "error": None,
+            "status": (
+                "error" if remaining_error else "stopped"
+            ) if persisted_args_error else deployment.get("status"),
+            "error": remaining_error or None,
         })
+        deployment.pop("launch_settings_error", None)
         deployment.pop("kv_capacity", None)
         deployment.pop("auto_concurrency_adjustment", None)
         self._save_deployments()
@@ -2637,13 +2675,21 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
+        if action not in {"start", "stop", "remove"}:
+            raise ValueError("invalid deployment action")
+        if action == "start" and (
+            deployment.get("launch_settings_error")
+            or PERSISTED_DEPLOYMENT_ARGS_ERROR
+            in str(deployment.get("error") or "")
+        ):
+            raise ValueError(
+                "saved launch arguments are invalid; edit extra_args before starting"
+            )
         if (
             action == "start"
             and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
-        if action not in {"start", "stop", "remove"}:
-            raise ValueError("invalid deployment action")
 
         if action == "start" and deployment.get("settings_dirty"):
             # The stopped containers still contain the old argv. Remove them,

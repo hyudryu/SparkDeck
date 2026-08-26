@@ -68,6 +68,8 @@ class VllmAdapter(RuntimeAdapter):
             command += ["--gpu-memory-utilization", str(settings["gpu_memory_utilization"])]
         if settings.get("tensor_parallel_size"):
             command += ["--tensor-parallel-size", str(settings["tensor_parallel_size"])]
+        if settings.get("pipeline_parallel_size"):
+            command += ["--pipeline-parallel-size", str(settings["pipeline_parallel_size"])]
         max_model_len = settings.get("max_model_len") or settings.get("context_length")
         if max_model_len:
             command += ["--max-model-len", str(max_model_len)]
@@ -165,6 +167,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             extra: list[str] = []
             for key, flag in (
                 ("tensor_parallel_size", "--tensor-parallel-size"),
+                ("pipeline_parallel_size", "--pipeline-parallel-size"),
                 ("context_length", "--max-model-len"),
                 ("quantization", "--quantization"),
                 ("revision", "--revision"),

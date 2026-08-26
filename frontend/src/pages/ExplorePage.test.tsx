@@ -107,7 +107,7 @@ describe('ExplorePage model rows', () => {
     }))
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
-    await user.click(await screen.findByRole('tab', { name: 'Community run models' }))
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
 
     expect(await screen.findByRole('button', { name: 'Expand community/model' })).toBeInTheDocument()
     expect(screen.queryByText('Hugging Face unavailable')).not.toBeInTheDocument()

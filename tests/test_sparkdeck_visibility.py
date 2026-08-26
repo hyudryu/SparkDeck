@@ -245,6 +245,46 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("deployment_mode must be", response.text)
 
+    async def test_recipe_creation_rejects_malformed_node_ids_before_persisting(self):
+        invalid_values = [
+            [{"id": "node-2"}], [1], [""], ["   "], "local", {"id": "local"}, [],
+        ]
+        for node_ids in invalid_values:
+            with (
+                self.subTest(node_ids=node_ids),
+                patch.object(server.manager, "recipes", []),
+                patch.object(server.manager, "_save_recipes") as save,
+            ):
+                response = await self.client.post("/api/recipes", json={
+                    "model": "org/model", "node_ids": node_ids,
+                })
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("node_ids", response.text)
+                self.assertEqual(server.manager.recipes, [])
+                save.assert_not_called()
+
+    async def test_recipe_update_rejects_malformed_node_ids_before_persisting(self):
+        original = {
+            "id": "recipe-1", "model": "org/model", "engine": "vllm",
+            "deployment_mode": "single", "node_ids": ["local"], "extra_args": [],
+        }
+        for node_ids in ([{"id": "node-2"}], [2], [" "]):
+            recipe = dict(original)
+            with (
+                self.subTest(node_ids=node_ids),
+                patch.object(server.manager, "recipes", [recipe]),
+                patch.object(server.manager, "_save_recipes") as save,
+            ):
+                response = await self.client.put("/api/recipes/recipe-1", json={
+                    "node_ids": node_ids,
+                })
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("node_ids", response.text)
+                self.assertEqual(recipe, original)
+                save.assert_not_called()
+
     async def test_revision_pinned_recipe_requires_the_exact_cached_revision(self):
         recipe = {
             "id": "revision-b", "model": "org/model", "engine": "vllm",

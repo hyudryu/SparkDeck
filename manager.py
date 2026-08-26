@@ -6037,6 +6037,25 @@ class Manager:
             deployment_mode or "single", tuple(node_ids or [LOCAL_NODE_ID]),
         )
 
+    @staticmethod
+    def _normalize_recipe_node_ids(node_ids: list[str] | None) -> list[str]:
+        if node_ids is None:
+            return [LOCAL_NODE_ID]
+        if not isinstance(node_ids, list):
+            raise ValueError("node_ids must be an array")
+        if not node_ids:
+            raise ValueError("node_ids must contain at least one node ID")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in node_ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("node_ids must contain only non-empty strings")
+            node_id = value.strip()
+            if node_id not in seen:
+                seen.add(node_id)
+                normalized.append(node_id)
+        return normalized
+
     async def add_recipe(
         self,
         model: str,
@@ -6065,7 +6084,7 @@ class Manager:
         deployment_mode = deployment_mode or "single"
         if deployment_mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
-        node_ids = list(dict.fromkeys(node_ids or [LOCAL_NODE_ID]))
+        node_ids = self._normalize_recipe_node_ids(node_ids)
         if deployment_mode == "single":
             node_ids = node_ids[:1]
         elif len(node_ids) < 2:
@@ -6182,7 +6201,7 @@ class Manager:
             mode = merged.get("deployment_mode") or "single"
             if mode not in {"single", "sharded", "replicated"}:
                 raise ValueError("deployment_mode must be single, sharded, or replicated")
-            nodes = list(dict.fromkeys(merged.get("node_ids") or [LOCAL_NODE_ID]))
+            nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":
                 nodes = nodes[:1]
             elif len(nodes) < 2:

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from sparkdeck.onboarding import is_forwardable_path
+from sparkdeck.virtual_nas import VirtualNAS
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -303,6 +305,114 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_forwardable_path("/api/v1/storage"))
         self.assertTrue(is_forwardable_path("/api/v1/storage/transfers"))
         self.assertFalse(is_forwardable_path("/api/agent/virtual-nas/inventory"))
+
+
+class VirtualNASInventoryTests(unittest.TestCase):
+    def _nas(self, root: Path) -> tuple[VirtualNAS, Path]:
+        hub = root / "hub"
+        hub.mkdir()
+        return VirtualNAS(root / "data", lambda: hub, Mock(), lambda: True), hub
+
+    @staticmethod
+    def _snapshot(hub: Path, revision: str = "revision-1") -> tuple[Path, Path]:
+        repository = hub / "models--org--model"
+        snapshot = repository / "snapshots" / revision
+        blobs = repository / "blobs"
+        snapshot.mkdir(parents=True)
+        blobs.mkdir()
+        return snapshot, blobs
+
+    def test_inventory_rejects_partial_transformer_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+            snapshot, blobs = self._snapshot(hub)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"one")
+            (blobs / "unrelated-complete-blob").write_bytes(b"not a shard")
+
+            self.assertEqual(nas.inventory(), [])
+
+    def test_inventory_requires_config_tokenizer_and_all_indexed_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+            snapshot, _ = self._snapshot(hub)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"one")
+            (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"two")
+            (snapshot / "model.safetensors.index.json").write_text(
+                '{"weight_map":{"a":"model-00001-of-00002.safetensors",'
+                '"b":"model-00002-of-00002.safetensors"}}',
+                encoding="utf-8",
+            )
+
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            self.assertEqual(models[0]["model_id"], "org/model")
+            self.assertEqual(models[0]["revisions"], ["revision-1"])
+
+    def test_inventory_rejects_missing_runtime_requirements(self):
+        cases = {
+            "configuration": {"tokenizer.json", "model.safetensors"},
+            "tokenizer": {"config.json", "model.safetensors"},
+        }
+        for missing, filenames in cases.items():
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                nas, hub = self._nas(Path(directory))
+                snapshot, _ = self._snapshot(hub)
+                for filename in filenames:
+                    (snapshot / filename).write_bytes(b"content")
+
+                self.assertEqual(nas.inventory(), [])
+
+    def test_inventory_rejects_weight_index_with_missing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+            snapshot, _ = self._snapshot(hub)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (snapshot / "model-a.safetensors").write_bytes(b"one")
+            (snapshot / "model.safetensors.index.json").write_text(
+                '{"weight_map":{"a":"model-a.safetensors",'
+                '"b":"model-b.safetensors"}}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
+    def test_inventory_advertises_only_complete_revision_and_matching_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+            incomplete, _ = self._snapshot(hub, "incomplete")
+            (incomplete / "config.json").write_text("{}", encoding="utf-8")
+            complete = incomplete.parent / "complete"
+            complete.mkdir()
+            (complete / "model.gguf").write_bytes(b"complete gguf")
+            refs = incomplete.parent.parent / "refs"
+            refs.mkdir()
+            (refs / "main").write_text("complete", encoding="utf-8")
+            (refs / "broken").write_text("incomplete", encoding="utf-8")
+
+            models = nas.inventory()
+
+            self.assertEqual(models[0]["revisions"], ["complete", "main"])
+
+    @unittest.skipIf(os.name == "nt", "creating cache symlinks requires Windows privileges")
+    def test_inventory_rejects_snapshot_with_dangling_blob_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+            snapshot, blobs = self._snapshot(hub)
+            config_blob = blobs / "config"
+            tokenizer_blob = blobs / "tokenizer"
+            config_blob.write_text("{}", encoding="utf-8")
+            tokenizer_blob.write_text("{}", encoding="utf-8")
+            (snapshot / "config.json").symlink_to(config_blob)
+            (snapshot / "tokenizer.json").symlink_to(tokenizer_blob)
+            (snapshot / "model.safetensors").symlink_to(blobs / "missing-weight")
+
+            self.assertEqual(nas.inventory(), [])
 
 
 if __name__ == "__main__":

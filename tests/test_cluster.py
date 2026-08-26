@@ -10,6 +10,7 @@ from unittest import mock
 import httpx
 
 from cluster import (
+    AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
     AgentCredentials,
     NodeRegistry,
@@ -148,6 +149,167 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0].extensions["sni_hostname"], "worker.tail.example")
         self.assertEqual(requests[0].headers["authorization"], "Bearer agent-secret")
         self.assertEqual(json.loads(requests[0].content)["hf_token"], "hf-secret")
+
+    async def test_authenticated_request_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (
+                    socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("fd7a:115c:a1e0::10", port, 0, 0),
+                ),
+                (
+                    socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                    ("100.100.20.30", port),
+                ),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("IPv6 unavailable", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_control_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    result = await registry.request(
+                        "remote-1", "POST", "/api/agent/containers",
+                        json_body={"hf_token": "hf-secret"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "https://[fd7a:115c:a1e0::10]:7878/api/agent/containers",
+            "https://100.100.20.30:7878/api/agent/containers",
+        ])
+        self.assertTrue(all(
+            request.headers["authorization"] == "Bearer agent-secret"
+            and request.headers["host"] == "worker.tail.example:7878"
+            and request.extensions["sni_hostname"] == "worker.tail.example"
+            for request in requests
+        ))
+
+    async def test_pairing_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.10", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.11", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectTimeout("first address timed out", request=request)
+            return httpx.Response(200, json={
+                "node_id": "remote-1", "agent_token": "agent-secret",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+            }, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_control_connection,
+            )
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    paired = await registry.pair_remote(
+                        "http://worker.tail.example:7878", "123456",
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(paired["id"], "remote-1")
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "http://100.64.0.10:7878/api/agent/pair",
+            "http://100.64.0.11:7878/api/agent/pair",
+        ])
+        self.assertTrue(all(
+            json.loads(request.content)["pairing_code"] == "123456"
+            and request.headers["host"] == "worker.tail.example:7878"
+            for request in requests
+        ))
+
+    async def test_open_stream_tries_each_pinned_safe_address(self) -> None:
+        requests = []
+        resolution_count = 0
+
+        def resolve(host, port, **kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.20", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.64.0.21", port)),
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("first address refused", request=request)
+            return httpx.Response(200, content=b"stream", request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_control_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    response = await registry.open_stream(
+                        "remote-1", "GET", "/api/agent/files",
+                    )
+                    body = await response.aread()
+                    await response.aclose()
+            finally:
+                await client.aclose()
+
+        self.assertEqual(body, b"stream")
+        self.assertEqual(resolution_count, 1)
+        self.assertEqual([str(request.url) for request in requests], [
+            "http://100.64.0.20:7878/api/agent/files",
+            "http://100.64.0.21:7878/api/agent/files",
+        ])
+        self.assertTrue(all(
+            request.headers["authorization"] == "Bearer agent-secret"
+            and request.headers["host"] == "worker.tail.example:7878"
+            for request in requests
+        ))
 
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:

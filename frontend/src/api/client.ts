@@ -370,9 +370,9 @@ export const api = {
   },
   updates: {
     overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),
-    start: () => request<SystemUpdateJob>('/api/v1/system-update', {
+    start: (tag: string) => request<SystemUpdateJob>('/api/v1/system-update', {
       method: 'POST',
-      body: JSON.stringify({ confirm: 'update-entire-cluster' }),
+      body: JSON.stringify({ confirm: 'update-entire-cluster', tag }),
     }),
   },
   logs: {

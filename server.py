@@ -27,7 +27,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
-from sparkdeck.updater import CONFIRMATION, UpdateService
+from sparkdeck.updater import CONFIRMATION, UpdateService, current_revision
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
@@ -402,6 +402,7 @@ async def agent_info():
         "name": manager.settings.get("cluster_node_name"),
         "protocol_version": AGENT_PROTOCOL_VERSION,
         "pairing_required": True,
+        "app_revision": current_revision(ROOT),
     }
 
 
@@ -436,6 +437,20 @@ async def agent_start_system_update(req: Request):
         if not isinstance(body, dict) or set(body) != {"tag", "revision"}:
             raise ValueError("request must contain only tag and revision")
         return await updater.start_local(str(body["tag"]), str(body["revision"]))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/agent/system-update/preflight")
+async def agent_preflight_system_update(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"tag", "revision"}:
+            raise ValueError("request must contain only tag and revision")
+        return await updater.preflight_local(str(body["tag"]), str(body["revision"]))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
@@ -1464,9 +1479,11 @@ async def start_system_update(req: Request):
     _require_same_origin_or_forwarded(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) != {"confirm"}:
-            raise ValueError("request must contain only confirm")
-        return await updater.start_cluster(str(body.get("confirm") or ""))
+        if not isinstance(body, dict) or set(body) != {"confirm", "tag"}:
+            raise ValueError("request must contain only confirm and tag")
+        return await updater.start_cluster(
+            str(body.get("confirm") or ""), str(body.get("tag") or ""),
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:

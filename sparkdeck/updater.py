@@ -17,7 +17,7 @@ import httpx
 
 
 REPOSITORY = "hyudryu/SparkDeck"
-RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 TRUSTED_ORIGINS = {
     "https://github.com/hyudryu/SparkDeck.git",
     "https://github.com/hyudryu/SparkDeck",
@@ -82,7 +82,9 @@ class UpdateService:
         self.agent_path = self.data_dir / "system-update-agent.json"
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
-        self._release_cache: tuple[float, dict | None, str | None] | None = None
+        self._agent_lock = asyncio.Lock()
+        self._release_cache: tuple[float, list[dict], str | None] | None = None
+        self._resolved_releases: dict[str, dict] = {}
 
     @staticmethod
     def _read(path: Path) -> dict:
@@ -121,26 +123,52 @@ class UpdateService:
             "blockers": local_blockers(self.root),
         }
 
-    async def latest_release(self) -> tuple[dict | None, str | None]:
-        if self._release_cache and time.monotonic() - self._release_cache[0] < 300:
+    async def published_releases(self, *, force: bool = False) -> tuple[list[dict], str | None]:
+        if not force and self._release_cache and time.monotonic() - self._release_cache[0] < 300:
             return self._release_cache[1], self._release_cache[2]
         try:
             response = await self.manager.http.get(
-                RELEASE_API,
+                RELEASES_API,
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "SparkDeck"},
                 timeout=10,
             )
             if response.status_code == 404:
-                result = (None, "No published GitHub release is available")
+                result = ([], "No published GitHub release is available")
                 self._release_cache = (time.monotonic(), *result)
                 return result
             response.raise_for_status()
-            release = response.json()
-            tag = str(release.get("tag_name") or "").strip()
-            if not tag:
-                return None, "The latest GitHub release has no tag"
-            if not _valid_release_tag(tag):
-                return None, "The latest GitHub release has an invalid tag"
+            payload = response.json()
+            if not isinstance(payload, list):
+                return [], "GitHub returned an invalid releases response"
+            releases = []
+            for release in payload:
+                if not isinstance(release, dict) or release.get("draft"):
+                    continue
+                tag = str(release.get("tag_name") or "").strip()
+                if not _valid_release_tag(tag):
+                    continue
+                releases.append({
+                    "tag": tag,
+                    "name": release.get("name") or tag,
+                    "url": release.get("html_url"),
+                    "published_at": release.get("published_at"),
+                    "prerelease": bool(release.get("prerelease")),
+                })
+            error = None if releases else "No published GitHub release is available"
+            result = (releases, error)
+            self._release_cache = (time.monotonic(), *result)
+            return result
+        except (httpx.HTTPError, ValueError) as exc:
+            return [], f"Could not check GitHub releases: {str(exc)[:240]}"
+
+    async def resolve_release(self, tag: str, *, force: bool = False) -> tuple[dict | None, str | None]:
+        releases, error = await self.published_releases(force=force)
+        release = next((item for item in releases if item["tag"] == tag), None)
+        if not release:
+            return None, error or "Selected version is not a published GitHub release"
+        if not force and tag in self._resolved_releases:
+            return self._resolved_releases[tag], None
+        try:
             commit_response = await self.manager.http.get(
                 f"https://api.github.com/repos/{REPOSITORY}/commits/{tag}",
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "SparkDeck"},
@@ -150,17 +178,17 @@ class UpdateService:
             revision = str(commit_response.json().get("sha") or "").lower()
             if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
                 return None, "GitHub did not return an immutable release commit"
-            result = ({
-                "tag": tag,
-                "revision": revision,
-                "name": release.get("name") or tag,
-                "url": release.get("html_url"),
-                "published_at": release.get("published_at"),
-            }, None)
-            self._release_cache = (time.monotonic(), *result)
-            return result
+            resolved = {**release, "revision": revision}
+            self._resolved_releases[tag] = resolved
+            return resolved, None
         except (httpx.HTTPError, ValueError) as exc:
-            return None, f"Could not check GitHub releases: {str(exc)[:240]}"
+            return None, f"Could not resolve GitHub release {tag}: {str(exc)[:240]}"
+
+    async def latest_release(self) -> tuple[dict | None, str | None]:
+        releases, error = await self.published_releases()
+        if not releases:
+            return None, error
+        return await self.resolve_release(releases[0]["tag"])
 
     async def overview(self) -> dict:
         revision = current_revision(self.root)
@@ -169,7 +197,13 @@ class UpdateService:
             if revision == state.get("target_revision"):
                 state.update(active=False, phase="succeeded", message="Cluster update completed")
                 self._write(self.cluster_path, state)
-        release, release_error = await self.latest_release()
+        releases, release_error = await self.published_releases()
+        release_tags = {item["tag"] for item in releases}
+        try:
+            current_tags = _run(self.root, "git", "tag", "--points-at", "HEAD").splitlines()
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            current_tags = []
+        current_release_tag = next((tag for tag in current_tags if tag in release_tags), None)
         nodes = await self.manager.cluster_nodes()
         public_nodes = []
         blockers = local_blockers(self.root)
@@ -195,14 +229,16 @@ class UpdateService:
         return {
             "repository": REPOSITORY,
             "current_revision": revision,
-            "latest_release": release,
-            "can_update": bool(release) and not all_blockers and not state.get("active", False),
+            "current_release_tag": current_release_tag,
+            "releases": releases,
+            "latest_release": releases[0] if releases else None,
+            "can_update": bool(releases) and not all_blockers and not state.get("active", False),
             "blockers": all_blockers,
             "nodes": public_nodes,
             "job": state or None,
         }
 
-    async def start_cluster(self, confirmation: str) -> dict:
+    async def start_cluster(self, confirmation: str, tag: str) -> dict:
         if confirmation != CONFIRMATION:
             raise ValueError("Explicit cluster update confirmation is required")
         async with self._lock:
@@ -212,7 +248,9 @@ class UpdateService:
             overview = await self.overview()
             if not overview["can_update"]:
                 raise RuntimeError("; ".join(overview["blockers"]) or "No update is available")
-            release = overview["latest_release"]
+            release, release_error = await self.resolve_release(tag, force=True)
+            if release_error or not release:
+                raise ValueError(release_error or "Selected release is unavailable")
             nodes = [{
                 "id": node["id"], "name": node["name"], "local": node["local"],
                 "phase": "pending", "current_revision": node.get("current_revision"),
@@ -228,13 +266,17 @@ class UpdateService:
             return state
 
     async def _run_cluster(self, state: dict) -> None:
+        changed_workers = 0
         try:
             # Re-probe every worker before mutating the first one.
+            await self.preflight_local(state["target_tag"], state["target_revision"])
             for node in state["nodes"]:
                 if node["local"]:
                     continue
                 status = await self.manager.node_registry.request(
-                    node["id"], "GET", "/api/agent/system-update", timeout=10,
+                    node["id"], "POST", "/api/agent/system-update/preflight",
+                    json_body={"tag": state["target_tag"], "revision": state["target_revision"]},
+                    timeout=60,
                 )
                 if status.get("blockers"):
                     raise RuntimeError(f"{node['name']}: {'; '.join(status['blockers'])}")
@@ -266,8 +308,9 @@ class UpdateService:
                     node["error"] = status.get("error")
                     self._write(self.cluster_path, state)
                     if status.get("phase") == "succeeded" and status.get("current_revision") == state["target_revision"]:
+                        changed_workers += 1
                         break
-                    if status.get("phase") == "failed":
+                    if status.get("phase") in {"failed", "rolled_back", "recovery_required"}:
                         raise RuntimeError(f"{node['name']}: {status.get('error') or 'update failed'}")
                 else:
                     raise RuntimeError(f"{node['name']}: timed out waiting for restart")
@@ -277,31 +320,64 @@ class UpdateService:
             self._write(self.cluster_path, state)
             await self.start_local(state["target_tag"], state["target_revision"])
         except Exception as exc:
-            state.update(active=False, phase="failed", error=str(exc)[:500], message="Update stopped safely")
+            state.update(
+                active=False,
+                phase="partial" if changed_workers else "failed",
+                error=str(exc)[:500],
+                message=(
+                    "Update stopped after one or more workers changed"
+                    if changed_workers else "Update stopped before any node changed"
+                ),
+            )
             self._write(self.cluster_path, state)
 
-    async def start_local(self, tag: str, revision: str) -> dict:
-        if not tag or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
-            raise ValueError("A valid release tag and immutable commit are required")
-        latest, error = await self.latest_release()
-        if error or not latest or latest["tag"] != tag or latest["revision"] != revision.lower():
-            raise ValueError("Update target is not the current official GitHub release")
+    async def preflight_local(self, tag: str, revision: str) -> dict:
+        release, error = await self.resolve_release(tag, force=True)
+        if error or not release or release["revision"] != revision.lower():
+            raise ValueError("Update target is not an official published GitHub release")
         blockers = local_blockers(self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
-        state = self._read(self.agent_path)
-        if state.get("phase") in {"accepted", "staging", "restarting"}:
-            raise RuntimeError("This node is already updating")
-        if current_revision(self.root) == revision.lower():
-            state = {"phase": "succeeded", "target_revision": revision.lower(), "message": "Already up to date"}
+        _run(self.root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}", timeout=60)
+        fetched = _run(self.root, "git", "rev-parse", f"{tag}^{{commit}}")
+        if fetched.lower() != revision.lower():
+            raise ValueError("Fetched release tag does not match the approved commit")
+        forward = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=self.root,
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+        backward = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", revision, "HEAD"], cwd=self.root,
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+        if not forward and not backward:
+            raise RuntimeError("Selected release is not in the installed release history")
+        try:
+            manifest = json.loads(_run(self.root, "git", "show", f"{revision}:sparkdeck-update.json"))
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError("Selected release has no valid update compatibility manifest") from exc
+        if manifest.get("update_protocol") != 1 or manifest.get("data_schema") != 1:
+            raise RuntimeError("Selected release is not compatible with this updater or data schema")
+        return {"ok": True, "capability": CAPABILITY, "target_revision": revision.lower()}
+
+    async def start_local(self, tag: str, revision: str) -> dict:
+        async with self._agent_lock:
+            if not tag or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
+                raise ValueError("A valid release tag and immutable commit are required")
+            await self.preflight_local(tag, revision)
+            state = self._read(self.agent_path)
+            if state.get("phase") in {"accepted", "staging", "restarting"}:
+                raise RuntimeError("This node is already updating")
+            if current_revision(self.root) == revision.lower():
+                state = {"phase": "succeeded", "target_revision": revision.lower(), "message": "Already up to date"}
+                self._write(self.agent_path, state)
+                return state
+            state = {"phase": "accepted", "target_tag": tag, "target_revision": revision.lower(), "message": "Update accepted"}
             self._write(self.agent_path, state)
+            subprocess.Popen(
+                [sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
+                 "--state", str(self.agent_path), "--tag", tag, "--revision", revision.lower()],
+                cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
             return state
-        state = {"phase": "accepted", "target_tag": tag, "target_revision": revision.lower(), "message": "Update accepted"}
-        self._write(self.agent_path, state)
-        subprocess.Popen(
-            [sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
-             "--state", str(self.agent_path), "--tag", tag, "--revision", revision.lower()],
-            cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
-        )
-        return state

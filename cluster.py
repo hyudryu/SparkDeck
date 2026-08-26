@@ -186,17 +186,20 @@ class NodeRegistry:
         self.nodes = self._load()
         self._status_cache: dict[str, tuple[float, dict]] = {}
 
-    async def _connection_target(
+    async def _connection_targets(
         self, agent_url: str, path: str,
-    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+    ) -> list[tuple[str, dict[str, str], dict[str, Any]]]:
         if self.connection_resolver is None:
-            return f"{agent_url}{path}", {}, {}
+            return [(f"{agent_url}{path}", {}, {})]
         connection = await self.connection_resolver(agent_url)
-        return (
-            f"{connection.connect_url}{path}",
-            {"Host": connection.host_header},
-            {"sni_hostname": connection.sni_hostname},
-        )
+        return [
+            (
+                f"{connect_url}{path}",
+                {"Host": connection.host_header},
+                {"sni_hostname": connection.sni_hostname},
+            )
+            for connect_url in connection.connect_urls
+        ]
 
     def _load(self) -> list[dict]:
         if not self.path.exists():
@@ -229,22 +232,33 @@ class NodeRegistry:
     ) -> dict:
         url = normalize_agent_url(agent_url)
         try:
-            target, pinned_headers, extensions = await self._connection_target(
+            targets = await self._connection_targets(
                 url, "/api/agent/pair",
             )
-            response = await self.http.post(
-                target,
-                headers=pinned_headers,
-                json={
-                    "pairing_code": str(pairing_code or ""),
-                    "controller_id": self.controller_id,
-                },
-                timeout=10,
-                extensions=extensions,
-                follow_redirects=False,
-            )
-            response.raise_for_status()
-            paired = response.json()
+            last_error: httpx.HTTPError | None = None
+            for target, pinned_headers, extensions in targets:
+                try:
+                    response = await self.http.post(
+                        target,
+                        headers=pinned_headers,
+                        json={
+                            "pairing_code": str(pairing_code or ""),
+                            "controller_id": self.controller_id,
+                        },
+                        timeout=10,
+                        extensions=extensions,
+                        follow_redirects=False,
+                    )
+                    response.raise_for_status()
+                    paired = response.json()
+                    break
+                except httpx.HTTPStatusError:
+                    raise
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_error = exc
+            else:
+                assert last_error is not None
+                raise last_error
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:300]
             raise ValueError(f"agent rejected pairing: {detail}") from exc
@@ -343,26 +357,35 @@ class NodeRegistry:
         if not node.get("enabled", True):
             raise ValueError(f"node {node.get('name', node_id)} is disabled")
         try:
-            target, pinned_headers, extensions = await self._connection_target(
+            targets = await self._connection_targets(
                 node["agent_url"], path,
             )
-            response = await self.http.request(
-                method,
-                target,
-                headers={
-                    **pinned_headers,
-                    "Authorization": f"Bearer {node['agent_token']}",
-                    COORDINATOR_ID_HEADER: self.controller_id,
-                },
-                json=json_body,
-                timeout=timeout,
-                extensions=extensions,
-                follow_redirects=False,
-            )
-            response.raise_for_status()
-            if not response.content:
-                return None
-            return response.json()
+            last_error: httpx.HTTPError | None = None
+            for target, pinned_headers, extensions in targets:
+                try:
+                    response = await self.http.request(
+                        method,
+                        target,
+                        headers={
+                            **pinned_headers,
+                            "Authorization": f"Bearer {node['agent_token']}",
+                            COORDINATOR_ID_HEADER: self.controller_id,
+                        },
+                        json=json_body,
+                        timeout=timeout,
+                        extensions=extensions,
+                        follow_redirects=False,
+                    )
+                    response.raise_for_status()
+                    if not response.content:
+                        return None
+                    return response.json()
+                except httpx.HTTPStatusError:
+                    raise
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_error = exc
+            assert last_error is not None
+            raise last_error
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
             raise RuntimeError(
@@ -393,27 +416,35 @@ class NodeRegistry:
         request_headers = dict(headers or {})
         request_headers["Authorization"] = f"Bearer {node['agent_token']}"
         request_headers[COORDINATOR_ID_HEADER] = self.controller_id
-        target, pinned_headers, extensions = await self._connection_target(
+        targets = await self._connection_targets(
             node["agent_url"], path,
         )
-        request_headers.update(pinned_headers)
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content
         elif json_body is not None:
             payload["json"] = json_body
-        request = self.http.build_request(
-            method, target, headers=request_headers,
-            timeout=timeout, extensions=extensions, **payload,
-        )
-        try:
-            return await self.http.send(
-                request, stream=True, follow_redirects=False,
+        last_error: httpx.HTTPError | None = None
+        for target, pinned_headers, extensions in targets:
+            candidate_headers = {**request_headers, **pinned_headers}
+            request = self.http.build_request(
+                method, target, headers=candidate_headers,
+                timeout=timeout, extensions=extensions, **payload,
             )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(
-                f"could not contact {node.get('name', node_id)}: {exc}"
-            ) from exc
+            try:
+                return await self.http.send(
+                    request, stream=True, follow_redirects=False,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc
+            except httpx.HTTPError as exc:
+                raise RuntimeError(
+                    f"could not contact {node.get('name', node_id)}: {exc}"
+                ) from exc
+        assert last_error is not None
+        raise RuntimeError(
+            f"could not contact {node.get('name', node_id)}: {last_error}"
+        ) from last_error
 
     async def probe(self, node: dict, *, force: bool = False) -> dict:
         node_id = node["id"]

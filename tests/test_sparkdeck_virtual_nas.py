@@ -17,7 +17,10 @@ def create_cached_model(hub: Path, model_id: str = "org/model") -> Path:
     (root / "blobs").mkdir(parents=True)
     (root / "snapshots" / "revision-1").mkdir(parents=True)
     (root / "blobs" / "weights").write_bytes(b"model-weights")
-    (root / "snapshots" / "revision-1" / "config.json").write_text("{}")
+    snapshot = root / "snapshots" / "revision-1"
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"model-weights")
     return root
 
 

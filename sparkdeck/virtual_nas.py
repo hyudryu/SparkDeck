@@ -25,6 +25,15 @@ LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
+_WEIGHT_SHARD = re.compile(
+    r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<total>\d{5})"
+    r"(?P<suffix>\.(?:safetensors|bin|gguf))$",
+    re.IGNORECASE,
+)
+_TOKENIZER_FILES = {
+    "tokenizer.json", "tokenizer.model", "spiece.model",
+    "sentencepiece.bpe.model", "tekken.json", "vocab.txt",
+}
 # Imports hold both the received tar and the extracted repository until the
 # final atomic rename. Reserve additional room for tar headers, metadata, and
 # filesystem allocation rounding rather than admitting at an exact 2x edge.
@@ -227,8 +236,6 @@ class VirtualNAS:
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
                 continue
-            if not _is_complete_repository(repository):
-                continue
             encoded = repository.name.removeprefix("models--")
             parts = encoded.split("--")
             if len(parts) != 2:
@@ -236,6 +243,9 @@ class VirtualNAS:
             try:
                 model_id = validate_model_id(f"{parts[0]}/{parts[1]}")
             except ValueError:
+                continue
+            snapshot_revisions = _complete_snapshot_revisions(repository)
+            if not snapshot_revisions:
                 continue
             size_bytes = 0
             file_count = 0
@@ -253,12 +263,6 @@ class VirtualNAS:
                     size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
-            snapshot_root = repository / "snapshots"
-            snapshot_revisions = {
-                item.name for item in snapshot_root.iterdir()
-                if item.is_dir() and not item.is_symlink()
-                and any(child.is_file() for child in item.rglob("*"))
-            }
             revisions = set(snapshot_revisions)
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
@@ -751,16 +755,132 @@ def _local_free_bytes(path: Path) -> int:
 
 
 def _is_complete_repository(repository: Path) -> bool:
+    return bool(_complete_snapshot_revisions(repository))
+
+
+def _complete_snapshot_revisions(repository: Path) -> set[str]:
+    """Return only revisions containing a usable, fully resolved model snapshot."""
     try:
         snapshots = repository / "snapshots"
         blobs = repository / "blobs"
-        snapshot_dirs = [item for item in snapshots.iterdir() if item.is_dir()]
-        has_snapshot_content = any(
-            item.is_file() for snapshot in snapshot_dirs for item in snapshot.rglob("*")
+        if (
+            not snapshots.is_dir() or snapshots.is_symlink()
+            or not blobs.is_dir() or blobs.is_symlink()
+        ):
+            return set()
+        blob_root = blobs.resolve(strict=True)
+        complete = set()
+        for snapshot in snapshots.iterdir():
+            if (
+                snapshot.is_dir() and not snapshot.is_symlink()
+                and _is_complete_snapshot(snapshot, blob_root)
+            ):
+                complete.add(snapshot.name)
+        return complete
+    except OSError:
+        return set()
+
+
+def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:
+    files: dict[str, Path] = {}
+    try:
+        for item in snapshot.rglob("*"):
+            relative = item.relative_to(snapshot).as_posix()
+            if item.is_symlink():
+                if not item.is_file():
+                    return False
+                resolved = item.resolve(strict=True)
+                if not resolved.is_relative_to(blob_root) or not resolved.is_file():
+                    return False
+            elif item.is_dir():
+                continue
+            elif not item.is_file():
+                return False
+            files[relative] = item
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not files or any(name.endswith((".incomplete", ".lock")) for name in files):
+        return False
+
+    lowered = {name.casefold(): path for name, path in files.items()}
+    weights = {
+        name: path for name, path in lowered.items()
+        if name.endswith((".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"))
+        or (
+            name.endswith(".bin")
+            and Path(name).name.startswith(("pytorch_model", "model", "adapter_model"))
         )
-        has_blob_content = any(
-            item.is_file() and item.stat().st_size > 0 for item in blobs.iterdir()
-        )
-        return bool(snapshot_dirs and has_snapshot_content and has_blob_content)
+    }
+    if not weights or not _required_files_are_nonempty(weights.values()):
+        return False
+    if not _weight_shards_are_complete(weights):
+        return False
+
+    # GGUF contains its own tensor metadata and tokenizer vocabulary. Other
+    # runtimes need both the Transformers configuration and tokenizer assets.
+    if any(name.endswith(".gguf") for name in weights):
+        return True
+    config = lowered.get("config.json")
+    if config is None or not _required_files_are_nonempty([config]):
+        return False
+    tokenizer = [
+        path for name, path in lowered.items()
+        if Path(name).name in _TOKENIZER_FILES
+    ]
+    if not tokenizer:
+        by_filename = {Path(name).name: path for name, path in lowered.items()}
+        if not {"vocab.json", "merges.txt"} <= by_filename.keys():
+            return False
+        tokenizer = [by_filename["vocab.json"], by_filename["merges.txt"]]
+    if not _required_files_are_nonempty(tokenizer):
+        return False
+    if not _weight_indexes_are_complete(lowered):
+        return False
+    return True
+
+
+def _required_files_are_nonempty(paths: Any) -> bool:
+    try:
+        return all(path.stat().st_size > 0 for path in paths)
     except OSError:
         return False
+
+
+def _weight_shards_are_complete(weights: dict[str, Path]) -> bool:
+    groups: dict[tuple[str, str, int], set[int]] = {}
+    for name in weights:
+        match = _WEIGHT_SHARD.match(name)
+        if not match:
+            continue
+        total = int(match.group("total"))
+        part = int(match.group("part"))
+        key = (match.group("prefix"), match.group("suffix").casefold(), total)
+        groups.setdefault(key, set()).add(part)
+    return all(parts == set(range(1, total + 1)) for (*_, total), parts in groups.items())
+
+
+def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
+    indexes = {
+        name: path for name, path in files.items()
+        if name.endswith((".safetensors.index.json", ".bin.index.json"))
+    }
+    for path in indexes.values():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            weight_map = value.get("weight_map") if isinstance(value, dict) else None
+            if not isinstance(weight_map, dict) or not weight_map:
+                return False
+            required = set()
+            for raw in weight_map.values():
+                candidate = PurePosixPath(str(raw or ""))
+                if (
+                    not str(raw or "") or candidate.is_absolute()
+                    or ".." in candidate.parts
+                ):
+                    return False
+                required.add(candidate.as_posix().casefold())
+            if not required <= files.keys():
+                return False
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+    return True

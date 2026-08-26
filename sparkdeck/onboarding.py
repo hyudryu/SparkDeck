@@ -60,9 +60,14 @@ class ControlConnection:
     """Logical control URL plus the IP-pinned transport destination."""
 
     url: str
-    connect_url: str
+    connect_urls: tuple[str, ...]
     host_header: str
     sni_hostname: str
+
+    @property
+    def connect_url(self) -> str:
+        """First candidate retained for callers that need one preferred URL."""
+        return self.connect_urls[0]
 
 
 async def resolve_control_connection(value: Any) -> ControlConnection:
@@ -98,7 +103,9 @@ async def resolve_control_connection(value: Any) -> ControlConnection:
     # after validation. Host and SNI retain the logical paired-node identity.
     return ControlConnection(
         url=url,
-        connect_url=str(parsed.copy_with(host=addresses[0])),
+        connect_urls=tuple(
+            str(parsed.copy_with(host=address)) for address in addresses
+        ),
         host_header=parsed.netloc.decode("ascii"),
         sni_hostname=host,
     )

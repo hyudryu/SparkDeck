@@ -7,16 +7,30 @@ import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
 
+function editableSettingsFingerprint(settings: AppSettings) {
+  return JSON.stringify({
+    theme: settings.theme ?? 'system',
+    default_runtime: settings.default_runtime ?? 'vllm',
+    default_context_length: settings.default_context_length ?? 8192,
+    community_api_url: settings.community_api_url ?? '',
+  })
+}
+
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
   const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), default_runtime: 'vllm', default_context_length: 8192 })
+  const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
 
   useEffect(() => {
     if (resource.data) {
-      setForm((current) => ({ ...current, ...resource.data }))
+      setForm((current) => {
+        const loaded = { ...current, ...resource.data }
+        setSavedFingerprint(editableSettingsFingerprint(loaded))
+        return loaded
+      })
       persistTheme(resource.data.theme ?? storedTheme())
     }
   }, [resource.data])
@@ -27,12 +41,15 @@ export function SettingsPage() {
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
+    if (savedFingerprint === undefined || editableSettingsFingerprint(form) === savedFingerprint) return
     setSaving(true)
     setSaved(false)
     setError(undefined)
     try {
       const savedSettings = await api.settings.update(form)
-      setForm((current) => ({ ...current, ...savedSettings }))
+      const savedForm = { ...form, ...savedSettings }
+      setForm(savedForm)
+      setSavedFingerprint(editableSettingsFingerprint(savedForm))
       persistTheme(savedSettings.theme ?? form.theme ?? 'system')
       setSaved(true)
       window.setTimeout(() => setSaved(false), 2400)
@@ -42,6 +59,9 @@ export function SettingsPage() {
       setSaving(false)
     }
   }
+
+  const hasUnsavedChanges = savedFingerprint !== undefined
+    && editableSettingsFingerprint(form) !== savedFingerprint
 
   return (
     <div className="page settings-page">
@@ -69,7 +89,7 @@ export function SettingsPage() {
             <div className="credential-state"><KeyRound size={17} /><div><strong>Device credential</strong><Status status="stopped">Not paired</Status></div><Button type="button" disabled>Pair account</Button></div>
           </div>
         </Panel>
-        <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
+        <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
     </div>
   )

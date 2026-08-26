@@ -205,6 +205,62 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('shows exact replicated disk usage and deploys legacy saved configurations', async () => {
+    const user = userEvent.setup()
+    const gib = 1024 ** 3
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return new Response(JSON.stringify({
+        id: 'dep-new', alias: 'Saved cluster', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local', 'node-2'],
+      }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
+        { id: 'node-2', name: 'Spark Two', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'replicated', node_ids: ['local', 'node-2'], extra_args_count: 2,
+      }] } : path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local', 'node-2'],
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Saved cluster configurations' })).toBeInTheDocument()
+    expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Deploy saved config' }))
+    expect(await screen.findByText('Deployed saved configuration Saved cluster.')).toBeInTheDocument()
+  })
+
+  it('surfaces saved-configuration failures without hiding deployment state', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/recipes')) return new Response(JSON.stringify({ detail: 'saved configurations unavailable' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const body = path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [{ id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true }] }
+          : path.includes('/api/v1/model-cache') ? { nodes: [] }
+            : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 }
+              : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Saved configurations: saved configurations unavailable')
+    expect(screen.getByText('No model servers yet')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
   it('retains the saved context length when switching runtimes', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

@@ -32,6 +32,8 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
+from sparkdeck.onboarding import resolve_agent_connection
+from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
 from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
@@ -86,6 +88,26 @@ DEFAULT_SETTINGS = {
 }
 
 logger = logging.getLogger(__name__)
+HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
+PERSISTED_RECIPE_ARGS_ERROR = (
+    "unsupported persisted extra_args: expected an array of strings"
+)
+PERSISTED_DEPLOYMENT_ARGS_ERROR = (
+    "unsupported persisted launch_settings.extra_args: expected an array of strings"
+)
+
+
+def _append_persisted_error(existing: Any, marker: str) -> str:
+    current = str(existing or "").strip()
+    return current if marker in current else "; ".join(filter(None, [current, marker]))
+
+
+def _remove_persisted_error(existing: Any, marker: str) -> str:
+    return "; ".join(
+        part.strip() for part in str(existing or "").split(";")
+        if part.strip() and part.strip() != marker
+    )
+
 
 # The official SGLang image exposes ``python3`` rather than a ``python``
 # executable. Keep this separate from the vLLM setting because SGLang recipes
@@ -325,6 +347,8 @@ class Manager:
         self.settings = self._load_settings()
         self.recipes_path = self.data_dir / "recipes.json"
         self.recipes: list[dict] = self._load_recipes()
+        if self._migrate_recipe_hf_credentials():
+            self._save_recipes()
         # Ephemeral launch phase for Saved Models.  This is returned with
         # /api/state so an image pull remains visible after a browser refresh.
         self.recipe_launches: dict[str, dict] = {}
@@ -395,7 +419,8 @@ class Manager:
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(
-            self.data_dir, self.http, self.agent_credentials.node_id
+            self.data_dir, self.http, self.agent_credentials.node_id,
+            connection_resolver=resolve_agent_connection,
         )
         self.routeros = RouterOSService(self.data_dir)
         self.virtual_nas = VirtualNAS(
@@ -415,7 +440,11 @@ class Manager:
         self._rebuild_synced_token_usage()
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
-        if self._migrate_vllm_prompt_token_details():
+        deployments_changed = self._migrate_deployment_hf_credentials()
+        deployments_changed = (
+            self._migrate_vllm_prompt_token_details() or deployments_changed
+        )
+        if deployments_changed:
             self._save_deployments()
         self.container_aliases_path = self.data_dir / "container_aliases.json"
         self.container_aliases: dict[str, str] = self._load_container_aliases()
@@ -1387,9 +1416,7 @@ class Manager:
             return []
 
     def _save_deployments(self) -> None:
-        tmp = self.deployments_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.deployments, indent=2), encoding="utf-8")
-        tmp.replace(self.deployments_path)
+        _atomic_private_json_write(self.deployments_path, self.deployments)
 
     @staticmethod
     def _with_vllm_prompt_token_details(args: list[Any]) -> list[Any]:
@@ -1407,6 +1434,12 @@ class Manager:
         """Mark saved vLLM deployments for a reporting-capable rebuild."""
         changed = False
         for deployment in self.deployments:
+            if (
+                deployment.get("status") == "error"
+                and PERSISTED_DEPLOYMENT_ARGS_ERROR
+                in str(deployment.get("error") or "")
+            ):
+                continue
             settings = deployment.get("launch_settings")
             if not isinstance(settings, dict):
                 continue
@@ -1419,6 +1452,49 @@ class Manager:
             settings["extra_args"] = updated
             deployment["settings_dirty"] = True
             changed = True
+        return changed
+
+    def _migrate_deployment_hf_credentials(self) -> bool:
+        """Discard legacy CLI credentials from durable deployment records."""
+        changed = False
+        for deployment in self.deployments:
+            if (
+                PERSISTED_DEPLOYMENT_ARGS_ERROR
+                in str(deployment.get("error") or "")
+                and deployment.get("launch_settings_error")
+                != PERSISTED_DEPLOYMENT_ARGS_ERROR
+            ):
+                deployment["launch_settings_error"] = (
+                    PERSISTED_DEPLOYMENT_ARGS_ERROR
+                )
+                changed = True
+            settings = deployment.get("launch_settings")
+            if not isinstance(settings, dict):
+                continue
+            raw_args = settings.get("extra_args")
+            if raw_args is None:
+                original = []
+            elif not isinstance(raw_args, list) or any(
+                not isinstance(value, str) for value in raw_args
+            ):
+                settings["extra_args"] = []
+                deployment["status"] = "error"
+                deployment["error"] = _append_persisted_error(
+                    deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
+                )
+                deployment["launch_settings_error"] = (
+                    PERSISTED_DEPLOYMENT_ARGS_ERROR
+                )
+                deployment["settings_dirty"] = True
+                changed = True
+                continue
+            else:
+                original = list(raw_args)
+            sanitized = self._without_hf_cli_credentials(original)
+            if sanitized != original:
+                settings["extra_args"] = sanitized
+                deployment["settings_dirty"] = True
+                changed = True
         return changed
 
     def _load_container_aliases(self) -> dict[str, str]:
@@ -1686,7 +1762,9 @@ class Manager:
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
         engine = body.get("engine") or "vllm"
-        extra_args = list(body.get("extra_args") or [])
+        extra_args = cls._without_hf_cli_credentials(
+            list(body.get("extra_args") or [])
+        )
         if engine == "vllm":
             extra_args = cls._with_vllm_prompt_token_details(extra_args)
         return {
@@ -1861,11 +1939,28 @@ class Manager:
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""
+        if "extra_args" in body:
+            self._reject_hf_cli_credentials(body.get("extra_args"))
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
-        if deployment.get("status") != "stopped":
+        persisted_args_error = bool(
+            deployment.get("launch_settings_error")
+            or PERSISTED_DEPLOYMENT_ARGS_ERROR
+            in str(deployment.get("error") or "")
+        )
+        if deployment.get("status") != "stopped" and not (
+            deployment.get("status") == "error" and persisted_args_error
+        ):
             raise ValueError("stop the cluster before changing its launch settings")
+        if persisted_args_error and (
+            "extra_args" not in body
+            or not isinstance(body.get("extra_args"), list)
+        ):
+            raise ValueError(
+                "extra_args must be explicitly repaired with an array before "
+                "this deployment can start"
+            )
 
         current = deployment.get("launch_settings") or {
             "deployment_name": deployment.get("name"),
@@ -1919,6 +2014,12 @@ class Manager:
         # Preserve the assigned API port unless the editor explicitly changes it.
         if settings.get("port") is None:
             settings["port"] = deployment.get("api_port")
+        remaining_error = (
+            _remove_persisted_error(
+                deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
+            )
+            if persisted_args_error else ""
+        )
         deployment.update({
             "name": settings.get("deployment_name") or settings["model"],
             "model": settings["model"],
@@ -1927,8 +2028,12 @@ class Manager:
             "node_ids": settings["node_ids"],
             "launch_settings": settings,
             "settings_dirty": True,
-            "error": None,
+            "status": (
+                "error" if remaining_error else "stopped"
+            ) if persisted_args_error else deployment.get("status"),
+            "error": remaining_error or None,
         })
+        deployment.pop("launch_settings_error", None)
         deployment.pop("kv_capacity", None)
         deployment.pop("auto_concurrency_adjustment", None)
         self._save_deployments()
@@ -2029,6 +2134,27 @@ class Manager:
             result.append(value)
             i += 1
         return result
+
+    @classmethod
+    def _without_hf_cli_credentials(cls, args: list[Any]) -> list[str]:
+        if not isinstance(args, list):
+            return []
+        return cls._without_cli_options(
+            [str(value) for value in (args or [])], HF_CREDENTIAL_CLI_OPTIONS,
+        )
+
+    @classmethod
+    def _reject_hf_cli_credentials(cls, args: list[Any] | None) -> None:
+        if args is not None and (
+            not isinstance(args, list)
+            or any(not isinstance(value, str) for value in args)
+        ):
+            raise ValueError("extra_args must be an array of strings")
+        original = [str(value) for value in (args or [])]
+        if cls._without_hf_cli_credentials(original) != original:
+            raise ValueError(
+                "configure Hugging Face credentials in Settings, not launch arguments"
+            )
 
     @staticmethod
     def _cli_option(args: list[str], names: set[str], cast=None):
@@ -2341,6 +2467,7 @@ class Manager:
 
     async def create_deployment(self, body: dict) -> dict:
         body = dict(body)
+        self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
@@ -2670,13 +2797,21 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
+        if action not in {"start", "stop", "remove"}:
+            raise ValueError("invalid deployment action")
+        if action == "start" and (
+            deployment.get("launch_settings_error")
+            or PERSISTED_DEPLOYMENT_ARGS_ERROR
+            in str(deployment.get("error") or "")
+        ):
+            raise ValueError(
+                "saved launch arguments are invalid; edit extra_args before starting"
+            )
         if (
             action == "start"
             and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
-        if action not in {"start", "stop", "remove"}:
-            raise ValueError("invalid deployment action")
 
         if action == "start" and deployment.get("settings_dirty"):
             # The stopped containers still contain the old argv. Remove them,
@@ -3652,8 +3787,12 @@ class Manager:
 
     def _resolved_hf_token(self, explicit: str | None = None) -> str:
         """Resolve an HF credential without exposing it through public state."""
+        # A controller-supplied value is authoritative, including an empty
+        # value. Remote workers must never silently substitute a different
+        # local account when the controller has no credential configured.
+        if explicit is not None:
+            return explicit.strip() if isinstance(explicit, str) else ""
         candidates = [
-            explicit,
             self.settings.get("hf_token"),
             os.environ.get("HF_TOKEN"),
             os.environ.get("HUGGING_FACE_HUB_TOKEN"),
@@ -3670,6 +3809,13 @@ class Manager:
             except OSError:
                 pass
         return ""
+
+    def _redact_hf_secret(self, value: Any, explicit: str | None = None) -> str:
+        redacted = str(value)
+        token = self._resolved_hf_token(explicit)
+        if token:
+            redacted = redacted.replace(token, "[REDACTED]")
+        return redacted
 
     def _container_hf_environment(self, explicit: str | None = None) -> dict[str, str]:
         token = self._resolved_hf_token(explicit)
@@ -3864,14 +4010,19 @@ class Manager:
         return dict(DEFAULT_SETTINGS)
 
     def _save_settings(self):
-        self.settings_path.write_text(json.dumps(self.settings, indent=2))
-        self.settings_path.chmod(0o600)
+        _atomic_private_json_write(self.settings_path, self.settings)
 
     def public_settings(self) -> dict:
         public = {k: v for k, v in self.settings.items() if k != "hf_token"}
         public["hf_token"] = ""
         public["hf_token_configured"] = bool(self._resolved_hf_token())
         return public
+
+    async def clear_hf_token(self) -> dict:
+        async with self.lock:
+            self.settings["hf_token"] = ""
+            self._save_settings()
+        return self.public_settings()
 
     async def update_settings(self, data: dict) -> dict:
         async with self.lock:
@@ -5983,6 +6134,94 @@ class Manager:
         ]
 
     # ---------- recipes ----------
+    def recipe_deployment_contract(self, recipe: dict) -> dict:
+        """Return the node-count contract for a persisted launch recipe."""
+        def positive_parallelism(value) -> int:
+            try:
+                return max(1, int(value or 1))
+            except (TypeError, ValueError):
+                return 1
+
+        engine = str(recipe.get("engine") or "vllm")
+        raw_args = recipe.get("extra_args")
+        args_error = None
+        if raw_args is None:
+            args = []
+        elif not isinstance(raw_args, list) or any(
+            not isinstance(value, str) for value in raw_args
+        ):
+            args = []
+            args_error = PERSISTED_RECIPE_ARGS_ERROR
+        else:
+            args = list(raw_args)
+        if engine == "sglang":
+            tensor_parallel = recipe.get("sg_tp_size")
+            if tensor_parallel is not None:
+                try:
+                    tensor_parallel = int(tensor_parallel)
+                except (TypeError, ValueError):
+                    tensor_parallel = None
+            if tensor_parallel is None:
+                tensor_parallel = self._cli_option(args, {"--tp-size"}, int)
+            pipeline_parallel = 1
+        else:
+            tensor_parallel = self._cli_option(
+                args, {"--tensor-parallel-size", "-tp"}, int
+            )
+            pipeline_parallel = self._cli_option(
+                args, {"--pipeline-parallel-size", "-pp"}, int
+            )
+        tensor_parallel = positive_parallelism(tensor_parallel)
+        pipeline_parallel = positive_parallelism(pipeline_parallel)
+        parallel_nodes = tensor_parallel * pipeline_parallel
+        persisted_mode = recipe.get("deployment_mode")
+        mode = str(persisted_mode or "single")
+        mode_error = args_error
+        raw_saved_nodes = recipe.get("node_ids")
+        saved_nodes = []
+        if raw_saved_nodes is None or raw_saved_nodes == []:
+            saved_nodes = [LOCAL_NODE_ID]
+        elif not isinstance(raw_saved_nodes, list):
+            mode_error = "persisted node_ids must be an array of non-empty node IDs"
+            saved_nodes = [LOCAL_NODE_ID]
+        else:
+            seen_nodes = set()
+            for value in raw_saved_nodes:
+                if not isinstance(value, str) or not value.strip():
+                    mode_error = "persisted node_ids must contain only non-empty node IDs"
+                    continue
+                node_id = value.strip()
+                if node_id not in seen_nodes:
+                    seen_nodes.add(node_id)
+                    saved_nodes.append(node_id)
+            if not saved_nodes:
+                saved_nodes = [LOCAL_NODE_ID]
+        if mode == "replicated":
+            required_nodes = max(2, len(saved_nodes))
+        elif mode == "sharded":
+            required_nodes = parallel_nodes if parallel_nodes > 1 else max(2, len(saved_nodes))
+        elif persisted_mode is None and parallel_nodes > 1:
+            # A legacy TP/PP recipe created before deployment modes existed is
+            # a distributed launch even if its persisted mode defaulted to single.
+            mode = "sharded"
+            required_nodes = parallel_nodes
+        elif mode == "single":
+            required_nodes = 1
+        else:
+            required_nodes = 1
+            invalid_mode = f"unsupported persisted deployment mode: {mode}"
+            mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
+        model_revision = self._cli_option(args, {"--revision"})
+        return {
+            "required_node_count": required_nodes,
+            "deployment_mode": mode,
+            "tensor_parallel_size": tensor_parallel,
+            "pipeline_parallel_size": pipeline_parallel,
+            "model_revision": str(model_revision).strip() if model_revision else None,
+            "supported": mode_error is None,
+            "error": mode_error,
+        }
+
     def _load_recipes(self) -> list[dict]:
         if self.recipes_path.exists():
             try:
@@ -5999,8 +6238,36 @@ class Manager:
                 pass
         return []
 
+    def _migrate_recipe_hf_credentials(self) -> bool:
+        """Discard legacy CLI credentials so they cannot re-enter public state."""
+        changed = False
+        for recipe in self.recipes:
+            raw_args = recipe.get("extra_args")
+            if raw_args is None:
+                original = []
+            elif not isinstance(raw_args, list) or any(
+                not isinstance(value, str) for value in raw_args
+            ):
+                recipe["supported"] = False
+                recipe["error"] = _append_persisted_error(
+                    recipe.get("error"), PERSISTED_RECIPE_ARGS_ERROR,
+                )
+                # Replace the corrupt launch input so every public/listing
+                # path remains safe while the durable unsupported marker keeps
+                # this recipe from being launched until the user edits it.
+                recipe["extra_args"] = []
+                changed = True
+                continue
+            else:
+                original = list(raw_args)
+            sanitized = self._without_hf_cli_credentials(original)
+            if sanitized != original:
+                recipe["extra_args"] = sanitized
+                changed = True
+        return changed
+
     def _save_recipes(self):
-        self.recipes_path.write_text(json.dumps(self.recipes, indent=2))
+        _atomic_private_json_write(self.recipes_path, self.recipes)
 
     @staticmethod
     def _recipe_key(model: str, image: str | None, extra_args: list | None,
@@ -6010,6 +6277,25 @@ class Manager:
             model or "", image or "", tuple(extra_args or []), engine or "vllm",
             deployment_mode or "single", tuple(node_ids or [LOCAL_NODE_ID]),
         )
+
+    @staticmethod
+    def _normalize_recipe_node_ids(node_ids: list[str] | None) -> list[str]:
+        if node_ids is None:
+            return [LOCAL_NODE_ID]
+        if not isinstance(node_ids, list):
+            raise ValueError("node_ids must be an array")
+        if not node_ids:
+            raise ValueError("node_ids must contain at least one node ID")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in node_ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("node_ids must contain only non-empty strings")
+            node_id = value.strip()
+            if node_id not in seen:
+                seen.add(node_id)
+                normalized.append(node_id)
+        return normalized
 
     async def add_recipe(
         self,
@@ -6031,10 +6317,19 @@ class Manager:
         launch_controls: dict | None = None,
         force_new: bool = False,
     ) -> dict:
+        self._reject_hf_cli_credentials(extra_args)
         if not model:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
+        deployment_mode = deployment_mode or "single"
+        if deployment_mode not in {"single", "sharded", "replicated"}:
+            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        node_ids = self._normalize_recipe_node_ids(node_ids)
+        if deployment_mode == "single":
+            node_ids = node_ids[:1]
+        elif len(node_ids) < 2:
+            raise ValueError(f"{deployment_mode} deployment requires at least two nodes")
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")
@@ -6132,6 +6427,8 @@ class Manager:
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported recipe field(s): {', '.join(unknown)}")
+        if "extra_args" in changes:
+            self._reject_hf_cli_credentials(changes.get("extra_args"))
         async with self.lock:
             recipe = next((r for r in self.recipes if r.get("id") == rid), None)
             if not recipe:
@@ -6145,7 +6442,7 @@ class Manager:
             mode = merged.get("deployment_mode") or "single"
             if mode not in {"single", "sharded", "replicated"}:
                 raise ValueError("deployment_mode must be single, sharded, or replicated")
-            nodes = list(dict.fromkeys(merged.get("node_ids") or [LOCAL_NODE_ID]))
+            nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":
                 nodes = nodes[:1]
             elif len(nodes) < 2:
@@ -6173,6 +6470,19 @@ class Manager:
             merged["engine"] = engine
             merged["deployment_mode"] = mode
             merged["extra_args"] = list(merged.get("extra_args") or [])
+            if "extra_args" in changes:
+                had_args_error = PERSISTED_RECIPE_ARGS_ERROR in str(
+                    merged.get("error") or ""
+                )
+                remaining_error = _remove_persisted_error(
+                    merged.get("error"), PERSISTED_RECIPE_ARGS_ERROR,
+                )
+                if remaining_error:
+                    merged["error"] = remaining_error
+                    merged["supported"] = False
+                elif had_args_error:
+                    merged.pop("error", None)
+                    merged.pop("supported", None)
             merged["updated_at"] = time.time()
             recipe.clear()
             recipe.update(merged)
@@ -6961,6 +7271,7 @@ class Manager:
         hf_token: str | None = None,
         sparkdeck_deployment_id: str | None = None,
     ) -> dict:
+        self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
         distributed_member = bool(
@@ -7115,11 +7426,12 @@ class Manager:
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:
+                safe_error = self._redact_hf_secret(exc, hf_token)
                 self._cluster_launch_update(
-                    name, "error", f"Launch failed: {exc}",
-                    model=model, cluster_member=cluster_member, error=str(exc),
+                    name, "error", f"Launch failed: {safe_error}",
+                    model=model, cluster_member=cluster_member, error=safe_error,
                 )
-                raise
+                raise RuntimeError(safe_error) from exc
         else:
             # vLLM path — VRAM-aware multi-model
             image = image or self.settings["vllm_image"]
@@ -7264,11 +7576,12 @@ class Manager:
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:
+                safe_error = self._redact_hf_secret(exc, hf_token)
                 self._cluster_launch_update(
-                    name, "error", f"Launch failed: {exc}",
-                    model=model, cluster_member=cluster_member, error=str(exc),
+                    name, "error", f"Launch failed: {safe_error}",
+                    model=model, cluster_member=cluster_member, error=safe_error,
                 )
-                raise
+                raise RuntimeError(safe_error) from exc
 
     async def start_container(self, name: str) -> dict:
         # VRAM-aware: evict only if the GPU is full.

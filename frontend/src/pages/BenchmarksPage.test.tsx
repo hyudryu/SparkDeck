@@ -44,4 +44,46 @@ describe('BenchmarksPage community privacy', () => {
     await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
     expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
   })
+
+  it('refreshes local aggregates after deleting a contributing benchmark', async () => {
+    let deleted = false
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown
+      if (path.includes('/api/v1/benchmarks')) {
+        if (init?.method === 'DELETE') {
+          deleted = true
+          body = { ok: true }
+        } else {
+          body = {
+            items: deleted ? [] : [{
+              id: 'sample-1', created_at: '2026-08-26T00:00:00Z',
+              model: { repository: 'org/model' }, runtime: 'vllm',
+              configuration: { context_length: 8192 }, latency_ms: 100,
+              generation_tokens_per_second: 42.5, eligible_for_community: true,
+            }],
+            total: deleted ? 0 : 1, limit: 100, offset: 0,
+          }
+        }
+      } else if (path.endsWith('/api/v1/community/aggregates')) {
+        body = {
+          items: deleted ? [] : [{ model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 42.5, sample_count: 1 }],
+          availability: deleted ? 'not_configured' : 'local',
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+        }
+      } else {
+        body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+
+    render(<BenchmarksPage />)
+
+    expect((await screen.findAllByText('42.5 tok/s')).length).toBeGreaterThan(0)
+    await user.click(screen.getByRole('button', { name: 'Delete benchmark for org/model' }))
+
+    expect(await screen.findByText('No community estimates yet')).toBeInTheDocument()
+    expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
+  })
 })

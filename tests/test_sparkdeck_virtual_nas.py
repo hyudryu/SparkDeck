@@ -17,7 +17,10 @@ def create_cached_model(hub: Path, model_id: str = "org/model") -> Path:
     (root / "blobs").mkdir(parents=True)
     (root / "snapshots" / "revision-1").mkdir(parents=True)
     (root / "blobs" / "weights").write_bytes(b"model-weights")
-    (root / "snapshots" / "revision-1" / "config.json").write_text("{}")
+    snapshot = root / "snapshots" / "revision-1"
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"model-weights")
     return root
 
 
@@ -100,12 +103,18 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
+            (complete / "refs").mkdir()
+            (complete / "refs" / "main").write_text("revision-1")
+            (complete / "refs" / "stale").write_text("missing-revision")
+            (complete / "snapshots" / "empty-revision").mkdir()
+            (complete / "refs" / "empty").write_text("empty-revision")
             (hub / "models--partial--repo" / "snapshots").mkdir(parents=True)
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: False)
 
             models = nas.inventory()
 
             self.assertEqual([item["model_id"] for item in models], ["org/model"])
+            self.assertEqual(models[0]["revisions"], ["main", "revision-1"])
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])

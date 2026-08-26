@@ -26,7 +26,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
-from sparkdeck.web import register_spa_routes
+from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
@@ -1615,6 +1615,7 @@ async def get_server_logs(tail: int = 500):
 
 # ---------- static frontend ----------
 FRONTEND_DIST = ROOT / "frontend" / "dist"
+configure_static_asset_mime_types()
 if FRONTEND_DIST.exists():
     app.mount("/static/app", StaticFiles(directory=FRONTEND_DIST), name="sparkdeck-app")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")

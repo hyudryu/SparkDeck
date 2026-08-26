@@ -78,3 +78,33 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertIsNone(rows[0]["runtime_version"])
         local, _ = self.store.benchmarks()
         self.assertEqual(local[0]["sync_state"], "pending")
+
+    def test_withdrawing_consent_removes_unsent_uploads_but_keeps_samples(self):
+        base = BenchmarkSample(
+            id="pending", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=20, output_tokens=30,
+            latency_ms=100, ttft_ms=10, generation_tokens_per_second=300,
+            prompt_tokens_per_second=200, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.set_community_consent(True)
+        self.store.add_benchmark(base, queue=True)
+        self.store.add_benchmark(replace(base, id="failed"), queue=True)
+        self.store.mark_outbox_failed(["failed"], "offline")
+
+        self.store.set_community_consent(False)
+
+        self.assertFalse(self.store.sync_status()["consent"])
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.retry_outbox(), 0)
+        local, total = self.store.benchmarks()
+        self.assertEqual(total, 2)
+        self.assertTrue(all(item["sync_state"] == "local" for item in local))
+
+        self.store.set_community_consent(True)
+        self.assertEqual(
+            {item["id"] for item in self.store.outbox_batch()}, {"pending", "failed"}
+        )

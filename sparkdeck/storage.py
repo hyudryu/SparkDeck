@@ -313,12 +313,22 @@ class SparkDeckStore:
 
     def set_community_consent(self, enabled: bool) -> None:
         """Persist consent and queue eligible local samples only after opt-in."""
-        self.set_setting("community_consent", enabled)
-        if not enabled:
-            return
-        pairing = self.get_setting("device_pairing", {"status": "not_paired"})
-        status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
         with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                ("community_consent", json.dumps(bool(enabled))),
+            )
+            if not enabled:
+                # Withdrawing consent removes every unsent upload instruction,
+                # while the benchmark_samples rows remain available locally.
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+                return
+            pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+            status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
             self._connection.execute(
                 """INSERT OR IGNORE INTO upload_outbox(sample_id, status, created_at)
                    SELECT id, ?, created_at FROM benchmark_samples WHERE eligible = 1""",

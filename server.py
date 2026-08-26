@@ -1302,6 +1302,7 @@ async def v1_deployments():
 def _public_recipe(recipe: dict) -> dict:
     """Return the safe saved-configuration contract used by the Models UI."""
     contract = manager.recipe_deployment_contract(recipe)
+    supported = recipe.get("supported", True) is not False and contract["supported"]
     return {
         "id": recipe.get("id"),
         "name": recipe.get("name") or recipe.get("model"),
@@ -1318,8 +1319,8 @@ def _public_recipe(recipe: dict) -> dict:
         **contract,
         "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
         "extra_args_count": len(recipe.get("extra_args") or []),
-        "supported": recipe.get("supported", True),
-        "error": recipe.get("error"),
+        "supported": supported,
+        "error": recipe.get("error") or contract.get("error"),
         "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
     }
 
@@ -1335,15 +1336,18 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
     if not recipe:
         raise HTTPException(404, "saved configuration not found")
-    if recipe.get("supported") is False:
-        raise HTTPException(400, recipe.get("error") or "saved runtime is unsupported")
+    contract = manager.recipe_deployment_contract(recipe)
+    if recipe.get("supported") is False or contract["supported"] is False:
+        raise HTTPException(
+            400,
+            recipe.get("error") or contract.get("error") or "saved runtime is unsupported",
+        )
     try:
         body = await req.json()
     except json.JSONDecodeError:
         body = {}
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")
-    contract = manager.recipe_deployment_contract(recipe)
     try:
         selected_node_ids = _requested_node_ids(body)
     except ValueError as exc:
@@ -1368,11 +1372,16 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     inventory = await manager.model_cache_inventory()
+    requested_revision = contract.get("model_revision")
     nodes_with_weights = {
         node.get("id")
         for node in inventory
         if any(
             model.get("model_id") == recipe.get("model")
+            and (
+                not requested_revision
+                or requested_revision in (model.get("revisions") or [])
+            )
             for model in node.get("models") or []
         )
     }

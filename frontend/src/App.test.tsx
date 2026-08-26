@@ -298,6 +298,50 @@ describe('model deployments', () => {
     expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeEnabled()
   })
 
+  it('deduplicates saved node IDs before filling an exact-count selector', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-duplicates/deploy')) {
+        return new Response(JSON.stringify({
+          id: 'dep-replicas', alias: 'Saved replicas', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {},
+          node_ids: ['local', 'node-2'],
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-duplicates', name: 'Saved replicas', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'replicated', required_node_count: 2, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local', 'local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved replicas' })
+
+    expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
+    expect(dialog).toHaveTextContent('This device, Spark Two')
+    const deploy = within(dialog).getByRole('button', { name: 'Deploy on 2 nodes' })
+    expect(deploy).toBeEnabled()
+    await user.click(deploy)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-duplicates/deploy',
+      expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ node_ids: ['local', 'node-2'] }),
+      }),
+    ))
+  })
+
   it('surfaces saved-configuration failures without hiding deployment state', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

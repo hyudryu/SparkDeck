@@ -5753,55 +5753,24 @@ class Manager:
 
     # ---------- cross-backend mutual exclusion ----------
     async def evict_other_backends(self, protect: str = "") -> dict:
-        """
-        Release GPU memory held by backends other than `protect`, so the
-        three inference backends never share the GPU at once:
-          protect="vllm"    → stop vLLM containers, unload Unsloth, stop Ollama
-          protect="sglang"  → stop SGLang containers, unload Unsloth, stop Ollama
-          protect="unsloth" → unload Unsloth (no-op if different model), stop vLLM/SGLang, stop Ollama
-          protect="ollama"  → stop vLLM/SGLang, unload Unsloth
-          protect=""        → stop all three
-        Best-effort: logs failures but never raises, so one backend being
-        unreachable doesn't block the calling action.
-        """
-        actions: dict[str, list] = {"stopped_vllm": [], "unloaded_unsloth": [], "stopped_ollama": []}
-
-        # --- vLLM & SGLang containers ---
-        if protect not in ("vllm", "sglang"):
-            try:
-                for c in await self.list_containers():
-                    if c.get("managed") and c["status"] == "running":
-                        await self.stop_container(c["name"])
-                        self._activity.pop(c["name"], None)
-                        actions["stopped_vllm"].append(c["name"])
-            except Exception as e:
-                print(f"[evict] container stop failed: {e}")
-
-        # --- Unsloth model ---
-        if protect != "unsloth":
-            # Probe /v1/models for the loaded model — this sees loads done
-            # from the Studio UI too, not just controller-initiated ones.
-            try:
-                loaded = await self._unsloth_loaded_model()
-                if loaded:
-                    await self.unload_unsloth_model(loaded)
-                    actions["unloaded_unsloth"].append(loaded)
-            except Exception as e:
-                print(f"[evict] unsloth unload failed: {e}")
-
-        # --- Ollama models ---
-        if protect != "ollama":
-            try:
-                actions["stopped_ollama"] = await self._stop_ollama_models()
-            except Exception as e:
-                print(f"[evict] ollama stop failed: {e}")
-
-        if any(actions.values()):
-            print(f"[evict] protect={protect or 'none'}: "
-                  f"vllm={actions['stopped_vllm']} "
-                  f"unsloth={actions['unloaded_unsloth']} "
-                  f"ollama={actions['stopped_ollama']}")
-        return actions
+        """Stop other supported managed runtimes before an exclusive launch."""
+        # SparkDeck only coordinates its supported managed runtimes. Legacy
+        # local backends are deliberately not probed, stopped, or unloaded.
+        supported_actions: dict[str, list] = {"stopped": []}
+        try:
+            for container in await self.list_containers():
+                runtime = container.get("engine") or "vllm"
+                if (
+                    container.get("managed")
+                    and container.get("status") == "running"
+                    and runtime != protect
+                ):
+                    await self.stop_container(container["name"])
+                    self._activity.pop(container["name"], None)
+                    supported_actions["stopped"].append(container["name"])
+        except Exception as exc:
+            print(f"[evict] managed runtime stop failed: {exc}")
+        return supported_actions
 
     # ---------- containers ----------
     def _container_summary(self, c) -> dict | None:

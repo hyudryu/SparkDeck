@@ -251,6 +251,16 @@ async def onboarding_leave(req: Request):
     return await onboarding.leave(str(req.base_url))
 
 
+@app.post("/api/v1/onboarding/unregister")
+async def onboarding_unregister(req: Request):
+    try:
+        return onboarding.unregister(req.headers)
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 # ---------- aggregate state ----------
 @app.get("/api/state")
 async def get_state():

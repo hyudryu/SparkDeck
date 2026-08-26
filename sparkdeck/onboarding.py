@@ -7,6 +7,7 @@ import ipaddress
 import json
 import secrets
 import socket
+import sqlite3
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -127,6 +128,7 @@ def is_forwardable_path(path: str) -> bool:
 class OnboardingService:
     def __init__(self, manager: Any, data_dir: Path, port: int = 7878):
         self.manager = manager
+        self.data_dir = Path(data_dir)
         self.port = int(port)
         self.assignment = ControllerAssignment(data_dir)
         self._join_attempts: dict[str, deque[float]] = defaultdict(deque)
@@ -208,6 +210,59 @@ class OnboardingService:
             raise ValueError("too many join attempts; wait before trying again")
         attempts.append(now)
 
+    def _saved_deployment_count(self) -> int:
+        """Count local application deployment records without mutating SQLite."""
+        path = self.data_dir / "sparkdeck.sqlite3"
+        if not path.exists():
+            return 0
+        try:
+            uri = f"file:{path.resolve().as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deployments'"
+                ).fetchone()
+                if not exists:
+                    return 0
+                row = connection.execute("SELECT COUNT(*) FROM deployments").fetchone()
+                return int(row[0] if row else 0)
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise ValueError(
+                "cannot verify that saved deployments were migrated; "
+                "repair sparkdeck.sqlite3 and retry"
+            ) from exc
+
+    async def _assert_joinable(self) -> None:
+        saved = self._saved_deployment_count()
+        legacy = len([
+            deployment for deployment in getattr(self.manager, "deployments", [])
+            if isinstance(deployment, dict)
+        ])
+        try:
+            containers = await self.manager.list_containers()
+        except Exception as exc:
+            raise ValueError(
+                "cannot verify that managed workloads were migrated because Docker "
+                "is unavailable; restore Docker access and retry"
+            ) from exc
+        managed = [container for container in containers if container.get("managed")]
+        if not (saved or legacy or managed):
+            return
+        details = []
+        if saved:
+            details.append(f"{saved} saved deployment record{'s' if saved != 1 else ''}")
+        if legacy:
+            details.append(f"{legacy} legacy deployment record{'s' if legacy != 1 else ''}")
+        if managed:
+            details.append(f"{len(managed)} managed container{'s' if len(managed) != 1 else ''}")
+        raise ValueError(
+            "cannot join while this node still owns " + ", ".join(details) + ". "
+            "Migrate or remove every local deployment and managed container, then retry; "
+            "joining never discards workloads automatically."
+        )
+
     async def register(
         self, body: dict[str, Any], request_origin: str, client_id: str,
     ) -> dict[str, Any]:
@@ -246,6 +301,9 @@ class OnboardingService:
         }
 
     async def join(self, body: dict[str, Any], request_origin: str) -> dict[str, Any]:
+        if self.assignment.load():
+            raise ValueError("this node is already joined to a controller")
+        await self._assert_joinable()
         controller_url = await validate_control_url(body.get("controller_url"))
         advertise_url = await validate_control_url(body.get("advertise_url"))
         if controller_url == advertise_url:
@@ -301,6 +359,33 @@ class OnboardingService:
         return result
 
     async def leave(self, request_origin: str) -> dict[str, Any]:
+        assignment = self.assignment.load()
+        if not assignment:
+            result = await self.status(request_origin)
+            result["ok"] = True
+            return result
+
+        # Revoke the credential the former controller uses to reach this
+        # worker before deleting the only durable record of that controller.
+        # If the atomic credential write fails, leave controller.json intact
+        # so the user can retry and the process cannot report a false leave.
+        self.manager.agent_credentials.revoke_remote_access()
+        try:
+            controller_url = await validate_control_url(assignment["controller_url"])
+            response = await self.manager.http.post(
+                f"{controller_url}/api/v1/onboarding/unregister",
+                headers={
+                    FORWARD_NODE_HEADER: assignment["node_id"],
+                    FORWARD_HOP_HEADER: "1",
+                    FORWARD_TOKEN_HEADER: assignment["forward_token"],
+                },
+                timeout=5,
+            )
+            response.raise_for_status()
+        except (httpx.HTTPError, ValueError, KeyError):
+            # Local agent-token rotation already revoked an offline or stale
+            # controller. Controller-side inventory cleanup is best effort.
+            pass
         self.assignment.clear()
         adopt_controller = getattr(self.manager, "adopt_controller_role", None)
         if adopt_controller is not None:
@@ -308,6 +393,16 @@ class OnboardingService:
         result = await self.status(request_origin)
         result["ok"] = True
         return result
+
+    def unregister(self, headers: Any) -> dict[str, Any]:
+        """Revoke a leaving worker's one-hop grant and inventory record."""
+        valid, detail = self.validate_forward_headers(headers)
+        if not valid:
+            raise PermissionError(detail)
+        node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
+        if not self.manager.node_registry.remove(node_id):
+            raise ValueError("worker is not registered")
+        return {"ok": True, "node_id": node_id, "revoked": True}
 
     def validate_forward_headers(self, headers: Any) -> tuple[bool, str]:
         hop = str(headers.get(FORWARD_HOP_HEADER) or "")

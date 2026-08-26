@@ -36,6 +36,7 @@ export function BenchmarksPage() {
   const remove = async (id: string) => {
     await api.benchmarks.deleteLocal(id)
     samples.reload()
+    aggregates.reload()
     sync.reload()
   }
 

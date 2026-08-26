@@ -19,6 +19,8 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
+const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
+
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const resource = useResource((signal) => api.deployments.list(signal))
@@ -102,12 +104,15 @@ export function ModelsPage() {
     }
   }
 
-  const nodesWithWeights = (recipe: SavedConfiguration) => new Set(
-    (modelCache.data?.nodes ?? [])
+  const nodesWithWeights = (recipe: SavedConfiguration) => {
+    if (isLocalModelPath(recipe.model)) {
+      return new Set(localNodeId ? [localNodeId] : [])
+    }
+    return new Set((modelCache.data?.nodes ?? [])
       .filter((node) => node.models.some((model) => model.model_id === recipe.model
-        && (!recipe.model_revision || model.revisions?.includes(recipe.model_revision))))
-      .map((node) => node.id),
-  )
+        && model.revisions?.includes(recipe.model_revision ?? 'main')))
+      .map((node) => node.id))
+  }
 
   const openRecipeDeployment = (recipe: SavedConfiguration) => {
     const weighted = nodesWithWeights(recipe)
@@ -242,26 +247,27 @@ export function ModelsPage() {
 
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment
+        const localPath = isLocalModelPath(recipe.model)
         const weighted = nodesWithWeights(recipe)
         const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
-        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, 'Model weights not cached']))
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
         const localRequired = recipe.deployment_mode === 'sharded' && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === recipe.required_node_count
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const coordinatorReady = recipe.deployment_mode !== 'sharded' || Boolean(localNodeId && nodeIds.includes(localNodeId))
-        const ready = !nodes.loading && !nodes.error && !modelCache.loading && !modelCache.error && exactCount && allEligible && coordinatorReady
+        const ready = !nodes.loading && !nodes.error && (localPath || (!modelCache.loading && !modelCache.error)) && exactCount && allEligible && coordinatorReady
         const recipeBusy = busy === `recipe:${recipe.id}`
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
             <div className="modal-heading"><div><p className="eyebrow">Saved cluster configuration</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights are disabled.</p>
             {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
-            {modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setRecipeDeployment({ recipe, nodeIds: next.length <= recipe.required_node_count ? next : nodeIds })}
-              loading={nodes.loading || modelCache.loading}
+              loading={nodes.loading || (!localPath && modelCache.loading)}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload() }}
               multiple={recipe.required_node_count > 1}
@@ -274,7 +280,7 @@ export function ModelsPage() {
                 ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
                 : nodeIds[0]}
               legend="Deployment nodes"
-              help={`Only nodes with ${recipe.model} already cached can be selected.`}
+              help={localPath ? 'Local model paths can run only on the controller.' : `Only nodes with ${recipe.model} already cached can be selected.`}
             />
             {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}

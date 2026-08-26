@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from cluster import (
     normalize_agent_url,
 )
 from manager import Manager
+from sparkdeck.onboarding import resolve_control_connection
 
 
 class AgentCredentialsTests(unittest.TestCase):
@@ -96,6 +98,57 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_request_pins_validated_agent_address(self) -> None:
+        requests = []
+        resolutions = []
+
+        def resolve(host, port, **kwargs):
+            resolutions.append((host, port))
+            address = "100.100.20.30" if len(resolutions) == 1 else "203.0.113.10"
+            return [(
+                socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                (address, port),
+            )]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(
+                Path(directory), client, "controller",
+                connection_resolver=resolve_control_connection,
+            )
+            registry.nodes = [{
+                "id": "remote-1",
+                "name": "Spark 2",
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+                "enabled": True,
+            }]
+            try:
+                with mock.patch(
+                    "sparkdeck.onboarding.socket.getaddrinfo", side_effect=resolve,
+                ):
+                    result = await registry.request(
+                        "remote-1", "POST", "/api/agent/containers",
+                        json_body={"hf_token": "hf-secret"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(resolutions, [("worker.tail.example", 7878)])
+        self.assertEqual(
+            str(requests[0].url),
+            "https://100.100.20.30:7878/api/agent/containers",
+        )
+        self.assertEqual(requests[0].headers["host"], "worker.tail.example:7878")
+        self.assertEqual(requests[0].extensions["sni_hostname"], "worker.tail.example")
+        self.assertEqual(requests[0].headers["authorization"], "Bearer agent-secret")
+        self.assertEqual(json.loads(requests[0].content)["hf_token"], "hf-secret")
+
     async def test_pairing_persists_secret_but_returns_public_config(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.path, "/api/agent/pair")

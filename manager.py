@@ -32,7 +32,7 @@ from cluster import (
     AgentCredentials,
     NodeRegistry,
 )
-from sparkdeck.onboarding import validate_control_url
+from sparkdeck.onboarding import resolve_control_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
@@ -394,7 +394,8 @@ class Manager:
         self.http = httpx.AsyncClient(timeout=600)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(
-            self.data_dir, self.http, self.agent_credentials.node_id
+            self.data_dir, self.http, self.agent_credentials.node_id,
+            connection_resolver=resolve_control_connection,
         )
         self.virtual_nas = VirtualNAS(
             self.data_dir,
@@ -2140,14 +2141,6 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
-        if payload.get("hf_token"):
-            node = self.node_registry.get(node_id)
-            if not node:
-                raise ValueError("remote node not found")
-            # Re-resolve the destination immediately before transmitting a
-            # cluster credential. This prevents stale or rebound hostnames
-            # from turning an authenticated agent request into secret egress.
-            await validate_control_url(node.get("agent_url"))
         return await self.node_registry.request(
             node_id,
             "POST",

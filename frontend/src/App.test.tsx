@@ -178,8 +178,8 @@ describe('model deployments', () => {
         model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local', 'node-2'],
       }), { status: 201, headers: { 'Content-Type': 'application/json' } })
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
-        { id: 'local', name: 'Spark One', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
-        { id: 'node-2', name: 'Spark Two', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib }] },
+        { id: 'local', name: 'Spark One', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib, revisions: ['main'] }] },
         { id: 'node-3', name: 'Spark Three', online: true, total_size: 100 * gib, models: [] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{
         id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
@@ -223,6 +223,64 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
+  it('requires the main cache ref for an unpinned saved configuration', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Snapshot only', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['snapshot-a'] }] },
+        { id: 'node-2', name: 'Default branch', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main', 'snapshot-b'] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-main', name: 'Saved main', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Snapshot only', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'node-2', name: 'Default branch', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved main' })
+
+    expect(within(dialog).getByRole('radio', { name: /Snapshot only/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /Default branch/ })).toBeChecked()
+  })
+
+  it('allows a saved local model path on the controller without cache inventory', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/model-cache')) {
+        return new Response(JSON.stringify({ detail: 'cache unavailable' }), {
+          status: 503, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-local', name: 'Local weights', model: '/models/local', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'node-2', name: 'Worker', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Local weights' })
+
+    expect(within(dialog).getByRole('radio', { name: /Controller/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Worker/ })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Deploy on 1 node' })).toBeEnabled()
+    expect(dialog).not.toHaveTextContent('cache unavailable')
+  })
+
   it('keeps a pending saved deployment open so late failures remain visible', async () => {
     const user = userEvent.setup()
     let resolveDeploy: (response: Response) => void = () => undefined
@@ -231,7 +289,7 @@ describe('model deployments', () => {
       const path = String(input)
       if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return deployResponse
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
-        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{
         id: 'recipe-1', name: 'Saved local', model: 'org/model', engine: 'vllm',
         deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
@@ -273,8 +331,8 @@ describe('model deployments', () => {
         }), { status: 201, headers: { 'Content-Type': 'application/json' } })
       }
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
-        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
-        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 20 }] },
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{
         id: 'recipe-duplicates', name: 'Saved replicas', model: 'org/model', engine: 'vllm',
         deployment_mode: 'replicated', required_node_count: 2, tensor_parallel_size: 1,

@@ -11,7 +11,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -177,12 +177,26 @@ class NodeRegistry:
     def __init__(
         self, data_dir: Path, http: httpx.AsyncClient,
         controller_id: str = "",
+        connection_resolver: Callable[[Any], Awaitable[Any]] | None = None,
     ):
         self.path = Path(data_dir) / "nodes.json"
         self.http = http
         self.controller_id = str(controller_id or "")
+        self.connection_resolver = connection_resolver
         self.nodes = self._load()
         self._status_cache: dict[str, tuple[float, dict]] = {}
+
+    async def _connection_target(
+        self, agent_url: str, path: str,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        if self.connection_resolver is None:
+            return f"{agent_url}{path}", {}, {}
+        connection = await self.connection_resolver(agent_url)
+        return (
+            f"{connection.connect_url}{path}",
+            {"Host": connection.host_header},
+            {"sni_hostname": connection.sni_hostname},
+        )
 
     def _load(self) -> list[dict]:
         if not self.path.exists():
@@ -215,13 +229,19 @@ class NodeRegistry:
     ) -> dict:
         url = normalize_agent_url(agent_url)
         try:
+            target, pinned_headers, extensions = await self._connection_target(
+                url, "/api/agent/pair",
+            )
             response = await self.http.post(
-                f"{url}/api/agent/pair",
+                target,
+                headers=pinned_headers,
                 json={
                     "pairing_code": str(pairing_code or ""),
                     "controller_id": self.controller_id,
                 },
                 timeout=10,
+                extensions=extensions,
+                follow_redirects=False,
             )
             response.raise_for_status()
             paired = response.json()
@@ -323,15 +343,21 @@ class NodeRegistry:
         if not node.get("enabled", True):
             raise ValueError(f"node {node.get('name', node_id)} is disabled")
         try:
+            target, pinned_headers, extensions = await self._connection_target(
+                node["agent_url"], path,
+            )
             response = await self.http.request(
                 method,
-                f"{node['agent_url']}{path}",
+                target,
                 headers={
+                    **pinned_headers,
                     "Authorization": f"Bearer {node['agent_token']}",
                     COORDINATOR_ID_HEADER: self.controller_id,
                 },
                 json=json_body,
                 timeout=timeout,
+                extensions=extensions,
+                follow_redirects=False,
             )
             response.raise_for_status()
             if not response.content:
@@ -367,17 +393,23 @@ class NodeRegistry:
         request_headers = dict(headers or {})
         request_headers["Authorization"] = f"Bearer {node['agent_token']}"
         request_headers[COORDINATOR_ID_HEADER] = self.controller_id
+        target, pinned_headers, extensions = await self._connection_target(
+            node["agent_url"], path,
+        )
+        request_headers.update(pinned_headers)
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content
         elif json_body is not None:
             payload["json"] = json_body
         request = self.http.build_request(
-            method, f"{node['agent_url']}{path}", headers=request_headers,
-            timeout=timeout, **payload,
+            method, target, headers=request_headers,
+            timeout=timeout, extensions=extensions, **payload,
         )
         try:
-            return await self.http.send(request, stream=True)
+            return await self.http.send(
+                request, stream=True, follow_redirects=False,
+            )
         except httpx.HTTPError as exc:
             raise RuntimeError(
                 f"could not contact {node.get('name', node_id)}: {exc}"

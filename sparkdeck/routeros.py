@@ -11,13 +11,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
+
+from .private_json import atomic_private_json_write as _atomic_private_json
 
 
 MNDP_PORT = 5678
 MNDP_TTL_SECONDS = 150.0
+MNDP_MAX_DISCOVERED_DEVICES = 256
+MNDP_MAX_FIELD_LENGTH = 256
 ROUTEROS_TIMEOUT_SECONDS = 5.0
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
@@ -69,20 +73,8 @@ _TRAFFIC_FIELDS = frozenset({
     "tx-queue-drops-per-second",
 })
 
-
-def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    try:
-        temporary.chmod(0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+_MNDP_PUBLIC_FIELDS = frozenset({*_MNDP_FIELDS.values(), "address"})
+_MNDP_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _format_mac(value: bytes) -> str:
@@ -170,6 +162,7 @@ async def _resolve_routeros_connection(value: Any) -> _RouterOSConnection:
     parsed = httpx.URL(url)
     host = parsed.raw_host.decode("ascii")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    literal: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
     try:
         literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
@@ -181,7 +174,14 @@ async def _resolve_routeros_connection(value: Any) -> _RouterOSConnection:
             raise ValueError("RouterOS hostname could not be resolved") from exc
         addresses = []
         for row in rows:
-            address = row[4][0].split("%", 1)[0]
+            address = str(row[4][0])
+            if (
+                row[0] == socket.AF_INET6
+                and "%" not in address
+                and len(row[4]) >= 4
+                and row[4][3]
+            ):
+                address = f"{address}%{row[4][3]}"
             if address not in addresses:
                 addresses.append(address)
         if not addresses or not all(_allowed_routeros_ip(address) for address in addresses):
@@ -193,14 +193,18 @@ async def _resolve_routeros_connection(value: Any) -> _RouterOSConnection:
             raise ValueError(
                 "RouterOS URL must resolve only to private network addresses"
             )
-        addresses = [str(literal)]
+        # Keep a link-local literal's scope identifier. RFC 6874 encodes the
+        # separating percent sign as %25 in a URL, while the socket layer needs
+        # the decoded ``address%zone`` form.
+        addresses = [unquote(host)]
     return _RouterOSConnection(
         url=url,
         connect_urls=tuple(
             str(parsed.copy_with(host=address)) for address in addresses
         ),
         host_header=parsed.netloc.decode("ascii"),
-        sni_hostname=host,
+        # A zone is routing metadata, not part of a TLS server identity.
+        sni_hostname=str(literal) if literal is not None else host,
     )
 
 
@@ -279,20 +283,49 @@ class RouterOSService:
             self._discovery_transport = None
 
     def record_discovery(self, candidate: dict[str, Any]) -> None:
+        now = time.time()
+        self._prune_discovery(now)
+        sanitized: dict[str, str] = {}
+        for field in _MNDP_PUBLIC_FIELDS:
+            if field not in candidate:
+                continue
+            value = _MNDP_CONTROL_CHARACTERS.sub("", str(candidate[field])).strip()
+            if not value:
+                continue
+            value = value[:MNDP_MAX_FIELD_LENGTH]
+            if field in {"address", "ipv4", "ipv6"}:
+                try:
+                    ipaddress.ip_address(value.split("%", 1)[0])
+                except ValueError:
+                    continue
+            sanitized[field] = value
+        if sanitized.get("platform", "").casefold() != "mikrotik":
+            return
+        if not any(sanitized.get(field) for field in ("version", "software_id", "board")):
+            return
         key = str(
-            candidate.get("mac") or candidate.get("address")
-            or candidate.get("identity") or ""
+            sanitized.get("mac") or sanitized.get("address")
+            or sanitized.get("identity") or ""
         ).casefold()
         if not key:
             return
-        self._discovered[key] = {**candidate, "last_seen": time.time()}
+        if key not in self._discovered and len(self._discovered) >= MNDP_MAX_DISCOVERED_DEVICES:
+            oldest = min(
+                self._discovered,
+                key=lambda item: float(self._discovered[item].get("last_seen") or 0),
+            )
+            self._discovered.pop(oldest, None)
+        self._discovered[key] = {**sanitized, "last_seen": now}
 
-    def _active_discovery(self) -> list[dict[str, Any]]:
-        cutoff = time.time() - MNDP_TTL_SECONDS
+    def _prune_discovery(self, now: float | None = None) -> None:
+        cutoff = (time.time() if now is None else now) - MNDP_TTL_SECONDS
         self._discovered = {
             key: value for key, value in self._discovered.items()
             if float(value.get("last_seen") or 0) >= cutoff
         }
+
+    def _active_discovery(self) -> list[dict[str, Any]]:
+        self._prune_discovery()
         return sorted(
             (dict(value) for value in self._discovered.values()),
             key=lambda item: str(item.get("identity") or item.get("address") or ""),
@@ -320,40 +353,12 @@ class RouterOSService:
         if not selected:
             raise RuntimeError("RouterOS switch is not configured")
         try:
-            connection = await _resolve_routeros_connection(selected["base_url"])
-            async with httpx.AsyncClient(
-                auth=(str(selected["username"]), str(selected.get("password") or "")),
+            return await asyncio.wait_for(
+                self._request_within_deadline(
+                    selected, method, path, json_body,
+                ),
                 timeout=ROUTEROS_TIMEOUT_SECONDS,
-                verify=bool(selected.get("verify_tls", True)),
-                transport=self._transport,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                last_connect_error: httpx.HTTPError | None = None
-                for connect_url in connection.connect_urls:
-                    try:
-                        response = await client.request(
-                            method,
-                            f"{connect_url}/rest/{path.lstrip('/')}",
-                            json=json_body,
-                            headers={
-                                "Accept": "application/json",
-                                "Host": connection.host_header,
-                            },
-                            extensions={"sni_hostname": connection.sni_hostname},
-                            follow_redirects=False,
-                        )
-                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-                        last_connect_error = exc
-                        continue
-                    break
-                else:
-                    assert last_connect_error is not None
-                    raise last_connect_error
-                response.raise_for_status()
-                if not response.content:
-                    return []
-                return response.json()
+            )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in {401, 403}:
@@ -366,8 +371,52 @@ class RouterOSService:
                 pass
             suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"RouterOS returned HTTP {status}{suffix}") from exc
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            httpx.HTTPError, json.JSONDecodeError, ValueError, asyncio.TimeoutError,
+        ) as exc:
             raise RuntimeError("Could not communicate with the RouterOS REST API") from exc
+
+    async def _request_within_deadline(
+        self,
+        selected: dict[str, Any],
+        method: str,
+        path: str,
+        json_body: dict[str, str] | None,
+    ) -> Any:
+        connection = await _resolve_routeros_connection(selected["base_url"])
+        async with httpx.AsyncClient(
+            auth=(str(selected["username"]), str(selected.get("password") or "")),
+            timeout=ROUTEROS_TIMEOUT_SECONDS,
+            verify=bool(selected.get("verify_tls", True)),
+            transport=self._transport,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            last_connect_error: httpx.HTTPError | None = None
+            for connect_url in connection.connect_urls:
+                try:
+                    response = await client.request(
+                        method,
+                        f"{connect_url}/rest/{path.lstrip('/')}",
+                        json=json_body,
+                        headers={
+                            "Accept": "application/json",
+                            "Host": connection.host_header,
+                        },
+                        extensions={"sni_hostname": connection.sni_hostname},
+                        follow_redirects=False,
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_connect_error = exc
+                    continue
+                break
+            else:
+                assert last_connect_error is not None
+                raise last_connect_error
+            response.raise_for_status()
+            if not response.content:
+                return []
+            return response.json()
 
     async def connect(self, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(body, dict):

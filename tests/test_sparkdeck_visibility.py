@@ -293,6 +293,41 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(recipe, original)
                 save.assert_not_called()
 
+    async def test_valid_args_repair_only_the_persisted_args_error(self):
+        marker = "unsupported persisted extra_args: expected an array of strings"
+        cases = [
+            ({"supported": False, "error": marker}, True, None),
+            (
+                {"supported": False, "error": f"manual unsupported reason; {marker}"},
+                False,
+                "manual unsupported reason",
+            ),
+        ]
+        for flags, becomes_supported, expected_error in cases:
+            recipe = {
+                "id": "recipe-1", "model": "org/model", "engine": "vllm",
+                "deployment_mode": "single", "node_ids": ["local"],
+                "extra_args": [], **flags,
+            }
+            with (
+                self.subTest(flags=flags),
+                patch.object(server.manager, "recipes", [recipe]),
+                patch.object(server.manager, "recipe_launches", {}),
+                patch.object(server.manager, "_save_recipes") as save,
+            ):
+                updated = await self.client.put(
+                    "/api/recipes/recipe-1",
+                    json={"extra_args": ["--dtype", "auto"]},
+                )
+                listed = await self.client.get("/api/v1/recipes")
+
+            self.assertEqual(updated.status_code, 200)
+            item = listed.json()["items"][0]
+            self.assertEqual(item["supported"], becomes_supported)
+            self.assertEqual(item["error"], expected_error)
+            self.assertNotIn(marker, str(updated.json().get("error") or ""))
+            save.assert_called_once()
+
     async def test_revision_pinned_recipe_requires_the_exact_cached_revision(self):
         recipe = {
             "id": "revision-b", "model": "org/model", "engine": "vllm",

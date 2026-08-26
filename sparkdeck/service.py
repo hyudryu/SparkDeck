@@ -280,10 +280,12 @@ class SparkDeckService:
     async def community_aggregates(self) -> dict[str, Any]:
         """Return configured community evidence or privacy-safe local evidence."""
         endpoint = str(
-            self.store.get_setting("community_api_url", "") or ""
+            await asyncio.to_thread(
+                self.store.get_setting, "community_api_url", ""
+            ) or ""
         ).strip().rstrip("/")
         if not endpoint:
-            items = self.store.community_aggregates()
+            items = await asyncio.to_thread(self.store.community_aggregates)
             return {
                 "items": items,
                 "availability": "local" if items else "not_configured",

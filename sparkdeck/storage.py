@@ -6,7 +6,6 @@ import json
 import math
 import sqlite3
 import threading
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,7 @@ COMMUNITY_EVIDENCE_POLICY = {
     "exact_match_dimensions": ["model_id", "context_window_size"],
     "metric": "inference_tokens_per_second",
 }
+_COMMUNITY_AGGREGATE_BATCH_SIZE = 256
 
 
 class SparkDeckStore:
@@ -285,36 +285,43 @@ class SparkDeckStore:
         ``COMMUNITY_EVIDENCE_POLICY`` and no private benchmark metadata leaves
         this method.
         """
+        grouped: dict[tuple[str, int], tuple[float, int]] = {}
         with self._lock:
-            rows = self._connection.execute(
+            cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, generation_tps "
                 "FROM benchmark_samples WHERE eligible = 1"
-            ).fetchall()
-
-        grouped: dict[tuple[str, int], list[float]] = defaultdict(list)
-        for row in rows:
-            try:
-                model = json.loads(row["model_json"] or "{}")
-                configuration = json.loads(row["configuration_json"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(model, dict) or not isinstance(configuration, dict):
-                continue
-            model_id = str(model.get("repository") or "").strip()
-            context_window = community_context_window(configuration)
-            speed = _positive_speed(row["generation_tps"])
-            if not model_id or context_window is None or speed is None:
-                continue
-            grouped[(model_id, context_window)].append(speed)
+            )
+            while True:
+                rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
+                if not rows:
+                    break
+                for row in rows:
+                    try:
+                        model = json.loads(row["model_json"] or "{}")
+                        configuration = json.loads(
+                            row["configuration_json"] or "{}"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(model, dict) or not isinstance(configuration, dict):
+                        continue
+                    model_id = str(model.get("repository") or "").strip()
+                    context_window = community_context_window(configuration)
+                    speed = _positive_speed(row["generation_tps"])
+                    if not model_id or context_window is None or speed is None:
+                        continue
+                    key = (model_id, context_window)
+                    total, count = grouped.get(key, (0.0, 0))
+                    grouped[key] = (total + speed, count + 1)
 
         items = [
             {
                 "model_id": model_id,
                 "context_window_size": context_window,
-                "inference_tokens_per_second": sum(speeds) / len(speeds),
-                "sample_count": len(speeds),
+                "inference_tokens_per_second": total / count,
+                "sample_count": count,
             }
-            for (model_id, context_window), speeds in grouped.items()
+            for (model_id, context_window), (total, count) in grouped.items()
         ]
         return sorted(
             items,

@@ -1,10 +1,11 @@
 import socket
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -102,6 +103,35 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_policy"]["exact_match_dimensions"],
             ["model_id", "context_window_size"],
         )
+
+    async def test_local_community_database_work_runs_off_event_loop(self):
+        event_loop_thread = threading.get_ident()
+        setting_threads = []
+        aggregate_threads = []
+        get_setting = self.service.store.get_setting
+        community_aggregates = self.service.store.community_aggregates
+
+        def tracked_get_setting(*args):
+            setting_threads.append(threading.get_ident())
+            return get_setting(*args)
+
+        def tracked_aggregates():
+            aggregate_threads.append(threading.get_ident())
+            return community_aggregates()
+
+        with (
+            patch.object(self.service.store, "get_setting", tracked_get_setting),
+            patch.object(
+                self.service.store, "community_aggregates", tracked_aggregates,
+            ),
+        ):
+            result = await self.service.community_aggregates()
+
+        self.assertEqual(result["availability"], "not_configured")
+        self.assertTrue(setting_threads)
+        self.assertTrue(aggregate_threads)
+        self.assertNotIn(event_loop_thread, setting_threads)
+        self.assertNotIn(event_loop_thread, aggregate_threads)
 
     async def test_invalid_configured_community_response_fails_visibly(self):
         def respond(request: httpx.Request) -> httpx.Response:

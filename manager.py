@@ -988,6 +988,20 @@ class Manager:
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
+        nodes = await self.model_cache_inventory()
+        return {
+            "enabled": True, "nodes": nodes,
+            "jobs": self.virtual_nas_transfers()["items"],
+            "instructions": instructions,
+        }
+
+    async def model_cache_inventory(self) -> list[dict]:
+        """Return safe Hugging Face cache sizes even when transfers are off.
+
+        The Models page needs read-only disk accounting independently of the
+        Virtual NAS transfer feature.  Inventory responses contain model IDs
+        and byte counts only; filesystem paths remain agent-private.
+        """
         cluster_nodes = await self.cluster_nodes()
 
         async def inventory_for(node: dict) -> dict:
@@ -1022,11 +1036,7 @@ class Manager:
             }
 
         nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
-        return {
-            "enabled": True, "nodes": nodes,
-            "jobs": self.virtual_nas_transfers()["items"],
-            "instructions": instructions,
-        }
+        return list(nodes)
 
     async def queue_virtual_nas_transfer(
         self, model_id: str, source_node_id: str,
@@ -5522,14 +5532,24 @@ class Manager:
             if end_dt and dt >= end_dt:
                 continue
             date_str = dt.strftime("%Y-%m-%d")
-            d = daily.setdefault(date_str, {"input": 0, "output": 0, "cached": 0, "requests": 0})
+            d = daily.setdefault(date_str, {
+                "input": 0, "output": 0, "cached": 0, "requests": 0,
+                "models": {},
+            })
             d["input"] += sum(m.get("input", 0) for m in models.values())
             d["output"] += sum(m.get("output", 0) for m in models.values())
             d["cached"] += sum(m.get("cached", 0) for m in models.values())
             d["requests"] += sum(m.get("requests", 0) for m in models.values())
+            for model, counters in models.items():
+                model_total = d["models"].setdefault(model, {
+                    "input": 0, "output": 0, "cached": 0, "requests": 0,
+                })
+                for key in ("input", "output", "cached", "requests"):
+                    model_total[key] += counters.get(key, 0)
         return [
             {"date": d, "input": v["input"], "output": v["output"],
-             "cached": v["cached"], "requests": v["requests"]}
+             "cached": v["cached"], "requests": v["requests"],
+             "models": v["models"]}
             for d, v in sorted(daily.items())
         ]
 

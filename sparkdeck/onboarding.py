@@ -282,9 +282,11 @@ class OnboardingService:
                 "the deployment remains manageable."
             )
         raise ValueError(
-            "cannot join while this node still owns " + ", ".join(details) + ". "
-            "Migrate or remove every local deployment and managed container, then retry; "
-            "joining never discards workloads automatically."
+            "cannot join because this node is currently the workload controller for "
+            + ", ".join(details) + ". Keep this node as the controller and join the "
+            "other SparkDeck nodes to this node. If you intentionally want another "
+            "controller, migrate these deployment records first; model weights and the "
+            "Hugging Face cache do not need to be deleted."
         )
 
     async def _assert_joinable(self) -> None:

@@ -351,6 +351,7 @@ class SparkDeckService:
                     "extra_args": extra_args,
                     "managed_by": "sparkdeck",
                     "sparkdeck_record_id": deployment_id,
+                    "recipe_id": body.get("recipe_id"),
                 }
                 if runtime is RuntimeKind.SGLANG:
                     launch_body.update({

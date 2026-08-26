@@ -540,6 +540,36 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_cancels_stalled_controller_headers_on_browser_disconnect(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def send(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        http = Mock(
+            build_request=Mock(return_value=object()),
+            send=send,
+        )
+        request = request_for("/api/state")
+        request.is_disconnected = AsyncMock(side_effect=[False, True])
+
+        response = await asyncio.wait_for(
+            forward_management_request(request, Mock(http=http), {
+                "controller_url": "http://127.0.0.1:9000",
+                "forward_token": "worker-secret", "node_id": "worker-id",
+            }),
+            timeout=1,
+        )
+
+        self.assertTrue(started.is_set())
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(response.status_code, 499)
+
     async def test_proxy_preserves_query_body_status_content_type_and_authenticates_worker(self):
         captured = []
 

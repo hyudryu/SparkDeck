@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import time
 from collections import defaultdict, deque
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -29,6 +30,7 @@ JOIN_CODE_TTL_SECONDS = 600.0
 JOIN_RATE_LIMIT = 5
 JOIN_RATE_WINDOW_SECONDS = 60.0
 PROXY_TIMEOUT_SECONDS = 600.0
+PROXY_DISCONNECT_POLL_SECONDS = 0.1
 
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
@@ -482,7 +484,47 @@ async def forward_management_request(
             request.method, target, headers=headers, content=await request.body(),
             timeout=PROXY_TIMEOUT_SECONDS,
         )
-        upstream = await manager.http.send(upstream_request, stream=True)
+        send_task = asyncio.create_task(manager.http.send(upstream_request, stream=True))
+
+        async def wait_for_disconnect() -> bool:
+            try:
+                while not await request.is_disconnected():
+                    await asyncio.sleep(PROXY_DISCONNECT_POLL_SECONDS)
+                return True
+            except Exception:
+                # A broken disconnect probe must not abort an otherwise valid
+                # controller request. The configured proxy timeout still bounds it.
+                return False
+
+        disconnect_task = asyncio.create_task(wait_for_disconnect())
+        try:
+            done, _ = await asyncio.wait(
+                {send_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            disconnected = (
+                disconnect_task in done and disconnect_task.result()
+            )
+            if disconnected:
+                if send_task.done() and not send_task.cancelled():
+                    upstream = send_task.result()
+                    await upstream.aclose()
+                else:
+                    send_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await send_task
+                return JSONResponse(
+                    {"detail": "client disconnected"}, status_code=499,
+                )
+            upstream = await send_task
+        finally:
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
+            if not send_task.done():
+                send_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await send_task
     except httpx.HTTPError as exc:
         return JSONResponse(
             {

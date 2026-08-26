@@ -365,6 +365,30 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("forward_token", json.dumps(status))
         await manager.http.aclose()
 
+    async def test_status_never_advertises_loopback_to_cluster_nodes(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+
+        status = await service.status("http://127.0.0.1:7878")
+
+        self.assertEqual(status["node"]["port"], 7878)
+        self.assertEqual(status["node"]["access_urls"], ["http://100.100.20.30:7878"])
+        self.assertNotIn("127.0.0.1", json.dumps(status["node"]["access_urls"]))
+        await manager.http.aclose()
+
+    async def test_status_preserves_https_serve_origin_and_raw_tailscale_fallback(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+
+        status = await service.status("https://spark-one.example-tailnet.ts.net")
+
+        self.assertEqual(status["node"]["port"], 7878)
+        self.assertEqual(status["node"]["access_urls"], [
+            "https://spark-one.example-tailnet.ts.net",
+            "http://100.100.20.30:7878",
+        ])
+        await manager.http.aclose()
+
     async def test_leave_unregisters_then_revokes_before_clearing_assignment(self):
         requests = []
         observed = {}

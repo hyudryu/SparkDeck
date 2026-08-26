@@ -392,6 +392,39 @@ class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
         manager._release_inference_slot.assert_called_once_with("remote-cluster")
 
 
+class NetworkInterfaceDiscoveryTests(unittest.TestCase):
+    def test_tailscale_status_supplies_ipv4_when_linux_ip_is_unavailable(self):
+        tailscale = Mock(stdout=json.dumps({
+            "BackendState": "Running",
+            "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"],
+        }))
+        with patch(
+            "manager.subprocess.run",
+            side_effect=[FileNotFoundError("ip"), tailscale],
+        ) as run:
+            interfaces = Manager._network_interfaces()
+
+        self.assertEqual(interfaces, [{
+            "name": "tailscale0",
+            "ipv4": ["100.101.102.103"],
+            "up": True,
+            "rdma": False,
+        }])
+        self.assertEqual(run.call_count, 2)
+
+    def test_existing_linux_tailscale_interface_avoids_cli_fallback(self):
+        linux = Mock(stdout=json.dumps([{
+            "ifname": "tailscale0",
+            "operstate": "UNKNOWN",
+            "addr_info": [{"family": "inet", "local": "100.64.0.9"}],
+        }]))
+        with patch("manager.subprocess.run", return_value=linux) as run:
+            interfaces = Manager._network_interfaces()
+
+        self.assertEqual(interfaces[0]["ipv4"], ["100.64.0.9"])
+        run.assert_called_once()
+
+
 class RemovedOllamaTests(unittest.IsolatedAsyncioTestCase):
     async def test_proxy_models_ignores_legacy_ollama_state(self):
         manager = Manager.__new__(Manager)

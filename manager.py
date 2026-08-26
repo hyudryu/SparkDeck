@@ -9625,7 +9625,10 @@ class Manager:
             # or see request counters.  Stopping one member independently would
             # tear down the entire deployment, so cluster lifecycle is always
             # coordinated at the deployment level.
-            if c.get("deployment_id"):
+            if c.get("deployment_id") and (
+                c.get("deployment_mode") != "single"
+                or int(c.get("nnodes") or 1) > 1
+            ):
                 continue
             phase = (c.get("phase") or {}).get("phase")
             if phase != "ready":

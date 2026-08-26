@@ -281,6 +281,11 @@ class SparkDeckService:
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
+        if (
+            deployment.get("kind") == DeploymentKind.MANAGED.value
+            and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+        ):
+            return await self._proxy_managed(deployment, body, endpoint, cancel)
         base_url = deployment.get("_base_url")
         if not base_url:
             raise LookupError("deployment endpoint is unavailable")
@@ -306,9 +311,37 @@ class SparkDeckService:
         self._record_response(
             deployment["id"], deployment["model"]["repository"],
             deployment["runtime"], deployment.get("settings") or {}, started, data,
+            revision=deployment["model"].get("revision"),
         )
         data["model"] = deployment["alias"]
         return data
+
+    async def _proxy_managed(self, deployment: dict[str, Any], body: dict[str, Any],
+                             endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
+        """Keep managed vLLM/SGLang requests on Manager's admission path."""
+        model = deployment["model"]["repository"]
+        upstream_body = {**body, "model": model}
+        stream = bool(upstream_body.get("stream"))
+        started = time.monotonic()
+        result = (
+            await self.manager._vllm_chat(model, upstream_body, stream, cancel)
+            if endpoint == "chat/completions"
+            else await self.manager._vllm_completions(model, upstream_body, stream, cancel)
+        )
+        settings = deployment.get("settings") or {}
+        revision = deployment["model"].get("revision")
+        if hasattr(result, "__aiter__"):
+            return self._observe_stream(
+                result, deployment["id"], model, deployment["runtime"], settings,
+                started, revision=revision,
+            )
+        self._record_response(
+            deployment["id"], model, deployment["runtime"], settings, started,
+            result, revision=revision,
+        )
+        if isinstance(result, dict):
+            result["model"] = deployment["alias"]
+        return result
 
     async def _http_stream(self, url: str, body: dict[str, Any], headers: dict[str, str],
                            deployment: dict[str, Any], started: float,
@@ -358,11 +391,12 @@ class SparkDeckService:
                 deployment["id"], deployment["model"]["repository"],
                 deployment["runtime"], deployment.get("settings") or {}, started,
                 usage, first_token_at,
+                revision=deployment["model"].get("revision"),
             )
 
     async def _observe_stream(self, stream: AsyncIterator[str], deployment_id: str | None,
                               model: str, runtime: str, settings: dict[str, Any],
-                              started: float) -> AsyncIterator[str]:
+                              started: float, revision: str | None = None) -> AsyncIterator[str]:
         first_token_at = None
         usage = None
         async for chunk in stream:
@@ -375,10 +409,14 @@ class SparkDeckService:
                     first_token_at = time.monotonic()
             yield chunk
         if usage:
-            self._record_usage(deployment_id, model, runtime, settings, started, usage, first_token_at)
+            self._record_usage(
+                deployment_id, model, runtime, settings, started, usage,
+                first_token_at, revision=revision,
+            )
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
-                         settings: dict[str, Any], started: float, data: dict[str, Any]) -> None:
+                         settings: dict[str, Any], started: float, data: dict[str, Any],
+                         revision: str | None = None) -> None:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict):
             timings = data.get("timings") or {}
@@ -386,13 +424,15 @@ class SparkDeckService:
                 deployment_id, model, runtime, settings, started, usage, None,
                 native_generation_tps=_positive_float(timings.get("predicted_per_second")),
                 native_prompt_tps=_positive_float(timings.get("prompt_per_second")),
+                revision=revision,
             )
 
     def _record_usage(self, deployment_id: str | None, model: str, runtime: str,
                       settings: dict[str, Any], started: float, usage: dict[str, Any],
                       first_token_at: float | None,
                       native_generation_tps: float | None = None,
-                      native_prompt_tps: float | None = None) -> None:
+                      native_prompt_tps: float | None = None,
+                      revision: str | None = None) -> None:
         completed = time.monotonic()
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -403,7 +443,7 @@ class SparkDeckService:
         quantization = _optional_string(safe_settings.get("quantization"))
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
-            if first_token_at is not None and output_tokens else None
+            if output_tokens else None
         )
         observed_prompt_tps = (
             round(input_tokens / max(0.000001, first_token_at - started), 3)
@@ -420,7 +460,11 @@ class SparkDeckService:
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
-            model=ModelIdentity(repository=public_model, quantization=quantization),
+            model=ModelIdentity(
+                repository=public_model,
+                revision=_optional_string(revision),
+                quantization=quantization,
+            ),
             runtime=runtime_kind,
             runtime_version=_optional_string(safe_settings.get("runtime_version")),
             hardware=self._hardware_snapshot(),

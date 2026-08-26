@@ -122,6 +122,14 @@ systemctl --user enable --now sparkdeck.service
 
 Adjust the template if your checkout lives elsewhere. Never place tokens directly in the committed unit file.
 
+### Cluster-wide release updates
+
+After installing the bundled user service, open **Settings → Software update** to check the official GitHub repository for its latest published release. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
+
+Self-update is intentionally release-only: it never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled `sparkdeck.service`, and already support the update protocol. A dirty, offline, divergent, or unsupported node blocks the rollout before any node changes. Because older installations do not expose this protocol, install the release containing this feature manually on every node once; later releases can update the whole cluster from the Settings button.
+
+Publish a GitHub Release with a tag whose commit is a fast-forward from the installed version. SparkDeck resolves that tag to an immutable commit, stages the Python and frontend builds in a temporary worktree, fast-forwards the live checkout, and restarts through systemd. If no release exists, Settings reports that honestly and does not fall back to `main`.
+
 ## Development
 
 Run backend tests with:

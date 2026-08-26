@@ -19,6 +19,7 @@ import httpx
 
 LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 1
+COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
 
 
 def _atomic_json_write(path: Path, value: Any) -> None:
@@ -85,6 +86,23 @@ class AgentCredentials:
             token, self.data.get("agent_token", "")
         )
 
+    def authorize_controller(self, token: str, controller_id: str) -> bool:
+        """Authorize and durably claim one coordinator for legacy pairings."""
+        if not self.accepts_token(token) or not str(controller_id or "").strip():
+            return False
+        controller_id = str(controller_id).strip()
+        owner = str(self.data.get("paired_controller_id") or "")
+        if owner:
+            return secrets.compare_digest(owner, controller_id)
+        value = {
+            **self.data,
+            "paired_controller_id": controller_id,
+            "controller_claimed_at": time.time(),
+        }
+        _atomic_json_write(self.path, value)
+        self.data = value
+        return True
+
     @property
     def cluster_join_code(self) -> str:
         return str(self.data["cluster_join_code"])
@@ -125,32 +143,50 @@ class AgentCredentials:
             "credentials_rotated_at": time.time(),
         }
         value.pop("paired_at", None)
+        value.pop("paired_controller_id", None)
+        value.pop("controller_claimed_at", None)
         _atomic_json_write(self.path, value)
         self.data = value
 
-    def pair(self, pairing_code: str) -> dict:
+    def validate_pairing_code(self, pairing_code: str) -> None:
         if not pairing_code or not secrets.compare_digest(
             str(pairing_code), str(self.data.get("pairing_code", ""))
         ):
             raise ValueError("invalid pairing code")
-        response = {
+
+    def pair(self, pairing_code: str, controller_id: str) -> dict:
+        self.validate_pairing_code(pairing_code)
+        controller_id = str(controller_id or "").strip()
+        if not controller_id:
+            raise ValueError("controller id is required")
+        # One-time pairing codes prevent another controller from replaying a
+        # code seen in logs. Rotating the bearer makes coordinator ownership
+        # exclusive, so a previously paired cluster cannot keep reading or
+        # relaying this node's usage after it joins a different cluster.
+        value = {
+            **self.data,
+            "agent_token": secrets.token_urlsafe(32),
+            "pairing_code": f"{secrets.randbelow(1_000_000):06d}",
+            "paired_controller_id": controller_id,
+            "paired_at": time.time(),
+        }
+        _atomic_json_write(self.path, value)
+        self.data = value
+        return {
             "node_id": self.node_id,
-            "agent_token": self.data["agent_token"],
+            "agent_token": value["agent_token"],
             "protocol_version": AGENT_PROTOCOL_VERSION,
         }
-        # One-time pairing codes prevent another controller from replaying a
-        # code seen in logs.  The durable agent token is not rotated because a
-        # previously paired coordinator may still be managing deployments.
-        self.data["pairing_code"] = f"{secrets.randbelow(1_000_000):06d}"
-        self.data["paired_at"] = time.time()
-        _atomic_json_write(self.path, self.data)
-        return response
 
 
 class NodeRegistry:
-    def __init__(self, data_dir: Path, http: httpx.AsyncClient):
+    def __init__(
+        self, data_dir: Path, http: httpx.AsyncClient,
+        controller_id: str = "",
+    ):
         self.path = Path(data_dir) / "nodes.json"
         self.http = http
+        self.controller_id = str(controller_id or "")
         self.nodes = self._load()
         self._status_cache: dict[str, tuple[float, dict]] = {}
 
@@ -187,7 +223,10 @@ class NodeRegistry:
         try:
             response = await self.http.post(
                 f"{url}/api/agent/pair",
-                json={"pairing_code": str(pairing_code or "")},
+                json={
+                    "pairing_code": str(pairing_code or ""),
+                    "controller_id": self.controller_id,
+                },
                 timeout=10,
             )
             response.raise_for_status()
@@ -210,6 +249,7 @@ class NodeRegistry:
             "enabled": True,
             "protocol_version": paired.get("protocol_version"),
             "paired_at": time.time(),
+            "usage_reconciled": False,
         }
         self.nodes = [n for n in self.nodes if n.get("id") != node_id]
         self.nodes.append(node)
@@ -238,6 +278,15 @@ class NodeRegistry:
         self._save()
         self._status_cache.pop(node_id, None)
         return True
+
+    def mark_usage_reconciled(self, node_id: str) -> None:
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID:
+            raise ValueError("remote node not found")
+        if node.get("usage_reconciled") is True:
+            return
+        node["usage_reconciled"] = True
+        self._save()
 
     @staticmethod
     def public_config(node: dict) -> dict:
@@ -283,7 +332,10 @@ class NodeRegistry:
             response = await self.http.request(
                 method,
                 f"{node['agent_url']}{path}",
-                headers={"Authorization": f"Bearer {node['agent_token']}"},
+                headers={
+                    "Authorization": f"Bearer {node['agent_token']}",
+                    COORDINATOR_ID_HEADER: self.controller_id,
+                },
                 json=json_body,
                 timeout=timeout,
             )
@@ -320,6 +372,7 @@ class NodeRegistry:
             raise ValueError(f"node {node.get('name', node_id)} is disabled")
         request_headers = dict(headers or {})
         request_headers["Authorization"] = f"Bearer {node['agent_token']}"
+        request_headers[COORDINATOR_ID_HEADER] = self.controller_id
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content

@@ -17,7 +17,11 @@ import httpx
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import Manager, ClientAbort, FanSettingsConflict
-from cluster import AGENT_PROTOCOL_VERSION, LOCAL_NODE_ID
+from cluster import (
+    AGENT_PROTOCOL_VERSION,
+    COORDINATOR_ID_HEADER,
+    LOCAL_NODE_ID,
+)
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
 from sparkdeck.onboarding import (
@@ -186,7 +190,10 @@ async def security_headers(request: Request, call_next):
 def _require_agent(request: Request) -> None:
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not manager.agent_credentials.accepts_token(token):
+    controller_id = request.headers.get(COORDINATOR_ID_HEADER, "")
+    if scheme.lower() != "bearer" or not manager.agent_credentials.authorize_controller(
+        token, controller_id
+    ):
         raise HTTPException(401, "invalid node-agent token")
 
 
@@ -410,7 +417,10 @@ async def agent_info():
 async def agent_pair(req: Request):
     body = await req.json()
     try:
-        result = manager.agent_credentials.pair(body.get("pairing_code") or "")
+        pairing_code = body.get("pairing_code") or ""
+        result = manager.agent_credentials.pair(
+            pairing_code, body.get("controller_id") or ""
+        )
     except ValueError as exc:
         raise HTTPException(403, str(exc)) from exc
     result["name"] = manager.settings.get("cluster_node_name")
@@ -627,8 +637,6 @@ async def agent_token_usage(req: Request):
 @app.post("/api/agent/token-usage")
 async def agent_merge_token_usage(req: Request):
     _require_agent(req)
-    if not manager.settings.get("sync_token_usage"):
-        return {"enabled": False, "changed": False}
     try:
         changed = manager.merge_token_usage_sync(await req.json())
     except ValueError as exc:

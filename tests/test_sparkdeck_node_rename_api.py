@@ -47,14 +47,14 @@ class NodeRenameApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_patch_requires_auth_and_updates_only_local_node(self):
         rename = AsyncMock(return_value={"id": "local", "name": "Worker"})
         with (
-            patch.object(server.manager.agent_credentials, "accepts_token", return_value=False),
+            patch.object(server.manager.agent_credentials, "authorize_controller", return_value=False),
             patch.object(server.manager, "rename_cluster_node", rename),
         ):
             unauthorized = await self.client.patch(
                 "/api/agent/node", json={"name": "Worker"},
             )
         with (
-            patch.object(server.manager.agent_credentials, "accepts_token", return_value=True),
+            patch.object(server.manager.agent_credentials, "authorize_controller", return_value=True),
             patch.object(server.manager, "rename_cluster_node", rename),
         ):
             accepted = await self.client.patch(

@@ -74,6 +74,8 @@ describe('StoragePage', () => {
     render(<StoragePage />)
 
     await user.click(await screen.findByRole('checkbox', { name: /Backup Spark/ }))
+    expect(screen.getAllByText('954 MB used').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/cataloged/i)).not.toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /Archive Spark/ })).toBeDisabled()
     expect(screen.getByText('Model already available')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Queue transfer' }))

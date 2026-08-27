@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from docker.errors import DockerException
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -376,14 +377,22 @@ class OnboardingService:
             deployment for deployment in getattr(self.manager, "deployments", [])
             if isinstance(deployment, dict)
         ])
-        try:
-            containers = await self.manager.list_containers()
-        except Exception as exc:
-            raise ValueError(
-                "cannot verify that managed workloads were migrated because Docker "
-                "is unavailable; restore Docker access and retry"
-            ) from exc
-        managed = [container for container in containers if container.get("managed")]
+        managed = []
+        if not (saved or legacy):
+            try:
+                containers = await self.manager.list_containers()
+            except DockerException as exc:
+                # Joining changes only SparkDeck's controller assignment. An
+                # otherwise-empty controller-only installation does not need
+                # Docker to become a worker. Keep leave fail-closed because an
+                # offline worker's inventory is its last ownership check.
+                if action == "join":
+                    return
+                raise ValueError(
+                    "cannot verify that managed workloads were migrated because Docker "
+                    "is unavailable; restore Docker access and retry"
+                ) from exc
+            managed = [container for container in containers if container.get("managed")]
         if not (saved or legacy or managed):
             return
         details = []

@@ -236,6 +236,24 @@ def _rows(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _health_rows(value: Any) -> list[dict[str, Any]]:
+    """Normalize modern sensor rows and legacy RouterOS property maps."""
+    result: list[dict[str, Any]] = []
+    for row in _rows(value):
+        if str(row.get("name") or "").strip():
+            result.append(dict(row))
+            continue
+        for name, reading in row.items():
+            name = str(name or "").strip()
+            if not name or name == "name" or name.startswith("."):
+                continue
+            if isinstance(reading, dict) and "value" in reading:
+                result.append({**reading, "name": name})
+            else:
+                result.append({"name": name, "value": reading})
+    return result
+
+
 class _MNDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, service: "RouterOSService") -> None:
         self.service = service
@@ -540,7 +558,7 @@ class RouterOSService:
                 "verify_tls": bool(config.get("verify_tls", True)),
                 "device": device,
                 "cpus": _rows(cpus),
-                "health": _rows(health),
+                "health": _health_rows(health),
                 "fan_settings": settings or None,
                 "fan_capabilities": sorted(FAN_SETTING_KEYS.intersection(settings)),
                 "interfaces": interface_rows,
@@ -579,7 +597,14 @@ class RouterOSService:
                 result[key] = "yes" if value else "no"
             elif key == "cpu-overtemp-startup-delay":
                 text = str(value or "").strip()
-                if not _ROUTEROS_TIME.fullmatch(text):
+                clock_parts = text.split(":") if ":" in text else None
+                if (
+                    not _ROUTEROS_TIME.fullmatch(text)
+                    or (
+                        clock_parts is not None
+                        and (int(clock_parts[1]) > 59 or int(clock_parts[2]) > 59)
+                    )
+                ):
                     raise ValueError("cpu-overtemp-startup-delay must be a RouterOS time value")
                 result[key] = text
             else:

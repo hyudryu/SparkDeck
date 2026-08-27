@@ -234,6 +234,24 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
             member_loads(manager, manager.deployments[0]), [0, 0]
         )
 
+    async def test_nonstream_failover_observes_actual_serving_member(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("could not contact Node 0: connect failed"),
+            {"choices": [], "ok": True},
+        ])
+        route_observation = {}
+
+        await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": False},
+            "chat/completions", route_observation=route_observation,
+        )
+
+        self.assertEqual(
+            route_observation["member"]["node_id"], "remote-2",
+        )
+
     async def test_exhausted_replicas_raise_last_error(self):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[

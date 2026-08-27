@@ -1,4 +1,4 @@
-"""Release-only, controller-orchestrated SparkDeck self updates."""
+"""Controller-orchestrated SparkDeck self updates."""
 from __future__ import annotations
 
 import asyncio
@@ -18,13 +18,16 @@ import httpx
 
 REPOSITORY = "hyudryu/SparkDeck"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
+MAIN_BRANCH = "main"
+MAIN_COMMIT_API = f"https://api.github.com/repos/{REPOSITORY}/commits/{MAIN_BRANCH}"
+MAIN_URL = f"https://github.com/{REPOSITORY}/tree/{MAIN_BRANCH}"
 TRUSTED_ORIGINS = {
     "https://github.com/hyudryu/SparkDeck.git",
     "https://github.com/hyudryu/SparkDeck",
     "git@github.com:hyudryu/SparkDeck.git",
     "ssh://git@github.com/hyudryu/SparkDeck.git",
 }
-CAPABILITY = "cluster_update_v1"
+CAPABILITY = "cluster_update_main_v1"
 CONFIRMATION = "update-entire-cluster"
 UPDATE_STATE_FILENAME = "system-update-agent.json"
 
@@ -104,6 +107,7 @@ class UpdateService:
         self._agent_lock = asyncio.Lock()
         self._release_cache: tuple[float, list[dict], str | None] | None = None
         self._resolved_releases: dict[str, dict] = {}
+        self._main_cache: tuple[float, dict | None, str | None] | None = None
 
     @staticmethod
     def _read(path: Path) -> dict:
@@ -141,6 +145,7 @@ class UpdateService:
             "capability": CAPABILITY,
             "current_revision": revision,
             "phase": state.get("phase", "idle"),
+            "target_branch": state.get("target_branch"),
             "target_revision": state.get("target_revision"),
             "message": state.get("message"),
             "error": state.get("error"),
@@ -214,6 +219,33 @@ class UpdateService:
             return None, error
         return await self.resolve_release(releases[0]["tag"])
 
+    # Release discovery and resolution above are intentionally retained while
+    # SparkDeck temporarily follows origin/main for self-updates.
+    async def resolve_main(self, *, force: bool = False) -> tuple[dict | None, str | None]:
+        if not force and self._main_cache and time.monotonic() - self._main_cache[0] < 300:
+            return self._main_cache[1], self._main_cache[2]
+        try:
+            response = await self.manager.http.get(
+                MAIN_COMMIT_API,
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "SparkDeck"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            revision = str(payload.get("sha") or "").lower() if isinstance(payload, dict) else ""
+            if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+                result = (None, "GitHub did not return an immutable origin/main commit")
+            else:
+                result = ({
+                    "branch": MAIN_BRANCH,
+                    "url": MAIN_URL,
+                    "revision": revision,
+                }, None)
+        except (httpx.HTTPError, ValueError) as exc:
+            result = (None, f"Could not check origin/main: {str(exc)[:240]}")
+        self._main_cache = (time.monotonic(), *result)
+        return result
+
     async def overview(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.cluster_path)
@@ -236,13 +268,7 @@ class UpdateService:
                     message="Interrupted rollout can be retried",
                 )
             self._write(self.cluster_path, state)
-        releases, release_error = await self.published_releases()
-        release_tags = {item["tag"] for item in releases}
-        try:
-            current_tags = _run(self.root, "git", "tag", "--points-at", "HEAD").splitlines()
-        except (OSError, RuntimeError, subprocess.TimeoutExpired):
-            current_tags = []
-        current_release_tag = next((tag for tag in current_tags if tag in release_tags), None)
+        main_target, main_error = await self.resolve_main()
         nodes = await self.manager.cluster_nodes()
         public_nodes = []
         blockers = local_blockers(self.root)
@@ -262,24 +288,29 @@ class UpdateService:
                 "current_revision": node.get("app_revision") or (revision if node.get("local") else None),
                 "blockers": node_blockers,
             })
-        all_blockers = ([release_error] if release_error else []) + [
+        all_blockers = ([main_error] if main_error else []) + [
             f"{node['name']}: {item}" for node in public_nodes for item in node["blockers"]
         ]
+        up_to_date = bool(main_target and public_nodes) and all(
+            node.get("current_revision") == main_target["revision"] for node in public_nodes
+        )
         return {
             "repository": REPOSITORY,
             "current_revision": revision,
-            "current_release_tag": current_release_tag,
-            "releases": releases,
-            "latest_release": releases[0] if releases else None,
-            "can_update": bool(releases) and not all_blockers and not state.get("active", False),
+            "target": main_target,
+            "up_to_date": up_to_date,
+            "can_update": bool(main_target) and not up_to_date and not all_blockers and not state.get("active", False),
             "blockers": all_blockers,
             "nodes": public_nodes,
             "job": state or None,
         }
 
-    async def start_cluster(self, confirmation: str, tag: str) -> dict:
+    async def start_cluster(self, confirmation: str, revision: str) -> dict:
         if confirmation != CONFIRMATION:
             raise ValueError("Explicit cluster update confirmation is required")
+        revision = revision.lower()
+        if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+            raise ValueError("An immutable origin/main commit is required")
         async with self._lock:
             existing = self._read(self.cluster_path)
             if existing.get("active"):
@@ -287,14 +318,16 @@ class UpdateService:
             overview = await self.overview()
             if not overview["can_update"]:
                 raise RuntimeError("; ".join(overview["blockers"]) or "No update is available")
-            release, release_error = await self.resolve_release(tag, force=True)
+            release, release_error = await self.resolve_main(force=True)
             if release_error or not release:
-                raise ValueError(release_error or "Selected release is unavailable")
+                raise ValueError(release_error or "origin/main is unavailable")
+            if release["revision"] != revision:
+                raise RuntimeError("origin/main changed; refresh update status and confirm the new commit")
             if overview["nodes"] and all(
                 node.get("current_revision") == release["revision"]
                 for node in overview["nodes"]
             ):
-                raise RuntimeError("Selected release is already installed on every node")
+                raise RuntimeError("Latest origin/main is already installed on every node")
             nodes = [{
                 "id": node["id"], "name": node["name"], "local": node["local"],
                 "phase": "pending", "current_revision": node.get("current_revision"),
@@ -302,8 +335,8 @@ class UpdateService:
             state = {
                 "id": uuid.uuid4().hex, "active": True, "phase": "preflight",
                 "message": "Checking every cluster node before making changes",
-                "target_tag": release["tag"], "target_revision": release["revision"],
-                "release_url": release.get("url"), "started_at": time.time(), "nodes": nodes,
+                "target_branch": release["branch"], "target_revision": release["revision"],
+                "source_url": release.get("url"), "started_at": time.time(), "nodes": nodes,
             }
             self._write(self.cluster_path, state)
             self._task = asyncio.create_task(self._run_cluster(state))
@@ -313,13 +346,13 @@ class UpdateService:
         changed_workers = 0
         try:
             # Re-probe every worker before mutating the first one.
-            await self.preflight_local(state["target_tag"], state["target_revision"])
+            await self.preflight_local(state["target_branch"], state["target_revision"])
             for node in state["nodes"]:
                 if node["local"]:
                     continue
                 status = await self.manager.node_registry.request(
                     node["id"], "POST", "/api/agent/system-update/preflight",
-                    json_body={"tag": state["target_tag"], "revision": state["target_revision"]},
+                    json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
                     timeout=60,
                 )
                 if status.get("blockers"):
@@ -335,7 +368,7 @@ class UpdateService:
                 self._write(self.cluster_path, state)
                 await self.manager.node_registry.request(
                     node["id"], "POST", "/api/agent/system-update",
-                    json_body={"tag": state["target_tag"], "revision": state["target_revision"]},
+                    json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
                     timeout=120,
                 )
                 deadline = time.monotonic() + 600
@@ -362,7 +395,7 @@ class UpdateService:
             local = next(node for node in state["nodes"] if node["local"])
             local["phase"] = "updating"
             self._write(self.cluster_path, state)
-            await self.start_local(state["target_tag"], state["target_revision"])
+            await self.start_local(state["target_branch"], state["target_revision"])
         except Exception as exc:
             state.update(
                 active=False,
@@ -375,7 +408,39 @@ class UpdateService:
             )
             self._write(self.cluster_path, state)
 
-    async def preflight_local(self, tag: str, revision: str) -> dict:
+    async def preflight_local(self, branch: str, revision: str) -> dict:
+        if branch != MAIN_BRANCH:
+            raise ValueError("The active update target is origin/main")
+        target, error = await self.resolve_main(force=True)
+        if error or not target or target["revision"] != revision.lower():
+            raise ValueError("Update target is not the current origin/main commit")
+        blockers = local_blockers(self.root)
+        if blockers:
+            raise RuntimeError("; ".join(blockers))
+        remote_ref = f"refs/remotes/origin/{MAIN_BRANCH}"
+        _run(
+            self.root, "git", "fetch", "--force", "origin",
+            f"refs/heads/{MAIN_BRANCH}:{remote_ref}", timeout=60,
+        )
+        fetched = _run(self.root, "git", "rev-parse", f"{remote_ref}^{{commit}}")
+        if fetched.lower() != revision.lower():
+            raise ValueError("Fetched origin/main does not match the approved commit")
+        forward = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=self.root,
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+        if not forward:
+            raise RuntimeError("origin/main is not a forward-only update from the installed revision")
+        try:
+            manifest = json.loads(_run(self.root, "git", "show", f"{revision}:sparkdeck-update.json"))
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError("origin/main has no valid update compatibility manifest") from exc
+        if manifest.get("update_protocol") != 1 or manifest.get("data_schema") != 1:
+            raise RuntimeError("origin/main is not compatible with this updater or data schema")
+        return {"ok": True, "capability": CAPABILITY, "target_revision": revision.lower()}
+
+    async def preflight_release_local(self, tag: str, revision: str) -> dict:
+        """Dormant release-mode preflight retained for restoring release updates."""
         release, error = await self.resolve_release(tag, force=True)
         if error or not release or release["revision"] != revision.lower():
             raise ValueError("Update target is not an official published GitHub release")
@@ -404,23 +469,26 @@ class UpdateService:
             raise RuntimeError("Selected release is not compatible with this updater or data schema")
         return {"ok": True, "capability": CAPABILITY, "target_revision": revision.lower()}
 
-    async def start_local(self, tag: str, revision: str) -> dict:
+    async def start_local(self, branch: str, revision: str) -> dict:
         async with self._agent_lock:
-            if not tag or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
-                raise ValueError("A valid release tag and immutable commit are required")
-            await self.preflight_local(tag, revision)
+            if not branch or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
+                raise ValueError("A valid update target and immutable commit are required")
+            await self.preflight_local(branch, revision)
             state = self._read(self.agent_path)
             if state.get("phase") in {"accepted", "staging", "restarting"}:
                 raise RuntimeError("This node is already updating")
             if current_revision(self.root) == revision.lower():
-                state = {"phase": "succeeded", "target_revision": revision.lower(), "message": "Already up to date"}
+                state = {
+                    "phase": "succeeded", "target_branch": branch,
+                    "target_revision": revision.lower(), "message": "Already up to date",
+                }
                 self._write(self.agent_path, state)
                 return state
-            state = {"phase": "accepted", "target_tag": tag, "target_revision": revision.lower(), "message": "Update accepted"}
+            state = {"phase": "accepted", "target_branch": branch, "target_revision": revision.lower(), "message": "Update accepted"}
             self._write(self.agent_path, state)
             process = subprocess.Popen(
                 [sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
-                 "--state", str(self.agent_path), "--tag", tag, "--revision", revision.lower()],
+                 "--state", str(self.agent_path), "--branch", branch, "--revision", revision.lower()],
                 cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )

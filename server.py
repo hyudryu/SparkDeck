@@ -501,9 +501,9 @@ async def agent_start_system_update(req: Request):
     _require_agent(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) != {"tag", "revision"}:
-            raise ValueError("request must contain only tag and revision")
-        return await updater.start_local(str(body["tag"]), str(body["revision"]))
+        if not isinstance(body, dict) or set(body) != {"branch", "revision"}:
+            raise ValueError("request must contain only branch and revision")
+        return await updater.start_local(str(body["branch"]), str(body["revision"]))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
@@ -515,9 +515,9 @@ async def agent_preflight_system_update(req: Request):
     _require_agent(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) != {"tag", "revision"}:
-            raise ValueError("request must contain only tag and revision")
-        return await updater.preflight_local(str(body["tag"]), str(body["revision"]))
+        if not isinstance(body, dict) or set(body) != {"branch", "revision"}:
+            raise ValueError("request must contain only branch and revision")
+        return await updater.preflight_local(str(body["branch"]), str(body["revision"]))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
@@ -1860,10 +1860,10 @@ async def start_system_update(req: Request):
     _require_same_origin_or_forwarded(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) != {"confirm", "tag"}:
-            raise ValueError("request must contain only confirm and tag")
+        if not isinstance(body, dict) or set(body) != {"confirm", "revision"}:
+            raise ValueError("request must contain only confirm and revision")
         return await updater.start_cluster(
-            str(body.get("confirm") or ""), str(body.get("tag") or ""),
+            str(body.get("confirm") or ""), str(body.get("revision") or ""),
         )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc

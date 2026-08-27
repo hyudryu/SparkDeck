@@ -3270,7 +3270,11 @@ class Manager:
                 vllm_parallel_layout = (1, len(node_ids))
         requested_port = body.get("port")
         local_port = requested_port
-        if LOCAL_NODE_ID in node_ids and local_port is None:
+        if LOCAL_NODE_ID in node_ids and local_port is not None:
+            local_port = await self._validate_available_port(
+                local_port, exclude_deployment_id=exclude_deployment_id,
+            )
+        elif LOCAL_NODE_ID in node_ids:
             # A controller port is meaningful only for the controller member.
             # Remote agents allocate against their own Docker/host namespace.
             if exclude_deployment_id:
@@ -8109,9 +8113,9 @@ class Manager:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
         return self._parse_phase(logs)
 
-    async def _allocate_port(
+    async def _used_host_ports(
         self, *, exclude_deployment_id: str | None = None,
-    ) -> int:
+    ) -> set[int]:
         def _scan():
             used = set()
             for c in self.client.containers.list(all=True):
@@ -8128,7 +8132,33 @@ class Manager:
                         except Exception:
                             pass
             return used
-        used = await asyncio.to_thread(_scan)
+
+        return await asyncio.to_thread(_scan)
+
+    async def _validate_available_port(
+        self, port: Any, *, exclude_deployment_id: str | None = None,
+    ) -> int:
+        if isinstance(port, bool):
+            raise ValueError("port must be an integer between 1 and 65535")
+        try:
+            port_number = int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("port must be an integer between 1 and 65535") from exc
+        if not 1 <= port_number <= 65535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        used = await self._used_host_ports(
+            exclude_deployment_id=exclude_deployment_id,
+        )
+        if port_number in used:
+            raise RuntimeError(f"Port {port_number} is already in use")
+        return port_number
+
+    async def _allocate_port(
+        self, *, exclude_deployment_id: str | None = None,
+    ) -> int:
+        used = await self._used_host_ports(
+            exclude_deployment_id=exclude_deployment_id,
+        )
         for p in range(self.settings["port_range_start"], self.settings["port_range_end"] + 1):
             if p not in used:
                 return p

@@ -265,7 +265,8 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.push_unpair.assert_awaited_once_with("user-sub-123")
 
     async def test_unpair_without_local_pairing_skips_the_fanout(self):
-        response = await self.client.delete("/api/v1/community/pair")
+        response = await self.client.delete(
+            "/api/v1/community/pair", headers=_bearer())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {

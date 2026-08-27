@@ -1,9 +1,11 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { useEffect } from 'react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
-import { AuthProvider } from '../auth/AuthContext'
+import { AuthProvider, useAuth } from '../auth/AuthContext'
+import { api } from '../api/client'
 import { THEME_STORAGE_KEY } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
 
@@ -19,6 +21,14 @@ function fakeIdToken(claims: Record<string, unknown>) {
   const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
     .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
   return `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode(claims)}.signature`
+}
+
+function ProtectedRequestOnSignIn() {
+  const auth = useAuth()
+  useEffect(() => {
+    if (auth.status === 'signed-in') void api.benchmarks.aggregates()
+  }, [auth.status])
+  return <span>{auth.status}</span>
 }
 
 describe('settings page', () => {
@@ -645,5 +655,58 @@ describe('community features sign-in', () => {
       method: 'POST',
       body: expect.stringContaining('"id_token"'),
     })))
+  })
+
+  it('installs the restored bearer before signed-in children request community data', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const token = fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    })
+    localStorage.setItem('sparkdeck.cognito.id_token', token)
+
+    render(<AuthProvider><ProtectedRequestOnSignIn /></AuthProvider>)
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).endsWith('/api/v1/community/aggregates')
+    ))).toBe(true))
+    const aggregate = fetchMock.mock.calls.find(([input]) => (
+      String(input).endsWith('/api/v1/community/aggregates')
+    ))
+    expect(aggregate?.[1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${token}`,
+    }))
+  })
+
+  it('refreshes a near-expiry bearer before unpairing a long-open session', async () => {
+    const refreshed = fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    })
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: (body) => new Response(JSON.stringify(
+        body.AuthFlow === 'REFRESH_TOKEN_AUTH'
+          ? { AuthenticationResult: { IdToken: refreshed, AccessToken: 'new-access' } }
+          : {},
+      ), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    })
+    const user = userEvent.setup()
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1',
+      exp: Math.floor(Date.now() / 1000) + 30,
+    }))
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
+    const unpair = fetchMock.mock.calls.find(([input, init]) => (
+      String(input).endsWith('/api/v1/community/pair') && init?.method === 'DELETE'
+    ))
+    expect(unpair?.[1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${refreshed}`,
+    }))
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
   })
 })

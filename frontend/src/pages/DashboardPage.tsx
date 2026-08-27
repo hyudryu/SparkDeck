@@ -15,7 +15,7 @@ import { api } from '../api/client'
 import type { ActiveRequestStats, GpuStats } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
   return value === null || value === undefined ? '—' : `${value.toFixed(digits)}${suffix}`
@@ -63,6 +63,7 @@ function memorySnapshot(stats?: { gpus?: GpuStats[]; mem?: { total?: number; use
 export function DashboardPage() {
   const resource = useResource((signal) => api.dashboard.load(signal))
   const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
 
   useEffect(() => {
     const timer = window.setInterval(resource.reload, 10_000)
@@ -186,14 +187,14 @@ export function DashboardPage() {
             </Panel>
           </div>
 
-          <Panel className="community-strip" title={communityAccess.enabled ? undefined : COMMUNITY_ACCESS_HINT}>
+          <Panel className="community-strip" title={communityAccess.enabled ? undefined : accessHint}>
             <span className="panel-icon"><Cloud size={17} /></span>
             <div><h2>Community benchmark sync</h2><p>Share aggregation-safe performance measurements without prompts or responses.</p></div>
             <Status status={resource.data.sync.sharing_enabled ? (resource.data.sync.account_paired ? 'running' : 'waiting') : 'stopped'}>
               {resource.data.sync.sharing_enabled ? (resource.data.sync.account_paired ? 'Connected' : 'Waiting for account') : 'Sharing off'}
             </Status>
             <span className="community-counts">{resource.data.sync.pending_count} pending · {resource.data.sync.synced_count} synced</span>
-            <Link className="text-link" to={communityAccess.enabled ? '/benchmarks' : '/settings'}>{communityAccess.enabled ? 'View benchmarks' : 'Open community settings'}</Link>
+            <Link className="text-link" to={communityAccess.enabled || communityAccess.signedIn ? '/benchmarks' : '/settings'}>{communityAccess.enabled ? 'View benchmarks' : communityAccess.signedIn ? 'Review sharing' : 'Open community settings'}</Link>
           </Panel>
         </>
       )}

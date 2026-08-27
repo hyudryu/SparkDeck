@@ -1,9 +1,36 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api } from './client'
+import { api, setAuthTokenProvider } from './client'
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  setAuthTokenProvider(undefined)
+  vi.restoreAllMocks()
+})
 
 describe('API client adapters', () => {
+  it('awaits an async bearer provider before protected community requests', async () => {
+    let resolveToken: ((token: string) => void) | undefined
+    setAuthTokenProvider(() => new Promise<string>((resolve) => {
+      resolveToken = resolve
+    }))
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      items: [], availability: 'available',
+      evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const request = api.benchmarks.aggregates()
+    await Promise.resolve()
+    expect(fetchMock).not.toHaveBeenCalled()
+    resolveToken?.('refreshed-token')
+    await request
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/community/aggregates',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer refreshed-token' }),
+      }),
+    )
+  })
   it('normalizes deployment wire records for the UI', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       items: [{

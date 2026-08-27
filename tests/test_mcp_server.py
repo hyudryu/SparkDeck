@@ -98,6 +98,17 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["metrics"]["output_tokens_per_second"], 0)
         self.assertEqual(result["recording"]["status"], "recorded")
 
+    async def test_benchmark_rejects_unbounded_concurrency_before_controller_request(self) -> None:
+        async def unexpected_request(_request: httpx.Request) -> httpx.Response:
+            self.fail("invalid concurrency must fail before making a request")
+
+        client = ControllerClient(transport=httpx.MockTransport(unexpected_request))
+
+        with self.assertRaisesRegex(
+            ControllerError, "concurrency must be one of 1, 2, 5, or 10"
+        ):
+            await client.benchmark("mcp-1", concurrency=1_000_000)
+
 
 class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_server_publishes_ab_and_lifecycle_tools(self) -> None:

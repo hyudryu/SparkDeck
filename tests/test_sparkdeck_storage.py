@@ -481,6 +481,18 @@ class SparkDeckStoreTests(unittest.TestCase):
             sample, id="other-context", configuration={"max_model_len": 8192},
             generation_tokens_per_second=40,
         ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="coordinated-c1", configuration={
+                "context_length": 4096, "benchmark_concurrency": 1,
+                "tensor_parallel_size": 1,
+            }, generation_tokens_per_second=500,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="coordinated-c10", configuration={
+                "context_length": 4096, "benchmark_concurrency": 10,
+                "tensor_parallel_size": 2,
+            }, generation_tokens_per_second=5,
+        ), queue=False)
 
         aggregates = self.store.community_aggregates()
 

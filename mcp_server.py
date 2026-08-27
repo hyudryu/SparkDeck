@@ -273,6 +273,8 @@ class ControllerClient:
     ) -> dict[str, Any]:
         if repetitions < 1 or concurrency < 1 or max_tokens < 1 or warmup_requests < 0:
             raise ControllerError("repetitions, concurrency, and max_tokens must be positive")
+        if concurrency not in {1, 2, 5, 10}:
+            raise ControllerError("concurrency must be one of 1, 2, 5, or 10")
         deployment = await self.deployment(deployment_id)
         if deployment.get("status") != "ready":
             raise ControllerError(

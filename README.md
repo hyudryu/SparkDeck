@@ -8,6 +8,12 @@ I built SparkDeck for my own GB10 cluster to answer those questions in one local
 
 The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
 
+## Documentation
+
+- **[QuickStart: connect two DGX Sparks over Tailscale](QUICKSTART.md)** — install Tailscale, find each node's private IP, pair the cluster, and deploy a first model.
+- **[Product manual](docs/PRODUCT_MANUAL.md)** — a screenshot-led guide to every left-navigation tab and all Settings areas.
+- **[Security policy](SECURITY.md)** — supported versions, private-network guidance, and vulnerability reporting.
+
 ## Example render
 
 ![SparkDeck dark-mode dashboard showing a four-node DGX Spark cluster](docs/screenshots/readme/sparkdeck-dashboard-dark.png)

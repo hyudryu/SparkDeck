@@ -1,8 +1,51 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+import httpx
+
 from manager import ClientAbort, Manager
+
+
+def status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(
+        f"upstream returned HTTP {status}", request=request, response=response,
+    )
+
+
+def upstream_error_stream(status: int):
+    """Emulate a ``_vllm_stream`` that reports an upstream HTTP error."""
+
+    async def gen():
+        yield (
+            "data: " + json.dumps({
+                "error": {
+                    "message": f"HTTP {status}: boom",
+                    "type": "upstream_error",
+                    "code": status,
+                },
+            }) + "\n\n"
+        )
+        yield "data: [DONE]\n\n"
+
+    return gen()
+
+
+class StreamResponse:
+    status_code = 200
+
+    def __init__(self):
+        self.closed = False
+
+    async def aiter_lines(self):
+        yield 'data: {"choices": []}'
+        yield "data: [DONE]"
+
+    async def aclose(self):
+        self.closed = True
 
 
 def member(rank: int, node_id: str, container_name: str) -> dict:
@@ -129,6 +172,22 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         order = manager._cluster_route_order(deployment)
         self.assertEqual([m["container_name"] for m in order], ["repl-1-r0"])
 
+    def test_failover_candidates_follow_least_loaded_order(self):
+        deployment = replicated_deployment()
+        deployment["members"].append(member(2, "remote-3", "repl-1-r2"))
+        manager = build_manager(deployment)
+        members = Manager._cluster_members_sorted(deployment)
+        for _ in range(5):
+            manager._acquire_cluster_member("repl-1", members[0])
+        manager._acquire_cluster_member("repl-1", members[2])
+        manager._acquire_cluster_member("repl-1", members[2])
+
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual(
+            [m["container_name"] for m in order],
+            ["repl-1-r1", "repl-1-r2", "repl-1-r0"],
+        )
+
 
 class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def proxy(self, manager: Manager, **overrides):
@@ -182,21 +241,73 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
             await self.proxy(manager)
         manager.node_registry.request.assert_awaited_once()
 
+    async def test_admission_limits_are_scoped_per_replica(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("could not contact Node 0: connect failed"),
+            {"choices": [], "ok": True},
+        ])
+        captured = []
+
+        async def capture_slot(container, model, cancel):
+            captured.append(dict(container))
+            return None
+
+        manager._acquire_inference_slot = AsyncMock(side_effect=capture_slot)
+
+        await self.proxy(manager)
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(
+            {c["name"] for c in captured}, {"repl-1-r0", "repl-1-r1"},
+        )
+        for container in captured:
+            self.assertNotIn("deployment_id", container)
+        targets = {
+            Manager._inference_admission_config(container, "org/model")[0]
+            for container in captured
+        }
+        self.assertEqual(len(targets), 2)
+
+    async def test_admission_cancel_releases_replica_load(self):
+        manager = build_manager(replicated_deployment())
+        manager._acquire_inference_slot = AsyncMock(
+            side_effect=ClientAbort("client disconnected while queued")
+        )
+
+        with self.assertRaises(ClientAbort):
+            await self.proxy(manager)
+
+        manager.node_registry.request.assert_not_awaited()
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+    async def test_remote_upstream_client_error_does_not_fail_over(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("Node 0 agent error: HTTP 400: invalid parameters"),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            await self.proxy(manager)
+
+        manager.node_registry.request.assert_awaited_once()
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+    async def test_remote_upstream_server_error_fails_over(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("Node 0 agent error: HTTP 503: model overloaded"),
+            {"choices": [], "ok": True},
+        ])
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(manager.node_registry.request.await_count, 2)
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
-    class StreamResponse:
-        status_code = 200
-
-        def __init__(self):
-            self.closed = False
-
-        async def aiter_lines(self):
-            yield 'data: {"choices": []}'
-            yield "data: [DONE]"
-
-        async def aclose(self):
-            self.closed = True
-
     class UnavailableResponse:
         status_code = 503
 
@@ -208,7 +319,7 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_releases_replica_load_after_consumption(self):
         manager = build_manager(replicated_deployment())
-        response = self.StreamResponse()
+        response = StreamResponse()
         manager.node_registry.open_stream = AsyncMock(return_value=response)
         deployment = manager.deployments[0]
         body = {"model": "org/model", "messages": [], "stream": True}
@@ -228,7 +339,7 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
         manager = build_manager(replicated_deployment())
         manager.node_registry.open_stream = AsyncMock(side_effect=[
             self.UnavailableResponse(),
-            self.StreamResponse(),
+            StreamResponse(),
         ])
         deployment = manager.deployments[0]
         body = {"model": "org/model", "messages": [], "stream": True}
@@ -272,9 +383,9 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_replica_failure_fails_over_to_remote(self):
         manager, deployment = self.manager()
-        manager._vllm_chat = AsyncMock(
-            side_effect=RuntimeError("local container unavailable")
-        )
+        manager._vllm_chat = AsyncMock(side_effect=LookupError(
+            "No managed container found for model 'org/model'"
+        ))
         manager.node_registry.request = AsyncMock(
             return_value={"choices": [], "ok": True}
         )
@@ -305,6 +416,44 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
         chunks = [chunk async for chunk in stream]
 
         self.assertEqual(chunks, ["chunk-1", "chunk-2"])
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_stream_server_error_fails_over_to_remote(self):
+        manager, deployment = self.manager()
+        manager._vllm_chat = AsyncMock(
+            side_effect=lambda *a, **k: upstream_error_stream(503)
+        )
+        manager.node_registry.open_stream = AsyncMock(return_value=StreamResponse())
+
+        stream = await self.manager_proxy(manager, stream=True)
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        manager._vllm_chat.assert_awaited_once()
+        manager.node_registry.open_stream.assert_awaited_once()
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_stream_client_error_does_not_fail_over(self):
+        manager, deployment = self.manager()
+        manager._vllm_chat = AsyncMock(
+            side_effect=lambda *a, **k: upstream_error_stream(400)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "local inference failed: HTTP 400"):
+            await self.manager_proxy(manager, stream=True)
+
+        manager.node_registry.open_stream.assert_not_awaited()
+        manager.node_registry.request.assert_not_awaited()
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_upstream_client_error_does_not_fail_over(self):
+        manager, deployment = self.manager()
+        manager._vllm_chat = AsyncMock(side_effect=status_error(400))
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self.manager_proxy(manager)
+
+        manager.node_registry.request.assert_not_awaited()
         self.assertEqual(member_loads(manager, deployment), [0, 0])
 
     async def manager_proxy(self, manager: Manager, **overrides):

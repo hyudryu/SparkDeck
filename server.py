@@ -250,7 +250,7 @@ _STORAGE_PRIVATE_KEYS = {
 }
 _STORAGE_INSTRUCTIONS = [
     "Pair SparkDeck nodes over a cluster-private network such as Tailscale.",
-    "Only complete Hugging Face cache weights are shown and transferable.",
+    "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
     "Choose an online source and one or more online targets with enough free space.",
 ]
 

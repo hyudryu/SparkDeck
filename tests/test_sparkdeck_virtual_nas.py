@@ -99,7 +99,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 
-    async def test_inventory_lists_only_complete_models_without_paths(self):
+    async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
@@ -113,8 +113,13 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             models = nas.inventory()
 
-            self.assertEqual([item["model_id"] for item in models], ["org/model"])
+            self.assertEqual(
+                [item["model_id"] for item in models],
+                ["org/model", "partial/repo"],
+            )
             self.assertEqual(models[0]["revisions"], ["main", "revision-1"])
+            self.assertFalse(models[0]["partial"])
+            self.assertTrue(models[1]["partial"])
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
@@ -151,7 +156,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                     }), encoding="utf-8")
                 nas = VirtualNAS(root, lambda: hub, FakeRegistry(), lambda: False)
 
-                self.assertEqual(nas.inventory(), [])
+                self.assertTrue(nas.inventory()[0]["partial"])
 
     async def test_streamed_export_import_uses_exact_repository(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:

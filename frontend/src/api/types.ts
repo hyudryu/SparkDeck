@@ -409,6 +409,7 @@ export interface DashboardData {
 export interface StorageModel {
   model_id: string
   size_bytes: number
+  partial?: boolean
   last_modified?: string
   revision?: string
   revisions?: string[]

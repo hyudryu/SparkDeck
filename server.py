@@ -2276,12 +2276,40 @@ async def disk_manager_page():
 app.mount("", mcp_http_app, name="mcp")
 
 
-if __name__ == "__main__":
+async def _serve_application() -> None:
+    """Serve one application instance and honor the Windows launcher stop file."""
     import uvicorn
-    uvicorn.run(
-        "server:app",
+
+    shutdown_file = ROOT / "data" / "run" / "shutdown.request"
+    instance = uvicorn.Server(uvicorn.Config(
+        # Passing the application object avoids importing this module a second
+        # time and constructing duplicate managers/background resources.
+        app,
         host="0.0.0.0",
         port=7878,
         log_level="info",
         timeout_graceful_shutdown=10,
-    )
+    ))
+
+    async def watch_launcher_shutdown() -> None:
+        while not instance.should_exit:
+            if shutdown_file.exists():
+                shutdown_file.unlink(missing_ok=True)
+                instance.should_exit = True
+                return
+            await asyncio.sleep(0.25)
+
+    watcher = asyncio.create_task(watch_launcher_shutdown())
+    try:
+        await instance.serve()
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        shutdown_file.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(_serve_application())

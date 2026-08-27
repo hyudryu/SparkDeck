@@ -69,20 +69,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false
     const restore = async () => {
-      let tokens = storedTokens()
-      if (tokens && isExpired(tokens.idToken)) tokens = await refresh()
-      if (cancelled) return
-      if (tokens && !isExpired(tokens.idToken)) {
-        setIdToken(tokens.idToken)
-        setStatus('signed-in')
-        // The backend may have lost its pairing while we were away; re-pair
-        // best-effort (idempotent same-sub no-op) without signing out on failure.
-        api.community.pair(tokens.idToken)
-          .then((paired) => { if (!cancelled) setClusterSync(paired.cluster ?? null) })
-          .catch(() => undefined)
-      } else {
-        setStatus('signed-out')
+      try {
+        let tokens = storedTokens()
+        if (tokens && isExpired(tokens.idToken)) tokens = await refresh()
+        if (cancelled) return
+        if (tokens && !isExpired(tokens.idToken)) {
+          try {
+            const paired = await api.community.pair(tokens.idToken)
+            if (cancelled) return
+            setClusterSync(paired.cluster ?? null)
+            setIdToken(tokens.idToken)
+            setStatus('signed-in')
+            return
+          } catch {
+            await cognitoSignOut()
+          }
+        }
+      } catch {
+        // Retryable refresh failures retain browser credentials for the next
+        // restore attempt, but never create an unpaired signed-in UI session.
       }
+      if (cancelled) return
+      setClusterSync(null)
+      setIdToken(undefined)
+      setStatus('signed-out')
     }
     void restore()
     return () => {

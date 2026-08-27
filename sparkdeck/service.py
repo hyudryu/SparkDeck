@@ -7,6 +7,7 @@ import copy
 import inspect
 import ipaddress
 import json
+import logging
 import math
 import platform
 import re
@@ -46,6 +47,8 @@ _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_COMMUNITY_UPLOAD_INTERVAL_SECONDS = 5.0
+logger = logging.getLogger(__name__)
 
 
 async def _public_connection_urls(
@@ -212,6 +215,64 @@ def _community_aggregate_url(endpoint: str) -> httpx.URL:
     return url.copy_with(path=path or "/aggregates", fragment=None)
 
 
+def _community_upload_url(endpoint: str) -> httpx.URL:
+    """Append the benchmark-ingestion route to a configured API base."""
+    try:
+        url = httpx.URL(endpoint)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community upload URL is invalid") from exc
+    path = url.path.rstrip("/")
+    if not path.endswith("/benchmarks"):
+        path = f"{path}/benchmarks"
+    return url.copy_with(path=path or "/benchmarks", fragment=None)
+
+
+async def _post_public_community_url(
+    url: str | httpx.URL, payload: dict[str, Any], *, token: str,
+    idempotency_key: str, transport: httpx.AsyncBaseTransport | None = None,
+    resolver: Any = socket.getaddrinfo,
+) -> httpx.Response:
+    """POST one sample to a DNS-pinned public URL without forwarding redirects."""
+    try:
+        target = httpx.URL(url)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("community upload URL is invalid") from exc
+    pinned_urls, host_header, sni_hostname = await _public_connection_urls(
+        target, resolver,
+    )
+    last_connect_error: httpx.HTTPError | None = None
+    for pinned in pinned_urls:
+        async with httpx.AsyncClient(
+            transport=transport,
+            trust_env=False,
+            follow_redirects=False,
+            timeout=15,
+        ) as client:
+            request = client.build_request(
+                "POST",
+                pinned,
+                headers={
+                    "Host": host_header,
+                    "Connection": "close",
+                    "Authorization": f"Bearer {token}",
+                    "Idempotency-Key": idempotency_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                extensions={"sni_hostname": sni_hostname},
+            )
+            try:
+                response = await client.send(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_connect_error = exc
+                continue
+            if response.status_code in _COMMUNITY_REDIRECT_STATUSES:
+                raise ValueError("community upload service must not redirect")
+            return response
+    assert last_connect_error is not None
+    raise last_connect_error
+
+
 def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
     """Validate and bound the public response from a configured aggregator."""
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
@@ -264,7 +325,10 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
 
 
 class SparkDeckService:
-    def __init__(self, manager: Any, data_dir: Path):
+    def __init__(
+        self, manager: Any, data_dir: Path, *,
+        community_upload_url: str = "", community_upload_token: str = "",
+    ):
         self.manager = manager
         self.store = SparkDeckStore(Path(data_dir) / "sparkdeck.sqlite3")
         self.registry = RuntimeRegistry()
@@ -273,9 +337,103 @@ class SparkDeckService:
             token_provider=lambda: getattr(manager, "_resolved_hf_token", lambda: "")(),
         )
         self._deployment_create_lock = asyncio.Lock()
+        self._community_upload_task: asyncio.Task[None] | None = None
+        self._community_upload_lock = asyncio.Lock()
+        # Upload authentication is deliberately process configuration, not a
+        # browser token or user-editable setting. Deployments can issue a
+        # revocable, node-scoped telemetry credential without exposing Cognito
+        # credentials to peers or arbitrary configured aggregate endpoints.
+        self._community_upload_url = community_upload_url.strip().rstrip("/")
+        self._community_upload_token = community_upload_token.strip()
+
+    async def start(self) -> None:
+        if self._community_upload_task is None:
+            self._community_upload_task = asyncio.create_task(
+                self._community_upload_loop(), name="sparkdeck-community-upload",
+            )
+
+    @property
+    def community_upload_configured(self) -> bool:
+        return bool(self._community_upload_url and self._community_upload_token)
 
     async def close(self) -> None:
+        if self._community_upload_task is not None:
+            self._community_upload_task.cancel()
+            try:
+                await self._community_upload_task
+            except asyncio.CancelledError:
+                pass
+            self._community_upload_task = None
         self.store.close()
+
+    async def set_community_consent(self, enabled: bool) -> None:
+        """Serialize consent withdrawal with all outbound uploads."""
+        async with self._community_upload_lock:
+            await asyncio.to_thread(self.store.set_community_consent, enabled)
+
+    async def upload_community_once(self) -> int:
+        async with self._community_upload_lock:
+            return await self._upload_community_once_locked()
+
+    async def _upload_community_once_locked(self) -> int:
+        """Drain one bounded outbox batch when consent and credentials exist."""
+        consent = await asyncio.to_thread(
+            self.store.get_setting, "community_consent", False,
+        )
+        pairing = await asyncio.to_thread(
+            self.store.get_setting, "device_pairing", {"status": "not_paired"},
+        )
+        endpoint = self._community_upload_url
+        token = self._community_upload_token
+        if not consent or pairing.get("status") != "paired" or not endpoint or not token:
+            return 0
+
+        entries = await asyncio.to_thread(self.store.outbox_entries)
+        synced = 0
+        upload_url = _community_upload_url(endpoint)
+        for entry in entries:
+            sample_id = entry["sample_id"]
+            try:
+                response = await _post_public_community_url(
+                    upload_url,
+                    entry["payload"],
+                    token=token,
+                    idempotency_key=sample_id,
+                    transport=getattr(self.manager, "community_http_transport", None),
+                    resolver=getattr(
+                        self.manager, "community_resolver", socket.getaddrinfo,
+                    ),
+                )
+                if response.is_success or response.status_code == 409:
+                    await asyncio.to_thread(
+                        self.store.mark_outbox_synced, [sample_id],
+                    )
+                    synced += 1
+                else:
+                    await asyncio.to_thread(
+                        self.store.mark_outbox_failed,
+                        [sample_id],
+                        f"community service returned HTTP {response.status_code}",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPError, TypeError, ValueError) as exc:
+                await asyncio.to_thread(
+                    self.store.mark_outbox_failed, [sample_id], str(exc),
+                )
+        return synced
+
+    async def _community_upload_loop(self) -> None:
+        while True:
+            try:
+                await self.upload_community_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Per-item failures are persisted; this protects the lifecycle
+                # task from an unexpected storage or configuration failure.
+                logger.exception("community upload worker failed")
+            await asyncio.sleep(_COMMUNITY_UPLOAD_INTERVAL_SECONDS)
 
     async def community_aggregates(self) -> dict[str, Any]:
         """Return configured community evidence or privacy-safe local evidence."""

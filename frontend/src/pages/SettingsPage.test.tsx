@@ -223,6 +223,10 @@ describe('community features sign-in', () => {
   } = {}) {
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
+      if (path.endsWith('/api/v1/community/auth-config')) return new Response(JSON.stringify({
+        idp_endpoint: 'https://cognito-idp.us-east-2.amazonaws.com/',
+        client_id: '30ihrkeg4k1rn95d4mmkq00fvl',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path.includes('cognito-idp')) {
         if (options.idpResponse) return options.idpResponse(JSON.parse(String(init?.body)))
         return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -382,7 +386,7 @@ describe('community features sign-in', () => {
     expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
   })
 
-  it('stays signed in when the background re-pair after restore fails', async () => {
+  it('rejects a restored session when backend re-pairing fails', async () => {
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
       pairResponse: () => new Response(JSON.stringify({ detail: 'pairing backend exploded' }), {
         status: 500, headers: { 'Content-Type': 'application/json' },
@@ -394,13 +398,32 @@ describe('community features sign-in', () => {
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
-    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
       method: 'POST',
     })))
-    expect(screen.getByText('Signed in')).toBeInTheDocument()
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-    expect(localStorage.getItem('sparkdeck.cognito.id_token')).not.toBeNull()
+    expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
+    expect(screen.queryByText('driver@example.com')).not.toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+  })
+
+  it('pressing Enter in credentials does not submit dirty application settings', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    })
+    const user = userEvent.setup()
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.selectOptions(await screen.findByLabelText('Appearance'), 'dark')
+    await user.type(screen.getByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1{Enter}')
+
+    expect(await screen.findByText('Signed in')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input).endsWith('/api/v1/settings') && init?.method === 'PUT'
+    ))).toBe(false)
   })
 
   it('shows unpair propagation failures after signing out', async () => {

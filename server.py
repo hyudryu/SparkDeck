@@ -36,7 +36,12 @@ from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
-sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
+sparkdeck = SparkDeckService(
+    manager,
+    data_dir=ROOT / "data",
+    community_upload_url=os.environ.get("SPARKDECK_COMMUNITY_UPLOAD_URL", ""),
+    community_upload_token=os.environ.get("SPARKDECK_COMMUNITY_UPLOAD_TOKEN", ""),
+)
 onboarding = OnboardingService(manager, data_dir=ROOT / "data", port=7878)
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
@@ -149,6 +154,7 @@ _install_log_capture()
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
+        await sparkdeck.start()
         try:
             yield
         finally:
@@ -745,15 +751,17 @@ async def agent_apply_community_pairing(req: Request):
     email = body.get("email") if isinstance(body, dict) else None
     if not isinstance(sub, str) or not sub:
         raise HTTPException(400, "sub is required")
-    existing = sparkdeck.store.get_setting(
-        "device_pairing", {"status": "not_paired"})
-    if existing.get("status") == "paired":
-        if existing.get("sub") == sub:
-            return {"applied": True, "already": True}
-        return {"applied": False, "existing": {"email": existing.get("email")}}
-    sparkdeck.store.set_setting(
-        "device_pairing", {"status": "paired", "sub": sub, "email": email})
-    sparkdeck.store.promote_outbox_for_pairing()
+    with sparkdeck.store.locked():
+        existing = sparkdeck.store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if existing.get("status") == "paired":
+            if existing.get("sub") == sub:
+                sparkdeck.store.promote_outbox_for_pairing()
+                return {"applied": True, "already": True}
+            return {"applied": False, "existing": {"email": existing.get("email")}}
+        sparkdeck.store.set_setting(
+            "device_pairing", {"status": "paired", "sub": sub, "email": email})
+        sparkdeck.store.promote_outbox_for_pairing()
     return {"applied": True}
 
 
@@ -2017,18 +2025,55 @@ def _cognito_jwks():
 
 def _verify_cognito_id_token(id_token: str) -> dict:
     signing_key = _cognito_jwks().get_signing_key_from_jwt(id_token)
-    return jwt.decode(
+    claims = jwt.decode(
         id_token,
         signing_key.key,
         algorithms=["RS256"],
         audience=COGNITO_CLIENT_ID,
         issuer=COGNITO_ISSUER,
     )
+    if claims.get("token_use") != "id" or not claims.get("sub"):
+        raise jwt.InvalidTokenError("token is not a Cognito ID token")
+    return claims
+
+
+async def _verified_community_claims(req: Request) -> dict:
+    authorization = req.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not token:
+        raise HTTPException(401, "a Cognito ID token is required")
+    try:
+        return await asyncio.to_thread(_verify_cognito_id_token, token)
+    except Exception as exc:
+        raise HTTPException(401, "id_token could not be verified") from exc
+
+
+def _require_matching_community_pairing(claims: dict) -> dict:
+    pairing = sparkdeck.store.get_setting(
+        "device_pairing", {"status": "not_paired"},
+    )
+    if pairing.get("status") != "paired" or pairing.get("sub") != claims.get("sub"):
+        raise HTTPException(403, "this account is not paired with the node")
+    return pairing
+
+
+@app.get("/api/v1/community/auth-config")
+async def v1_community_auth_config():
+    return {
+        "idp_endpoint": f"{COGNITO_IDP_ORIGIN.rstrip('/')}/",
+        "client_id": COGNITO_CLIENT_ID,
+    }
 
 
 @app.get("/api/v1/community/sync")
 async def v1_community_sync():
-    return sparkdeck.store.sync_status()
+    return _community_sync_status()
+
+
+def _community_sync_status() -> dict:
+    status = sparkdeck.store.sync_status()
+    status["upload_configured"] = sparkdeck.community_upload_configured
+    return status
 
 
 @app.put("/api/v1/community/consent")
@@ -2037,14 +2082,14 @@ async def v1_community_consent(req: Request):
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    sparkdeck.store.set_community_consent(enabled)
-    return sparkdeck.store.sync_status()
+    await sparkdeck.set_community_consent(enabled)
+    return _community_sync_status()
 
 
 @app.post("/api/v1/community/retry")
 async def v1_community_retry():
     return {"retried": sparkdeck.store.retry_outbox(),
-            "sync": sparkdeck.store.sync_status()}
+            "sync": _community_sync_status()}
 
 
 @app.post("/api/v1/community/pair")
@@ -2057,34 +2102,51 @@ async def v1_community_pair(req: Request):
         claims = await asyncio.to_thread(_verify_cognito_id_token, id_token)
     except Exception as e:
         raise HTTPException(401, "id_token could not be verified") from e
-    existing = sparkdeck.store.get_setting(
-        "device_pairing", {"status": "not_paired"})
-    if existing.get("status") == "paired" and existing.get("sub") != claims.get("sub"):
-        # Never overwrite a different account's pairing on this node.
-        return JSONResponse(
-            {"error": "already_paired", "existing": {"email": existing.get("email")}},
-            status_code=409,
-        )
-    pairing = {
-        "status": "paired",
-        "sub": claims.get("sub"),
-        "email": claims.get("email"),
-    }
-    sparkdeck.store.set_setting("device_pairing", pairing)
-    sparkdeck.store.promote_outbox_for_pairing()
+    with sparkdeck.store.locked():
+        existing = sparkdeck.store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if existing.get("status") == "paired" and existing.get("sub") != claims.get("sub"):
+            # Never overwrite a different account's pairing on this node.
+            return JSONResponse(
+                {"error": "already_paired", "existing": {"email": existing.get("email")}},
+                status_code=409,
+            )
+        pairing = {
+            "status": "paired",
+            "sub": claims.get("sub"),
+            "email": claims.get("email"),
+        }
+        sparkdeck.store.set_setting("device_pairing", pairing)
+        sparkdeck.store.promote_outbox_for_pairing()
     # Best-effort cluster propagation; failures are reported, never raised.
     cluster = await manager.push_community_pairing(pairing["sub"], pairing["email"])
     return {"pairing": pairing, "cluster": cluster}
 
 
 @app.delete("/api/v1/community/pair")
-async def v1_community_unpair():
+async def v1_community_unpair(req: Request):
     existing = sparkdeck.store.get_setting(
         "device_pairing", {"status": "not_paired"})
+    if existing.get("status") == "paired":
+        claims = await _verified_community_claims(req)
+    else:
+        claims = None
+    with sparkdeck.store.locked():
+        existing = sparkdeck.store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if existing.get("status") == "paired":
+            if claims is None:
+                raise HTTPException(401, "a Cognito ID token is required")
+            if existing.get("sub") != claims.get("sub"):
+                raise HTTPException(403, "this account is not paired with the node")
+            sparkdeck.store.set_setting(
+                "device_pairing", {"status": "not_paired"})
+            unpaired_sub = existing.get("sub")
+        else:
+            unpaired_sub = None
     pairing = {"status": "not_paired"}
-    sparkdeck.store.set_setting("device_pairing", pairing)
-    if existing.get("status") == "paired" and existing.get("sub"):
-        cluster = await manager.push_community_unpair(existing["sub"])
+    if unpaired_sub:
+        cluster = await manager.push_community_unpair(unpaired_sub)
     else:
         # Nothing was paired locally, so there is nothing to propagate.
         cluster = {"applied": [], "conflicts": [], "errors": []}
@@ -2092,7 +2154,11 @@ async def v1_community_unpair():
 
 
 @app.get("/api/v1/community/aggregates")
-async def v1_community_aggregates():
+async def v1_community_aggregates(req: Request):
+    claims = await _verified_community_claims(req)
+    _require_matching_community_pairing(claims)
+    if not sparkdeck.store.get_setting("community_consent", False):
+        raise HTTPException(403, "community sharing consent is required")
     try:
         return await sparkdeck.community_aggregates()
     except RuntimeError as exc:

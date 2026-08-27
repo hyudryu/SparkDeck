@@ -36,7 +36,7 @@ describe('BenchmarksPage community privacy', () => {
       else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
         consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
         body = {}
-      } else body = { consent, pairing: { status: 'paired' }, outbox: { pending: 0, synced: 2 } }
+      } else body = { consent, pairing: { status: 'paired' }, upload_configured: true, outbox: { pending: 0, synced: 2 } }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -103,7 +103,7 @@ describe('BenchmarksPage community privacy', () => {
 
   it('locks community estimates behind sign-in and telemetry opt-in but keeps the consent path usable', async () => {
     Object.assign(communityAccess, { signedIn: false, sharingEnabled: false, enabled: false })
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       let body: unknown
       if (path.includes('/api/v1/benchmarks')) {
@@ -118,7 +118,8 @@ describe('BenchmarksPage community privacy', () => {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
       }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
-    }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
 
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
@@ -127,5 +128,8 @@ describe('BenchmarksPage community privacy', () => {
     expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).endsWith('/api/v1/community/aggregates')
+    ))).toBe(false)
   })
 })

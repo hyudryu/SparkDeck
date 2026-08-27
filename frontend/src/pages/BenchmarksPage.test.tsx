@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BenchmarksPage } from './BenchmarksPage'
 
-const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true }))
+const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true, reload: vi.fn() }))
 
 vi.mock('../hooks/useCommunityAccess', () => ({
   COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',
@@ -13,6 +13,7 @@ vi.mock('../hooks/useCommunityAccess', () => ({
 
 beforeEach(() => {
   Object.assign(communityAccess, { signedIn: true, sharingEnabled: true, loading: false, enabled: true })
+  communityAccess.reload.mockClear()
 })
 
 afterEach(() => {
@@ -55,6 +56,7 @@ describe('BenchmarksPage community privacy', () => {
     expect(dialog).toHaveTextContent('Not shared: prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.')
     await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
     expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
+    expect(communityAccess.reload).toHaveBeenCalled()
   })
 
   it('refreshes local aggregates after deleting a contributing benchmark', async () => {

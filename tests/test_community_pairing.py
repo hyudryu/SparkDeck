@@ -1,3 +1,4 @@
+import threading
 import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -57,6 +58,16 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             server.sparkdeck.store, "set_setting",
         )
         self.set_setting = self.set_setting_patch.start()
+        self.get_setting_patch = patch.object(
+            server.sparkdeck.store, "get_setting",
+            return_value={"status": "not_paired"},
+        )
+        self.get_setting = self.get_setting_patch.start()
+        self.promote_patch = patch.object(
+            server.sparkdeck.store, "promote_outbox_for_pairing",
+            Mock(return_value=0),
+        )
+        self.promote = self.promote_patch.start()
         self.push_pair_patch = patch.object(
             server.manager, "push_community_pairing",
             AsyncMock(return_value={"applied": [], "conflicts": [], "errors": []}),
@@ -72,8 +83,18 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.push_unpair_patch.stop()
         self.push_pair_patch.stop()
+        self.promote_patch.stop()
+        self.get_setting_patch.stop()
         self.set_setting_patch.stop()
         self.jwks_patch.stop()
+
+    async def test_csp_permits_the_cognito_idp_origin(self):
+        response = await self.client.get("/api/v1/community/sync")
+
+        self.assertEqual(response.status_code, 200)
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn(
+            "connect-src 'self' https://cognito-idp.us-east-2.amazonaws.com", csp)
 
     async def test_valid_id_token_pairs_the_device(self):
         response = await self.client.post(
@@ -93,7 +114,55 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "sub": "user-sub-123",
             "email": "user@example.com",
         })
+        self.promote.assert_called_once_with()
         self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com")
+
+    async def test_pairing_refuses_to_overwrite_a_different_account(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "other-sub", "email": "other@example.com",
+        }
+
+        response = await self.client.post(
+            "/api/v1/community/pair", json={"id_token": _id_token()})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {
+            "error": "already_paired",
+            "existing": {"email": "other@example.com"},
+        })
+        self.set_setting.assert_not_called()
+        self.promote.assert_not_called()
+        self.push_pair.assert_not_awaited()
+
+    async def test_repairing_the_same_account_is_a_noop_success(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        }
+
+        response = await self.client.post(
+            "/api/v1/community/pair", json={"id_token": _id_token()})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["pairing"]["sub"], "user-sub-123")
+        self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com")
+
+    async def test_jwks_verification_runs_off_the_event_loop(self):
+        verify_threads = []
+
+        def recording_verify(token):
+            verify_threads.append(threading.get_ident())
+            return {"sub": "user-sub-123", "email": "user@example.com"}
+
+        with patch.object(
+            server, "_verify_cognito_id_token", side_effect=recording_verify,
+        ):
+            response = await self.client.post(
+                "/api/v1/community/pair", json={"id_token": _id_token()})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(verify_threads), 1)
+        self.assertNotEqual(verify_threads[0], threading.get_ident())
 
     async def test_pairing_reports_cluster_conflicts_without_failing(self):
         self.push_pair.return_value = {
@@ -152,12 +221,12 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.set_setting.assert_not_called()
 
     async def test_unpair_marks_the_device_not_paired(self):
-        with patch.object(
-            server.sparkdeck.store, "get_setting",
-            return_value={"status": "paired", "sub": "user-sub-123",
-                          "email": "user@example.com"},
-        ):
-            response = await self.client.delete("/api/v1/community/pair")
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        }
+
+        response = await self.client.delete("/api/v1/community/pair")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
@@ -167,6 +236,16 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.set_setting.assert_called_once_with(
             "device_pairing", {"status": "not_paired"})
         self.push_unpair.assert_awaited_once_with("user-sub-123")
+
+    async def test_unpair_without_local_pairing_skips_the_fanout(self):
+        response = await self.client.delete("/api/v1/community/pair")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "pairing": {"status": "not_paired"},
+            "cluster": {"applied": [], "conflicts": [], "errors": []},
+        })
+        self.push_unpair.assert_not_awaited()
 
 
 class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
@@ -187,9 +266,15 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             server.sparkdeck.store, "set_setting",
         )
         self.set_setting = self.set_setting_patch.start()
+        self.promote_patch = patch.object(
+            server.sparkdeck.store, "promote_outbox_for_pairing",
+            Mock(return_value=0),
+        )
+        self.promote = self.promote_patch.start()
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.promote_patch.stop()
         self.set_setting_patch.stop()
         self.get_setting_patch.stop()
         self.agent_patch.stop()
@@ -212,6 +297,7 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "status": "paired", "sub": "user-sub-123",
             "email": "user@example.com",
         })
+        self.promote.assert_called_once_with()
 
     async def test_same_account_pairing_is_a_noop(self):
         self.pair_locally()
@@ -223,6 +309,7 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"applied": True, "already": True})
         self.set_setting.assert_not_called()
+        self.promote.assert_not_called()
 
     async def test_different_account_pairing_is_refused(self):
         self.pair_locally()
@@ -279,6 +366,15 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json(), {
             "applied": False, "existing": {"email": "user@example.com"},
         })
+        self.set_setting.assert_not_called()
+
+    async def test_unpair_requires_a_sub(self):
+        self.get_setting.return_value = {"status": "not_paired"}
+
+        response = await self.client.request(
+            "DELETE", "/api/agent/community-pairing", json={})
+
+        self.assertEqual(response.status_code, 400)
         self.set_setting.assert_not_called()
 
 

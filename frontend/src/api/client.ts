@@ -36,6 +36,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body?: unknown,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -63,13 +64,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`
+    let body: { detail?: unknown; message?: string } | undefined
     try {
-      const body = (await response.json()) as { detail?: string; message?: string }
-      message = body.detail ?? body.message ?? message
+      body = (await response.json()) as { detail?: unknown; message?: string }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.message) message = body.message
     } catch {
       // The status text is still useful for non-JSON failures.
     }
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, body)
   }
   if (response.status === 204) return undefined as T
   if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T

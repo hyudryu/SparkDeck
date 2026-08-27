@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { api, setAuthTokenProvider } from '../api/client'
+import { api, ApiError, setAuthTokenProvider } from '../api/client'
 import type { CommunityClusterSync } from '../api/types'
 import {
   confirmForgotPassword,
@@ -56,6 +56,11 @@ function isExpired(idToken: string): boolean {
   return !exp || exp * 1000 <= Date.now()
 }
 
+function pairingConflictMessage(error: ApiError): Error {
+  const existing = (error.body as { existing?: { email?: string } } | undefined)?.existing?.email
+  return new Error(`This node is already signed in as ${existing ?? 'another account'}`)
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthState['status']>('signed-out')
   const [idToken, setIdToken] = useState<string>()
@@ -70,6 +75,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (tokens && !isExpired(tokens.idToken)) {
         setIdToken(tokens.idToken)
         setStatus('signed-in')
+        // The backend may have lost its pairing while we were away; re-pair
+        // best-effort (idempotent same-sub no-op) without signing out on failure.
+        api.community.pair(tokens.idToken)
+          .then((paired) => { if (!cancelled) setClusterSync(paired.cluster ?? null) })
+          .catch(() => undefined)
       } else {
         setStatus('signed-out')
       }
@@ -95,8 +105,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setClusterSync(null)
       try {
         const tokens = await cognitoSignIn(email, password)
-        const paired = await api.community.pair(tokens.idToken).catch(() => undefined)
-        setClusterSync(paired?.cluster ?? null)
+        try {
+          const paired = await api.community.pair(tokens.idToken)
+          setClusterSync(paired.cluster ?? null)
+        } catch (pairError) {
+          // Pairing is what makes community features work; if it fails, do not
+          // leave the UI looking signed in.
+          await cognitoSignOut()
+          throw pairError instanceof ApiError && pairError.status === 409
+            ? pairingConflictMessage(pairError)
+            : pairError
+        }
         setIdToken(tokens.idToken)
         setStatus('signed-in')
       } catch (reason) {

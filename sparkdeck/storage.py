@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,12 @@ COMMUNITY_EVIDENCE_POLICY = {
     "exact_match_dimensions": ["model_id", "context_window_size"],
     "metric": "inference_tokens_per_second",
 }
+# The hosted community API works out of the box; clearing the setting keeps
+# the installation fully local.
+DEFAULT_COMMUNITY_API_URL = os.environ.get(
+    "SPARKDECK_COMMUNITY_API_URL",
+    "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
+)
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
 
 
@@ -101,6 +108,10 @@ class SparkDeckStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
+                ("community_api_url", json.dumps(DEFAULT_COMMUNITY_API_URL)),
             )
             deployment_columns = {
                 row[1] for row in self._connection.execute(
@@ -383,6 +394,15 @@ class SparkDeckStore:
 
     def outbox_batch(self, limit: int = 50, now: str | None = None) -> list[dict[str, Any]]:
         """Return an idempotent upload batch without exposing private deployment data."""
+        return [
+            payload
+            for _, payload in self.outbox_batch_with_ids(limit, now)
+        ]
+
+    def outbox_batch_with_ids(
+        self, limit: int = 50, now: str | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return ``(sample_id, payload)`` pairs for the uploader to mark results."""
         limit = min(200, max(1, int(limit)))
         now = now or datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -407,7 +427,11 @@ class SparkDeckStore:
             for row in sample_rows
             if (payload := _upload_row(row)) is not None
         }
-        return [by_id[sample_id] for sample_id in wanted if sample_id in by_id]
+        return [
+            (sample_id, by_id[sample_id])
+            for sample_id in wanted
+            if sample_id in by_id
+        ]
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
         if not sample_ids:
@@ -450,9 +474,17 @@ class SparkDeckStore:
                 "SELECT status, COUNT(*) AS count FROM upload_outbox GROUP BY status"
             ).fetchall()
         counts = {row["status"]: row["count"] for row in rows}
+        pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+        if isinstance(pairing, dict):
+            # The refresh token only ever leaves the store for Cognito token
+            # minting; it must not leak into API responses.
+            pairing = {
+                key: value for key, value in pairing.items()
+                if key != "refresh_token"
+            }
         return {
             "consent": bool(self.get_setting("community_consent", False)),
-            "pairing": self.get_setting("device_pairing", {"status": "not_paired"}),
+            "pairing": pairing,
             "outbox": {
                 "pending": counts.get("pending", 0),
                 "waiting_for_account": counts.get("waiting_for_account", 0),

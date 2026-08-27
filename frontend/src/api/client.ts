@@ -343,9 +343,12 @@ export const api = {
       request<void>(`/api/v1/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },
   community: {
-    pair: (idToken: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
+    pair: (idToken: string, refreshToken?: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
       method: 'POST',
-      body: JSON.stringify({ id_token: idToken }),
+      body: JSON.stringify({
+        id_token: idToken,
+        ...(refreshToken ? { refresh_token: refreshToken } : {}),
+      }),
     }),
     unpair: () => request<CommunityPairResponse>('/api/v1/community/pair', { method: 'DELETE' }),
   },

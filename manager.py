@@ -1395,7 +1395,9 @@ class Manager:
         })
         return dict(status)
 
-    async def push_community_pairing(self, sub: str, email: str | None) -> dict:
+    async def push_community_pairing(
+        self, sub: str, email: str | None, refresh_token: str | None = None,
+    ) -> dict:
         """Best-effort fan-out of a community sign-in to every enabled peer."""
         nodes = [
             node for node in self.node_registry.nodes
@@ -1404,7 +1406,11 @@ class Manager:
         results = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "PUT", "/api/agent/community-pairing",
-                json_body={"sub": sub, "email": email},
+                json_body={
+                    "sub": sub,
+                    "email": email,
+                    "refresh_token": refresh_token,
+                },
                 timeout=5,
             )
             for node in nodes

@@ -293,6 +293,12 @@ describe('community features sign-in', () => {
       method: 'POST',
       body: expect.stringContaining('"id_token"'),
     })))
+    const pairCall = fetchMock.mock.calls.find(([input, init]) => (
+      String(input).endsWith('/api/v1/community/pair') && init?.method === 'POST'
+    ))
+    expect(JSON.parse(String(pairCall?.[1]?.body))).toMatchObject({
+      refresh_token: 'refresh-token',
+    })
   })
 
   it('reports cluster conflicts and unreachable nodes after sign-in', async () => {

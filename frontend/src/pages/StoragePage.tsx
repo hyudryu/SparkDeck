@@ -191,6 +191,12 @@ export function StoragePage() {
         {nodes.length === 0 ? <EmptyState title="No storage nodes" description="Join a node to the cluster before transferring model weights." /> : <div className="storage-node-grid">
           {nodes.map((node) => {
             const used = node.models.reduce((total, model) => total + model.size_bytes, 0)
+            // "Used" counts SparkDeck-managed model weights only, so the
+            // capacity denominator must be that usage plus the disk's real
+            // free space — the raw disk total also holds OS and app data
+            // that model usage can never fill.
+            const hasFree = (node.free_size ?? 0) > 0
+            const capacity = hasFree ? used + (node.free_size ?? 0) : node.total_size
             const alreadyStored = Boolean(draggedModel && node.models.some((model) => model.model_id === draggedModel.modelId))
             const validDrop = Boolean(draggedModel && node.online && draggedModel.sourceNodeId !== node.id && !alreadyStored)
             return <Panel
@@ -213,8 +219,12 @@ export function StoragePage() {
               onDrop={(event) => dropModel(event, node)}
             >
               <div className="storage-node-heading"><HardDrive size={18} /><div><h3>{node.name}</h3><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div></div>
-              <div className="storage-capacity"><span>{formatBytes(used)} used</span><span>{formatBytes(node.total_size)} total</span></div>
-              <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${node.total_size > 0 ? Math.min(100, (used / node.total_size) * 100) : 0}%` }} /></div>
+              <div className="storage-capacity">
+                <span>{formatBytes(used)} used</span>
+                {hasFree && <span>{formatBytes(node.free_size ?? 0)} free</span>}
+                <span>{formatBytes(capacity)} total</span>
+              </div>
+              <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>
               {node.models.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
                 {node.models.map((model) => <li

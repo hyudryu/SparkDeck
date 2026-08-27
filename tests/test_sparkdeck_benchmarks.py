@@ -84,7 +84,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.service.store.add_deployment(Deployment(
             id="dep-series", alias="series", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
-            settings={"context_length": 16384, "tensor_parallel_size": 2},
+            settings={
+                "context_length": 16384, "tensor_parallel_size": 2,
+                "model_source": "public_repository",
+            },
             base_url_set=True,
         ), "http://127.0.0.1:8000")
         self.service.store.set_setting("device_pairing", {"status": "paired"})
@@ -187,6 +190,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_coordinated_run_resolves_manager_only_launch_metadata(self):
         manager_deployment = {
             "id": "manager-only", "model": "org/manager-model", "status": "ready",
+            "model_source": "public_repository",
             "node_ids": ["local"],
             "launch_settings": {
                 "model": "org/manager-model", "engine": "vllm",
@@ -218,6 +222,47 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "tensor_parallel_size": 2,
         })
 
+    async def test_coordinated_manager_run_uses_runtime_provenance_for_relative_local_model(self):
+        manager_deployment = {
+            "id": "manager-relative", "model": "models/customer",
+            "status": "ready", "node_ids": ["worker-1"],
+            "model_source": "local",
+            "launch_settings": {
+                "model": "models/customer", "engine": "vllm",
+                "extra_args": ["--max-model-len", "8192"],
+                "model_source": "local",
+            },
+        }
+        self.manager.deployments = [manager_deployment]
+        self.manager._cluster_primary_member = lambda _deployment_id: (
+            manager_deployment, {"node_id": "worker-1"},
+        )
+        self.manager.node_registry = SimpleNamespace(request=AsyncMock(return_value={
+            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
+        }))
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+
+        point = await self.service.record_benchmark_series_point({
+            "deployment_id": "manager-relative", "concurrency": 1,
+            "request_count": 2, "prompt_tokens": 100,
+            "generation_tokens": 50, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
+        })
+
+        self.assertRegex(point["model_id"], r"^local-model-[0-9a-f]{16}$")
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(samples[0]["model"]["repository"], "local-model")
+        self.assertNotIn("model_source", samples[0]["configuration"])
+        self.assertFalse(samples[0]["eligible_for_community"])
+        self.assertEqual(self.service.store.outbox_batch(), [])
+        self.assertEqual(
+            self.service.store.benchmark_model_summaries()[0]["model_id"],
+            point["model_id"],
+        )
+        self.assertNotIn("models/customer", str(point) + str(samples))
+
     async def test_coordinated_run_enriches_normalized_manager_record(self):
         self.service.store.add_deployment(Deployment(
             id="sparkdeck-record", alias="stored", runtime=RuntimeKind.VLLM,
@@ -233,6 +278,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         manager_deployment = {
             "id": "manager-stored", "sparkdeck_record_id": "sparkdeck-record",
             "model": "org/stored-model", "status": "ready", "node_ids": ["local"],
+            "model_source": "public_repository",
             "members": [],
             "launch_settings": {
                 "model": "org/stored-model", "engine": "vllm",
@@ -283,6 +329,14 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             await self.service.record_benchmark_series_point({
                 "deployment_id": "dep-series", "concurrency": 10,
                 "request_count": 5, "prompt_tokens": 100,
+                "generation_tokens": 50, "prompt_seconds": 0.25,
+                "wall_seconds": 1,
+            })
+
+        with self.assertRaisesRegex(ValueError, "divisible by the measured concurrency"):
+            await self.service.record_benchmark_series_point({
+                "deployment_id": "dep-series", "concurrency": 5,
+                "request_count": 6, "prompt_tokens": 100,
                 "generation_tokens": 50, "prompt_seconds": 0.25,
                 "wall_seconds": 1,
             })

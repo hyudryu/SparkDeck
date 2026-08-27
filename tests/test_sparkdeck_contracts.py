@@ -14,6 +14,7 @@ class FakeManager:
     def __init__(self):
         self.http = httpx.AsyncClient()
         self.list_containers = AsyncMock(return_value=[])
+        self.remove_container = AsyncMock(return_value={"ok": True})
         self.start_container = AsyncMock(return_value={"status": "running"})
         self.stop_container = AsyncMock(return_value={"status": "exited"})
         self._vllm_chat = AsyncMock()
@@ -131,6 +132,41 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             })
 
         self.assertEqual(launch.await_args.args[5]["revision"], "revision-abc")
+
+    async def test_managed_ownership_is_durable_before_container_launch(self):
+        async def fail_launch(*args):
+            stored = self.service.store.deployment("durable-launch")
+            self.assertIsNotNone(stored)
+            self.assertTrue(stored["container_name"].startswith("sparkdeck-durable-launch-"))
+            raise RuntimeError("launch failed")
+
+        with patch(
+            "sparkdeck.service.launch_managed_container", side_effect=fail_launch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                await self.service.create_deployment({
+                    "model": "org/model", "alias": "durable-launch",
+                    "runtime": "vllm",
+                })
+
+        self.manager.remove_container.assert_awaited_once()
+        self.assertIsNone(self.service.store.deployment("durable-launch"))
+
+    async def test_failed_container_cleanup_retains_ownership_record(self):
+        self.manager.remove_container.side_effect = RuntimeError("Docker unavailable")
+        with patch(
+            "sparkdeck.service.launch_managed_container",
+            side_effect=RuntimeError("launch failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                await self.service.create_deployment({
+                    "model": "org/model", "alias": "retained-launch",
+                    "runtime": "vllm",
+                })
+
+        stored = self.service.store.deployment("retained-launch")
+        self.assertIsNotNone(stored)
+        self.assertTrue(stored["container_name"].startswith("sparkdeck-retained-launch-"))
 
 
 

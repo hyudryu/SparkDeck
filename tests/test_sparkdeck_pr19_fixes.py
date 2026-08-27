@@ -93,7 +93,10 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch("sparkdeck.service.launch_managed_container", AsyncMock(return_value=launched)),
-            patch.object(self.service.store, "add_deployment", side_effect=OSError("disk full")),
+            patch.object(
+                self.service.store, "update_managed_routing",
+                side_effect=OSError("disk full"),
+            ),
         ):
             with self.assertRaisesRegex(OSError, "disk full"):
                 await self.service.create_deployment({
@@ -101,6 +104,23 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
                 })
 
         self.manager.remove_container.assert_awaited_once_with(launched["name"])
+        self.assertIsNone(self.service.store.deployment("model"))
+
+    async def test_failed_prelaunch_persistence_never_starts_docker(self):
+        launch = AsyncMock()
+        with (
+            patch("sparkdeck.service.launch_managed_container", launch),
+            patch.object(
+                self.service.store, "add_deployment", side_effect=OSError("disk full"),
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await self.service.create_deployment({
+                    "model": "org/model", "alias": "model", "runtime": "vllm",
+                })
+
+        launch.assert_not_awaited()
+        self.manager.remove_container.assert_not_awaited()
 
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):

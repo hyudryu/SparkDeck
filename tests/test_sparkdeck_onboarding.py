@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+from docker.errors import DockerException
 from fastapi import Request
 
 from cluster import AGENT_PROTOCOL_VERSION, AgentCredentials, NodeRegistry
@@ -22,6 +23,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
     validate_control_url,
 )
+from sparkdeck.workload_ownership import ManagedWorkloadLedger
 
 
 class FakeManager:
@@ -48,6 +50,7 @@ class FakeManager:
         self.adopt_controller_role = Mock()
         self.deployments = []
         self.list_containers = AsyncMock(return_value=[])
+        self.managed_workload_ledger = ManagedWorkloadLedger(data_dir)
 
     @staticmethod
     def _network_interfaces():
@@ -497,6 +500,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             connection.close()
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         manager = FakeManager(self.root, http)
+        manager.list_containers.side_effect = DockerException("daemon is not running")
         service = OnboardingService(manager, self.root)
 
         with self.assertRaisesRegex(ValueError, "1 saved deployment record"):
@@ -507,7 +511,31 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             }, "http://127.0.0.1:7878")
 
         self.assertEqual(requests, [])
-        manager.list_containers.assert_awaited_once()
+        manager.list_containers.assert_not_awaited()
+        await http.aclose()
+
+    async def test_join_rejects_legacy_deployments_without_requiring_docker(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.deployments = [{"id": "legacy"}]
+        manager.list_containers.side_effect = DockerException("daemon is not running")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "1 legacy deployment record"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        manager.list_containers.assert_not_awaited()
         await http.aclose()
 
     async def test_join_rejects_managed_containers_before_contacting_controller(self):
@@ -534,6 +562,108 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(requests, [])
         await http.aclose()
+
+    async def test_join_without_deployments_does_not_require_docker(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "role": "controller",
+                    "node": {
+                        "id": "controller-id",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                })
+            return httpx.Response(200, json={
+                "ok": True,
+                "role": "controller",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "forward_token": "forward-secret",
+                "cluster": {"nodes": []},
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.list_containers.side_effect = DockerException("daemon is not running")
+        service = OnboardingService(manager, self.root)
+
+        joined = await service.join({
+            "controller_url": "http://127.0.0.1:9000",
+            "join_code": "654321",
+            "advertise_url": "http://127.0.0.1:9001",
+        }, "http://127.0.0.1:7878")
+
+        self.assertEqual(joined["role"], "worker")
+        self.assertEqual([request.method for request in requests], ["GET", "POST", "GET"])
+        manager.adopt_worker_role.assert_awaited_once()
+        await http.aclose()
+
+    async def test_join_without_docker_rejects_durable_workload_claim(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.managed_workload_ledger.claim("sparkdeck-orphan", "deployment-1")
+        manager.list_containers.side_effect = DockerException("daemon is not running")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "durable managed workload ownership"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        await http.aclose()
+
+    async def test_join_clears_stale_claim_after_successful_empty_inventory(self):
+        manager = FakeManager(self.root)
+        manager.managed_workload_ledger.claim("sparkdeck-stale", "deployment-1")
+
+        async def inventory():
+            manager.managed_workload_ledger.reconcile({})
+            return []
+        manager.list_containers.side_effect = inventory
+        service = OnboardingService(manager, self.root)
+
+        await service._assert_no_owned_workloads("join")
+
+        self.assertEqual(manager.managed_workload_ledger.snapshot(), {})
+
+    async def test_join_rejects_corrupt_workload_ledger(self):
+        manager = FakeManager(self.root)
+        manager.managed_workload_ledger.path.write_text("not-json", encoding="utf-8")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "cannot verify managed workload ownership"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        await manager.http.aclose()
+
+    async def test_join_still_surfaces_unexpected_inventory_failures(self):
+        manager = FakeManager(self.root)
+        manager.list_containers.side_effect = RuntimeError("invalid container response")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(RuntimeError, "invalid container response"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        await manager.http.aclose()
 
     async def test_join_rejects_nested_cluster_members_before_contacting_controller(self):
         requests = []
@@ -834,6 +964,25 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [])
         manager.adopt_controller_role.assert_not_called()
         await http.aclose()
+
+    async def test_leave_without_docker_keeps_assignment_and_credentials(self):
+        manager = FakeManager(self.root)
+        manager.list_containers.side_effect = DockerException("daemon is not running")
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        with self.assertRaisesRegex(ValueError, "Docker is unavailable"):
+            await service.leave("http://127.0.0.1:7878")
+
+        self.assertIsNotNone(service.assignment.load())
+        self.assertTrue(manager.agent_credentials.accepts_token(old_token))
+        manager.adopt_controller_role.assert_not_called()
+        await manager.http.aclose()
 
     async def test_leave_honors_authoritative_controller_deployment_guard(self):
         def handler(request: httpx.Request) -> httpx.Response:

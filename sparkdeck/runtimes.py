@@ -243,7 +243,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             ]
         except Exception:
             pass
-        container = manager.client.containers.run(**options)
+        container = manager._run_managed_container(options)
         container.reload()
         summary = manager._container_summary(container) or {}
         return {**summary, "port": summary.get("port") or port,

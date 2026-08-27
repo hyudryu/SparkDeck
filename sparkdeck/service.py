@@ -914,6 +914,12 @@ class SparkDeckService:
 
             adapter = self.registry.get(runtime)
             cleanup_name = safe_container_name(alias, deployment_id)
+            # Persist ownership before Docker is mutated. If launch succeeds,
+            # the record is filled with the discovered endpoint below. If
+            # launch or cleanup fails, onboarding still has a durable signal
+            # that this controller may own a managed workload.
+            deployment.container_name = cleanup_name
+            self.store.add_deployment(deployment, None, None)
             try:
                 launched = await launch_managed_container(
                     self.manager, adapter, deployment_id, alias, model,
@@ -932,14 +938,19 @@ class SparkDeckService:
                 if not deployment.container_name or not port:
                     raise RuntimeError("runtime launched without a discoverable container endpoint")
                 cleanup_name = deployment.container_name
-                self.store.add_deployment(
-                    deployment, f"http://127.0.0.1:{int(port)}", None
+                self.store.update_managed_routing(
+                    deployment.id, deployment.settings, deployment.container_name,
+                    f"http://127.0.0.1:{int(port)}",
                 )
             except Exception:
+                cleaned = False
                 try:
                     await self.manager.remove_container(cleanup_name)
-                except Exception:
-                    pass
+                    cleaned = True
+                except Exception as cleanup_error:
+                    cleaned = _is_missing_container_error(cleanup_error)
+                if cleaned:
+                    self.store.delete_deployment(deployment_id)
                 raise
             result = self.store.deployment(deployment_id) or deployment.to_dict()
             result.update({"status": launched.get("status", "running"), "port": int(port)})

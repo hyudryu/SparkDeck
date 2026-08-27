@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from docker.errors import DockerException
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -376,15 +377,34 @@ class OnboardingService:
             deployment for deployment in getattr(self.manager, "deployments", [])
             if isinstance(deployment, dict)
         ])
-        try:
-            containers = await self.manager.list_containers()
-        except Exception as exc:
-            raise ValueError(
-                "cannot verify that managed workloads were migrated because Docker "
-                "is unavailable; restore Docker access and retry"
-            ) from exc
-        managed = [container for container in containers if container.get("managed")]
-        if not (saved or legacy or managed):
+        ledger = getattr(self.manager, "managed_workload_ledger", None)
+        claims = ledger.snapshot() if ledger is not None else {}
+        managed = []
+        if not (saved or legacy):
+            try:
+                containers = await self.manager.list_containers()
+            except DockerException as exc:
+                # Joining changes only SparkDeck's controller assignment. An
+                # otherwise-empty controller-only installation does not need
+                # Docker to become a worker. Keep leave fail-closed because an
+                # offline worker's inventory is its last ownership check.
+                if action == "join" and not claims:
+                    return
+                if action == "join":
+                    raise ValueError(
+                        "cannot join while this node has durable managed workload "
+                        "ownership claims and Docker is unavailable to verify them; "
+                        "restore Docker access, remove the workloads, and retry"
+                    ) from exc
+                raise ValueError(
+                    "cannot verify that managed workloads were migrated because Docker "
+                    "is unavailable; restore Docker access and retry"
+                ) from exc
+            managed = [container for container in containers if container.get("managed")]
+            claims = ledger.snapshot() if ledger is not None else {}
+        managed_names = {str(container.get("name") or "") for container in managed}
+        pending_claims = [name for name in claims if name not in managed_names]
+        if not (saved or legacy or managed or pending_claims):
             return
         details = []
         if saved:
@@ -393,6 +413,11 @@ class OnboardingService:
             details.append(f"{legacy} legacy deployment record{'s' if legacy != 1 else ''}")
         if managed:
             details.append(f"{len(managed)} managed container{'s' if len(managed) != 1 else ''}")
+        if pending_claims:
+            details.append(
+                f"{len(pending_claims)} pending managed workload "
+                f"claim{'s' if len(pending_claims) != 1 else ''}"
+            )
         if action == "leave":
             raise ValueError(
                 "cannot leave while this node still hosts " + ", ".join(details) + ". "

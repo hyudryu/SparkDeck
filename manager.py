@@ -3587,7 +3587,8 @@ class Manager:
 
         def _reader():
             try:
-                assert proc.stdout is not None
+                if proc.stdout is None:
+                    raise RuntimeError("perf provided no stdout stream")
                 first = True
                 for line in proc.stdout:
                     if first:
@@ -6986,7 +6987,8 @@ class Manager:
         run["proc"] = proc
         run["status"] = "running"
         try:
-            assert proc.stdout is not None
+            if proc.stdout is None:
+                raise RuntimeError("sparkrun provided no stdout stream")
             async for raw in proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 run["log_lines"].append(line)

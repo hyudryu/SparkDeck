@@ -131,7 +131,8 @@ class FanDaemon:
         duty, max_speed = self._target_duty(
             temp, time.monotonic(), control.max_speed,
         )
-        assert self.link is not None
+        if self.link is None:
+            raise RuntimeError("fan serial link is not connected")
         self.link.set_duty(duty)
         display_rpm = (
             int(round(byte_to_pct(duty) / 100.0 * self.settings.max_rpm))

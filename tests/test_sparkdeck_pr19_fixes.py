@@ -212,6 +212,75 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             await self.service.deployment_action("container:legacy-model", "start", node_ids=["remote-1"])
         self.manager.start_container.assert_not_awaited()
 
+    async def test_cluster_member_start_with_selection_dispatches_to_owner(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "members": [
+                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
+                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1},
+            ],
+            "launch_settings": {"engine": "vllm", "deployment_mode": "sharded"},
+        }]
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "local", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "node-2", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+        ])
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "exited", "port": 8000,
+        }]
+
+        started = await self.service.deployment_action(
+            "container:cluster-1-r0-model", "start", node_ids=["local", "node-2"],
+        )
+
+        # The discovered rank card addresses its whole cluster, never the
+        # single local container — otherwise the health monitor would
+        # resurrect the deployment.
+        self.assertEqual(started["status"], "running")
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["local", "node-2"])
+        self.manager.start_container.assert_not_awaited()
+
+    async def test_start_rejects_remote_node_for_controller_local_models(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-local", alias="local weights", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("/models/weights"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager._resolve_local_path = Mock(return_value="/models/weights")
+
+        with self.assertRaisesRegex(ValueError, "controller-local model paths"):
+            await self.service.deployment_action("dep-local", "start", node_ids=["remote-1"])
+        self.manager.deployment_action.assert_not_awaited()
+
+    async def test_start_weight_check_uses_persisted_revision(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-pin", alias="pinned", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "launch_settings": {"extra_args": ["--revision=release-b"]},
+        }]
+        self.manager.recipe_deployment_contract = lambda recipe: {
+            "model_revision": "release-b", "deployment_mode": "single",
+            "required_node_count": 1,
+        }
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager._resolve_local_path = Mock(return_value=None)
+        # "main" is absent everywhere; only the persisted pin exists.
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["release-b"], "partial": False}]},
+        ])
+
+        await self.service.deployment_action("dep-pin", "start", node_ids=["a"])
+
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a"])
+
     async def test_cluster_member_card_exposes_persisted_layout(self):
         self.manager.deployments = [{
             "id": "cluster-1", "status": "stopped", "engine": "vllm",

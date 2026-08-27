@@ -207,7 +207,7 @@ Virtual NAS is an opt-in cluster feature for copying model weights that are alre
 
 Keep every node and transfer on a cluster-private network, preferably Tailscale. The transfer endpoints use the paired node-agent credentials, but SparkDeck is not a public file server and these routes should never be exposed directly to the internet. Pair the nodes first, confirm that their Tailscale addresses report online, and allow enough free space for a complete copy before starting a transfer.
 
-Only complete Hugging Face cache model weights are shown and transferable. Virtual NAS does not browse arbitrary directories, expose cache paths or Hugging Face tokens, or copy unrelated files. Deletion is similarly limited to an exact cached model ID and is refused while the model is serving or participating in an active transfer.
+Complete and partial Hugging Face model caches are shown in Storage, with partial caches marked by a warning. Only complete caches are transferable. Virtual NAS does not browse arbitrary directories, expose cache paths or Hugging Face tokens, or copy unrelated files. Deletion is similarly limited to an exact cached model ID and is refused while the model is serving or participating in an active transfer.
 
 The optional MCP endpoint is served on the application port:
 

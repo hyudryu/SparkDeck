@@ -700,6 +700,7 @@ class SparkDeckService:
                 stored["container_name"] = container_name
                 manager_id = cluster.get("id")
             stored["status"] = _deployment_status(cluster.get("status"))
+            stored.update(self._layout_contract(cluster.get("launch_settings")))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
             created_at = cluster.get("created_at")
@@ -744,8 +745,10 @@ class SparkDeckService:
             owner = cluster_by_container.get(container.get("name"))
             if owner:
                 # One rank of a multi-node cluster: the card reports the whole
-                # deployment's state, not just this node's rank container.
+                # deployment's state and layout contract, not just this node's
+                # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
+                discovered.update(self._layout_contract(owner.get("launch_settings")))
             registered.append(discovered)
         for deployment in registered:
             if (
@@ -1025,6 +1028,54 @@ class SparkDeckService:
             # diagnostic record if even local SQLite adoption fails.
             pass
 
+    def _layout_contract(self, launch_settings: Any) -> dict[str, Any]:
+        """Best-effort persisted layout for a cluster deployment.
+
+        Returns deployment_mode and required_node_count when the manager can
+        derive them from the persisted launch settings; callers fall back to
+        their own defaults when absent.
+        """
+        contract_fn = getattr(self.manager, "recipe_deployment_contract", None)
+        if not contract_fn:
+            return {}
+        try:
+            contract = contract_fn(launch_settings or {})
+        except Exception:
+            return {}
+        if not isinstance(contract, dict):
+            return {}
+        result: dict[str, Any] = {}
+        if isinstance(contract.get("deployment_mode"), str):
+            result["deployment_mode"] = contract["deployment_mode"]
+        count = contract.get("required_node_count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            result["required_node_count"] = count
+        return result
+
+    async def _validate_weights_cached(self, deployment: dict[str, Any], node_ids: list[str]) -> None:
+        """Mirror the recipe deploy gate: every chosen node needs the weights."""
+        repository = str((deployment.get("model") or {}).get("repository") or "")
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if not repository or (resolve_local and resolve_local(repository)):
+            return
+        inventory = await self.manager.model_cache_inventory()
+        cached_revision = (deployment.get("model") or {}).get("revision") or "main"
+        nodes_with_weights = {
+            node.get("id")
+            for node in inventory if isinstance(node, dict)
+            for model in node.get("models") or []
+            if isinstance(model, dict)
+            and not model.get("partial")
+            and model.get("model_id") == repository
+            and cached_revision in (model.get("revisions") or [])
+        }
+        missing = [node_id for node_id in node_ids if node_id not in nodes_with_weights]
+        if missing:
+            raise ValueError(
+                "model weights are not available on selected node(s): "
+                + ", ".join(missing)
+            )
+
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -1044,6 +1095,11 @@ class SparkDeckService:
             raise ValueError("external endpoints cannot be started or stopped by SparkDeck")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         if manager_id:
+            if node_ids and action == "start":
+                # The picker constrains choices in the UI, but an API client
+                # can bypass it and the cache can change after the inventory
+                # loads — revalidate before relaunching.
+                await self._validate_weights_cached(deployment, node_ids)
             if node_ids is None:
                 result = await self.manager.deployment_action(manager_id, action)
             else:
@@ -1091,6 +1147,13 @@ class SparkDeckService:
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
             return {**deployment, "status": "running" if action == "start" else "stopped"}
+        if node_ids and any(item != "local" for item in node_ids):
+            # A standalone container runs on the node that holds it; only
+            # cluster deployments can be relocated by a start selection.
+            raise ValueError(
+                "node selection is only available for cluster deployments; "
+                "this deployment starts on its existing node"
+            )
         if action == "start":
             await self.manager.start_container(container)
         elif action == "stop":

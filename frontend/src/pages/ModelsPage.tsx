@@ -178,6 +178,7 @@ export function ModelsPage() {
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState<string>()
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
+  const [startError, setStartError] = useState<string>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -292,27 +293,24 @@ export function ModelsPage() {
     if (!startSelection) return
     const { deployment, nodeIds } = startSelection
     setBusy(deployment.id)
-    setActionError(undefined)
-    setActionNotice(undefined)
+    setStartError(undefined)
     try {
       await api.deployments.action(deployment.id, 'start', nodeIds)
       setActionNotice(`Starting ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
       setStartSelection(undefined)
       resource.reload()
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : 'Could not start deployment')
+      // Render inside the dialog: the page-level alert sits behind the
+      // modal backdrop where the user cannot see it.
+      setStartError(reason instanceof Error ? reason.message : 'Could not start deployment')
     } finally {
       setBusy(undefined)
     }
   }
 
-  // A TP>1 launch is sharded across exactly that many nodes; everything else
-  // runs on one.
-  const deploymentRequiredNodes = (deployment: Deployment) => {
-    if (deployment.runtime === 'llama.cpp') return 1
-    const tensorParallel = deployment.settings.tensor_parallel_size ?? 1
-    return tensorParallel > 1 ? tensorParallel : 1
-  }
+  // The backend derives the persisted layout contract (replicated saved-node
+  // count, TP×PP for sharded, single otherwise); unknown layouts start on one.
+  const deploymentRequiredNodes = (deployment: Deployment) => deployment.required_node_count ?? 1
 
   const deploymentWeightedNodes = (deployment: Deployment) => {
     if (isLocalModelPath(deployment.model_id)) {
@@ -335,6 +333,7 @@ export function ModelsPage() {
       // (all of them, or the single node holding the weights).
       nodeIds = [...new Set([...nodeIds, ...availableIds])].slice(0, required)
     }
+    setStartError(undefined)
     setStartSelection({ deployment, nodeIds })
   }
 
@@ -790,7 +789,7 @@ export function ModelsPage() {
         const weighted = deploymentWeightedNodes(deployment)
         const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
         const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
-        const sharded = required > 1
+        const sharded = deployment.deployment_mode === 'sharded'
         const localRequired = sharded && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
@@ -800,7 +799,8 @@ export function ModelsPage() {
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
             <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="start-deployment-title">Start {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} Nodes without the complete model weights are disabled.</p>
+            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} Nodes without the complete model weights are disabled.</p>
+            {startError && <p className="form-error" role="alert">{startError}</p>}
             {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
@@ -809,7 +809,7 @@ export function ModelsPage() {
               loading={nodes.loading || (!localPath && modelCache.loading)}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload() }}
-              multiple={sharded}
+              multiple={required > 1}
               disabled={startBusy}
               requiredIds={localRequired}
               allowedIds={allowedIds}

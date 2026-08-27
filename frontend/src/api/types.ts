@@ -75,6 +75,8 @@ export interface Deployment {
   runtime_version?: string
   image?: string
   settings: DeploymentSettings
+  deployment_mode?: string
+  required_node_count?: number
   last_error?: string
   created_at?: string
   updated_at?: string

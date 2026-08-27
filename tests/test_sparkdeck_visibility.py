@@ -226,10 +226,16 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/deployments/dep-1/start",
                 json={"node_ids": []},
             )
+            invalid_utf8 = await self.client.post(
+                "/api/v1/deployments/dep-1/start",
+                content=b"\xff\xfe{}",
+                headers={"content-type": "application/json"},
+            )
 
         self.assertEqual(without_body.status_code, 200)
         self.assertEqual(with_nodes.status_code, 200)
         self.assertEqual(with_invalid.status_code, 400)
+        self.assertEqual(invalid_utf8.status_code, 400)
         action.assert_any_await("dep-1", "start", None)
         action.assert_any_await("dep-1", "start", ["local", "node-2"])
 

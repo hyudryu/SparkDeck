@@ -134,6 +134,8 @@ interface WireDeployment {
   port?: number
   node_ids?: string[]
   selected_nodes?: Deployment['selected_nodes']
+  deployment_mode?: string
+  required_node_count?: number
   created_at?: string
 }
 
@@ -165,6 +167,8 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     status: item.status,
     managed: item.kind === 'managed',
     settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    deployment_mode: item.deployment_mode,
+    required_node_count: item.required_node_count,
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,

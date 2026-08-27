@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import docker
 import httpx
 
-from manager import Manager
+from manager import Manager, _RetryingDockerClient
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -30,13 +32,19 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             self.manager = Manager(Path(self.temp.name))
         return self.manager
 
-    async def test_controller_starts_with_degraded_empty_docker_inventory(self):
+    async def test_controller_starts_with_explicitly_unavailable_docker_inventory(self):
         manager = self.manager_without_docker()
         unavailable = docker.errors.DockerException("daemon is not running")
 
         with patch("manager.docker.from_env", side_effect=unavailable):
-            self.assertEqual(await manager.list_containers(), [])
-            self.assertEqual(await manager.list_images(), [])
+            with self.assertRaisesRegex(
+                docker.errors.DockerException, "Docker is unavailable"
+            ):
+                await manager.list_containers()
+            with self.assertRaisesRegex(
+                docker.errors.DockerException, "Docker is unavailable"
+            ):
+                await manager.list_images()
             manager.get_disk = AsyncMock(return_value={})
             status = await manager.agent_status(stats={})
 
@@ -46,6 +54,7 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_docker_inventory_recovers_without_restarting_manager(self):
         manager = self.manager_without_docker()
+        manager.client._retry_after = 0.0
         container = SimpleNamespace(
             name="external-container",
             labels={},
@@ -97,6 +106,34 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["containers"], [])
         self.assertEqual(response.json()["images"], [])
+        self.assertFalse(response.json()["docker_ready"])
+
+    async def test_state_marks_local_deployment_unknown_during_docker_outage(self):
+        manager = self.manager_without_docker()
+        manager.deployments = [{
+            "id": "deployment-1",
+            "name": "Existing deployment",
+            "model": "org/model",
+            "status": "ready",
+            "members": [{
+                "node_id": "local",
+                "rank": 0,
+                "container_name": "sparkdeck-existing",
+            }],
+        }]
+        manager.get_stats = AsyncMock(return_value={})
+        manager.get_disk = AsyncMock(return_value={})
+        unavailable = docker.errors.DockerException("daemon is not running")
+
+        with patch("manager.docker.from_env", side_effect=unavailable):
+            state = await manager.get_state()
+
+        deployment = state["deployments"][0]
+        self.assertEqual(deployment["status"], "unknown")
+        self.assertEqual(deployment["status_message"], "Docker is unavailable")
+        self.assertEqual(deployment["members"][0]["status"], "unknown")
+        self.assertNotEqual(deployment["members"][0]["status"], "missing")
+        self.assertFalse(state["docker_ready"])
 
     async def test_liveness_api_does_not_query_docker_or_cluster_state(self):
         transport = httpx.ASGITransport(app=server.app)
@@ -113,3 +150,72 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 204)
         self.assertEqual(response.content, b"")
         get_state.assert_not_awaited()
+
+
+class RetryingDockerClientTests(unittest.TestCase):
+    def test_failed_reconnect_is_cached_then_eventually_recovers(self):
+        now = [100.0]
+        unavailable = docker.errors.DockerException("daemon is not running")
+        proxy = _RetryingDockerClient(
+            initial_error=unavailable,
+            retry_interval=5,
+            clock=lambda: now[0],
+        )
+
+        with patch("manager.docker.from_env", side_effect=unavailable) as reconnect:
+            with self.assertRaisesRegex(docker.errors.DockerException, "unavailable"):
+                proxy.ping()
+            self.assertEqual(reconnect.call_count, 0)
+
+            now[0] = 106.0
+            with self.assertRaisesRegex(docker.errors.DockerException, "unavailable"):
+                proxy.ping()
+            with self.assertRaisesRegex(docker.errors.DockerException, "unavailable"):
+                proxy.ping()
+            self.assertEqual(reconnect.call_count, 1)
+
+        client = Mock()
+        client.ping.return_value = True
+        now[0] = 112.0
+        with patch("manager.docker.from_env", return_value=client) as reconnect:
+            self.assertTrue(proxy.ping())
+            self.assertTrue(proxy.ping())
+
+        reconnect.assert_called_once_with()
+        self.assertEqual(client.ping.call_count, 2)
+
+    def test_in_progress_reconnect_does_not_queue_another_caller(self):
+        entered = threading.Event()
+        release = threading.Event()
+        first_error = []
+
+        def hung_connect():
+            entered.set()
+            release.wait(timeout=2)
+            raise docker.errors.DockerException("daemon timed out")
+
+        proxy = _RetryingDockerClient(retry_interval=5)
+
+        def first_caller():
+            try:
+                proxy.ping()
+            except docker.errors.DockerException as exc:
+                first_error.append(exc)
+
+        with patch("manager.docker.from_env", side_effect=hung_connect) as reconnect:
+            thread = threading.Thread(target=first_caller)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                docker.errors.DockerException, "reconnect is already in progress"
+            ):
+                proxy.ping()
+            elapsed = time.monotonic() - started
+            release.set()
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(reconnect.call_count, 1)
+        self.assertEqual(len(first_error), 1)

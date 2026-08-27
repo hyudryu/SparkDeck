@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sparkdeck.models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.storage import (
+    COMMUNITY_CONSENT_CONTRACT_VERSION,
     COMMUNITY_EVIDENCE_POLICY,
     COMMUNITY_UPLOAD_FIELDS,
     SparkDeckStore,
@@ -236,6 +237,37 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(len(uploads), 2)
         self.assertTrue(all(set(item) <= COMMUNITY_UPLOAD_FIELDS for item in uploads))
 
+    def test_migration_requires_fresh_consent_for_expanded_payload_contract(self):
+        sample = BenchmarkSample(
+            id="legacy-consent", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={"context_length": 4096},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=300, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.set_community_consent(True)
+        self.store.add_benchmark(sample, queue=True)
+        with self.store._connection:
+            self.store._connection.execute(
+                "DELETE FROM settings WHERE key = ?",
+                ("community_consent_contract_version",),
+            )
+
+        database = self.store.path
+        self.store.close()
+        self.store = SparkDeckStore(database)
+
+        self.assertFalse(self.store.sync_status()["consent"])
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.benchmarks()[1], 1)
+        self.assertEqual(
+            self.store.get_setting("community_consent_contract_version"),
+            COMMUNITY_CONSENT_CONTRACT_VERSION,
+        )
+
     def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
         sample = BenchmarkSample(
             id="legacy-hardware", created_at="2026-08-25T00:00:00+00:00",
@@ -455,12 +487,15 @@ class SparkDeckStoreTests(unittest.TestCase):
             "concurrency": 5, "tensor_parallel_size": 2,
         }])
 
-    def test_upload_omits_tp_for_ordinary_sample_without_concurrency(self):
+    def test_upload_omits_untrusted_benchmark_dimensions_for_ordinary_sample(self):
         sample = BenchmarkSample(
             id="ordinary-tp", created_at="2026-08-27T00:00:00+00:00",
             deployment_id="dep-1", model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
-            configuration={"context_length": 16384, "tensor_parallel_size": 4},
+            configuration={
+                "context_length": 16384, "benchmark_concurrency": 3,
+                "tensor_parallel_size": 4,
+            },
             input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
             generation_tokens_per_second=50, prompt_tokens_per_second=100,
             cold_start=False, eligible_for_community=True,
@@ -470,6 +505,7 @@ class SparkDeckStoreTests(unittest.TestCase):
 
         local, _ = self.store.benchmarks()
         self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
+        self.assertEqual(local[0]["configuration"]["benchmark_concurrency"], 3)
         self.assertEqual(self.store.outbox_batch(), [{
             "model_id": "org/model", "context_window_size": 16384,
             "inference_tokens_per_second": 50.0,
@@ -492,6 +528,11 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.add_benchmark(sample, queue=False)
         self.store.add_benchmark(replace(
             sample, id="eligible-2", generation_tokens_per_second=100,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="invalid-coordinated-marker",
+            configuration={"context_length": 4096, "benchmark_concurrency": 3},
+            generation_tokens_per_second=90,
         ), queue=False)
         self.store.add_benchmark(replace(
             sample, id="ineligible", eligible_for_community=False,
@@ -521,7 +562,7 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "context_window_size": 4096,
                 "inference_tokens_per_second": 90.0,
-                "sample_count": 2,
+                "sample_count": 3,
             },
             {
                 "model_id": "org/model",

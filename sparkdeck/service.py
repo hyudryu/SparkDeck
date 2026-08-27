@@ -41,7 +41,7 @@ _SAFE_CONFIGURATION_KEYS = {
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
-    "runtime_version", "benchmark_concurrency",
+    "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -571,11 +571,14 @@ class SparkDeckService:
             and math.isfinite(generation_tokens_per_second)
         ):
             raise ValueError("derived benchmark throughput is outside the supported range")
+        model_id = _public_model_id(
+            (deployment.get("model") or {}).get("repository") or "local-model"
+        )
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "deployment_id": deployment.get("id"),
-            "model_id": str((deployment.get("model") or {}).get("repository") or "local-model"),
+            "model_id": model_id,
             "context_window_size": context_window,
             "concurrency": concurrency,
             "tensor_parallel_size": tensor_parallel_size,
@@ -584,14 +587,16 @@ class SparkDeckService:
             "request_count": request_count,
         }
         await asyncio.to_thread(self.store.add_benchmark_series_point, point)
-        model_id = point["model_id"]
         runtime = RuntimeKind(str(deployment.get("runtime") or RuntimeKind.VLLM.value))
         configuration = self._safe_configuration({
             **settings,
             "context_length": context_window,
-            "benchmark_concurrency": concurrency,
             "tensor_parallel_size": tensor_parallel_size,
         })
+        # This marker is trusted run metadata, not a deployment setting. Keep
+        # it out of the general configuration allowlist so ordinary proxy
+        # samples cannot impersonate coordinated runs.
+        configuration["benchmark_concurrency"] = concurrency
         hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
         eligible_for_community = bool(
             model_id != "local-model"
@@ -1671,6 +1676,8 @@ class SparkDeckService:
         self, deployment: dict[str, Any]
     ) -> tuple[dict[str, Any], bool]:
         """Resolve benchmark hardware from the cluster member that serves requests."""
+        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+            return self._unknown_hardware_snapshot(), False
         manager_id = (deployment.get("settings") or {}).get("manager_deployment_id")
         if not manager_id:
             return self._hardware_snapshot(), True

@@ -323,6 +323,30 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.node_registry.request.await_count, 2)
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
+    async def test_remote_missing_container_fails_over_without_stream(self):
+        # The agent types a missing container as a 404 with a
+        # ``replica_unavailable`` detail; ``NodeRegistry.request`` wraps that
+        # as a RuntimeError, which must still be treated as availability.
+        detail = json.dumps({
+            "detail": {
+                "type": "replica_unavailable",
+                "message": "No managed container found for repl-1-r0",
+            },
+        })
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError(f"Node 0 agent error: HTTP 404: {detail}"),
+            {"choices": [], "ok": True},
+        ])
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(manager.node_registry.request.await_count, 2)
+        second = manager.node_registry.request.await_args_list[1]
+        self.assertEqual(second.args[0], "remote-2")
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
     class UnavailableResponse:
@@ -375,17 +399,23 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
         manager.node_registry.open_stream = AsyncMock(side_effect=[
             ErrorStreamResponse(503), StreamResponse(),
         ])
+        route_observation = {}
 
         stream = await manager.proxy_cluster_inference(
             "repl-1", "org/model",
             {"model": "org/model", "messages": [], "stream": True},
             "chat/completions",
+            route_observation=route_observation,
         )
+        self.assertEqual(route_observation, {})
         chunks = [chunk async for chunk in stream]
 
         self.assertEqual(chunks[0], 'data: {"choices": []}\n\n')
         self.assertNotIn("runtime disappeared", "".join(chunks))
         self.assertEqual(manager.node_registry.open_stream.await_count, 2)
+        self.assertEqual(
+            route_observation["member"]["node_id"], "remote-2",
+        )
 
     async def test_remote_codeless_stream_error_before_output_fails_over(self):
         manager = build_manager(replicated_deployment())

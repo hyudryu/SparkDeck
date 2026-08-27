@@ -2837,6 +2837,18 @@ class Manager:
         return f"data: {json.dumps({'error': error})}\n\n"
 
     @staticmethod
+    def _observe_cluster_serving_member(
+        observation: dict | None, member: dict,
+    ) -> None:
+        """Publish the member that actually committed a response."""
+        if observation is None:
+            return
+        observation["member"] = {
+            key: member.get(key)
+            for key in ("node_id", "node_name", "container_name", "rank")
+        }
+
+    @staticmethod
     def _cluster_failover_retryable(exc: BaseException) -> bool:
         """True when a replica failure is worth retrying on another replica.
 
@@ -2859,6 +2871,9 @@ class Manager:
                 or "no connectable endpoints" in message
                 or "remote node not found" in message
                 or "is disabled" in message
+                # NodeRegistry.request embeds the agent's typed 404 detail
+                # when a member's container is missing.
+                or "replica_unavailable" in message
                 or bool(re.search(r"HTTP 5\d\d", message))
             )
         return False
@@ -2872,6 +2887,8 @@ class Manager:
         body: dict,
         endpoint: str,
         cancel: asyncio.Event | None,
+        initial_member: dict,
+        route_observation: dict | None,
     ):
         """Relay a stream, failing over until its first real SSE event.
 
@@ -2884,6 +2901,7 @@ class Manager:
 
         async def relay():
             current = stream
+            current_member = initial_member
             candidates = iter(remaining)
             failure: BaseException | None = None
             terminal_chunk: str | None = None
@@ -2903,6 +2921,7 @@ class Manager:
                             current = await self._proxy_cluster_member(
                                 deployment, member, model, body, endpoint, cancel,
                             )
+                            current_member = member
                         except ClientAbort:
                             raise
                         except Exception as exc:
@@ -2955,6 +2974,9 @@ class Manager:
 
                     # The first real event commits output to this replica; no
                     # later failure may be replayed without risking duplicates.
+                    self._observe_cluster_serving_member(
+                        route_observation, current_member,
+                    )
                     yield first_chunk
                     async for chunk in current:
                         yield chunk
@@ -2972,6 +2994,7 @@ class Manager:
         body: dict,
         endpoint: str,
         cancel: asyncio.Event | None = None,
+        route_observation: dict | None = None,
     ):
         """Proxy to a cluster member, balancing replicas and failing over."""
         deployment = self._deployment(deployment_id)
@@ -2988,8 +3011,11 @@ class Manager:
                 if body.get("stream"):
                     return self._cluster_stream_with_failover(
                         result, candidates[index + 1:], deployment, model,
-                        body, endpoint, cancel,
+                        body, endpoint, cancel, member, route_observation,
                     )
+                self._observe_cluster_serving_member(
+                    route_observation, member,
+                )
                 return result
             except ClientAbort:
                 raise

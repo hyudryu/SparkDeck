@@ -342,7 +342,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         ))
         insertion_started = threading.Event()
         release_insertion = threading.Event()
-        original_add = self.service.store.add_benchmark
+        original_add = self.service.store.add_coordinated_benchmark
 
         def blocking_add(*args, **kwargs):
             insertion_started.set()
@@ -350,7 +350,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 raise TimeoutError("test did not release benchmark insertion")
             return original_add(*args, **kwargs)
 
-        with patch.object(self.service.store, "add_benchmark", side_effect=blocking_add):
+        with patch.object(
+            self.service.store, "add_coordinated_benchmark", side_effect=blocking_add,
+        ):
             record_task = asyncio.create_task(
                 self.service.record_benchmark_series_point({
                     "deployment_id": "dep-consent-race", "concurrency": 1,

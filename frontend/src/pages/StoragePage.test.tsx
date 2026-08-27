@@ -127,6 +127,29 @@ describe('StoragePage', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Queued org/model for transfer to Backup Spark.')
   })
 
+  it('shows partial caches with a warning and excludes them from transfers', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              ...node.models,
+              { model_id: 'org/partial-model', size_bytes: 400_000_000, partial: true },
+            ],
+          }
+        : node),
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const partial = await screen.findByLabelText('Partial cache org/partial-model on Studio Spark')
+    expect(partial).toHaveTextContent('Partial')
+    expect(partial).toHaveAttribute('draggable', 'false')
+    expect(screen.getByLabelText('Partial cache')).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'org/partial-model' })).not.toBeInTheDocument()
+  })
+
   it('supports drag transfer, per-node deletion, and queue cancellation', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

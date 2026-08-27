@@ -469,6 +469,29 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached_main.status_code, 201)
         create.assert_awaited_once()
 
+    async def test_recipe_rejects_partial_cache_even_if_it_advertises_main(self):
+        recipe = {
+            "id": "partial-cache", "model": "org/model", "engine": "vllm",
+            "extra_args": [],
+        }
+        inventory = [{
+            "id": "local", "models": [{
+                "model_id": "org/model", "size_bytes": 12,
+                "partial": True, "revisions": ["main"],
+            }],
+        }]
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
+            patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=inventory)),
+            patch.object(server.sparkdeck, "create_deployment", AsyncMock()) as create,
+        ):
+            response = await self.client.post("/api/v1/recipes/partial-cache/deploy")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("model weights are not available", response.text)
+        create.assert_not_awaited()
+
     async def test_valid_local_path_recipe_skips_hub_cache_preflight(self):
         recipe = {
             "id": "local-path", "model": "/models/local", "engine": "vllm",

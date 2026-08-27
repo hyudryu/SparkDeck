@@ -289,6 +289,7 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
+  cluster_node_name?: string
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.
   default_runtime?: RuntimeKind

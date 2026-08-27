@@ -93,12 +93,13 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         point = await self.service.record_benchmark_series_point({
             "deployment_id": "dep-series", "concurrency": 5,
             "request_count": 10, "prompt_tokens": 1000,
-            "generation_tokens": 500, "wall_seconds": 2.0,
+            "generation_tokens": 500, "prompt_seconds": 0.5,
+            "wall_seconds": 2.0,
         })
 
         self.assertEqual(point["context_window_size"], 16384)
         self.assertEqual(point["tensor_parallel_size"], 2)
-        self.assertEqual(point["prompt_tokens_per_second"], 500.0)
+        self.assertEqual(point["prompt_tokens_per_second"], 2000.0)
         self.assertEqual(point["generation_tokens_per_second"], 250.0)
         self.assertEqual(self.service.store.benchmark_model_detail("org/model")["points"][0]["concurrency"], 5)
         self.assertEqual(self.service.store.outbox_batch(), [{
@@ -124,7 +125,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 point = await self.service.record_benchmark_series_point({
                     "deployment_id": deployment_id, "concurrency": 1,
                     "request_count": 2, "prompt_tokens": 100,
-                    "generation_tokens": 50, "wall_seconds": 1,
+                    "generation_tokens": 50, "prompt_seconds": 0.25,
+                    "wall_seconds": 1,
                 })
 
                 self.assertEqual(point["model_id"], "local-model")
@@ -160,7 +162,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.record_benchmark_series_point({
             "deployment_id": "external-series", "concurrency": 1,
             "request_count": 2, "prompt_tokens": 100,
-            "generation_tokens": 50, "wall_seconds": 1,
+            "generation_tokens": 50, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
         })
 
         samples, total = self.service.store.benchmarks()
@@ -189,7 +192,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         point = await self.service.record_benchmark_series_point({
             "deployment_id": "manager-only", "concurrency": 2,
             "request_count": 4, "prompt_tokens": 400,
-            "generation_tokens": 80, "wall_seconds": 2,
+            "generation_tokens": 80, "prompt_seconds": 0.5,
+            "wall_seconds": 2,
         })
 
         self.assertEqual(point["deployment_id"], "manager-only")
@@ -230,7 +234,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         point = await self.service.record_benchmark_series_point({
             "deployment_id": "manager-stored", "concurrency": 1,
             "request_count": 2, "prompt_tokens": 200,
-            "generation_tokens": 40, "wall_seconds": 1,
+            "generation_tokens": 40, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
         })
 
         self.assertEqual(point["deployment_id"], "sparkdeck-record")
@@ -248,20 +253,23 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             await self.service.record_benchmark_series_point({
                 "deployment_id": "dep-series", "concurrency": 3,
                 "request_count": 2, "prompt_tokens": 100,
-                "generation_tokens": 50, "wall_seconds": 1,
+                "generation_tokens": 50, "prompt_seconds": 0.25,
+                "wall_seconds": 1,
             })
 
         with self.assertRaisesRegex(ValueError, "at least the measured concurrency"):
             await self.service.record_benchmark_series_point({
                 "deployment_id": "dep-series", "concurrency": 10,
                 "request_count": 5, "prompt_tokens": 100,
-                "generation_tokens": 50, "wall_seconds": 1,
+                "generation_tokens": 50, "prompt_seconds": 0.25,
+                "wall_seconds": 1,
             })
 
         base = {
             "deployment_id": "dep-series", "concurrency": 1,
             "request_count": 2, "prompt_tokens": 100,
-            "generation_tokens": 50, "wall_seconds": 1,
+            "generation_tokens": 50, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
         }
         for field in ("concurrency", "request_count", "prompt_tokens", "generation_tokens"):
             with self.subTest(field=field):
@@ -269,6 +277,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                     await self.service.record_benchmark_series_point({
                         **base, field: 1.9,
                     })
+
+        without_prompt_timing = dict(base)
+        without_prompt_timing.pop("prompt_seconds")
+        with self.assertRaisesRegex(ValueError, "prompt_seconds must be a positive number"):
+            await self.service.record_benchmark_series_point(without_prompt_timing)
+
+        with self.assertRaisesRegex(ValueError, "without measured prompt tokens"):
+            await self.service.record_benchmark_series_point({
+                **base, "prompt_tokens": 0,
+            })
 
         with self.assertRaisesRegex(ValueError, "derived benchmark throughput"):
             await self.service.record_benchmark_series_point({
@@ -288,7 +306,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.record_benchmark_series_point({
             "deployment_id": "dep-quality", "concurrency": 1,
             "request_count": 2, "prompt_tokens": 100,
-            "generation_tokens": 1, "wall_seconds": 1,
+            "generation_tokens": 1, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
         })
         self.service._managed_hardware_snapshot = AsyncMock(return_value=(
             {"hardware_class": "unknown", "gpu_count": None, "gpus": []}, False,
@@ -296,7 +315,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.record_benchmark_series_point({
             "deployment_id": "dep-quality", "concurrency": 1,
             "request_count": 2, "prompt_tokens": 100,
-            "generation_tokens": 50, "wall_seconds": 1,
+            "generation_tokens": 50, "prompt_seconds": 0.25,
+            "wall_seconds": 1,
         })
 
         samples, total = self.service.store.benchmarks()
@@ -307,6 +327,49 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.benchmark_model_detail("org/model")["points"][0]["sample_count"],
             2,
         )
+
+    async def test_coordinated_queueing_serializes_with_consent_withdrawal(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-consent-race", alias="consent-race",
+            runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            settings={"context_length": 4096},
+        ))
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        self.service._managed_hardware_snapshot = AsyncMock(return_value=(
+            {"hardware_class": "dgx-spark", "gpu_count": 1, "gpus": []}, True,
+        ))
+        insertion_started = threading.Event()
+        release_insertion = threading.Event()
+        original_add = self.service.store.add_benchmark
+
+        def blocking_add(*args, **kwargs):
+            insertion_started.set()
+            if not release_insertion.wait(timeout=5):
+                raise TimeoutError("test did not release benchmark insertion")
+            return original_add(*args, **kwargs)
+
+        with patch.object(self.service.store, "add_benchmark", side_effect=blocking_add):
+            record_task = asyncio.create_task(
+                self.service.record_benchmark_series_point({
+                    "deployment_id": "dep-consent-race", "concurrency": 1,
+                    "request_count": 2, "prompt_tokens": 100,
+                    "generation_tokens": 50, "prompt_seconds": 0.25,
+                    "wall_seconds": 1,
+                })
+            )
+            self.assertTrue(await asyncio.to_thread(insertion_started.wait, 2))
+            withdraw_task = asyncio.create_task(
+                self.service.set_community_consent(False)
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(withdraw_task.done())
+            release_insertion.set()
+            await asyncio.gather(record_task, withdraw_task)
+
+        self.assertFalse(self.service.store.sync_status()["consent"])
+        self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_upload_worker_drains_exact_privacy_payload_with_idempotency(self):
         requests = []

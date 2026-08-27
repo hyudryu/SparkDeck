@@ -63,6 +63,46 @@ describe('StoragePage', () => {
     }))
   })
 
+  it('reports node capacity as model usage plus real free space, not raw disk size', async () => {
+    const gib = 1024 ** 3
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: [
+        {
+          id: 'node-e', name: 'Tight Spark', online: true, total_size: 900 * gib, free_size: 100 * gib,
+          models: [{ model_id: 'org/big', size_bytes: 400 * gib, revision: 'main', file_count: 4 }],
+        },
+        {
+          id: 'node-f', name: 'Full Spark', online: true, total_size: 900 * gib, free_size: 0,
+          models: [{ model_id: 'org/full', size_bytes: 100 * gib }],
+        },
+        {
+          id: 'node-d', name: 'Cold Spark', online: false, total_size: 3_000_000_000, free_size: 50 * gib,
+          models: [{ model_id: 'org/offline-model', size_bytes: 500_000_000 }],
+        },
+      ],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => json(storage))
+    vi.stubGlobal('fetch', fetchMock)
+    render(<StoragePage />)
+
+    expect(await screen.findByText('400 GB used')).toBeInTheDocument()
+    expect(screen.getByText('100 GB free')).toBeInTheDocument()
+    expect(screen.getByText('500 GB total')).toBeInTheDocument()
+    expect(screen.queryByText('900 GB total')).not.toBeInTheDocument()
+    const track = screen.getByLabelText('Tight Spark used model storage')
+    expect(track.firstElementChild).toHaveStyle({ width: '80%' })
+    // A zero free reading is a genuinely full disk, not missing telemetry.
+    expect(screen.getByText('0 B free')).toBeInTheDocument()
+    expect(screen.getByText('100 GB total')).toBeInTheDocument()
+    const fullTrack = screen.getByLabelText('Full Spark used model storage')
+    expect(fullTrack.firstElementChild).toHaveStyle({ width: '100%' })
+    // Offline nodes keep the raw disk total because their model inventory
+    // cannot be validated.
+    expect(screen.getByText('2.8 GB total')).toBeInTheDocument()
+    expect(screen.queryByText('50 GB free')).not.toBeInTheDocument()
+  })
+
   it('queues a transfer from the keyboard and touch-friendly form', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

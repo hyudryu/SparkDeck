@@ -1,0 +1,364 @@
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, Mock
+
+from manager import ClientAbort, Manager
+
+
+def member(rank: int, node_id: str, container_name: str) -> dict:
+    return {
+        "rank": rank,
+        "node_id": node_id,
+        "node_name": f"Node {rank}",
+        "container_name": container_name,
+    }
+
+
+def replicated_deployment() -> dict:
+    return {
+        "id": "repl-1",
+        "model": "org/model",
+        "mode": "replicated",
+        "launch_settings": {},
+        "members": [
+            member(0, "remote-1", "repl-1-r0"),
+            member(1, "remote-2", "repl-1-r1"),
+        ],
+    }
+
+
+def build_manager(deployment: dict) -> Manager:
+    manager = Manager.__new__(Manager)
+    manager.deployments = [deployment]
+    manager.node_registry = Mock()
+    manager.node_registry.request = AsyncMock(return_value={"choices": []})
+    manager.node_registry.open_stream = AsyncMock()
+    manager._acquire_inference_slot = AsyncMock(return_value=None)
+    manager._release_inference_slot = Mock()
+    return manager
+
+
+def proxied_containers(manager: Manager) -> list[str]:
+    return [
+        call.kwargs["json_body"]["_sparkdeck_container_name"]
+        for call in manager.node_registry.request.await_args_list
+    ]
+
+
+def member_loads(manager: Manager, deployment: dict) -> list[int]:
+    return [
+        manager._cluster_member_active("repl-1", m)
+        for m in deployment["members"]
+    ]
+
+
+class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
+    async def proxy(self, manager: Manager, **overrides):
+        body = {"model": "org/model", "messages": [], "stream": False, **overrides}
+        return await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+
+    async def test_idle_replicas_alternate_requests(self):
+        manager = build_manager(replicated_deployment())
+
+        for _ in range(4):
+            await self.proxy(manager)
+
+        self.assertEqual(
+            proxied_containers(manager),
+            ["repl-1-r0", "repl-1-r1", "repl-1-r0", "repl-1-r1"],
+        )
+        nodes = [
+            call.args[0] for call in manager.node_registry.request.await_args_list
+        ]
+        self.assertEqual(nodes, ["remote-1", "remote-2", "remote-1", "remote-2"])
+
+    async def test_least_loaded_replica_receives_concurrent_request(self):
+        manager = build_manager(replicated_deployment())
+        first_started = asyncio.Event()
+
+        async def slow_rank_zero(node_id, method, path, *, json_body=None, timeout=30):
+            if json_body["_sparkdeck_container_name"] == "repl-1-r0":
+                first_started.set()
+                await asyncio.sleep(0.05)
+            return {"choices": []}
+
+        manager.node_registry.request = AsyncMock(side_effect=slow_rank_zero)
+
+        first = asyncio.create_task(self.proxy(manager))
+        await first_started.wait()
+        second = await self.proxy(manager)
+        await first
+
+        self.assertEqual(second, {"choices": []})
+        # Rank 0 is still busy with the first request, so the second one
+        # must route to the idle replica.
+        self.assertEqual(proxied_containers(manager)[1], "repl-1-r1")
+        self.assertEqual(
+            member_loads(manager, manager.deployments[0]), [0, 0]
+        )
+
+    def test_balanced_selection_prefers_least_loaded_member(self):
+        manager = build_manager(replicated_deployment())
+        deployment = manager.deployments[0]
+        members = Manager._cluster_members_sorted(deployment)
+
+        manager._acquire_cluster_member("repl-1", members[0])
+        manager._acquire_cluster_member("repl-1", members[0])
+
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual(order[0]["container_name"], "repl-1-r1")
+
+    def test_single_mode_deployment_always_routes_to_primary(self):
+        deployment = replicated_deployment()
+        deployment["mode"] = "single"
+        deployment["members"] = deployment["members"][:1]
+        manager = build_manager(deployment)
+
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual([m["container_name"] for m in order], ["repl-1-r0"])
+
+    def test_sharded_deployment_stays_on_rank_zero_under_load(self):
+        deployment = replicated_deployment()
+        deployment["mode"] = "sharded"
+        manager = build_manager(deployment)
+        members = Manager._cluster_members_sorted(deployment)
+        manager._acquire_cluster_member("repl-1", members[0])
+
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual([m["container_name"] for m in order], ["repl-1-r0"])
+
+
+class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
+    async def proxy(self, manager: Manager, **overrides):
+        body = {"model": "org/model", "messages": [], "stream": False, **overrides}
+        return await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+
+    async def test_unreachable_replica_fails_over_to_next(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("could not contact Node 0: connect failed"),
+            {"choices": [], "ok": True},
+        ])
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result, {"choices": [], "ok": True})
+        self.assertEqual(manager.node_registry.request.await_count, 2)
+        second = manager.node_registry.request.await_args_list[1]
+        self.assertEqual(second.args[0], "remote-2")
+        self.assertEqual(
+            second.kwargs["json_body"]["_sparkdeck_container_name"], "repl-1-r1"
+        )
+        # The failed attempt must not leak a load slot.
+        self.assertEqual(
+            member_loads(manager, manager.deployments[0]), [0, 0]
+        )
+
+    async def test_exhausted_replicas_raise_last_error(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("could not contact Node 0"),
+            RuntimeError("could not contact Node 1"),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "Node 1"):
+            await self.proxy(manager)
+        self.assertEqual(manager.node_registry.request.await_count, 2)
+        self.assertEqual(
+            member_loads(manager, manager.deployments[0]), [0, 0]
+        )
+
+    async def test_client_abort_does_not_fail_over(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(
+            side_effect=ClientAbort("client disconnected")
+        )
+
+        with self.assertRaises(ClientAbort):
+            await self.proxy(manager)
+        manager.node_registry.request.assert_awaited_once()
+
+
+class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
+    class StreamResponse:
+        status_code = 200
+
+        def __init__(self):
+            self.closed = False
+
+        async def aiter_lines(self):
+            yield 'data: {"choices": []}'
+            yield "data: [DONE]"
+
+        async def aclose(self):
+            self.closed = True
+
+    class UnavailableResponse:
+        status_code = 503
+
+        async def aread(self):
+            return b"unavailable"
+
+        async def aclose(self):
+            pass
+
+    async def test_stream_releases_replica_load_after_consumption(self):
+        manager = build_manager(replicated_deployment())
+        response = self.StreamResponse()
+        manager.node_registry.open_stream = AsyncMock(return_value=response)
+        deployment = manager.deployments[0]
+        body = {"model": "org/model", "messages": [], "stream": True}
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+        self.assertEqual(sum(member_loads(manager, deployment)), 1)
+
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertTrue(response.closed)
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_failed_stream_open_fails_over_and_releases(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.open_stream = AsyncMock(side_effect=[
+            self.UnavailableResponse(),
+            self.StreamResponse(),
+        ])
+        deployment = manager.deployments[0]
+        body = {"model": "org/model", "messages": [], "stream": True}
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertEqual(manager.node_registry.open_stream.await_count, 2)
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+
+class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
+    def manager(self):
+        deployment = replicated_deployment()
+        deployment["members"] = [
+            member(0, "local", "repl-1-r0"),
+            member(1, "remote-2", "repl-1-r1"),
+        ]
+        manager = build_manager(deployment)
+        manager._vllm_chat = AsyncMock(return_value={"choices": []})
+        manager._vllm_completions = AsyncMock(return_value={"choices": []})
+        return manager, deployment
+
+    async def test_local_and_remote_replicas_share_work(self):
+        manager, deployment = self.manager()
+
+        for _ in range(2):
+            await self.manager_proxy(manager)
+
+        manager._vllm_chat.assert_awaited_once()
+        self.assertEqual(
+            manager._vllm_chat.await_args.kwargs["container_name"], "repl-1-r0"
+        )
+        remote_calls = manager.node_registry.request.await_args_list
+        self.assertEqual(len(remote_calls), 1)
+        self.assertEqual(remote_calls[0].args[0], "remote-2")
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_replica_failure_fails_over_to_remote(self):
+        manager, deployment = self.manager()
+        manager._vllm_chat = AsyncMock(
+            side_effect=RuntimeError("local container unavailable")
+        )
+        manager.node_registry.request = AsyncMock(
+            return_value={"choices": [], "ok": True}
+        )
+
+        result = await self.manager_proxy(manager)
+
+        self.assertEqual(result["ok"], True)
+        manager.node_registry.request.assert_awaited_once()
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_stream_releases_load_after_consumption(self):
+        manager, deployment = self.manager()
+
+        async def fake_stream(*args, **kwargs):
+            async def gen():
+                yield "chunk-1"
+                yield "chunk-2"
+
+            return gen()
+
+        manager._vllm_chat = AsyncMock(side_effect=fake_stream)
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": True},
+            "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks, ["chunk-1", "chunk-2"])
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def manager_proxy(self, manager: Manager, **overrides):
+        body = {"model": "org/model", "messages": [], "stream": False, **overrides}
+        return await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+
+
+class ReplicaHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replicated_health_ready_when_any_replica_ready(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": False}, {"ready": True},
+        ])
+
+        self.assertTrue(
+            await manager.cluster_deployment_health("repl-1", "org/model")
+        )
+        containers = [
+            call.kwargs["json_body"]["_sparkdeck_container_name"]
+            for call in manager.node_registry.request.await_args_list
+        ]
+        self.assertEqual(sorted(containers), ["repl-1-r0", "repl-1-r1"])
+
+    async def test_replicated_health_down_when_all_replicas_unready(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(return_value={"ready": False})
+
+        self.assertFalse(
+            await manager.cluster_deployment_health("repl-1", "org/model")
+        )
+
+    async def test_replica_agent_error_counts_as_unhealthy(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(side_effect=[
+            RuntimeError("could not contact Node 0"), {"ready": True},
+        ])
+
+        self.assertTrue(
+            await manager.cluster_deployment_health("repl-1", "org/model")
+        )
+
+    async def test_legacy_deployment_without_mode_keeps_primary_health(self):
+        deployment = replicated_deployment()
+        deployment.pop("mode")
+        manager = build_manager(deployment)
+        manager.node_registry.request = AsyncMock(return_value={"ready": True})
+
+        self.assertTrue(
+            await manager.cluster_deployment_health("repl-1", "org/model")
+        )
+        manager.node_registry.request.assert_awaited_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

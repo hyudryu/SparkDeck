@@ -278,6 +278,7 @@ class SparkDeckService:
             token_provider=lambda: getattr(manager, "_resolved_hf_token", lambda: "")(),
         )
         self._deployment_create_lock = asyncio.Lock()
+        self._deployment_launches: dict[str, asyncio.Event] = {}
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
@@ -919,42 +920,52 @@ class SparkDeckService:
             # launch or cleanup fails, onboarding still has a durable signal
             # that this controller may own a managed workload.
             deployment.container_name = cleanup_name
-            self.store.add_deployment(deployment, None, None)
+            launch_complete = asyncio.Event()
+            self._deployment_launches[deployment_id] = launch_complete
             try:
-                launched = await launch_managed_container(
-                    self.manager, adapter, deployment_id, alias, model,
-                    {
-                        **settings,
-                        "artifact": identity.artifact,
-                        "revision": identity.revision,
-                    },
-                )
-                deployment.container_name = launched.get("name")
-                deployment.settings = self._local_configuration({
-                    **settings,
-                    "model_source": launched.get("model_source") or "unknown",
-                })
-                port = launched.get("port")
-                if not deployment.container_name or not port:
-                    raise RuntimeError("runtime launched without a discoverable container endpoint")
-                cleanup_name = deployment.container_name
-                self.store.update_managed_routing(
-                    deployment.id, deployment.settings, deployment.container_name,
-                    f"http://127.0.0.1:{int(port)}",
-                )
-            except Exception:
-                cleaned = False
+                self.store.add_deployment(deployment, None, None)
                 try:
-                    await self.manager.remove_container(cleanup_name)
-                    cleaned = True
-                except Exception as cleanup_error:
-                    cleaned = _is_missing_container_error(cleanup_error)
-                if cleaned:
-                    self.store.delete_deployment(deployment_id)
-                raise
-            result = self.store.deployment(deployment_id) or deployment.to_dict()
-            result.update({"status": launched.get("status", "running"), "port": int(port)})
-            return result
+                    launched = await launch_managed_container(
+                        self.manager, adapter, deployment_id, alias, model,
+                        {
+                            **settings,
+                            "artifact": identity.artifact,
+                            "revision": identity.revision,
+                        },
+                    )
+                    deployment.container_name = launched.get("name")
+                    deployment.settings = self._local_configuration({
+                        **settings,
+                        "model_source": launched.get("model_source") or "unknown",
+                    })
+                    port = launched.get("port")
+                    if not deployment.container_name or not port:
+                        raise RuntimeError(
+                            "runtime launched without a discoverable container endpoint"
+                        )
+                    cleanup_name = deployment.container_name
+                    self.store.update_managed_routing(
+                        deployment.id, deployment.settings, deployment.container_name,
+                        f"http://127.0.0.1:{int(port)}",
+                    )
+                except Exception:
+                    cleaned = False
+                    try:
+                        await self.manager.remove_container(cleanup_name)
+                        cleaned = True
+                    except Exception as cleanup_error:
+                        cleaned = _is_missing_container_error(cleanup_error)
+                    if cleaned:
+                        self.store.delete_deployment(deployment_id)
+                    raise
+                result = self.store.deployment(deployment_id) or deployment.to_dict()
+                result.update({
+                    "status": launched.get("status", "running"), "port": int(port),
+                })
+                return result
+            finally:
+                launch_complete.set()
+                self._deployment_launches.pop(deployment_id, None)
 
     async def _recover_failed_cluster_launch(
         self, deployment: Deployment, settings: dict[str, Any],
@@ -1062,13 +1073,14 @@ class SparkDeckService:
         return current
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
-        # Creation persists a provisional record before launching Docker. Keep
-        # deletion on the same lock so it cannot remove that record while the
-        # launch is still in flight and leave an untracked container behind.
-        async with self._deployment_create_lock:
-            return await self._delete_deployment_locked(deployment_id)
-
-    async def _delete_deployment_locked(self, deployment_id: str) -> dict[str, Any]:
+        # A provisional row is visible while Docker launch is in flight. Wait
+        # only for that deployment to settle; unrelated removals must remain
+        # responsive during a slow image pull or container startup.
+        provisional = self.store.deployment(deployment_id, include_private=True)
+        if provisional:
+            launch_complete = self._deployment_launches.get(provisional["id"])
+            if launch_complete is not None:
+                await launch_complete.wait()
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = False
         if not deployment and deployment_id.startswith("container:"):

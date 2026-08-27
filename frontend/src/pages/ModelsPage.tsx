@@ -177,6 +177,7 @@ export function ModelsPage() {
   const [logText, setLogText] = useState('')
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState<string>()
+  const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -285,6 +286,56 @@ export function ModelsPage() {
     } finally {
       setBusy(undefined)
     }
+  }
+
+  const confirmStart = async () => {
+    if (!startSelection) return
+    const { deployment, nodeIds } = startSelection
+    setBusy(deployment.id)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      await api.deployments.action(deployment.id, 'start', nodeIds)
+      setActionNotice(`Starting ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
+      setStartSelection(undefined)
+      resource.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not start deployment')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  // A TP>1 launch is sharded across exactly that many nodes; everything else
+  // runs on one.
+  const deploymentRequiredNodes = (deployment: Deployment) => {
+    if (deployment.runtime === 'llama.cpp') return 1
+    const tensorParallel = deployment.settings.tensor_parallel_size ?? 1
+    return tensorParallel > 1 ? tensorParallel : 1
+  }
+
+  const deploymentWeightedNodes = (deployment: Deployment) => {
+    if (isLocalModelPath(deployment.model_id)) {
+      return new Set(localNodeId ? [localNodeId] : [])
+    }
+    return new Set((modelCache.data?.nodes ?? [])
+      .filter((node) => node.models.some((model) => model.model_id === deployment.model_id
+        && model.revisions?.includes(deployment.model_revision ?? 'main')))
+      .map((node) => node.id))
+  }
+
+  const openStartPicker = (deployment: Deployment) => {
+    const required = deploymentRequiredNodes(deployment)
+    const weighted = nodes.data?.filter((node) => deploymentWeightedNodes(deployment).has(node.id) && isNodeSelectable(node)) ?? []
+    const availableIds = weighted.map((node) => node.id)
+    const saved = (deployment.node_ids ?? []).filter((id) => availableIds.includes(id))
+    let nodeIds = saved.slice(0, required)
+    if (nodeIds.length < required) {
+      // Default to the weighted nodes when they exactly satisfy the layout
+      // (all of them, or the single node holding the weights).
+      nodeIds = [...new Set([...nodeIds, ...availableIds])].slice(0, required)
+    }
+    setStartSelection({ deployment, nodeIds })
   }
 
   const saveRename = async () => {
@@ -601,7 +652,7 @@ export function ModelsPage() {
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.status === 'running' || deployment.status === 'starting'
                       ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
@@ -728,6 +779,52 @@ export function ModelsPage() {
             {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || recipeBusy} onClick={() => void deployRecipe()}><Play size={15} /> {recipeBusy ? 'Deploying…' : `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
+      {startSelection && (() => {
+        const { deployment, nodeIds } = startSelection
+        const required = deploymentRequiredNodes(deployment)
+        const localPath = isLocalModelPath(deployment.model_id)
+        const weighted = deploymentWeightedNodes(deployment)
+        const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
+        const sharded = required > 1
+        const localRequired = sharded && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
+        const exactCount = nodeIds.length === required
+        const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+        const coordinatorReady = !sharded || Boolean(localNodeId && nodeIds.includes(localNodeId))
+        const ready = !nodes.loading && !nodes.error && exactCount && allEligible && coordinatorReady
+        const startBusy = busy === deployment.id
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
+            <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="start-deployment-title">Start {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} Nodes without the complete model weights are disabled.</p>
+            {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={nodeIds}
+              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
+              loading={nodes.loading || (!localPath && modelCache.loading)}
+              error={nodes.error}
+              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              multiple={sharded}
+              disabled={startBusy}
+              requiredIds={localRequired}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={sharded
+                ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
+                : nodeIds[0]}
+              legend="Deployment nodes"
+              help={localPath ? 'Local model paths can run only on the controller.' : `Only nodes with ${deployment.model_id} already cached can be selected.`}
+            />
+            {sharded && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
+            {allowedIds.length < required && <p className="field-note">Model weights are cached on only {allowedIds.length} of {required} required {required === 1 ? 'node' : 'nodes'}. Copy the weights in Storage first.</p>}
+            {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+            <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

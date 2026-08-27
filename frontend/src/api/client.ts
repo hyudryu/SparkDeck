@@ -229,11 +229,15 @@ export const api = {
       })
       return deploymentFromWire(data)
     },
-    action: async (id: string, action: 'start' | 'stop' | 'remove') => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(`/api/v1/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
       }
-      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
+      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
+        method: 'POST',
+        body,
+      })
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {

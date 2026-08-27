@@ -39,6 +39,9 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Spark Two')).toBeInTheDocument()
     expect(screen.getByText('Spark Three')).toBeInTheDocument()
     expect(screen.getByText(/2 of 3 nodes online/)).toBeInTheDocument()
+    expect(document.querySelector('.community-strip')).toHaveAttribute(
+      'title', 'Sign in and enable telemetry in Settings → Community Features to see community data.')
+    expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
   })
 
   it('keeps local telemetry visible when cluster inventory fails', async () => {

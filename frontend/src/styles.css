@@ -305,6 +305,9 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .args-editor { display: grid; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
 .args-editor .field-grid { gap: 10px; }
 .args-editor .field-note { margin-top: 0; }
+.recipe-transfer-options { display: grid; gap: 9px; padding: 12px; margin-top: 12px; border: 1px solid var(--border-subtle); border-radius: 9px; background: var(--bg-subtle); }
+.recipe-transfer-options > div:first-child > strong, .recipe-transfer-options > div:first-child > small { display: block; }.recipe-transfer-options > div:first-child > strong { font-size: 12px; }.recipe-transfer-options > div:first-child > small, .recipe-transfer-options > p { color: var(--text-secondary); font-size: 11px; }
+.recipe-transfer-targets { display: grid; gap: 6px; }.recipe-transfer-target { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px; background: var(--panel); border: 1px solid var(--border-subtle); border-radius: 7px; }.recipe-transfer-target.unavailable { opacity: .7; }.recipe-transfer-target span { min-width: 0; }.recipe-transfer-target strong, .recipe-transfer-target small { display: block; }.recipe-transfer-target strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.recipe-transfer-target small { margin-top: 2px; color: var(--text-secondary); font-size: 10px; }.recipe-transfer-error { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--danger); font-size: 11px; }
 .args-editor-actions { display: flex; align-items: center; gap: 10px; }
 .sort-field { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
 .rename-row { display: flex; align-items: center; gap: 6px; }

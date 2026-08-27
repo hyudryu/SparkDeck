@@ -429,6 +429,7 @@ export interface StorageNode {
   name: string
   online: boolean
   total_size?: number | null
+  cache_free_size?: number | null
   free_size?: number | null
   models: StorageModel[]
 }
@@ -455,6 +456,31 @@ export interface StorageState {
   nodes: StorageNode[]
   jobs: StorageTransferJob[]
   instructions: string[]
+}
+
+export interface StorageTransferPreflightTarget {
+  node_id: string
+  node_name: string
+  eligible: boolean
+  reason?: string | null
+  free_bytes?: number | null
+  required_free_bytes?: number | null
+  active_job_id?: string | null
+  active_job_status?: string | null
+}
+
+export interface StorageTransferPreflight {
+  enabled: boolean
+  model_id: string
+  revision: string
+  source?: { node_id: string; node_name: string; size_bytes: number } | null
+  targets: StorageTransferPreflightTarget[]
+  staging_reserve_bytes: number
+}
+
+export interface StorageTransferResult {
+  job_ids: string[]
+  jobs: StorageTransferJob[]
 }
 
 export interface ModelCacheState {

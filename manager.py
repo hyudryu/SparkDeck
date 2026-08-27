@@ -2626,16 +2626,98 @@ class Manager:
             timeout=1800,
         )
 
+    @staticmethod
+    def _cluster_members_sorted(deployment: dict) -> list[dict]:
+        return sorted(
+            deployment.get("members") or [],
+            key=lambda member: int(member.get("rank") or 0),
+        )
+
     def _cluster_primary_member(self, deployment_id: str) -> tuple[dict, dict]:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise LookupError("cluster deployment not found")
-        members = sorted(
-            deployment.get("members") or [], key=lambda member: int(member.get("rank") or 0)
-        )
+        members = self._cluster_members_sorted(deployment)
         if not members:
             raise LookupError("cluster deployment has no inference member")
         return deployment, members[0]
+
+    # ----- replicated-deployment load balancing -----
+    @staticmethod
+    def _cluster_member_key(deployment_id: str, member: dict) -> str:
+        identity = member.get("container_name") or member.get("node_id") or ""
+        return f"{deployment_id}:{identity}"
+
+    def _cluster_member_loads(self) -> dict[str, int]:
+        # Several focused tests construct Manager with __new__. Keep this
+        # state lazily initializable so those tests remain lightweight.
+        loads = getattr(self, "_cluster_member_load_counts", None)
+        if loads is None:
+            loads = self._cluster_member_load_counts = {}
+        return loads
+
+    def _cluster_member_active(self, deployment_id: str, member: dict) -> int:
+        return self._cluster_member_loads().get(
+            self._cluster_member_key(deployment_id, member), 0
+        )
+
+    def _acquire_cluster_member(self, deployment_id: str, member: dict) -> None:
+        key = self._cluster_member_key(deployment_id, member)
+        loads = self._cluster_member_loads()
+        loads[key] = loads.get(key, 0) + 1
+
+    def _release_cluster_member(self, deployment_id: str, member: dict) -> None:
+        key = self._cluster_member_key(deployment_id, member)
+        loads = self._cluster_member_loads()
+        loads[key] = max(0, loads.get(key, 0) - 1)
+
+    def _balanced_cluster_member(self, deployment: dict) -> dict:
+        """Pick the least-loaded replica, rotating among equals.
+
+        A replica's load is counted from selection until its response (or
+        stream) finishes, so concurrent arrivals spread across every member.
+        Round-robin tie-breaking keeps an idle cluster alternating instead of
+        funneling every request to rank 0.
+        """
+        members = self._cluster_members_sorted(deployment)
+        deployment_id = str(deployment.get("id") or "")
+        loads = [
+            self._cluster_member_active(deployment_id, member)
+            for member in members
+        ]
+        tied = [
+            member for member, load in zip(members, loads)
+            if load == min(loads)
+        ]
+        rotation = getattr(self, "_cluster_member_rotation", None)
+        if rotation is None:
+            rotation = self._cluster_member_rotation = {}
+        index = rotation.get(deployment_id, 0) % len(tied)
+        rotation[deployment_id] = rotation.get(deployment_id, 0) + 1
+        return tied[index]
+
+    def _cluster_route_order(self, deployment: dict) -> list[dict]:
+        """Members to try for one request, best candidate first.
+
+        Replicated deployments balance across every member and fail over to
+        the next replica when one is unreachable. Sharded ranks form a single
+        engine, so only the rank-0 coordinator may serve a request.
+        """
+        members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") != "replicated" or len(members) < 2:
+            return members[:1]
+        chosen = self._balanced_cluster_member(deployment)
+        return [chosen] + [m for m in members if m is not chosen]
+
+    def _tracked_cluster_stream(self, stream, deployment_id: str, member: dict):
+        async def relay():
+            try:
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                self._release_cluster_member(deployment_id, member)
+
+        return relay()
 
     async def proxy_cluster_inference(
         self,
@@ -2645,30 +2727,73 @@ class Manager:
         endpoint: str,
         cancel: asyncio.Event | None = None,
     ):
-        """Proxy through the selected primary member without bypassing admission."""
-        deployment, primary = self._cluster_primary_member(deployment_id)
-        node_id = primary.get("node_id")
+        """Proxy to a cluster member, balancing replicas and failing over."""
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise LookupError("cluster deployment not found")
+        candidates = self._cluster_route_order(deployment)
+        if not candidates:
+            raise LookupError("cluster deployment has no inference member")
+        for index, member in enumerate(candidates):
+            try:
+                return await self._proxy_cluster_member(
+                    deployment, member, model, body, endpoint, cancel,
+                )
+            except ClientAbort:
+                raise
+            except Exception as exc:
+                if index == len(candidates) - 1:
+                    raise
+                print(
+                    f"[cluster-lb] {deployment_id}: replica on "
+                    f"{member.get('node_name') or member.get('node_id')} failed "
+                    f"({exc}); trying the next replica"
+                )
+        raise LookupError("cluster deployment has no inference member")
+
+    async def _proxy_cluster_member(
+        self,
+        deployment: dict,
+        member: dict,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None,
+    ):
+        """Send one request to a specific member without failover.
+
+        The replica's load is held from selection until its response (or
+        stream) finishes. Once a stream has started producing content the
+        request cannot be retried on another replica, so failover only ever
+        happens before the first byte is forwarded.
+        """
+        deployment_id = str(deployment.get("id") or "")
+        node_id = member.get("node_id")
+        self._acquire_cluster_member(deployment_id, member)
         if node_id == LOCAL_NODE_ID:
-            return (
-                await self._vllm_chat(
-                    model, body, bool(body.get("stream")), cancel,
-                    container_name=primary.get("container_name"),
-                    deployment_id=deployment_id,
-                )
+            proxy = (
+                self._vllm_chat
                 if endpoint == "chat/completions"
-                else await self._vllm_completions(
+                else self._vllm_completions
+            )
+            try:
+                result = await proxy(
                     model, body, bool(body.get("stream")), cancel,
-                    container_name=primary.get("container_name"),
+                    container_name=member.get("container_name"),
                     deployment_id=deployment_id,
                 )
-            )
-        if not node_id:
-            raise LookupError("cluster primary node is unavailable")
+            except BaseException:
+                self._release_cluster_member(deployment_id, member)
+                raise
+            if body.get("stream"):
+                return self._tracked_cluster_stream(result, deployment_id, member)
+            self._release_cluster_member(deployment_id, member)
+            return result
 
         controls = self._deployment_launch_controls(deployment.get("launch_settings") or {})
         admission_container = {
             "deployment_id": deployment_id,
-            "name": primary.get("container_name"),
+            "name": member.get("container_name"),
             "stats_key": model,
             "load_settings": {"max_concurrency": controls.get("max_concurrency")},
         }
@@ -2676,7 +2801,7 @@ class Manager:
         path = f"/api/agent/inference/{endpoint}"
         remote_body = {
             **body,
-            "_sparkdeck_container_name": primary.get("container_name"),
+            "_sparkdeck_container_name": member.get("container_name"),
             "_sparkdeck_deployment_id": deployment_id,
         }
         if body.get("stream"):
@@ -2693,6 +2818,7 @@ class Manager:
                     raise RuntimeError(f"remote inference failed: HTTP {response.status_code}: {detail[:500]}")
             except BaseException:
                 self._release_inference_slot(admission)
+                self._release_cluster_member(deployment_id, member)
                 raise
 
             async def stream_remote():
@@ -2703,6 +2829,7 @@ class Manager:
                 finally:
                     await response.aclose()
                     self._release_inference_slot(admission)
+                    self._release_cluster_member(deployment_id, member)
 
             return stream_remote()
 
@@ -2715,14 +2842,33 @@ class Manager:
             )
         finally:
             self._release_inference_slot(admission)
+            self._release_cluster_member(deployment_id, member)
 
     async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
-        """Check the selected primary member through its authenticated agent."""
-        _, primary = self._cluster_primary_member(deployment_id)
-        node_id = primary.get("node_id")
+        """Check member readiness through authenticated agents.
+
+        A replicated deployment stays healthy while any replica can serve;
+        other modes still depend on their rank-0 primary.
+        """
+        deployment, primary = self._cluster_primary_member(deployment_id)
+        members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") != "replicated" or len(members) < 2:
+            return await self._cluster_member_health(
+                deployment_id, primary, model,
+            )
+        results = await asyncio.gather(*(
+            self._cluster_member_health(deployment_id, member, model)
+            for member in members
+        ), return_exceptions=True)
+        return any(result is True for result in results)
+
+    async def _cluster_member_health(
+        self, deployment_id: str, member: dict, model: str,
+    ) -> bool:
+        node_id = member.get("node_id")
         if node_id == LOCAL_NODE_ID:
             container = await self._resolve_vllm_target(
-                model, container_name=primary.get("container_name"),
+                model, container_name=member.get("container_name"),
                 deployment_id=deployment_id,
             )
             return await self._check_ready(container)
@@ -2730,7 +2876,7 @@ class Manager:
             node_id, "POST", "/api/agent/inference/health",
             json_body={
                 "model": model,
-                "_sparkdeck_container_name": primary.get("container_name"),
+                "_sparkdeck_container_name": member.get("container_name"),
                 "_sparkdeck_deployment_id": deployment_id,
             }, timeout=10,
         )

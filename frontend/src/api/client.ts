@@ -24,6 +24,8 @@ import type {
   StorageTransferJob,
   ModelCacheState,
   SavedConfiguration,
+  SavedConfigurationDetail,
+  RecipeUpdateInput,
   UsageAnalysis,
   UsageSummary,
   SystemUpdateOverview,
@@ -104,6 +106,7 @@ interface WireDeployment {
   port?: number
   node_ids?: string[]
   selected_nodes?: Deployment['selected_nodes']
+  created_at?: string
 }
 
 interface WireBenchmark {
@@ -136,6 +139,7 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
+    created_at: item.created_at,
   }
 }
 
@@ -204,12 +208,26 @@ export const api = {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
       return deploymentFromWire(data)
     },
+    rename: async (id: string, alias: string) => {
+      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ alias }),
+      })
+      return deploymentFromWire(data)
+    },
   },
   recipes: {
     list: async (signal?: AbortSignal) => {
       const data = await request<{ items: SavedConfiguration[] }>('/api/v1/recipes', { signal })
       return data.items
     },
+    get: (id: string, signal?: AbortSignal) =>
+      request<SavedConfigurationDetail>(`/api/v1/recipes/${encodeURIComponent(id)}`, { signal }),
+    update: (id: string, input: RecipeUpdateInput) =>
+      request<SavedConfigurationDetail>(`/api/v1/recipes/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(input),
+      }),
     deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },

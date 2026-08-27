@@ -1477,6 +1477,51 @@ async def v1_recipes():
     return {"items": [_public_recipe(recipe) for recipe in manager.recipes]}
 
 
+def _recipe_detail(recipe: dict) -> dict:
+    """Public saved-configuration contract plus its editable launch inputs."""
+    detail = _public_recipe(recipe)
+    detail["extra_args"] = manager._without_hf_cli_credentials(
+        recipe.get("extra_args") or []
+    )
+    detail["launch_controls"] = manager._deployment_launch_controls(
+        manager._deployment_launch_settings(recipe)
+    )
+    return detail
+
+
+@app.get("/api/v1/recipes/{recipe_id}")
+async def v1_recipe_detail(recipe_id: str):
+    """Return one saved configuration with its editable launch controls."""
+    recipe = await manager.get_recipe(recipe_id)
+    if not recipe:
+        raise HTTPException(404, "saved configuration not found")
+    return _recipe_detail(recipe)
+
+
+@app.put("/api/v1/recipes/{recipe_id}")
+async def v1_update_recipe(recipe_id: str, req: Request):
+    """Update the editable fields of a saved configuration."""
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "name", "extra_args", "launch_controls",
+        "gpu_memory_utilization", "gpu_memory_gb",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        updated = await manager.update_recipe(recipe_id, body)
+    except ValueError as exc:
+        status = 404 if str(exc) == "recipe not found" else 400
+        raise HTTPException(status, str(exc)) from exc
+    return _recipe_detail(updated)
+
+
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
 async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
@@ -1488,9 +1533,13 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             400,
             recipe.get("error") or contract.get("error") or "saved runtime is unsupported",
         )
-    try:
-        body = await req.json()
-    except json.JSONDecodeError:
+    raw_body = await req.body()
+    if raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "request body must be valid JSON") from exc
+    else:
         body = {}
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")
@@ -1578,6 +1627,8 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "community_api_url": "",
+    "default_runtime": "vllm",
+    "default_context_length": 8192,
 }
 
 
@@ -1607,9 +1658,23 @@ async def v1_update_settings(req: Request):
             raise HTTPException(400, "community_api_url must be a valid URL") from e
         if parsed.scheme not in ("http", "https") or not parsed.host:
             raise HTTPException(400, "community_api_url must be an http or https URL")
+    default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
+    if default_runtime not in ("vllm", "llama.cpp", "sglang"):
+        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, or sglang")
+    raw_context_length = body.get(
+        "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
+    )
+    try:
+        default_context_length = int(raw_context_length)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, "default_context_length must be an integer") from e
+    if not 256 <= default_context_length <= 10_000_000:
+        raise HTTPException(400, "default_context_length must be between 256 and 10000000")
     values = {
         "theme": theme,
         "community_api_url": community_api_url,
+        "default_runtime": default_runtime,
+        "default_context_length": default_context_length,
     }
     credential = body.get("hf_token")
     if credential is not None:
@@ -1848,6 +1913,22 @@ async def v1_delete_deployment(deployment_id: str):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.patch("/api/v1/deployments/{deployment_id}")
+async def v1_rename_deployment(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    try:
+        return await sparkdeck.rename_deployment(deployment_id, body.get("alias"))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/v1/benchmarks")

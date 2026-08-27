@@ -21,11 +21,15 @@ SparkDeck is under active development. The management API is not hardened for di
 
 ### Requirements
 
-- Linux with Docker and the NVIDIA Container Toolkit
 - Python 3.11 or newer
 - Node.js 20 or newer with npm (for the web app build)
-- An NVIDIA GPU for GPU-backed runtimes
+- Linux with Docker and the NVIDIA Container Toolkit for the recommended GPU-worker setup
+- Windows 10/11 with PowerShell 5.1 or newer for a native controller or UI node
+- Docker Desktop using its WSL2/Linux-container engine for experimental local-container actions on Windows
+- An NVIDIA GPU and supported container GPU access for GPU-backed runtimes
 - A Hugging Face account for gated models
+
+### Linux
 
 Create a virtual environment, install the dependencies, and start the application:
 
@@ -35,6 +39,35 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ./run.sh
 ```
+
+### Windows
+
+The Windows launcher bootstraps the virtual environment and frontend, then starts SparkDeck in the background:
+
+```powershell
+.\run-windows.cmd
+```
+
+SparkDeck can run as a controller and manage remote Linux/DGX workers when local Docker is unavailable. Local container inventory and deployment actions remain unavailable until Docker Desktop is running with Linux containers; Linux remains the recommended GPU-worker platform.
+
+To install the command shim into your user PATH, run once from the checkout:
+
+```powershell
+.\sparkdeck.cmd install
+```
+
+Open a new PowerShell window after installation. The launcher then supports:
+
+```powershell
+sparkdeck start
+sparkdeck status
+sparkdeck logs
+sparkdeck stop
+sparkdeck restart
+sparkdeck run       # foreground diagnostics
+```
+
+Background output is stored beneath `data/logs/`. The launcher validates its saved process identity before stopping anything and refuses to take over an unrelated process already using port 7878.
 
 Open `http://localhost:7878`. Application state is written beneath `data/`, which is intentionally excluded from version control.
 

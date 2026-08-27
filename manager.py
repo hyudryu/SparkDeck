@@ -97,6 +97,37 @@ PERSISTED_DEPLOYMENT_ARGS_ERROR = (
 )
 
 
+class _RetryingDockerClient:
+    """Reconnect to Docker lazily after the daemon was unavailable at startup.
+
+    Docker's ``from_env`` constructor negotiates an API version immediately,
+    so constructing the process-wide manager used to prevent controller-only
+    installations from starting at all. Keep the normal eager client when it
+    works, but use this small proxy after a connection failure. Every access
+    retries until Docker becomes available, then caches the working client.
+    """
+
+    def __init__(self):
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _connect(self):
+        if self._client is not None:
+            return self._client
+        with self._lock:
+            if self._client is None:
+                try:
+                    self._client = docker.from_env()
+                except docker.errors.DockerException as exc:
+                    raise docker.errors.DockerException(
+                        f"Docker is unavailable: {exc}"
+                    ) from exc
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._connect(), name)
+
+
 def _append_persisted_error(existing: Any, marker: str) -> str:
     current = str(existing or "").strip()
     return current if marker in current else "; ".join(filter(None, [current, marker]))
@@ -439,7 +470,14 @@ class Manager:
         self.hourly_token_stats: dict[str, dict] = self._load_hourly_token_stats()
         # In-flight Spark Run executions (run_id -> run dict). Not persisted.
         self.spark_runs: dict[str, dict] = {}
-        self.client = docker.from_env()
+        try:
+            self.client = docker.from_env()
+        except docker.errors.DockerException as exc:
+            logger.warning(
+                "Docker is unavailable; starting in controller-only mode: %s",
+                exc,
+            )
+            self.client = _RetryingDockerClient()
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.lock = asyncio.Lock()
@@ -7263,7 +7301,10 @@ class Manager:
                     out.append(summary)
             out.sort(key=lambda x: (x["status"] != "running", x["name"]))
             return out
-        containers = await asyncio.to_thread(_run)
+        try:
+            containers = await asyncio.to_thread(_run)
+        except docker.errors.DockerException:
+            return []
         # Attach setup phase (health/log-derived) in parallel.
         if containers:
             phases = await asyncio.gather(
@@ -8047,7 +8088,10 @@ class Manager:
                 })
             out.sort(key=lambda x: (not x["is_vllm"], x["tags"][0] if x["tags"] else ""))
             return out
-        self._images_cache = await asyncio.to_thread(_do)
+        try:
+            self._images_cache = await asyncio.to_thread(_do)
+        except docker.errors.DockerException:
+            return []
         self._images_ts = now
         return self._images_cache
 

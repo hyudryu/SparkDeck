@@ -217,6 +217,8 @@ describe('community features sign-in', () => {
   function stubSettingsFetch(fetchMock: ReturnType<typeof vi.fn<typeof fetch>>, options: {
     idpResponse?: (body: Record<string, unknown>) => Response
     cluster?: { applied: string[]; conflicts: { node: string; email?: string }[]; errors: string[] }
+    pairResponse?: () => Response
+    unpairCluster?: { applied: string[]; conflicts: { node: string; email?: string }[]; errors: string[] }
   } = {}) {
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
@@ -225,13 +227,16 @@ describe('community features sign-in', () => {
         return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      if (path.endsWith('/api/v1/community/pair') && init?.method === 'POST') return new Response(JSON.stringify({
-        pairing: { status: 'paired' },
-        cluster: options.cluster ?? { applied: [], conflicts: [], errors: [] },
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/pair') && init?.method === 'POST') {
+        if (options.pairResponse) return options.pairResponse()
+        return new Response(JSON.stringify({
+          pairing: { status: 'paired' },
+          cluster: options.cluster ?? { applied: [], conflicts: [], errors: [] },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
       if (path.endsWith('/api/v1/community/pair') && init?.method === 'DELETE') return new Response(JSON.stringify({
         pairing: { status: 'not_paired' },
-        cluster: { applied: [], conflicts: [], errors: [] },
+        cluster: options.unpairCluster ?? { applied: [], conflicts: [], errors: [] },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
         theme: 'system', hf_token: '', hf_token_configured: false, community_api_url: '',
@@ -329,6 +334,94 @@ describe('community features sign-in', () => {
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
 
     expect(await screen.findByText('Sign-in synced to 2 nodes.')).toBeInTheDocument()
+  })
+
+  it('signs back out and shows the error when backend pairing fails', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+      pairResponse: () => new Response(JSON.stringify({ detail: 'pairing backend exploded' }), {
+        status: 500, headers: { 'Content-Type': 'application/json' },
+      }),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('pairing backend exploded')
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument()
+    expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+  })
+
+  it('signs back out with a conflict message when the node is paired with another account', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+      pairResponse: () => new Response(JSON.stringify({
+        error: 'already_paired', existing: { email: 'other@example.com' },
+      }), { status: 409, headers: { 'Content-Type': 'application/json' } }),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This node is already signed in as other@example.com')
+    expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+  })
+
+  it('stays signed in when the background re-pair after restore fails', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      pairResponse: () => new Response(JSON.stringify({ detail: 'pairing backend exploded' }), {
+        status: 500, headers: { 'Content-Type': 'application/json' },
+      }),
+    })
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
+    }))
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
+      method: 'POST',
+    })))
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).not.toBeNull()
+  })
+
+  it('shows unpair propagation failures after signing out', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      unpairCluster: {
+        applied: [],
+        conflicts: [{ node: 'Spark Three', email: 'other@example.com' }],
+        errors: ['Spark Four: Spark Four agent error: unreachable'],
+      },
+    })
+    const user = userEvent.setup()
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
+    }))
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
+    expect(screen.getByText('Sign-out was not applied to: Spark Three (signed in as other@example.com).')).toBeInTheDocument()
+    expect(screen.getByText('Some nodes are still signed in: Spark Four — they could not be reached.')).toBeInTheDocument()
   })
 
   it('creates an account and asks for the emailed confirmation code', async () => {
@@ -524,5 +617,9 @@ describe('community features sign-in', () => {
       AuthFlow: 'REFRESH_TOKEN_AUTH',
       AuthParameters: { REFRESH_TOKEN: 'saved-refresh-token' },
     })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
+      method: 'POST',
+      body: expect.stringContaining('"id_token"'),
+    })))
   })
 })

@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ExplorePage } from './ExplorePage'
 
-const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true }))
+const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true, reload: () => undefined }))
 
 vi.mock('../hooks/useCommunityAccess', () => ({
   COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',

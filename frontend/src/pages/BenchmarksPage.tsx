@@ -21,6 +21,7 @@ export function BenchmarksPage() {
     setSyncBusy(true)
     try {
       sync.setData(await api.benchmarks.setConsent(!sync.data.sharing_enabled))
+      communityAccess.reload()
       setReviewingConsent(false)
     } finally {
       setSyncBusy(false)

@@ -1,6 +1,14 @@
 import { expect, test } from '@playwright/test'
 
 const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/switch', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
+const benchmarkCurves = [
+  { context: 4096, prompt: [5980, 6120, 5100, 4950], generation: [95, 155, 168, 140] },
+  { context: 8192, prompt: [5600, 5850, 5300, 5050], generation: [100, 162, 148, 110] },
+  { context: 16384, prompt: [5200, 5350, 4800, 4650], generation: [102, 150, 98, 58] },
+  { context: 32768, prompt: [5200, 5450, 3000, 2800], generation: [99, 98, 42, 28] },
+  { context: 65536, prompt: [3500, 3350, 3900, 3600], generation: [96, 80, 12, 5] },
+  { context: 100000, prompt: [2800, 3100, 2500, 2900], generation: [84, 18, 6, 3] },
+]
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
@@ -27,7 +35,28 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/deployments')) body = { items: [{ id: 'dep-1', alias: 'Test model', runtime: 'vllm', kind: 'managed', model: { repository: 'org/test-model' }, status: 'running', settings: {} }] }
     else if (path.endsWith('/nodes')) body = { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, fabric_ready: true, selectable: true }, { id: 'spark-2', name: 'Studio Spark', local: false, online: true, docker_ready: true, fabric_ready: true, selectable: true }] }
     else if (path.endsWith('/onboarding')) body = { role: 'controller', node: { id: 'local', name: 'Studio controller', port: 7878, access_urls: ['https://controller.tailnet.ts.net:7878'] }, controller_reachable: true, join_code: 'PAIR-123', instructions: [] }
-    else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+    else if (path.endsWith('/benchmark-models')) body = { items: [{
+      model_id: 'nvidia/Qwen3.5-35B-A3B-NVFP4', run_count: 12,
+      best_prompt_tokens_per_second: 6120, best_generation_tokens_per_second: 168,
+      context_windows: benchmarkCurves.map(({ context }) => context), tensor_parallel_sizes: [1, 2],
+      latest_at: '2026-08-27T12:00:00Z',
+    }] }
+    else if (path.includes('/benchmark-models/')) body = {
+      model_id: 'nvidia/Qwen3.5-35B-A3B-NVFP4',
+      points: benchmarkCurves.flatMap(({ context, prompt, generation }) => [1, 2, 5, 10].map((concurrency, index) => ({
+        context_window_size: context, concurrency, tensor_parallel_size: 1,
+        prompt_tokens_per_second: prompt[index],
+        generation_tokens_per_second: generation[index],
+        sample_count: 3,
+      }))).concat([{ context_window_size: 16384, concurrency: 1, tensor_parallel_size: 2, prompt_tokens_per_second: 6200, generation_tokens_per_second: 112, sample_count: 2 }]),
+    }
+    else if (path.includes('/benchmarks')) body = { items: [{
+      id: 'run-latest', created_at: '2026-08-27T12:00:00Z', deployment_id: 'dep-1',
+      model: { repository: 'nvidia/Qwen3.5-35B-A3B-NVFP4', quantization: 'NVFP4' },
+      runtime: 'vllm', hardware: { hardware_class: 'dgx-spark' }, input_tokens: 12240,
+      output_tokens: 336, latency_ms: 2000, generation_tokens_per_second: 168,
+      cold_start: false, eligible_for_community: true, sync_state: 'synced',
+    }], total: 1, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
     else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured', evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' } }
     else if (path.endsWith('/images')) body = { items: [{ id: 'sha256:remote', repository: 'org/remote-runtime', tag: 'v1', size: 2147483648, runtimes: ['vllm'], node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }] }
@@ -66,8 +95,9 @@ test('renders lifetime and analysis usage without horizontal overflow', async ({
   await expect(page.getByRole('heading', { name: 'Usage stats', exact: true })).toBeVisible()
   await expect(page.getByRole('table', { name: 'Lifetime model usage' })).toContainText('Test workload')
   await expect(page.getByRole('table', { name: 'Lifetime model usage' })).toContainText('$1.25')
-  await expect(page.getByRole('img', { name: 'Daily model token trend for the last 30 days' })).toBeVisible()
-  await expect(page.getByText('Aug 26')).toBeVisible()
+  const trend = page.getByRole('img', { name: 'Daily model token trend for the last 30 days' })
+  await expect(trend).toBeVisible()
+  await expect(trend).toContainText('All models')
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)
 })
@@ -91,6 +121,22 @@ test('keeps a saved theme after reload', async ({ page }) => {
   await page.reload()
   await expect(page.getByRole('combobox', { name: 'Appearance' })).toHaveValue('dark')
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+})
+
+test('renders the benchmark explorer dialog in dark mode without overflow', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/settings', async (route) => route.fulfill({ json: { theme: 'dark', hf_token_configured: false, community_api_url: '' } }))
+  await page.goto('/benchmarks')
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await page.getByRole('button', { name: /^nvidia\/Qwen3.5-35B-A3B-NVFP4 12 runs/ }).click()
+  const dialog = page.getByRole('dialog', { name: 'nvidia/Qwen3.5-35B-A3B-NVFP4' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByRole('img', { name: /^Prompt throughput/ })).toBeVisible()
+  await expect(dialog.getByRole('img', { name: /^Text generation throughput/ })).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+  if (testInfo.project.name === 'desktop-1440') {
+    await page.screenshot({ path: testInfo.outputPath('benchmark-explorer-dark.png'), fullPage: true })
+  }
 })
 
 test('persists the navigation theme toggle after reload', async ({ page }) => {
@@ -154,7 +200,17 @@ test('renames remote cluster nodes without horizontal overflow', async ({ page }
 })
 
 test('keeps community sharing disclosure and estimates clear on every viewport', async ({ page }) => {
-  await page.route('**/api/v1/community/sync', (route) => route.fulfill({ json: { consent: false, pairing: { status: 'paired' }, outbox: { pending: 0, synced: 4 } } }))
+  let consent = false
+  await page.addInitScript(() => {
+    const payload = btoa(JSON.stringify({ exp: 4_102_444_800, email: 'test@example.com' }))
+      .replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+    localStorage.setItem('sparkdeck.cognito.id_token', `test.${payload}.signature`)
+  })
+  await page.route('**/api/v1/community/sync', (route) => route.fulfill({ json: { consent, pairing: { status: 'paired' }, outbox: { pending: 0, synced: 4 } } }))
+  await page.route('**/api/v1/community/consent', async (route) => {
+    consent = Boolean((await route.request().postDataJSON()).enabled)
+    await route.fulfill({ json: {} })
+  })
   await page.route('**/api/v1/community/aggregates', (route) => route.fulfill({ json: {
     items: [{ model_id: 'org/test-model', context_window_size: 8192, inference_tokens_per_second: 37.2, sample_count: 12 }],
     availability: 'available',
@@ -168,14 +224,15 @@ test('keeps community sharing disclosure and estimates clear on every viewport',
 
   await page.goto('/benchmarks')
   await expect(page.getByRole('heading', { name: 'Community estimates' })).toBeVisible()
-  await expect(page.getByText('37.2 tok/s')).toBeVisible()
   await page.getByRole('button', { name: 'Review & enable' }).click()
   const dialog = page.getByRole('dialog', { name: 'Enable community sharing?' })
-  await expect(dialog).toContainText('Only shared: model name, context window size, and measured inference tok/s.')
-  await expect(dialog).toContainText('Not shared: prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.')
-  await page.getByRole('button', { name: 'Close dialog' }).click()
+  await expect(dialog).toContainText('Benchmark JSON: model identifier, context-window size, measured inference tok/s')
+  await expect(dialog).toContainText('Never in benchmark JSON: prompts or outputs')
+  await dialog.getByRole('button', { name: /I understand, enable sharing/ }).click()
+  await expect(page.getByText('37.2 tok/s')).toBeVisible()
 
   await page.goto('/explore')
+  await page.getByRole('button', { name: 'Expand org/test-model' }).click()
   const estimate = page.getByLabel('Community inference-speed estimate for org/test-model')
   await expect(estimate).toContainText('37.2 tok/s')
   await expect(estimate).toContainText('8,192-token context window')

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sparkdeck.models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.storage import (
+    COMMUNITY_CONSENT_CONTRACT_VERSION,
     COMMUNITY_EVIDENCE_POLICY,
     COMMUNITY_UPLOAD_FIELDS,
     SparkDeckStore,
@@ -190,7 +191,10 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_setting("device_pairing", {"status": "paired"})
         self.store.retry_outbox()
         rows = self.store.outbox_batch()
-        self.assertEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertEqual(set(rows[0]), {
+            "model_id", "context_window_size", "inference_tokens_per_second",
+        })
+        self.assertLessEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
         self.assertEqual(rows, [{
             "model_id": "org/model",
             "context_window_size": 4096,
@@ -232,7 +236,38 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_community_consent(True)
         uploads = self.store.outbox_batch()
         self.assertEqual(len(uploads), 2)
-        self.assertTrue(all(set(item) == COMMUNITY_UPLOAD_FIELDS for item in uploads))
+        self.assertTrue(all(set(item) <= COMMUNITY_UPLOAD_FIELDS for item in uploads))
+
+    def test_migration_requires_fresh_consent_for_expanded_payload_contract(self):
+        sample = BenchmarkSample(
+            id="legacy-consent", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={"context_length": 4096},
+            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            generation_tokens_per_second=300, prompt_tokens_per_second=200,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.set_community_consent(True)
+        self.store.add_benchmark(sample, queue=True)
+        with self.store._connection:
+            self.store._connection.execute(
+                "DELETE FROM settings WHERE key = ?",
+                ("community_consent_contract_version",),
+            )
+
+        database = self.store.path
+        self.store.close()
+        self.store = SparkDeckStore(database)
+
+        self.assertFalse(self.store.sync_status()["consent"])
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.benchmarks()[1], 1)
+        self.assertEqual(
+            self.store.get_setting("community_consent_contract_version"),
+            COMMUNITY_CONSENT_CONTRACT_VERSION,
+        )
 
     def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
         sample = BenchmarkSample(
@@ -253,7 +288,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         upload = self.store.outbox_batch()
 
         self.assertEqual(local[0]["hardware"], {"hardware_class": "dgx-spark"})
-        self.assertEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertLessEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
         self.assertNotIn("hardware", upload[0])
 
     def test_context_and_speed_are_required_at_the_upload_boundary(self):
@@ -289,6 +324,223 @@ class SparkDeckStoreTests(unittest.TestCase):
             "metric": "inference_tokens_per_second",
         })
 
+    def test_coordinated_series_groups_exact_dimensions_without_filling_gaps(self):
+        base = {
+            "id": "run-1", "created_at": "2026-08-27T00:00:00+00:00",
+            "deployment_id": "dep-1", "model_id": "org/model",
+            "context_window_size": 4096, "concurrency": 1,
+            "tensor_parallel_size": 2, "prompt_tokens_per_second": 1000.0,
+            "generation_tokens_per_second": 80.0, "request_count": 4,
+        }
+        self.store.add_benchmark_series_point(base)
+        self.store.add_benchmark_series_point({
+            **base, "id": "run-2", "prompt_tokens_per_second": 1200.0,
+            "generation_tokens_per_second": 100.0,
+        })
+        self.store.add_benchmark_series_point({
+            **base, "id": "run-c5", "concurrency": 5,
+            "prompt_tokens_per_second": 900.0,
+            "generation_tokens_per_second": 150.0,
+        })
+
+        summaries = self.store.benchmark_model_summaries()
+        detail = self.store.benchmark_model_detail("org/model")
+
+        self.assertEqual(summaries[0]["run_count"], 3)
+        self.assertEqual(summaries[0]["context_windows"], [4096])
+        self.assertEqual(summaries[0]["tensor_parallel_sizes"], [2])
+        self.assertEqual([point["concurrency"] for point in detail["points"]], [1, 5])
+        self.assertEqual(detail["points"][0]["prompt_tokens_per_second"], 1100.0)
+        self.assertEqual(detail["points"][0]["sample_count"], 2)
+
+    def test_deleting_coordinated_history_removes_linked_series_point(self):
+        created_at = "2026-08-27T00:00:00+00:00"
+        point = {
+            "id": "series-delete", "created_at": created_at,
+            "deployment_id": "dep-1", "model_id": "org/model",
+            "context_window_size": 4096, "concurrency": 2,
+            "tensor_parallel_size": 2, "prompt_tokens_per_second": 1000.0,
+            "generation_tokens_per_second": 80.0, "request_count": 4,
+        }
+        self.store.add_benchmark_series_point(point)
+        self.store.add_benchmark_series_point({
+            **point, "id": "series-keep",
+            "created_at": "2026-08-27T00:01:00+00:00",
+            "generation_tokens_per_second": 160.0,
+        })
+        sample = BenchmarkSample(
+            id="history-delete", created_at=created_at,
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 4096, "benchmark_concurrency": 2,
+                "tensor_parallel_size": 2,
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=80, prompt_tokens_per_second=1000,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.add_benchmark(sample, queue=False)
+
+        linked_sample = self.store._connection.execute(
+            "SELECT sample_id FROM benchmark_series_points WHERE id = ?",
+            (point["id"],),
+        ).fetchone()[0]
+        self.assertEqual(linked_sample, sample.id)
+        self.assertEqual(self.store.benchmark_model_summaries()[0]["run_count"], 2)
+        self.assertEqual(
+            self.store.benchmark_model_detail("org/model")["points"][0]["sample_count"],
+            2,
+        )
+
+        self.assertTrue(self.store.delete_benchmark(sample.id))
+
+        local, total = self.store.benchmarks()
+        detail = self.store.benchmark_model_detail("org/model")
+        self.assertEqual((local, total), ([], 0))
+        self.assertEqual(self.store.benchmark_model_summaries()[0]["run_count"], 1)
+        self.assertEqual(detail["points"][0]["sample_count"], 1)
+        self.assertEqual(detail["points"][0]["generation_tokens_per_second"], 160.0)
+        self.assertIsNone(self.store._connection.execute(
+            "SELECT id FROM benchmark_series_points WHERE id = ?",
+            (point["id"],),
+        ).fetchone())
+
+    def test_coordinated_point_and_history_roll_back_together(self):
+        point = {
+            "id": "duplicate-series", "created_at": "2026-08-27T00:00:00+00:00",
+            "deployment_id": "dep-1", "model_id": "org/model",
+            "context_window_size": 4096, "concurrency": 2,
+            "tensor_parallel_size": 2, "prompt_tokens_per_second": 1000.0,
+            "generation_tokens_per_second": 80.0, "request_count": 4,
+        }
+        self.store.add_benchmark_series_point(point)
+        sample = BenchmarkSample(
+            id="atomic-history", created_at=point["created_at"],
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 4096, "benchmark_concurrency": 2,
+                "tensor_parallel_size": 2,
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=80, prompt_tokens_per_second=1000,
+            cold_start=False, eligible_for_community=True,
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.add_coordinated_benchmark(point, sample, queue=True)
+
+        local, total = self.store.benchmarks()
+        self.assertEqual((local, total), ([], 0))
+        self.assertEqual(self.store.benchmark_model_summaries()[0]["run_count"], 1)
+
+    def test_migration_backfills_legacy_coordinated_history_link(self):
+        database = Path(self.temp.name) / "legacy-series.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE benchmark_samples (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    deployment_id TEXT, model_json TEXT NOT NULL,
+                    runtime TEXT NOT NULL, runtime_version TEXT,
+                    hardware_json TEXT NOT NULL, configuration_json TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                    latency_ms REAL NOT NULL, ttft_ms REAL, generation_tps REAL,
+                    prompt_tps REAL, cold_start INTEGER, eligible INTEGER NOT NULL
+                );
+                CREATE TABLE benchmark_series_points (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    deployment_id TEXT, model_id TEXT NOT NULL,
+                    context_window_size INTEGER NOT NULL, concurrency INTEGER NOT NULL,
+                    tensor_parallel_size INTEGER NOT NULL, prompt_tps REAL NOT NULL,
+                    generation_tps REAL NOT NULL, request_count INTEGER NOT NULL
+                );
+                """
+            )
+            values = (
+                "legacy-history", "2026-08-27T00:00:00+00:00", "dep-1",
+                '{"repository":"org/model"}', "vllm", None, "{}",
+                '{"context_length":4096,"benchmark_concurrency":2,'
+                '"tensor_parallel_size":2}',
+                100, 50, 1000.0, None, 80.0, 1000.0, 0, 0,
+            )
+            connection.execute(
+                "INSERT INTO benchmark_samples VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+            connection.execute(
+                "INSERT INTO benchmark_series_points VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-series", values[1], "dep-1", "org/model",
+                    4096, 2, 2, 1000.0, 80.0, 4,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SparkDeckStore(database)
+        try:
+            linked_sample = migrated._connection.execute(
+                "SELECT sample_id FROM benchmark_series_points WHERE id = ?",
+                ("legacy-series",),
+            ).fetchone()[0]
+            self.assertEqual(linked_sample, "legacy-history")
+            self.assertTrue(migrated.delete_benchmark("legacy-history"))
+            self.assertEqual(migrated.benchmark_model_summaries(), [])
+        finally:
+            migrated.close()
+
+    def test_upload_includes_only_optional_benchmark_dimensions_when_recorded(self):
+        sample = BenchmarkSample(
+            id="series-upload", created_at="2026-08-27T00:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 16384, "benchmark_concurrency": 5,
+                "tensor_parallel_size": 2, "private": "drop-me",
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=50, prompt_tokens_per_second=100,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.add_benchmark(sample, queue=True)
+
+        self.assertEqual(self.store.outbox_batch(), [{
+            "model_id": "org/model", "context_window_size": 16384,
+            "inference_tokens_per_second": 50.0,
+            "concurrency": 5, "tensor_parallel_size": 2,
+        }])
+
+    def test_upload_omits_untrusted_benchmark_dimensions_for_ordinary_sample(self):
+        sample = BenchmarkSample(
+            id="ordinary-tp", created_at="2026-08-27T00:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 16384, "benchmark_concurrency": 3,
+                "tensor_parallel_size": 4,
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=50, prompt_tokens_per_second=100,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.add_benchmark(sample, queue=True)
+
+        local, _ = self.store.benchmarks()
+        self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
+        self.assertEqual(local[0]["configuration"]["benchmark_concurrency"], 3)
+        self.assertEqual(self.store.outbox_batch(), [{
+            "model_id": "org/model", "context_window_size": 16384,
+            "inference_tokens_per_second": 50.0,
+        }])
+
     def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
         sample = BenchmarkSample(
             id="eligible-1", created_at="2026-08-25T00:00:00+00:00",
@@ -308,12 +560,29 @@ class SparkDeckStoreTests(unittest.TestCase):
             sample, id="eligible-2", generation_tokens_per_second=100,
         ), queue=False)
         self.store.add_benchmark(replace(
+            sample, id="invalid-coordinated-marker",
+            configuration={"context_length": 4096, "benchmark_concurrency": 3},
+            generation_tokens_per_second=90,
+        ), queue=False)
+        self.store.add_benchmark(replace(
             sample, id="ineligible", eligible_for_community=False,
             generation_tokens_per_second=1000,
         ), queue=False)
         self.store.add_benchmark(replace(
             sample, id="other-context", configuration={"max_model_len": 8192},
             generation_tokens_per_second=40,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="coordinated-c1", configuration={
+                "context_length": 4096, "benchmark_concurrency": 1,
+                "tensor_parallel_size": 1,
+            }, generation_tokens_per_second=500,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            sample, id="coordinated-c10", configuration={
+                "context_length": 4096, "benchmark_concurrency": 10,
+                "tensor_parallel_size": 2,
+            }, generation_tokens_per_second=5,
         ), queue=False)
 
         aggregates = self.store.community_aggregates()
@@ -323,7 +592,7 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "context_window_size": 4096,
                 "inference_tokens_per_second": 90.0,
-                "sample_count": 2,
+                "sample_count": 3,
             },
             {
                 "model_id": "org/model",

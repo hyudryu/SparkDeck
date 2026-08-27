@@ -26,6 +26,7 @@ TRUSTED_ORIGINS = {
 }
 CAPABILITY = "cluster_update_v1"
 CONFIRMATION = "update-entire-cluster"
+UPDATE_STATE_FILENAME = "system-update-agent.json"
 
 
 def _valid_release_tag(tag: str) -> bool:
@@ -97,7 +98,7 @@ class UpdateService:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.cluster_path = self.data_dir / "system-update.json"
-        self.agent_path = self.data_dir / "system-update-agent.json"
+        self.agent_path = self.data_dir / UPDATE_STATE_FILENAME
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._agent_lock = asyncio.Lock()

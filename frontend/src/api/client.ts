@@ -3,6 +3,8 @@ import type {
   BenchmarkAggregate,
   CommunityAggregatesResponse,
   BenchmarkSample,
+  BenchmarkModelDetail,
+  BenchmarkModelSummary,
   CatalogResponse,
   ChatCompletionResponse,
   ChatMessage,
@@ -328,6 +330,12 @@ export const api = {
         created_at: item.created_at,
       }))
     },
+    models: async (signal?: AbortSignal): Promise<BenchmarkModelSummary[]> => {
+      const data = await request<{ items: BenchmarkModelSummary[] }>('/api/v1/benchmark-models', { signal })
+      return data.items
+    },
+    model: (modelId: string, signal?: AbortSignal): Promise<BenchmarkModelDetail> =>
+      request<BenchmarkModelDetail>(`/api/v1/benchmark-models/${encodeURIComponent(modelId)}`, { signal }),
     aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
       request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {

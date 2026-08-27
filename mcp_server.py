@@ -28,6 +28,7 @@ OWNER = "sparkdeck-mcp"
 # safely stop or remove them through the same ownership guard.
 LEGACY_OWNERS = frozenset({"vllm-controller-mcp"})
 DEFAULT_CONTROLLER_URL = "http://127.0.0.1:7878"
+MAX_INFERENCE_ERROR_BYTES = 500
 DEFAULT_PROMPTS = [
     "Explain why speculative decoding can improve language-model serving throughput.",
     "Write a concise checklist for diagnosing a distributed GPU inference launch.",
@@ -35,8 +36,64 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def _stream_event(line: str) -> dict[str, Any] | None:
+    if not line.startswith("data:"):
+        return None
+    payload = line[5:].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _stream_output_text(event: dict[str, Any]) -> str:
+    values: list[str] = []
+    for choice in event.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            for key in ("content", "reasoning_content"):
+                value = delta.get(key)
+                if isinstance(value, str) and value:
+                    values.append(value)
+        value = choice.get("text")
+        if isinstance(value, str) and value:
+            values.append(value)
+    return "".join(values)
+
+
 class ControllerError(RuntimeError):
     """A controller or inference endpoint returned an actionable error."""
+
+
+class _InferenceHTTPError(RuntimeError):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+async def _bounded_stream_error(response: httpx.Response) -> str:
+    """Read enough of a streaming error to diagnose it without unbounded buffering."""
+    content = bytearray()
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        remaining = MAX_INFERENCE_ERROR_BYTES - len(content)
+        if remaining <= 0:
+            truncated = True
+            break
+        content.extend(chunk[:remaining])
+        if len(chunk) > remaining or len(content) == MAX_INFERENCE_ERROR_BYTES:
+            truncated = True
+            break
+    detail = bytes(content).decode("utf-8", errors="replace").strip()
+    if truncated:
+        detail += "..."
+    return detail or response.reason_phrase
 
 
 class StaticTokenVerifier:
@@ -250,6 +307,22 @@ class ControllerClient:
         index = max(0, math.ceil(percentile * len(ordered)) - 1)
         return ordered[index]
 
+    @staticmethod
+    def _interval_union_seconds(intervals: list[tuple[float, float]]) -> float:
+        """Return elapsed time covered by one or more possibly overlapping intervals."""
+        if not intervals:
+            return 0.0
+        ordered = sorted(intervals)
+        current_start, current_end = ordered[0]
+        total = 0.0
+        for started_at, ended_at in ordered[1:]:
+            if started_at <= current_end:
+                current_end = max(current_end, ended_at)
+                continue
+            total += current_end - current_start
+            current_start, current_end = started_at, ended_at
+        return total + current_end - current_start
+
     def _inference_url(self, deployment: dict[str, Any]) -> str:
         port = deployment.get("api_port")
         if not port:
@@ -273,6 +346,8 @@ class ControllerClient:
     ) -> dict[str, Any]:
         if repetitions < 1 or concurrency < 1 or max_tokens < 1 or warmup_requests < 0:
             raise ControllerError("repetitions, concurrency, and max_tokens must be positive")
+        if concurrency not in {1, 2, 5, 10}:
+            raise ControllerError("concurrency must be one of 1, 2, 5, or 10")
         deployment = await self.deployment(deployment_id)
         if deployment.get("status") != "ready":
             raise ControllerError(
@@ -294,33 +369,112 @@ class ControllerClient:
             except (httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
                 raise ControllerError(f"could not discover served model at {base_url}: {exc}") from exc
 
-            async def request_once(prompt: str) -> dict[str, Any]:
+            async def request_once(
+                prompt: str, *, include_stream_usage: bool,
+                request_max_tokens: int | None = None,
+            ) -> dict[str, Any]:
+                request_body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": request_max_tokens or max_tokens,
+                    "temperature": temperature,
+                    "stream": True,
+                }
+                if include_stream_usage:
+                    request_body["stream_options"] = {"include_usage": True}
                 started = time.perf_counter()
-                response = await client.post(
-                    f"{base_url}/v1/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "stream": False,
-                    },
+                first_token_at: float | None = None
+                usage: dict[str, Any] = {}
+                text_parts: list[str] = []
+
+                async def consume(body: dict[str, Any]) -> None:
+                    nonlocal first_token_at, usage
+                    async with client.stream(
+                        "POST", f"{base_url}/v1/chat/completions", json=body,
+                    ) as response:
+                        if not 200 <= response.status_code < 300:
+                            detail = await _bounded_stream_error(response)
+                            raise _InferenceHTTPError(response.status_code, detail)
+                        async for line in response.aiter_lines():
+                            event = _stream_event(line)
+                            if event is None:
+                                continue
+                            event_usage = event.get("usage")
+                            if isinstance(event_usage, dict):
+                                usage = event_usage
+                            output = _stream_output_text(event)
+                            if output:
+                                if first_token_at is None:
+                                    first_token_at = time.perf_counter()
+                                if sum(len(value) for value in text_parts) < 240:
+                                    text_parts.append(output)
+
+                await consume(request_body)
+                completed = time.perf_counter()
+                first_token_seconds = (
+                    first_token_at - started if first_token_at is not None else None
                 )
-                response.raise_for_status()
-                elapsed = time.perf_counter() - started
-                body = response.json()
-                usage = body.get("usage") or {}
-                text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
                 return {
-                    "latency_seconds": elapsed,
+                    "latency_seconds": completed - started,
+                    "time_to_first_token_seconds": first_token_seconds,
+                    "_prompt_started_at": started,
+                    "_first_token_at": first_token_at,
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage.get("completion_tokens") or 0),
-                    "sample": text[:240],
+                    "sample": "".join(text_parts)[:240],
                 }
 
-            for index in range(warmup_requests):
+            # Resolve stream_options support once before starting the measured
+            # batch. Servers that reject it are then called directly with the
+            # cached fallback shape, so failed capability attempts cannot
+            # inflate batch wall time or generation/request throughput.
+            stream_usage_supported = True
+            probe_max_tokens = max_tokens if warmup_requests else 1
+            probe_prompt = (
+                prompt_values[0] if warmup_requests
+                else f"__sparkdeck_capability_probe_{uuid.uuid4().hex}__"
+            )
+            while not warmup_requests and probe_prompt in prompt_values:
+                probe_prompt = f"__sparkdeck_capability_probe_{uuid.uuid4().hex}__"
+            try:
+                await request_once(
+                    probe_prompt, include_stream_usage=True,
+                    request_max_tokens=probe_max_tokens,
+                )
+            except _InferenceHTTPError as exc:
+                if exc.status_code not in {400, 422}:
+                    raise ControllerError(
+                        f"benchmark capability probe failed "
+                        f"({exc.status_code}): {exc.detail}"
+                    ) from exc
+                stream_usage_supported = False
                 try:
-                    await request_once(prompt_values[index % len(prompt_values)])
+                    await request_once(
+                        probe_prompt, include_stream_usage=False,
+                        request_max_tokens=probe_max_tokens,
+                    )
+                except _InferenceHTTPError as fallback_exc:
+                    raise ControllerError(
+                        f"benchmark capability fallback failed "
+                        f"({fallback_exc.status_code}): {fallback_exc.detail}"
+                    ) from fallback_exc
+                except httpx.HTTPError as fallback_exc:
+                    raise ControllerError(
+                        f"benchmark capability fallback failed: {fallback_exc}"
+                    ) from fallback_exc
+            except httpx.HTTPError as exc:
+                raise ControllerError(f"benchmark capability probe failed: {exc}") from exc
+
+            for index in range(1, warmup_requests):
+                try:
+                    await request_once(
+                        prompt_values[index % len(prompt_values)],
+                        include_stream_usage=stream_usage_supported,
+                    )
+                except _InferenceHTTPError as exc:
+                    raise ControllerError(
+                        f"benchmark warmup failed ({exc.status_code}): {exc.detail}"
+                    ) from exc
                 except httpx.HTTPError as exc:
                     raise ControllerError(f"benchmark warmup failed: {exc}") from exc
 
@@ -329,15 +483,23 @@ class ControllerClient:
                 for _ in range(repetitions)
                 for prompt in prompt_values
             ]
+            # Every wave must contain the requested concurrency. Pad a partial
+            # final wave by cycling supplied prompts; otherwise a result can be
+            # labelled C5/C10 even though part of the run measured fewer active
+            # requests.
+            while len(jobs) % concurrency:
+                jobs.append(prompt_values[len(jobs) % len(prompt_values)])
             semaphore = asyncio.Semaphore(concurrency)
 
             async def limited(prompt: str) -> dict[str, Any]:
                 async with semaphore:
                     try:
-                        return await request_once(prompt)
-                    except httpx.HTTPStatusError as exc:
+                        return await request_once(
+                            prompt, include_stream_usage=stream_usage_supported,
+                        )
+                    except _InferenceHTTPError as exc:
                         raise ControllerError(
-                            f"inference request failed ({exc.response.status_code}): {exc.response.text[:500]}"
+                            f"inference request failed ({exc.status_code}): {exc.detail}"
                         ) from exc
                     except httpx.HTTPError as exc:
                         raise ControllerError(f"inference request failed: {exc}") from exc
@@ -349,7 +511,34 @@ class ControllerClient:
         completion_tokens = sum(result["completion_tokens"] for result in results)
         prompt_tokens = sum(result["prompt_tokens"] for result in results)
         latencies = [result["latency_seconds"] for result in results]
-        return {
+        first_token_times = [
+            result["time_to_first_token_seconds"] for result in results
+            if result["time_to_first_token_seconds"] is not None
+        ]
+        prompt_intervals = [
+            (result["_prompt_started_at"], result["_first_token_at"])
+            for result in results
+            if result["_first_token_at"] is not None
+        ]
+        prompt_metric_available = bool(
+            prompt_tokens > 0
+            and len(first_token_times) == len(results)
+            and len(prompt_intervals) == len(results)
+            and all(value > 0 for value in first_token_times)
+            and all(result["prompt_tokens"] > 0 for result in results)
+        )
+        prompt_seconds = (
+            self._interval_union_seconds(prompt_intervals)
+            if prompt_metric_available else None
+        )
+        prompt_tokens_per_second = (
+            prompt_tokens / prompt_seconds
+            if prompt_seconds is not None and prompt_seconds > 0 else None
+        )
+        for sample in results:
+            sample.pop("_prompt_started_at", None)
+            sample.pop("_first_token_at", None)
+        result = {
             "deployment_id": deployment_id,
             "model": model,
             "configuration": {
@@ -365,14 +554,49 @@ class ControllerClient:
                 "wall_seconds": wall_seconds,
                 "completion_tokens": completion_tokens,
                 "prompt_tokens": prompt_tokens,
+                "prompt_seconds": prompt_seconds,
+                "prompt_tokens_per_second": prompt_tokens_per_second,
                 "output_tokens_per_second": completion_tokens / wall_seconds if wall_seconds else 0.0,
                 "requests_per_second": len(results) / wall_seconds if wall_seconds else 0.0,
                 "mean_latency_seconds": statistics.fmean(latencies),
                 "p50_latency_seconds": self._percentile(latencies, 0.50),
                 "p95_latency_seconds": self._percentile(latencies, 0.95),
+                "mean_time_to_first_token_seconds": (
+                    statistics.fmean(first_token_times) if prompt_metric_available else None
+                ),
+                "p50_time_to_first_token_seconds": (
+                    self._percentile(first_token_times, 0.50) if prompt_metric_available else None
+                ),
+                "p95_time_to_first_token_seconds": (
+                    self._percentile(first_token_times, 0.95) if prompt_metric_available else None
+                ),
             },
             "samples": results,
         }
+        if not prompt_metric_available:
+            result["recording"] = {
+                "status": "not_recorded",
+                "reason": "prompt throughput unavailable because a request lacked first-token timing or prompt-token usage",
+            }
+            return result
+        try:
+            recorded = await self._request(
+                "POST", "/api/v1/benchmark-runs",
+                json_body={
+                    "deployment_id": deployment_id,
+                    "concurrency": concurrency,
+                    "request_count": len(results),
+                    "prompt_tokens": prompt_tokens,
+                    "generation_tokens": completion_tokens,
+                    "prompt_seconds": prompt_seconds,
+                    "wall_seconds": wall_seconds,
+                },
+            )
+            result["recording"] = {"status": "recorded", "id": recorded.get("id")}
+        except ControllerError as exc:
+            # Preserve the benchmark result for legacy deployments/controllers.
+            result["recording"] = {"status": "not_recorded", "reason": str(exc)}
+        return result
 
 
 def _save_ab_result(result: dict[str, Any]) -> None:

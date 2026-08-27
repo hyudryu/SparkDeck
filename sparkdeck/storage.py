@@ -17,7 +17,9 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
     "model_id", "context_window_size", "inference_tokens_per_second",
+    "concurrency", "tensor_parallel_size",
 })
+COMMUNITY_CONSENT_CONTRACT_VERSION = 2
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
     "exact_match_dimensions": ["model_id", "context_window_size"],
@@ -99,6 +101,21 @@ class SparkDeckStore:
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
+                CREATE TABLE IF NOT EXISTS benchmark_series_points (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    deployment_id TEXT,
+                    model_id TEXT NOT NULL,
+                    context_window_size INTEGER NOT NULL,
+                    concurrency INTEGER NOT NULL,
+                    tensor_parallel_size INTEGER NOT NULL,
+                    prompt_tps REAL NOT NULL,
+                    generation_tps REAL NOT NULL,
+                    request_count INTEGER NOT NULL,
+                    sample_id TEXT REFERENCES benchmark_samples(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS benchmark_series_model
+                    ON benchmark_series_points(model_id, tensor_parallel_size, context_window_size, concurrency);
                 CREATE TABLE IF NOT EXISTS upload_outbox (
                     sample_id TEXT PRIMARY KEY REFERENCES benchmark_samples(id) ON DELETE CASCADE,
                     status TEXT NOT NULL,
@@ -113,6 +130,37 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("community_consent", "false"),
             )
+            consent_version_row = self._connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?",
+                ("community_consent_contract_version",),
+            ).fetchone()
+            try:
+                consent_version = (
+                    json.loads(consent_version_row["value_json"])
+                    if consent_version_row is not None else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                consent_version = None
+            if consent_version != COMMUNITY_CONSENT_CONTRACT_VERSION:
+                # The coordinated benchmark payload widens the original
+                # three-field consent contract. Existing opt-ins must not
+                # silently authorize the new concurrency/TP dimensions.
+                self._connection.execute(
+                    "UPDATE settings SET value_json = 'false' "
+                    "WHERE key = 'community_consent'"
+                )
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    (
+                        "community_consent_contract_version",
+                        json.dumps(COMMUNITY_CONSENT_CONTRACT_VERSION),
+                    ),
+                )
             self._connection.execute(
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
@@ -131,6 +179,21 @@ class SparkDeckStore:
                 "WHERE created_at IS NULL OR TRIM(created_at) = ''",
                 (datetime.now(timezone.utc).isoformat(),),
             )
+            series_columns = {
+                row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(benchmark_series_points)"
+                )
+            }
+            if "sample_id" not in series_columns:
+                self._connection.execute(
+                    "ALTER TABLE benchmark_series_points ADD COLUMN sample_id TEXT "
+                    "REFERENCES benchmark_samples(id) ON DELETE CASCADE"
+                )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS benchmark_series_sample "
+                "ON benchmark_series_points(sample_id) WHERE sample_id IS NOT NULL"
+            )
+            self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
             # opening an existing database and discard only their unsent upload
@@ -160,6 +223,40 @@ class SparkDeckStore:
                     f"DELETE FROM upload_outbox WHERE sample_id IN ({marks}) "
                     "AND status IN ('pending', 'failed', 'waiting_for_account')",
                     tuple(invalid_sample_ids),
+                )
+
+    def _backfill_benchmark_series_links(self) -> None:
+        """Link legacy coordinated rows when their local sample is unambiguous."""
+        points = self._connection.execute(
+            """SELECT id, created_at, deployment_id, model_id,
+                      context_window_size, concurrency, tensor_parallel_size
+               FROM benchmark_series_points WHERE sample_id IS NULL"""
+        ).fetchall()
+        point_matches: dict[str, list[str]] = {}
+        sample_match_counts: dict[str, int] = {}
+        for point in points:
+            candidates = self._connection.execute(
+                """SELECT id, model_json, configuration_json
+                   FROM benchmark_samples
+                   WHERE created_at = ? AND deployment_id IS ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM benchmark_series_points linked
+                         WHERE linked.sample_id = benchmark_samples.id
+                     )""",
+                (point["created_at"], point["deployment_id"]),
+            ).fetchall()
+            matches = [
+                row["id"] for row in candidates
+                if _benchmark_matches_series_point(row, point)
+            ]
+            point_matches[point["id"]] = matches
+            for sample_id in matches:
+                sample_match_counts[sample_id] = sample_match_counts.get(sample_id, 0) + 1
+        for point_id, matches in point_matches.items():
+            if len(matches) == 1 and sample_match_counts[matches[0]] == 1:
+                self._connection.execute(
+                    "UPDATE benchmark_series_points SET sample_id = ? WHERE id = ?",
+                    (matches[0], point_id),
                 )
 
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -293,6 +390,7 @@ class SparkDeckStore:
                     int(community_eligible),
                 ),
             )
+            self._link_benchmark_series_point(sample)
             if queue and community_eligible:
                 pairing = self.get_setting("device_pairing", {"status": "not_paired"})
                 status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
@@ -300,6 +398,30 @@ class SparkDeckStore:
                     "INSERT INTO upload_outbox(sample_id, status, created_at) VALUES (?, ?, ?)",
                     (sample.id, status, sample.created_at),
                 )
+
+    def _link_benchmark_series_point(self, sample: BenchmarkSample) -> None:
+        """Connect a coordinated chart point to its Local history sample."""
+        value = sample.to_dict()
+        candidates = self._connection.execute(
+            """SELECT id, created_at, deployment_id, model_id,
+                      context_window_size, concurrency, tensor_parallel_size
+               FROM benchmark_series_points
+               WHERE sample_id IS NULL AND created_at = ? AND deployment_id IS ?""",
+            (sample.created_at, sample.deployment_id),
+        ).fetchall()
+        matches = [
+            point["id"] for point in candidates
+            if _benchmark_matches_series_point({
+                "id": sample.id,
+                "model_json": json.dumps(value["model"]),
+                "configuration_json": json.dumps(value["configuration"]),
+            }, point)
+        ]
+        if len(matches) == 1:
+            self._connection.execute(
+                "UPDATE benchmark_series_points SET sample_id = ? WHERE id = ?",
+                (sample.id, matches[0]),
+            )
 
     def benchmarks(self, limit: int = 100, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
         limit = min(500, max(1, int(limit)))
@@ -316,6 +438,133 @@ class SparkDeckStore:
         items = [_benchmark_row(row) for row in rows]
         return items, total
 
+    def add_benchmark_series_point(self, point: dict[str, Any]) -> None:
+        """Persist one coordinated benchmark run without prompts or outputs."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO benchmark_series_points(
+                    id, created_at, deployment_id, model_id, context_window_size,
+                    concurrency, tensor_parallel_size, prompt_tps, generation_tps,
+                    request_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    point["id"], point["created_at"], point.get("deployment_id"),
+                    point["model_id"], point["context_window_size"],
+                    point["concurrency"], point["tensor_parallel_size"],
+                    point["prompt_tokens_per_second"],
+                    point["generation_tokens_per_second"], point["request_count"],
+                ),
+            )
+
+    def add_coordinated_benchmark(
+        self, point: dict[str, Any], sample: BenchmarkSample, queue: bool,
+    ) -> None:
+        """Atomically persist one chart point, Local-history row, and outbox row."""
+        value = sample.to_dict()
+        community_eligible = bool(
+            sample.eligible_for_community
+            and community_context_window(sample.configuration) is not None
+            and _positive_speed(sample.generation_tokens_per_second) is not None
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO benchmark_samples VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )""",
+                (
+                    sample.id, sample.created_at, sample.deployment_id,
+                    json.dumps(value["model"]), sample.runtime.value,
+                    sample.runtime_version, json.dumps(sample.hardware),
+                    json.dumps(sample.configuration), sample.input_tokens,
+                    sample.output_tokens, sample.latency_ms, sample.ttft_ms,
+                    sample.generation_tokens_per_second,
+                    sample.prompt_tokens_per_second,
+                    None if sample.cold_start is None else int(sample.cold_start),
+                    int(community_eligible),
+                ),
+            )
+            self._connection.execute(
+                """INSERT INTO benchmark_series_points(
+                    id, created_at, deployment_id, model_id, context_window_size,
+                    concurrency, tensor_parallel_size, prompt_tps, generation_tps,
+                    request_count, sample_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    point["id"], point["created_at"], point.get("deployment_id"),
+                    point["model_id"], point["context_window_size"],
+                    point["concurrency"], point["tensor_parallel_size"],
+                    point["prompt_tokens_per_second"],
+                    point["generation_tokens_per_second"], point["request_count"],
+                    sample.id,
+                ),
+            )
+            if queue and community_eligible:
+                pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+                status = (
+                    "pending" if pairing.get("status") == "paired"
+                    else "waiting_for_account"
+                )
+                self._connection.execute(
+                    "INSERT INTO upload_outbox(sample_id, status, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (sample.id, status, sample.created_at),
+                )
+
+    def benchmark_model_summaries(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT model_id, COUNT(*) AS run_count,
+                          MAX(prompt_tps) AS best_prompt_tps,
+                          MAX(generation_tps) AS best_generation_tps,
+                          MAX(created_at) AS latest_at
+                   FROM benchmark_series_points
+                   GROUP BY model_id ORDER BY latest_at DESC, model_id COLLATE NOCASE"""
+            ).fetchall()
+            dimensions = self._connection.execute(
+                """SELECT DISTINCT model_id, context_window_size, tensor_parallel_size
+                   FROM benchmark_series_points"""
+            ).fetchall()
+        by_model: dict[str, dict[str, set[int]]] = {}
+        for row in dimensions:
+            values = by_model.setdefault(row["model_id"], {"windows": set(), "tp_sizes": set()})
+            values["windows"].add(int(row["context_window_size"]))
+            values["tp_sizes"].add(int(row["tensor_parallel_size"]))
+        return [{
+            "model_id": row["model_id"],
+            "run_count": int(row["run_count"]),
+            "best_prompt_tokens_per_second": float(row["best_prompt_tps"]),
+            "best_generation_tokens_per_second": float(row["best_generation_tps"]),
+            "context_windows": sorted(by_model[row["model_id"]]["windows"]),
+            "tensor_parallel_sizes": sorted(by_model[row["model_id"]]["tp_sizes"]),
+            "latest_at": row["latest_at"],
+        } for row in rows]
+
+    def benchmark_model_detail(self, model_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT context_window_size, concurrency, tensor_parallel_size,
+                          AVG(prompt_tps) AS prompt_tps,
+                          AVG(generation_tps) AS generation_tps,
+                          COUNT(*) AS sample_count
+                   FROM benchmark_series_points WHERE model_id = ?
+                   GROUP BY context_window_size, concurrency, tensor_parallel_size
+                   ORDER BY tensor_parallel_size, context_window_size, concurrency""",
+                (model_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        return {
+            "model_id": model_id,
+            "points": [{
+                "context_window_size": int(row["context_window_size"]),
+                "concurrency": int(row["concurrency"]),
+                "tensor_parallel_size": int(row["tensor_parallel_size"]),
+                "prompt_tokens_per_second": float(row["prompt_tps"]),
+                "generation_tokens_per_second": float(row["generation_tps"]),
+                "sample_count": int(row["sample_count"]),
+            } for row in rows],
+        }
+
     def community_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate only the fields that are eligible for community sharing.
 
@@ -323,7 +572,10 @@ class SparkDeckStore:
         keeping the public aggregate boundary identical to the upload payload.
         Rows are grouped by the exact dimensions declared in
         ``COMMUNITY_EVIDENCE_POLICY`` and no private benchmark metadata leaves
-        this method.
+        this method. Coordinated runs are excluded because their concurrency
+        and tensor-parallel dimensions cannot be represented by this legacy
+        aggregate contract; the dimension-aware benchmark explorer reads them
+        from ``benchmark_series_points`` instead.
         """
         grouped: dict[tuple[str, int], tuple[float, int]] = {}
         with self._lock:
@@ -344,6 +596,10 @@ class SparkDeckStore:
                     except (TypeError, ValueError, json.JSONDecodeError):
                         continue
                     if not isinstance(model, dict) or not isinstance(configuration, dict):
+                        continue
+                    if _coordinated_concurrency(
+                        configuration.get("benchmark_concurrency")
+                    ) is not None:
                         continue
                     model_id = str(model.get("repository") or "").strip()
                     context_window = community_context_window(configuration)
@@ -518,6 +774,14 @@ class SparkDeckStore:
                 "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
                 ("community_consent", json.dumps(bool(enabled))),
             )
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                (
+                    "community_consent_contract_version",
+                    json.dumps(COMMUNITY_CONSENT_CONTRACT_VERSION),
+                ),
+            )
             if not enabled:
                 # Withdrawing consent removes every unsent upload instruction,
                 # while the benchmark_samples rows remain available locally.
@@ -533,6 +797,28 @@ class SparkDeckStore:
                    SELECT id, ?, created_at FROM benchmark_samples WHERE eligible = 1""",
                 (status,),
             )
+
+
+def _benchmark_matches_series_point(
+    sample_row: sqlite3.Row | dict[str, Any],
+    point_row: sqlite3.Row,
+) -> bool:
+    """Return whether a local sample is the series row created for the same run."""
+    try:
+        model = json.loads(sample_row["model_json"] or "{}")
+        configuration = json.loads(sample_row["configuration_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(model, dict) or not isinstance(configuration, dict):
+        return False
+    return (
+        str(model.get("repository") or "").strip() == point_row["model_id"]
+        and community_context_window(configuration) == point_row["context_window_size"]
+        and _positive_integer(configuration.get("benchmark_concurrency"))
+        == point_row["concurrency"]
+        and _positive_integer(configuration.get("tensor_parallel_size"))
+        == point_row["tensor_parallel_size"]
+    )
 
 
 def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -561,7 +847,7 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
-    """Build the exact three-field cloud payload, separate from local history."""
+    """Build the strict cloud payload allowlist, separate from local history."""
     value = _benchmark_row(row)
     context_window = community_context_window(value["configuration"])
     speed = _positive_speed(value["generation_tokens_per_second"])
@@ -573,7 +859,18 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "context_window_size": context_window,
         "inference_tokens_per_second": speed,
     }
-    assert set(payload) == COMMUNITY_UPLOAD_FIELDS
+    concurrency = _coordinated_concurrency(
+        value["configuration"].get("benchmark_concurrency")
+    )
+    tensor_parallel_size = _positive_integer(
+        value["configuration"].get("tensor_parallel_size")
+    )
+    if concurrency is not None:
+        payload["concurrency"] = concurrency
+        if tensor_parallel_size is not None:
+            payload["tensor_parallel_size"] = tensor_parallel_size
+    if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
+        raise ValueError("community upload payload exceeds the public field contract")
     return payload
 
 
@@ -591,6 +888,11 @@ def community_context_window(configuration: dict[str, Any]) -> int | None:
     return None
 
 
+def _coordinated_concurrency(value: Any) -> int | None:
+    parsed = _positive_integer(value)
+    return parsed if parsed in {1, 2, 5, 10} else None
+
+
 def _positive_speed(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -599,3 +901,13 @@ def _positive_speed(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 and math.isfinite(parsed) else None
+
+
+def _positive_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 < parsed <= 100_000_000 else None

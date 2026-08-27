@@ -1671,6 +1671,42 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             volumes["/host/huggingface"]["bind"], "/root/.cache/huggingface"
         )
 
+    def test_created_container_model_source_uses_node_runtime_provenance(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._resolve_local_path = mock.Mock(return_value=None)
+        container = mock.Mock()
+
+        container.exec_run.return_value = (0, b"")
+        self.assertEqual(
+            instance._created_container_model_source(container, "models/customer"),
+            "local",
+        )
+        container.exec_run.assert_called_once_with([
+            "test", "-e", "--", "models/customer",
+        ])
+
+        container.exec_run.reset_mock()
+        container.exec_run.return_value = (1, b"")
+        self.assertEqual(
+            instance._created_container_model_source(container, "org/model"),
+            "public_repository",
+        )
+
+        instance._resolve_local_path.return_value = "/models/mounted"
+        container.exec_run.reset_mock()
+        self.assertEqual(
+            instance._created_container_model_source(container, "/models/mounted"),
+            "local",
+        )
+        container.exec_run.assert_not_called()
+
+        instance._resolve_local_path.return_value = None
+        container.exec_run.side_effect = RuntimeError("container unavailable")
+        self.assertEqual(
+            instance._created_container_model_source(container, "org/model"),
+            "unknown",
+        )
+
     def test_hf_token_is_masked_publicly_and_exported_to_containers(self) -> None:
         instance = Manager.__new__(Manager)
         instance.settings = {"hf_token": "hf_test_secret", "hf_cache": ""}
@@ -1862,7 +1898,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             async def create_member(node_id, payload):
                 captured.append((node_id, payload))
-                return {"id": f"container-{node_id}", "status": "running"}
+                return {
+                    "id": f"container-{node_id}", "status": "running",
+                    "model_source": "public_repository",
+                }
 
             instance.cluster_nodes = cluster_nodes
             instance._allocate_port = allocate_port
@@ -1880,6 +1919,15 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             })
 
             self.assertEqual(deployment["status"], "starting")
+            self.assertEqual(deployment["model_source"], "public_repository")
+            self.assertEqual(
+                deployment["launch_settings"]["model_source"],
+                "public_repository",
+            )
+            self.assertTrue(all(
+                member["model_source"] == "public_repository"
+                for member in deployment["members"]
+            ))
             self.assertEqual(len(captured), 2)
             for rank, (node_id, payload) in enumerate(captured):
                 args = payload["extra_args"]

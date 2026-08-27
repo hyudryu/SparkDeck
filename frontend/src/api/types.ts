@@ -202,6 +202,30 @@ export interface BenchmarkSample {
   created_at: string
 }
 
+export interface BenchmarkModelSummary {
+  model_id: string
+  run_count: number
+  best_prompt_tokens_per_second: number
+  best_generation_tokens_per_second: number
+  context_windows: number[]
+  tensor_parallel_sizes: number[]
+  latest_at: string
+}
+
+export interface BenchmarkSeriesPoint {
+  context_window_size: number
+  concurrency: 1 | 2 | 5 | 10
+  tensor_parallel_size: number
+  prompt_tokens_per_second: number
+  generation_tokens_per_second: number
+  sample_count: number
+}
+
+export interface BenchmarkModelDetail {
+  model_id: string
+  points: BenchmarkSeriesPoint[]
+}
+
 export interface DevicePairing {
   status: 'paired' | 'not_paired'
   sub?: string

@@ -288,8 +288,9 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .saved-configuration-group-count { color: var(--text-tertiary); font-size: 11px; font-weight: 500; }
 .pin-button { width: 32px; height: 32px; color: var(--text-secondary); background: var(--bg-subtle); border: 1px solid var(--border-subtle); }
 .pin-button.pinned { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
-.saved-configuration-actions { display: flex; gap: 8px; margin-top: auto; }
-.saved-configuration-card .saved-configuration-actions .button { width: auto; margin-top: 0; }
+.saved-configuration-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; }
+.saved-configuration-card .saved-configuration-actions .button { width: auto; margin-top: 0; white-space: nowrap; }
+.saved-configuration-card .saved-configuration-actions .button-primary { flex: 1 1 auto; }
 .args-editor { display: grid; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
 .args-editor .field-grid { gap: 10px; }
 .args-editor .field-note { margin-top: 0; }

@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 import docker
 import httpx
+import requests
 import shutil
 
 from cluster import (
@@ -3668,7 +3669,7 @@ class Manager:
         docker_error = None
         try:
             managed = await self.is_managed_container(name)
-        except docker.errors.DockerException as exc:
+        except (docker.errors.DockerException, requests.exceptions.RequestException) as exc:
             if not launch_text:
                 raise
             managed = False

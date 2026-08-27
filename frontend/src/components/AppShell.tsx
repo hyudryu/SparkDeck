@@ -52,6 +52,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [themeSyncing, setThemeSyncing] = useState(false)
   const [themeStatus, setThemeStatus] = useState('')
   const [switchDetected, setSwitchDetected] = useState(false)
+  const [nodeName, setNodeName] = useState('')
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
   const themeInteractedRef = useRef(false)
@@ -61,15 +62,43 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => setDrawerOpen(false), [location.pathname])
 
   useEffect(() => {
-    const controller = new AbortController()
-    api.settings.get(controller.signal).then((settings) => {
-      if (themeInteractedRef.current) return
-      persistTheme(settings.theme ?? storedTheme())
-      setTheme(resolvedTheme())
-    }).catch(() => {
-      // The locally stored preference remains authoritative while offline.
-    })
-    return () => controller.abort()
+    let disposed = false
+    let controller: AbortController | undefined
+    let latestRequest = 0
+    const refreshSettings = () => {
+      controller?.abort()
+      const requestController = new AbortController()
+      const requestId = ++latestRequest
+      controller = requestController
+      const isFresh = () => !disposed && requestId === latestRequest && !requestController.signal.aborted
+      api.settings.get(requestController.signal).then((settings) => {
+        if (!isFresh()) return
+        if (!themeInteractedRef.current) {
+          persistTheme(settings.theme ?? storedTheme())
+          setTheme(resolvedTheme())
+        }
+      }).catch(() => {
+        // The locally stored preference remains authoritative while offline.
+      })
+      // On a joined worker the settings request is forwarded to the controller,
+      // so the sidebar name comes from the unforwarded onboarding status that
+      // whichever node serves the browser answers for itself.
+      api.onboarding.get(requestController.signal).then((status) => {
+        if (!isFresh()) return
+        const name = status.node?.name
+        setNodeName(typeof name === 'string' ? name.trim() : '')
+      }).catch(() => {
+        // The chip stays empty until the next refresh; theme sync is unaffected.
+      })
+    }
+    refreshSettings()
+    window.addEventListener('sparkdeck:node-name-changed', refreshSettings)
+    return () => {
+      disposed = true
+      latestRequest += 1
+      controller?.abort()
+      window.removeEventListener('sparkdeck:node-name-changed', refreshSettings)
+    }
   }, [])
 
   useEffect(() => {
@@ -200,6 +229,10 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <Icon size={19} aria-hidden="true" />
               <span>{label}</span>
+              {/* The leading space separates the node name in the accessible
+                  name: JSX strips inter-element whitespace and jsdom has no
+                  layout-based word spacing. */}
+              {to === '/' && nodeName && <span className="nav-node-name">{' '}{nodeName}</span>}
             </NavLink>
           })}
         </nav>

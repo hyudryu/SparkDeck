@@ -136,6 +136,20 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.mark_outbox_synced(["sample-2"]), 1)
         self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
 
+    def test_sync_status_redacts_the_stored_refresh_token(self):
+        self.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret-1",
+        })
+
+        status = self.store.sync_status()
+
+        self.assertNotIn("refresh-secret-1", str(status))
+        self.assertEqual(status["pairing"], {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        })
+
     def test_pairing_promotes_waiting_uploads_to_pending(self):
         sample = BenchmarkSample(
             id="sample-waiting", created_at="2026-08-25T00:00:00+00:00",

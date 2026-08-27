@@ -25,6 +25,7 @@ from cluster import (
 )
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
+from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.onboarding import (
     FORWARD_HEADERS,
     OnboardingService,
@@ -149,9 +150,11 @@ _install_log_capture()
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
+        uploader = asyncio.create_task(community_upload_loop())
         try:
             yield
         finally:
+            uploader.cancel()
             await sparkdeck.close()
             await manager.stop()
 
@@ -743,16 +746,23 @@ async def agent_apply_community_pairing(req: Request):
     body = await req.json()
     sub = body.get("sub") if isinstance(body, dict) else None
     email = body.get("email") if isinstance(body, dict) else None
+    refresh_token = body.get("refresh_token") if isinstance(body, dict) else None
     if not isinstance(sub, str) or not sub:
         raise HTTPException(400, "sub is required")
+    if refresh_token is not None and not isinstance(refresh_token, str):
+        raise HTTPException(400, "refresh_token must be a string")
     existing = sparkdeck.store.get_setting(
         "device_pairing", {"status": "not_paired"})
     if existing.get("status") == "paired":
         if existing.get("sub") == sub:
             return {"applied": True, "already": True}
         return {"applied": False, "existing": {"email": existing.get("email")}}
-    sparkdeck.store.set_setting(
-        "device_pairing", {"status": "paired", "sub": sub, "email": email})
+    pairing = {"status": "paired", "sub": sub, "email": email}
+    if refresh_token:
+        # Stored locally (never echoed back) so this node's uploader can mint
+        # ID tokens for consented telemetry uploads.
+        pairing["refresh_token"] = refresh_token
+    sparkdeck.store.set_setting("device_pairing", pairing)
     sparkdeck.store.promote_outbox_for_pairing()
     return {"applied": True}
 
@@ -2053,6 +2063,9 @@ async def v1_community_pair(req: Request):
     id_token = body.get("id_token") if isinstance(body, dict) else None
     if not isinstance(id_token, str) or not id_token:
         raise HTTPException(400, "id_token is required")
+    refresh_token = body.get("refresh_token") if isinstance(body, dict) else None
+    if refresh_token is not None and not isinstance(refresh_token, str):
+        raise HTTPException(400, "refresh_token must be a string")
     try:
         claims = await asyncio.to_thread(_verify_cognito_id_token, id_token)
     except Exception as e:
@@ -2070,11 +2083,17 @@ async def v1_community_pair(req: Request):
         "sub": claims.get("sub"),
         "email": claims.get("email"),
     }
+    if refresh_token:
+        # Stored locally (never echoed back) so the uploader can mint ID
+        # tokens for consented telemetry uploads.
+        pairing["refresh_token"] = refresh_token
     sparkdeck.store.set_setting("device_pairing", pairing)
     sparkdeck.store.promote_outbox_for_pairing()
     # Best-effort cluster propagation; failures are reported, never raised.
-    cluster = await manager.push_community_pairing(pairing["sub"], pairing["email"])
-    return {"pairing": pairing, "cluster": cluster}
+    cluster = await manager.push_community_pairing(
+        pairing["sub"], pairing["email"], refresh_token)
+    public_pairing = {k: v for k, v in pairing.items() if k != "refresh_token"}
+    return {"pairing": public_pairing, "cluster": cluster}
 
 
 @app.delete("/api/v1/community/pair")
@@ -2092,11 +2111,163 @@ async def v1_community_unpair():
 
 
 @app.get("/api/v1/community/aggregates")
-async def v1_community_aggregates():
+async def v1_community_aggregates(req: Request):
+    api_url = str(
+        sparkdeck.store.get_setting("community_api_url", "") or ""
+    ).strip().rstrip("/")
+    if not api_url:
+        try:
+            return await sparkdeck.community_aggregates()
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc)) from exc
     try:
-        return await sparkdeck.community_aggregates()
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
+        upstream = await _community_http.get(
+            f"{api_url}/v1/aggregates",
+            headers={
+                "Authorization": req.headers.get("authorization", ""),
+            },
+        )
+    except httpx.HTTPError:
+        return _community_aggregates_unavailable()
+    if upstream.status_code == 401:
+        raise HTTPException(401, "community aggregates require sign-in")
+    if upstream.status_code != 200:
+        return _community_aggregates_unavailable()
+    return upstream.json()
+
+
+def _community_aggregates_unavailable() -> dict:
+    return {
+        "items": [],
+        "availability": "unavailable",
+        "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
+    }
+
+
+# ---------- Community telemetry uploader ----------
+# Shared client for the community API and Cognito token minting. Tests swap in
+# a MockTransport-backed client.
+_community_http = httpx.AsyncClient(timeout=5)
+
+COMMUNITY_UPLOAD_BATCH_SIZE = 50
+COMMUNITY_UPLOAD_INTERVAL_SECONDS = 60
+
+logger = logging.getLogger(__name__)
+
+_community_token_cache: dict = {
+    "refresh_token": None, "id_token": None, "expires_at": 0.0,
+}
+
+
+async def _community_id_token(refresh_token: str, force: bool = False) -> str | None:
+    """Mint (and cache) a Cognito ID token from the stored refresh token."""
+    cache = _community_token_cache
+    if (
+        not force
+        and cache["id_token"]
+        and cache["refresh_token"] == refresh_token
+        and cache["expires_at"] > time.time() + 60
+    ):
+        return cache["id_token"]
+    try:
+        response = await _community_http.post(
+            f"{COGNITO_IDP_ORIGIN}/",
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
+            },
+            json={
+                "ClientId": COGNITO_CLIENT_ID,
+                "AuthFlow": "REFRESH_TOKEN_AUTH",
+                "AuthParameters": {"REFRESH_TOKEN": refresh_token},
+            },
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    result = response.json().get("AuthenticationResult") or {}
+    id_token = result.get("IdToken")
+    if not id_token:
+        return None
+    cache.update({
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "expires_at": time.time() + float(result.get("ExpiresIn", 3600)),
+    })
+    return id_token
+
+
+async def _post_community_sample(api_url: str, id_token: str, payload: dict) -> httpx.Response | None:
+    try:
+        return await _community_http.post(
+            f"{api_url}/v1/samples",
+            json=payload,
+            headers={"Authorization": f"Bearer {id_token}"},
+        )
+    except httpx.HTTPError:
+        return None
+
+
+async def community_upload_once() -> dict:
+    """Upload one batch of pending consented samples; transient errors stay pending."""
+    store = sparkdeck.store
+    if not store.get_setting("community_consent", False):
+        return {"uploaded": 0, "failed": 0, "reason": "consent_off"}
+    pairing = store.get_setting("device_pairing", {"status": "not_paired"})
+    refresh_token = (
+        pairing.get("refresh_token")
+        if isinstance(pairing, dict) and pairing.get("status") == "paired"
+        else None
+    )
+    api_url = str(
+        store.get_setting("community_api_url", "") or ""
+    ).strip().rstrip("/")
+    if not refresh_token or not api_url:
+        return {"uploaded": 0, "failed": 0, "reason": "not_configured"}
+    batch = store.outbox_batch_with_ids(COMMUNITY_UPLOAD_BATCH_SIZE)
+    if not batch:
+        return {"uploaded": 0, "failed": 0, "reason": "idle"}
+    id_token = await _community_id_token(refresh_token)
+    if not id_token:
+        return {"uploaded": 0, "failed": 0, "reason": "token_unavailable"}
+
+    synced: list[str] = []
+    failed: list[str] = []
+    for sample_id, payload in batch:
+        response = await _post_community_sample(api_url, id_token, payload)
+        if response is not None and response.status_code == 401:
+            # The cached token expired early; mint once and retry this sample.
+            id_token = await _community_id_token(refresh_token, force=True)
+            if not id_token:
+                break
+            response = await _post_community_sample(api_url, id_token, payload)
+        if response is None:
+            continue  # transient transport error: leave pending
+        if response.status_code in (200, 201):
+            synced.append(sample_id)
+        elif response.status_code == 401:
+            continue  # still unauthorized after one refresh: leave pending
+        elif 400 <= response.status_code < 500:
+            # Definitive rejection (e.g. schema validation): retryable via the
+            # existing retry button, not hot-looped.
+            failed.append(sample_id)
+        # 5xx: leave pending for the next tick.
+    store.mark_outbox_synced(synced)
+    if failed:
+        store.mark_outbox_failed(failed, "community API rejected the sample")
+    return {"uploaded": len(synced), "failed": len(failed)}
+
+
+async def community_upload_loop() -> None:
+    while True:
+        try:
+            await community_upload_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("community sample upload failed")
+        await asyncio.sleep(COMMUNITY_UPLOAD_INTERVAL_SECONDS)
 
 
 # ---------- OpenAI-compatible /v1 proxy ----------

@@ -105,6 +105,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_local_community_database_work_runs_off_event_loop(self):
+        # An explicitly empty URL keeps the installation fully local even
+        # though a default hosted endpoint is seeded.
+        self.service.store.set_setting("community_api_url", "")
         event_loop_thread = threading.get_ident()
         setting_threads = []
         aggregate_threads = []

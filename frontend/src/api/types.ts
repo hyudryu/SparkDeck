@@ -22,7 +22,7 @@ export interface CommunityEvidencePolicy {
 
 export interface CommunityAggregatesResponse {
   items: BenchmarkAggregate[]
-  availability: 'available' | 'local' | 'not_configured'
+  availability: 'available' | 'local' | 'not_configured' | 'ok' | 'unavailable'
   evidence_policy: CommunityEvidencePolicy
 }
 

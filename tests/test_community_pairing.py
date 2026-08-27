@@ -115,7 +115,7 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "email": "user@example.com",
         })
         self.promote.assert_called_once_with()
-        self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com")
+        self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com", None)
 
     async def test_pairing_refuses_to_overwrite_a_different_account(self):
         self.get_setting.return_value = {
@@ -145,7 +145,36 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["pairing"]["sub"], "user-sub-123")
-        self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com")
+        self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com", None)
+
+    async def test_pairing_stores_the_refresh_token_without_echoing_it(self):
+        response = await self.client.post(
+            "/api/v1/community/pair",
+            json={"id_token": _id_token(), "refresh_token": "refresh-secret-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.set_setting.assert_called_once_with("device_pairing", {
+            "status": "paired",
+            "sub": "user-sub-123",
+            "email": "user@example.com",
+            "refresh_token": "refresh-secret-1",
+        })
+        self.assertNotIn("refresh-secret-1", response.text)
+        self.assertEqual(response.json()["pairing"], {
+            "status": "paired",
+            "sub": "user-sub-123",
+            "email": "user@example.com",
+        })
+        self.push_pair.assert_awaited_once_with(
+            "user-sub-123", "user@example.com", "refresh-secret-1")
+
+    async def test_pairing_rejects_a_non_string_refresh_token(self):
+        response = await self.client.post(
+            "/api/v1/community/pair",
+            json={"id_token": _id_token(), "refresh_token": 42})
+
+        self.assertEqual(response.status_code, 400)
+        self.set_setting.assert_not_called()
 
     async def test_jwks_verification_runs_off_the_event_loop(self):
         verify_threads = []
@@ -299,6 +328,21 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         })
         self.promote.assert_called_once_with()
 
+    async def test_applies_pairing_with_a_refresh_token(self):
+        self.get_setting.return_value = {"status": "not_paired"}
+
+        response = await self.client.put(
+            "/api/agent/community-pairing",
+            json={"sub": "user-sub-123", "email": "user@example.com",
+                  "refresh_token": "refresh-secret-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.set_setting.assert_called_once_with("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret-1",
+        })
+        self.assertNotIn("refresh-secret-1", response.text)
+
     async def test_same_account_pairing_is_a_noop(self):
         self.pair_locally()
 
@@ -402,7 +446,7 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
             self.nodes("Spark Two", "Spark Three", "Spark Four"), request)
 
         result = await instance.push_community_pairing(
-            "user-sub-123", "user@example.com")
+            "user-sub-123", "user@example.com", "refresh-1")
 
         self.assertEqual(result, {
             "applied": ["Spark Two"],
@@ -415,6 +459,7 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
             "node-1", "PUT", "/api/agent/community-pairing"))
         self.assertEqual(first_call.kwargs["json_body"], {
             "sub": "user-sub-123", "email": "user@example.com",
+            "refresh_token": "refresh-1",
         })
 
     async def test_unpair_fanout_skips_disabled_nodes(self):

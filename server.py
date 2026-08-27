@@ -1406,6 +1406,51 @@ async def v1_recipes():
     return {"items": [_public_recipe(recipe) for recipe in manager.recipes]}
 
 
+def _recipe_detail(recipe: dict) -> dict:
+    """Public saved-configuration contract plus its editable launch inputs."""
+    detail = _public_recipe(recipe)
+    detail["extra_args"] = manager._without_hf_cli_credentials(
+        recipe.get("extra_args") or []
+    )
+    detail["launch_controls"] = manager._deployment_launch_controls(
+        manager._deployment_launch_settings(recipe)
+    )
+    return detail
+
+
+@app.get("/api/v1/recipes/{recipe_id}")
+async def v1_recipe_detail(recipe_id: str):
+    """Return one saved configuration with its editable launch controls."""
+    recipe = await manager.get_recipe(recipe_id)
+    if not recipe:
+        raise HTTPException(404, "saved configuration not found")
+    return _recipe_detail(recipe)
+
+
+@app.put("/api/v1/recipes/{recipe_id}")
+async def v1_update_recipe(recipe_id: str, req: Request):
+    """Update the editable fields of a saved configuration."""
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "name", "extra_args", "launch_controls",
+        "gpu_memory_utilization", "gpu_memory_gb",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        updated = await manager.update_recipe(recipe_id, body)
+    except ValueError as exc:
+        status = 404 if str(exc) == "recipe not found" else 400
+        raise HTTPException(status, str(exc)) from exc
+    return _recipe_detail(updated)
+
+
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
 async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
@@ -1728,6 +1773,22 @@ async def v1_delete_deployment(deployment_id: str):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.patch("/api/v1/deployments/{deployment_id}")
+async def v1_rename_deployment(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    try:
+        return await sparkdeck.rename_deployment(deployment_id, body.get("alias"))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/v1/benchmarks")

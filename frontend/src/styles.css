@@ -277,6 +277,21 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 
 .model-disk-usage { display: flex !important; align-items: center; gap: 4px; margin-top: 5px !important; color: var(--text-tertiary) !important; }
 .saved-configuration-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.saved-configuration-group { margin-bottom: 18px; }
+.saved-configuration-group-title { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; font-size: 13px; }
+.saved-configuration-group-count { color: var(--text-tertiary); font-size: 11px; font-weight: 500; }
+.pin-button { width: 32px; height: 32px; color: var(--text-secondary); background: var(--bg-subtle); border: 1px solid var(--border-subtle); }
+.pin-button.pinned { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.saved-configuration-actions { display: flex; gap: 8px; margin-top: auto; }
+.saved-configuration-card .saved-configuration-actions .button { width: auto; margin-top: 0; }
+.args-editor { display: grid; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
+.args-editor .field-grid { gap: 10px; }
+.args-editor .field-note { margin-top: 0; }
+.args-editor-actions { display: flex; align-items: center; gap: 10px; }
+.sort-field { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+.rename-row { display: flex; align-items: center; gap: 6px; }
+.rename-input { min-width: 0; width: 100%; padding: 6px 8px; font-size: 13px; color: inherit; background: var(--bg-subtle); border: 1px solid var(--border-strong); border-radius: 8px; outline: none; }
+.rename-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .saved-configuration-card { min-width: 0; display: flex; flex-direction: column; padding: 15px; }
 .saved-configuration-heading { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: start; }.saved-configuration-heading h3, .saved-configuration-heading p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.saved-configuration-heading h3 { font-size: 14px; }.saved-configuration-heading p { margin-top: 2px; color: var(--text-secondary); font-size: 11px; }
 .saved-configuration-card dl { display: grid; gap: 7px; margin: 14px 0; padding-block: 11px; border-block: 1px solid var(--border-subtle); }.saved-configuration-card dl > div { min-width: 0; display: flex; justify-content: space-between; gap: 12px; }.saved-configuration-card dt { color: var(--text-secondary); font-size: 11px; }.saved-configuration-card dd { min-width: 0; overflow: hidden; font-size: 11px; font-weight: 600; text-align: right; text-overflow: ellipsis; white-space: nowrap; }.saved-configuration-card .button { width: 100%; margin-top: auto; }.saved-configuration-warning { margin: -3px 0 12px; color: var(--warning); font-size: 11px; }

@@ -411,9 +411,6 @@ class UpdateService:
     async def preflight_local(self, branch: str, revision: str) -> dict:
         if branch != MAIN_BRANCH:
             raise ValueError("The active update target is origin/main")
-        target, error = await self.resolve_main(force=True)
-        if error or not target or target["revision"] != revision.lower():
-            raise ValueError("Update target is not the current origin/main commit")
         blockers = local_blockers(self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
@@ -423,8 +420,12 @@ class UpdateService:
             f"refs/heads/{MAIN_BRANCH}:{remote_ref}", timeout=60,
         )
         fetched = _run(self.root, "git", "rev-parse", f"{remote_ref}^{{commit}}")
-        if fetched.lower() != revision.lower():
-            raise ValueError("Fetched origin/main does not match the approved commit")
+        still_on_main = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", revision, fetched], cwd=self.root,
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+        if not still_on_main:
+            raise RuntimeError("The approved commit is no longer in origin/main history")
         forward = subprocess.run(
             ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=self.root,
             capture_output=True, text=True, check=False,

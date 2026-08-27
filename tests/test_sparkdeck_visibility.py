@@ -29,6 +29,35 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
             "node-2", "GET", "/api/agent/virtual-nas/inventory", timeout=30,
         )
 
+    async def test_inventory_prefers_cache_mount_free_space_and_null_when_missing(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True, "disk": {"total": 100, "free": 7}},
+            {"id": "node-2", "name": "Spark Two", "online": True, "disk": {"total": 200, "free": 9}},
+            {"id": "node-3", "name": "Spark Three", "online": True},
+            {"id": "node-4", "name": "Spark Four", "online": False, "disk": {"total": 300, "free": 0}},
+        ])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{"model_id": "org/model", "size_bytes": 10}]
+        # Zero free bytes is a genuinely full cache mount, not missing data.
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(side_effect=[
+            {"models": [{"model_id": "org/model", "size_bytes": 11}], "free_size": 5678},
+            {"models": []},
+        ])
+
+        nodes = await manager.model_cache_inventory()
+
+        self.assertEqual(nodes[0]["free_size"], 0)
+        self.assertEqual(nodes[0]["total_size"], 100)
+        self.assertEqual(nodes[1]["free_size"], 5678)
+        self.assertEqual(nodes[1]["total_size"], 200)
+        self.assertIsNone(nodes[2]["total_size"])
+        self.assertIsNone(nodes[2]["free_size"])
+        self.assertEqual(nodes[3]["free_size"], 0)
+        self.assertEqual(nodes[3]["total_size"], 300)
+
 
 class DailyUsageSeriesTests(unittest.TestCase):
     def test_daily_usage_preserves_per_model_series(self):

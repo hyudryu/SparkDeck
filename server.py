@@ -634,7 +634,8 @@ async def agent_remove_image(image_id: str, req: Request):
 async def agent_virtual_nas_inventory(req: Request):
     _require_agent(req)
     models = await asyncio.to_thread(manager.virtual_nas.inventory)
-    return _public_storage_payload({"models": models})
+    free_size = await asyncio.to_thread(manager.virtual_nas.free_bytes)
+    return _public_storage_payload({"models": models, "free_size": free_size})
 
 
 @app.get("/api/agent/virtual-nas/models/{model_id:path}/export")

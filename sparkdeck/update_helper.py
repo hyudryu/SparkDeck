@@ -1,4 +1,4 @@
-"""Detached, narrowly-scoped release apply helper."""
+"""Detached, narrowly-scoped update apply helper."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,12 @@ import time
 import urllib.request
 from pathlib import Path
 
-from .updater import CAPABILITY, TRUSTED_ORIGINS, UPDATE_STATE_FILENAME
+from .updater import (
+    CAPABILITY,
+    MAIN_BRANCH,
+    TRUSTED_ORIGINS,
+    UPDATE_STATE_FILENAME,
+)
 
 
 def validate_state_path(state_path: Path, root: Path) -> Path:
@@ -95,8 +100,8 @@ def _restore_frontend_bundle(live_dist: Path, swap_root: Path, had_previous: boo
         os.replace(previous, live_dist)
 
 
-def install_revision(root: Path, revision: str) -> str:
-    """Move only along one release chain without resetting a local branch."""
+def install_release_revision(root: Path, revision: str) -> str:
+    """Dormant release-mode install retained for restoring release updates."""
     forward = subprocess.run(
         ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=root,
         capture_output=True, text=True, check=False,
@@ -106,12 +111,23 @@ def install_revision(root: Path, revision: str) -> str:
         capture_output=True, text=True, check=False,
     ).returncode == 0
     if not forward and not backward:
-        raise RuntimeError("Selected release is not in the installed release history")
+        raise RuntimeError("Selected revision is not in the installed update history")
     if forward:
         run(root, "git", "merge", "--ff-only", revision)
         return "upgrade"
     run(root, "git", "checkout", "--detach", revision)
     return "downgrade"
+
+
+def install_revision(root: Path, revision: str) -> None:
+    """Fast-forward the live checkout to the approved origin/main commit."""
+    forward = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=root,
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+    if not forward:
+        raise RuntimeError("origin/main is not a forward-only update from the installed revision")
+    run(root, "git", "merge", "--ff-only", revision)
 
 
 def wait_for_revision(revision: str, timeout: int = 90) -> bool:
@@ -128,7 +144,32 @@ def wait_for_revision(revision: str, timeout: int = 90) -> bool:
     return False
 
 
-def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
+def fetch_release_target(root: Path, tag: str, revision: str) -> None:
+    """Dormant release-mode fetch retained for restoring release updates."""
+    run(root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
+    fetched = run(root, "git", "rev-parse", f"{tag}^{{commit}}")
+    if fetched.lower() != revision:
+        raise RuntimeError("Fetched release tag does not match the approved commit")
+
+
+def fetch_update_target(root: Path, branch: str, revision: str) -> None:
+    if branch != MAIN_BRANCH:
+        raise RuntimeError("The active update target is origin/main")
+    remote_ref = f"refs/remotes/origin/{MAIN_BRANCH}"
+    run(
+        root, "git", "fetch", "--force", "origin",
+        f"refs/heads/{MAIN_BRANCH}:{remote_ref}",
+    )
+    fetched = run(root, "git", "rev-parse", f"{remote_ref}^{{commit}}")
+    contains_target = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", revision, fetched], cwd=root,
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+    if not contains_target:
+        raise RuntimeError("The approved commit is no longer in origin/main history")
+
+
+def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
     root = root.resolve()
     state_path = validate_state_path(state_path, root)
     time.sleep(1.0)  # Let the accepting HTTP response leave the process first.
@@ -144,27 +185,24 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         if run(root, "git", "status", "--porcelain", "--untracked-files=no"):
             raise RuntimeError("Tracked files changed after preflight")
         previous_revision = run(root, "git", "rev-parse", "HEAD").lower()
-        write_state(state_path, phase="staging", message=f"Fetching and validating {tag}")
-        run(root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
-        fetched = run(root, "git", "rev-parse", f"{tag}^{{commit}}")
-        if fetched.lower() != revision:
-            raise RuntimeError("Fetched release tag does not match the approved commit")
+        write_state(state_path, phase="staging", message=f"Fetching and validating origin/{branch}")
+        fetch_update_target(root, branch, revision)
         stage_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-update-"))
         run(root, "git", "worktree", "add", "--detach", str(stage_dir), revision)
         try:
             manifest = json.loads((stage_dir / "sparkdeck-update.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise RuntimeError("Selected release has no valid update compatibility manifest") from exc
+            raise RuntimeError("Selected origin/main revision has no valid update compatibility manifest") from exc
         if manifest.get("update_protocol") != 1 or manifest.get("data_schema") != 1:
-            raise RuntimeError("Selected release is not compatible with this updater or data schema")
+            raise RuntimeError("Selected origin/main revision is not compatible with this updater or data schema")
         update_source = stage_dir / "sparkdeck" / "updater.py"
         if not update_source.exists() or CAPABILITY not in update_source.read_text(encoding="utf-8"):
-            raise RuntimeError("Selected release does not support safe cluster updates")
+            raise RuntimeError("Selected origin/main revision does not support safe cluster updates")
         run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
         if (stage_dir / "frontend" / "package-lock.json").exists():
             run(stage_dir, "npm", "--prefix", "frontend", "ci", "--ignore-scripts")
             build_environment = os.environ.copy()
-            build_environment["SPARKDECK_VERSION"] = tag
+            build_environment["SPARKDECK_VERSION"] = f"{branch}-{revision[:8]}"
             run(stage_dir, "npm", "--prefix", "frontend", "run", "build", env=build_environment)
             frontend_swap = _prepare_frontend_bundle(
                 stage_dir / "frontend" / "dist", root / "frontend" / "dist",
@@ -177,15 +215,15 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
         if frontend_swap:
             had_previous_frontend = _publish_frontend_bundle(root / "frontend" / "dist", frontend_swap)
             frontend_published = True
-        write_state(state_path, phase="restarting", message="Release installed; restarting SparkDeck")
+        write_state(state_path, phase="restarting", message="Update installed; restarting SparkDeck")
         run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
         if not wait_for_revision(revision):
-            raise RuntimeError("SparkDeck did not become healthy on the selected release")
-        write_state(state_path, phase="succeeded", message="Release installed and verified", error=None)
+            raise RuntimeError("SparkDeck did not become healthy on the selected revision")
+        write_state(state_path, phase="succeeded", message="Update installed and verified", error=None)
     except Exception as exc:
         if applied and previous_revision:
             try:
-                write_state(state_path, phase="rolling_back", error=str(exc)[:500], message="Health check failed; restoring the previous release")
+                write_state(state_path, phase="rolling_back", error=str(exc)[:500], message="Health check failed; restoring the previous revision")
                 run(root, "git", "checkout", "--detach", previous_revision)
                 if frontend_published and frontend_swap:
                     _restore_frontend_bundle(
@@ -193,8 +231,8 @@ def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
                     )
                 run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
                 if not wait_for_revision(previous_revision):
-                    raise RuntimeError("previous release did not become healthy")
-                write_state(state_path, phase="rolled_back", error=str(exc)[:500], message="Selected release failed; previous release restored")
+                    raise RuntimeError("previous revision did not become healthy")
+                write_state(state_path, phase="rolled_back", error=str(exc)[:500], message="Selected update failed; previous revision restored")
             except Exception as rollback_exc:
                 write_state(
                     state_path, phase="recovery_required",
@@ -215,10 +253,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--state", required=True)
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--branch", required=True)
     parser.add_argument("--revision", required=True)
     args = parser.parse_args()
-    apply(Path(args.root).resolve(), Path(args.state).resolve(), args.tag, args.revision.lower())
+    apply(Path(args.root).resolve(), Path(args.state).resolve(), args.branch, args.revision.lower())
 
 
 if __name__ == "__main__":

@@ -68,6 +68,63 @@ describe('BenchmarksPage community privacy', () => {
     expect(within(dialog).queryByText('4K context')).not.toBeInTheDocument()
   })
 
+  it('never renders a previous model detail while the next model loads or fails', async () => {
+    let resolveModelB: (response: Response) => void = () => undefined
+    const modelBResponse = new Promise<Response>((resolve) => { resolveModelB = resolve })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown
+      if (path.endsWith('/api/v1/benchmark-models')) body = { items: [
+        {
+          model_id: 'org/model-a', run_count: 1,
+          best_prompt_tokens_per_second: 100, best_generation_tokens_per_second: 20,
+          context_windows: [4096], tensor_parallel_sizes: [1],
+          latest_at: '2026-08-27T12:00:00Z',
+        },
+        {
+          model_id: 'org/model-b', run_count: 1,
+          best_prompt_tokens_per_second: 200, best_generation_tokens_per_second: 40,
+          context_windows: [16384], tensor_parallel_sizes: [2],
+          latest_at: '2026-08-27T13:00:00Z',
+        },
+      ] }
+      else if (path.endsWith('/api/v1/benchmark-models/org%2Fmodel-a')) body = {
+        model_id: 'org/model-a', points: [{
+          context_window_size: 4096, concurrency: 1, tensor_parallel_size: 1,
+          prompt_tokens_per_second: 100, generation_tokens_per_second: 20, sample_count: 1,
+        }],
+      }
+      else if (path.endsWith('/api/v1/benchmark-models/org%2Fmodel-b')) return modelBResponse
+      else if (path.includes('/api/v1/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+      else if (path.endsWith('/api/v1/community/aggregates')) body = {
+        items: [], availability: 'available',
+        evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+      }
+      else body = { consent: true, pairing: { status: 'paired' }, upload_configured: true, outbox: {} }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: /org\/model-a/ }))
+    const modelADialog = await screen.findByRole('dialog', { name: 'org/model-a' })
+    expect(within(modelADialog).getAllByText('4K context').length).toBeGreaterThan(0)
+
+    await user.click(screen.getByRole('button', { name: /org\/model-b/ }))
+    const modelBDialog = screen.getByRole('dialog', { name: 'org/model-b' })
+    expect(within(modelBDialog).getByRole('status')).toHaveTextContent('Loading model benchmark')
+    expect(within(modelBDialog).queryByText('4K context')).not.toBeInTheDocument()
+
+    resolveModelB(new Response(JSON.stringify({ detail: 'Model B unavailable' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    expect(await within(modelBDialog).findByRole('alert')).toHaveTextContent('Model B unavailable')
+    expect(within(modelBDialog).queryByText('4K context')).not.toBeInTheDocument()
+  })
+
   it('discloses the exact shared fields and renders only contract-safe estimates', async () => {
     let consent = false
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

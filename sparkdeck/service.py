@@ -539,13 +539,7 @@ class SparkDeckService:
         deployment_id = str(body.get("deployment_id") or "").strip()
         if not deployment_id:
             raise ValueError("deployment_id is required")
-        deployments = await self.deployments()
-        deployment = next((item for item in deployments if (
-            item.get("id") == deployment_id
-            or (item.get("settings") or {}).get("manager_deployment_id") == deployment_id
-        )), None)
-        if deployment is None:
-            raise LookupError("deployment not found")
+        deployment = await self._benchmark_deployment(deployment_id)
         settings = deployment.get("settings") or {}
         context_window = community_context_window(settings)
         if context_window is None:
@@ -588,7 +582,14 @@ class SparkDeckService:
             "benchmark_concurrency": concurrency,
             "tensor_parallel_size": tensor_parallel_size,
         })
-        hardware, _hardware_verified = await self._managed_hardware_snapshot(deployment)
+        hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
+        eligible_for_community = bool(
+            model_id != "local-model"
+            and prompt_tokens > 0
+            and generation_tokens >= 16
+            and runtime.value in self.registry.kinds
+            and hardware_verified
+        )
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=point["created_at"],
             deployment_id=deployment.get("id"),
@@ -599,9 +600,7 @@ class SparkDeckService:
             latency_ms=wall_seconds * 1000, ttft_ms=None,
             generation_tokens_per_second=point["generation_tokens_per_second"],
             prompt_tokens_per_second=point["prompt_tokens_per_second"],
-            cold_start=False, eligible_for_community=(
-                model_id != "local-model" and generation_tokens > 0
-            ),
+            cold_start=False, eligible_for_community=eligible_for_community,
         )
         consent = bool(await asyncio.to_thread(
             self.store.get_setting, "community_consent", False,
@@ -611,6 +610,80 @@ class SparkDeckService:
             queue=sample.eligible_for_community and consent,
         )
         return point
+
+    async def _benchmark_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Resolve both SparkDeck records and Manager-only MCP deployments."""
+        registered = self.store.deployments(include_private=True)
+        deployment = next((item for item in registered if (
+            item.get("id") == deployment_id
+            or (item.get("settings") or {}).get("manager_deployment_id") == deployment_id
+        )), None)
+        manager_id = (
+            (deployment.get("settings") or {}).get("manager_deployment_id")
+            if deployment else deployment_id
+        )
+        if deployment is not None and not manager_id:
+            return deployment
+
+        lookup_manager_deployment = getattr(self.manager, "_deployment", None)
+        manager_deployment = (
+            lookup_manager_deployment(manager_id)
+            if callable(lookup_manager_deployment) else None
+        )
+        if manager_deployment is None and deployment is not None:
+            manager_deployment = next((item for item in getattr(self.manager, "deployments", []) if (
+                isinstance(item, dict)
+                and item.get("sparkdeck_record_id") == deployment.get("id")
+            )), None)
+        if manager_deployment is not None and not manager_deployment.get("launch_settings"):
+            try:
+                state = await self.manager.get_state()
+                manager_deployment = next((item for item in state.get("deployments", []) if (
+                    isinstance(item, dict)
+                    and item.get("id") == manager_deployment.get("id")
+                )), manager_deployment)
+            except Exception:
+                pass
+        if manager_deployment is None:
+            if deployment is not None:
+                return deployment
+            raise LookupError("deployment not found")
+
+        launch_settings = manager_deployment.get("launch_settings") or {}
+        launch_controls = self.manager._deployment_launch_controls(launch_settings)
+        settings = dict((deployment or {}).get("settings") or {})
+        settings["manager_deployment_id"] = manager_deployment.get("id")
+        context_window = launch_controls.get("context_window") or launch_settings.get("sg_context_length")
+        if context_window is not None:
+            settings["context_length"] = context_window
+        contract = self.manager.recipe_deployment_contract(launch_settings)
+        if not contract.get("supported", True):
+            raise ValueError(contract.get("error") or "deployment launch metadata is unsupported")
+        tensor_parallel_size = contract.get("tensor_parallel_size")
+        if tensor_parallel_size is not None:
+            settings["tensor_parallel_size"] = tensor_parallel_size
+
+        model_id = _public_model_id(
+            manager_deployment.get("model")
+            or launch_settings.get("model")
+            or ((deployment or {}).get("model") or {}).get("repository")
+            or "local-model"
+        )
+        runtime = str(
+            manager_deployment.get("engine")
+            or launch_settings.get("engine")
+            or (deployment or {}).get("runtime")
+            or RuntimeKind.VLLM.value
+        )
+        return {
+            **(deployment or {}),
+            "id": (deployment or {}).get("id") or manager_deployment.get("id"),
+            "kind": (deployment or {}).get("kind") or DeploymentKind.MANAGED.value,
+            "runtime": runtime,
+            "model": {**((deployment or {}).get("model") or {}), "repository": model_id},
+            "settings": settings,
+            "status": _deployment_status(manager_deployment.get("status")),
+        }
 
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None
@@ -1679,10 +1752,19 @@ def _optional_string(value: Any) -> str | None:
 def _bounded_benchmark_integer(value: Any, name: str, *, allow_zero: bool = False) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
-    try:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be an integer")
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer") from exc
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not text.lstrip("+-").isdigit():
+            raise ValueError(f"{name} must be an integer")
+        parsed = int(text)
+    else:
+        raise ValueError(f"{name} must be an integer")
     minimum = 0 if allow_zero else 1
     if parsed < minimum or parsed > 100_000_000:
         raise ValueError(f"{name} is outside the supported range")

@@ -361,6 +361,16 @@ export function SettingsPage() {
                 Sign-in synced to {auth.clusterSync.applied.length} node{auth.clusterSync.applied.length === 1 ? '' : 's'}.
               </p>}
             </>}
+            {auth.status !== 'signed-in' && auth.clusterSync && <>
+              {auth.clusterSync.conflicts.map((conflict) => (
+                <p className="muted wide-field" role="status" key={conflict.node}>
+                  Sign-out was not applied to: {conflict.node}{conflict.email ? ` (signed in as ${conflict.email})` : ''}.
+                </p>
+              ))}
+              {auth.clusterSync.errors.length > 0 && <p className="muted wide-field" role="status">
+                Some nodes are still signed in: {auth.clusterSync.errors.map((entry) => entry.split(':')[0]).join(', ')} — they could not be reached.
+              </p>}
+            </>}
           </div>
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>

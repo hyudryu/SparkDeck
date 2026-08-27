@@ -347,6 +347,15 @@ class SparkDeckStore:
             )
         return cursor.rowcount
 
+    def promote_outbox_for_pairing(self) -> int:
+        """Move account-waiting uploads to pending after pairing succeeds."""
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE upload_outbox SET status = 'pending' "
+                "WHERE status = 'waiting_for_account'",
+            )
+        return cursor.rowcount
+
     def outbox_batch(self, limit: int = 50, now: str | None = None) -> list[dict[str, Any]]:
         """Return an idempotent upload batch without exposing private deployment data."""
         limit = min(200, max(1, int(limit)))

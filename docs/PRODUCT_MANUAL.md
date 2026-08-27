@@ -184,7 +184,7 @@ It provides:
 - lifetime model or alias share; and
 - sortable detailed accounting for input misses, cache hits, output, requests, average speed, and configured cost.
 
-Aliases and merge groups change how rows are presented; they do not rewrite the underlying counters. **Reset lifetime** is destructive and should be used only when the stored accounting is no longer needed.
+Aliases, merge groups, and routing rules change how rows are presented; they do not rewrite the underlying counters. Routing rules send one model's recorded totals to another model's row and can be set, changed, or removed per model from the **Edit usage model** dialog on this page. **Reset lifetime** is destructive and should be used only when the stored accounting is no longer needed.
 
 ## Images
 

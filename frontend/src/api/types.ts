@@ -550,6 +550,7 @@ export interface UsageSummary {
   models: Record<string, UsageCounters>
   groups: UsageGroup[]
   total: UsageCounters
+  routing_rules?: Record<string, string>
 }
 
 export interface HourlyUsagePoint {

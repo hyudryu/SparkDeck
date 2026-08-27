@@ -186,7 +186,8 @@ async def _send_pinned_control_request(
             return await send_task
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_connect_error = exc
-    assert last_connect_error is not None
+    if last_connect_error is None:
+        raise RuntimeError("controller has no connectable endpoints")
     raise last_connect_error
 
 

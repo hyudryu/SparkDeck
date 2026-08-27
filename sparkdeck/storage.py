@@ -565,7 +565,8 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "context_window_size": context_window,
         "inference_tokens_per_second": speed,
     }
-    assert set(payload) == COMMUNITY_UPLOAD_FIELDS
+    if set(payload) != COMMUNITY_UPLOAD_FIELDS:
+        raise ValueError("community upload payload does not match the public field contract")
     return payload
 
 

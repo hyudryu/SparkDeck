@@ -317,7 +317,7 @@ export function ModelsPage() {
       return new Set(localNodeId ? [localNodeId] : [])
     }
     return new Set((modelCache.data?.nodes ?? [])
-      .filter((node) => node.models.some((model) => model.model_id === deployment.model_id
+      .filter((node) => node.models.some((model) => !model.partial && model.model_id === deployment.model_id
         && model.revisions?.includes(deployment.model_revision ?? 'main')))
       .map((node) => node.id))
   }

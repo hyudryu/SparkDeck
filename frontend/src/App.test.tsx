@@ -644,6 +644,7 @@ describe('model deployments', () => {
       ] } : path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
         { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-3', name: 'Spark Three', online: true, models: [{ model_id: 'org/model', size_bytes: 1_000_000_000, revisions: ['main'], partial: true }] },
       ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -653,8 +654,8 @@ describe('model deployments', () => {
 
     const dialog = await screen.findByRole('dialog', { name: 'Start Sharded model' })
     expect(dialog).toHaveTextContent('TP2 requires exactly 2 nodes')
-    // Exactly two nodes hold the weights, so both start selected and the
-    // node without weights is unavailable.
+    // Exactly two nodes hold complete weights, so both start selected; a
+    // partial cache entry does not count as usable weights.
     expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Three/ })).toBeDisabled()

@@ -1,7 +1,19 @@
 import { cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BenchmarksPage } from './BenchmarksPage'
+
+const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true }))
+
+vi.mock('../hooks/useCommunityAccess', () => ({
+  COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',
+  useCommunityAccess: () => communityAccess,
+}))
+
+beforeEach(() => {
+  Object.assign(communityAccess, { signedIn: true, sharingEnabled: true, loading: false, enabled: true })
+})
 
 afterEach(() => {
   cleanup()
@@ -28,7 +40,7 @@ describe('BenchmarksPage community privacy', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
-    render(<BenchmarksPage />)
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('42.5 tok/s')).toBeInTheDocument()
     expect(screen.getByText('16,384 tokens')).toBeInTheDocument()
@@ -78,12 +90,40 @@ describe('BenchmarksPage community privacy', () => {
     }))
     const user = userEvent.setup()
 
-    render(<BenchmarksPage />)
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect((await screen.findAllByText('42.5 tok/s')).length).toBeGreaterThan(0)
     await user.click(screen.getByRole('button', { name: 'Delete benchmark for org/model' }))
 
     expect(await screen.findByText('No community estimates yet')).toBeInTheDocument()
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
+  })
+
+  it('locks community estimates behind sign-in and telemetry opt-in but keeps the consent path usable', async () => {
+    Object.assign(communityAccess, { signedIn: false, sharingEnabled: false, enabled: false })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown
+      if (path.includes('/api/v1/benchmarks')) {
+        body = { items: [], total: 0, limit: 100, offset: 0 }
+      } else if (path.endsWith('/api/v1/community/aggregates')) {
+        body = {
+          items: [{ model_id: 'org/model', context_window_size: 16384, inference_tokens_per_second: 42.5, sample_count: 12 }],
+          availability: 'available',
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+        }
+      } else {
+        body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Community estimates are locked')).toBeInTheDocument()
+    expect(screen.getByText('Sign in and enable telemetry in Settings → Community Features to see community data.')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
+    expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()
   })
 })

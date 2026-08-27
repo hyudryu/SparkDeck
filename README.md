@@ -80,6 +80,24 @@ Community upload payloads contain exactly three fields: `model_id`, `context_win
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
 
+## Community sign-in (Cognito email + password)
+
+Community features (shared benchmark telemetry and community estimates) require an account, created and used from **Settings → Community Features**. The app renders a native email + password form and calls the Amazon Cognito IDP HTTPS API (`https://cognito-idp.us-east-2.amazonaws.com/`) directly — there is no hosted UI, no redirect, and no third-party identity provider. Sign-up uses `SignUp`/`ConfirmSignUp` (Cognito emails a verification code; Cognito's default email sender is used, which is fine for low volume), sign-in uses `InitiateAuth` with the `USER_PASSWORD_AUTH` flow, and sessions refresh with `REFRESH_TOKEN_AUTH`. Password reset is also handled in-app via `ForgotPassword`/`ConfirmForgotPassword` from the same form. All authentication traffic goes straight from the browser to Cognito over HTTPS; passwords never touch the SparkDeck backend.
+
+After a successful sign-in the frontend sends the Cognito ID token to the SparkDeck backend (`POST /api/v1/community/pair`), which verifies it against the pool's JWKS before marking the device paired. Signing out (`DELETE /api/v1/community/pair` via the app's Sign out button, plus a best-effort `RevokeToken` call) returns the device to `not_paired`.
+
+**Sessions are effectively indefinite.** The pool issues refresh tokens valid for 3650 days (the Cognito maximum). Tokens are stored in the browser's localStorage, so sign-in survives browser restarts; an expired ID token is refreshed silently on load without user interaction.
+
+**Sign-in propagates across the cluster.** After pairing locally, the controller pushes the sign-in (and later the sign-out) to every enabled peer node over the cluster-private agent channel (`PUT`/`DELETE /api/agent/community-pairing`). Propagation is best-effort and never blocks sign-in: a node that is already paired with a *different* account is never overridden — the conflict is reported in **Settings → Community Features** ("Sign-in was not applied to…") and that node keeps its existing account. Unreachable nodes are reported too and pick up the state on the next sign-in or sign-out.
+
+The infrastructure lives in `infra/cognito-community.yml` (CloudFormation stack `sparkdeck-community-auth`): a user pool with email-as-username, self sign-up, and auto-verified email, plus a public app client (no secret; `ALLOW_USER_PASSWORD_AUTH` + `ALLOW_REFRESH_TOKEN_AUTH`; revocation enabled; ID/access tokens 60 minutes, refresh tokens 3650 days).
+
+The backend defaults to the deployed pool and can be pointed at another one with environment variables (these identifiers are not secret):
+
+- `SPARKDECK_COGNITO_USER_POOL_ID` (default `us-east-2_TjntedtdI`)
+- `SPARKDECK_COGNITO_CLIENT_ID` (default `30ihrkeg4k1rn95d4mmkq00fvl`)
+- `SPARKDECK_COGNITO_ISSUER` (default `https://cognito-idp.us-east-2.amazonaws.com/us-east-2_TjntedtdI`)
+
 ## Cluster and MCP automation
 
 SparkDeck nodes can be paired over a trusted management network for distributed and replicated deployments. Pairing credentials are stored locally beneath `data/`; do not commit or share that directory. The controller is the authoritative cluster registry, but every online worker can also display the controller's current one-time pairing code and act as an onboarding entry point at its own Tailscale URL. The joining node verifies the worker's pinned controller referral, registers directly with that controller, and then uses the controller directly for normal management traffic.

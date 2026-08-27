@@ -1,14 +1,25 @@
 import { cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ExplorePage } from './ExplorePage'
+
+const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true }))
+
+vi.mock('../hooks/useCommunityAccess', () => ({
+  COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',
+  useCommunityAccess: () => communityAccess,
+}))
 
 const gib = 1024 ** 3
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 }
+
+beforeEach(() => {
+  Object.assign(communityAccess, { signedIn: true, sharingEnabled: true, loading: false, enabled: true })
+})
 
 afterEach(() => {
   cleanup()
@@ -146,5 +157,35 @@ describe('ExplorePage model rows', () => {
 
     expect(screen.getAllByRole('button', { name: /^Expand community\/model-/ })).toHaveLength(100)
     expect(screen.getByRole('button', { name: 'Load more community models (20 remaining)' })).toBeInTheDocument()
+  })
+
+  it('locks community features behind sign-in and telemetry opt-in', async () => {
+    Object.assign(communityAccess, { signedIn: false, sharingEnabled: false, enabled: false })
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({
+        items: [{
+          id: 'org/model', author: 'org', name: 'model', downloads: 1000, likes: 12,
+          parameter_count: 7_000_000_000, weight_size_bytes: 14 * gib,
+          runtime_compatibility: [],
+          community: { model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 31.25, sample_count: 14 },
+        }],
+        total: 1,
+      })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    const tab = await screen.findByRole('tab', { name: 'Community Run Models' })
+    expect(tab).toBeDisabled()
+    expect(tab).toHaveAttribute('title', 'Sign in and enable telemetry in Settings → Community Features to see community data.')
+    expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeDisabled()
+
+    await user.click(await screen.findByRole('button', { name: 'Expand org/model' }))
+
+    expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
   })
 })

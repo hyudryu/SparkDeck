@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
+import { AuthProvider } from '../auth/AuthContext'
 import { THEME_STORAGE_KEY } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
 
@@ -10,8 +11,15 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   localStorage.clear()
+  localStorage.clear()
   delete document.documentElement.dataset.theme
 })
+
+function fakeIdToken(claims: Record<string, unknown>) {
+  const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
+    .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+  return `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode(claims)}.signature`
+}
 
 describe('settings page', () => {
   it('shows the version embedded when the frontend was built', () => {
@@ -192,5 +200,329 @@ describe('settings page', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/system-update', expect.objectContaining({
       method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', tag: 'v0.9.0' }),
     }))
+  })
+})
+
+describe('community features sign-in', () => {
+  function authResult(email: string) {
+    return {
+      AuthenticationResult: {
+        IdToken: fakeIdToken({ email, sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600 }),
+        AccessToken: 'access-token',
+        RefreshToken: 'refresh-token',
+      },
+    }
+  }
+
+  function stubSettingsFetch(fetchMock: ReturnType<typeof vi.fn<typeof fetch>>, options: {
+    idpResponse?: (body: Record<string, unknown>) => Response
+    cluster?: { applied: string[]; conflicts: { node: string; email?: string }[]; errors: string[] }
+  } = {}) {
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('cognito-idp')) {
+        if (options.idpResponse) return options.idpResponse(JSON.parse(String(init?.body)))
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/pair') && init?.method === 'POST') return new Response(JSON.stringify({
+        pairing: { status: 'paired' },
+        cluster: options.cluster ?? { applied: [], conflicts: [], errors: [] },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/pair') && init?.method === 'DELETE') return new Response(JSON.stringify({
+        pairing: { status: 'not_paired' },
+        cluster: { applied: [], conflicts: [], errors: [] },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', hf_token: '', hf_token_configured: false, community_api_url: '',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function cognitoCalls(fetchMock: ReturnType<typeof vi.fn<typeof fetch>>, target: string) {
+    return fetchMock.mock.calls.filter(([input, init]) => (
+      String(input).includes('cognito-idp')
+      && String((init?.headers as Record<string, string>)?.['X-Amz-Target']).endsWith(target)
+    ))
+  }
+
+  it('renders the email and password sign-in form when signed out', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>())
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('heading', { name: 'Community Features' })).toBeInTheDocument()
+    expect(screen.getByText('Create an account or sign in to share anonymized benchmark telemetry and see community data.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Email')).toBeInTheDocument()
+    expect(screen.getByLabelText('Password')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Create account' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Pair account' })).not.toBeInTheDocument()
+  })
+
+  it('signs in with email and password and pairs the device', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'InitiateAuth')[0][1]?.body))).toMatchObject({
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      AuthParameters: { USERNAME: 'driver@example.com', PASSWORD: 'Password1' },
+    })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
+      method: 'POST',
+      body: expect.stringContaining('"id_token"'),
+    })))
+  })
+
+  it('reports cluster conflicts and unreachable nodes after sign-in', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+      cluster: {
+        applied: [],
+        conflicts: [{ node: 'Spark Three', email: 'other@example.com' }],
+        errors: ['Spark Four: Spark Four agent error: unreachable'],
+      },
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByText('Sign-in was not applied to: Spark Three (already signed in as other@example.com).')).toBeInTheDocument()
+    expect(screen.getByText("Could not reach: Spark Four — they'll stay signed out until synced.")).toBeInTheDocument()
+    expect(screen.queryByText(/Sign-in synced to/)).not.toBeInTheDocument()
+  })
+
+  it('confirms when sign-in synced to peer nodes', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+      cluster: { applied: ['Spark Two', 'Spark Three'], conflicts: [], errors: [] },
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByText('Sign-in synced to 2 nodes.')).toBeInTheDocument()
+  })
+
+  it('creates an account and asks for the emailed confirmation code', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Create account' }))
+    await user.type(screen.getByLabelText('Email'), 'new@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.type(screen.getByLabelText('Confirm password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Create account' }))
+
+    expect(await screen.findByLabelText('Confirmation code')).toBeInTheDocument()
+    expect(screen.getByText('We emailed a confirmation code to new@example.com.')).toBeInTheDocument()
+    expect(cognitoCalls(fetchMock, 'SignUp')).toHaveLength(1)
+
+    await user.type(screen.getByLabelText('Confirmation code'), '123456')
+    await user.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    expect(await screen.findByText('Account confirmed — sign in with your password.')).toBeInTheDocument()
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'ConfirmSignUp')[0][1]?.body))).toMatchObject({
+      Username: 'new@example.com', ConfirmationCode: '123456',
+    })
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument()
+  })
+
+  it('rejects mismatched passwords before calling Cognito', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Create account' }))
+    await user.type(screen.getByLabelText('Email'), 'new@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.type(screen.getByLabelText('Confirm password'), 'Password2')
+    await user.click(screen.getByRole('button', { name: 'Create account' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Passwords do not match')
+    expect(cognitoCalls(fetchMock, 'SignUp')).toHaveLength(0)
+  })
+
+  it('shows a friendly message when the password is wrong', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify({ __type: 'NotAuthorizedException', message: 'Incorrect username or password.' }), {
+        status: 400, headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+      }),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.type(screen.getByLabelText('Password'), 'wrong-pass')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Incorrect email or password')
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument()
+  })
+
+  it('jumps to the confirmation step when the account is unconfirmed', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify({ __type: 'UserNotConfirmedException' }), {
+        status: 400, headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+      }),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'pending@example.com')
+    await user.type(screen.getByLabelText('Password'), 'Password1')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    expect(await screen.findByLabelText('Confirmation code')).toBeInTheDocument()
+    expect(screen.getByText(/not confirmed yet/)).toBeInTheDocument()
+  })
+
+  it('resets a forgotten password and returns to sign-in', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.click(screen.getByRole('button', { name: 'Forgot password?' }))
+
+    expect(screen.getByLabelText('Email')).toHaveValue('driver@example.com')
+    await user.click(screen.getByRole('button', { name: 'Send reset code' }))
+
+    expect(await screen.findByText('If an account exists for driver@example.com, we emailed a reset code.')).toBeInTheDocument()
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'ForgotPassword')[0][1]?.body))).toMatchObject({
+      Username: 'driver@example.com',
+    })
+
+    await user.type(screen.getByLabelText('Confirmation code'), '654321')
+    await user.type(screen.getByLabelText('New password'), 'NewPassword1')
+    await user.type(screen.getByLabelText('Confirm new password'), 'NewPassword1')
+    await user.click(screen.getByRole('button', { name: 'Reset password' }))
+
+    expect(await screen.findByText('Password updated — sign in with your new password.')).toBeInTheDocument()
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'ConfirmForgotPassword')[0][1]?.body))).toMatchObject({
+      Username: 'driver@example.com', ConfirmationCode: '654321', Password: 'NewPassword1',
+    })
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument()
+  })
+
+  it('shows a friendly error when the reset code is wrong', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: (body) => ('ConfirmationCode' in body
+        ? new Response(JSON.stringify({ __type: 'CodeMismatchException' }), {
+            status: 400, headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+          })
+        : new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })),
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.click(screen.getByRole('button', { name: 'Forgot password?' }))
+    await user.click(screen.getByRole('button', { name: 'Send reset code' }))
+
+    await user.type(await screen.findByLabelText('Confirmation code'), '000000')
+    await user.type(screen.getByLabelText('New password'), 'NewPassword1')
+    await user.type(screen.getByLabelText('Confirm new password'), 'NewPassword1')
+    await user.click(screen.getByRole('button', { name: 'Reset password' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('That confirmation code is not correct')
+    expect(screen.getByRole('button', { name: 'Reset password' })).toBeInTheDocument()
+  })
+
+  it('rejects mismatched new passwords before calling Cognito', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.type(await screen.findByLabelText('Email'), 'driver@example.com')
+    await user.click(screen.getByRole('button', { name: 'Forgot password?' }))
+    await user.click(screen.getByRole('button', { name: 'Send reset code' }))
+
+    await user.type(await screen.findByLabelText('Confirmation code'), '654321')
+    await user.type(screen.getByLabelText('New password'), 'NewPassword1')
+    await user.type(screen.getByLabelText('Confirm new password'), 'NewPassword2')
+    await user.click(screen.getByRole('button', { name: 'Reset password' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Passwords do not match')
+    expect(cognitoCalls(fetchMock, 'ConfirmForgotPassword')).toHaveLength(0)
+  })
+
+  it('shows the account email when signed in and unpairs on sign out', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
+    }))
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Sign out' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
+      method: 'DELETE',
+    })))
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+  })
+
+  it('silently refreshes an expired stored session on load', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    })
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
+      email: 'driver@example.com', sub: 'user-sub-1', exp: 1,
+    }))
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'InitiateAuth')[0][1]?.body))).toMatchObject({
+      AuthFlow: 'REFRESH_TOKEN_AUTH',
+      AuthParameters: { REFRESH_TOKEN: 'saved-refresh-token' },
+    })
   })
 })

@@ -1,8 +1,10 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { Check, Cloud, DownloadCloud, KeyRound, MonitorCog, Network, RefreshCw, Save } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
+import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
@@ -95,8 +97,153 @@ function editableSettingsFingerprint(settings: AppSettings) {
   })
 }
 
+type CommunityAuthMode = 'sign-in' | 'sign-up' | 'confirm' | 'reset-request' | 'reset-confirm'
+
+function CommunitySignInForm() {
+  const auth = useAuth()
+  const [mode, setMode] = useState<CommunityAuthMode>('sign-in')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [notice, setNotice] = useState<string>()
+
+  const switchMode = (next: CommunityAuthMode) => {
+    setMode(next)
+    setError(undefined)
+    setNotice(undefined)
+  }
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      await action()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Something went wrong')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submitSignIn = () => void run(async () => {
+    try {
+      await auth.signIn(email.trim(), password)
+    } catch (reason) {
+      if (reason instanceof UserNotConfirmedError) {
+        switchMode('confirm')
+        setNotice('This account is not confirmed yet — enter the code from your email.')
+        return
+      }
+      throw reason
+    }
+  })
+
+  const submitSignUp = () => {
+    if (password !== confirmPassword) {
+      setError('Passwords do not match')
+      return
+    }
+    void run(async () => {
+      await auth.signUp(email.trim(), password)
+      switchMode('confirm')
+      setNotice(`We emailed a confirmation code to ${email.trim()}.`)
+    })
+  }
+
+  const submitConfirm = () => void run(async () => {
+    await auth.confirmSignUp(email.trim(), code.trim())
+    setPassword('')
+    setConfirmPassword('')
+    setCode('')
+    switchMode('sign-in')
+    setNotice('Account confirmed — sign in with your password.')
+  })
+
+  const resend = () => void run(async () => {
+    await auth.resendCode(email.trim())
+    setNotice('A new confirmation code is on its way.')
+  })
+
+  const submitResetRequest = () => void run(async () => {
+    await auth.forgotPassword(email.trim())
+    switchMode('reset-confirm')
+    setNotice(`If an account exists for ${email.trim()}, we emailed a reset code.`)
+  })
+
+  const submitResetConfirm = () => {
+    if (password !== confirmPassword) {
+      setError('Passwords do not match')
+      return
+    }
+    void run(async () => {
+      await auth.confirmForgotPassword(email.trim(), code.trim(), password)
+      setPassword('')
+      setConfirmPassword('')
+      setCode('')
+      switchMode('sign-in')
+      setNotice('Password updated — sign in with your new password.')
+    })
+  }
+
+  const submit = mode === 'sign-in' ? submitSignIn
+    : mode === 'sign-up' ? submitSignUp
+      : mode === 'confirm' ? submitConfirm
+        : mode === 'reset-request' ? submitResetRequest
+          : submitResetConfirm
+  const onEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && !busy) submit()
+  }
+
+  return (
+    <div className="community-auth wide-field">
+      {(mode === 'sign-in' || mode === 'sign-up' || mode === 'reset-request') && <label className="field"><span>Email</span><input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={onEnter} /></label>}
+      {(mode === 'sign-in' || mode === 'sign-up') && <label className="field"><span>Password</span><input type="password" autoComplete={mode === 'sign-up' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} onKeyDown={onEnter} /></label>}
+      {mode === 'sign-up' && <>
+        <label className="field"><span>Confirm password</span><input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} onKeyDown={onEnter} /></label>
+        <small className="muted">At least 8 characters with upper and lower case letters and a number.</small>
+      </>}
+      {(mode === 'confirm' || mode === 'reset-confirm') && <label className="field"><span>Confirmation code</span><input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} onKeyDown={onEnter} /></label>}
+      {mode === 'reset-confirm' && <>
+        <label className="field"><span>New password</span><input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} onKeyDown={onEnter} /></label>
+        <label className="field"><span>Confirm new password</span><input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} onKeyDown={onEnter} /></label>
+        <small className="muted">At least 8 characters with upper and lower case letters and a number.</small>
+      </>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {notice && !error && <p className="muted" role="status">{notice}</p>}
+      <div className="credential-state">
+        {mode === 'sign-in' && <>
+          <Button type="button" variant="primary" disabled={busy || auth.status === 'signing-in' || !email.trim() || !password} onClick={submitSignIn}>{busy ? 'Signing in…' : 'Sign in'}</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-up')}>Create account</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('reset-request')}>Forgot password?</Button>
+        </>}
+        {mode === 'sign-up' && <>
+          <Button type="button" variant="primary" disabled={busy || !email.trim() || !password || !confirmPassword} onClick={submitSignUp}>{busy ? 'Creating…' : 'Create account'}</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
+        </>}
+        {mode === 'confirm' && <>
+          <Button type="button" variant="primary" disabled={busy || !code.trim()} onClick={submitConfirm}>{busy ? 'Confirming…' : 'Confirm'}</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={resend}>Resend code</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
+        </>}
+        {mode === 'reset-request' && <>
+          <Button type="button" variant="primary" disabled={busy || !email.trim()} onClick={submitResetRequest}>{busy ? 'Sending…' : 'Send reset code'}</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
+        </>}
+        {mode === 'reset-confirm' && <>
+          <Button type="button" variant="primary" disabled={busy || !code.trim() || !password || !confirmPassword} onClick={submitResetConfirm}>{busy ? 'Resetting…' : 'Reset password'}</Button>
+          <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
+        </>}
+      </div>
+    </div>
+  )
+}
+
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
+  const auth = useAuth()
   const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), community_api_url: '' })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
@@ -195,10 +342,25 @@ export function SettingsPage() {
           </div>
         </Panel>
         <Panel className="settings-section">
-          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community service</h2><p>Optional hosted service for account pairing and benchmark aggregation.</p></div></div>
+          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to share anonymized benchmark telemetry and see community data.</p></div></div>
           <div className="settings-fields">
             <label className="field wide-field"><span>Community API URL</span><input type="url" value={form.community_api_url ?? ''} onChange={(event) => setForm({ ...form, community_api_url: event.target.value })} placeholder="Not configured" /><small>Leave empty to keep SparkDeck entirely local.</small></label>
-            <div className="credential-state"><KeyRound size={17} /><div><strong>Device credential</strong><Status status="stopped">Not paired</Status></div><Button type="button" disabled>Pair account</Button></div>
+            {auth.status === 'signed-in'
+              ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" onClick={() => void auth.signOut()}>Sign out</Button></div>
+              : <CommunitySignInForm />}
+            {auth.status === 'signed-in' && auth.clusterSync && <>
+              {auth.clusterSync.conflicts.map((conflict) => (
+                <p className="muted wide-field" role="status" key={conflict.node}>
+                  Sign-in was not applied to: {conflict.node}{conflict.email ? ` (already signed in as ${conflict.email})` : ''}.
+                </p>
+              ))}
+              {auth.clusterSync.errors.length > 0 && <p className="muted wide-field" role="status">
+                Could not reach: {auth.clusterSync.errors.map((entry) => entry.split(':')[0]).join(', ')} — they'll stay signed out until synced.
+              </p>}
+              {auth.clusterSync.applied.length > 0 && auth.clusterSync.conflicts.length === 0 && <p className="muted wide-field" role="status">
+                Sign-in synced to {auth.clusterSync.applied.length} node{auth.clusterSync.applied.length === 1 ? '' : 's'}.
+              </p>}
+            </>}
           </div>
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>

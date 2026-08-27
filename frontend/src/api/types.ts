@@ -148,6 +148,23 @@ export interface BenchmarkSample {
   created_at: string
 }
 
+export interface DevicePairing {
+  status: 'paired' | 'not_paired'
+  sub?: string
+  email?: string
+}
+
+export interface CommunityClusterSync {
+  applied: string[]
+  conflicts: { node: string; email?: string }[]
+  errors: string[]
+}
+
+export interface CommunityPairResponse {
+  pairing: DevicePairing
+  cluster?: CommunityClusterSync
+}
+
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean

@@ -405,6 +405,35 @@ class SparkDeckStoreTests(unittest.TestCase):
             (point["id"],),
         ).fetchone())
 
+    def test_coordinated_point_and_history_roll_back_together(self):
+        point = {
+            "id": "duplicate-series", "created_at": "2026-08-27T00:00:00+00:00",
+            "deployment_id": "dep-1", "model_id": "org/model",
+            "context_window_size": 4096, "concurrency": 2,
+            "tensor_parallel_size": 2, "prompt_tokens_per_second": 1000.0,
+            "generation_tokens_per_second": 80.0, "request_count": 4,
+        }
+        self.store.add_benchmark_series_point(point)
+        sample = BenchmarkSample(
+            id="atomic-history", created_at=point["created_at"],
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 4096, "benchmark_concurrency": 2,
+                "tensor_parallel_size": 2,
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=80, prompt_tokens_per_second=1000,
+            cold_start=False, eligible_for_community=True,
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.add_coordinated_benchmark(point, sample, queue=True)
+
+        local, total = self.store.benchmarks()
+        self.assertEqual((local, total), ([], 0))
+        self.assertEqual(self.store.benchmark_model_summaries()[0]["run_count"], 1)
+
     def test_migration_backfills_legacy_coordinated_history_link(self):
         database = Path(self.temp.name) / "legacy-series.sqlite3"
         connection = sqlite3.connect(database)

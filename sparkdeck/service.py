@@ -587,7 +587,6 @@ class SparkDeckService:
             "generation_tokens_per_second": generation_tokens_per_second,
             "request_count": request_count,
         }
-        await asyncio.to_thread(self.store.add_benchmark_series_point, point)
         runtime = RuntimeKind(str(deployment.get("runtime") or RuntimeKind.VLLM.value))
         configuration = self._safe_configuration({
             **settings,
@@ -627,8 +626,8 @@ class SparkDeckService:
                 self.store.get_setting, "community_consent", False,
             ))
             await asyncio.to_thread(
-                self.store.add_benchmark, sample,
-                queue=sample.eligible_for_community and consent,
+                self.store.add_coordinated_benchmark, point, sample,
+                sample.eligible_for_community and consent,
             )
         return point
 

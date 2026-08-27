@@ -66,7 +66,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(calls, 2)
 
-    async def test_benchmark_reports_concurrent_output_throughput(self) -> None:
+    async def test_benchmark_uses_union_for_overlapping_c10_prompt_timing(self) -> None:
         recorded_bodies = []
 
         async def controller_handler(request: httpx.Request) -> httpx.Response:
@@ -113,6 +113,10 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["metrics"]["prompt_tokens_per_second"], 0)
         self.assertGreater(result["metrics"]["prompt_seconds"], 0)
         self.assertGreater(result["metrics"]["mean_time_to_first_token_seconds"], 0)
+        summed_ttft = sum(
+            sample["time_to_first_token_seconds"] for sample in result["samples"]
+        )
+        self.assertLess(result["metrics"]["prompt_seconds"], summed_ttft / 2)
         self.assertGreater(result["metrics"]["output_tokens_per_second"], 0)
         self.assertEqual(result["recording"], {"status": "recorded", "id": "run-1"})
         self.assertEqual(len(recorded_bodies), 1)
@@ -122,6 +126,56 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("prompts", recorded_bodies[0])
         self.assertNotIn("samples", recorded_bodies[0])
+
+    async def test_benchmark_pads_default_c5_run_to_two_full_waves(self) -> None:
+        recorded_bodies = []
+        arrivals = [0, 0]
+        wave_ready = [asyncio.Event(), asyncio.Event()]
+        request_count = 0
+
+        async def controller_handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                recorded_bodies.append(json.loads(request.content))
+                return httpx.Response(201, json={"id": "run-c5"})
+            return httpx.Response(200, json={
+                "deployments": [{
+                    "id": "mcp-1", "status": "ready", "api_port": 8000,
+                }]
+            })
+
+        async def inference_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "served-model"}]})
+            wave = request_count // 5
+            request_count += 1
+            arrivals[wave] += 1
+            if arrivals[wave] == 5:
+                wave_ready[wave].set()
+            await asyncio.wait_for(wave_ready[wave].wait(), timeout=1)
+            return httpx.Response(
+                200,
+                content=(
+                    'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+                    'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                    '"completion_tokens":10}}\n\n'
+                    'data: [DONE]\n\n'
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        client = ControllerClient(
+            transport=httpx.MockTransport(controller_handler),
+            inference_transport=httpx.MockTransport(inference_handler),
+        )
+        result = await asyncio.wait_for(
+            client.benchmark("mcp-1", concurrency=5, warmup_requests=0),
+            timeout=3,
+        )
+
+        self.assertEqual(result["configuration"]["requests"], 10)
+        self.assertEqual(arrivals, [5, 5])
+        self.assertEqual(recorded_bodies[0]["request_count"], 10)
 
     async def test_benchmark_does_not_record_without_stream_usage(self) -> None:
         recorded_bodies = []

@@ -280,6 +280,22 @@ class ControllerClient:
         index = max(0, math.ceil(percentile * len(ordered)) - 1)
         return ordered[index]
 
+    @staticmethod
+    def _interval_union_seconds(intervals: list[tuple[float, float]]) -> float:
+        """Return elapsed time covered by one or more possibly overlapping intervals."""
+        if not intervals:
+            return 0.0
+        ordered = sorted(intervals)
+        current_start, current_end = ordered[0]
+        total = 0.0
+        for started_at, ended_at in ordered[1:]:
+            if started_at <= current_end:
+                current_end = max(current_end, ended_at)
+                continue
+            total += current_end - current_start
+            current_start, current_end = started_at, ended_at
+        return total + current_end - current_start
+
     def _inference_url(self, deployment: dict[str, Any]) -> str:
         port = deployment.get("api_port")
         if not port:
@@ -384,6 +400,8 @@ class ControllerClient:
                 return {
                     "latency_seconds": completed - started,
                     "time_to_first_token_seconds": first_token_seconds,
+                    "_prompt_started_at": started,
+                    "_first_token_at": first_token_at,
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage.get("completion_tokens") or 0),
                     "sample": "".join(text_parts)[:240],
@@ -400,11 +418,11 @@ class ControllerClient:
                 for _ in range(repetitions)
                 for prompt in prompt_values
             ]
-            # A C10 data point must actually have ten requests available to run
-            # together. Fill short prompt sets by cycling the supplied prompts;
-            # otherwise the result would only be labelled with the requested
-            # concurrency instead of measuring it.
-            while len(jobs) < concurrency:
+            # Every wave must contain the requested concurrency. Pad a partial
+            # final wave by cycling supplied prompts; otherwise a result can be
+            # labelled C5/C10 even though part of the run measured fewer active
+            # requests.
+            while len(jobs) % concurrency:
                 jobs.append(prompt_values[len(jobs) % len(prompt_values)])
             semaphore = asyncio.Semaphore(concurrency)
 
@@ -430,17 +448,29 @@ class ControllerClient:
             result["time_to_first_token_seconds"] for result in results
             if result["time_to_first_token_seconds"] is not None
         ]
+        prompt_intervals = [
+            (result["_prompt_started_at"], result["_first_token_at"])
+            for result in results
+            if result["_first_token_at"] is not None
+        ]
         prompt_metric_available = bool(
             prompt_tokens > 0
             and len(first_token_times) == len(results)
+            and len(prompt_intervals) == len(results)
             and all(value > 0 for value in first_token_times)
             and all(result["prompt_tokens"] > 0 for result in results)
         )
-        prompt_seconds = sum(first_token_times) if prompt_metric_available else None
+        prompt_seconds = (
+            self._interval_union_seconds(prompt_intervals)
+            if prompt_metric_available else None
+        )
         prompt_tokens_per_second = (
             prompt_tokens / prompt_seconds
             if prompt_seconds is not None and prompt_seconds > 0 else None
         )
+        for sample in results:
+            sample.pop("_prompt_started_at", None)
+            sample.pop("_first_token_at", None)
         result = {
             "deployment_id": deployment_id,
             "model": model,

@@ -448,6 +448,60 @@ class SparkDeckStore:
                 ),
             )
 
+    def add_coordinated_benchmark(
+        self, point: dict[str, Any], sample: BenchmarkSample, queue: bool,
+    ) -> None:
+        """Atomically persist one chart point, Local-history row, and outbox row."""
+        value = sample.to_dict()
+        community_eligible = bool(
+            sample.eligible_for_community
+            and community_context_window(sample.configuration) is not None
+            and _positive_speed(sample.generation_tokens_per_second) is not None
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO benchmark_samples VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )""",
+                (
+                    sample.id, sample.created_at, sample.deployment_id,
+                    json.dumps(value["model"]), sample.runtime.value,
+                    sample.runtime_version, json.dumps(sample.hardware),
+                    json.dumps(sample.configuration), sample.input_tokens,
+                    sample.output_tokens, sample.latency_ms, sample.ttft_ms,
+                    sample.generation_tokens_per_second,
+                    sample.prompt_tokens_per_second,
+                    None if sample.cold_start is None else int(sample.cold_start),
+                    int(community_eligible),
+                ),
+            )
+            self._connection.execute(
+                """INSERT INTO benchmark_series_points(
+                    id, created_at, deployment_id, model_id, context_window_size,
+                    concurrency, tensor_parallel_size, prompt_tps, generation_tps,
+                    request_count, sample_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    point["id"], point["created_at"], point.get("deployment_id"),
+                    point["model_id"], point["context_window_size"],
+                    point["concurrency"], point["tensor_parallel_size"],
+                    point["prompt_tokens_per_second"],
+                    point["generation_tokens_per_second"], point["request_count"],
+                    sample.id,
+                ),
+            )
+            if queue and community_eligible:
+                pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+                status = (
+                    "pending" if pairing.get("status") == "paired"
+                    else "waiting_for_account"
+                )
+                self._connection.execute(
+                    "INSERT INTO upload_outbox(sample_id, status, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (sample.id, status, sample.created_at),
+                )
+
     def benchmark_model_summaries(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(

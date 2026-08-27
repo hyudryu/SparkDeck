@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Bookmark, Check, HardDrive, Pencil, Play, Plus, Server, Settings2, Trash2, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, Server, Settings2, Trash2, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
@@ -170,6 +170,7 @@ export function ModelsPage() {
   const [recipeError, setRecipeError] = useState<string>()
   const [sortMode, setSortMode] = useState<SortMode>(readSortMode)
   const [pinned, setPinned] = useState<string[]>(readPinned)
+  const [expandedGroups, setExpandedGroups] = useState<string[]>([])
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
@@ -312,6 +313,12 @@ export function ModelsPage() {
       localStorage.setItem(PIN_STORAGE_KEY, JSON.stringify(next))
       return next
     })
+  }
+
+  const toggleGroup = (company: string) => {
+    setExpandedGroups((current) => current.includes(company)
+      ? current.filter((name) => name !== company)
+      : [...current, company])
   }
 
   const sortedDeployments = useMemo(() => {
@@ -579,10 +586,16 @@ export function ModelsPage() {
       )}
       {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">
         <div className="section-heading"><div><h2 id="saved-configurations-title">Recipes</h2><p>Saved launch configurations — choose nodes and launch one as a deployment.</p></div></div>
-        {recipeGroups.map(([company, items]) => (
-          <div className="saved-configuration-group" key={company}>
-            <h3 className="saved-configuration-group-title">{company} <span className="saved-configuration-group-count">{items.length}</span></h3>
-            <div className="saved-configuration-grid">
+        {recipeGroups.map(([company, items]) => {
+          const expanded = expandedGroups.includes(company)
+          return <div className="saved-configuration-group" key={company}>
+            <h3 className="saved-configuration-group-title">
+              <button type="button" className="group-toggle" aria-expanded={expanded} onClick={() => toggleGroup(company)}>
+                {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                {company} <span className="saved-configuration-group-count">{items.length}</span>
+              </button>
+            </h3>
+            {expanded && <div className="saved-configuration-grid">
               {items.map((recipe) => {
                 const targets = (recipe.node_ids?.length ? recipe.node_ids : ['local']).map((id) => nodes.data?.find((node) => node.id === id))
                 const targetNames = targets.map((node, index) => node?.name ?? recipe.node_ids?.[index] ?? 'This device')
@@ -640,9 +653,9 @@ export function ModelsPage() {
                   </div>}
                 </Panel>
               })}
-            </div>
+            </div>}
           </div>
-        ))}
+        })}
       </section>}
 
       {recipeDeployment && (() => {

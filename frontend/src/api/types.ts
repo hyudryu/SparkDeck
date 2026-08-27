@@ -551,6 +551,7 @@ export interface UsageSummary {
   groups: UsageGroup[]
   total: UsageCounters
   routing_rules?: Record<string, string>
+  merge_groups?: Record<string, string>
 }
 
 export interface HourlyUsagePoint {

@@ -131,13 +131,17 @@ export function UsagePage() {
   const setSort = (next: SortKey) => { if (next === sortKey) setSortAscending((value) => !value); else { setSortKey(next); setSortAscending(next === 'model') } }
   const reload = () => { summary.reload(); analysis.reload() }
   const reset = async () => { if (!window.confirm('Reset lifetime token counters for every model? This cannot be undone.')) return; setBusy('reset'); setActionError(undefined); try { await api.usage.reset(); setNotice('Lifetime usage counters reset.'); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not reset lifetime usage') } finally { setBusy(undefined) } }
-  const beginEdit = (member: UsageMember) => { setEditing(member); setAlias(member.alias ?? ''); setMergeGroup(member.merge_group ?? ''); setRouteTo(summary.data?.routing_rules?.[member.model] ?? ''); setActionError(undefined) }
+  // member.merge_group holds the destination's resolved group for routed
+  // sources; only summary.merge_groups carries the source's own setting.
+  const beginEdit = (member: UsageMember) => { setEditing(member); setAlias(member.alias ?? ''); setMergeGroup(summary.data?.merge_groups?.[member.model] ?? ''); setRouteTo(summary.data?.routing_rules?.[member.model] ?? ''); setActionError(undefined) }
   const saveDisplay = async (event: FormEvent) => {
     event.preventDefault(); if (!editing) return
     const destination = routeTo.trim(); const currentRoute = summary.data?.routing_rules?.[editing.model]
+    const configuredGroup = summary.data?.merge_groups?.[editing.model] ?? ''
+    const nextGroup = mergeGroup.trim()
     setBusy(`alias:${editing.model}`); setActionError(undefined)
     try {
-      await api.usage.updateAlias(editing.model, alias.trim() || null, mergeGroup.trim() || null)
+      await api.usage.updateAlias(editing.model, alias.trim() || null, nextGroup === configuredGroup ? undefined : nextGroup || null)
       if (!destination && currentRoute) await api.usage.deleteRoute(editing.model)
       else if (destination && destination !== currentRoute) await api.usage.setRoute(editing.model, destination)
       setEditing(undefined); setNotice(`Updated usage display for ${editing.model}.`); summary.reload()

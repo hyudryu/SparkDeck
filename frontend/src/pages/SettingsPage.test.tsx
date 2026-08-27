@@ -77,7 +77,7 @@ describe('settings page', () => {
   it('restores the saved theme and only persists a new selection after save', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
-      if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: ['No published GitHub release is available'], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: ['Could not resolve origin/main'], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify(init?.method === 'PUT' ? {
         theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
       } : {
@@ -208,20 +208,15 @@ describe('settings page', () => {
     }))
   })
 
-  it('confirms and starts one cluster-wide release update', async () => {
+  it('confirms and starts one cluster-wide update to main without downgrade controls', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('system-update')) return new Response(JSON.stringify(init?.method === 'POST' ? {
-        id: 'job-1', active: true, phase: 'preflight', target_tag: 'v0.9.0', target_revision: 'b'.repeat(40), nodes: [],
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main', target_revision: 'b'.repeat(40), nodes: [],
       } : {
         repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
-        current_release_tag: 'v1.0.0',
-        releases: [
-          { tag: 'v1.1.0', name: 'Version 1.1' },
-          { tag: 'v1.0.0', name: 'Version 1.0' },
-          { tag: 'v0.9.0', name: 'Version 0.9' },
-        ],
-        latest_release: { tag: 'v1.1.0', name: 'Version 1.1' },
+        target: { branch: 'main', revision: 'b'.repeat(40), url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
+        up_to_date: false,
         can_update: true, blockers: [], nodes: [{ id: 'local', name: 'Controller', local: true, online: true, current_revision: 'a'.repeat(40), blockers: [] }],
       }), { status: init?.method === 'POST' ? 202 : 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({ theme: 'system', default_runtime: 'vllm', default_context_length: 8192 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -231,18 +226,37 @@ describe('settings page', () => {
     const user = userEvent.setup()
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    const release = await screen.findByRole('combobox', { name: 'Release version' })
-    expect(release).toHaveValue('v1.1.0')
-    expect(screen.getByRole('option', { name: /Version 1.0.*installed/ })).toBeInTheDocument()
-    await user.selectOptions(release, 'v1.0.0')
-    expect(screen.getByRole('button', { name: 'Installed on all nodes' })).toBeDisabled()
-    await user.selectOptions(release, 'v0.9.0')
-    await user.click(screen.getByRole('button', { name: 'Install on all nodes' }))
+    expect(await screen.findByText('origin/main bbbbbbbb · 1 cluster node')).toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Release version' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/downgrade|roll back|rollback/i)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Update to main' }))
 
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/v0\.9\.0.*may upgrade or downgrade.*controller restarts last/i))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/origin\/main at bbbbbbbb.*controller restarts last/i))
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/system-update', expect.objectContaining({
-      method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', tag: 'v0.9.0' }),
+      method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', revision: 'b'.repeat(40) }),
     }))
+  })
+
+  it('shows the cluster as up to date when every node matches main', async () => {
+    const revision = 'b'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: revision,
+        target: { branch: 'main', revision, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
+        up_to_date: true,
+        can_update: false, blockers: [],
+        nodes: [{ id: 'local', name: 'Controller', local: true, online: true, current_revision: revision, blockers: [] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', default_runtime: 'vllm', default_context_length: 8192,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Running bbbbbbbb')).toBeInTheDocument()
+    expect(screen.getByText('origin/main bbbbbbbb · 1 cluster node')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Up to date' })).toBeDisabled()
   })
 })
 

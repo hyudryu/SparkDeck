@@ -444,6 +444,15 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify({ model, alias, merge_group }),
       }),
+    setRoute: (source: string, destination: string) =>
+      request<void>('/api/token-stats/rules', {
+        method: 'PUT',
+        body: JSON.stringify({ source, destination }),
+      }),
+    deleteRoute: (source: string) => request<void>(
+      `/api/token-stats/rules/${encodeURIComponent(source)}`,
+      { method: 'DELETE' },
+    ),
     erase: (model: string) => request<void>(
       `/api/token-stats/${encodeURIComponent(model)}`,
       { method: 'DELETE' },

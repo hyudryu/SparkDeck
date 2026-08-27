@@ -84,9 +84,12 @@ export function activityHeatmapCalendar(points: DailyUsagePoint[], reference = n
 function ActivityHeatmap({ points }: { points: DailyUsagePoint[] }) {
   const { cells, months } = activityHeatmapCalendar(points)
   const maximum = Math.max(1, ...cells.map((cell) => cell.value))
-  return <div className="usage-heatmap-scroll" role="img" aria-label="Daily token activity for the last year"><div className="usage-heatmap">
-    {cells.map((cell) => { const ratio = cell.value / maximum; const level = cell.value === 0 ? 0 : ratio < .08 ? 1 : ratio < .25 ? 2 : ratio < .55 ? 3 : 4; return <span key={cell.date} className={`usage-heatmap-cell level-${level}`} title={`${cell.date}: ${formatTokens(cell.value)} tokens`} /> })}
-  </div><div className="usage-heatmap-months" aria-hidden="true">{months.map((month) => <span key={month.key} style={{ gridColumn: `${month.column} / span 4` }}>{month.label}</span>)}</div></div>
+  const [hover, setHover] = useState<{ date: string; value: number; x: number; y: number }>()
+  return <div className="usage-heatmap-scroll" role="img" aria-label="Daily token activity for the last year" onMouseLeave={() => setHover(undefined)}><div className="usage-heatmap">
+    {cells.map((cell) => { const ratio = cell.value / maximum; const level = cell.value === 0 ? 0 : ratio < .08 ? 1 : ratio < .25 ? 2 : ratio < .55 ? 3 : 4; return <span key={cell.date} className={`usage-heatmap-cell level-${level}`} onMouseEnter={(event) => setHover({ date: cell.date, value: cell.value, x: event.clientX, y: event.clientY })} /> })}
+  </div><div className="usage-heatmap-months" aria-hidden="true">{months.map((month) => <span key={month.key} style={{ gridColumn: `${month.column} / span 4` }}>{month.label}</span>)}</div><div className="usage-heatmap-scale" aria-hidden="true"><span>Less</span>{[0, 1, 2, 3, 4].map((level) => <i key={level} className={`usage-heatmap-cell level-${level}`} />)}<span>More</span></div>
+    {hover && <div className="usage-heatmap-tooltip" style={{ left: Math.min(Math.max(hover.x, 90), window.innerWidth - 90), top: hover.y }}><strong>{formatTokens(hover.value)} tokens</strong><span>{new Date(`${hover.date}T00:00:00Z`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })}</span></div>}
+  </div>
 }
 
 function TrendChart({ points, range }: { points: DailyUsagePoint[]; range: RangeDays }) {

@@ -1544,6 +1544,18 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
+@app.get("/api/v1/deployments/{deployment_id}/logs")
+async def v1_deployment_logs(deployment_id: str, tail: int = 300):
+    try:
+        return await sparkdeck.deployment_logs(deployment_id, tail)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 def _public_recipe(recipe: dict) -> dict:
     """Return the safe saved-configuration contract used by the Models UI."""
     safe_recipe = {

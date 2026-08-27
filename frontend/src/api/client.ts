@@ -236,6 +236,10 @@ export const api = {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
       return deploymentFromWire(data)
     },
+    logs: async (id: string, tail = 300) => {
+      const data = await request<{ logs: string }>(`/api/v1/deployments/${encodeURIComponent(id)}/logs?tail=${tail}`)
+      return data.logs
+    },
     rename: async (id: string, alias: string) => {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}`, {
         method: 'PATCH',

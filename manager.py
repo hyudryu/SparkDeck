@@ -1402,6 +1402,10 @@ class Manager:
         return await self.node_registry.probe(node, force=True)
 
     def remove_cluster_node(self, node_id: str) -> bool:
+        self._assert_cluster_node_removable(node_id)
+        return self.node_registry.remove(node_id)
+
+    def _assert_cluster_node_removable(self, node_id: str) -> None:
         for deployment in self.deployments:
             member_node_ids = {
                 member.get("node_id")
@@ -1412,6 +1416,38 @@ class Manager:
                 raise ValueError(
                     f"node is still used by {name}; remove that deployment first"
                 )
+
+    async def detach_cluster_node(self, node_id: str, *, force: bool = False) -> bool:
+        """Disconnect one worker before forgetting its controller-side record.
+
+        A force removal is intentionally controller-local recovery for an
+        unreachable node. The worker may retain a stale assignment until its
+        operator uses Leave cluster or pairs it again.
+        """
+        if node_id == LOCAL_NODE_ID:
+            raise ValueError("the controller node cannot be removed")
+        node = self.node_registry.get(node_id)
+        if not node:
+            return False
+        self._assert_cluster_node_removable(node_id)
+        if not force:
+            try:
+                await self.node_registry.request(
+                    node_id, "POST", "/api/agent/onboarding/detach", timeout=10,
+                )
+            except RuntimeError as exc:
+                cause = exc.__cause__
+                protocol_version = node.get("protocol_version")
+                if not (
+                    protocol_version == AGENT_PROTOCOL_VERSION
+                    and isinstance(cause, httpx.HTTPStatusError)
+                    and cause.response.status_code == 404
+                ):
+                    raise
+                # Protocol v1 predates authenticated detach but remains the
+                # advertised compatible version. Preserve the legacy removal
+                # behavior when that one capability is absent; a later local
+                # Leave cluster clears the worker's stale assignment.
         return self.node_registry.remove(node_id)
 
     # ---------- clustered deployments ----------

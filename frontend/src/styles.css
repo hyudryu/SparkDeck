@@ -412,7 +412,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .page-header { display: grid; gap: 16px; }.page-actions { width: 100%; }.page-actions .button { flex: 1; }
   .field-grid { grid-template-columns: 1fr; }
   .node-options { grid-template-columns: 1fr; }
-  .node-management { padding: 14px; }.node-management .section-heading { align-items: flex-start; }.node-management-row { gap: 9px; }.node-rename-form { grid-template-columns: 1fr; }.node-rename-actions { display: grid; grid-template-columns: 1fr 1fr; }.node-rename-actions .button { min-height: 44px; }.node-rename-form .inline-error { grid-column: 1; }
+  .node-management { padding: 14px; }.node-management .section-heading { align-items: flex-start; }.node-management-row { gap: 9px; }.node-rename-form { grid-template-columns: 1fr; }.node-rename-actions { display: grid; grid-template-columns: 1fr 1fr; }.node-rename-actions .button { min-height: 44px; }.node-rename-actions .node-remove-button { grid-column: 1 / -1; }.node-rename-form .inline-error { grid-column: 1; }
   .storage-node-grid, .storage-targets > div { grid-template-columns: 1fr; }.storage-transfer-actions { align-items: stretch; flex-direction: column; }.storage-transfer-actions .button { width: 100%; }.storage-model-table .table-row, .storage-job-table .table-row { grid-template-columns: 1fr; }
   .catalog-filters { grid-template-columns: 1fr; }.catalog-filters > .button { grid-column: 1; }.catalog-model-actions { display: grid; grid-template-columns: 1fr 1fr; }.catalog-model-actions .button { min-height: 44px; }
   .compare-submit { align-items: stretch; flex-direction: column; }.compare-submit p { max-width: none; }.compare-submit .button { width: 100%; }

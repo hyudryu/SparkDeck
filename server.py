@@ -165,9 +165,19 @@ app = FastAPI(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    if is_forwardable_path(request.url.path):
+    forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
+    forgotten_unregister = (
+        forwarded
+        and request.method == "POST"
+        and request.url.path == "/api/v1/onboarding/unregister"
+        and onboarding.is_already_unregistered_worker(request.headers)
+    )
+    if forgotten_unregister:
+        # The route turns this exact already-absent state into the 404 that a
+        # force-forgotten worker recognizes as a successful local recovery.
+        response = await call_next(request)
+    elif is_forwardable_path(request.url.path):
         assignment = onboarding.assignment.load()
-        forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
         if assignment:
             response = await forward_management_request(request, manager, assignment)
         elif forwarded:
@@ -497,6 +507,15 @@ async def agent_rename_node(req: Request):
         return await manager.rename_cluster_node(LOCAL_NODE_ID, body.get("name"))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agent/onboarding/detach")
+async def agent_detach_from_controller(req: Request):
+    _require_agent(req)
+    try:
+        return await onboarding.detach()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/agent/temperature-history")
@@ -830,11 +849,11 @@ async def refresh_cluster_node(node_id: str):
 
 @app.delete("/api/nodes/{node_id}")
 async def remove_cluster_node(node_id: str):
-    if node_id == LOCAL_NODE_ID:
-        raise HTTPException(400, "the coordinator node cannot be removed")
     try:
-        removed = manager.remove_cluster_node(node_id)
+        removed = await manager.detach_cluster_node(node_id)
     except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     if not removed:
         raise HTTPException(404, "node not found")
@@ -1271,6 +1290,19 @@ async def v1_rename_node(node_id: str, req: Request):
         raise HTTPException(404, str(exc)) from exc
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/v1/nodes/{node_id}")
+async def v1_remove_node(node_id: str, force: bool = False):
+    try:
+        removed = await manager.detach_cluster_node(node_id, force=force)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, "node not found")
+    return {"ok": True, "node_id": node_id, "forced": force}
 
 
 @app.post("/api/v1/images/pull", status_code=201)

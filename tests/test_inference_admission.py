@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
+
 from manager import ClientAbort, Manager
 
 
@@ -240,18 +242,16 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             "model", {"model": "model", "messages": [], "stream": True},
             stream=True,
         )
-        second_stream = await instance._vllm_chat(
-            "model", {"model": "model", "messages": [], "stream": True},
-            stream=True,
+        second_open = asyncio.create_task(
+            instance._vllm_chat(
+                "model", {"model": "model", "messages": [], "stream": True},
+                stream=True,
+            )
         )
 
         async def consume(stream):
             return [chunk async for chunk in stream]
 
-        first = asyncio.create_task(consume(first_stream))
-        while len(upstream_calls) < 1:
-            await asyncio.sleep(0)
-        second = asyncio.create_task(consume(second_stream))
         await asyncio.sleep(0)
 
         self.assertEqual(len(upstream_calls), 1)
@@ -259,11 +259,12 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             instance.inference_admission()["deployment-a"]["queued"], 1,
         )
         releases[0].set()
-        await first
+        await consume(first_stream)
         while len(upstream_calls) < 2:
             await asyncio.sleep(0)
+        second_stream = await second_open
         releases[1].set()
-        await second
+        await consume(second_stream)
         self.assertEqual(instance.inference_admission(), {})
 
     async def test_stream_disconnect_cancels_stalled_response_headers(self) -> None:
@@ -289,18 +290,42 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             stream=lambda *args, **kwargs: StalledContext(),
         )
         cancel = asyncio.Event()
-        stream = await instance._vllm_chat(
-            "model", {"model": "model", "messages": [], "stream": True},
-            stream=True, cancel=cancel,
-        )
-        consume = asyncio.create_task(
-            anext(stream)
+        opening = asyncio.create_task(
+            instance._vllm_chat(
+                "model", {"model": "model", "messages": [], "stream": True},
+                stream=True, cancel=cancel,
+            )
         )
         await entered.wait()
         cancel.set()
 
-        with self.assertRaises(StopAsyncIteration):
-            await consume
+        with self.assertRaises(ClientAbort):
+            await opening
+        self.assertEqual(instance.inference_admission(), {})
+
+    async def test_stream_preserves_rejection_status_during_preparation(self) -> None:
+        instance = self.manager()
+        instance._resolve_vllm_target = mock.AsyncMock(return_value=container())
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance.http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                422, text="invalid parameters", request=request,
+            )
+        ))
+
+        try:
+            with self.assertRaises(httpx.HTTPStatusError) as raised:
+                await instance._vllm_chat(
+                    "model",
+                    {"model": "model", "messages": [], "stream": True},
+                    stream=True,
+                )
+        finally:
+            await instance.http.aclose()
+
+        self.assertEqual(raised.exception.response.status_code, 422)
         self.assertEqual(instance.inference_admission(), {})
 
     async def test_nudger_replays_only_newer_zero_output_stream(self) -> None:

@@ -1,9 +1,10 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+from fastapi import HTTPException
 
 from manager import ClientAbort, Manager
 
@@ -46,6 +47,22 @@ class StreamResponse:
 
     async def aclose(self):
         self.closed = True
+
+
+class ErrorStreamResponse(StreamResponse):
+    def __init__(self, status=None):
+        super().__init__()
+        self.status = status
+
+    async def aiter_lines(self):
+        error = {
+            "message": "runtime disappeared",
+            "type": "upstream_error",
+        }
+        if self.status is not None:
+            error["code"] = self.status
+        yield "data: " + json.dumps({"error": error})
+        yield "data: [DONE]"
 
 
 def member(rank: int, node_id: str, container_name: str) -> dict:
@@ -353,6 +370,86 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.node_registry.open_stream.await_count, 2)
         self.assertEqual(member_loads(manager, deployment), [0, 0])
 
+    async def test_remote_stream_error_before_output_fails_over(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.open_stream = AsyncMock(side_effect=[
+            ErrorStreamResponse(503), StreamResponse(),
+        ])
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": True},
+            "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[0], 'data: {"choices": []}\n\n')
+        self.assertNotIn("runtime disappeared", "".join(chunks))
+        self.assertEqual(manager.node_registry.open_stream.await_count, 2)
+
+    async def test_remote_codeless_stream_error_before_output_fails_over(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.open_stream = AsyncMock(side_effect=[
+            ErrorStreamResponse(), StreamResponse(),
+        ])
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": True},
+            "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertEqual(manager.node_registry.open_stream.await_count, 2)
+
+    async def test_missing_remote_container_404_fails_over(self):
+        manager = build_manager(replicated_deployment())
+        request = httpx.Request("POST", "http://remote/agent/inference")
+        missing = httpx.Response(
+            404,
+            json={"detail": {
+                "type": "replica_unavailable",
+                "message": "No managed container found",
+            }},
+            request=request,
+        )
+        manager.node_registry.open_stream = AsyncMock(side_effect=[
+            missing, StreamResponse(),
+        ])
+
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": True},
+            "chat/completions",
+        )
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertEqual(manager.node_registry.open_stream.await_count, 2)
+
+    async def test_remote_upstream_404_does_not_fail_over(self):
+        manager = build_manager(replicated_deployment())
+        request = httpx.Request("POST", "http://remote/agent/inference")
+        rejected = httpx.Response(
+            404,
+            json={"detail": {
+                "type": "upstream_error", "message": "model not found",
+            }},
+            request=request,
+        )
+        manager.node_registry.open_stream = AsyncMock(return_value=rejected)
+
+        with self.assertRaises(httpx.HTTPStatusError) as raised:
+            await manager.proxy_cluster_inference(
+                "repl-1", "org/model",
+                {"model": "org/model", "messages": [], "stream": True},
+                "chat/completions",
+            )
+
+        self.assertEqual(raised.exception.response.status_code, 404)
+        manager.node_registry.open_stream.assert_awaited_once()
+
 
 class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
     def manager(self):
@@ -439,11 +536,43 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda *a, **k: upstream_error_stream(400)
         )
 
-        with self.assertRaisesRegex(RuntimeError, "local inference failed: HTTP 400"):
-            await self.manager_proxy(manager, stream=True)
+        stream = await self.manager_proxy(manager, stream=True)
+        chunks = [chunk async for chunk in stream]
 
+        self.assertIn('"code": 400', chunks[0])
         manager.node_registry.open_stream.assert_not_awaited()
         manager.node_registry.request.assert_not_awaited()
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_codeless_stream_error_fails_over_to_remote(self):
+        manager, deployment = self.manager()
+
+        async def unavailable(*args, **kwargs):
+            async def gen():
+                yield "data: " + json.dumps({"error": {
+                    "message": "connect failed", "type": "upstream_error",
+                }}) + "\n\n"
+            return gen()
+
+        manager._vllm_chat = AsyncMock(side_effect=unavailable)
+        manager.node_registry.open_stream = AsyncMock(return_value=StreamResponse())
+
+        stream = await self.manager_proxy(manager, stream=True)
+        chunks = [chunk async for chunk in stream]
+
+        self.assertEqual(chunks[0], 'data: {"choices": []}\n\n')
+        manager.node_registry.open_stream.assert_awaited_once()
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+
+    async def test_local_stream_http_error_preserves_status_before_headers(self):
+        manager, deployment = self.manager()
+        manager._vllm_chat = AsyncMock(side_effect=status_error(422))
+
+        with self.assertRaises(httpx.HTTPStatusError) as raised:
+            await self.manager_proxy(manager, stream=True)
+
+        self.assertEqual(raised.exception.response.status_code, 422)
+        manager.node_registry.open_stream.assert_not_awaited()
         self.assertEqual(member_loads(manager, deployment), [0, 0])
 
     async def test_local_upstream_client_error_does_not_fail_over(self):
@@ -460,6 +589,51 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
         body = {"model": "org/model", "messages": [], "stream": False, **overrides}
         return await manager.proxy_cluster_inference(
             "repl-1", "org/model", body, "chat/completions",
+        )
+
+
+class AgentInferenceErrorTests(unittest.IsolatedAsyncioTestCase):
+    class Request:
+        headers = {}
+
+        async def json(self):
+            return {"model": "org/model", "messages": [], "stream": True}
+
+        async def is_disconnected(self):
+            return False
+
+    async def test_agent_preserves_upstream_http_status(self):
+        import server
+
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(
+                server.manager, "_vllm_chat",
+                AsyncMock(side_effect=status_error(422)),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await server.agent_inference("chat/completions", self.Request())
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.detail["type"], "upstream_error")
+
+    async def test_agent_types_missing_container_as_replica_unavailable(self):
+        import server
+
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(
+                server.manager, "_vllm_chat",
+                AsyncMock(side_effect=LookupError("No managed container found")),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await server.agent_inference("chat/completions", self.Request())
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(
+            raised.exception.detail["type"], "replica_unavailable",
         )
 
 

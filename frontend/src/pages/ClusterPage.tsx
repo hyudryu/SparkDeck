@@ -128,10 +128,14 @@ export function ClusterPage() {
       nodes.setData((nodes.data ?? []).map((item) => item.id === node.id ? { ...item, ...updated } : item))
       if (resource.data && isCurrentEntryNode(node, resource.data)) {
         resource.setData({ ...resource.data, node: { ...resource.data.node, name: updated.name } })
+        // The shell caches the entry node's name for the sidebar chip. The
+        // rename only changed this node's own settings once the write reached
+        // it; the controller reports "pending" when an offline worker still
+        // holds its old name.
+        if (updated.name_sync !== 'pending') {
+          window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
+        }
       }
-      // The shell caches this node's name for the sidebar; renaming the local
-      // node must reach it without waiting for a full page reload.
-      if (node.local) window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
       setEditingNodeId(undefined)
       setNodeName('')
       setNotice(`Renamed ${node.name} to ${updated.name}.`)

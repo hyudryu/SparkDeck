@@ -1744,7 +1744,10 @@ async def v1_settings():
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
-    values["cluster_node_name"] = manager.settings.get("cluster_node_name")
+    # cluster_node_name is deliberately absent: this response is forwarded to
+    # the controller on joined workers, so it would name the controller rather
+    # than the node serving the browser. Clients read the unforwarded
+    # /api/v1/onboarding status, which every node answers for itself.
     return values
 
 

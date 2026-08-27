@@ -668,6 +668,22 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["detected"])
         self.assertTrue(result["nodes"][1]["detected"])
 
+    async def test_lightweight_presence_does_not_infer_switch_connectivity(self) -> None:
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1",
+            "name": "Rack node",
+            "online": True,
+            "routeros": {"detected": True, "configured": True},
+        }])
+
+        result = await manager.routeros_cluster_presence()
+
+        self.assertTrue(result["detected"])
+        self.assertTrue(result["nodes"][0]["online"])
+        self.assertTrue(result["nodes"][0]["configured"])
+        self.assertNotIn("connected", result["nodes"][0])
+
     async def test_remote_failure_does_not_hide_other_switch_nodes(self) -> None:
         manager = Manager.__new__(Manager)
         manager.cluster_nodes = mock.AsyncMock(return_value=[

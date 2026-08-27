@@ -97,6 +97,97 @@ PERSISTED_DEPLOYMENT_ARGS_ERROR = (
 )
 
 
+class _RetryingDockerClient:
+    """Reconnect to Docker lazily after the daemon was unavailable at startup.
+
+    Docker's ``from_env`` constructor negotiates an API version immediately,
+    so constructing the process-wide manager used to prevent controller-only
+    installations from starting at all. Defer even the first negotiation until
+    an operation actually needs Docker. Failed attempts are cached briefly and
+    only one caller may negotiate at a time, so aggregate state polling cannot
+    fill the thread pool while a daemon is hung. A later access retries and
+    permanently caches the first working client.
+    """
+
+    RETRY_INTERVAL_SECONDS = 5.0
+    CONNECT_WAIT_SECONDS = 0.25
+
+    def __init__(
+        self,
+        initial_error=None,
+        *,
+        retry_interval=None,
+        connect_wait_timeout=None,
+        clock=None,
+    ):
+        self._client = None
+        self._condition = threading.Condition()
+        self._connecting = False
+        self._clock = clock or time.monotonic
+        self._retry_interval = (
+            self.RETRY_INTERVAL_SECONDS
+            if retry_interval is None
+            else max(0.0, float(retry_interval))
+        )
+        self._connect_wait_timeout = (
+            self.CONNECT_WAIT_SECONDS
+            if connect_wait_timeout is None
+            else max(0.0, float(connect_wait_timeout))
+        )
+        self._last_error = str(initial_error) if initial_error is not None else ""
+        self._retry_after = (
+            self._clock() + self._retry_interval
+            if initial_error is not None
+            else 0.0
+        )
+
+    def _unavailable(self, detail: str | None = None):
+        message = detail or self._last_error or "reconnect is already in progress"
+        return docker.errors.DockerException(f"Docker is unavailable: {message}")
+
+    def _connect(self):
+        with self._condition:
+            if self._client is not None:
+                return self._client
+            if self._clock() < self._retry_after:
+                raise self._unavailable()
+            if self._connecting:
+                # Healthy API negotiation is normally quick. Let concurrent
+                # inventory/status callers share that first result rather than
+                # reporting a transient outage, but cap the wait so a hung
+                # Docker daemon cannot tie up the controller thread pool.
+                finished = self._condition.wait_for(
+                    lambda: self._client is not None or not self._connecting,
+                    timeout=self._connect_wait_timeout,
+                )
+                if self._client is not None:
+                    return self._client
+                if finished:
+                    raise self._unavailable()
+                raise self._unavailable("reconnect is already in progress")
+            self._connecting = True
+        try:
+            try:
+                client = docker.from_env()
+            except docker.errors.DockerException as exc:
+                with self._condition:
+                    self._last_error = str(exc)
+                    self._retry_after = self._clock() + self._retry_interval
+                raise self._unavailable() from exc
+            with self._condition:
+                self._client = client
+                self._last_error = ""
+                self._retry_after = 0.0
+            return client
+        finally:
+            with self._condition:
+                self._connecting = False
+                self._condition.notify_all()
+
+    def __getattr__(self, name: str):
+        return getattr(self._connect(), name)
+
+
 def _append_persisted_error(existing: Any, marker: str) -> str:
     current = str(existing or "").strip()
     return current if marker in current else "; ".join(filter(None, [current, marker]))
@@ -439,7 +530,10 @@ class Manager:
         self.hourly_token_stats: dict[str, dict] = self._load_hourly_token_stats()
         # In-flight Spark Run executions (run_id -> run dict). Not persisted.
         self.spark_runs: dict[str, dict] = {}
-        self.client = docker.from_env()
+        # docker.from_env() negotiates the daemon API version synchronously.
+        # Keep construction non-blocking so a hung Docker Desktop cannot delay
+        # the controller UI from binding and serving its liveness endpoint.
+        self.client = _RetryingDockerClient()
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.lock = asyncio.Lock()
@@ -811,10 +905,7 @@ class Manager:
         if stats is None:
             stats = await self.get_stats()
         disk = await self.get_disk()
-        try:
-            docker_ready = bool(await asyncio.to_thread(self.client.ping))
-        except Exception:
-            docker_ready = False
+        docker_ready, docker_status_message = await self._docker_runtime_status()
         try:
             containers = await self.list_containers()
             containers = [
@@ -870,7 +961,7 @@ class Manager:
             "app_revision": current_revision(Path(__file__).parent),
             "status": "online" if docker_ready else "degraded",
             "online": True,
-            "status_message": None if docker_ready else "Docker is unavailable",
+            "status_message": docker_status_message,
             "docker_ready": docker_ready,
             "fabric_ready": fabric_ready,
             "interfaces": interfaces,
@@ -880,6 +971,23 @@ class Manager:
             "containers": containers,
             "llama_rpc": self.llama_rpc_status(),
         }
+
+    async def _docker_runtime_status(self) -> tuple[bool, str | None]:
+        """Return whether Docker can run SparkDeck's Linux GPU workloads."""
+
+        def probe() -> tuple[bool, str | None]:
+            if not self.client.ping():
+                return False, "Docker is unavailable"
+            daemon_info = self.client.info()
+            os_type = str((daemon_info or {}).get("OSType") or "").strip().lower()
+            if os_type != "linux":
+                return False, "Docker must be configured to use Linux containers"
+            return True, None
+
+        try:
+            return await asyncio.to_thread(probe)
+        except Exception:
+            return False, "Docker is unavailable"
 
     def _cluster_launch_update(
         self,
@@ -11094,12 +11202,35 @@ class Manager:
 
     # ---------- aggregate state ----------
     async def get_state(self) -> dict:
-        containers, images, stats = await asyncio.gather(
+        containers_result, images_result, stats_result = await asyncio.gather(
             self.list_containers(),
             self.list_images(),
             self.get_stats(),
+            return_exceptions=True,
         )
+        for result in (containers_result, images_result):
+            if isinstance(result, BaseException) and not isinstance(
+                result, docker.errors.DockerException
+            ):
+                raise result
+        if isinstance(stats_result, BaseException):
+            raise stats_result
+        containers_unavailable = isinstance(
+            containers_result, docker.errors.DockerException
+        )
+        images_unavailable = isinstance(images_result, docker.errors.DockerException)
+        containers = [] if containers_unavailable else containers_result
+        images = [] if images_unavailable else images_result
+        stats = stats_result
         nodes = await self.cluster_nodes(stats)
+        local_docker_ready = next(
+            (
+                bool(node.get("docker_ready"))
+                for node in nodes
+                if node.get("local") or node.get("id") == LOCAL_NODE_ID
+            ),
+            False,
+        )
         containers_by_node: dict[str, dict[str, dict]] = {
             LOCAL_NODE_ID: {c.get("name"): c for c in containers},
         }
@@ -11114,6 +11245,7 @@ class Manager:
         for saved in self.deployments:
             deployment = {**saved, "members": []}
             member_states = []
+            member_inventory_unknown = False
             runtime_flags = []
             primary_container = None
             for original in saved.get("members", []):
@@ -11139,13 +11271,23 @@ class Manager:
                         })
                     if primary_container is None or member.get("rank") == 0:
                         primary_container = container
+                elif (
+                    containers_unavailable
+                    and member.get("node_id") == LOCAL_NODE_ID
+                ):
+                    member["status"] = "unknown"
+                    member["status_message"] = "Docker is unavailable"
+                    member_inventory_unknown = True
                 elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
                 member["node_status"] = node.get("status", "unknown")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
-                if any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
+                if member_inventory_unknown:
+                    deployment["status"] = "unknown"
+                    deployment["status_message"] = "Docker is unavailable"
+                elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"
@@ -11210,6 +11352,11 @@ class Manager:
         return {
             "containers": containers,
             "images": images,
+            "docker_ready": bool(
+                local_docker_ready
+                and not containers_unavailable
+                and not images_unavailable
+            ),
             "stats": stats,
             "settings": self.public_settings(),
             "token_usage_sync": dict(self._token_usage_sync_status),

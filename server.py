@@ -729,7 +729,13 @@ async def agent_inference(endpoint: str, req: Request):
     except ClientAbort:
         return Response(status_code=499)
     except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        raise HTTPException(404, {
+            "type": "replica_unavailable", "message": str(exc),
+        }) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, {
+            "type": "upstream_error", "message": exc.response.text[:500],
+        }) from exc
     finally:
         if not stream:
             watcher.cancel()

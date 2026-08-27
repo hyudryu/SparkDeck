@@ -340,6 +340,61 @@ class StreamNudge(Exception):
     """Raised internally to close and replay a zero-output upstream stream."""
 
 
+class ClusterReplicaUnavailable(RuntimeError):
+    """A replica-local availability failure that may be failed over."""
+
+
+_STREAM_READY = object()
+
+
+class PreparedAsyncStream:
+    """Async iterator whose upstream connection can be validated separately.
+
+    ``prepare`` consumes only a private readiness marker emitted after the
+    upstream HTTP response has been opened and accepted.  It never waits for
+    the model's first generated SSE event, so callers can return downstream
+    response headers promptly while still surfacing connection/status errors
+    before committing to a replica.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._prepare_lock = asyncio.Lock()
+        self._prepared = False
+        self._buffered = None
+
+    async def prepare(self):
+        if self._prepared:
+            return self
+        async with self._prepare_lock:
+            if self._prepared:
+                return self
+            try:
+                first = await self._stream.__anext__()
+            except StopAsyncIteration as exc:
+                raise RuntimeError(
+                    "upstream stream ended before its response was ready"
+                ) from exc
+            if first is not _STREAM_READY:
+                self._buffered = first
+            self._prepared = True
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self.prepare()
+        if self._buffered is not None:
+            chunk = self._buffered
+            self._buffered = None
+            return chunk
+        return await self._stream.__anext__()
+
+    async def aclose(self):
+        await self._stream.aclose()
+
+
 class FanSettingsConflict(Exception):
     """Raised when live FanController state cannot safely accept an update."""
 
@@ -2628,16 +2683,311 @@ class Manager:
             timeout=1800,
         )
 
+    @staticmethod
+    def _cluster_members_sorted(deployment: dict) -> list[dict]:
+        return sorted(
+            deployment.get("members") or [],
+            key=lambda member: int(member.get("rank") or 0),
+        )
+
     def _cluster_primary_member(self, deployment_id: str) -> tuple[dict, dict]:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise LookupError("cluster deployment not found")
-        members = sorted(
-            deployment.get("members") or [], key=lambda member: int(member.get("rank") or 0)
-        )
+        members = self._cluster_members_sorted(deployment)
         if not members:
             raise LookupError("cluster deployment has no inference member")
         return deployment, members[0]
+
+    # ----- replicated-deployment load balancing -----
+    @staticmethod
+    def _cluster_member_key(deployment_id: str, member: dict) -> str:
+        identity = member.get("container_name") or member.get("node_id") or ""
+        return f"{deployment_id}:{identity}"
+
+    def _cluster_member_loads(self) -> dict[str, int]:
+        # Several focused tests construct Manager with __new__. Keep this
+        # state lazily initializable so those tests remain lightweight.
+        loads = getattr(self, "_cluster_member_load_counts", None)
+        if loads is None:
+            loads = self._cluster_member_load_counts = {}
+        return loads
+
+    def _cluster_member_active(self, deployment_id: str, member: dict) -> int:
+        return self._cluster_member_loads().get(
+            self._cluster_member_key(deployment_id, member), 0
+        )
+
+    def _acquire_cluster_member(self, deployment_id: str, member: dict) -> None:
+        key = self._cluster_member_key(deployment_id, member)
+        loads = self._cluster_member_loads()
+        loads[key] = loads.get(key, 0) + 1
+
+    def _release_cluster_member(self, deployment_id: str, member: dict) -> None:
+        key = self._cluster_member_key(deployment_id, member)
+        loads = self._cluster_member_loads()
+        loads[key] = max(0, loads.get(key, 0) - 1)
+
+    def _balanced_cluster_member(self, deployment: dict) -> dict:
+        """Pick the least-loaded replica, rotating among equals.
+
+        A replica's load is counted from selection until its response (or
+        stream) finishes, so concurrent arrivals spread across every member.
+        Round-robin tie-breaking keeps an idle cluster alternating instead of
+        funneling every request to rank 0.
+        """
+        members = self._cluster_members_sorted(deployment)
+        deployment_id = str(deployment.get("id") or "")
+        loads = [
+            self._cluster_member_active(deployment_id, member)
+            for member in members
+        ]
+        tied = [
+            member for member, load in zip(members, loads)
+            if load == min(loads)
+        ]
+        rotation = getattr(self, "_cluster_member_rotation", None)
+        if rotation is None:
+            rotation = self._cluster_member_rotation = {}
+        index = rotation.get(deployment_id, 0) % len(tied)
+        rotation[deployment_id] = rotation.get(deployment_id, 0) + 1
+        return tied[index]
+
+    def _cluster_route_order(self, deployment: dict) -> list[dict]:
+        """Members to try for one request, best candidate first.
+
+        Replicated deployments balance across every member, and the failover
+        candidates follow in least-loaded order so an outage shifts work to
+        the least busy replicas first. Sharded ranks form a single engine,
+        so only the rank-0 coordinator may serve a request.
+        """
+        members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") != "replicated" or len(members) < 2:
+            return members[:1]
+        deployment_id = str(deployment.get("id") or "")
+        chosen = self._balanced_cluster_member(deployment)
+        rest = [m for m in members if m is not chosen]
+        rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
+        return [chosen, *rest]
+
+    def _tracked_cluster_stream(
+        self, stream, deployment_id: str, member: dict,
+    ):
+        async def relay():
+            try:
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                await stream.aclose()
+                self._release_cluster_member(deployment_id, member)
+
+        return relay()
+
+    @staticmethod
+    async def _prime_cluster_stream(stream) -> str:
+        """Pull the first streamed chunk while failover is still possible."""
+        async for chunk in stream:
+            return chunk
+        return ""
+
+    @staticmethod
+    def _upstream_stream_error(chunk: str) -> tuple[int | None, str] | None:
+        """Return status/message from a streamed upstream error event.
+
+        A missing status is significant: ``_vllm_stream`` uses that form for
+        transport failures after the HTTP response was prepared.
+        """
+        if not chunk.startswith("data: "):
+            return None
+        try:
+            payload = json.loads(chunk[len("data: "):].strip())
+        except ValueError:
+            return None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict) or error.get("type") != "upstream_error":
+            return None
+        try:
+            status = int(error.get("code"))
+        except (TypeError, ValueError):
+            status = None
+        return status, str(error.get("message") or "upstream stream failed")
+
+    @staticmethod
+    def _remote_agent_error_type(detail: str) -> str | None:
+        """Extract the private agent route's typed error classification."""
+        try:
+            payload = json.loads(detail)
+        except ValueError:
+            return None
+        error = payload.get("detail") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            value = error.get("type")
+            return str(value) if value else None
+        return None
+
+    @staticmethod
+    def _cluster_error_event(exc: BaseException) -> str:
+        status = None
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+        error = {
+            "message": str(exc),
+            "type": "upstream_error",
+        }
+        if status is not None:
+            error["code"] = status
+        return f"data: {json.dumps({'error': error})}\n\n"
+
+    @staticmethod
+    def _observe_cluster_serving_member(
+        observation: dict | None, member: dict,
+    ) -> None:
+        """Publish the member that actually committed a response."""
+        if observation is None:
+            return
+        observation["member"] = {
+            key: member.get(key)
+            for key in ("node_id", "node_name", "container_name", "rank")
+        }
+
+    @staticmethod
+    def _cluster_failover_retryable(exc: BaseException) -> bool:
+        """True when a replica failure is worth retrying on another replica.
+
+        Connectivity and availability problems fail over. Deterministic
+        upstream rejections such as HTTP 400 for an invalid request are
+        surfaced as-is instead of being replayed against every replica.
+        """
+        if isinstance(exc, ClusterReplicaUnavailable):
+            return True
+        if isinstance(exc, httpx.TransportError):
+            return True
+        if isinstance(exc, (LookupError, TimeoutError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code >= 500
+        if isinstance(exc, (RuntimeError, ValueError)):
+            message = str(exc)
+            return (
+                "could not contact" in message
+                or "no connectable endpoints" in message
+                or "remote node not found" in message
+                or "is disabled" in message
+                # NodeRegistry.request embeds the agent's typed 404 detail
+                # when a member's container is missing.
+                or "replica_unavailable" in message
+                or bool(re.search(r"HTTP 5\d\d", message))
+            )
+        return False
+
+    def _cluster_stream_with_failover(
+        self,
+        stream,
+        remaining: list[dict],
+        deployment: dict,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None,
+        initial_member: dict,
+        route_observation: dict | None,
+    ):
+        """Relay a stream, failing over until its first real SSE event.
+
+        The first replica's HTTP connection has already been prepared, so the
+        caller can return downstream headers immediately.  Priming happens
+        inside this returned iterator: availability errors before any output
+        can still move to another replica without delaying those headers.
+        """
+        deployment_id = str(deployment.get("id") or "")
+
+        async def relay():
+            current = stream
+            current_member = initial_member
+            candidates = iter(remaining)
+            failure: BaseException | None = None
+            terminal_chunk: str | None = None
+            try:
+                while True:
+                    if current is None:
+                        try:
+                            member = next(candidates)
+                        except StopIteration:
+                            if terminal_chunk is not None:
+                                yield terminal_chunk
+                            elif failure is not None:
+                                yield self._cluster_error_event(failure)
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            current = await self._proxy_cluster_member(
+                                deployment, member, model, body, endpoint, cancel,
+                            )
+                            current_member = member
+                        except ClientAbort:
+                            raise
+                        except Exception as exc:
+                            failure = exc
+                            if self._cluster_failover_retryable(exc):
+                                print(
+                                    f"[cluster-lb] {deployment_id}: replica on "
+                                    f"{member.get('node_name') or member.get('node_id')} "
+                                    f"failed ({exc}); trying the next replica"
+                                )
+                                continue
+                            # Downstream headers are already committed after a
+                            # prior replica failed before output. Preserve the
+                            # deterministic status in an SSE error event.
+                            yield self._cluster_error_event(exc)
+                            yield "data: [DONE]\n\n"
+                            return
+
+                    try:
+                        first_chunk = await self._prime_cluster_stream(current)
+                    except ClientAbort:
+                        raise
+                    except Exception as exc:
+                        failure = exc
+                        await current.aclose()
+                        current = None
+                        if self._cluster_failover_retryable(exc):
+                            continue
+                        yield self._cluster_error_event(exc)
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if not first_chunk:
+                        failure = ClusterReplicaUnavailable(
+                            "replica stream ended before its first event"
+                        )
+                        await current.aclose()
+                        current = None
+                        continue
+
+                    upstream_error = self._upstream_stream_error(first_chunk)
+                    if upstream_error is not None:
+                        status, message = upstream_error
+                        if status is None or status >= 500:
+                            failure = ClusterReplicaUnavailable(message)
+                            terminal_chunk = first_chunk
+                            await current.aclose()
+                            current = None
+                            continue
+
+                    # The first real event commits output to this replica; no
+                    # later failure may be replayed without risking duplicates.
+                    self._observe_cluster_serving_member(
+                        route_observation, current_member,
+                    )
+                    yield first_chunk
+                    async for chunk in current:
+                        yield chunk
+                    return
+            finally:
+                if current is not None:
+                    await current.aclose()
+
+        return relay()
 
     async def proxy_cluster_inference(
         self,
@@ -2646,85 +2996,186 @@ class Manager:
         body: dict,
         endpoint: str,
         cancel: asyncio.Event | None = None,
+        route_observation: dict | None = None,
     ):
-        """Proxy through the selected primary member without bypassing admission."""
-        deployment, primary = self._cluster_primary_member(deployment_id)
-        node_id = primary.get("node_id")
-        if node_id == LOCAL_NODE_ID:
-            return (
-                await self._vllm_chat(
-                    model, body, bool(body.get("stream")), cancel,
-                    container_name=primary.get("container_name"),
-                    deployment_id=deployment_id,
-                )
-                if endpoint == "chat/completions"
-                else await self._vllm_completions(
-                    model, body, bool(body.get("stream")), cancel,
-                    container_name=primary.get("container_name"),
-                    deployment_id=deployment_id,
-                )
-            )
-        if not node_id:
-            raise LookupError("cluster primary node is unavailable")
-
-        controls = self._deployment_launch_controls(deployment.get("launch_settings") or {})
-        admission_container = {
-            "deployment_id": deployment_id,
-            "name": primary.get("container_name"),
-            "stats_key": model,
-            "load_settings": {"max_concurrency": controls.get("max_concurrency")},
-        }
-        admission = await self._acquire_inference_slot(admission_container, model, cancel)
-        path = f"/api/agent/inference/{endpoint}"
-        remote_body = {
-            **body,
-            "_sparkdeck_container_name": primary.get("container_name"),
-            "_sparkdeck_deployment_id": deployment_id,
-        }
-        if body.get("stream"):
+        """Proxy to a cluster member, balancing replicas and failing over."""
+        deployment = self._deployment(deployment_id)
+        if not deployment:
+            raise LookupError("cluster deployment not found")
+        candidates = self._cluster_route_order(deployment)
+        if not candidates:
+            raise LookupError("cluster deployment has no inference member")
+        for index, member in enumerate(candidates):
             try:
-                response = await self._await_or_cancel(
-                    self.node_registry.open_stream(
+                result = await self._proxy_cluster_member(
+                    deployment, member, model, body, endpoint, cancel,
+                )
+                if body.get("stream"):
+                    return self._cluster_stream_with_failover(
+                        result, candidates[index + 1:], deployment, model,
+                        body, endpoint, cancel, member, route_observation,
+                    )
+                self._observe_cluster_serving_member(
+                    route_observation, member,
+                )
+                return result
+            except ClientAbort:
+                raise
+            except Exception as exc:
+                if (
+                    index == len(candidates) - 1
+                    or not self._cluster_failover_retryable(exc)
+                ):
+                    raise
+                print(
+                    f"[cluster-lb] {deployment_id}: replica on "
+                    f"{member.get('node_name') or member.get('node_id')} failed "
+                    f"({exc}); trying the next replica"
+                )
+        raise LookupError("cluster deployment has no inference member")
+
+    async def _proxy_cluster_member(
+        self,
+        deployment: dict,
+        member: dict,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None,
+    ):
+        """Send one request to a specific member without failover.
+
+        The replica's load is held from selection until its response (or
+        stream) finishes. Streaming upstream connections and HTTP statuses are
+        validated here without waiting for a generated event. Once a stream
+        is returned, its generator owns the load slot and the outer relay can
+        still fail over until the first real SSE event is forwarded.
+        """
+        deployment_id = str(deployment.get("id") or "")
+        node_id = member.get("node_id")
+        self._acquire_cluster_member(deployment_id, member)
+        stream_owns_member = False
+        try:
+            if node_id == LOCAL_NODE_ID:
+                proxy = (
+                    self._vllm_chat
+                    if endpoint == "chat/completions"
+                    else self._vllm_completions
+                )
+                result = await proxy(
+                    model, body, bool(body.get("stream")), cancel,
+                    container_name=member.get("container_name"),
+                    deployment_id=deployment_id,
+                )
+                if not body.get("stream"):
+                    return result
+                stream_owns_member = True
+                return self._tracked_cluster_stream(
+                    result, deployment_id, member,
+                )
+
+            controls = self._deployment_launch_controls(deployment.get("launch_settings") or {})
+            # Key admission by the member container rather than the
+            # deployment so every replica gets its own ``max_concurrency``
+            # slot pool.
+            admission_container = {
+                "name": member.get("container_name"),
+                "stats_key": model,
+                "load_settings": {"max_concurrency": controls.get("max_concurrency")},
+            }
+            admission = await self._acquire_inference_slot(admission_container, model, cancel)
+            path = f"/api/agent/inference/{endpoint}"
+            remote_body = {
+                **body,
+                "_sparkdeck_container_name": member.get("container_name"),
+                "_sparkdeck_deployment_id": deployment_id,
+            }
+            if body.get("stream"):
+                try:
+                    response = await self._await_or_cancel(
+                        self.node_registry.open_stream(
+                            node_id, "POST", path, json_body=remote_body, timeout=600,
+                        ),
+                        cancel,
+                    )
+                    if response.status_code >= 400:
+                        detail = (await response.aread()).decode("utf-8", errors="replace")
+                        await response.aclose()
+                        if (
+                            response.status_code == 404
+                            and self._remote_agent_error_type(detail)
+                            == "replica_unavailable"
+                        ):
+                            raise ClusterReplicaUnavailable(
+                                f"remote replica is unavailable: {detail[:500]}"
+                            )
+                        try:
+                            request = response.request
+                        except (AttributeError, RuntimeError):
+                            request = httpx.Request(
+                                "POST", f"http://{node_id}{path}"
+                            )
+                        raise httpx.HTTPStatusError(
+                            f"remote inference failed: HTTP "
+                            f"{response.status_code}: {detail[:500]}",
+                            request=request,
+                            response=response,
+                        )
+                except BaseException:
+                    self._release_inference_slot(admission)
+                    raise
+                stream_owns_member = True
+
+                async def stream_remote():
+                    try:
+                        async for line in self._aiter_lines_cancellable(response, cancel):
+                            if line:
+                                yield f"{line}\n\n"
+                    finally:
+                        await response.aclose()
+                        self._release_inference_slot(admission)
+                        self._release_cluster_member(deployment_id, member)
+
+                return stream_remote()
+
+            try:
+                return await self._await_or_cancel(
+                    self.node_registry.request(
                         node_id, "POST", path, json_body=remote_body, timeout=600,
                     ),
                     cancel,
                 )
-                if response.status_code >= 400:
-                    detail = (await response.aread()).decode("utf-8", errors="replace")
-                    await response.aclose()
-                    raise RuntimeError(f"remote inference failed: HTTP {response.status_code}: {detail[:500]}")
-            except BaseException:
+            finally:
                 self._release_inference_slot(admission)
-                raise
-
-            async def stream_remote():
-                try:
-                    async for line in self._aiter_lines_cancellable(response, cancel):
-                        if line:
-                            yield f"{line}\n\n"
-                finally:
-                    await response.aclose()
-                    self._release_inference_slot(admission)
-
-            return stream_remote()
-
-        try:
-            return await self._await_or_cancel(
-                self.node_registry.request(
-                    node_id, "POST", path, json_body=remote_body, timeout=600,
-                ),
-                cancel,
-            )
         finally:
-            self._release_inference_slot(admission)
+            if not stream_owns_member:
+                self._release_cluster_member(deployment_id, member)
 
     async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
-        """Check the selected primary member through its authenticated agent."""
-        _, primary = self._cluster_primary_member(deployment_id)
-        node_id = primary.get("node_id")
+        """Check member readiness through authenticated agents.
+
+        A replicated deployment stays healthy while any replica can serve;
+        other modes still depend on their rank-0 primary.
+        """
+        deployment, primary = self._cluster_primary_member(deployment_id)
+        members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") != "replicated" or len(members) < 2:
+            return await self._cluster_member_health(
+                deployment_id, primary, model,
+            )
+        results = await asyncio.gather(*(
+            self._cluster_member_health(deployment_id, member, model)
+            for member in members
+        ), return_exceptions=True)
+        return any(result is True for result in results)
+
+    async def _cluster_member_health(
+        self, deployment_id: str, member: dict, model: str,
+    ) -> bool:
+        node_id = member.get("node_id")
         if node_id == LOCAL_NODE_ID:
             container = await self._resolve_vllm_target(
-                model, container_name=primary.get("container_name"),
+                model, container_name=member.get("container_name"),
                 deployment_id=deployment_id,
             )
             return await self._check_ready(container)
@@ -2732,7 +3183,7 @@ class Manager:
             node_id, "POST", "/api/agent/inference/health",
             json_body={
                 "model": model,
-                "_sparkdeck_container_name": primary.get("container_name"),
+                "_sparkdeck_container_name": member.get("container_name"),
                 "_sparkdeck_deployment_id": deployment_id,
             }, timeout=10,
         )
@@ -9687,10 +10138,12 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/chat/completions"
         if stream:
-            return self._vllm_stream(
+            result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
             )
+            await result.prepare()
+            return result
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
@@ -9728,10 +10181,12 @@ class Manager:
         body = {**body, "model": self._upstream_model_id(container, model)}
         url = f"http://localhost:{port}/v1/completions"
         if stream:
-            return self._vllm_stream(
+            result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
             )
+            await result.prepare()
+            return result
         else:
             admission = None
             container, admission = await self._admit_vllm_target(
@@ -9973,12 +10428,25 @@ class Manager:
         except TimeoutError:
             raise TimeoutError(f"Timeout waiting for model '{model}' to become ready")
 
-    async def _vllm_stream(self, url: str, body: dict, key: str,
-                           cancel: asyncio.Event | None = None,
-                           container: dict | None = None,
-                           requested_model: str | None = None, *,
-                           container_name: str | None = None,
-                           deployment_id: str | None = None):
+    def _vllm_stream(self, url: str, body: dict, key: str,
+                     cancel: asyncio.Event | None = None,
+                     container: dict | None = None,
+                     requested_model: str | None = None, *,
+                     container_name: str | None = None,
+                     deployment_id: str | None = None):
+        return PreparedAsyncStream(self._vllm_stream_events(
+            url, body, key, cancel, container, requested_model,
+            container_name=container_name, deployment_id=deployment_id,
+        ))
+
+    async def _vllm_stream_events(
+        self, url: str, body: dict, key: str,
+        cancel: asyncio.Event | None = None,
+        container: dict | None = None,
+        requested_model: str | None = None, *,
+        container_name: str | None = None,
+        deployment_id: str | None = None,
+    ):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
         as generation begins, allowing the live prefill rate to be populated
@@ -10003,6 +10471,7 @@ class Manager:
         nudge_event = asyncio.Event()
         retried_without_token_ids = False
         retried_without_continuous_usage = False
+        prepared = False
         try:
             if container is not None:
                 requested_model = requested_model or body.get("model") or key
@@ -10073,9 +10542,13 @@ class Manager:
                                 },
                             }
                             continue
-                        yield f"data: {json.dumps({'error': {'message': f'HTTP {r.status_code}: {detail[:300]}', 'type': 'upstream_error', 'code': r.status_code}})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                        r.raise_for_status()
+                    if not prepared:
+                        prepared = True
+                        # ``PreparedAsyncStream.prepare`` consumes this marker;
+                        # no generated event is pulled while response headers
+                        # and status are validated.
+                        yield _STREAM_READY
                     first_out_ts = None
                     last_out_ts = None
                     latest_usage = None
@@ -10191,8 +10664,12 @@ class Manager:
                     rec["admission_target"] = admission
                     rec["paused"] = False
         except ClientAbort:
+            if not prepared:
+                raise
             return
         except Exception as e:
+            if not prepared:
+                raise
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_error'}})}\n\n"
             yield "data: [DONE]\n\n"
         finally:

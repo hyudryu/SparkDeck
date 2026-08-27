@@ -172,6 +172,7 @@ export function ModelsPage() {
   const [pinned, setPinned] = useState<string[]>(readPinned)
   const [expandedGroups, setExpandedGroups] = useState<string[]>([])
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
+  const logRequestRef = useRef(0)
   const [logViewer, setLogViewer] = useState<{ id: string; alias: string }>()
   const [logText, setLogText] = useState('')
   const [logLoading, setLogLoading] = useState(false)
@@ -305,14 +306,20 @@ export function ModelsPage() {
   }
 
   const loadLogs = async (id: string) => {
+    // A slower request for a previously viewed deployment must never
+    // overwrite the currently displayed one.
+    const requestId = ++logRequestRef.current
     setLogLoading(true)
     setLogError(undefined)
     try {
-      setLogText(await api.deployments.logs(id))
+      const logs = await api.deployments.logs(id)
+      if (logRequestRef.current !== requestId) return
+      setLogText(logs)
     } catch (reason) {
+      if (logRequestRef.current !== requestId) return
       setLogError(reason instanceof Error ? reason.message : 'Could not load logs')
     } finally {
-      setLogLoading(false)
+      if (logRequestRef.current === requestId) setLogLoading(false)
     }
   }
 
@@ -595,7 +602,7 @@ export function ModelsPage() {
                     {deployment.managed && (deployment.status === 'running' || deployment.status === 'starting'
                       ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
-                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>
+                    {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
                       if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')

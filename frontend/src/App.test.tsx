@@ -592,10 +592,16 @@ describe('model deployments', () => {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
       }
-      const body = path.includes('/api/v1/deployments') ? { items: [{
-        id: 'dep-1', alias: 'Loud model', runtime: 'vllm', kind: 'managed',
-        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
-      }] } : path.includes('/api/v1/nodes') ? { items: [
+      const body = path.includes('/api/v1/deployments') ? { items: [
+        {
+          id: 'dep-1', alias: 'Loud model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
+        },
+        {
+          id: 'dep-ext', alias: 'Remote endpoint', runtime: 'vllm', kind: 'external',
+          model: { repository: 'org/remote' }, status: 'running', settings: {},
+        },
+      ] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
       ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -610,6 +616,8 @@ describe('model deployments', () => {
       '/api/v1/deployments/dep-1/logs?tail=300',
       expect.objectContaining({ headers: expect.anything() }),
     )
+    // External endpoints have no managed logs, so they get no log action.
+    expect(screen.queryByRole('button', { name: 'Logs for Remote endpoint' })).not.toBeInTheDocument()
 
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog', { name: 'Loud model' })).not.toBeInTheDocument()

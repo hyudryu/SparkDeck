@@ -40,11 +40,11 @@ For a first installation, start with the [two-node QuickStart](../QUICKSTART.md)
 - **Per-machine membership:** pairing one machine does not import other machines that it previously controlled. Join every physical machine separately.
 - **Alternate entry, not failover:** an online worker URL opens the same controller-managed cluster, but workers do not automatically become controllers if the controller goes offline.
 - **Node-targeted work:** downloads, image pulls, deployments, and model-weight transfers are assigned to explicit nodes.
-- **Local-first data:** operational state, settings, credentials, prompts, responses, and detailed benchmark history stay on the systems you control. Community sharing is optional and separately disclosed.
+- **Local-first data:** operational state, settings, credentials, detailed benchmark history, and prompts and responses sent to managed local deployments stay on the systems you control. A configured external OpenAI-compatible endpoint receives its prompts and returns its responses outside those systems. Community sharing is optional and separately disclosed.
 
 ## Dashboard
 
-The Dashboard is the cluster command center. It summarizes the current entry node and every paired node without combining per-machine telemetry into misleading cluster totals.
+The Dashboard is the cluster command center. Its local CPU, GPU, temperature, memory, and request telemetry comes from the controller. Opening SparkDeck through a joined worker still forwards these management requests to the controller; the worker URL does not make that worker the local telemetry source. Paired-node status remains listed separately rather than being combined into misleading cluster totals.
 
 ![Dashboard with illustrative four-node telemetry](screenshots/readme/sparkdeck-dashboard-dark.png)
 
@@ -55,7 +55,9 @@ Use it to:
 - see online and offline cluster members;
 - find active and queued inference requests;
 - jump to running models, Chat, Cluster, or Benchmarks; and
-- verify whether community benchmark synchronization is connected.
+- see high-level community account and sharing status.
+
+Use **Benchmarks** to verify synchronization health, including missing upload credentials or an invalid account token; the Dashboard's high-level status is not a complete upload-health check.
 
 An offline node keeps its last known identity, but live telemetry is shown as unavailable. A running model can continue serving if the controller becomes unavailable, although cluster management is unavailable until the controller returns.
 
@@ -209,7 +211,7 @@ Storage is SparkDeck's opt-in Virtual NAS for complete Hugging Face cache entrie
 
 Use it to:
 
-- see model identity, revision, size, file count, and node availability;
+- see model identity, size, file count, and node availability;
 - drag model weights from one node card to another on desktop;
 - use the keyboard- and touch-friendly transfer form on any device;
 - send one cached model to multiple online target nodes;

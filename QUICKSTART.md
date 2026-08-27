@@ -155,6 +155,28 @@ Both should show the same controller-owned cluster inventory with `Spark 1` and 
 
 On **Dashboard**, verify both node cards are present. On **Cluster**, verify both nodes are online and named correctly.
 
+## Optional: use Tailscale Serve HTTPS
+
+Complete this optional switch before deploying a model to Spark 2 in step 9. Run this on each Spark after SparkDeck is listening locally:
+
+```bash
+sudo tailscale serve --bg --https=443 localhost:7878
+```
+
+The command prints that machine's URL, normally:
+
+```text
+https://<machine-name>.<tailnet-name>.ts.net
+```
+
+Each machine has a different machine name even though the Tailscale DNS page shows one shared tailnet suffix. Because the nodes were paired with HTTP URLs in step 6, switch the stored cluster URLs by opening Cluster on Spark 2, choosing **Leave cluster**, generating a fresh pairing code on Spark 1, and joining again. During that rejoin, use Spark 1's printed HTTPS URL as **Existing cluster entry URL** and Spark 2's printed HTTPS URL as **This node's advertised Tailscale URL**. Verify the proxy with:
+
+```bash
+tailscale serve status
+```
+
+[Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) is private to the tailnet. **Tailscale Funnel is public and must not be used for SparkDeck.** HTTPS certificate names are recorded in public certificate-transparency logs, so rename machines first if their names are sensitive.
+
 ## 8. Add Hugging Face access
 
 If you use gated or private repositories:
@@ -169,34 +191,12 @@ SparkDeck reports whether a token exists but never returns the stored value to t
 
 1. Open **Explore** and search Hugging Face.
 2. Expand a model row and inspect the fit indicator.
-3. Choose **Deploy** or open **Models** to create a saved configuration.
-4. Select the node that should download and run the model.
-5. For TP2, select exactly two eligible nodes. Nodes without the weights remain disabled until the model is downloaded or transferred there.
+3. Choose **Deploy**, which opens the **Add model** form in Models, or open **Models → Add model** directly.
+4. For this first deployment, select one node that should download and run the model, configure the runtime, and submit the form. **Add model** creates an active deployment record, not a saved recipe.
+5. If the installation already contains a saved recipe, its separate **Deploy** action enforces cached-weight eligibility and tensor-parallel node count. A TP2 recipe requires exactly two eligible nodes. Selecting multiple nodes in **Add model** creates replicas; it does not create a sharded TP2 deployment.
 6. When the deployment is ready, open **Chat** and select it.
 
 Use **Storage** to copy an existing complete Hugging Face cache entry from one Spark to another instead of downloading it again. Virtual NAS must be enabled before transfers can be queued.
-
-## Optional: use Tailscale Serve HTTPS
-
-Run this on each Spark after SparkDeck is listening locally:
-
-```bash
-sudo tailscale serve --bg --https=443 localhost:7878
-```
-
-The command prints that machine's URL, normally:
-
-```text
-https://<machine-name>.<tailnet-name>.ts.net
-```
-
-Each machine has a different machine name even though the Tailscale DNS page shows one shared tailnet suffix. If you already paired the nodes with the HTTP URLs in step 6, switch the stored cluster URLs by opening Cluster on Spark 2, choosing **Leave cluster**, generating a fresh pairing code on Spark 1, and joining again. During that rejoin, use Spark 1's printed HTTPS URL as **Existing cluster entry URL** and Spark 2's printed HTTPS URL as **This node's advertised Tailscale URL**. Verify the proxy with:
-
-```bash
-tailscale serve status
-```
-
-[Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) is private to the tailnet. **Tailscale Funnel is public and must not be used for SparkDeck.** HTTPS certificate names are recorded in public certificate-transparency logs, so rename machines first if their names are sensitive.
 
 ## Keep SparkDeck running after logout
 

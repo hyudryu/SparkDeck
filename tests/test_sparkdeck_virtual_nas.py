@@ -120,6 +120,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(models[0]["revisions"], ["main", "revision-1"])
             self.assertFalse(models[0]["partial"])
             self.assertTrue(models[1]["partial"])
+            self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])

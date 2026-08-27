@@ -14,6 +14,7 @@ import type {
   AdmissionStats,
   LogEntry,
   SyncStatus,
+  CommunityClusterSync,
   CommunityPairResponse,
   CommunityAuthConfig,
   NodeInventoryItem,
@@ -58,11 +59,18 @@ export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
   authTokenProvider = provider
 }
 
+function requiresCommunityBearer(path: string, method = 'GET'): boolean {
+  const normalizedMethod = method.toUpperCase()
+  return (
+    (path === '/api/v1/community/aggregates' && normalizedMethod === 'GET')
+    || (path === '/api/v1/community/pair' && normalizedMethod === 'DELETE')
+  )
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = (
-    path.startsWith('/api/v1/community/')
-    && path !== '/api/v1/community/auth-config'
-  ) ? await authTokenProvider?.() : undefined
+  const token = requiresCommunityBearer(path, init?.method)
+    ? await authTokenProvider?.()
+    : undefined
   const response = await fetch(path, {
     ...init,
     headers: {
@@ -334,11 +342,14 @@ export const api = {
       }
     },
     setConsent: async (sharing_enabled: boolean) => {
-      await request<unknown>('/api/v1/community/consent', {
+      const result = await request<{ cluster?: CommunityClusterSync }>('/api/v1/community/consent', {
         method: 'PUT',
         body: JSON.stringify({ enabled: sharing_enabled }),
       })
-      return api.benchmarks.syncStatus()
+      return {
+        ...await api.benchmarks.syncStatus(),
+        cluster_errors: result.cluster?.errors ?? [],
+      }
     },
     retry: async () => {
       await request<unknown>('/api/v1/community/retry', { method: 'POST' })

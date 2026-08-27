@@ -252,6 +252,7 @@ export function SettingsPage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
+  const [signingOut, setSigningOut] = useState(false)
 
   useEffect(() => {
     if (resource.data) {
@@ -267,6 +268,23 @@ export function SettingsPage() {
   useEffect(() => {
     applyTheme(form.theme ?? 'system')
   }, [form.theme])
+
+  useEffect(() => {
+    if (auth.status === 'signed-in') setError(undefined)
+  }, [auth.status])
+
+  const signOut = async () => {
+    setSigningOut(true)
+    setError(undefined)
+    try {
+      await auth.signOut()
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : 'The controller could not be reached'
+      setError(`Could not sign out: ${detail} Your account may still be paired with this node. Sign in again if prompted, then retry Sign out.`)
+    } finally {
+      setSigningOut(false)
+    }
+  }
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -351,9 +369,11 @@ export function SettingsPage() {
           <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to share anonymized benchmark telemetry and see community data.</p></div></div>
           <div className="settings-fields">
             <label className="field wide-field"><span>Community API URL</span><input type="url" value={form.community_api_url ?? ''} onChange={(event) => setForm({ ...form, community_api_url: event.target.value })} placeholder="Not configured" /><small>Leave empty to keep SparkDeck entirely local.</small></label>
-            {auth.status === 'signed-in'
-              ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" onClick={() => void auth.signOut()}>Sign out</Button></div>
-              : <CommunitySignInForm />}
+            {auth.status === 'restoring'
+              ? <p className="muted wide-field" role="status">Restoring community sessionâ€¦</p>
+              : auth.status === 'signed-in'
+                ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" disabled={signingOut} onClick={() => void signOut()}>{signingOut ? 'Signing outâ€¦' : 'Sign out'}</Button></div>
+                : <CommunitySignInForm />}
             {auth.status === 'signed-in' && auth.clusterSync && <>
               {auth.clusterSync.conflicts.map((conflict) => (
                 <p className="muted wide-field" role="status" key={conflict.node}>

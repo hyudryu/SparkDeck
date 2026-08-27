@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -572,14 +573,18 @@ class SparkDeckService:
             and math.isfinite(generation_tokens_per_second)
         ):
             raise ValueError("derived benchmark throughput is outside the supported range")
-        model_id = _public_model_id(
+        raw_model_id = str(
             (deployment.get("model") or {}).get("repository") or "local-model"
+        ).strip()
+        upload_model_id = _public_model_id(raw_model_id)
+        local_model_id = _local_benchmark_model_id(
+            raw_model_id, deployment.get("id") or deployment_id,
         )
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "deployment_id": deployment.get("id"),
-            "model_id": model_id,
+            "model_id": local_model_id,
             "context_window_size": context_window,
             "concurrency": concurrency,
             "tensor_parallel_size": tensor_parallel_size,
@@ -599,7 +604,7 @@ class SparkDeckService:
         configuration["benchmark_concurrency"] = concurrency
         hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
         eligible_for_community = bool(
-            model_id != "local-model"
+            upload_model_id != "local-model"
             and prompt_tokens > 0
             and generation_tokens >= 16
             and runtime.value in self.registry.kinds
@@ -608,7 +613,7 @@ class SparkDeckService:
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=point["created_at"],
             deployment_id=deployment.get("id"),
-            model=ModelIdentity(repository=model_id), runtime=runtime,
+            model=ModelIdentity(repository=upload_model_id), runtime=runtime,
             runtime_version=_optional_string(settings.get("runtime_version")),
             hardware=hardware, configuration=configuration,
             input_tokens=prompt_tokens, output_tokens=generation_tokens,
@@ -675,6 +680,8 @@ class SparkDeckService:
         settings["manager_deployment_id"] = manager_deployment.get("id")
         context_window = launch_controls.get("context_window") or launch_settings.get("sg_context_length")
         if context_window is not None:
+            for key in ("max_model_len", "context_length", "context_size"):
+                settings.pop(key, None)
             settings["context_length"] = context_window
         contract = self.manager.recipe_deployment_contract(launch_settings)
         if not contract.get("supported", True):
@@ -683,12 +690,12 @@ class SparkDeckService:
         if tensor_parallel_size is not None:
             settings["tensor_parallel_size"] = tensor_parallel_size
 
-        model_id = _public_model_id(
+        model_id = str(
             manager_deployment.get("model")
             or launch_settings.get("model")
             or ((deployment or {}).get("model") or {}).get("repository")
             or "local-model"
-        )
+        ).strip()
         runtime = str(
             manager_deployment.get("engine")
             or launch_settings.get("engine")
@@ -1866,7 +1873,7 @@ def _is_missing_container_error(exc: Exception) -> bool:
 
 
 def _public_model_id(value: str) -> str:
-    """Exclude endpoint URLs and local paths from persistent benchmark identity."""
+    """Exclude endpoint URLs and local paths from the upload-facing identity."""
     text = str(value or "").strip()
     if (
         not text
@@ -1882,6 +1889,23 @@ def _public_model_id(value: str) -> str:
     ):
         return "local-model"
     return text
+
+
+def _local_benchmark_model_id(value: str, deployment_id: str | None) -> str:
+    """Return a local grouping key without exposing private model identifiers."""
+    public_model_id = _public_model_id(value)
+    if public_model_id != "local-model":
+        return public_model_id
+    identity = json.dumps(
+        [str(deployment_id or "").strip(), str(value or "").strip()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    # This deliberately does not resemble an owner/repository ID, so the
+    # upload-facing sanitizer will still collapse it to ``local-model`` if it
+    # ever reaches that boundary.
+    return f"local-model-{digest}"
 
 
 def _parse_sse(line: str) -> dict[str, Any] | None:

@@ -108,9 +108,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "concurrency": 5, "tensor_parallel_size": 2,
         }])
 
-    async def test_coordinated_run_redacts_private_model_identifiers_before_persistence(self):
+    async def test_coordinated_run_groups_private_models_by_distinct_opaque_local_ids(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
+        point_ids = []
         for deployment_id, model in (
             ("private-path", r"C:\private\customer-model.gguf"),
             ("private-url", "https://models.private.example/customer-model"),
@@ -129,22 +130,31 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                     "wall_seconds": 1,
                 })
 
-                self.assertEqual(point["model_id"], "local-model")
+                point_ids.append(point["model_id"])
+                self.assertRegex(point["model_id"], r"^local-model-[0-9a-f]{16}$")
+                self.assertNotIn(model, str(point))
 
         samples, total = self.service.store.benchmarks()
         self.assertEqual(total, 2)
+        self.assertEqual(len(set(point_ids)), 2)
         self.assertTrue(all(
             sample["model"]["repository"] == "local-model"
             and not sample["eligible_for_community"]
             for sample in samples
         ))
         self.assertEqual(self.service.store.outbox_batch(), [])
-        self.assertEqual(
-            self.service.store.benchmark_model_detail("local-model")["points"][0][
+        summaries = self.service.store.benchmark_model_summaries()
+        self.assertEqual({item["model_id"] for item in summaries}, set(point_ids))
+        self.assertTrue(all(item["run_count"] == 1 for item in summaries))
+        self.assertTrue(all(
+            self.service.store.benchmark_model_detail(model_id)["points"][0][
                 "sample_count"
-            ],
-            2,
-        )
+            ] == 1
+            for model_id in point_ids
+        ))
+        persisted = str(summaries) + str(samples)
+        self.assertNotIn(r"C:\private\customer-model.gguf", persisted)
+        self.assertNotIn("models.private.example", persisted)
 
     async def test_coordinated_external_run_keeps_hardware_unverified(self):
         self.manager._stats_cache = {
@@ -212,7 +222,12 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.service.store.add_deployment(Deployment(
             id="sparkdeck-record", alias="stored", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/stored-model"),
-            settings={"manager_deployment_id": "manager-stored"},
+            settings={
+                "manager_deployment_id": "manager-stored",
+                "max_model_len": 4096,
+                "context_length": 8192,
+                "context_size": 2048,
+            },
             base_url_set=True,
         ), "http://127.0.0.1:8000")
         manager_deployment = {
@@ -241,6 +256,13 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["deployment_id"], "sparkdeck-record")
         self.assertEqual(point["context_window_size"], 16384)
         self.assertEqual(point["tensor_parallel_size"], 4)
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(samples[0]["configuration"], {
+            "context_length": 16384,
+            "benchmark_concurrency": 1,
+            "tensor_parallel_size": 4,
+        })
 
     async def test_coordinated_run_rejects_unmeasured_concurrency(self):
         self.service.store.add_deployment(Deployment(

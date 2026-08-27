@@ -277,6 +277,26 @@ class SparkDeckService:
     async def close(self) -> None:
         self.store.close()
 
+    async def set_community_consent(self, enabled: bool) -> None:
+        await asyncio.to_thread(self.store.set_community_consent, enabled)
+
+    async def unpair_community_device(
+        self, expected_sub: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Account-matched unpairing as one serialized state change."""
+        with self.store.locked():
+            existing = self.store.get_setting(
+                "device_pairing", {"status": "not_paired"},
+            )
+            if existing.get("status") != "paired":
+                return "already", existing
+            if existing.get("sub") != expected_sub:
+                return "conflict", existing
+            self.store.set_setting(
+                "device_pairing", {"status": "not_paired"},
+            )
+            return "unpaired", existing
+
     async def community_aggregates(self) -> dict[str, Any]:
         """Return configured community evidence or privacy-safe local evidence."""
         endpoint = str(

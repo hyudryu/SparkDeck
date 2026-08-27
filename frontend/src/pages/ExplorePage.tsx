@@ -5,7 +5,7 @@ import { api } from '../api/client'
 import type { BenchmarkAggregate, CatalogModel, NodeInventoryItem, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, formatNumber, formatRate, LoadingState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { formatBytes } from '../utils/format'
 
 type CatalogTab = 'hugging-face' | 'community'
@@ -137,7 +137,13 @@ export function ExplorePage() {
     [query, runtime],
   )
   const nodes = useResource((signal) => api.nodes.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
+  const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setQuery(draft.trim()), 350)
@@ -206,7 +212,6 @@ export function ExplorePage() {
     return next
   })
 
-  const communityAccess = useCommunityAccess()
   const communityEnabled = communityAccess.enabled
   const communityUnavailable = Boolean(aggregates.error) && tab === 'community'
   const activeError = tab === 'hugging-face' ? catalog.error : aggregates.error
@@ -222,7 +227,7 @@ export function ExplorePage() {
 
       <div className="usage-tabs catalog-tabs" role="tablist" aria-label="Model catalog source">
         <button role="tab" aria-selected={tab === 'hugging-face'} onClick={() => setTab('hugging-face')}>Hugging Face</button>
-        <button role="tab" aria-selected={tab === 'community'} disabled={!communityEnabled} title={communityEnabled ? undefined : COMMUNITY_ACCESS_HINT} onClick={() => setTab('community')}>Community Run Models</button>
+        <button role="tab" aria-selected={tab === 'community'} disabled={!communityEnabled} title={communityEnabled ? undefined : accessHint} onClick={() => setTab('community')}>Community Run Models</button>
       </div>
 
       <div className="catalog-toolbar">
@@ -245,7 +250,7 @@ export function ExplorePage() {
         </form>
         <div className="catalog-filters" aria-label="Model filters">
           <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
-          <label title={communityEnabled ? undefined : COMMUNITY_ACCESS_HINT}><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={!communityEnabled || tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
+          <label title={communityEnabled ? undefined : accessHint}><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={!communityEnabled || tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>

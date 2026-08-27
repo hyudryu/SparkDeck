@@ -3,7 +3,7 @@
 // localStorage so the session survives browser restarts; the refresh token is
 // valid for years and expired ID tokens are refreshed silently on load.
 
-import { cognitoClientId, cognitoIdpEndpoint } from './config'
+import { cognitoConfig } from './config'
 
 const ID_TOKEN_KEY = 'sparkdeck.cognito.id_token'
 const ACCESS_TOKEN_KEY = 'sparkdeck.cognito.access_token'
@@ -85,15 +85,21 @@ function clearTokens() {
 }
 
 async function callIdp(operation: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  let config
+  try {
+    config = await cognitoConfig()
+  } catch {
+    throw new CognitoAuthError('Could not load the community sign-in configuration', 'ConfigurationError')
+  }
   let response: Response
   try {
-    response = await fetch(cognitoIdpEndpoint(), {
+    response = await fetch(config.idp_endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-amz-json-1.1',
         'X-Amz-Target': `AWSCognitoIdentityProviderService.${operation}`,
       },
-      body: JSON.stringify({ ClientId: cognitoClientId(), ...body }),
+      body: JSON.stringify({ ClientId: config.client_id, ...body }),
     })
   } catch {
     throw new CognitoAuthError('Could not reach the community sign-in service', 'NetworkError')
@@ -161,16 +167,25 @@ export async function signIn(email: string, password: string): Promise<TokenSet>
 
 export async function refresh(): Promise<TokenSet | null> {
   const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
-  if (!refreshToken) return null
+  if (!refreshToken) {
+    clearTokens()
+    return null
+  }
   try {
     const data = await callIdp('InitiateAuth', {
       AuthFlow: 'REFRESH_TOKEN_AUTH',
       AuthParameters: { REFRESH_TOKEN: refreshToken },
     })
     return tokensFromAuthResult(data)
-  } catch {
-    clearTokens()
-    return null
+  } catch (reason) {
+    if (
+      reason instanceof CognitoAuthError
+      && (reason.code === 'NotAuthorizedException' || reason.code === 'UserNotFoundException')
+    ) {
+      clearTokens()
+      return null
+    }
+    throw reason
   }
 }
 

@@ -4,13 +4,18 @@ import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
   const [syncBusy, setSyncBusy] = useState(false)
   const [reviewingConsent, setReviewingConsent] = useState(false)
   const aggregateResponse = aggregates.data
@@ -53,7 +58,7 @@ export function BenchmarksPage() {
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
           {sync.data && <>
-            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? 'Sharing enabled' : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
+            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired && sync.data.upload_configured ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? (sync.data.upload_configured ? 'Sharing enabled' : 'Queued locally') : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
             <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
           </>}
         </Panel>
@@ -65,11 +70,13 @@ export function BenchmarksPage() {
         </Panel>
       </div>
 
-      <div className="section-heading" title={communityAccess.enabled ? undefined : COMMUNITY_ACCESS_HINT}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
+      <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
       {!communityAccess.enabled && !communityAccess.loading && <EmptyState
         title="Community estimates are locked"
-        description={COMMUNITY_ACCESS_HINT}
-        action={<Link className="button button-secondary" to="/settings">Open community settings</Link>}
+        description={accessHint}
+        action={communityAccess.signedIn
+          ? <Button variant="secondary" onClick={() => setReviewingConsent(true)}>Review sharing</Button>
+          : <Link className="button button-secondary" to="/settings">Open community settings</Link>}
       />}
       {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
       {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}

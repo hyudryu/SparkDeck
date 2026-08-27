@@ -18,6 +18,7 @@ COMMUNITY_UPLOAD_FIELDS = frozenset({
     "model_id", "context_window_size", "inference_tokens_per_second",
     "concurrency", "tensor_parallel_size",
 })
+COMMUNITY_CONSENT_CONTRACT_VERSION = 2
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
     "exact_match_dimensions": ["model_id", "context_window_size"],
@@ -121,6 +122,37 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("community_consent", "false"),
             )
+            consent_version_row = self._connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?",
+                ("community_consent_contract_version",),
+            ).fetchone()
+            try:
+                consent_version = (
+                    json.loads(consent_version_row["value_json"])
+                    if consent_version_row is not None else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                consent_version = None
+            if consent_version != COMMUNITY_CONSENT_CONTRACT_VERSION:
+                # The coordinated benchmark payload widens the original
+                # three-field consent contract. Existing opt-ins must not
+                # silently authorize the new concurrency/TP dimensions.
+                self._connection.execute(
+                    "UPDATE settings SET value_json = 'false' "
+                    "WHERE key = 'community_consent'"
+                )
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    (
+                        "community_consent_contract_version",
+                        json.dumps(COMMUNITY_CONSENT_CONTRACT_VERSION),
+                    ),
+                )
             self._connection.execute(
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
@@ -503,7 +535,9 @@ class SparkDeckStore:
                         continue
                     if not isinstance(model, dict) or not isinstance(configuration, dict):
                         continue
-                    if configuration.get("benchmark_concurrency") is not None:
+                    if _coordinated_concurrency(
+                        configuration.get("benchmark_concurrency")
+                    ) is not None:
                         continue
                     model_id = str(model.get("repository") or "").strip()
                     context_window = community_context_window(configuration)
@@ -678,6 +712,14 @@ class SparkDeckStore:
                 "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
                 ("community_consent", json.dumps(bool(enabled))),
             )
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                (
+                    "community_consent_contract_version",
+                    json.dumps(COMMUNITY_CONSENT_CONTRACT_VERSION),
+                ),
+            )
             if not enabled:
                 # Withdrawing consent removes every unsent upload instruction,
                 # while the benchmark_samples rows remain available locally.
@@ -755,7 +797,9 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "context_window_size": context_window,
         "inference_tokens_per_second": speed,
     }
-    concurrency = _positive_integer(value["configuration"].get("benchmark_concurrency"))
+    concurrency = _coordinated_concurrency(
+        value["configuration"].get("benchmark_concurrency")
+    )
     tensor_parallel_size = _positive_integer(
         value["configuration"].get("tensor_parallel_size")
     )
@@ -780,6 +824,11 @@ def community_context_window(configuration: dict[str, Any]) -> int | None:
         if parsed > 0:
             return parsed
     return None
+
+
+def _coordinated_concurrency(value: Any) -> int | None:
+    parsed = _positive_integer(value)
+    return parsed if parsed in {1, 2, 5, 10} else None
 
 
 def _positive_speed(value: Any) -> float | None:

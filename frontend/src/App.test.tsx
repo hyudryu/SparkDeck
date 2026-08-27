@@ -74,6 +74,25 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Explore' })).toHaveAttribute('href', '/explore')
   })
 
+  it('refreshes the sidebar node name when the local node is renamed', async () => {
+    let nodeName = 'gx10-node-1'
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
+        return new Response(JSON.stringify({ cluster_node_name: nodeName }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+
+    nodeName = 'renamed-gx10'
+    window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
+    await waitFor(() => expect(within(screen.getByRole('link', { name: /Dashboard/ })).getByText('renamed-gx10')).toBeInTheDocument())
+  })
+
   it('ignores an older aborted presence failure after a newer refresh succeeds', async () => {
     const presenceRequests: Array<{
       signal?: AbortSignal

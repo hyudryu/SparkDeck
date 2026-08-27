@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -219,6 +220,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
             inventory=Mock(return_value=[{
                 "model_id": "org/model", "size_bytes": 9, "cache_path": "/private",
             }]),
+            free_bytes=Mock(return_value=42),
             export_model=export,
             import_model=import_model,
         )
@@ -250,6 +252,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(inventory.status_code, 200)
         self.assertNotIn("cache_path", str(inventory.json()))
+        self.assertEqual(inventory.json()["free_size"], 42)
         self.assertEqual(exported.content, b"tar-bytes")
         self.assertEqual(exported.headers["content-type"], "application/x-tar")
         self.assertEqual(imported.status_code, 200)
@@ -264,8 +267,9 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         inventory_scan = Mock(return_value=[{
             "model_id": "org/model", "size_bytes": 9,
         }])
-        virtual_nas = SimpleNamespace(inventory=inventory_scan)
-        delegated = AsyncMock(return_value=inventory_scan.return_value)
+        free_scan = Mock(return_value=123)
+        virtual_nas = SimpleNamespace(inventory=inventory_scan, free_bytes=free_scan)
+        delegated = AsyncMock(side_effect=[inventory_scan.return_value, free_scan.return_value])
         with (
             patch.object(
                 server.manager.agent_credentials, "authorize_controller", return_value=True,
@@ -280,8 +284,12 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["models"][0]["model_id"], "org/model")
-        delegated.assert_awaited_once_with(inventory_scan)
+        self.assertEqual(response.json()["free_size"], 123)
+        self.assertEqual(delegated.await_count, 2)
+        delegated.assert_any_call(inventory_scan)
+        delegated.assert_any_call(free_scan)
         inventory_scan.assert_not_called()
+        free_scan.assert_not_called()
 
     async def test_agent_export_reports_missing_model_before_stream_headers(self):
         virtual_nas = SimpleNamespace(
@@ -332,6 +340,19 @@ class VirtualNASInventoryTests(unittest.TestCase):
             (blobs / "unrelated-complete-blob").write_bytes(b"not a shard")
 
             self.assertEqual(nas.inventory(), [])
+
+    def test_free_bytes_measures_the_hub_filesystem(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas, hub = self._nas(Path(directory))
+
+            free = nas.free_bytes()
+
+            # Concurrent writes make exact byte equality racy across calls,
+            # so compare against a fresh reading within a small tolerance.
+            fresh = shutil.disk_usage(hub).free
+            self.assertIsInstance(free, int)
+            self.assertGreaterEqual(free, 0)
+            self.assertLessEqual(abs(free - fresh), max(1024 * 1024, fresh // 1000))
 
     def test_inventory_requires_config_tokenizer_and_all_indexed_weights(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -192,11 +192,14 @@ export function StoragePage() {
           {nodes.map((node) => {
             const used = node.models.reduce((total, model) => total + model.size_bytes, 0)
             // "Used" counts SparkDeck-managed model weights only, so the
-            // capacity denominator must be that usage plus the disk's real
-            // free space — the raw disk total also holds OS and app data
-            // that model usage can never fill.
-            const hasFree = (node.free_size ?? 0) > 0
-            const capacity = hasFree ? used + (node.free_size ?? 0) : node.total_size
+            // capacity denominator must be that usage plus the free space on
+            // the model-cache mount (reported with the inventory). The free
+            // reading is only meaningful while the node's inventory is valid —
+            // the manager marks a node offline when that request fails — and
+            // zero is a genuinely full disk, not missing data.
+            const cacheFree = node.online && typeof node.free_size === 'number' ? node.free_size : undefined
+            const hasFree = cacheFree !== undefined
+            const capacity = hasFree ? used + cacheFree : (node.total_size ?? 0)
             const alreadyStored = Boolean(draggedModel && node.models.some((model) => model.model_id === draggedModel.modelId))
             const validDrop = Boolean(draggedModel && node.online && draggedModel.sourceNodeId !== node.id && !alreadyStored)
             return <Panel
@@ -221,7 +224,7 @@ export function StoragePage() {
               <div className="storage-node-heading"><HardDrive size={18} /><div><h3>{node.name}</h3><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div></div>
               <div className="storage-capacity">
                 <span>{formatBytes(used)} used</span>
-                {hasFree && <span>{formatBytes(node.free_size ?? 0)} free</span>}
+                {hasFree && <span>{formatBytes(cacheFree)} free</span>}
                 <span>{formatBytes(capacity)} total</span>
               </div>
               <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>

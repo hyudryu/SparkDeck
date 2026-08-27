@@ -179,7 +179,7 @@ It provides:
 
 - lifetime token and request totals;
 - peak-day, active-day, current-streak, and longest-streak summaries;
-- a one-year daily activity heatmap;
+- a one-year daily activity heatmap with a color scale and per-day hover details;
 - 7-day and 30-day trend charts;
 - lifetime model or alias share; and
 - sortable detailed accounting for input misses, cache hits, output, requests, average speed, and configured cost.

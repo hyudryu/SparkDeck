@@ -1540,11 +1540,12 @@ class Manager:
     async def push_community_pairing(
         self, sub: str, email: str | None, refresh_token: str | None = None,
     ) -> dict:
-        """Best-effort fan-out of a community sign-in to every enabled peer."""
-        nodes = [
-            node for node in self.node_registry.nodes
-            if node.get("enabled", True)
-        ]
+        """Best-effort fan-out of a community sign-in to every joined peer.
+
+        Disabled nodes still expose their own SparkDeck UI and must show the
+        same account state even when they are excluded from model workloads.
+        """
+        nodes = list(self.node_registry.nodes)
         results = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "PUT", "/api/agent/community-pairing",
@@ -1554,6 +1555,7 @@ class Manager:
                     "refresh_token": refresh_token,
                 },
                 timeout=5,
+                allow_disabled=True,
             )
             for node in nodes
         ), return_exceptions=True)

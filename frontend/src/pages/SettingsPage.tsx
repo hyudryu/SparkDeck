@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
-import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
+import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings } from '../api/types'
@@ -231,6 +231,87 @@ function CommunitySignInForm() {
   )
 }
 
+interface CommunitySignOutDialogProps {
+  accountEmail?: string
+  busy: boolean
+  error?: string
+  onClose: () => void
+  onSubmit: (password: string) => Promise<void>
+  returnFocusRef: RefObject<HTMLButtonElement | null>
+}
+
+function CommunitySignOutDialog({
+  accountEmail, busy, error, onClose, onSubmit, returnFocusRef,
+}: CommunitySignOutDialogProps) {
+  const [password, setPassword] = useState('')
+  const passwordRef = useRef<HTMLInputElement>(null)
+  const busyRef = useRef(busy)
+
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
+
+  useEffect(() => {
+    const returnFocusTarget = returnFocusRef.current
+    passwordRef.current?.focus()
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape' && !busyRef.current) onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('keydown', closeOnEscape)
+      returnFocusTarget?.focus()
+    }
+  }, [onClose, returnFocusRef])
+
+  const keepFocusInside = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Tab') return
+    const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ))
+    if (!focusable.length) return
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!password || busy) return
+    const accountPassword = password
+    setPassword('')
+    void onSubmit(accountPassword)
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) onClose()
+    }}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="community-signout-title" onKeyDown={keepFocusInside}>
+        <div className="modal-heading">
+          <div><p className="eyebrow">Community Features</p><h2 id="community-signout-title">Sign out everywhere</h2></div>
+          <button className="icon-button" type="button" disabled={busy} onClick={onClose} aria-label="Cancel sign out"><X size={17} /></button>
+        </div>
+        <p className="modal-description">Re-enter the password for {accountEmail ?? 'the paired account'} to sign out every joined node.</p>
+        <form onSubmit={submit}>
+          <label className="field"><span>Password</span><input ref={passwordRef} type="password" autoComplete="current-password" value={password} disabled={busy} onChange={(event) => setPassword(event.target.value)} /></label>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="modal-actions">
+            <Button type="button" variant="tertiary" disabled={busy} onClick={onClose}>Cancel</Button>
+            <Button type="submit" variant="primary" disabled={busy || !password}>{busy ? 'Signing out…' : 'Sign out everywhere'}</Button>
+          </div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
   const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
@@ -242,7 +323,10 @@ export function SettingsPage() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
   const [signingOut, setSigningOut] = useState(false)
+  const [signOutDialogOpen, setSignOutDialogOpen] = useState(false)
+  const [signOutError, setSignOutError] = useState<string>()
   const [legalDialog, setLegalDialog] = useState<'privacy' | 'terms'>()
+  const signOutButtonRef = useRef<HTMLButtonElement>(null)
   const privacyButtonRef = useRef<HTMLButtonElement>(null)
   const termsButtonRef = useRef<HTMLButtonElement>(null)
   const closeLegalDialog = useCallback(() => setLegalDialog(undefined), [])
@@ -266,14 +350,20 @@ export function SettingsPage() {
     if (auth.status === 'signed-in') setError(undefined)
   }, [auth.status])
 
-  const signOut = async () => {
+  const closeSignOutDialog = useCallback(() => {
+    setSignOutError(undefined)
+    setSignOutDialogOpen(false)
+  }, [])
+
+  const signOut = async (password: string) => {
     setSigningOut(true)
-    setError(undefined)
+    setSignOutError(undefined)
     try {
-      await auth.signOut()
+      await auth.signOut(password)
+      setSignOutDialogOpen(false)
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : 'The controller could not be reached'
-      setError(`Could not sign out: ${detail} Your account may still be paired with this node. Sign in again if prompted, then retry Sign out.`)
+      setSignOutError(`Could not sign out: ${detail} Your account may still be paired with this node. Retry with the paired account password.`)
     } finally {
       setSigningOut(false)
     }
@@ -366,7 +456,7 @@ export function SettingsPage() {
             {auth.status === 'restoring'
               ? <p className="muted wide-field" role="status">Restoring community session…</p>
               : auth.status === 'signed-in'
-                ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" disabled={signingOut} onClick={() => void signOut()}>{signingOut ? 'Signing out…' : 'Sign out'}</Button></div>
+                ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><button ref={signOutButtonRef} className="button button-secondary" type="button" disabled={signingOut} onClick={() => { setSignOutError(undefined); setSignOutDialogOpen(true) }}>Sign out</button></div>
                 : <CommunitySignInForm />}
             {auth.status === 'signed-in' && auth.clusterSync && <>
               {auth.clusterSync.conflicts.map((conflict) => (
@@ -404,10 +494,11 @@ export function SettingsPage() {
           <div><Bug size={17} /><span><strong>Report a bug</strong><small>Open a GitHub issue. Never include passwords, tokens, prompts, model outputs, or other sensitive data.</small></span><a className="button button-secondary" href="https://github.com/hyudryu/SparkDeck/issues/new" target="_blank" rel="noopener noreferrer">Report a bug <ExternalLink size={14} /></a></div>
         </div>
       </Panel>
+      {signOutDialogOpen && <CommunitySignOutDialog accountEmail={auth.email} busy={signingOut} error={signOutError} onClose={closeSignOutDialog} onSubmit={signOut} returnFocusRef={signOutButtonRef} />}
       {legalDialog === 'privacy' && <LegalDialog eyebrow="Your data" title="SparkDeck Privacy Policy" titleId="privacy-policy-title" onClose={closeLegalDialog} returnFocusRef={privacyButtonRef}>
         <p className="legal-effective">Effective August 27, 2026</p>
         <section><h3>Local-first by default</h3><p>SparkDeck's core app runs on systems you control. It keeps benchmark history, runtime details, settings, and operational records locally on your device or cluster. Local storage is not collection by SparkDeck's hosted Community Features service.</p><p>If you do not create or sign in to a Community Features account, SparkDeck does not send account data or benchmark telemetry to the Community Features service.</p></section>
-        <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data, and your browser stores session tokens locally to keep you signed in.</p></section>
+        <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data. Your browser removes its token copy after pairing, while each paired SparkDeck node privately stores a refresh credential so signed-in status can be shared across your joined cluster without returning that credential to the browser.</p></section>
         <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly opt in from Benchmarks. When enabled, eligible existing local samples may be queued along with future samples. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>model identifier;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>tensor-parallel (TP) size, when recorded; and</li><li>context-window size.</li></ul><p>Prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
         <section><h3>How information is used</h3><p>Account information authenticates Community Features. Benchmark telemetry is used to group comparable results, show expected performance for the same model and configuration, detect invalid submissions, and operate the service. Published results may be aggregated with other users' results.</p><p>Telemetry uploads use a node-scoped credential and idempotency identifier. Hosting and network providers may also process ordinary connection metadata such as IP address, request time, and user agent for security and service operation. This metadata is not part of the benchmark JSON.</p></section>
         <section><h3>Your controls and retention</h3><p>You can turn telemetry off at any time. This stops future uploads and removes unsent queued uploads; it does not delete local benchmark history or recall data already received. Account information and received telemetry are retained only while reasonably needed to provide Community Features, protect the service, meet legal obligations, or maintain aggregated benchmark results. You may request access, correction, or deletion through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. Do not include sensitive personal information in a public issue. Backup and aggregated records may persist where legally permitted or where they can no longer reasonably be linked to an account.</p></section>

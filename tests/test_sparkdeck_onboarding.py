@@ -1210,7 +1210,13 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             captured.append(request)
             return httpx.Response(
                 207, stream=Body(),
-                headers={"content-type": "application/problem+json"},
+                headers={
+                    "content-type": "application/problem+json",
+                    "set-cookie": (
+                        "sparkdeck_community_session=opaque; HttpOnly; "
+                        "SameSite=strict"
+                    ),
+                },
             )
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -1238,6 +1244,10 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 207)
         self.assertEqual(response.headers["content-type"], "application/problem+json")
+        self.assertIn(
+            "sparkdeck_community_session=opaque",
+            response.headers["set-cookie"],
+        )
         self.assertEqual(content, b'{"partial":true}')
         self.assertEqual(str(captured[0].url), "http://127.0.0.1:9000/api/v1/images/pull?force=1")
         self.assertEqual(captured[0].content, b'{"image":"x"}')

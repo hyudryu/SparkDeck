@@ -859,6 +859,11 @@ class SparkDeckService:
         existing = self.store.deployment(alias)
         if existing and existing["id"] != stored["id"]:
             raise ValueError(f"deployment alias '{alias}' is already in use")
+        manager_id = stored.get("settings", {}).get("manager_deployment_id")
+        if manager_id:
+            # Keep the Manager record in sync so /api/state and MCP cluster
+            # listings (and future Manager-driven rebuilds) use the new name.
+            self.manager.update_deployment_alias(manager_id, alias)
         self.store.update_alias(stored["id"], alias)
         stored.pop("_base_url", None)
         stored.pop("_credential_ref", None)

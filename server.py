@@ -1501,9 +1501,13 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             400,
             recipe.get("error") or contract.get("error") or "saved runtime is unsupported",
         )
-    try:
-        body = await req.json()
-    except json.JSONDecodeError:
+    raw_body = await req.body()
+    if raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "request body must be valid JSON") from exc
+    else:
         body = {}
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")

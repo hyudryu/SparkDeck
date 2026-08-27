@@ -61,7 +61,8 @@ class SparkDeckStore:
                     base_url TEXT,
                     container_name TEXT,
                     settings_json TEXT NOT NULL DEFAULT '{}',
-                    credential_ref TEXT
+                    credential_ref TEXT,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS benchmark_samples (
                     id TEXT PRIMARY KEY,
@@ -100,6 +101,20 @@ class SparkDeckStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
+            )
+            deployment_columns = {
+                row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(deployments)"
+                )
+            }
+            if "created_at" not in deployment_columns:
+                self._connection.execute(
+                    "ALTER TABLE deployments ADD COLUMN created_at TEXT"
+                )
+            self._connection.execute(
+                "UPDATE deployments SET created_at = ? "
+                "WHERE created_at IS NULL OR TRIM(created_at) = ''",
+                (datetime.now(timezone.utc).isoformat(),),
             )
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
@@ -153,14 +168,16 @@ class SparkDeckStore:
             self._connection.execute(
                 """INSERT INTO deployments(
                     id, alias, runtime, kind, repository, revision, artifact,
-                    quantization, base_url, container_name, settings_json, credential_ref
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    quantization, base_url, container_name, settings_json, credential_ref,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     deployment.id, deployment.alias, deployment.runtime.value,
                     deployment.kind.value, deployment.model.repository,
                     deployment.model.revision, deployment.model.artifact,
                     deployment.model.quantization, base_url, deployment.container_name,
                     json.dumps(deployment.settings), credential_ref,
+                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
 
@@ -219,6 +236,7 @@ class SparkDeckStore:
                 settings=json.loads(row["settings_json"] or "{}"),
                 base_url_set=bool(row["base_url"]),
             ).to_dict()
+            deployment["created_at"] = row["created_at"]
             if include_private:
                 deployment["_base_url"] = row["base_url"]
                 deployment["_credential_ref"] = row["credential_ref"]

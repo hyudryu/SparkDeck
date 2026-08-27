@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from sparkdeck.models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
@@ -35,6 +36,74 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertTrue(public["base_url_set"])
         self.assertNotIn("_base_url", public)
         self.assertNotIn("private-host", str(public))
+
+    def test_deployment_creation_timestamps_persist_for_all_kinds(self):
+        cases = (
+            ("external", RuntimeKind.VLLM, DeploymentKind.EXTERNAL),
+            ("managed-llama", RuntimeKind.LLAMA_CPP, DeploymentKind.MANAGED),
+        )
+        created_at = {}
+        for deployment_id, runtime, kind in cases:
+            self.store.add_deployment(Deployment(
+                id=deployment_id,
+                alias=deployment_id,
+                runtime=runtime,
+                kind=kind,
+                model=ModelIdentity(f"org/{deployment_id}"),
+            ))
+            value = self.store.deployment(deployment_id)["created_at"]
+            self.assertIsNotNone(datetime.fromisoformat(value))
+            created_at[deployment_id] = value
+
+        database = self.store.path
+        self.store.close()
+        self.store = SparkDeckStore(database)
+
+        self.assertEqual(
+            {item["id"]: item["created_at"] for item in self.store.deployments()},
+            created_at,
+        )
+
+    def test_migration_backfills_created_at_for_legacy_deployments(self):
+        database = Path(self.temp.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                """CREATE TABLE deployments (
+                    id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE,
+                    runtime TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    revision TEXT,
+                    artifact TEXT,
+                    quantization TEXT,
+                    base_url TEXT,
+                    container_name TEXT,
+                    settings_json TEXT NOT NULL DEFAULT '{}',
+                    credential_ref TEXT
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO deployments(
+                    id, alias, runtime, kind, repository, settings_json
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                ("legacy", "Legacy", "llama.cpp", "managed", "org/model", "{}"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SparkDeckStore(database)
+        try:
+            created_at = migrated.deployment("legacy")["created_at"]
+            self.assertIsNotNone(datetime.fromisoformat(created_at))
+            stored = migrated._connection.execute(
+                "SELECT created_at FROM deployments WHERE id = 'legacy'"
+            ).fetchone()[0]
+            self.assertEqual(stored, created_at)
+        finally:
+            migrated.close()
 
     def test_only_consented_eligible_samples_enter_outbox(self):
         sample = BenchmarkSample(

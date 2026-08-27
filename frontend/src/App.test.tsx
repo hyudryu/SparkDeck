@@ -200,7 +200,9 @@ describe('model discovery', () => {
   it('opens deployment with the selected catalog model prefilled', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
-      const body = path.includes('/api/v1/nodes')
+      const body = path.includes('/api/v1/settings')
+        ? { default_runtime: 'sglang', default_context_length: 24576 }
+        : path.includes('/api/v1/nodes')
         ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
         : { items: [] }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -211,9 +213,11 @@ describe('model discovery', () => {
     expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
     expect(screen.getByRole('textbox', { name: 'Display name' })).toHaveValue('chosen-model')
-    expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('vllm')
-    expect(screen.getByRole('spinbutton', { name: 'Context length' })).toHaveValue(8192)
-    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v1/settings'))).toBe(false)
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Runtime' })).toHaveValue('sglang')
+      expect(screen.getByRole('spinbutton', { name: 'Context length' })).toHaveValue(24576)
+    })
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v1/settings'))).toBe(true)
   })
 })
 
@@ -555,11 +559,15 @@ describe('model deployments', () => {
     const detail = {
       id: 'recipe-args', name: 'Args config', model: 'org/model', engine: 'vllm',
       deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
-      pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 3,
-      extra_args: ['--max-model-len', '32768', '--enable-prefix-caching'],
+      pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 6,
+      extra_args: [
+        '--max-model-len', '32768', '--enable-prefix-caching',
+        '--speculative-config', '{"model":"org/draft","num_speculative_tokens":4,"draft_tensor_parallel_size":2}',
+        '--default-chat-template-kwargs={"thinking":true,"note":"don\'t drop"}',
+      ],
       launch_controls: {
         context_window: 32768, max_concurrency: null, kv_cache_dtype: null,
-        thinking_mode: 'default', dspark_num_speculative_tokens: null,
+        thinking_mode: 'default', dspark_num_speculative_tokens: 4,
         max_cudagraph_capture_size: null, max_num_batched_tokens: null,
       },
       gpu_memory_utilization: 0.9, gpu_memory_gb: null,
@@ -588,7 +596,9 @@ describe('model deployments', () => {
     await user.click(await screen.findByRole('button', { name: 'Arguments' }))
     const contextWindow = await screen.findByRole('spinbutton', { name: 'Context window' })
     expect(contextWindow).toHaveValue(32768)
-    expect(screen.getByRole('textbox', { name: 'Other flags' })).toHaveValue('--enable-prefix-caching')
+    expect(screen.getByRole('textbox', { name: 'Other flags' })).toHaveValue(
+      `--enable-prefix-caching --speculative-config '{"model":"org/draft","num_speculative_tokens":4,"draft_tensor_parallel_size":2}' '--default-chat-template-kwargs={"thinking":true,"note":"don'\\''t drop"}'`,
+    )
     expect(screen.getByRole('spinbutton', { name: 'GPU memory util' })).toHaveValue(0.9)
 
     await user.clear(contextWindow)
@@ -601,7 +611,14 @@ describe('model deployments', () => {
     ))
     const putCall = fetchMock.mock.calls.find(([input, init]) => String(input) === '/api/v1/recipes/recipe-args' && init?.method === 'PUT')
     const payload = JSON.parse(String(putCall?.[1]?.body))
-    expect(payload.extra_args).toEqual(['--enable-prefix-caching'])
+    // Compound JSON flags round-trip verbatim; the backend merges the
+    // structured fields into them instead of the editor dropping them.
+    expect(payload.extra_args).toEqual([
+      '--enable-prefix-caching',
+      '--speculative-config',
+      '{"model":"org/draft","num_speculative_tokens":4,"draft_tensor_parallel_size":2}',
+      '--default-chat-template-kwargs={"thinking":true,"note":"don\'t drop"}',
+    ])
     expect(payload.launch_controls.context_window).toBe(65536)
     expect(payload.gpu_memory_utilization).toBe(0.9)
     expect(await screen.findByText('Saved.')).toBeInTheDocument()

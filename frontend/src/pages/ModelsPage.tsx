@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Bookmark, Check, HardDrive, Pencil, Play, Plus, Server, Settings2, Trash2, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -19,6 +19,26 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
+const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
+
+function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): CreateDeploymentInput {
+  const runtime = isRuntimeKind(settings?.default_runtime) ? settings.default_runtime : initialForm.runtime
+  const savedContextLength = settings?.default_context_length
+  const contextLength = typeof savedContextLength === 'number'
+    && Number.isInteger(savedContextLength)
+    && savedContextLength >= 256
+    ? savedContextLength
+    : initialForm.settings.context_length
+  return {
+    ...initialForm,
+    runtime,
+    settings: runtime === 'llama.cpp'
+      ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
+      : { context_length: contextLength, tensor_parallel_size: 1 },
+    node_ids: [localNodeId],
+  }
+}
+
 const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
 
 const PIN_STORAGE_KEY = 'sparkdeck:pinned-recipes'
@@ -26,12 +46,17 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
-// Flags the structured argument editor manages; everything else in a saved
-// configuration's extra args is shown verbatim in the "Other flags" field.
+// Scalar flags the structured argument editor manages; everything else in a
+// saved configuration's extra args is shown verbatim in the "Other flags"
+// field. Compound JSON flags (--speculative-config,
+// --default-chat-template-kwargs) intentionally stay in "Other flags" so a
+// save round-trips their full payloads — the backend merges the structured
+// speculative-token count / thinking mode into the JSON without discarding
+// unrelated properties.
 const CONTROLLED_FLAGS = new Set([
   '--max-model-len', '--max-model-length', '--max-num-seqs', '--kv-cache-dtype',
   '--context-length', '--max-running-requests', '--max-cudagraph-capture-size',
-  '--max-num-batched-tokens', '--speculative-config', '--default-chat-template-kwargs',
+  '--max-num-batched-tokens',
 ])
 
 const shellQuote = (arg: string) => (/[\s"']/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
@@ -132,6 +157,7 @@ export function ModelsPage() {
   const resource = useResource((signal) => api.deployments.list(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
+  const appSettings = useResource((signal) => api.settings.get(signal))
   const modelCache = useResource((signal) => api.modelCache.get(signal))
   const recipes = useResource((signal) => api.recipes.list(signal))
   const [creating, setCreating] = useState(false)
@@ -146,6 +172,9 @@ export function ModelsPage() {
   const [pinned, setPinned] = useState<string[]>(readPinned)
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
+  const defaultsApplied = useRef(false)
+  const runtimeTouched = useRef(false)
+  const contextLengthTouched = useRef(false)
 
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
@@ -172,6 +201,31 @@ export function ModelsPage() {
   }, [nodes.data])
 
   const localNodeId = nodes.data?.find((node) => node.local)?.id
+
+  useEffect(() => {
+    if (!appSettings.data || defaultsApplied.current) return
+    defaultsApplied.current = true
+    setForm((current) => {
+      const defaults = deploymentDefaults(appSettings.data, localNodeId ?? current.node_ids?.[0] ?? 'local')
+      const runtime = runtimeTouched.current ? current.runtime : defaults.runtime
+      const contextLength = contextLengthTouched.current
+        ? current.settings.context_length
+        : defaults.settings.context_length
+      const nodeIds = runtime === 'llama.cpp'
+        ? [localNodeId ?? current.node_ids?.[0] ?? 'local']
+        : current.node_ids
+      return {
+        ...current,
+        runtime,
+        node_ids: nodeIds,
+        deployment_mode: (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single',
+        settings: runtime === 'llama.cpp'
+          ? { context_length: contextLength, parallel_slots: current.settings.parallel_slots ?? 1, gpu_layers: current.settings.gpu_layers ?? 99 }
+          : { context_length: contextLength, tensor_parallel_size: current.settings.tensor_parallel_size ?? 1 },
+      }
+    })
+  }, [appSettings.data, localNodeId])
+
   const selectionReady = !nodes.loading && !nodes.error && (form.node_ids?.length ?? 0) > 0
     && (form.node_ids ?? []).every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
     && (form.runtime !== 'llama.cpp' || (form.node_ids?.length === 1 && form.node_ids[0] === localNodeId))
@@ -192,7 +246,9 @@ export function ModelsPage() {
         || selectedNodeLabel(nodes.data ?? [], deployment.node_ids ?? form.node_ids ?? ['local'], localLabel)
       setActionNotice(`Added ${deployment.alias} on ${selected}.`)
       setCreating(false)
-      setForm(initialForm)
+      runtimeTouched.current = false
+      contextLengthTouched.current = false
+      setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
       resource.reload()
     } catch (reason) {
       setFormError(reason instanceof Error ? reason.message : 'Could not create deployment')
@@ -416,6 +472,7 @@ export function ModelsPage() {
   }
 
   const updateRuntime = (runtime: RuntimeKind) => {
+    runtimeTouched.current = true
     setForm((current) => {
       const contextLength = current.settings.context_length ?? 8192
       const localId = localNodeId ?? 'local'
@@ -652,6 +709,7 @@ export function ModelsPage() {
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
+                  contextLengthTouched.current = true
                   setForm({ ...form, settings: { ...form.settings, context_length: Number(event.target.value) } })
                 }} /></label>
                 {form.runtime === 'llama.cpp' ? (

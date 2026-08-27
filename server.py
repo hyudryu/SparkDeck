@@ -357,6 +357,12 @@ async def onboarding_unregister(req: Request):
 
 
 # ---------- aggregate state ----------
+@app.get("/healthz", include_in_schema=False, status_code=204)
+async def healthz():
+    """Return local process liveness without touching Docker or cluster nodes."""
+    return Response(status_code=204)
+
+
 def _public_legacy_recipe(recipe: dict) -> dict:
     """Remove embedded credentials without changing the legacy recipe shape."""
     public = dict(recipe)

@@ -94,4 +94,35 @@ Describe "SparkDeck Windows launcher" {
         $result = Invoke-SparkDeckCommand -Command "not-a-command"
         $result | Should Be 1
     }
+
+    InModuleScope SparkDeck.Windows {
+        It "accepts the default Python 3 launcher runtime when it is 3.11 or newer" {
+            Mock Get-Command { [pscustomobject]@{ Source = "C:\Windows\py.exe" } } -ParameterFilter { $Name -eq "py.exe" }
+            Mock Invoke-SparkDeckNativeCapture {
+                [pscustomobject]@{ ExitCode = 0; Stdout = ""; Stderr = "" }
+            } -ParameterFilter {
+                $Arguments[0] -eq "-3" -and
+                $Arguments[1] -eq "-c" -and
+                $Arguments[2] -match "sys.version_info >= \(3, 11\)"
+            }
+
+            $result = Get-SparkDeckBootstrapPython
+
+            $result.FilePath | Should Be "C:\Windows\py.exe"
+            $result.PrefixArguments.Count | Should Be 1
+            $result.PrefixArguments[0] | Should Be "-3"
+            Assert-MockCalled Invoke-SparkDeckNativeCapture -Times 1 -Exactly
+        }
+
+        It "checks process liveness through the lightweight local endpoint" {
+            Mock Invoke-WebRequest { [pscustomobject]@{ StatusCode = 204 } } -ParameterFilter {
+                $Uri -eq "http://127.0.0.1:7878/healthz"
+            }
+
+            (Test-SparkDeckHealth) | Should Be $true
+            Assert-MockCalled Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+                $Uri -eq "http://127.0.0.1:7878/healthz"
+            }
+        }
+    }
 }

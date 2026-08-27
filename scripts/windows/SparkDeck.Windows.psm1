@@ -152,8 +152,9 @@ function Test-SparkDeckProcessIdentity {
 
 function Test-SparkDeckHealth {
     try {
-        $response = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/api/state" -f $script:SparkDeckPort) -UseBasicParsing -TimeoutSec 2
-        return ([int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300)
+        # This local-only liveness route never waits for Docker or remote nodes.
+        $response = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/healthz" -f $script:SparkDeckPort) -UseBasicParsing -TimeoutSec 2
+        return ([int]$response.StatusCode -eq 204)
     }
     catch {
         return $false
@@ -220,11 +221,12 @@ function Invoke-SparkDeckNativeCapture {
 }
 
 function Get-SparkDeckBootstrapPython {
+    $versionCheck = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($null -ne $launcher) {
-        foreach ($version in @("-3.12", "-3.11")) {
-            $probe = Invoke-SparkDeckNativeCapture -FilePath $launcher.Source -Arguments @($version, "-c", "import sys; print(sys.executable)")
-            if ($probe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($probe.Stdout)) {
+        foreach ($version in @("-3", "-3.12", "-3.11")) {
+            $probe = Invoke-SparkDeckNativeCapture -FilePath $launcher.Source -Arguments @($version, "-c", $versionCheck)
+            if ($probe.ExitCode -eq 0) {
                 return [pscustomobject]@{ FilePath = $launcher.Source; PrefixArguments = @($version) }
             }
         }
@@ -232,7 +234,7 @@ function Get-SparkDeckBootstrapPython {
 
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($null -ne $python) {
-        $probe = Invoke-SparkDeckNativeCapture -FilePath $python.Source -Arguments @("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)")
+        $probe = Invoke-SparkDeckNativeCapture -FilePath $python.Source -Arguments @("-c", $versionCheck)
         if ($probe.ExitCode -eq 0) {
             return [pscustomobject]@{ FilePath = $python.Source; PrefixArguments = @() }
         }

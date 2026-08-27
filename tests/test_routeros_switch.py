@@ -262,6 +262,34 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
             })
         self.assertFalse(service.config_path.exists())
 
+    async def test_overview_normalizes_legacy_health_property_map(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/rest/system/resource":
+                return httpx.Response(200, json=[{
+                    "platform": "MikroTik", "version": "7.19",
+                    "board-name": "CRS326",
+                }], request=request)
+            if request.url.path == "/rest/system/health":
+                return httpx.Response(200, json={
+                    "temperature": "44", "fan1-speed": "5100",
+                }, request=request)
+            return httpx.Response(200, json=[], request=request)
+
+        service = RouterOSService(
+            Path(self.directory.name), transport=httpx.MockTransport(handler),
+        )
+        config = {
+            "base_url": "http://10.0.0.10", "username": "sparkdeck",
+            "password": "secret", "verify_tls": True,
+        }
+
+        result = await service._overview_with_config(config)
+
+        self.assertEqual(result["health"], [
+            {"name": "temperature", "value": "44"},
+            {"name": "fan1-speed", "value": "5100"},
+        ])
+
     async def test_authenticated_request_pins_validated_hostname_resolution(self) -> None:
         requests = []
         resolutions = []
@@ -494,6 +522,26 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
             self.service.validate_fan_settings(
                 {"fan-target-temp": 55}, {"fan-control-interval"},
             )
+
+    def test_startup_delay_clock_rejects_invalid_minute_and_second_components(self) -> None:
+        for value in ("1:60:00", "1:00:60", "123:99:99"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "RouterOS time value"):
+                    self.service.validate_fan_settings({
+                        "cpu-overtemp-startup-delay": value,
+                    })
+        self.assertEqual(
+            self.service.validate_fan_settings({
+                "cpu-overtemp-startup-delay": "123:59:59",
+            }),
+            {"cpu-overtemp-startup-delay": "123:59:59"},
+        )
+        self.assertEqual(
+            self.service.validate_fan_settings({
+                "cpu-overtemp-startup-delay": "90m",
+            }),
+            {"cpu-overtemp-startup-delay": "90m"},
+        )
 
 
 class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):

@@ -18,7 +18,7 @@ from cluster import (
     NodeRegistry,
     normalize_agent_url,
 )
-from manager import Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
+from manager import DEPLOYMENT_LABEL, Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
 from sparkdeck.onboarding import resolve_agent_connection
 
 
@@ -2860,6 +2860,48 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 ["old-r0", "old-r1"],
             )
             self.assertEqual(old["status"], "stopped")
+
+    async def test_relaunch_preflight_reuses_only_replaced_deployments_port(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "port_range_start": 8000,
+            "port_range_end": 8001,
+            "cluster_fabric_ip": None,
+            "cluster_fabric_interface": None,
+        }
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "docker_ready": True, "fabric_ip": None,
+            "fabric_interface": None, "interfaces": [],
+        }])
+
+        replaced = mock.Mock()
+        replaced.labels = {DEPLOYMENT_LABEL: "deployment-old"}
+        replaced.ports = {"8000/tcp": [{"HostPort": "8000"}]}
+        replaced.status = "exited"
+        unrelated = mock.Mock()
+        unrelated.labels = {DEPLOYMENT_LABEL: "deployment-other"}
+        unrelated.ports = {"8001/tcp": [{"HostPort": "8001"}]}
+        unrelated.status = "running"
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = [replaced, unrelated]
+        launch_body = {
+            "model": "example/Model", "engine": "vllm",
+            "deployment_mode": "single", "node_ids": ["local"],
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError, "No available ports in configured range",
+        ):
+            await instance._preflight_deployment_launch(launch_body)
+
+        plan = await instance._preflight_deployment_launch(
+            launch_body, exclude_deployment_id="deployment-old",
+        )
+
+        self.assertEqual(plan["local_port"], 8000)
 
     def test_explicit_args_repair_preserves_unrelated_deployment_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

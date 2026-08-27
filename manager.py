@@ -3189,7 +3189,9 @@ class Manager:
         )
         return bool((result or {}).get("ready"))
 
-    async def _preflight_deployment_launch(self, body: dict) -> dict:
+    async def _preflight_deployment_launch(
+        self, body: dict, *, exclude_deployment_id: str | None = None,
+    ) -> dict:
         """Validate and normalize a launch without mutating runtime state."""
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
@@ -3271,7 +3273,12 @@ class Manager:
         if LOCAL_NODE_ID in node_ids and local_port is None:
             # A controller port is meaningful only for the controller member.
             # Remote agents allocate against their own Docker/host namespace.
-            local_port = await self._allocate_port()
+            if exclude_deployment_id:
+                local_port = await self._allocate_port(
+                    exclude_deployment_id=exclude_deployment_id,
+                )
+            else:
+                local_port = await self._allocate_port()
         master_ip, _ = self._inferred_fabric(
             available[LOCAL_NODE_ID],
             self.settings.get("cluster_fabric_ip"),
@@ -3603,7 +3610,9 @@ class Manager:
             # fabric identity a sharded runtime requires; discovering that
             # after removing the old ranks would turn a rejected relocation
             # into an outage.
-            await self._preflight_deployment_launch(launch_body)
+            await self._preflight_deployment_launch(
+                launch_body, exclude_deployment_id=deployment_id,
+            )
 
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
@@ -8100,10 +8109,18 @@ class Manager:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
         return self._parse_phase(logs)
 
-    async def _allocate_port(self) -> int:
+    async def _allocate_port(
+        self, *, exclude_deployment_id: str | None = None,
+    ) -> int:
         def _scan():
             used = set()
             for c in self.client.containers.list(all=True):
+                if (
+                    exclude_deployment_id
+                    and _label_value(c.labels or {}, DEPLOYMENT_LABEL)
+                    == exclude_deployment_id
+                ):
+                    continue
                 for _, bindings in (c.ports or {}).items():
                     for b in (bindings or []):
                         try:

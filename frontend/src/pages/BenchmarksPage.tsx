@@ -4,12 +4,13 @@ import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
   const aggregates = useResource(
     (signal) => api.benchmarks.aggregates(signal),
     [communityAccess.enabled],
@@ -69,11 +70,13 @@ export function BenchmarksPage() {
         </Panel>
       </div>
 
-      <div className="section-heading" title={communityAccess.enabled ? undefined : COMMUNITY_ACCESS_HINT}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
+      <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
       {!communityAccess.enabled && !communityAccess.loading && <EmptyState
         title="Community estimates are locked"
-        description={COMMUNITY_ACCESS_HINT}
-        action={<Link className="button button-secondary" to="/settings">Open community settings</Link>}
+        description={accessHint}
+        action={communityAccess.signedIn
+          ? <Button variant="secondary" onClick={() => setReviewingConsent(true)}>Review sharing</Button>
+          : <Link className="button button-secondary" to="/settings">Open community settings</Link>}
       />}
       {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
       {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}

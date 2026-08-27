@@ -7,7 +7,9 @@ import { BenchmarksPage } from './BenchmarksPage'
 const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true, reload: vi.fn() }))
 
 vi.mock('../hooks/useCommunityAccess', () => ({
-  COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',
+  communityAccessHint: (signedIn: boolean) => signedIn
+    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    : 'Sign in under Settings → Community Features to see community data.',
   useCommunityAccess: () => communityAccess,
 }))
 
@@ -102,7 +104,7 @@ describe('BenchmarksPage community privacy', () => {
   })
 
   it('locks community estimates behind sign-in and telemetry opt-in but keeps the consent path usable', async () => {
-    Object.assign(communityAccess, { signedIn: false, sharingEnabled: false, enabled: false })
+    Object.assign(communityAccess, { signedIn: true, sharingEnabled: false, enabled: false })
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       let body: unknown
@@ -124,8 +126,8 @@ describe('BenchmarksPage community privacy', () => {
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('Community estimates are locked')).toBeInTheDocument()
-    expect(screen.getByText('Sign in and enable telemetry in Settings → Community Features to see community data.')).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
+    expect(screen.getByText('Review and enable community sharing on Benchmarks to see community data.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review sharing' })).toBeInTheDocument()
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([input]) => (

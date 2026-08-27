@@ -777,13 +777,11 @@ async def agent_apply_community_unpairing(req: Request):
     if not isinstance(sub, str) or not sub:
         # A missing sub would act as a wildcard; refuse it outright.
         raise HTTPException(400, "sub is required")
-    existing = sparkdeck.store.get_setting(
-        "device_pairing", {"status": "not_paired"})
-    if existing.get("status") != "paired":
+    result, existing = await sparkdeck.unpair_community_device(sub)
+    if result == "already":
         return {"applied": True, "already": True}
-    if existing.get("sub") != sub:
+    if result == "conflict":
         return {"applied": False, "existing": {"email": existing.get("email")}}
-    sparkdeck.store.set_setting("device_pairing", {"status": "not_paired"})
     return {"applied": True}
 
 
@@ -2125,25 +2123,11 @@ async def v1_community_pair(req: Request):
 
 @app.delete("/api/v1/community/pair")
 async def v1_community_unpair(req: Request):
-    existing = sparkdeck.store.get_setting(
-        "device_pairing", {"status": "not_paired"})
-    if existing.get("status") == "paired":
-        claims = await _verified_community_claims(req)
-    else:
-        claims = None
-    with sparkdeck.store.locked():
-        existing = sparkdeck.store.get_setting(
-            "device_pairing", {"status": "not_paired"})
-        if existing.get("status") == "paired":
-            if claims is None:
-                raise HTTPException(401, "a Cognito ID token is required")
-            if existing.get("sub") != claims.get("sub"):
-                raise HTTPException(403, "this account is not paired with the node")
-            sparkdeck.store.set_setting(
-                "device_pairing", {"status": "not_paired"})
-            unpaired_sub = existing.get("sub")
-        else:
-            unpaired_sub = None
+    claims = await _verified_community_claims(req)
+    result, existing = await sparkdeck.unpair_community_device(claims["sub"])
+    if result == "conflict":
+        raise HTTPException(403, "this account is not paired with the node")
+    unpaired_sub = existing.get("sub") if result == "unpaired" else None
     pairing = {"status": "not_paired"}
     if unpaired_sub:
         cluster = await manager.push_community_unpair(unpaired_sub)

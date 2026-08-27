@@ -221,6 +221,8 @@ def _community_upload_url(endpoint: str) -> httpx.URL:
         url = httpx.URL(endpoint)
     except (TypeError, httpx.InvalidURL) as exc:
         raise ValueError("community upload URL is invalid") from exc
+    if url.scheme != "https":
+        raise ValueError("community upload URL must use HTTPS")
     path = url.path.rstrip("/")
     if not path.endswith("/benchmarks"):
         path = f"{path}/benchmarks"
@@ -237,6 +239,8 @@ async def _post_public_community_url(
         target = httpx.URL(url)
     except (TypeError, httpx.InvalidURL) as exc:
         raise ValueError("community upload URL is invalid") from exc
+    if target.scheme != "https":
+        raise ValueError("community upload URL must use HTTPS")
     pinned_urls, host_header, sni_hostname = await _public_connection_urls(
         target, resolver,
     )
@@ -262,10 +266,21 @@ async def _post_public_community_url(
                 extensions={"sni_hostname": sni_hostname},
             )
             try:
-                response = await client.send(request)
+                streamed = await client.send(request, stream=True)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_connect_error = exc
                 continue
+            try:
+                response = httpx.Response(
+                    streamed.status_code,
+                    headers=streamed.headers,
+                    request=streamed.request,
+                    extensions=streamed.extensions,
+                )
+            finally:
+                # Upload responses have no response-body contract. Never read
+                # or buffer an untrusted body merely to inspect the status.
+                await streamed.aclose()
             if response.status_code in _COMMUNITY_REDIRECT_STATUSES:
                 raise ValueError("community upload service must not redirect")
             return response
@@ -339,6 +354,7 @@ class SparkDeckService:
         self._deployment_create_lock = asyncio.Lock()
         self._community_upload_task: asyncio.Task[None] | None = None
         self._community_upload_lock = asyncio.Lock()
+        self._community_upload_drain_lock = asyncio.Lock()
         # Upload authentication is deliberately process configuration, not a
         # browser token or user-editable setting. Deployments can issue a
         # revocable, node-scoped telemetry credential without exposing Cognito
@@ -371,56 +387,80 @@ class SparkDeckService:
         async with self._community_upload_lock:
             await asyncio.to_thread(self.store.set_community_consent, enabled)
 
-    async def upload_community_once(self) -> int:
+    async def unpair_community_device(
+        self, expected_sub: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Serialize account-matched unpairing with outbound upload batches."""
         async with self._community_upload_lock:
+            with self.store.locked():
+                existing = self.store.get_setting(
+                    "device_pairing", {"status": "not_paired"},
+                )
+                if existing.get("status") != "paired":
+                    return "already", existing
+                if existing.get("sub") != expected_sub:
+                    return "conflict", existing
+                self.store.set_setting(
+                    "device_pairing", {"status": "not_paired"},
+                )
+                return "unpaired", existing
+
+    async def upload_community_once(self) -> int:
+        async with self._community_upload_drain_lock:
             return await self._upload_community_once_locked()
 
     async def _upload_community_once_locked(self) -> int:
         """Drain one bounded outbox batch when consent and credentials exist."""
-        consent = await asyncio.to_thread(
-            self.store.get_setting, "community_consent", False,
-        )
-        pairing = await asyncio.to_thread(
-            self.store.get_setting, "device_pairing", {"status": "not_paired"},
-        )
         endpoint = self._community_upload_url
         token = self._community_upload_token
-        if not consent or pairing.get("status") != "paired" or not endpoint or not token:
+        if not endpoint or not token:
             return 0
 
         entries = await asyncio.to_thread(self.store.outbox_entries)
         synced = 0
         upload_url = _community_upload_url(endpoint)
         for entry in entries:
-            sample_id = entry["sample_id"]
-            try:
-                response = await _post_public_community_url(
-                    upload_url,
-                    entry["payload"],
-                    token=token,
-                    idempotency_key=sample_id,
-                    transport=getattr(self.manager, "community_http_transport", None),
-                    resolver=getattr(
-                        self.manager, "community_resolver", socket.getaddrinfo,
-                    ),
+            async with self._community_upload_lock:
+                consent = await asyncio.to_thread(
+                    self.store.get_setting, "community_consent", False,
                 )
-                if response.is_success or response.status_code == 409:
-                    await asyncio.to_thread(
-                        self.store.mark_outbox_synced, [sample_id],
-                    )
-                    synced += 1
-                else:
-                    await asyncio.to_thread(
-                        self.store.mark_outbox_failed,
-                        [sample_id],
-                        f"community service returned HTTP {response.status_code}",
-                    )
-            except asyncio.CancelledError:
-                raise
-            except (httpx.HTTPError, TypeError, ValueError) as exc:
-                await asyncio.to_thread(
-                    self.store.mark_outbox_failed, [sample_id], str(exc),
+                pairing = await asyncio.to_thread(
+                    self.store.get_setting,
+                    "device_pairing", {"status": "not_paired"},
                 )
+                if not consent or pairing.get("status") != "paired":
+                    break
+                sample_id = entry["sample_id"]
+                try:
+                    response = await _post_public_community_url(
+                        upload_url,
+                        entry["payload"],
+                        token=token,
+                        idempotency_key=sample_id,
+                        transport=getattr(
+                            self.manager, "community_http_transport", None,
+                        ),
+                        resolver=getattr(
+                            self.manager, "community_resolver", socket.getaddrinfo,
+                        ),
+                    )
+                    if response.is_success or response.status_code == 409:
+                        await asyncio.to_thread(
+                            self.store.mark_outbox_synced, [sample_id],
+                        )
+                        synced += 1
+                    else:
+                        await asyncio.to_thread(
+                            self.store.mark_outbox_failed,
+                            [sample_id],
+                            f"community service returned HTTP {response.status_code}",
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except (httpx.HTTPError, TypeError, ValueError) as exc:
+                    await asyncio.to_thread(
+                        self.store.mark_outbox_failed, [sample_id], str(exc),
+                    )
         return synced
 
     async def _community_upload_loop(self) -> None:

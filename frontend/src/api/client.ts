@@ -50,7 +50,7 @@ export class ApiError extends Error {
   }
 }
 
-type AuthTokenProvider = () => string | undefined
+type AuthTokenProvider = () => string | undefined | Promise<string | undefined>
 
 let authTokenProvider: AuthTokenProvider | undefined
 
@@ -59,7 +59,10 @@ export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = path.startsWith('/api/v1/community/') ? authTokenProvider?.() : undefined
+  const token = (
+    path.startsWith('/api/v1/community/')
+    && path !== '/api/v1/community/auth-config'
+  ) ? await authTokenProvider?.() : undefined
   const response = await fetch(path, {
     ...init,
     headers: {

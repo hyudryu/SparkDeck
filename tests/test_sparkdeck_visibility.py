@@ -178,6 +178,36 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(create.await_args.args[0]["recipe_id"], "recipe-1")
 
+    async def test_recipe_deploy_rejects_malformed_nonempty_json(self):
+        recipe = {
+            "id": "recipe-1",
+            "model": "org/model",
+            "engine": "vllm",
+            "extra_args": [],
+        }
+        selected = AsyncMock()
+        inventory = AsyncMock()
+        create = AsyncMock()
+        with (
+            patch.object(
+                server.manager, "get_recipe", AsyncMock(return_value=recipe)
+            ),
+            patch.object(server.manager, "selected_cluster_nodes", selected),
+            patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(server.sparkdeck, "create_deployment", create),
+        ):
+            response = await self.client.post(
+                "/api/v1/recipes/recipe-1/deploy",
+                content=b'{"node_ids":["local"]',
+                headers={"content-type": "application/json"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("valid JSON", response.text)
+        selected.assert_not_awaited()
+        inventory.assert_not_awaited()
+        create.assert_not_awaited()
+
     async def test_malformed_parallelism_does_not_hide_other_saved_configurations(self):
         recipes = [
             {"id": "bad-tp", "model": "org/bad", "engine": "sglang", "sg_tp_size": "bad"},

@@ -815,6 +815,8 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:
         return False
     if not _weight_shards_are_complete(weights):
         return False
+    if not _weight_indexes_are_complete(lowered):
+        return False
 
     # GGUF contains its own tensor metadata and tokenizer vocabulary. Other
     # runtimes need both the Transformers configuration and tokenizer assets.
@@ -833,8 +835,6 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:
             return False
         tokenizer = [by_filename["vocab.json"], by_filename["merges.txt"]]
     if not _required_files_are_nonempty(tokenizer):
-        return False
-    if not _weight_indexes_are_complete(lowered):
         return False
     return True
 
@@ -864,6 +864,15 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
         name: path for name, path in files.items()
         if name.endswith((".safetensors.index.json", ".bin.index.json"))
     }
+    required_indexes = set()
+    for name in files:
+        match = _WEIGHT_SHARD.match(name)
+        if match and match.group("suffix").casefold() != ".gguf":
+            required_indexes.add(
+                f"{match.group('prefix')}{match.group('suffix')}.index.json".casefold()
+            )
+    if not required_indexes <= indexes.keys():
+        return False
     for path in indexes.values():
         try:
             value = json.loads(path.read_text(encoding="utf-8"))

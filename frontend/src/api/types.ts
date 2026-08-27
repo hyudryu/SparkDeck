@@ -237,6 +237,10 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
+  // Retained for backward compatibility with settings saved before these
+  // controls were removed from the Settings page.
+  default_runtime?: RuntimeKind
+  default_context_length?: number
   hf_token?: string
   hf_token_configured?: boolean
   community_api_url?: string

@@ -2033,7 +2033,7 @@ async def v1_record_benchmark_run(req: Request):
         raise HTTPException(400, "request body must be valid JSON") from exc
     allowed = {
         "deployment_id", "concurrency", "request_count", "prompt_tokens",
-        "generation_tokens", "wall_seconds",
+        "generation_tokens", "prompt_seconds", "wall_seconds",
     }
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")

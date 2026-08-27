@@ -553,16 +553,17 @@ class SparkDeckService:
             raise ValueError("request_count must be at least the measured concurrency")
         prompt_tokens = _bounded_benchmark_integer(body.get("prompt_tokens"), "prompt_tokens", allow_zero=True)
         generation_tokens = _bounded_benchmark_integer(body.get("generation_tokens"), "generation_tokens", allow_zero=True)
+        prompt_seconds = _positive_finite(body.get("prompt_seconds"), "prompt_seconds")
         wall_seconds = _positive_finite(body.get("wall_seconds"), "wall_seconds")
-        if prompt_tokens == 0 and generation_tokens == 0:
-            raise ValueError("benchmark must include measured tokens")
+        if prompt_tokens == 0:
+            raise ValueError("prompt throughput is unavailable without measured prompt tokens")
 
         tensor_parallel_size = 1
         raw_tp = settings.get("tensor_parallel_size")
         if raw_tp is not None:
             tensor_parallel_size = _bounded_benchmark_integer(raw_tp, "tensor_parallel_size")
         try:
-            prompt_tokens_per_second = prompt_tokens / wall_seconds
+            prompt_tokens_per_second = prompt_tokens / prompt_seconds
             generation_tokens_per_second = generation_tokens / wall_seconds
         except OverflowError as exc:
             raise ValueError("derived benchmark throughput is outside the supported range") from exc
@@ -617,13 +618,18 @@ class SparkDeckService:
             prompt_tokens_per_second=point["prompt_tokens_per_second"],
             cold_start=False, eligible_for_community=eligible_for_community,
         )
-        consent = bool(await asyncio.to_thread(
-            self.store.get_setting, "community_consent", False,
-        ))
-        await asyncio.to_thread(
-            self.store.add_benchmark, sample,
-            queue=sample.eligible_for_community and consent,
-        )
+        # Keep the consent decision and outbox insertion in the same critical
+        # section as opt-in/withdrawal and outbound uploads. Otherwise a
+        # consent transition can scan or clear the outbox between these two
+        # operations and leave sharing state inconsistent.
+        async with self._community_upload_lock:
+            consent = bool(await asyncio.to_thread(
+                self.store.get_setting, "community_consent", False,
+            ))
+            await asyncio.to_thread(
+                self.store.add_benchmark, sample,
+                queue=sample.eligible_for_community and consent,
+            )
         return point
 
     async def _benchmark_deployment(self, deployment_id: str) -> dict[str, Any]:

@@ -61,6 +61,8 @@ describe('BenchmarksPage community privacy', () => {
     expect(within(dialog).getByRole('img', { name: /^Text generation throughput/ })).toBeInTheDocument()
     expect(within(dialog).getAllByText('C1').length).toBeGreaterThan(0)
     expect(within(dialog).getAllByText('C10').length).toBeGreaterThan(0)
+    expect(dialog.querySelectorAll('.chart-series path').length).toBeGreaterThan(0)
+    expect(dialog.querySelector('polyline')).not.toBeInTheDocument()
     await user.click(within(dialog).getByRole('tab', { name: 'TP 2' }))
     expect(within(dialog).getAllByText('16K context').length).toBeGreaterThan(0)
     expect(within(dialog).queryByText('4K context')).not.toBeInTheDocument()

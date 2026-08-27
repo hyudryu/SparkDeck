@@ -15,6 +15,21 @@ function compactTokens(value: number) {
   return value >= 1024 ? `${Number((value / 1024).toFixed(value >= 10240 ? 0 : 1))}K` : String(value)
 }
 
+function smoothPath(
+  points: BenchmarkSeriesPoint[],
+  metric: BenchmarkLineChartProps['metric'],
+  x: (concurrency: number) => number,
+  y: (value: number) => number,
+) {
+  const coordinates = points.map((point) => ({ x: x(point.concurrency), y: y(point[metric]) }))
+  if (!coordinates.length) return ''
+  return coordinates.slice(1).reduce((path, point, index) => {
+    const previous = coordinates[index]
+    const midpoint = (previous.x + point.x) / 2
+    return `${path} C ${midpoint} ${previous.y}, ${midpoint} ${point.y}, ${point.x} ${point.y}`
+  }, `M ${coordinates[0].x} ${coordinates[0].y}`)
+}
+
 export function BenchmarkLineChart({ title, metric, points }: BenchmarkLineChartProps) {
   const windows = [...new Set(points.map((point) => point.context_window_size))].sort((a, b) => a - b)
   const maximum = Math.max(1, ...points.map((point) => point[metric]))
@@ -47,7 +62,7 @@ export function BenchmarkLineChart({ title, metric, points }: BenchmarkLineChart
             })
             if (segment.length) segments.push(segment)
             return <g className={`chart-series chart-color-${colorIndex % 6}`} key={window}>
-              {segments.filter((items) => items.length > 1).map((items, index) => <polyline key={index} points={items.map((point) => `${x(point.concurrency)},${y(point[metric])}`).join(' ')} />)}
+              {segments.filter((items) => items.length > 1).map((items, index) => <path key={index} d={smoothPath(items, metric, x, y)} />)}
               {[...values.values()].map((point) => <circle key={point.concurrency} cx={x(point.concurrency)} cy={y(point[metric])} r="4"><title>{compactTokens(window)} context, C{point.concurrency}: {point[metric].toFixed(1)} tok/s from {point.sample_count} run{point.sample_count === 1 ? '' : 's'}</title></circle>)}
             </g>
           })}

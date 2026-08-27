@@ -1639,6 +1639,27 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads(instance.recipes_path.read_text())
             self.assertEqual(len(saved), 2)
 
+    async def test_recipe_delete_is_durable_and_clears_transient_launch_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = [{"id": "delete-me"}, {"id": "keep-me"}]
+            instance.recipe_launches = {
+                "delete-me": {"phase": "ready"},
+                "keep-me": {"phase": "starting"},
+            }
+            instance.recipes_path = Path(directory) / "recipes.json"
+
+            self.assertTrue(await instance.delete_recipe("delete-me"))
+            self.assertFalse(await instance.delete_recipe("missing"))
+
+            self.assertEqual(instance.recipes, [{"id": "keep-me"}])
+            self.assertEqual(instance.recipe_launches, {"keep-me": {"phase": "starting"}})
+            self.assertEqual(
+                json.loads(instance.recipes_path.read_text()),
+                [{"id": "keep-me"}],
+            )
+
     def test_hf_cache_mount_uses_image_hf_home(self) -> None:
         instance = Manager.__new__(Manager)
         image = type("Image", (), {

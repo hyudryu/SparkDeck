@@ -315,6 +315,35 @@ export function ModelsPage() {
     })
   }
 
+  const deleteRecipe = async (recipe: SavedConfiguration) => {
+    const label = recipe.name || recipe.model
+    if (!window.confirm(`Delete recipe ${label}? Existing deployments and cached model weights will not be removed.`)) return
+    const busyKey = `recipe-delete:${recipe.id}`
+    setBusy(busyKey)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      await api.recipes.remove(recipe.id)
+      recipes.setData((current) => current?.filter((item) => item.id !== recipe.id))
+      setPinned((current) => {
+        const next = current.filter((id) => id !== recipe.id)
+        localStorage.setItem(PIN_STORAGE_KEY, JSON.stringify(next))
+        return next
+      })
+      setArgsEditors((current) => {
+        const next = { ...current }
+        delete next[recipe.id]
+        return next
+      })
+      if (recipeDeployment?.recipe.id === recipe.id) setRecipeDeployment(undefined)
+      setActionNotice(`Deleted recipe ${label}. Existing deployments and cached model weights were left unchanged.`)
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not delete recipe')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const toggleGroup = (company: string) => {
     setExpandedGroups((current) => current.includes(company)
       ? current.filter((name) => name !== company)
@@ -604,6 +633,7 @@ export function ModelsPage() {
                 const isPinned = pinned.includes(recipe.id)
                 const editor = argsEditors[recipe.id]
                 const isVllm = (recipe.engine || 'vllm') !== 'sglang'
+                const deleting = busy === `recipe-delete:${recipe.id}`
                 return <Panel className="saved-configuration-card" key={recipe.id}>
                   <div className="saved-configuration-heading">
                     <button
@@ -623,8 +653,9 @@ export function ModelsPage() {
                   </dl>
                   {(recipe.error || unavailable) && <p className="saved-configuration-warning">{recipe.error || 'One or more saved nodes are missing, offline, or not ready.'}</p>}
                   <div className="saved-configuration-actions">
-                    <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => openRecipeDeployment(recipe)}><Play size={15} /> Choose nodes &amp; deploy</Button>
-                    <Button variant="tertiary" aria-expanded={editor?.open ?? false} onClick={() => void toggleArgsEditor(recipe)}><Settings2 size={15} /> Arguments</Button>
+                    <Button variant="primary" disabled={disabled || deleting || busy === `recipe:${recipe.id}`} onClick={() => openRecipeDeployment(recipe)}><Play size={15} /> Choose nodes &amp; deploy</Button>
+                    <Button variant="tertiary" disabled={deleting} aria-expanded={editor?.open ?? false} onClick={() => void toggleArgsEditor(recipe)}><Settings2 size={15} /> Arguments</Button>
+                    <Button variant="danger" disabled={deleting} aria-label={`Delete recipe ${recipe.name || recipe.model}`} onClick={() => void deleteRecipe(recipe)}><Trash2 size={15} /> {deleting ? 'Deleting…' : 'Delete'}</Button>
                   </div>
                   {editor?.open && <div className="args-editor">
                     {editor.loading && <p className="field-note">Loading arguments…</p>}

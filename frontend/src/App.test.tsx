@@ -222,6 +222,42 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('deletes a saved recipe without removing deployments or cached weights', async () => {
+    const user = userEvent.setup()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    localStorage.setItem('sparkdeck:pinned-recipes', JSON.stringify(['recipe-1']))
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/recipes/recipe-1') && init?.method === 'DELETE') {
+        return new Response(null, { status: 204 })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(screen.getByRole('button', { name: 'Delete recipe Saved cluster' }))
+
+    expect(confirm).toHaveBeenCalledWith('Delete recipe Saved cluster? Existing deployments and cached model weights will not be removed.')
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-1', expect.objectContaining({ method: 'DELETE' }),
+    ))
+    expect(screen.queryByText('Saved cluster')).not.toBeInTheDocument()
+    expect(screen.getByText('Running model')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Deleted recipe Saved cluster. Existing deployments and cached model weights were left unchanged.')
+    expect(localStorage.getItem('sparkdeck:pinned-recipes')).toBe('[]')
+  })
+
   it('shows exact replicated disk usage and deploys legacy saved configurations', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3

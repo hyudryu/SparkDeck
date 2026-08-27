@@ -6726,6 +6726,7 @@ class Manager:
             before = len(self.recipes)
             self.recipes = [r for r in self.recipes if r.get("id") != rid]
             if len(self.recipes) < before:
+                self.recipe_launches.pop(rid, None)
                 self._save_recipes()
                 return True
         return False

@@ -789,6 +789,21 @@ async def agent_apply_community_unpairing(req: Request):
     return {"applied": True}
 
 
+@app.put("/api/agent/community-consent")
+async def agent_apply_community_consent(req: Request):
+    """Apply controller-owned sharing consent on this worker."""
+    _require_agent(req)
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be a boolean")
+    await sparkdeck.set_community_consent(enabled)
+    return {"applied": True, "enabled": enabled}
+
+
 @app.get("/api/agent/llama-rpc")
 async def agent_llama_rpc_status(req: Request):
     _require_agent(req)
@@ -2009,7 +2024,7 @@ async def v1_benchmarks(limit: int = 100, offset: int = 0):
 
 @app.delete("/api/v1/benchmarks/{sample_id}")
 async def v1_delete_benchmark(sample_id: str):
-    if not sparkdeck.store.delete_benchmark(sample_id):
+    if not await sparkdeck.delete_benchmark(sample_id):
         raise HTTPException(404, "benchmark sample not found")
     return {"ok": True, "id": sample_id}
 
@@ -2093,7 +2108,10 @@ async def v1_community_consent(req: Request):
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
     await sparkdeck.set_community_consent(enabled)
-    return _community_sync_status()
+    cluster = await manager.push_community_consent(enabled)
+    status = _community_sync_status()
+    status["cluster"] = cluster
+    return status
 
 
 @app.post("/api/v1/community/retry")
@@ -2287,14 +2305,22 @@ async def community_upload_once() -> dict:
     synced: list[str] = []
     failed: list[str] = []
     for entry in batch:
-        sample_id, payload = entry["sample_id"], entry["payload"]
-        response = await _post_community_sample(api_url, id_token, payload)
+        sample_id = entry["sample_id"]
+        # The batch is only a scheduling snapshot. Deletion, consent
+        # withdrawal, or another queue transition may have removed the row
+        # before this sample's turn; re-read it at the outbound boundary.
+        current = store.outbox_entry(sample_id)
+        if current is None:
+            continue
+        response = await _post_community_sample(
+            api_url, id_token, current["payload"])
         if response is not None and response.status_code == 401:
             # The cached token expired early; mint once and retry this sample.
             id_token = await _community_id_token(refresh_token, force=True)
             if not id_token:
                 break
-            response = await _post_community_sample(api_url, id_token, payload)
+            response = await _post_community_sample(
+                api_url, id_token, current["payload"])
         if response is None:
             continue  # transient transport error: leave pending
         if response.status_code in (200, 201):

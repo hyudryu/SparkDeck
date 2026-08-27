@@ -434,6 +434,28 @@ class SparkDeckStore:
             for sample_id in wanted if sample_id in by_id
         ]
 
+    def outbox_entry(
+        self, sample_id: str, now: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Re-read one currently uploadable sample at the outbound boundary."""
+        now = now or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT benchmark_samples.*
+                   FROM upload_outbox
+                   JOIN benchmark_samples
+                     ON benchmark_samples.id = upload_outbox.sample_id
+                   WHERE upload_outbox.sample_id = ?
+                     AND (upload_outbox.status = 'pending'
+                       OR (upload_outbox.status = 'failed'
+                         AND (upload_outbox.next_attempt_at IS NULL
+                           OR upload_outbox.next_attempt_at <= ?)))""",
+                (sample_id, now),
+            ).fetchone()
+        if row is None or (payload := _upload_row(row)) is None:
+            return None
+        return {"sample_id": sample_id, "payload": payload}
+
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
         if not sample_ids:
             return 0

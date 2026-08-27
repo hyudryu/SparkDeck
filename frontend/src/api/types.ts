@@ -233,6 +233,8 @@ export interface SyncStatus {
   failed_count: number
   last_sync_at?: string | null
   last_error?: string | null
+  /** Joined nodes that did not apply the latest consent change. */
+  cluster_errors?: string[]
 }
 
 export interface ContainerImage {

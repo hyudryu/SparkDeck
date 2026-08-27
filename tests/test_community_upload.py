@@ -278,6 +278,32 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outbox["failed"], 1)
         self.assertEqual(outbox["pending"], 0)
 
+    async def test_deleted_queued_sample_is_rechecked_before_its_turn(self):
+        self.configure()
+        self.store.add_benchmark(_sample("sample-1"), queue=True)
+        self.store.add_benchmark(_sample("sample-2"), queue=True)
+
+        def route(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if "cognito-idp" in str(request.url):
+                return httpx.Response(200, json={
+                    "AuthenticationResult": {
+                        "IdToken": "id-1", "ExpiresIn": 3600,
+                    },
+                })
+            # Deleting after the batch snapshot must stop the second upload.
+            self.store.delete_benchmark("sample-2")
+            return httpx.Response(201, json={"accepted": True})
+
+        http = _stub_http(self, route)
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 1, "failed": 0})
+        self.assertEqual(len(self.sample_requests()), 1)
+        self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
+
     async def test_consent_off_is_a_noop(self):
         self.configure(consent=False)
         self.store.add_benchmark(_sample(), queue=True)

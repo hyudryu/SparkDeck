@@ -280,6 +280,10 @@ class SparkDeckService:
     async def set_community_consent(self, enabled: bool) -> None:
         await asyncio.to_thread(self.store.set_community_consent, enabled)
 
+    async def delete_benchmark(self, sample_id: str) -> bool:
+        """Delete a sample; the uploader re-reads the outbox before sending."""
+        return await asyncio.to_thread(self.store.delete_benchmark, sample_id)
+
     async def unpair_community_device(
         self, expected_sub: str,
     ) -> tuple[str, dict[str, Any]]:

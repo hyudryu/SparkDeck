@@ -1,7 +1,7 @@
 import threading
 import time
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 import jwt as pyjwt
@@ -364,6 +364,46 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(no_consent.status_code, 403)
         aggregate.assert_not_awaited()
 
+    async def test_consent_changes_propagate_and_surface_cluster_failures(self):
+        cluster_result = {
+            "applied": ["Spark Two"],
+            "conflicts": [],
+            "errors": ["Spark Three: unreachable"],
+        }
+        with (
+            patch.object(
+                server.sparkdeck, "set_community_consent", AsyncMock(),
+            ) as set_consent,
+            patch.object(
+                server.manager, "push_community_consent",
+                AsyncMock(return_value=cluster_result),
+            ) as push_consent,
+            patch.object(
+                server, "_community_sync_status",
+                return_value={"consent": False, "pairing": {"status": "paired"}},
+            ),
+        ):
+            enabled = await self.client.put(
+                "/api/v1/community/consent", json={"enabled": True},
+            )
+            disabled = await self.client.put(
+                "/api/v1/community/consent", json={"enabled": False},
+            )
+
+        self.assertEqual(enabled.status_code, 200)
+        self.assertEqual(disabled.status_code, 200)
+        self.assertEqual(disabled.json(), {
+            "consent": False,
+            "pairing": {"status": "paired"},
+            "cluster": cluster_result,
+        })
+        self.assertEqual(
+            set_consent.await_args_list, [call(True), call(False)],
+        )
+        self.assertEqual(
+            push_consent.await_args_list, [call(True), call(False)],
+        )
+
 
 class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
     """The agent endpoint applies controller pushes without overriding."""
@@ -509,6 +549,38 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.set_setting.assert_not_called()
 
+    async def test_consent_enable_and_withdrawal_use_the_shared_service_setter(self):
+        with patch.object(
+            server.sparkdeck, "set_community_consent", AsyncMock(),
+        ) as set_consent:
+            enabled = await self.client.put(
+                "/api/agent/community-consent", json={"enabled": True},
+            )
+            disabled = await self.client.put(
+                "/api/agent/community-consent", json={"enabled": False},
+            )
+
+        self.assertEqual(
+            enabled.json(), {"applied": True, "enabled": True},
+        )
+        self.assertEqual(
+            disabled.json(), {"applied": True, "enabled": False},
+        )
+        self.assertEqual(
+            set_consent.await_args_list, [call(True), call(False)],
+        )
+
+    async def test_agent_consent_requires_a_boolean(self):
+        with patch.object(
+            server.sparkdeck, "set_community_consent", AsyncMock(),
+        ) as set_consent:
+            response = await self.client.put(
+                "/api/agent/community-consent", json={"enabled": "false"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        set_consent.assert_not_awaited()
+
 
 class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
     """The controller merges per-node results without failing the request."""
@@ -574,6 +646,31 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
         result = await instance.push_community_pairing("user-sub-123", None)
 
         self.assertEqual(result, {"applied": [], "conflicts": [], "errors": []})
+
+    async def test_consent_withdrawal_reaches_all_joined_nodes_and_reports_failures(self):
+        request = AsyncMock(side_effect=[
+            {"applied": True, "enabled": False},
+            RuntimeError("unreachable"),
+        ])
+        nodes = self.nodes("Spark Two", "Spark Disabled")
+        nodes[1]["enabled"] = False
+        instance = self.manager_with_nodes(nodes, request)
+
+        result = await instance.push_community_consent(False)
+
+        self.assertEqual(result, {
+            "applied": ["Spark Two"],
+            "conflicts": [],
+            "errors": ["Spark Disabled: unreachable"],
+        })
+        self.assertEqual(request.await_count, 2)
+        for node_id, item in zip(("node-1", "node-2"), request.await_args_list):
+            self.assertEqual(item.args[:3], (
+                node_id, "PUT", "/api/agent/community-consent",
+            ))
+            self.assertEqual(item.kwargs["json_body"], {"enabled": False})
+            self.assertEqual(item.kwargs["timeout"], 20)
+            self.assertTrue(item.kwargs["allow_disabled"])
 
 
 if __name__ == "__main__":

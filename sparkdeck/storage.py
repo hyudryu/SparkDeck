@@ -35,18 +35,33 @@ COMMUNITY_API_URL = os.environ.get(
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
 
 
+def _restrict_permissions(path: Path, mode: int) -> None:
+    """Best-effort owner-only permissions; Windows has no POSIX modes."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
 class SparkDeckStore:
     """Small synchronous store; operations are short and serialized locally."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_permissions(self.path.parent, 0o700)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._migrate()
+        # The store holds the community refresh token; keep it owner-only.
+        _restrict_permissions(self.path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.exists():
+                _restrict_permissions(sidecar, 0o600)
 
     def close(self) -> None:
         with self._lock:
@@ -753,9 +768,11 @@ class SparkDeckStore:
         pairing = self.get_setting("device_pairing", {"status": "not_paired"})
         return {
             "consent": bool(self.get_setting("community_consent", False)),
-            # Account claims and upload credentials are private service state.
+            # Account claims and upload credentials are private service state;
+            # only the status and a re-authentication flag leave the store.
             "pairing": {
                 "status": "paired" if pairing.get("status") == "paired" else "not_paired",
+                "token_invalid": bool(pairing.get("token_invalid")),
             },
             "outbox": {
                 "pending": counts.get("pending", 0),

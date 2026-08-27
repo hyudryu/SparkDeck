@@ -134,7 +134,12 @@ export function BenchmarksPage() {
       />}
       {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
       {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
-      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
+      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.availability === 'unavailable' && <EmptyState
+        title="Community service unavailable"
+        description="The hosted community service could not be reached. Your local benchmarks are unaffected — try again later."
+        action={<Button variant="secondary" onClick={aggregates.reload}>Retry</Button>}
+      />}
+      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.availability !== 'unavailable' && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
       {communityAccess.enabled && aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
         <Panel className="aggregate-item" key={`${item.model_id}-${item.context_window_size}`}>
           <div><p className="aggregate-model">{item.model_id}</p><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>

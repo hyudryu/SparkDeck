@@ -251,6 +251,7 @@ function CommunitySignInForm() {
 
 export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
+  const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const auth = useAuth()
   const [form, setForm] = useState<AppSettings>({ theme: storedTheme() })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
@@ -379,6 +380,7 @@ export function SettingsPage() {
           <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to access community data. Benchmark sharing remains off until you explicitly enable it.</p></div></div>
           <div className="settings-fields">
             <p className="muted wide-field">Connected to the SparkDeck community service.</p>
+            {communitySync.data?.token_invalid && <p className="form-error wide-field" role="alert">Your community session expired on this node — sign in again to resume sharing.</p>}
             {auth.status === 'restoring'
               ? <p className="muted wide-field" role="status">Restoring community session…</p>
               : auth.status === 'signed-in'

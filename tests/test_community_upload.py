@@ -159,6 +159,29 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             return await self.client.get(
                 "/api/v1/community/aggregates", headers=_bearer())
 
+    async def test_malformed_upstream_payload_reports_unavailable(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "items": [{
+                    "model_id": "org/model",
+                    "context_window_size": "4096",
+                    "inference_tokens_per_second": 42.5,
+                    "sample_count": 12,
+                }],
+                "availability": "ok",
+                "evidence_policy": {"minimum_samples": 10},
+            })
+
+        http = _stub_http(self, handler)
+        self.addAsyncCleanup(http.aclose)
+
+        response = await self.client.get(
+            "/api/v1/community/aggregates", headers=_bearer())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["availability"], "unavailable")
+        self.assertEqual(response.json()["items"], [])
+
     async def test_upstream_outage_reports_unavailable(self):
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("down", request=request)
@@ -188,6 +211,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         server._community_token_cache.update({
             "refresh_token": None, "id_token": None, "expires_at": 0.0,
         })
+        server._community_upload_not_before = 0.0
 
     async def asyncTearDown(self):
         self.api_url_patch.stop()
@@ -197,6 +221,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         server._community_token_cache.update({
             "refresh_token": None, "id_token": None, "expires_at": 0.0,
         })
+        server._community_upload_not_before = 0.0
 
     def configure(self, consent=True, paired=True):
         self.store.set_setting("community_consent", consent)
@@ -242,6 +267,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
             str(uploads[0].url), "https://community.example/v1/samples")
         self.assertEqual(
             uploads[0].headers["authorization"], "Bearer id-1")
+        self.assertEqual(uploads[0].headers["idempotency-key"], "sample-1")
         self.assertEqual(json.loads(uploads[0].content), {
             "model_id": "org/model",
             "context_window_size": 4096,
@@ -363,6 +389,134 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, "id-1")
         self.assertEqual(second, "id-1")
         self.assertEqual(len(self.idp_requests()), 1)
+
+    async def test_any_2xx_marks_the_sample_synced(self):
+        self.configure()
+        self.store.add_benchmark(_sample(), queue=True)
+        http = _stub_http(self, self.handler(
+            sample_response=lambda request: httpx.Response(202),
+        ))
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 1, "failed": 0})
+        self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
+
+    async def test_persistent_401_after_refresh_breaks_the_batch(self):
+        self.configure()
+        self.store.add_benchmark(_sample("sample-1"), queue=True)
+        self.store.add_benchmark(_sample("sample-2"), queue=True)
+        http = _stub_http(self, self.handler(
+            sample_response=lambda request: httpx.Response(401),
+        ))
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 0, "failed": 0})
+        # One attempt + one refreshed retry on the first sample, then stop.
+        self.assertEqual(len(self.sample_requests()), 2)
+        self.assertEqual(len(self.idp_requests()), 2)
+        self.assertEqual(self.store.sync_status()["outbox"]["pending"], 2)
+
+    async def test_consent_withdrawal_mid_batch_stops_uploading(self):
+        self.configure()
+        self.store.add_benchmark(_sample("sample-1"), queue=True)
+        self.store.add_benchmark(_sample("sample-2"), queue=True)
+
+        def withdraw_consent(request: httpx.Request) -> httpx.Response:
+            self.store.set_setting("community_consent", False)
+            return httpx.Response(201, json={"accepted": True})
+
+        http = _stub_http(self, self.handler(sample_response=withdraw_consent))
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 1, "failed": 0})
+        self.assertEqual(len(self.sample_requests()), 1)
+        # The second sample was never sent after consent flipped.
+        self.assertFalse(
+            self.store.sync_status()["consent"])
+
+    async def test_pairing_change_mid_batch_stops_uploading(self):
+        self.configure()
+        self.store.add_benchmark(_sample("sample-1"), queue=True)
+        self.store.add_benchmark(_sample("sample-2"), queue=True)
+
+        def unpair(request: httpx.Request) -> httpx.Response:
+            self.store.set_setting("device_pairing", {"status": "not_paired"})
+            return httpx.Response(201, json={"accepted": True})
+
+        http = _stub_http(self, self.handler(sample_response=unpair))
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 1, "failed": 0})
+        self.assertEqual(len(self.sample_requests()), 1)
+
+    async def test_429_pauses_uploads_until_retry_after(self):
+        self.configure()
+        self.store.add_benchmark(_sample(), queue=True)
+        http = _stub_http(self, self.handler(
+            sample_response=lambda request: httpx.Response(
+                429, headers={"Retry-After": "120"}),
+        ))
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result, {"uploaded": 0, "failed": 0})
+        outbox = self.store.sync_status()["outbox"]
+        self.assertEqual(outbox["pending"], 1)
+        self.assertEqual(outbox["failed"], 0)
+
+        # The next tick honors Retry-After without contacting the service.
+        paused = await server.community_upload_once()
+        self.assertEqual(paused["reason"], "rate_limited")
+        self.assertEqual(len(self.sample_requests()), 1)
+
+    async def test_invalid_api_url_is_treated_as_unconfigured(self):
+        self.configure()
+        self.store.add_benchmark(_sample(), queue=True)
+        self.api_url_patch.stop()
+        bad_url = patch.object(server, "COMMUNITY_API_URL", "http://community.example")
+        bad_url.start()
+        self.addCleanup(bad_url.stop)
+        http = _stub_http(self, self.handler())
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result["reason"], "not_configured")
+        self.assertEqual(self.sample_requests(), [])
+
+    async def test_rejected_refresh_token_flags_pairing_and_stops_retries(self):
+        self.configure()
+        self.store.add_benchmark(_sample(), queue=True)
+
+        def rejected(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(400, json={"__type": "NotAuthorizedException"})
+
+        http = _stub_http(self, rejected)
+        self.addAsyncCleanup(http.aclose)
+
+        result = await server.community_upload_once()
+
+        self.assertEqual(result["reason"], "token_unavailable")
+        pairing = self.store.get_setting("device_pairing", {})
+        self.assertTrue(pairing["token_invalid"])
+        self.assertTrue(
+            self.store.sync_status()["pairing"]["token_invalid"])
+
+        # Later ticks stop before contacting Cognito again.
+        self.requests.clear()
+        second = await server.community_upload_once()
+        self.assertEqual(second["reason"], "token_invalid")
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

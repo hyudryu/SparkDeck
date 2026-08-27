@@ -1541,16 +1541,18 @@ class Manager:
         return _community_pairing_fanout(nodes, results)
 
     async def push_community_unpair(self, sub: str) -> dict:
-        """Best-effort fan-out of a community sign-out to every enabled peer."""
-        nodes = [
-            node for node in self.node_registry.nodes
-            if node.get("enabled", True)
-        ]
+        """Best-effort fan-out of a community sign-out to every joined peer.
+
+        Disabled nodes still hold the shared refresh token, so unpairing must
+        reach them even though normal workload operations skip them.
+        """
+        nodes = list(self.node_registry.nodes)
         results = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "DELETE", "/api/agent/community-pairing",
                 json_body={"sub": sub},
                 timeout=5,
+                allow_disabled=True,
             )
             for node in nodes
         ), return_exceptions=True)

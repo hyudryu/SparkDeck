@@ -185,6 +185,29 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.push_pair.assert_awaited_once_with(
             "user-sub-123", "user@example.com", "refresh-secret-1")
 
+    async def test_repair_without_refresh_token_retains_the_stored_one(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-stored",
+            "token_invalid": True,
+        }
+
+        response = await self.client.post(
+            "/api/v1/community/pair", json={"id_token": _id_token()})
+
+        self.assertEqual(response.status_code, 200)
+        # The stored token survives an id-token-only re-pair, and a fresh
+        # pairing record clears a stale token_invalid flag.
+        self.set_setting.assert_called_once_with("device_pairing", {
+            "status": "paired",
+            "sub": "user-sub-123",
+            "email": "user@example.com",
+            "refresh_token": "refresh-stored",
+        })
+        self.assertNotIn("refresh-stored", response.text)
+        self.push_pair.assert_awaited_once_with(
+            "user-sub-123", "user@example.com", "refresh-stored")
+
     async def test_pairing_rejects_a_non_string_refresh_token(self):
         response = await self.client.post(
             "/api/v1/community/pair",
@@ -487,6 +510,22 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.set_setting.assert_not_called()
         self.promote.assert_called_once_with()
 
+    async def test_same_account_pairing_merges_a_rotated_refresh_token(self):
+        self.pair_locally()
+
+        response = await self.client.put(
+            "/api/agent/community-pairing",
+            json={"sub": "user-sub-123", "email": "user@example.com",
+                  "refresh_token": "refresh-rotated"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"applied": True, "already": True})
+        self.set_setting.assert_called_once_with("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-rotated",
+        })
+        self.assertNotIn("refresh-rotated", response.text)
+
     async def test_different_account_pairing_is_refused(self):
         self.pair_locally()
 
@@ -626,7 +665,7 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
             "refresh_token": "refresh-1",
         })
 
-    async def test_unpair_fanout_skips_disabled_nodes(self):
+    async def test_unpair_fanout_reaches_disabled_nodes(self):
         request = AsyncMock(return_value={"applied": True})
         nodes = self.nodes("Spark Two") + [
             {"id": "node-off", "name": "Spark Off", "enabled": False},
@@ -635,14 +674,16 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
 
         result = await instance.push_community_unpair("user-sub-123")
 
+        # Disabled nodes still hold the shared refresh token, so the sign-out
+        # fan-out must reach them too.
         self.assertEqual(result, {
-            "applied": ["Spark Two"], "conflicts": [], "errors": [],
+            "applied": ["Spark Two", "Spark Off"], "conflicts": [], "errors": [],
         })
-        request.assert_awaited_once()
-        self.assertEqual(request.await_args.args[:3], (
-            "node-1", "DELETE", "/api/agent/community-pairing"))
-        self.assertEqual(
-            request.await_args.kwargs["json_body"], {"sub": "user-sub-123"})
+        self.assertEqual(request.await_count, 2)
+        for call in request.await_args_list:
+            self.assertEqual(call.args[1:], ("DELETE", "/api/agent/community-pairing"))
+            self.assertEqual(call.kwargs["json_body"], {"sub": "user-sub-123"})
+            self.assertTrue(call.kwargs["allow_disabled"])
 
     async def test_no_peers_reports_empty_result(self):
         instance = self.manager_with_nodes([], AsyncMock())

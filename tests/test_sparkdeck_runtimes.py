@@ -116,3 +116,28 @@ class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 extra = manager.create_container.await_args.kwargs["extra_args"]
                 self.assertEqual(extra[extra.index("--revision") + 1], "revision-abc")
+
+    async def test_llama_bridge_uses_durable_managed_create(self):
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "model.gguf"
+            artifact.touch()
+            container = Mock()
+            container.reload = Mock()
+            manager = Mock()
+            manager.settings = {"shm_size": "16g"}
+            manager.evict_other_backends = AsyncMock()
+            manager._allocate_port = AsyncMock(return_value=8100)
+            manager._run_managed_container = Mock(return_value=container)
+            manager._container_summary = Mock(return_value={
+                "name": "sparkdeck-llama-dep-1", "port": 8100,
+            })
+            manager.client.images.get = Mock()
+
+            await launch_managed_container(
+                manager, LlamaCppAdapter(), "dep-1", "llama", "org/model",
+                {"artifact": str(artifact)},
+            )
+
+        options = manager._run_managed_container.call_args.args[0]
+        self.assertEqual(options["labels"]["io.sparkdeck.managed"], "1")
+        self.assertEqual(options["labels"]["io.sparkdeck.deployment"], "dep-1")

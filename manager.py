@@ -37,6 +37,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
 from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
+from sparkdeck.workload_ownership import ManagedWorkloadLedger
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -534,6 +535,7 @@ class Manager:
         # Keep construction non-blocking so a hung Docker Desktop cannot delay
         # the controller UI from binding and serving its liveness endpoint.
         self.client = _RetryingDockerClient()
+        self.managed_workload_ledger = ManagedWorkloadLedger(self.data_dir)
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.lock = asyncio.Lock()
@@ -7406,13 +7408,25 @@ class Manager:
 
     async def list_containers(self) -> list[dict]:
         def _run():
-            out = []
-            for c in self.client.containers.list(all=True):
-                summary = self._container_summary(c)
-                if summary:
-                    out.append(summary)
-            out.sort(key=lambda x: (x["status"] != "running", x["name"]))
-            return out
+            def inventory():
+                out = []
+                for c in self.client.containers.list(all=True):
+                    summary = self._container_summary(c)
+                    if summary:
+                        out.append(summary)
+                out.sort(key=lambda x: (x["status"] != "running", x["name"]))
+                return out
+
+            ledger = getattr(self, "managed_workload_ledger", None)
+            if ledger is None:
+                return inventory()
+            with ledger.locked():
+                out = inventory()
+                ledger.reconcile({
+                    container["name"]: container.get("deployment_id")
+                    for container in out if container.get("managed")
+                })
+                return out
         containers = await asyncio.to_thread(_run)
         # Attach setup phase (health/log-derived) in parallel.
         if containers:
@@ -7425,6 +7439,40 @@ class Manager:
                     "phase": "unknown", "progress": None, "message": str(ph),
                 }
         return containers
+
+    def _run_managed_container(self, run_options: dict[str, Any]):
+        """Claim ownership before Docker create and retain ambiguous failures."""
+        name = str(run_options.get("name") or "").strip()
+        labels = run_options.get("labels") or {}
+        deployment_id = _label_value(labels, DEPLOYMENT_LABEL, "") or None
+        ledger = getattr(self, "managed_workload_ledger", None)
+        if ledger is None:
+            return self.client.containers.run(**run_options)
+        with ledger.locked():
+            ledger.claim(name, deployment_id)
+            try:
+                container = self.client.containers.run(**run_options)
+            except Exception:
+                try:
+                    existing = self.client.containers.get(name)
+                except docker.errors.NotFound:
+                    ledger.release(name)
+                except Exception:
+                    # Docker cannot prove whether create succeeded. Retain the
+                    # pending claim so onboarding cannot orphan the workload.
+                    pass
+                else:
+                    existing_labels = existing.labels or {}
+                    if _label_value(existing_labels, CONTROLLER_LABEL) == "1":
+                        ledger.confirm(
+                            name,
+                            _label_value(existing_labels, DEPLOYMENT_LABEL, "") or deployment_id,
+                        )
+                    else:
+                        ledger.release(name)
+                raise
+            ledger.confirm(name, deployment_id)
+            return container
 
     # ---------- setup phase ----------
     _RE_LOAD_SHARDS = re.compile(
@@ -7700,7 +7748,7 @@ class Manager:
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
-                container = self.client.containers.run(**run_options)
+                container = self._run_managed_container(run_options)
                 container.reload()
                 self._cluster_launch_update(
                     name, "starting", "Container created; starting the model server",
@@ -7857,7 +7905,7 @@ class Manager:
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
-                container = self.client.containers.run(**run_options)
+                container = self._run_managed_container(run_options)
                 container.reload()
                 self._cluster_launch_update(
                     name, "starting", "Container created; starting the model server",
@@ -8091,31 +8139,47 @@ class Manager:
             create_config["HostConfig"] = copy.deepcopy(attrs.get("HostConfig") or {})
 
             def _replace():
-                backup = container
-                if was_running:
-                    backup.stop(timeout=30)
-                backup.rename(backup_name)
-                try:
-                    created = self.client.api.create_container_from_config(
-                        create_config, name=name
-                    )
-                    replacement = self.client.containers.get(created["Id"])
+                ledger = getattr(self, "managed_workload_ledger", None)
+                managed = _label_value(labels, CONTROLLER_LABEL) == "1"
+                deployment_id = _label_value(labels, DEPLOYMENT_LABEL, "") or None
+
+                def replace_locked():
+                    if ledger is not None and managed:
+                        ledger.claim(name, deployment_id)
+                    backup = container
                     if was_running:
-                        replacement.start()
-                    replacement.reload()
-                    summary = self._container_summary(replacement)
-                    backup.remove(force=True)
-                    return summary
-                except Exception:
+                        backup.stop(timeout=30)
+                    backup.rename(backup_name)
                     try:
-                        self.client.containers.get(name).remove(force=True)
+                        created = self.client.api.create_container_from_config(
+                            create_config, name=name
+                        )
+                        replacement = self.client.containers.get(created["Id"])
+                        if was_running:
+                            replacement.start()
+                        replacement.reload()
+                        summary = self._container_summary(replacement)
+                        backup.remove(force=True)
+                        if ledger is not None and managed:
+                            ledger.confirm(name, deployment_id)
+                        return summary
                     except Exception:
-                        pass
-                    backup = self.client.containers.get(backup_name)
-                    backup.rename(name)
-                    if was_running:
-                        backup.start()
-                    raise
+                        try:
+                            self.client.containers.get(name).remove(force=True)
+                        except Exception:
+                            pass
+                        backup = self.client.containers.get(backup_name)
+                        backup.rename(name)
+                        if was_running:
+                            backup.start()
+                        if ledger is not None and managed:
+                            ledger.confirm(name, deployment_id)
+                        raise
+
+                if ledger is None or not managed:
+                    return replace_locked()
+                with ledger.locked():
+                    return replace_locked()
 
             summary = await asyncio.to_thread(_replace)
             return {"ok": True, "container": summary}
@@ -8126,7 +8190,7 @@ class Manager:
             return _label_value(container.labels or {}, CONTROLLER_LABEL) == "1"
         try:
             return await asyncio.to_thread(_check)
-        except Exception:
+        except docker.errors.NotFound:
             return False
 
     async def stop_container(self, name: str) -> dict:
@@ -8153,7 +8217,17 @@ class Manager:
 
     async def remove_container(self, name: str) -> dict:
         def _do():
-            self.client.containers.get(name).remove(force=True)
+            ledger = getattr(self, "managed_workload_ledger", None)
+            if ledger is None:
+                self.client.containers.get(name).remove(force=True)
+                return
+            with ledger.locked():
+                try:
+                    self.client.containers.get(name).remove(force=True)
+                except docker.errors.NotFound:
+                    ledger.release(name)
+                    raise
+                ledger.release(name)
         await asyncio.to_thread(_do)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
         aliases = getattr(self, "container_aliases", {})

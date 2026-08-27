@@ -455,6 +455,26 @@ class SparkDeckStoreTests(unittest.TestCase):
             "concurrency": 5, "tensor_parallel_size": 2,
         }])
 
+    def test_upload_omits_tp_for_ordinary_sample_without_concurrency(self):
+        sample = BenchmarkSample(
+            id="ordinary-tp", created_at="2026-08-27T00:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={"context_length": 16384, "tensor_parallel_size": 4},
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=50, prompt_tokens_per_second=100,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.add_benchmark(sample, queue=True)
+
+        local, _ = self.store.benchmarks()
+        self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
+        self.assertEqual(self.store.outbox_batch(), [{
+            "model_id": "org/model", "context_window_size": 16384,
+            "inference_tokens_per_second": 50.0,
+        }])
+
     def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
         sample = BenchmarkSample(
             id="eligible-1", created_at="2026-08-25T00:00:00+00:00",

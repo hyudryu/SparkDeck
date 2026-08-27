@@ -163,12 +163,19 @@ describe('BenchmarksPage community privacy', () => {
     expect(communityAccess.reload).toHaveBeenCalled()
   })
 
-  it('refreshes local aggregates after deleting a contributing benchmark', async () => {
+  it('refreshes model summaries and local aggregates after deleting a contributing benchmark', async () => {
     let deleted = false
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       let body: unknown
-      if (path.includes('/api/v1/benchmarks')) {
+      if (path.endsWith('/api/v1/benchmark-models')) {
+        body = { items: deleted ? [] : [{
+          model_id: 'org/model', run_count: 1,
+          best_prompt_tokens_per_second: 100, best_generation_tokens_per_second: 42.5,
+          context_windows: [8192], tensor_parallel_sizes: [1],
+          latest_at: '2026-08-26T00:00:00Z',
+        }] }
+      } else if (path.includes('/api/v1/benchmarks')) {
         if (init?.method === 'DELETE') {
           deleted = true
           body = { ok: true }
@@ -198,9 +205,14 @@ describe('BenchmarksPage community privacy', () => {
 
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
+    const modelList = await screen.findByLabelText('Benchmarked models')
+    const explorerModel = within(modelList).getByRole('button', { name: /org\/model/ })
+    expect(explorerModel).toBeInTheDocument()
     expect((await screen.findAllByText('42.5 tok/s')).length).toBeGreaterThan(0)
     await user.click(screen.getByRole('button', { name: 'Delete benchmark for org/model' }))
 
+    expect(await screen.findByText('No coordinated benchmark runs yet')).toBeInTheDocument()
+    expect(explorerModel).not.toBeInTheDocument()
     expect(await screen.findByText('No community estimates yet')).toBeInTheDocument()
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
   })

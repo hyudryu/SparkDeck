@@ -31,6 +31,7 @@ class FakeManager:
         self.agent_credentials = AgentCredentials(data_dir)
         self.settings = {"cluster_node_name": "Spark Worker"}
         self.node_registry = Mock()
+        self.node_registry.nodes = []
         self.node_registry.set_forward_token = Mock()
         self.node_registry.accepts_forward_token = Mock(return_value=True)
         self.node_registry.remove = Mock(return_value=True)
@@ -476,6 +477,34 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [])
         await http.aclose()
 
+    async def test_join_rejects_nested_cluster_members_before_contacting_controller(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.node_registry.nodes = [{
+            "id": "9a3b4cf7195a41789b2414607d5c6cdc",
+            "name": "DESKTOP-6LLJ99Q",
+        }]
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "moves only this machine.*DESKTOP-6LLJ99Q|DESKTOP-6LLJ99Q.*moves only this machine",
+        ):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        await http.aclose()
+
     async def test_status_prefers_tailscale_and_never_exposes_credentials(self):
         manager = FakeManager(self.root)
         service = OnboardingService(manager, self.root)
@@ -611,6 +640,24 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             "old_agent_revoked": False,
         })
         await http.aclose()
+
+    async def test_authenticated_detach_revokes_credentials_and_makes_worker_controller(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        detached = await service.detach()
+
+        self.assertEqual(detached, {"ok": True, "role": "controller", "revoked": True})
+        self.assertIsNone(service.assignment.load())
+        self.assertFalse(manager.agent_credentials.accepts_token(old_token))
+        manager.adopt_controller_role.assert_called_once()
+        await manager.http.aclose()
 
     async def test_offline_controller_cannot_prevent_durable_local_leave(self):
         def handler(request: httpx.Request) -> httpx.Response:

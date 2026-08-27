@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 from urllib.parse import urlsplit
@@ -185,6 +186,9 @@ COGNITO_ISSUER = os.environ.get(
 # The browser calls the Cognito IDP API at the issuer's origin; the CSP must
 # permit that connection when SparkDeck serves the app.
 COGNITO_IDP_ORIGIN = urlsplit(COGNITO_ISSUER)._replace(path="", query="", fragment="").geturl()
+_COMMUNITY_SESSION_COOKIE = "sparkdeck_community_session"
+_COMMUNITY_SESSION_MAX_AGE = 3600
+_community_browser_sessions: dict[str, tuple[str, float]] = {}
 
 
 @app.middleware("http")
@@ -807,6 +811,7 @@ async def agent_apply_community_unpairing(req: Request):
         return {"applied": True, "already": True}
     if result == "conflict":
         return {"applied": False, "existing": {"email": existing.get("email")}}
+    _clear_community_browser_sessions(sub)
     return {"applied": True}
 
 
@@ -2113,13 +2118,54 @@ async def _verified_community_claims(req: Request) -> dict:
         raise HTTPException(401, "id_token could not be verified") from exc
 
 
-def _require_matching_community_pairing(claims: dict) -> dict:
-    pairing = sparkdeck.store.get_setting(
-        "device_pairing", {"status": "not_paired"},
-    )
-    if pairing.get("status") != "paired" or pairing.get("sub") != claims.get("sub"):
-        raise HTTPException(403, "this account is not paired with the node")
-    return pairing
+def _prune_community_browser_sessions() -> None:
+    now = time.time()
+    expired = [
+        token for token, (_, expires_at) in _community_browser_sessions.items()
+        if expires_at <= now
+    ]
+    for token in expired:
+        _community_browser_sessions.pop(token, None)
+
+
+def _clear_community_browser_sessions(sub: str) -> None:
+    for token, (session_sub, _) in list(_community_browser_sessions.items()):
+        if session_sub == sub:
+            _community_browser_sessions.pop(token, None)
+
+
+def _community_session_response(
+    req: Request, body: dict, sub: str | None = None,
+) -> JSONResponse:
+    response = JSONResponse(body, headers={"Cache-Control": "no-store"})
+    if sub:
+        _prune_community_browser_sessions()
+        token = secrets.token_urlsafe(32)
+        _community_browser_sessions[token] = (
+            sub, time.time() + _COMMUNITY_SESSION_MAX_AGE,
+        )
+        response.set_cookie(
+            _COMMUNITY_SESSION_COOKIE,
+            token,
+            max_age=_COMMUNITY_SESSION_MAX_AGE,
+            httponly=True,
+            secure=req.url.scheme == "https",
+            samesite="strict",
+            path="/api/v1/community",
+        )
+    else:
+        response.delete_cookie(
+            _COMMUNITY_SESSION_COOKIE, path="/api/v1/community")
+    return response
+
+
+def _require_community_browser_session(req: Request, sub: str) -> None:
+    _require_same_origin_or_forwarded(req, "Community account changes")
+    _prune_community_browser_sessions()
+    token = req.cookies.get(_COMMUNITY_SESSION_COOKIE)
+    session = _community_browser_sessions.get(token or "")
+    if not session or session[0] != sub:
+        raise HTTPException(401, "a current node community session is required")
 
 
 @app.get("/api/v1/community/auth-config")
@@ -2128,6 +2174,52 @@ async def v1_community_auth_config():
         "idp_endpoint": f"{COGNITO_IDP_ORIGIN.rstrip('/')}/",
         "client_id": COGNITO_CLIENT_ID,
     }
+
+
+@app.get("/api/v1/community/session")
+async def v1_community_session(req: Request):
+    """Restore the sanitized account session held by this SparkDeck node.
+
+    Cluster pairing keeps the reusable Cognito credential in the backend.
+    Browsers receive display state only, never the subject, refresh token, or
+    a short-lived hosted-service bearer.
+    """
+    pairing = sparkdeck.store.get_setting(
+        "device_pairing", {"status": "not_paired"})
+    if not isinstance(pairing, dict) or pairing.get("status") != "paired":
+        return _community_session_response(req, {"status": "signed-out"})
+    public = {
+        "status": "reauth-required",
+        "token_invalid": bool(pairing.get("token_invalid")),
+    }
+    email = pairing.get("email")
+    if isinstance(email, str) and email:
+        public["email"] = email
+    refresh_token = pairing.get("refresh_token")
+    if (
+        public["token_invalid"]
+        or not isinstance(refresh_token, str)
+        or not refresh_token
+    ):
+        return _community_session_response(req, public)
+    id_token = await _community_id_token(refresh_token)
+    if not id_token:
+        current = sparkdeck.store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if isinstance(current, dict) and current.get("token_invalid"):
+            public["token_invalid"] = True
+            return _community_session_response(req, public)
+        raise HTTPException(503, "community sign-in could not be restored")
+    try:
+        claims = await asyncio.to_thread(_verify_cognito_id_token, id_token)
+    except Exception as exc:
+        raise HTTPException(503, "community sign-in could not be verified") from exc
+    if claims.get("sub") != pairing.get("sub"):
+        _mark_community_token_invalid(refresh_token)
+        public["token_invalid"] = True
+        return _community_session_response(req, public)
+    public["status"] = "signed-in"
+    return _community_session_response(req, public, pairing["sub"])
 
 
 @app.get("/api/v1/community/sync")
@@ -2168,6 +2260,7 @@ async def v1_community_retry():
 
 @app.post("/api/v1/community/pair")
 async def v1_community_pair(req: Request):
+    _require_same_origin_or_forwarded(req, "Community sign-in")
     body = await req.json()
     id_token = body.get("id_token") if isinstance(body, dict) else None
     if not isinstance(id_token, str) or not id_token:
@@ -2179,6 +2272,23 @@ async def v1_community_pair(req: Request):
         claims = await asyncio.to_thread(_verify_cognito_id_token, id_token)
     except Exception as e:
         raise HTTPException(401, "id_token could not be verified") from e
+    if refresh_token:
+        refresh_id_token = await _community_id_token(refresh_token, force=True)
+        if not refresh_id_token:
+            raise HTTPException(401, "refresh_token could not be verified")
+        try:
+            refresh_claims = await asyncio.to_thread(
+                _verify_cognito_id_token, refresh_id_token)
+        except Exception as exc:
+            raise HTTPException(401, "refresh_token could not be verified") from exc
+        if refresh_claims.get("sub") != claims.get("sub"):
+            if _community_token_cache.get("refresh_token") == refresh_token:
+                _community_token_cache.update({
+                    "refresh_token": None,
+                    "id_token": None,
+                    "expires_at": 0.0,
+                })
+            raise HTTPException(401, "refresh_token belongs to another account")
     with sparkdeck.store.locked():
         existing = sparkdeck.store.get_setting(
             "device_pairing", {"status": "not_paired"})
@@ -2211,15 +2321,30 @@ async def v1_community_pair(req: Request):
     cluster = await manager.push_community_pairing(
         pairing["sub"], pairing["email"], effective_refresh_token)
     public_pairing = {k: v for k, v in pairing.items() if k != "refresh_token"}
-    return {"pairing": public_pairing, "cluster": cluster}
+    return _community_session_response(req, {
+        "pairing": public_pairing,
+        "cluster": cluster,
+    }, pairing["sub"])
 
 
 @app.delete("/api/v1/community/pair")
 async def v1_community_unpair(req: Request):
+    _require_same_origin_or_forwarded(req, "Community sign-out")
     claims = await _verified_community_claims(req)
+    current = sparkdeck.store.get_setting(
+        "device_pairing", {"status": "not_paired"})
+    sub = current.get("sub") if isinstance(current, dict) else None
+    if (
+        isinstance(current, dict)
+        and current.get("status") == "paired"
+        and not isinstance(sub, str)
+    ):
+        raise HTTPException(409, "the paired account identity is invalid")
+    if isinstance(sub, str) and sub != claims.get("sub"):
+        raise HTTPException(403, "this account is not paired with the node")
     result, existing = await sparkdeck.unpair_community_device(claims["sub"])
     if result == "conflict":
-        raise HTTPException(403, "this account is not paired with the node")
+        raise HTTPException(409, "the paired account changed; retry sign out")
     unpaired_sub = existing.get("sub") if result == "unpaired" else None
     pairing = {"status": "not_paired"}
     if unpaired_sub:
@@ -2227,13 +2352,29 @@ async def v1_community_unpair(req: Request):
     else:
         # Nothing was paired locally, so there is nothing to propagate.
         cluster = {"applied": [], "conflicts": [], "errors": []}
-    return {"pairing": pairing, "cluster": cluster}
+    refresh_token = existing.get("refresh_token") if result == "unpaired" else None
+    if isinstance(refresh_token, str) and refresh_token:
+        await _revoke_community_refresh_token(refresh_token)
+    if unpaired_sub:
+        _clear_community_browser_sessions(unpaired_sub)
+    return _community_session_response(req, {
+        "pairing": pairing,
+        "cluster": cluster,
+    })
 
 
 @app.get("/api/v1/community/aggregates")
 async def v1_community_aggregates(req: Request):
-    claims = await _verified_community_claims(req)
-    _require_matching_community_pairing(claims)
+    pairing = sparkdeck.store.get_setting(
+        "device_pairing", {"status": "not_paired"})
+    if not isinstance(pairing, dict) or pairing.get("status") != "paired":
+        raise HTTPException(401, "community aggregates require sign-in")
+    sub = pairing.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise HTTPException(401, "the paired account identity is invalid")
+    _require_community_browser_session(req, sub)
+    if pairing.get("token_invalid"):
+        raise HTTPException(401, "community sign-in expired; sign in again")
     if not sparkdeck.store.get_setting("community_consent", False):
         raise HTTPException(403, "community sharing consent is required")
     api_url = _validated_community_api_url()
@@ -2242,11 +2383,21 @@ async def v1_community_aggregates(req: Request):
             return await sparkdeck.community_aggregates()
         except RuntimeError as exc:
             raise HTTPException(502, str(exc)) from exc
+    refresh_token = pairing.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise HTTPException(401, "community sign-in must be refreshed")
+    id_token = await _community_id_token(refresh_token)
+    if not id_token:
+        current = sparkdeck.store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if isinstance(current, dict) and current.get("token_invalid"):
+            raise HTTPException(401, "community sign-in expired; sign in again")
+        return _community_aggregates_unavailable()
     try:
         upstream = await _community_http.get(
             f"{api_url}/v1/aggregates",
             headers={
-                "Authorization": req.headers.get("authorization", ""),
+                "Authorization": f"Bearer {id_token}",
             },
         )
     except httpx.HTTPError:
@@ -2379,6 +2530,26 @@ async def _community_id_token(refresh_token: str, force: bool = False) -> str | 
         "expires_at": time.time() + float(result.get("ExpiresIn", 3600)),
     })
     return id_token
+
+
+async def _revoke_community_refresh_token(refresh_token: str) -> bool:
+    """Best-effort single-session revocation without exposing the token."""
+    if _community_token_cache.get("refresh_token") == refresh_token:
+        _community_token_cache.update({
+            "refresh_token": None, "id_token": None, "expires_at": 0.0,
+        })
+    try:
+        response = await _community_http.post(
+            f"{COGNITO_IDP_ORIGIN}/",
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSCognitoIdentityProviderService.RevokeToken",
+            },
+            json={"ClientId": COGNITO_CLIENT_ID, "Token": refresh_token},
+        )
+    except httpx.HTTPError:
+        return False
+    return response.status_code == 200
 
 
 async def _post_community_sample(

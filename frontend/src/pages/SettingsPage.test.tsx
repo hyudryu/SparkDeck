@@ -1,10 +1,10 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { useEffect } from 'react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
-import { AuthProvider, useAuth } from '../auth/AuthContext'
+import { AuthProvider, COMMUNITY_SESSION_RENEW_MS, useAuth } from '../auth/AuthContext'
 import { api } from '../api/client'
 import { THEME_STORAGE_KEY } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
@@ -12,7 +12,6 @@ import { SPARKDECK_VERSION } from '../buildInfo'
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
-  localStorage.clear()
   localStorage.clear()
   delete document.documentElement.dataset.theme
 })
@@ -29,6 +28,22 @@ function ProtectedRequestOnSignIn() {
     if (auth.status === 'signed-in') void api.benchmarks.aggregates()
   }, [auth.status])
   return <span>{auth.status}</span>
+}
+
+function AuthStatus() {
+  const auth = useAuth()
+  return <span>{auth.status}:{auth.email}</span>
+}
+
+async function submitCommunitySignOut(user: ReturnType<typeof userEvent.setup>, password = 'Password1') {
+  await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+  const dialog = await screen.findByRole('dialog', { name: 'Sign out everywhere' })
+  const passwordInput = within(dialog).getByLabelText('Password')
+  expect(passwordInput).toHaveAttribute('type', 'password')
+  expect(passwordInput).toHaveAttribute('autocomplete', 'current-password')
+  await user.type(passwordInput, password)
+  await user.click(within(dialog).getByRole('button', { name: 'Sign out everywhere' }))
+  return { dialog, passwordInput }
 }
 
 describe('settings page', () => {
@@ -275,6 +290,8 @@ describe('community features sign-in', () => {
     pairResponse?: () => Response | Promise<Response>
     unpairResponse?: () => Response | Promise<Response>
     unpairCluster?: { applied: string[]; conflicts: { node: string; email?: string }[]; errors: string[] }
+    session?: { status: 'signed-in' | 'signed-out' | 'reauth-required'; email?: string; token_invalid?: boolean }
+    sessionResponse?: () => Response | Promise<Response>
   } = {}) {
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
@@ -282,8 +299,21 @@ describe('community features sign-in', () => {
         idp_endpoint: 'https://cognito-idp.us-east-2.amazonaws.com/',
         client_id: '30ihrkeg4k1rn95d4mmkq00fvl',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/session')) {
+        if (options.sessionResponse) return options.sessionResponse()
+        return new Response(JSON.stringify(options.session ?? { status: 'signed-out' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
       if (path.includes('cognito-idp')) {
-        if (options.idpResponse) return options.idpResponse(JSON.parse(String(init?.body)))
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        if (options.idpResponse) return options.idpResponse(body)
+        if (body.AuthFlow === 'USER_PASSWORD_AUTH') {
+          const parameters = body.AuthParameters as { USERNAME?: string } | undefined
+          return new Response(JSON.stringify(authResult(parameters?.USERNAME ?? 'driver@example.com')), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          })
+        }
         return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -363,6 +393,56 @@ describe('community features sign-in', () => {
     expect(JSON.parse(String(pairCall?.[1]?.body))).toMatchObject({
       refresh_token: 'refresh-token',
     })
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+    expect(localStorage.getItem('sparkdeck.cognito.refresh_token')).toBeNull()
+  })
+
+  it('restores a cluster-paired account without browser-local tokens', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com', token_invalid: false },
+    })
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/session', expect.objectContaining({
+      headers: expect.not.objectContaining({ Authorization: expect.anything() }),
+    }))
+  })
+
+  it('renews a long-open node session before its browser authorization expires', async () => {
+    const callbacks: Array<() => void> = []
+    const interval = vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
+      if (typeof handler === 'function') callbacks.push(handler as () => void)
+      return 1
+    })
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com', token_invalid: false },
+    })
+
+    render(<AuthProvider><AuthStatus /></AuthProvider>)
+
+    expect(await screen.findByText('signed-in:driver@example.com')).toBeInTheDocument()
+    expect(interval).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RENEW_MS)
+    expect(callbacks.length).toBeGreaterThan(0)
+    await act(async () => callbacks.at(-1)?.())
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input) === '/api/v1/community/session'
+    ))).toHaveLength(2))
+  })
+
+  it('requires sign-in again when the node reports an invalid shared session', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'reauth-required', email: 'driver@example.com', token_invalid: true },
+    })
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
+    expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
   })
 
   it('reports cluster conflicts and unreachable nodes after sign-in', async () => {
@@ -452,37 +532,32 @@ describe('community features sign-in', () => {
     expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
   })
 
-  it('rejects a restored session when backend re-pairing fails', async () => {
-    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
-      pairResponse: () => new Response(JSON.stringify({ detail: 'pairing backend exploded' }), {
-        status: 500, headers: { 'Content-Type': 'application/json' },
-      }),
-    })
+  it('does not silently re-pair a signed-out node from stale browser tokens', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
     localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
       email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
     }))
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'stale-refresh-token')
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
-      method: 'POST',
-    })))
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input).endsWith('/api/v1/community/pair') && init?.method === 'POST'
+    ))).toBe(false)
     expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
     expect(screen.queryByText('driver@example.com')).not.toBeInTheDocument()
     expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+    expect(localStorage.getItem('sparkdeck.cognito.refresh_token')).toBeNull()
   })
 
-  it('blocks interactive sign-in while a saved account is still restoring', async () => {
-    let resolvePair: ((response: Response) => void) | undefined
+  it('blocks interactive sign-in while the node account is still restoring', async () => {
+    let resolveSession: ((response: Response) => void) | undefined
     stubSettingsFetch(vi.fn<typeof fetch>(), {
-      pairResponse: () => new Promise<Response>((resolve) => {
-        resolvePair = resolve
+      sessionResponse: () => new Promise<Response>((resolve) => {
+        resolveSession = resolve
       }),
     })
-    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
-      email: 'account-a@example.com', sub: 'account-a', exp: Math.floor(Date.now() / 1000) + 3600,
-    }))
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
@@ -490,9 +565,9 @@ describe('community features sign-in', () => {
     expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Sign in' })).not.toBeInTheDocument()
 
-    resolvePair?.(new Response(JSON.stringify({
-      error: 'already_paired', existing: { email: 'account-b@example.com' },
-    }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+    resolveSession?.(new Response(JSON.stringify({ status: 'signed-out' }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
 
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
     expect(screen.queryByText('Restoring community session…')).not.toBeInTheDocument()
@@ -517,8 +592,31 @@ describe('community features sign-in', () => {
     ))).toBe(false)
   })
 
+  it('masks and clears the cluster sign-out password when cancelled', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+    let dialog = await screen.findByRole('dialog', { name: 'Sign out everywhere' })
+    const password = within(dialog).getByLabelText('Password')
+    expect(password).toHaveAttribute('type', 'password')
+    expect(password).toHaveAttribute('autocomplete', 'current-password')
+    await user.type(password, 'Password1')
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog', { name: 'Sign out everywhere' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Sign out' }))
+    dialog = await screen.findByRole('dialog', { name: 'Sign out everywhere' })
+    expect(within(dialog).getByLabelText('Password')).toHaveValue('')
+  })
+
   it('shows unpair propagation failures after signing out', async () => {
     stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
       unpairCluster: {
         applied: [],
         conflicts: [{ node: 'Spark Three', email: 'other@example.com' }],
@@ -532,7 +630,7 @@ describe('community features sign-in', () => {
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
-    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+    await submitCommunitySignOut(user)
 
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
     expect(screen.getByText('Sign-out was not applied to: Spark Three (signed in as other@example.com).')).toBeInTheDocument()
@@ -544,6 +642,7 @@ describe('community features sign-in', () => {
       email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
     })
     stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
       unpairResponse: () => new Response(JSON.stringify({ detail: 'controller unpair failed' }), {
         status: 503, headers: { 'Content-Type': 'application/json' },
       }),
@@ -552,22 +651,19 @@ describe('community features sign-in', () => {
     localStorage.setItem('sparkdeck.cognito.id_token', token)
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+    const { passwordInput } = await submitCommunitySignOut(user)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not sign out: controller unpair failed')
     expect(screen.getByRole('alert')).toHaveTextContent('Your account may still be paired with this node')
     expect(screen.getByText('Signed in')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled()
-    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBe(token)
+    expect(passwordInput).toHaveValue('')
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
   })
 
-  it('requires reauthentication when terminal refresh prevents unpairing', async () => {
+  it('reauthenticates instead of using stale browser tokens for cluster sign-out', async () => {
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
-      idpResponse: (body) => body.AuthFlow === 'REFRESH_TOKEN_AUTH'
-        ? new Response(JSON.stringify({ __type: 'NotAuthorizedException', message: 'Refresh token revoked' }), {
-          status: 400, headers: { 'Content-Type': 'application/json' },
-        })
-        : new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+      session: { status: 'signed-in', email: 'driver@example.com' },
     })
     const user = userEvent.setup()
     localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
@@ -576,15 +672,18 @@ describe('community features sign-in', () => {
     localStorage.setItem('sparkdeck.cognito.refresh_token', 'revoked-refresh-token')
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+    await submitCommunitySignOut(user)
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Your community session expired before this node could be signed out')
-    expect(screen.getByRole('alert')).toHaveTextContent('Sign in again if prompted, then retry Sign out')
-    expect(screen.getByLabelText('Email')).toBeInTheDocument()
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
     expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([input, init]) => (
       String(input).endsWith('/api/v1/community/pair') && init?.method === 'DELETE'
-    ))).toBe(false)
+    ))).toBe(true)
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
+    expect(JSON.parse(String(cognitoCalls(fetchMock, 'InitiateAuth')[0][1]?.body))).toMatchObject({
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      AuthParameters: { USERNAME: 'driver@example.com', PASSWORD: 'Password1' },
+    })
   })
 
   it('creates an account and asks for the emailed confirmation code', async () => {
@@ -742,7 +841,9 @@ describe('community features sign-in', () => {
   })
 
   it('shows the account email when signed in and unpairs on sign out', async () => {
-    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
+    })
     const user = userEvent.setup()
     localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
       email: 'driver@example.com', sub: 'user-sub-1', exp: Math.floor(Date.now() / 1000) + 3600,
@@ -754,43 +855,41 @@ describe('community features sign-in', () => {
     expect(screen.getByText('Signed in')).toBeInTheDocument()
     expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Sign out' }))
+    await submitCommunitySignOut(user)
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
       method: 'DELETE',
     })))
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
     expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
   })
 
-  it('silently refreshes an expired stored session on load', async () => {
+  it('prefers the paired node account over stale browser-local identity', async () => {
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
-      idpResponse: () => new Response(JSON.stringify(authResult('driver@example.com')), {
-        status: 200, headers: { 'Content-Type': 'application/json' },
-      }),
+      session: { status: 'signed-in', email: 'node@example.com' },
     })
     localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
-      email: 'driver@example.com', sub: 'user-sub-1', exp: 1,
+      email: 'stale@example.com', sub: 'stale-sub', exp: 1,
     }))
     localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
-    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    expect(await screen.findByText('node@example.com')).toBeInTheDocument()
     expect(screen.getByText('Signed in')).toBeInTheDocument()
-    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
-    expect(JSON.parse(String(cognitoCalls(fetchMock, 'InitiateAuth')[0][1]?.body))).toMatchObject({
-      AuthFlow: 'REFRESH_TOKEN_AUTH',
-      AuthParameters: { REFRESH_TOKEN: 'saved-refresh-token' },
-    })
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
-      method: 'POST',
-      body: expect.stringContaining('"id_token"'),
-    })))
+    expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(0)
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input).endsWith('/api/v1/community/pair') && init?.method === 'POST'
+    ))).toBe(false)
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBeNull()
+    expect(localStorage.getItem('sparkdeck.cognito.refresh_token')).toBeNull()
   })
 
-  it('installs the restored bearer before signed-in children request community data', async () => {
-    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>())
+  it('keeps hosted community bearers out of browser aggregate requests', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
+    })
     const token = fakeIdToken({
       email: 'driver@example.com', sub: 'user-sub-1',
       exp: Math.floor(Date.now() / 1000) + 3600,
@@ -805,22 +904,14 @@ describe('community features sign-in', () => {
     const aggregate = fetchMock.mock.calls.find(([input]) => (
       String(input).endsWith('/api/v1/community/aggregates')
     ))
-    expect(aggregate?.[1]?.headers).toEqual(expect.objectContaining({
-      Authorization: `Bearer ${token}`,
+    expect(aggregate?.[1]?.headers).not.toEqual(expect.objectContaining({
+      Authorization: expect.anything(),
     }))
   })
 
-  it('refreshes a near-expiry bearer before unpairing a long-open session', async () => {
-    const refreshed = fakeIdToken({
-      email: 'driver@example.com', sub: 'user-sub-1',
-      exp: Math.floor(Date.now() / 1000) + 3600,
-    })
+  it('unpairs a long-open session with fresh account proof', async () => {
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
-      idpResponse: (body) => new Response(JSON.stringify(
-        body.AuthFlow === 'REFRESH_TOKEN_AUTH'
-          ? { AuthenticationResult: { IdToken: refreshed, AccessToken: 'new-access' } }
-          : {},
-      ), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+      session: { status: 'signed-in', email: 'driver@example.com' },
     })
     const user = userEvent.setup()
     localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({
@@ -830,14 +921,14 @@ describe('community features sign-in', () => {
     localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Sign out' }))
+    await submitCommunitySignOut(user)
 
     expect(cognitoCalls(fetchMock, 'InitiateAuth')).toHaveLength(1)
     const unpair = fetchMock.mock.calls.find(([input, init]) => (
       String(input).endsWith('/api/v1/community/pair') && init?.method === 'DELETE'
     ))
     expect(unpair?.[1]?.headers).toEqual(expect.objectContaining({
-      Authorization: `Bearer ${refreshed}`,
+      Authorization: expect.stringMatching(/^Bearer /),
     }))
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
   })

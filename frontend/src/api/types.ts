@@ -249,6 +249,12 @@ export interface CommunityAuthConfig {
   client_id: string
 }
 
+export interface CommunitySession {
+  status: 'signed-in' | 'signed-out' | 'reauth-required'
+  email?: string
+  token_invalid?: boolean
+}
+
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean

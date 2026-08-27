@@ -49,6 +49,7 @@ def _bearer(token=None):
 
 class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        server._community_browser_sessions.clear()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server.app),
             base_url="http://test",
@@ -91,6 +92,16 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.get_setting_patch.stop()
         self.set_setting_patch.stop()
         self.jwks_patch.stop()
+        server._community_browser_sessions.clear()
+
+    def authorize_browser(self, sub="user-sub-123"):
+        token = "test-browser-session"
+        server._community_browser_sessions[token] = (sub, time.time() + 3600)
+        self.client.cookies.set(
+            server._COMMUNITY_SESSION_COOKIE,
+            token,
+            path="/api/v1/community",
+        )
 
     async def test_csp_permits_the_cognito_idp_origin(self):
         response = await self.client.get("/api/v1/community/sync")
@@ -112,6 +123,52 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "idp_endpoint": "https://idp.example/",
             "client_id": "custom-client",
         })
+
+    async def test_node_session_restores_sanitized_cluster_pairing(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret",
+        }
+        minted = _id_token()
+        with patch.object(
+            server, "_community_id_token", AsyncMock(return_value=minted),
+        ) as mint:
+            response = await self.client.get("/api/v1/community/session")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertIn("HttpOnly", response.headers["set-cookie"])
+        self.assertIn("SameSite=strict", response.headers["set-cookie"])
+        self.assertEqual(response.json(), {
+            "status": "signed-in", "email": "user@example.com",
+            "token_invalid": False,
+        })
+        self.assertNotIn("user-sub-123", response.text)
+        self.assertNotIn("refresh-secret", response.text)
+        self.assertNotIn(minted, response.text)
+        mint.assert_awaited_once_with("refresh-secret")
+
+    async def test_node_session_requires_reauth_for_an_invalid_token(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret",
+            "token_invalid": True,
+        }
+        with patch.object(
+            server, "_community_id_token", AsyncMock(),
+        ) as mint:
+            response = await self.client.get("/api/v1/community/session")
+
+        self.assertEqual(response.json(), {
+            "status": "reauth-required", "email": "user@example.com",
+            "token_invalid": True,
+        })
+        mint.assert_not_awaited()
+
+    async def test_node_session_reports_signed_out_without_a_pairing(self):
+        response = await self.client.get("/api/v1/community/session")
+
+        self.assertEqual(response.json(), {"status": "signed-out"})
 
     async def test_valid_id_token_pairs_the_device(self):
         response = await self.client.post(
@@ -165,9 +222,13 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com", None)
 
     async def test_pairing_stores_the_refresh_token_without_echoing_it(self):
-        response = await self.client.post(
-            "/api/v1/community/pair",
-            json={"id_token": _id_token(), "refresh_token": "refresh-secret-1"})
+        with patch.object(
+            server, "_community_id_token",
+            AsyncMock(return_value=_id_token()),
+        ):
+            response = await self.client.post(
+                "/api/v1/community/pair",
+                json={"id_token": _id_token(), "refresh_token": "refresh-secret-1"})
 
         self.assertEqual(response.status_code, 200)
         self.set_setting.assert_called_once_with("device_pairing", {
@@ -184,6 +245,21 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         })
         self.push_pair.assert_awaited_once_with(
             "user-sub-123", "user@example.com", "refresh-secret-1")
+
+    async def test_pairing_rejects_a_refresh_token_for_another_account(self):
+        with patch.object(
+            server, "_community_id_token",
+            AsyncMock(return_value=_id_token(sub="other-sub")),
+        ):
+            response = await self.client.post(
+                "/api/v1/community/pair",
+                json={"id_token": _id_token(), "refresh_token": "refresh-other"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("another account", response.json()["detail"])
+        self.set_setting.assert_not_called()
+        self.promote.assert_not_called()
+        self.push_pair.assert_not_awaited()
 
     async def test_repair_without_refresh_token_retains_the_stored_one(self):
         self.get_setting.return_value = {
@@ -327,27 +403,78 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         })
         self.push_unpair.assert_not_awaited()
 
-    async def test_unpair_requires_the_matching_account(self):
+    async def test_unpair_rejects_a_corrupt_pairing_identity(self):
         self.get_setting.return_value = {
-            "status": "paired", "sub": "other-sub", "email": "other@example.com",
+            "status": "paired", "sub": None, "email": "other@example.com",
         }
 
         response = await self.client.delete(
             "/api/v1/community/pair", headers=_bearer())
 
+        self.assertEqual(response.status_code, 409)
+        self.set_setting.assert_not_called()
+        self.push_unpair.assert_not_awaited()
+
+    async def test_unpair_requires_fresh_proof_for_the_paired_account(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        }
+
+        missing = await self.client.delete("/api/v1/community/pair")
+        mismatched = await self.client.delete(
+            "/api/v1/community/pair", headers=_bearer(_id_token(sub="other-sub")))
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(mismatched.status_code, 403)
+        self.set_setting.assert_not_called()
+        self.push_unpair.assert_not_awaited()
+
+    async def test_unpair_rejects_cross_origin_requests(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        }
+        response = await self.client.delete(
+            "/api/v1/community/pair",
+            headers={**_bearer(), "Origin": "https://attacker.example"},
+        )
+
         self.assertEqual(response.status_code, 403)
         self.set_setting.assert_not_called()
         self.push_unpair.assert_not_awaited()
 
-    async def test_unpair_requires_a_valid_bearer_when_paired(self):
+    async def test_unpair_revokes_the_backend_owned_refresh_token(self):
         self.get_setting.return_value = {
             "status": "paired", "sub": "user-sub-123", "email": "user@example.com",
+            "refresh_token": "refresh-secret",
         }
+        with patch.object(
+            server, "_revoke_community_refresh_token", AsyncMock(return_value=True),
+        ) as revoke:
+            response = await self.client.delete(
+                "/api/v1/community/pair", headers=_bearer())
 
-        response = await self.client.delete("/api/v1/community/pair")
+        self.assertEqual(response.status_code, 200)
+        revoke.assert_awaited_once_with("refresh-secret")
+        self.push_unpair.assert_awaited_once_with("user-sub-123")
 
-        self.assertEqual(response.status_code, 401)
-        self.set_setting.assert_not_called()
+    async def test_unpair_conflict_does_not_report_false_success(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com",
+        }
+        with patch.object(
+            server.sparkdeck, "unpair_community_device",
+            AsyncMock(return_value=("conflict", {
+                "status": "paired", "sub": "new-sub",
+                "email": "new@example.com",
+            })),
+        ):
+            response = await self.client.delete(
+                "/api/v1/community/pair", headers=_bearer())
+
+        self.assertEqual(response.status_code, 409)
         self.push_unpair.assert_not_awaited()
 
     async def test_aggregates_require_matching_pairing_and_consent(self):
@@ -358,6 +485,7 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             },
             "community_consent": True,
         }.get(key, default)
+        self.authorize_browser()
         with (
             # An empty built-in URL exercises the local stub branch.
             patch.object(server, "COMMUNITY_API_URL", ""),
@@ -366,8 +494,7 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value={"items": []}),
             ) as aggregate,
         ):
-            response = await self.client.get(
-                "/api/v1/community/aggregates", headers=_bearer())
+            response = await self.client.get("/api/v1/community/aggregates")
 
         self.assertEqual(response.status_code, 200)
         aggregate.assert_awaited_once_with()
@@ -380,16 +507,36 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             },
             "community_consent": False,
         }.get(key, default)
+        self.authorize_browser()
         with patch.object(
             server.sparkdeck, "community_aggregates", AsyncMock(),
         ) as aggregate:
+            no_consent = await self.client.get("/api/v1/community/aggregates")
+            self.get_setting.side_effect = lambda key, default=None: {
+                "device_pairing": {"status": "not_paired"},
+                "community_consent": True,
+            }.get(key, default)
             missing = await self.client.get("/api/v1/community/aggregates")
-            no_consent = await self.client.get(
-                "/api/v1/community/aggregates", headers=_bearer())
 
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(no_consent.status_code, 403)
         aggregate.assert_not_awaited()
+
+    async def test_aggregates_require_the_matching_node_session(self):
+        self.get_setting.side_effect = lambda key, default=None: {
+            "device_pairing": {
+                "status": "paired", "sub": "user-sub-123",
+                "email": "user@example.com", "refresh_token": "refresh-1",
+            },
+            "community_consent": True,
+        }.get(key, default)
+
+        missing = await self.client.get("/api/v1/community/aggregates")
+        self.authorize_browser("other-sub")
+        mismatched = await self.client.get("/api/v1/community/aggregates")
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(mismatched.status_code, 401)
 
     async def test_consent_changes_propagate_and_surface_cluster_failures(self):
         cluster_result = {
@@ -664,6 +811,22 @@ class CommunityPairingFanoutTests(unittest.IsolatedAsyncioTestCase):
             "sub": "user-sub-123", "email": "user@example.com",
             "refresh_token": "refresh-1",
         })
+        self.assertTrue(first_call.kwargs["allow_disabled"])
+
+    async def test_pairing_fanout_reaches_disabled_nodes(self):
+        request = AsyncMock(return_value={"applied": True})
+        nodes = [
+            {"id": "node-off", "name": "Spark Off", "enabled": False},
+        ]
+        instance = self.manager_with_nodes(nodes, request)
+
+        result = await instance.push_community_pairing(
+            "user-sub-123", "user@example.com", "refresh-1")
+
+        self.assertEqual(result, {
+            "applied": ["Spark Off"], "conflicts": [], "errors": [],
+        })
+        self.assertTrue(request.await_args.kwargs["allow_disabled"])
 
     async def test_unpair_fanout_reaches_disabled_nodes(self):
         request = AsyncMock(return_value={"applied": True})

@@ -815,7 +815,7 @@ async def forward_management_request(
         key: value for key, value in upstream.headers.items()
         if key.casefold() in {
             "content-type", "content-encoding", "cache-control",
-            "content-disposition", "vary",
+            "content-disposition", "vary", "set-cookie",
         }
     }
     return StreamingResponse(

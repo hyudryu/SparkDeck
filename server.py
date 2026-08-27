@@ -165,9 +165,19 @@ app = FastAPI(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    if is_forwardable_path(request.url.path):
+    forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
+    forgotten_unregister = (
+        forwarded
+        and request.method == "POST"
+        and request.url.path == "/api/v1/onboarding/unregister"
+        and onboarding.is_already_unregistered_worker(request.headers)
+    )
+    if forgotten_unregister:
+        # The route turns this exact already-absent state into the 404 that a
+        # force-forgotten worker recognizes as a successful local recovery.
+        response = await call_next(request)
+    elif is_forwardable_path(request.url.path):
         assignment = onboarding.assignment.load()
-        forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
         if assignment:
             response = await forward_management_request(request, manager, assignment)
         elif forwarded:

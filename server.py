@@ -2025,6 +2025,42 @@ async def v1_benchmarks(limit: int = 100, offset: int = 0):
             "offset": max(0, offset)}
 
 
+@app.post("/api/v1/benchmark-runs", status_code=201)
+async def v1_record_benchmark_run(req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    allowed = {
+        "deployment_id", "concurrency", "request_count", "prompt_tokens",
+        "generation_tokens", "wall_seconds",
+    }
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    unknown = set(body) - allowed
+    if unknown:
+        raise HTTPException(400, f"unsupported benchmark fields: {', '.join(sorted(unknown))}")
+    try:
+        return await sparkdeck.record_benchmark_series_point(body)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/v1/benchmark-models")
+async def v1_benchmark_models():
+    return {"items": sparkdeck.store.benchmark_model_summaries()}
+
+
+@app.get("/api/v1/benchmark-models/{model_id:path}")
+async def v1_benchmark_model(model_id: str):
+    detail = sparkdeck.store.benchmark_model_detail(model_id)
+    if detail is None:
+        raise HTTPException(404, "benchmark model not found")
+    return detail
+
+
 @app.delete("/api/v1/benchmarks/{sample_id}")
 async def v1_delete_benchmark(sample_id: str):
     if not await sparkdeck.delete_benchmark(sample_id):

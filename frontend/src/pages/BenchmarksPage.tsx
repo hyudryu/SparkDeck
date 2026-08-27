@@ -1,13 +1,16 @@
-import { useState } from 'react'
-import { Check, CloudOff, RotateCw, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { BarChart3, Check, ChevronRight, CloudOff, RotateCw, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { BenchmarkLineChart } from '../components/BenchmarkLineChart'
+import { LegalDialog } from '../components/LegalDialog'
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
+  const benchmarkModels = useResource((signal) => api.benchmarks.models(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const communityAccess = useCommunityAccess()
   const accessHint = communityAccessHint(communityAccess.signedIn)
@@ -19,8 +22,22 @@ export function BenchmarksPage() {
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncActionError, setSyncActionError] = useState<string>()
   const [reviewingConsent, setReviewingConsent] = useState(false)
+  const [selectedModel, setSelectedModel] = useState<string>()
+  const [selectedTp, setSelectedTp] = useState<number>()
+  const modelTriggerRef = useRef<HTMLButtonElement>(null)
+  const modelDetail = useResource(
+    (signal) => api.benchmarks.model(selectedModel ?? '', signal),
+    [selectedModel],
+    Boolean(selectedModel),
+  )
+  const closeModelDetail = useCallback(() => setSelectedModel(undefined), [])
   const aggregateResponse = aggregates.data
   const localAggregates = aggregateResponse?.availability === 'local'
+
+  useEffect(() => {
+    const sizes = [...new Set(modelDetail.data?.points.map((point) => point.tensor_parallel_size) ?? [])]
+    if (sizes.length && !sizes.includes(selectedTp ?? -1)) setSelectedTp(sizes[0])
+  }, [modelDetail.data, selectedTp])
 
   const applyConsent = async (enabled: boolean) => {
     if (!sync.data) return
@@ -64,7 +81,7 @@ export function BenchmarksPage() {
       <PageHeader eyebrow="Performance evidence" title="Benchmarks" description="Review measurements captured from SparkDeck requests and compare them with privacy-preserving community results." />
       <div className="benchmark-summary-grid">
         <Panel className="sync-panel">
-          <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Share only model name, context window size, and measured inference tok/s.</p></div></div>
+          <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Optional, account-linked benchmark evidence with a strict data allowlist.</p></div></div>
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
           {syncActionError && <p className="inline-error" role="alert">{syncActionError}</p>}
@@ -76,10 +93,32 @@ export function BenchmarksPage() {
         <Panel className="privacy-panel">
           <p className="eyebrow">Always private</p>
           <h2>Your content stays local</h2>
-          <p>Prompts and outputs, runtime, revision, quantization, hardware, settings, host or network identity, and paths are not shared.</p>
+          <p>Prompts and outputs never enter benchmark JSON. Ordinary authenticated request and network metadata may still be processed to operate the service.</p>
           <span><Check size={15} /> Sharing is off until you opt in</span>
         </Panel>
       </div>
+
+      <div className="section-heading"><div><h2>Benchmark runs by model</h2><p>Run a deployed model at C1, C2, C5, or C10. Select a model to compare prompt and generation throughput across context windows.</p></div></div>
+      {benchmarkModels.loading && <LoadingState label="Loading benchmark runs" />}
+      {benchmarkModels.error && <ErrorState message={benchmarkModels.error} onRetry={benchmarkModels.reload} />}
+      {!benchmarkModels.loading && !benchmarkModels.error && benchmarkModels.data?.length === 0 && <EmptyState title="No coordinated benchmark runs yet" description="Use benchmark_cluster_deployment for a ready model at concurrency 1, 2, 5, or 10. Every completed run is recorded here without its prompts or outputs." />}
+      {benchmarkModels.data && benchmarkModels.data.length > 0 && <Panel className="benchmark-model-panel"><div className="benchmark-model-list" aria-label="Benchmarked models">
+        {benchmarkModels.data.map((model) => <button
+          className="benchmark-model-row"
+          type="button"
+          aria-haspopup="dialog"
+          key={model.model_id}
+          onClick={(event) => { modelTriggerRef.current = event.currentTarget; setSelectedModel(model.model_id) }}
+        >
+          <span className="benchmark-model-icon"><BarChart3 size={17} /></span>
+          <span className="benchmark-model-main"><strong>{model.model_id}</strong><small>{model.run_count} run{model.run_count === 1 ? '' : 's'} · Updated {new Date(model.latest_at).toLocaleString()}</small></span>
+          <span><small>Best prompt</small><strong>{formatRate(model.best_prompt_tokens_per_second)}</strong></span>
+          <span><small>Best generation</small><strong>{formatRate(model.best_generation_tokens_per_second)}</strong></span>
+          <span><small>Context windows</small><strong>{model.context_windows.map((window) => `${Math.round(window / 1024)}K`).join(', ')}</strong></span>
+          <span><small>TP sizes</small><strong>{model.tensor_parallel_sizes.map((size) => `TP${size}`).join(', ')}</strong></span>
+          <ChevronRight size={17} aria-hidden="true" />
+        </button>)}
+      </div></Panel>}
 
       <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
       {!communityAccess.enabled && !communityAccess.loading && <EmptyState
@@ -116,7 +155,20 @@ export function BenchmarksPage() {
           <div role="cell" data-label="Actions"><Button variant="tertiary" aria-label={`Delete benchmark for ${sample.model_id}`} onClick={() => void remove(sample.id)}><Trash2 size={15} /></Button></div>
         </div>)}
       </div></Panel>}
-      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Only shared:</strong> model name, context window size, and measured inference tok/s.</p><p><strong>Not shared:</strong> prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
+      {selectedModel && <LegalDialog eyebrow="Benchmark detail" title={selectedModel} titleId="benchmark-model-title" onClose={closeModelDetail} returnFocusRef={modelTriggerRef}>
+        <p className="modal-description">Measured results only. Missing concurrency or context combinations remain blank.</p>
+        {modelDetail.loading && <LoadingState label="Loading model benchmark" />}
+        {modelDetail.error && <ErrorState message={modelDetail.error} onRetry={modelDetail.reload} />}
+        {modelDetail.data && <>
+          {[...new Set(modelDetail.data.points.map((point) => point.tensor_parallel_size))].length > 1 && <div className="benchmark-tp-tabs" role="tablist" aria-label="Tensor parallel size">{[...new Set(modelDetail.data.points.map((point) => point.tensor_parallel_size))].map((size) => <button type="button" role="tab" aria-selected={selectedTp === size} key={size} onClick={() => setSelectedTp(size)}>TP {size}</button>)}</div>}
+          <div className="benchmark-chart-stack">
+            <BenchmarkLineChart title="Prompt throughput" metric="prompt_tokens_per_second" points={modelDetail.data.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
+            <BenchmarkLineChart title="Text generation throughput" metric="generation_tokens_per_second" points={modelDetail.data.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
+          </div>
+          <p className="benchmark-method-note">Each point is the average of completed coordinated runs for the exact model, context window, concurrency, and TP size. Results vary with runtime, thermals, networking, and workload.</p>
+        </>}
+      </LegalDialog>}
+      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Benchmark JSON:</strong> model identifier, context-window size, measured inference tok/s, and—when a coordinated run records them—concurrency and TP size.</p><p><strong>Never in benchmark JSON:</strong> prompts or outputs, runtime, revision, quantization, hardware, settings, account email, host identity, or paths. The service still receives ordinary authenticated request and network metadata.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
     </div>
   )
 }

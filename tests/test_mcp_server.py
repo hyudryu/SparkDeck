@@ -89,12 +89,14 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await client.benchmark(
             "mcp-1", prompts=["one", "two"], repetitions=1,
-            concurrency=2, max_tokens=10, warmup_requests=0,
+            concurrency=10, max_tokens=10, warmup_requests=0,
         )
 
         self.assertEqual(result["model"], "served-model")
-        self.assertEqual(result["metrics"]["completion_tokens"], 20)
+        self.assertEqual(result["configuration"]["requests"], 10)
+        self.assertEqual(result["metrics"]["completion_tokens"], 100)
         self.assertGreater(result["metrics"]["output_tokens_per_second"], 0)
+        self.assertEqual(result["recording"]["status"], "recorded")
 
 
 class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):

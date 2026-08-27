@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { useEffect } from 'react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
@@ -32,6 +32,38 @@ function ProtectedRequestOnSignIn() {
 }
 
 describe('settings page', () => {
+  it('opens accessible legal dialogs and links bug reports without saving settings', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ theme: 'dark', hf_token_configured: false, community_api_url: '' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const privacy = await screen.findByRole('button', { name: 'View policy' })
+    await user.click(privacy)
+    const policy = screen.getByRole('dialog', { name: 'SparkDeck Privacy Policy' })
+    expect(policy).toHaveTextContent('Telemetry is off unless you sign in and explicitly opt in')
+    expect(policy).toHaveTextContent('Prompt text, system messages, retrieved context, uploaded content, and model output are never included')
+    expect(policy).toHaveTextContent('California residents may have rights')
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: 'SparkDeck Privacy Policy' })).not.toBeInTheDocument()
+    expect(privacy).toHaveFocus()
+
+    await user.click(screen.getByRole('button', { name: 'View terms' }))
+    const terms = screen.getByRole('dialog', { name: 'Terms & Conditions' })
+    expect(terms).toHaveTextContent('at least 18 years old')
+    expect(terms).toHaveTextContent('observations, not guarantees')
+    await user.click(within(terms).getByRole('button', { name: 'Done' }))
+
+    expect(screen.getByRole('link', { name: /Report a bug/ })).toHaveAttribute('href', 'https://github.com/hyudryu/SparkDeck/issues/new')
+    expect(screen.getByRole('link', { name: /Report a bug/ })).toHaveAttribute('target', '_blank')
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false)
+  })
+
   it('shows the version embedded when the frontend was built', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({
       theme: 'system', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
@@ -278,7 +310,7 @@ describe('community features sign-in', () => {
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
     expect(await screen.findByRole('heading', { name: 'Community Features' })).toBeInTheDocument()
-    expect(screen.getByText('Create an account or sign in to share anonymized benchmark telemetry and see community data.')).toBeInTheDocument()
+    expect(screen.getByText('Create an account or sign in to access community data. Benchmark sharing remains off until you explicitly enable it.')).toBeInTheDocument()
     expect(screen.getByLabelText('Email')).toBeInTheDocument()
     expect(screen.getByLabelText('Password')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()
@@ -434,7 +466,7 @@ describe('community features sign-in', () => {
 
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
-    expect(await screen.findByText('Restoring community sessionâ€¦')).toBeInTheDocument()
+    expect(await screen.findByText('Restoring community session…')).toBeInTheDocument()
     expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Sign in' })).not.toBeInTheDocument()
 
@@ -443,7 +475,7 @@ describe('community features sign-in', () => {
     }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
 
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()
-    expect(screen.queryByText('Restoring community sessionâ€¦')).not.toBeInTheDocument()
+    expect(screen.queryByText('Restoring community session…')).not.toBeInTheDocument()
   })
 
   it('pressing Enter in credentials does not submit dirty application settings', async () => {
@@ -545,6 +577,8 @@ describe('community features sign-in', () => {
     await user.type(screen.getByLabelText('Email'), 'new@example.com')
     await user.type(screen.getByLabelText('Password'), 'Password1')
     await user.type(screen.getByLabelText('Confirm password'), 'Password1')
+    expect(screen.getByRole('button', { name: 'Create account' })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: /at least 18 years old/ }))
     await user.click(screen.getByRole('button', { name: 'Create account' }))
 
     expect(await screen.findByLabelText('Confirmation code')).toBeInTheDocument()
@@ -571,6 +605,7 @@ describe('community features sign-in', () => {
     await user.type(screen.getByLabelText('Email'), 'new@example.com')
     await user.type(screen.getByLabelText('Password'), 'Password1')
     await user.type(screen.getByLabelText('Confirm password'), 'Password2')
+    await user.click(screen.getByRole('checkbox', { name: /at least 18 years old/ }))
     await user.click(screen.getByRole('button', { name: 'Create account' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Passwords do not match')

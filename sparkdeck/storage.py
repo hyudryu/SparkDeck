@@ -16,6 +16,7 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
     "model_id", "context_window_size", "inference_tokens_per_second",
+    "concurrency", "tensor_parallel_size",
 })
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
@@ -91,6 +92,20 @@ class SparkDeckStore:
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
+                CREATE TABLE IF NOT EXISTS benchmark_series_points (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    deployment_id TEXT,
+                    model_id TEXT NOT NULL,
+                    context_window_size INTEGER NOT NULL,
+                    concurrency INTEGER NOT NULL,
+                    tensor_parallel_size INTEGER NOT NULL,
+                    prompt_tps REAL NOT NULL,
+                    generation_tps REAL NOT NULL,
+                    request_count INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS benchmark_series_model
+                    ON benchmark_series_points(model_id, tensor_parallel_size, context_window_size, concurrency);
                 CREATE TABLE IF NOT EXISTS upload_outbox (
                     sample_id TEXT PRIMARY KEY REFERENCES benchmark_samples(id) ON DELETE CASCADE,
                     status TEXT NOT NULL,
@@ -307,6 +322,79 @@ class SparkDeckStore:
             ).fetchall()
         items = [_benchmark_row(row) for row in rows]
         return items, total
+
+    def add_benchmark_series_point(self, point: dict[str, Any]) -> None:
+        """Persist one coordinated benchmark run without prompts or outputs."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO benchmark_series_points(
+                    id, created_at, deployment_id, model_id, context_window_size,
+                    concurrency, tensor_parallel_size, prompt_tps, generation_tps,
+                    request_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    point["id"], point["created_at"], point.get("deployment_id"),
+                    point["model_id"], point["context_window_size"],
+                    point["concurrency"], point["tensor_parallel_size"],
+                    point["prompt_tokens_per_second"],
+                    point["generation_tokens_per_second"], point["request_count"],
+                ),
+            )
+
+    def benchmark_model_summaries(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT model_id, COUNT(*) AS run_count,
+                          MAX(prompt_tps) AS best_prompt_tps,
+                          MAX(generation_tps) AS best_generation_tps,
+                          MAX(created_at) AS latest_at
+                   FROM benchmark_series_points
+                   GROUP BY model_id ORDER BY latest_at DESC, model_id COLLATE NOCASE"""
+            ).fetchall()
+            dimensions = self._connection.execute(
+                """SELECT DISTINCT model_id, context_window_size, tensor_parallel_size
+                   FROM benchmark_series_points"""
+            ).fetchall()
+        by_model: dict[str, dict[str, set[int]]] = {}
+        for row in dimensions:
+            values = by_model.setdefault(row["model_id"], {"windows": set(), "tp_sizes": set()})
+            values["windows"].add(int(row["context_window_size"]))
+            values["tp_sizes"].add(int(row["tensor_parallel_size"]))
+        return [{
+            "model_id": row["model_id"],
+            "run_count": int(row["run_count"]),
+            "best_prompt_tokens_per_second": float(row["best_prompt_tps"]),
+            "best_generation_tokens_per_second": float(row["best_generation_tps"]),
+            "context_windows": sorted(by_model[row["model_id"]]["windows"]),
+            "tensor_parallel_sizes": sorted(by_model[row["model_id"]]["tp_sizes"]),
+            "latest_at": row["latest_at"],
+        } for row in rows]
+
+    def benchmark_model_detail(self, model_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT context_window_size, concurrency, tensor_parallel_size,
+                          AVG(prompt_tps) AS prompt_tps,
+                          AVG(generation_tps) AS generation_tps,
+                          COUNT(*) AS sample_count
+                   FROM benchmark_series_points WHERE model_id = ?
+                   GROUP BY context_window_size, concurrency, tensor_parallel_size
+                   ORDER BY tensor_parallel_size, context_window_size, concurrency""",
+                (model_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        return {
+            "model_id": model_id,
+            "points": [{
+                "context_window_size": int(row["context_window_size"]),
+                "concurrency": int(row["concurrency"]),
+                "tensor_parallel_size": int(row["tensor_parallel_size"]),
+                "prompt_tokens_per_second": float(row["prompt_tps"]),
+                "generation_tokens_per_second": float(row["generation_tps"]),
+                "sample_count": int(row["sample_count"]),
+            } for row in rows],
+        }
 
     def community_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate only the fields that are eligible for community sharing.
@@ -553,7 +641,7 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
-    """Build the exact three-field cloud payload, separate from local history."""
+    """Build the strict cloud payload allowlist, separate from local history."""
     value = _benchmark_row(row)
     context_window = community_context_window(value["configuration"])
     speed = _positive_speed(value["generation_tokens_per_second"])
@@ -565,8 +653,16 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "context_window_size": context_window,
         "inference_tokens_per_second": speed,
     }
-    if set(payload) != COMMUNITY_UPLOAD_FIELDS:
-        raise ValueError("community upload payload does not match the public field contract")
+    concurrency = _positive_integer(value["configuration"].get("benchmark_concurrency"))
+    tensor_parallel_size = _positive_integer(
+        value["configuration"].get("tensor_parallel_size")
+    )
+    if concurrency is not None:
+        payload["concurrency"] = concurrency
+    if tensor_parallel_size is not None:
+        payload["tensor_parallel_size"] = tensor_parallel_size
+    if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
+        raise ValueError("community upload payload exceeds the public field contract")
     return payload
 
 
@@ -592,3 +688,13 @@ def _positive_speed(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 and math.isfinite(parsed) else None
+
+
+def _positive_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 < parsed <= 100_000_000 else None

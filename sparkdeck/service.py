@@ -41,7 +41,7 @@ _SAFE_CONFIGURATION_KEYS = {
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
-    "runtime_version",
+    "runtime_version", "benchmark_concurrency",
 }
 _LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -533,6 +533,84 @@ class SparkDeckService:
             "availability": "available",
             "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
         }
+
+    async def record_benchmark_series_point(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Record aggregate benchmark counters; raw prompts and outputs are rejected upstream."""
+        deployment_id = str(body.get("deployment_id") or "").strip()
+        if not deployment_id:
+            raise ValueError("deployment_id is required")
+        deployments = await self.deployments()
+        deployment = next((item for item in deployments if (
+            item.get("id") == deployment_id
+            or (item.get("settings") or {}).get("manager_deployment_id") == deployment_id
+        )), None)
+        if deployment is None:
+            raise LookupError("deployment not found")
+        settings = deployment.get("settings") or {}
+        context_window = community_context_window(settings)
+        if context_window is None:
+            raise ValueError("deployment does not declare a context window")
+
+        concurrency = _bounded_benchmark_integer(body.get("concurrency"), "concurrency")
+        if concurrency not in {1, 2, 5, 10}:
+            raise ValueError("concurrency must be one of 1, 2, 5, or 10")
+        request_count = _bounded_benchmark_integer(body.get("request_count"), "request_count")
+        if request_count < concurrency:
+            raise ValueError("request_count must be at least the measured concurrency")
+        prompt_tokens = _bounded_benchmark_integer(body.get("prompt_tokens"), "prompt_tokens", allow_zero=True)
+        generation_tokens = _bounded_benchmark_integer(body.get("generation_tokens"), "generation_tokens", allow_zero=True)
+        wall_seconds = _positive_finite(body.get("wall_seconds"), "wall_seconds")
+        if prompt_tokens == 0 and generation_tokens == 0:
+            raise ValueError("benchmark must include measured tokens")
+
+        tensor_parallel_size = 1
+        raw_tp = settings.get("tensor_parallel_size")
+        if raw_tp is not None:
+            tensor_parallel_size = _bounded_benchmark_integer(raw_tp, "tensor_parallel_size")
+        point = {
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "deployment_id": deployment.get("id"),
+            "model_id": str((deployment.get("model") or {}).get("repository") or "local-model"),
+            "context_window_size": context_window,
+            "concurrency": concurrency,
+            "tensor_parallel_size": tensor_parallel_size,
+            "prompt_tokens_per_second": prompt_tokens / wall_seconds,
+            "generation_tokens_per_second": generation_tokens / wall_seconds,
+            "request_count": request_count,
+        }
+        await asyncio.to_thread(self.store.add_benchmark_series_point, point)
+        model_id = point["model_id"]
+        runtime = RuntimeKind(str(deployment.get("runtime") or RuntimeKind.VLLM.value))
+        configuration = self._safe_configuration({
+            **settings,
+            "context_length": context_window,
+            "benchmark_concurrency": concurrency,
+            "tensor_parallel_size": tensor_parallel_size,
+        })
+        hardware, _hardware_verified = await self._managed_hardware_snapshot(deployment)
+        sample = BenchmarkSample(
+            id=str(uuid.uuid4()), created_at=point["created_at"],
+            deployment_id=deployment.get("id"),
+            model=ModelIdentity(repository=model_id), runtime=runtime,
+            runtime_version=_optional_string(settings.get("runtime_version")),
+            hardware=hardware, configuration=configuration,
+            input_tokens=prompt_tokens, output_tokens=generation_tokens,
+            latency_ms=wall_seconds * 1000, ttft_ms=None,
+            generation_tokens_per_second=point["generation_tokens_per_second"],
+            prompt_tokens_per_second=point["prompt_tokens_per_second"],
+            cold_start=False, eligible_for_community=(
+                model_id != "local-model" and generation_tokens > 0
+            ),
+        )
+        consent = bool(await asyncio.to_thread(
+            self.store.get_setting, "community_consent", False,
+        ))
+        await asyncio.to_thread(
+            self.store.add_benchmark, sample,
+            queue=sample.eligible_for_community and consent,
+        )
+        return point
 
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None
@@ -1596,6 +1674,31 @@ class SparkDeckService:
 def _optional_string(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _bounded_benchmark_integer(value: Any, name: str, *, allow_zero: bool = False) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    minimum = 0 if allow_zero else 1
+    if parsed < minimum or parsed > 100_000_000:
+        raise ValueError(f"{name} is outside the supported range")
+    return parsed
+
+
+def _positive_finite(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > 86_400:
+        raise ValueError(f"{name} is outside the supported range")
+    return parsed
 
 
 def _requested_node_ids(body: dict[str, Any]) -> list[str] | None:

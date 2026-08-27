@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,12 @@ class SparkDeckStore:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    @contextmanager
+    def locked(self):
+        """Hold the store's re-entrant lock across a compound state change."""
+        with self._lock:
+            yield
 
     def _migrate(self) -> None:
         with self._lock, self._connection:
@@ -394,15 +401,10 @@ class SparkDeckStore:
 
     def outbox_batch(self, limit: int = 50, now: str | None = None) -> list[dict[str, Any]]:
         """Return an idempotent upload batch without exposing private deployment data."""
-        return [
-            payload
-            for _, payload in self.outbox_batch_with_ids(limit, now)
-        ]
+        return [item["payload"] for item in self.outbox_entries(limit, now)]
 
-    def outbox_batch_with_ids(
-        self, limit: int = 50, now: str | None = None,
-    ) -> list[tuple[str, dict[str, Any]]]:
-        """Return ``(sample_id, payload)`` pairs for the uploader to mark results."""
+    def outbox_entries(self, limit: int = 50, now: str | None = None) -> list[dict[str, Any]]:
+        """Return private queue identifiers alongside privacy-safe upload payloads."""
         limit = min(200, max(1, int(limit)))
         now = now or datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -428,9 +430,8 @@ class SparkDeckStore:
             if (payload := _upload_row(row)) is not None
         }
         return [
-            (sample_id, by_id[sample_id])
-            for sample_id in wanted
-            if sample_id in by_id
+            {"sample_id": sample_id, "payload": by_id[sample_id]}
+            for sample_id in wanted if sample_id in by_id
         ]
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
@@ -475,16 +476,12 @@ class SparkDeckStore:
             ).fetchall()
         counts = {row["status"]: row["count"] for row in rows}
         pairing = self.get_setting("device_pairing", {"status": "not_paired"})
-        if isinstance(pairing, dict):
-            # The refresh token only ever leaves the store for Cognito token
-            # minting; it must not leak into API responses.
-            pairing = {
-                key: value for key, value in pairing.items()
-                if key != "refresh_token"
-            }
         return {
             "consent": bool(self.get_setting("community_consent", False)),
-            "pairing": pairing,
+            # Account claims and upload credentials are private service state.
+            "pairing": {
+                "status": "paired" if pairing.get("status") == "paired" else "not_paired",
+            },
             "outbox": {
                 "pending": counts.get("pending", 0),
                 "waiting_for_account": counts.get("waiting_for_account", 0),

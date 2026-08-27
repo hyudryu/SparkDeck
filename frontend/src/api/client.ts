@@ -15,6 +15,7 @@ import type {
   LogEntry,
   SyncStatus,
   CommunityPairResponse,
+  CommunityAuthConfig,
   NodeInventoryItem,
   RenameNodeInput,
   ImagePullResult,
@@ -49,7 +50,7 @@ export class ApiError extends Error {
   }
 }
 
-type AuthTokenProvider = () => string | undefined
+type AuthTokenProvider = () => string | undefined | Promise<string | undefined>
 
 let authTokenProvider: AuthTokenProvider | undefined
 
@@ -58,7 +59,10 @@ export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = path.startsWith('/api/v1/community/') ? authTokenProvider?.() : undefined
+  const token = (
+    path.startsWith('/api/v1/community/')
+    && path !== '/api/v1/community/auth-config'
+  ) ? await authTokenProvider?.() : undefined
   const response = await fetch(path, {
     ...init,
     headers: {
@@ -319,10 +323,11 @@ export const api = {
     aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
       request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
-      const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number> }>('/api/v1/community/sync', { signal })
+      const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
       return {
         sharing_enabled: data.consent,
         account_paired: data.pairing?.status === 'paired',
+        upload_configured: Boolean(data.upload_configured),
         pending_count: (data.outbox?.pending ?? 0) + (data.outbox?.waiting_for_account ?? 0),
         synced_count: data.outbox?.synced ?? 0,
         failed_count: data.outbox?.failed ?? 0,
@@ -343,6 +348,7 @@ export const api = {
       request<void>(`/api/v1/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },
   community: {
+    authConfig: () => request<CommunityAuthConfig>('/api/v1/community/auth-config'),
     pair: (idToken: string, refreshToken?: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
       method: 'POST',
       body: JSON.stringify({

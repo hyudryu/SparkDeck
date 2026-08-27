@@ -2,7 +2,11 @@ import { api } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 import { useResource } from './useResource'
 
-export const COMMUNITY_ACCESS_HINT = 'Sign in and enable telemetry in Settings → Community Features to see community data.'
+export function communityAccessHint(signedIn: boolean) {
+  return signedIn
+    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    : 'Sign in under Settings → Community Features to see community data.'
+}
 
 // Community features are enabled only for a signed-in user who has also opted
 // in to telemetry sharing. Call reload() after consent or pairing changes so

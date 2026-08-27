@@ -7,7 +7,9 @@ import { ExplorePage } from './ExplorePage'
 const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true, reload: () => undefined }))
 
 vi.mock('../hooks/useCommunityAccess', () => ({
-  COMMUNITY_ACCESS_HINT: 'Sign in and enable telemetry in Settings → Community Features to see community data.',
+  communityAccessHint: (signedIn: boolean) => signedIn
+    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    : 'Sign in under Settings → Community Features to see community data.',
   useCommunityAccess: () => communityAccess,
 }))
 
@@ -181,7 +183,7 @@ describe('ExplorePage model rows', () => {
 
     const tab = await screen.findByRole('tab', { name: 'Community Run Models' })
     expect(tab).toBeDisabled()
-    expect(tab).toHaveAttribute('title', 'Sign in and enable telemetry in Settings → Community Features to see community data.')
+    expect(tab).toHaveAttribute('title', 'Sign in under Settings → Community Features to see community data.')
     expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeDisabled()
 
     await user.click(await screen.findByRole('button', { name: 'Expand org/model' }))

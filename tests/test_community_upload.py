@@ -1,10 +1,13 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import jwt as pyjwt
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from sparkdeck.models import BenchmarkSample, ModelIdentity, RuntimeKind
 from sparkdeck.storage import SparkDeckStore
@@ -12,6 +15,32 @@ from sparkdeck.storage import SparkDeckStore
 
 with patch("docker.from_env", return_value=Mock()):
     import server
+
+
+SIGNING_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _id_token():
+    return pyjwt.encode({
+        "sub": "user-sub-123",
+        "email": "user@example.com",
+        "iss": server.COGNITO_ISSUER,
+        "aud": server.COGNITO_CLIENT_ID,
+        "exp": int(time.time()) + 3600,
+        "iat": int(time.time()),
+        "token_use": "id",
+    }, SIGNING_KEY, algorithm="RS256", headers={"kid": "test-key"})
+
+
+def _jwks_stub():
+    client = Mock()
+    client.get_signing_key_from_jwt.return_value = Mock(
+        key=SIGNING_KEY.public_key())
+    return client
+
+
+def _bearer():
+    return {"Authorization": f"Bearer {_id_token()}"}
 
 
 def _sample(sample_id="sample-1"):
@@ -46,12 +75,22 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             server.sparkdeck.store, "get_setting",
         )
         self.get_setting = self.get_setting_patch.start()
-        self.get_setting.side_effect = lambda key, default=None: (
-            "https://community.example" if key == "community_api_url" else default
+        self.get_setting.side_effect = lambda key, default=None: {
+            "community_api_url": "https://community.example",
+            "community_consent": True,
+            "device_pairing": {
+                "status": "paired", "sub": "user-sub-123",
+                "email": "user@example.com", "refresh_token": "refresh-1",
+            },
+        }.get(key, default)
+        self.jwks_patch = patch.object(
+            server, "_cognito_jwks", return_value=_jwks_stub(),
         )
+        self.jwks_patch.start()
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.jwks_patch.stop()
         self.get_setting_patch.stop()
 
     async def test_passthrough_forwards_the_authorization_header(self):
@@ -73,17 +112,17 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
+        authorization = _bearer()["Authorization"]
         response = await self.client.get(
             "/api/v1/community/aggregates",
-            headers={"Authorization": "Bearer id-token-1"},
+            headers={"Authorization": authorization},
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "ok")
         self.assertEqual(response.json()["items"][0]["model_id"], "org/model")
         self.assertEqual(str(seen[0].url), "https://community.example/v1/aggregates")
-        self.assertEqual(
-            seen[0].headers["authorization"], "Bearer id-token-1")
+        self.assertEqual(seen[0].headers["authorization"], authorization)
 
     async def test_upstream_unauthorized_maps_to_401(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -92,12 +131,19 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        response = await self.client.get("/api/v1/community/aggregates")
+        response = await self.client.get(
+            "/api/v1/community/aggregates", headers=_bearer())
 
         self.assertEqual(response.status_code, 401)
 
     async def test_unconfigured_falls_back_to_the_local_stub(self):
-        self.get_setting.side_effect = lambda key, default=None: default
+        self.get_setting.side_effect = lambda key, default=None: {
+            "community_consent": True,
+            "device_pairing": {
+                "status": "paired", "sub": "user-sub-123",
+                "email": "user@example.com", "refresh_token": "refresh-1",
+            },
+        }.get(key, default)
         http = _stub_http(self, Mock(side_effect=AssertionError("no HTTP")))
         self.addAsyncCleanup(http.aclose)
         with patch.object(
@@ -107,7 +153,8 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
                 "evidence_policy": {},
             }),
         ):
-            response = await self.client.get("/api/v1/community/aggregates")
+            response = await self.client.get(
+                "/api/v1/community/aggregates", headers=_bearer())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "not_configured")
@@ -119,7 +166,8 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        response = await self.client.get("/api/v1/community/aggregates")
+        response = await self.client.get(
+            "/api/v1/community/aggregates", headers=_bearer())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "unavailable")

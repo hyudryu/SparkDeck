@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, ApiError, setAuthTokenProvider } from '../api/client'
 import type { CommunityClusterSync } from '../api/types'
 import {
@@ -65,36 +65,81 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthState['status']>('signed-out')
   const [idToken, setIdToken] = useState<string>()
   const [clusterSync, setClusterSync] = useState<CommunityClusterSync | null>(null)
+  const idTokenRef = useRef<string | undefined>(undefined)
+  const refreshPromiseRef = useRef<Promise<string | undefined> | null>(null)
+  const publishIdToken = useCallback((token: string | undefined) => {
+    idTokenRef.current = token
+    setIdToken(token)
+  }, [])
+
+  const validIdToken = useCallback(async () => {
+    const current = idTokenRef.current
+    if (!current) return undefined
+    const expiresAt = (decodeIdToken(current).exp ?? 0) * 1000
+    if (expiresAt - Date.now() > 60_000) return current
+    if (!refreshPromiseRef.current) {
+      refreshPromiseRef.current = (async () => {
+        const tokens = await refresh()
+        if (!tokens || isExpired(tokens.idToken)) {
+          publishIdToken(undefined)
+          setStatus('signed-out')
+          return undefined
+        }
+        publishIdToken(tokens.idToken)
+        return tokens.idToken
+      })().finally(() => {
+        refreshPromiseRef.current = null
+      })
+    }
+    return refreshPromiseRef.current
+  }, [publishIdToken])
 
   useEffect(() => {
     let cancelled = false
     const restore = async () => {
-      let tokens = storedTokens()
-      if (tokens && isExpired(tokens.idToken)) tokens = await refresh()
-      if (cancelled) return
-      if (tokens && !isExpired(tokens.idToken)) {
-        setIdToken(tokens.idToken)
-        setStatus('signed-in')
-        // The backend may have lost its pairing while we were away; re-pair
-        // best-effort (idempotent same-sub no-op) without signing out on failure.
-        // A refreshed TokenSet omits the refresh token, so read it from storage.
-        api.community.pair(tokens.idToken, storedTokens()?.refreshToken ?? tokens.refreshToken)
-          .then((paired) => { if (!cancelled) setClusterSync(paired.cluster ?? null) })
-          .catch(() => undefined)
-      } else {
-        setStatus('signed-out')
+      try {
+        let tokens = storedTokens()
+        if (tokens && isExpired(tokens.idToken)) tokens = await refresh()
+        if (cancelled) return
+        if (tokens && !isExpired(tokens.idToken)) {
+          try {
+            // A refreshed TokenSet omits the refresh token, so the backend
+            // re-pair reads it from storage (the uploader needs it to mint
+            // short-lived ID tokens for consented telemetry).
+            const paired = await api.community.pair(
+              tokens.idToken,
+              storedTokens()?.refreshToken ?? tokens.refreshToken,
+            )
+            if (cancelled) return
+            setClusterSync(paired.cluster ?? null)
+            publishIdToken(tokens.idToken)
+            setStatus('signed-in')
+            return
+          } catch {
+            await cognitoSignOut()
+          }
+        }
+      } catch {
+        // Retryable refresh failures retain browser credentials for the next
+        // restore attempt, but never create an unpaired signed-in UI session.
       }
+      if (cancelled) return
+      setClusterSync(null)
+      publishIdToken(undefined)
+      setStatus('signed-out')
     }
     void restore()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [publishIdToken])
 
   useEffect(() => {
-    setAuthTokenProvider(() => idToken)
-    return () => setAuthTokenProvider(undefined)
-  }, [idToken])
+    setAuthTokenProvider(validIdToken)
+    return () => {
+      setAuthTokenProvider(undefined)
+    }
+  }, [validIdToken])
 
   const value = useMemo<AuthState>(() => ({
     status,
@@ -117,7 +162,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             ? pairingConflictMessage(pairError)
             : pairError
         }
-        setIdToken(tokens.idToken)
+        publishIdToken(tokens.idToken)
         setStatus('signed-in')
       } catch (reason) {
         setStatus('signed-out')
@@ -131,13 +176,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     confirmForgotPassword,
     signOut: async () => {
       setClusterSync(null)
-      const unpaired = await api.community.unpair().catch(() => undefined)
+      const unpaired = await api.community.unpair()
       await cognitoSignOut()
       setClusterSync(unpaired?.cluster ?? null)
-      setIdToken(undefined)
+      publishIdToken(undefined)
       setStatus('signed-out')
     },
-  }), [status, idToken, clusterSync])
+  }), [status, idToken, clusterSync, publishIdToken])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

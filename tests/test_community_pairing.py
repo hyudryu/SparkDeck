@@ -43,6 +43,10 @@ def _jwks_stub(public_key):
     return client
 
 
+def _bearer(token=None):
+    return {"Authorization": f"Bearer {token or _id_token()}"}
+
+
 class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = httpx.AsyncClient(
@@ -95,6 +99,19 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         csp = response.headers["Content-Security-Policy"]
         self.assertIn(
             "connect-src 'self' https://cognito-idp.us-east-2.amazonaws.com", csp)
+
+    async def test_auth_config_uses_the_backend_runtime_values(self):
+        with (
+            patch.object(server, "COGNITO_IDP_ORIGIN", "https://idp.example"),
+            patch.object(server, "COGNITO_CLIENT_ID", "custom-client"),
+        ):
+            response = await self.client.get("/api/v1/community/auth-config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "idp_endpoint": "https://idp.example/",
+            "client_id": "custom-client",
+        })
 
     async def test_valid_id_token_pairs_the_device(self):
         response = await self.client.post(
@@ -249,13 +266,23 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.set_setting.assert_not_called()
 
+    async def test_non_id_token_is_rejected(self):
+        response = await self.client.post(
+            "/api/v1/community/pair",
+            json={"id_token": _id_token(token_use="access")},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.set_setting.assert_not_called()
+
     async def test_unpair_marks_the_device_not_paired(self):
         self.get_setting.return_value = {
             "status": "paired", "sub": "user-sub-123",
             "email": "user@example.com",
         }
 
-        response = await self.client.delete("/api/v1/community/pair")
+        response = await self.client.delete(
+            "/api/v1/community/pair", headers=_bearer())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
@@ -267,7 +294,8 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.push_unpair.assert_awaited_once_with("user-sub-123")
 
     async def test_unpair_without_local_pairing_skips_the_fanout(self):
-        response = await self.client.delete("/api/v1/community/pair")
+        response = await self.client.delete(
+            "/api/v1/community/pair", headers=_bearer())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
@@ -275,6 +303,66 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "cluster": {"applied": [], "conflicts": [], "errors": []},
         })
         self.push_unpair.assert_not_awaited()
+
+    async def test_unpair_requires_the_matching_account(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "other-sub", "email": "other@example.com",
+        }
+
+        response = await self.client.delete(
+            "/api/v1/community/pair", headers=_bearer())
+
+        self.assertEqual(response.status_code, 403)
+        self.set_setting.assert_not_called()
+        self.push_unpair.assert_not_awaited()
+
+    async def test_unpair_requires_a_valid_bearer_when_paired(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123", "email": "user@example.com",
+        }
+
+        response = await self.client.delete("/api/v1/community/pair")
+
+        self.assertEqual(response.status_code, 401)
+        self.set_setting.assert_not_called()
+        self.push_unpair.assert_not_awaited()
+
+    async def test_aggregates_require_matching_pairing_and_consent(self):
+        self.get_setting.side_effect = lambda key, default=None: {
+            "device_pairing": {
+                "status": "paired", "sub": "user-sub-123",
+                "email": "user@example.com",
+            },
+            "community_consent": True,
+        }.get(key, default)
+        with patch.object(
+            server.sparkdeck, "community_aggregates",
+            AsyncMock(return_value={"items": []}),
+        ) as aggregate:
+            response = await self.client.get(
+                "/api/v1/community/aggregates", headers=_bearer())
+
+        self.assertEqual(response.status_code, 200)
+        aggregate.assert_awaited_once_with()
+
+    async def test_aggregates_are_denied_before_service_access(self):
+        self.get_setting.side_effect = lambda key, default=None: {
+            "device_pairing": {
+                "status": "paired", "sub": "user-sub-123",
+                "email": "user@example.com",
+            },
+            "community_consent": False,
+        }.get(key, default)
+        with patch.object(
+            server.sparkdeck, "community_aggregates", AsyncMock(),
+        ) as aggregate:
+            missing = await self.client.get("/api/v1/community/aggregates")
+            no_consent = await self.client.get(
+                "/api/v1/community/aggregates", headers=_bearer())
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(no_consent.status_code, 403)
+        aggregate.assert_not_awaited()
 
 
 class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
@@ -353,7 +441,7 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"applied": True, "already": True})
         self.set_setting.assert_not_called()
-        self.promote.assert_not_called()
+        self.promote.assert_called_once_with()
 
     async def test_different_account_pairing_is_refused(self):
         self.pair_locally()

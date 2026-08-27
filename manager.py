@@ -1417,7 +1417,7 @@ class Manager:
         ), return_exceptions=True)
         return _community_pairing_fanout(nodes, results)
 
-    async def push_community_unpair(self, sub: str | None) -> dict:
+    async def push_community_unpair(self, sub: str) -> dict:
         """Best-effort fan-out of a community sign-out to every enabled peer."""
         nodes = [
             node for node in self.node_registry.nodes

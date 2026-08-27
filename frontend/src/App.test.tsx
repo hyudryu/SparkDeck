@@ -705,6 +705,58 @@ describe('model deployments', () => {
     ))
   })
 
+  it('uses the persisted deployment revision when choosing start nodes', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-pinned', alias: 'Pinned model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, model_revision: 'release-b',
+        status: 'stopped', settings: {}, node_ids: [],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Default branch', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Pinned revision', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Default branch', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Pinned revision', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['release-b'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Pinned model' })
+    expect(within(dialog).getByRole('radio', { name: /Default branch/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /Pinned revision/ })).toBeChecked()
+  })
+
+  it('starts controller-owned llama.cpp artifacts without an HF cache entry', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-llama', alias: 'Local GGUF', runtime: 'llama.cpp', kind: 'managed',
+        model: { repository: 'org/llama-artifact' }, status: 'stopped', settings: {},
+        node_ids: ['local'], deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Worker', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Local GGUF' })
+    expect(within(dialog).getByRole('radio', { name: /Controller/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Worker/ })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Start on 1 node' })).toBeEnabled()
+    expect(dialog).toHaveTextContent('This local artifact can run only on the controller')
+  })
+
   it('keeps the persisted replicated layout even when tensor parallelism is 1', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

@@ -136,6 +136,7 @@ interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   required_node_count?: number
+  model_revision?: string
   created_at?: string
 }
 
@@ -162,7 +163,7 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     id: item.id,
     alias: item.alias,
     model_id: item.model.repository,
-    model_revision: item.model.revision,
+    model_revision: item.model_revision ?? item.model.revision,
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',

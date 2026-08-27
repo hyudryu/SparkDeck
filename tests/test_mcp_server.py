@@ -147,6 +147,18 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             nonlocal request_count
             if request.url.path == "/v1/models":
                 return httpx.Response(200, json={"data": [{"id": "served-model"}]})
+            request_body = json.loads(request.content)
+            if request_body["max_tokens"] == 1:
+                return httpx.Response(
+                    200,
+                    content=(
+                        'data: {"choices":[{"delta":{"content":"probe"}}]}\n\n'
+                        'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                        '"completion_tokens":1}}\n\n'
+                        'data: [DONE]\n\n'
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                )
             wave = request_count // 5
             request_count += 1
             arrivals[wave] += 1
@@ -176,6 +188,58 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["configuration"]["requests"], 10)
         self.assertEqual(arrivals, [5, 5])
         self.assertEqual(recorded_bodies[0]["request_count"], 10)
+
+    async def test_benchmark_probes_and_caches_stream_options_before_timing(self) -> None:
+        attempts = []
+        recorded_bodies = []
+
+        async def controller_handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                recorded_bodies.append(json.loads(request.content))
+                return httpx.Response(201, json={"id": "run-fallback"})
+            return httpx.Response(200, json={
+                "deployments": [{
+                    "id": "mcp-1", "status": "ready", "api_port": 8000,
+                }]
+            })
+
+        async def inference_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "served-model"}]})
+            request_body = json.loads(request.content)
+            attempts.append(("stream_options" in request_body, request_body["max_tokens"]))
+            if "stream_options" in request_body:
+                await asyncio.sleep(0.2)
+                return httpx.Response(400, json={"detail": "unsupported stream_options"})
+            await asyncio.sleep(0.005)
+            return httpx.Response(
+                200,
+                content=(
+                    'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+                    'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                    '"completion_tokens":10}}\n\n'
+                    'data: [DONE]\n\n'
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        client = ControllerClient(
+            transport=httpx.MockTransport(controller_handler),
+            inference_transport=httpx.MockTransport(inference_handler),
+        )
+        result = await client.benchmark(
+            "mcp-1", prompts=["one"], repetitions=1,
+            concurrency=2, max_tokens=10, warmup_requests=0,
+        )
+
+        self.assertEqual(attempts, [
+            (True, 1), (False, 1), (False, 10), (False, 10),
+        ])
+        self.assertLess(result["metrics"]["wall_seconds"], 0.1)
+        self.assertEqual(result["recording"], {
+            "status": "recorded", "id": "run-fallback",
+        })
+        self.assertEqual(recorded_bodies[0]["request_count"], 2)
 
     async def test_benchmark_does_not_record_without_stream_usage(self) -> None:
         recorded_bodies = []

@@ -342,32 +342,29 @@ class ControllerClient:
             except (httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
                 raise ControllerError(f"could not discover served model at {base_url}: {exc}") from exc
 
-            async def request_once(prompt: str) -> dict[str, Any]:
+            async def request_once(
+                prompt: str, *, include_stream_usage: bool,
+                request_max_tokens: int | None = None,
+            ) -> dict[str, Any]:
                 request_body = {
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
+                    "max_tokens": request_max_tokens or max_tokens,
                     "temperature": temperature,
                     "stream": True,
-                    "stream_options": {"include_usage": True},
                 }
+                if include_stream_usage:
+                    request_body["stream_options"] = {"include_usage": True}
                 started = time.perf_counter()
                 first_token_at: float | None = None
                 usage: dict[str, Any] = {}
                 text_parts: list[str] = []
 
-                async def consume(body: dict[str, Any]) -> bool:
+                async def consume(body: dict[str, Any]) -> None:
                     nonlocal first_token_at, usage
                     async with client.stream(
                         "POST", f"{base_url}/v1/chat/completions", json=body,
                     ) as response:
-                        if response.status_code in {400, 422} and body.get("stream_options"):
-                            # Some OpenAI-compatible servers can stream but do
-                            # not implement include_usage. Retry without that
-                            # option; if usage never arrives, prompt throughput
-                            # is explicitly unavailable and is not persisted.
-                            await response.aread()
-                            return False
                         response.raise_for_status()
                         async for line in response.aiter_lines():
                             event = _stream_event(line)
@@ -382,17 +379,8 @@ class ControllerClient:
                                     first_token_at = time.perf_counter()
                                 if sum(len(value) for value in text_parts) < 240:
                                     text_parts.append(output)
-                    return True
 
-                if not await consume(request_body):
-                    started = time.perf_counter()
-                    first_token_at = None
-                    usage = {}
-                    text_parts = []
-                    await consume({
-                        key: value for key, value in request_body.items()
-                        if key != "stream_options"
-                    })
+                await consume(request_body)
                 completed = time.perf_counter()
                 first_token_seconds = (
                     first_token_at - started if first_token_at is not None else None
@@ -407,9 +395,42 @@ class ControllerClient:
                     "sample": "".join(text_parts)[:240],
                 }
 
-            for index in range(warmup_requests):
+            # Resolve stream_options support once before starting the measured
+            # batch. Servers that reject it are then called directly with the
+            # cached fallback shape, so failed capability attempts cannot
+            # inflate batch wall time or generation/request throughput.
+            stream_usage_supported = True
+            probe_max_tokens = max_tokens if warmup_requests else 1
+            try:
+                await request_once(
+                    prompt_values[0], include_stream_usage=True,
+                    request_max_tokens=probe_max_tokens,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {400, 422}:
+                    raise ControllerError(
+                        f"benchmark capability probe failed "
+                        f"({exc.response.status_code}): {exc.response.text[:500]}"
+                    ) from exc
+                stream_usage_supported = False
                 try:
-                    await request_once(prompt_values[index % len(prompt_values)])
+                    await request_once(
+                        prompt_values[0], include_stream_usage=False,
+                        request_max_tokens=probe_max_tokens,
+                    )
+                except httpx.HTTPError as fallback_exc:
+                    raise ControllerError(
+                        f"benchmark capability fallback failed: {fallback_exc}"
+                    ) from fallback_exc
+            except httpx.HTTPError as exc:
+                raise ControllerError(f"benchmark capability probe failed: {exc}") from exc
+
+            for index in range(1, warmup_requests):
+                try:
+                    await request_once(
+                        prompt_values[index % len(prompt_values)],
+                        include_stream_usage=stream_usage_supported,
+                    )
                 except httpx.HTTPError as exc:
                     raise ControllerError(f"benchmark warmup failed: {exc}") from exc
 
@@ -429,7 +450,9 @@ class ControllerClient:
             async def limited(prompt: str) -> dict[str, Any]:
                 async with semaphore:
                     try:
-                        return await request_once(prompt)
+                        return await request_once(
+                            prompt, include_stream_usage=stream_usage_supported,
+                        )
                     except httpx.HTTPStatusError as exc:
                         raise ControllerError(
                             f"inference request failed ({exc.response.status_code}): {exc.response.text[:500]}"

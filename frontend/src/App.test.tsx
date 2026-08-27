@@ -462,6 +462,55 @@ describe('model deployments', () => {
     expect(contextLength).toHaveValue(32768)
   })
 
+  it('sends launch arguments when adding a managed model server', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({
+          id: 'dep-new', alias: 'Flagged model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local'],
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Add model' }))
+
+    await user.type(screen.getByRole('textbox', { name: 'Display name' }), 'Flagged model')
+    await user.type(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' }), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.type(screen.getByRole('spinbutton', { name: 'GPU memory util' }), '0.85')
+    await user.type(screen.getByRole('textbox', { name: 'Extra flags' }), '--served-model-name "My Model" --kv-cache-dtype fp8')
+    await user.click(screen.getByRole('button', { name: 'Add to 1 node' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'org/model',
+          alias: 'Flagged model',
+          runtime: 'vllm',
+          kind: 'managed',
+          settings: {
+            context_length: 8192,
+            tensor_parallel_size: 1,
+            extra_args: ['--served-model-name', 'My Model', '--kv-cache-dtype', 'fp8'],
+            gpu_memory_utilization: 0.85,
+          },
+          node_ids: ['local'],
+          deployment_mode: 'single',
+        }),
+      }),
+    ))
+    expect(await screen.findByText('Added Flagged model on This device.')).toBeInTheDocument()
+  })
+
   it('groups saved configurations by company and pins cards within a group', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

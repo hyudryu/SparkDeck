@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import docker
 import httpx
 
 from cluster import (
@@ -1801,6 +1802,25 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Controller launch progress", logs)
         self.assertIn("Downloading Docker image", logs)
         self.assertIn("Container has not been created yet", logs)
+
+    async def test_cluster_logs_preserve_launch_progress_when_docker_is_offline(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_member_launches = {}
+        instance._cluster_launch_update(
+            "cluster-test-r0", "pulling_image", "Downloading Docker image",
+            model="example/model",
+            cluster_member={"deployment_id": "test", "node_id": "local", "rank": 0},
+        )
+
+        async def is_managed_container(name):
+            raise docker.errors.DockerException("daemon offline")
+
+        instance.is_managed_container = is_managed_container
+        logs = await instance.get_cluster_member_logs("cluster-test-r0")
+
+        self.assertIn("Controller launch progress", logs)
+        self.assertIn("Downloading Docker image", logs)
+        self.assertIn("Docker is unavailable: daemon offline", logs)
 
     async def test_combined_logs_fall_back_to_coordinator_status(self) -> None:
         instance = Manager.__new__(Manager)

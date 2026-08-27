@@ -1062,6 +1062,13 @@ class SparkDeckService:
         return current
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
+        # Creation persists a provisional record before launching Docker. Keep
+        # deletion on the same lock so it cannot remove that record while the
+        # launch is still in flight and leave an untracked container behind.
+        async with self._deployment_create_lock:
+            return await self._delete_deployment_locked(deployment_id)
+
+    async def _delete_deployment_locked(self, deployment_id: str) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = False
         if not deployment and deployment_id.startswith("container:"):

@@ -119,15 +119,17 @@ def install_release_revision(root: Path, revision: str) -> str:
     return "downgrade"
 
 
-def install_revision(root: Path, revision: str) -> None:
-    """Fast-forward the live checkout to the approved origin/main commit."""
-    forward = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=root,
-        capture_output=True, text=True, check=False,
-    ).returncode == 0
-    if not forward:
-        raise RuntimeError("origin/main is not a forward-only update from the installed revision")
-    run(root, "git", "merge", "--ff-only", revision)
+def install_revision(root: Path, revision: str) -> str:
+    """Install approved main without moving any local branch pointer.
+
+    A node can legitimately run a clean commit whose changes reached main
+    under another hash. Detaching also lets Git's no-overwrite-ignore safety
+    apply uniformly to main, feature, and already-detached installations.
+    """
+    run(
+        root, "git", "checkout", "--no-overwrite-ignore", "--detach", revision,
+    )
+    return "detached"
 
 
 def wait_for_revision(revision: str, timeout: int = 90) -> bool:

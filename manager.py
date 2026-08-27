@@ -2736,7 +2736,8 @@ class Manager:
         )
         return bool((result or {}).get("ready"))
 
-    async def create_deployment(self, body: dict) -> dict:
+    async def _preflight_deployment_launch(self, body: dict) -> dict:
+        """Validate and normalize a launch without mutating runtime state."""
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
@@ -2835,6 +2836,34 @@ class Manager:
                 raise ValueError(
                     f"could not determine fabric IP for {node.get('name', node_id)}"
                 )
+
+        return {
+            "body": body,
+            "engine": engine,
+            "mode": mode,
+            "node_ids": node_ids,
+            "available": available,
+            "model": model,
+            "vllm_parallel_layout": vllm_parallel_layout,
+            "requested_port": requested_port,
+            "local_port": local_port,
+            "master_ip": master_ip,
+            "fabrics": fabrics,
+        }
+
+    async def create_deployment(self, body: dict) -> dict:
+        plan = await self._preflight_deployment_launch(body)
+        body = plan["body"]
+        engine = plan["engine"]
+        mode = plan["mode"]
+        node_ids = plan["node_ids"]
+        available = plan["available"]
+        model = plan["model"]
+        vllm_parallel_layout = plan["vllm_parallel_layout"]
+        requested_port = plan["requested_port"]
+        local_port = plan["local_port"]
+        master_ip = plan["master_ip"]
+        fabrics = plan["fabrics"]
 
         # Persist only after every preflight check succeeds. A failed launch
         # remains visible for diagnosis, but invalid input does not leave a
@@ -3112,6 +3141,17 @@ class Manager:
         # relaunching the deployment through the fully validated path.
         relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
         if relaunch:
+            launch_body = dict(deployment.get("launch_settings") or {})
+            launch_body["recipe_id"] = deployment.get("recipe_id")
+            if node_ids:
+                launch_body["node_ids"] = [str(item) for item in node_ids]
+            # Reuse create_deployment's complete launch preflight before the
+            # first destructive action. A selectable node can still lack the
+            # fabric identity a sharded runtime requires; discovering that
+            # after removing the old ranks would turn a rejected relocation
+            # into an outage.
+            await self._preflight_deployment_launch(launch_body)
+
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
             # settings so every node/rank receives a coherent replacement.
@@ -3132,10 +3172,6 @@ class Manager:
             deployment["members"] = []
             deployment["error"] = None
             self._save_deployments()
-            launch_body = dict(deployment.get("launch_settings") or {})
-            launch_body["recipe_id"] = deployment.get("recipe_id")
-            if node_ids:
-                launch_body["node_ids"] = [str(item) for item in node_ids]
             try:
                 replacement = await self.create_deployment(launch_body)
             except Exception:

@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from sparkdeck.updater import CAPABILITY, CONFIRMATION, UpdateService
+from sparkdeck.updater import CAPABILITY, CONFIRMATION, MAIN_BRANCH, MAIN_COMMIT_API, UpdateService
 from sparkdeck.update_helper import (
     _prepare_frontend_bundle,
     _publish_frontend_bundle,
     _restore_frontend_bundle,
+    fetch_update_target,
+    install_release_revision,
     install_revision,
 )
 
@@ -42,13 +44,35 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp.cleanup()
 
-    async def test_no_release_is_an_honest_blocker(self):
+    async def test_unavailable_main_is_an_honest_blocker(self):
         self.manager.http.get.return_value = response(404, {"message": "Not Found"})
         with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
              patch("sparkdeck.updater.local_blockers", return_value=[]):
             overview = await self.service.overview()
         self.assertFalse(overview["can_update"])
-        self.assertIn("No published GitHub release", overview["blockers"][0])
+        self.assertIn("Could not check origin/main", overview["blockers"][0])
+
+    async def test_overview_resolves_immutable_main_target(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+        self.assertEqual(overview["target"], {
+            "branch": "main",
+            "revision": "b" * 40,
+            "url": "https://github.com/hyudryu/SparkDeck/tree/main",
+        })
+        self.assertFalse(overview["up_to_date"])
+        self.assertTrue(overview["can_update"])
+        self.assertEqual(self.manager.http.get.await_args.args[0], MAIN_COMMIT_API)
+
+    async def test_overview_reports_cluster_up_to_date_at_main_revision(self):
+        self.manager.http.get.return_value = response(200, {"sha": "a" * 40})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+        self.assertTrue(overview["up_to_date"])
+        self.assertFalse(overview["can_update"])
 
     async def test_release_resolves_to_immutable_commit(self):
         self.manager.http.get.side_effect = [
@@ -62,8 +86,19 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_requires_explicit_confirmation(self):
         with self.assertRaisesRegex(ValueError, "confirmation"):
-            await self.service.start_cluster("yes", "v1.2.3")
+            await self.service.start_cluster("yes", "b" * 40)
         self.assertEqual(CONFIRMATION, "update-entire-cluster")
+
+    async def test_start_rejects_when_main_moved_after_confirmation(self):
+        self.manager.http.get.side_effect = [
+            response(200, {"sha": "b" * 40}),
+            response(200, {"sha": "c" * 40}),
+        ]
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "origin/main changed"):
+                await self.service.start_cluster(CONFIRMATION, "b" * 40)
+        self.assertFalse(self.service._read(self.service.cluster_path).get("active", False))
 
     async def test_release_list_filters_drafts_and_keeps_prereleases(self):
         self.manager.http.get.return_value = response(200, [
@@ -92,7 +127,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_failure_stops_before_controller(self):
         state = {
-            "id": "job", "active": True, "phase": "preflight", "target_tag": "v1",
+            "id": "job", "active": True, "phase": "preflight", "target_branch": "main",
             "target_revision": "b" * 40,
             "nodes": [
                 {"id": "worker", "name": "Worker", "local": False, "phase": "pending"},
@@ -105,6 +140,51 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service._run_cluster(state)
         self.assertEqual(state["phase"], "failed")
         self.service.start_local.assert_not_awaited()
+
+    async def test_worker_requests_use_main_branch_and_immutable_revision(self):
+        state = {
+            "id": "job", "active": True, "phase": "preflight", "target_branch": "main",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {"id": "worker", "name": "Worker", "local": False, "phase": "pending"},
+                {"id": "local", "name": "Controller", "local": True, "phase": "pending"},
+            ],
+        }
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        self.service.start_local = AsyncMock()
+        self.manager.node_registry.request.side_effect = [
+            {"capability": CAPABILITY, "blockers": []},
+            {"phase": "accepted"},
+            {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()):
+            await self.service._run_cluster(state)
+        expected = {"branch": "main", "revision": "b" * 40}
+        self.assertEqual(self.manager.node_registry.request.await_args_list[0].kwargs["json_body"], expected)
+        self.assertEqual(self.manager.node_registry.request.await_args_list[1].kwargs["json_body"], expected)
+        self.service.start_local.assert_awaited_once_with("main", "b" * 40)
+
+    async def test_preflight_fetches_exact_main_ref_and_rejects_non_forward_target(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        commands = []
+
+        def command(_root, *args, **_kwargs):
+            commands.append(args)
+            if args[:2] == ("git", "rev-parse"):
+                return "b" * 40
+            if args[:2] == ("git", "show"):
+                return '{"update_protocol": 1, "data_schema": 1}'
+            return ""
+
+        with patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._run", side_effect=command), \
+             patch("sparkdeck.updater.subprocess.run", return_value=Mock(returncode=1)):
+            with self.assertRaisesRegex(RuntimeError, "forward-only"):
+                await self.service.preflight_local("main", "b" * 40)
+        self.assertIn((
+            "git", "fetch", "--force", "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ), commands)
 
     async def test_interrupted_local_helper_becomes_retryable(self):
         self.service._write(self.service.agent_path, {
@@ -169,13 +249,43 @@ class UpdateHelperTests(unittest.TestCase):
 
     @patch("sparkdeck.update_helper.run")
     @patch("sparkdeck.update_helper.subprocess.run")
-    def test_downgrade_uses_detached_checkout_without_reset(self, process_run, command_run):
+    def test_dormant_release_downgrade_uses_detached_checkout_without_reset(self, process_run, command_run):
         process_run.side_effect = [Mock(returncode=1), Mock(returncode=0)]
 
-        direction = install_revision(Path("/sparkdeck"), "b" * 40)
+        direction = install_release_revision(Path("/sparkdeck"), "b" * 40)
 
         self.assertEqual(direction, "downgrade")
         command_run.assert_called_once_with(
             Path("/sparkdeck"), "git", "checkout", "--detach", "b" * 40,
         )
         self.assertNotIn("reset", " ".join(str(part) for part in command_run.call_args.args))
+
+    @patch("sparkdeck.update_helper.subprocess.run")
+    @patch("sparkdeck.update_helper.run")
+    def test_main_fetch_uses_exact_remote_tracking_ref(self, command_run, process_run):
+        command_run.side_effect = ["", "b" * 40]
+        process_run.return_value = Mock(returncode=0)
+
+        fetch_update_target(Path("/sparkdeck"), MAIN_BRANCH, "b" * 40)
+
+        self.assertEqual(command_run.call_args_list[0].args, (
+            Path("/sparkdeck"), "git", "fetch", "--force", "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ))
+        self.assertEqual(command_run.call_args_list[1].args, (
+            Path("/sparkdeck"), "git", "rev-parse", "refs/remotes/origin/main^{commit}",
+        ))
+        process_run.assert_called_once_with(
+            ["git", "merge-base", "--is-ancestor", "b" * 40, "b" * 40],
+            cwd=Path("/sparkdeck"), capture_output=True, text=True, check=False,
+        )
+
+    @patch("sparkdeck.update_helper.run")
+    @patch("sparkdeck.update_helper.subprocess.run")
+    def test_main_install_rejects_backward_revision(self, process_run, command_run):
+        process_run.return_value = Mock(returncode=1)
+
+        with self.assertRaisesRegex(RuntimeError, "forward-only"):
+            install_revision(Path("/sparkdeck"), "b" * 40)
+
+        command_run.assert_not_called()

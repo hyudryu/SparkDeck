@@ -19,20 +19,7 @@ function SoftwareUpdatePanel() {
   const resource = useResource((signal) => api.updates.overview(signal))
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState<string>()
-  const [selectedTag, setSelectedTag] = useState('')
   const active = Boolean(resource.data?.job?.active)
-
-  useEffect(() => {
-    const releases = resource.data?.releases ?? []
-    const jobTag = resource.data?.job?.active ? resource.data.job.target_tag : undefined
-    if (jobTag && selectedTag !== jobTag) {
-      setSelectedTag(jobTag)
-      return
-    }
-    if (releases.length && !releases.some((release) => release.tag === selectedTag)) {
-      setSelectedTag(releases[0].tag)
-    }
-  }, [resource.data?.job?.active, resource.data?.job?.target_tag, resource.data?.releases, selectedTag])
 
   useEffect(() => {
     if (!active) return
@@ -42,12 +29,13 @@ function SoftwareUpdatePanel() {
 
   const start = async () => {
     const nodeCount = resource.data?.nodes?.length ?? 0
-    if (!selectedTag) return
-    if (!window.confirm(`Install ${selectedTag} on all ${nodeCount} cluster node${nodeCount === 1 ? '' : 's'}? This may upgrade or downgrade SparkDeck. Workers restart one at a time and the controller restarts last.`)) return
+    const targetRevision = resource.data?.target?.revision
+    if (!targetRevision) return
+    if (!window.confirm(`Update all ${nodeCount} cluster node${nodeCount === 1 ? '' : 's'} to origin/main at ${shortRevision(targetRevision)}? Workers restart one at a time and the controller restarts last.`)) return
     setStarting(true)
     setActionError(undefined)
     try {
-      await api.updates.start(selectedTag)
+      await api.updates.start(targetRevision)
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not start the cluster update')
@@ -59,16 +47,11 @@ function SoftwareUpdatePanel() {
   const data = resource.data
   const blockers = data?.blockers ?? []
   const nodes = data?.job?.nodes ?? data?.nodes ?? []
-  const releases = data?.releases ?? []
-  const selectedRelease = releases.find((release) => release.tag === selectedTag)
-  const selectedEverywhere = Boolean(
-    data?.current_release_tag === selectedTag
-    && data.nodes?.length
-    && data.nodes.every((node) => node.current_revision === data.current_revision),
-  )
+  const targetRevision = data?.target?.revision
+  const upToDate = Boolean(data?.up_to_date)
   return (
     <Panel className="settings-section software-update-section">
-      <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Install or roll back to a published GitHub release across the entire cluster.</p></div></div>
+      <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every cluster node to the latest commit on the main branch.</p></div></div>
       <div className="settings-fields">
         {resource.loading && !data && <LoadingState label="Checking for updates" />}
         {resource.error && !data && <ErrorState message={resource.error} onRetry={resource.reload} />}
@@ -76,12 +59,11 @@ function SoftwareUpdatePanel() {
           <div className="credential-state wide-field">
             <DownloadCloud size={17} />
             <div>
-              <strong>{data.current_release_tag ? `Running ${data.current_release_tag}` : `Running ${shortRevision(data.current_revision)}`}</strong>
-              <span className="muted">Latest {data.latest_release?.tag ?? 'unavailable'} · {data.nodes?.length ?? 0} cluster node{data.nodes?.length === 1 ? '' : 's'}</span>
+              <strong>Running {shortRevision(data.current_revision)}</strong>
+              <span className="muted">origin/main {targetRevision ? shortRevision(targetRevision) : 'unavailable'} · {data.nodes?.length ?? 0} cluster node{data.nodes?.length === 1 ? '' : 's'}</span>
             </div>
-            <Button type="button" variant="primary" disabled={!data.can_update || !selectedTag || selectedEverywhere || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Installing…' : selectedEverywhere ? 'Installed on all nodes' : 'Install on all nodes'}</Button>
+            <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
           </div>
-          {releases.length > 0 && <label className="field wide-field"><span>Release</span><select aria-label="Release version" value={selectedTag} disabled={active} onChange={(event) => setSelectedTag(event.target.value)}>{releases.map((release, index) => <option value={release.tag} key={release.tag}>{release.name} ({release.tag}){index === 0 ? ' — latest' : ''}{release.tag === data.current_release_tag ? ' — installed' : ''}{release.prerelease ? ' — prerelease' : ''}</option>)}</select><small>{selectedRelease?.published_at ? `Published ${new Date(selectedRelease.published_at).toLocaleDateString()}. ` : ''}Choosing an older release performs a cluster-wide rollback.</small></label>}
           {(data.job?.message || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || data.job?.message}</p>}
           {blockers.length > 0 && <div className="update-blockers wide-field"><strong>Update unavailable</strong><ul>{blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul></div>}
           {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={node.error ? 'error' : node.phase === 'succeeded' ? 'running' : node.online === false ? 'stopped' : 'starting'}>{node.error || node.phase || (node.online === false ? 'Offline' : 'Ready')}</Status></div>)}</div>}

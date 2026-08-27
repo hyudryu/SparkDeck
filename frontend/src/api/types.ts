@@ -323,7 +323,7 @@ export interface SystemUpdateJob {
   phase: string
   message?: string
   error?: string
-  target_tag: string
+  target_branch: 'main'
   target_revision: string
   nodes: SystemUpdateNode[]
 }
@@ -331,9 +331,12 @@ export interface SystemUpdateJob {
 export interface SystemUpdateOverview {
   repository: string
   current_revision?: string
-  current_release_tag?: string | null
-  releases: SystemUpdateRelease[]
-  latest_release?: SystemUpdateRelease | null
+  target?: {
+    branch: 'main'
+    revision: string
+    url?: string
+  } | null
+  up_to_date?: boolean
   can_update: boolean
   blockers: string[]
   nodes: SystemUpdateNode[]

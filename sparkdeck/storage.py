@@ -478,7 +478,10 @@ class SparkDeckStore:
         keeping the public aggregate boundary identical to the upload payload.
         Rows are grouped by the exact dimensions declared in
         ``COMMUNITY_EVIDENCE_POLICY`` and no private benchmark metadata leaves
-        this method.
+        this method. Coordinated runs are excluded because their concurrency
+        and tensor-parallel dimensions cannot be represented by this legacy
+        aggregate contract; the dimension-aware benchmark explorer reads them
+        from ``benchmark_series_points`` instead.
         """
         grouped: dict[tuple[str, int], tuple[float, int]] = {}
         with self._lock:
@@ -499,6 +502,8 @@ class SparkDeckStore:
                     except (TypeError, ValueError, json.JSONDecodeError):
                         continue
                     if not isinstance(model, dict) or not isinstance(configuration, dict):
+                        continue
+                    if configuration.get("benchmark_concurrency") is not None:
                         continue
                     model_id = str(model.get("repository") or "").strip()
                     context_window = community_context_window(configuration)

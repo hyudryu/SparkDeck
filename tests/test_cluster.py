@@ -1509,6 +1509,31 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 {"model/b": "model/c"},
             )
 
+    def test_get_token_stats_exposes_routing_rules(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "xxx/abcdefg": {
+                "input": 100, "cached": 25, "output": 40,
+                "requests": 2, "gen_tokens": 40, "gen_time_s": 4,
+            },
+            "xxx/1234567": {
+                "input": 300, "cached": 75, "output": 60,
+                "requests": 3, "gen_tokens": 60, "gen_time_s": 6,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {"xxx/abcdefg": "Fleet"}
+        instance.usage_routing_rules = {"xxx/abcdefg": "xxx/1234567"}
+        instance.speed_samples = {}
+        instance.deployments = []
+        instance.unsloth_settings = {}
+
+        stats = instance.get_token_stats()
+
+        self.assertEqual(stats["routing_rules"], {"xxx/abcdefg": "xxx/1234567"})
+        self.assertEqual(stats["merge_groups"], {"xxx/abcdefg": "Fleet"})
+        self.assertEqual(stats["groups"][0]["key"], "model:xxx/1234567")
+
     def test_rolling_speed_uses_only_newest_one_million_output_tokens(self) -> None:
         instance = Manager.__new__(Manager)
         instance.speed_samples = {

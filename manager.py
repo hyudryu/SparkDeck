@@ -5950,6 +5950,8 @@ class Manager:
             "models": self.token_stats,
             "groups": self.usage_rows(),
             "total": {"input": total_in, "output": total_out, "cached": total_cached, "requests": total_req},
+            "routing_rules": dict(getattr(self, "usage_routing_rules", {})),
+            "merge_groups": dict(getattr(self, "usage_merge_groups", {})),
         }
 
     def usage_rows(self) -> list[dict]:

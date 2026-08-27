@@ -1062,9 +1062,9 @@ class SparkDeckService:
     def _layout_contract(self, launch_settings: Any) -> dict[str, Any]:
         """Best-effort persisted layout for a cluster deployment.
 
-        Returns deployment_mode and required_node_count when the manager can
-        derive them from the persisted launch settings; callers fall back to
-        their own defaults when absent.
+        Returns the layout and revision fields the Models picker must enforce
+        when the manager can derive them from persisted launch settings;
+        callers fall back to their own defaults when absent.
         """
         contract_fn = getattr(self.manager, "recipe_deployment_contract", None)
         if not contract_fn:
@@ -1081,7 +1081,33 @@ class SparkDeckService:
         count = contract.get("required_node_count")
         if isinstance(count, int) and not isinstance(count, bool):
             result["required_node_count"] = count
+        revision = contract.get("model_revision")
+        if isinstance(revision, str) and revision.strip():
+            result["model_revision"] = revision.strip()
         return result
+
+    def _normalized_start_selection(
+        self, launch_settings: Any, node_ids: list[str],
+    ) -> list[str]:
+        """Enforce the saved topology before Manager removes existing ranks."""
+        selected = list(node_ids)
+        if len(set(selected)) != len(selected):
+            raise ValueError("node_ids must not contain duplicates")
+        contract = self._layout_contract(launch_settings)
+        required = contract.get("required_node_count")
+        if required is not None and len(selected) != required:
+            raise ValueError(
+                f"this deployment requires exactly {required} node(s)"
+            )
+        if contract.get("deployment_mode") == "sharded":
+            if "local" not in selected:
+                raise ValueError(
+                    "sharded deployments must include the controller node"
+                )
+            selected = [
+                "local", *(node_id for node_id in selected if node_id != "local")
+            ]
+        return selected
 
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
@@ -1091,11 +1117,21 @@ class SparkDeckService:
         repository = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         is_local_path = bool(repository and resolve_local and resolve_local(repository))
-        if is_local_path and any(item != "local" for item in node_ids):
+        # llama.cpp restarts an existing controller-owned GGUF container. Its
+        # repository field may be a file path, which Manager's directory-only
+        # HF path resolver intentionally does not recognize.
+        controller_artifact = (
+            deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
+        )
+        if (is_local_path or controller_artifact) and any(
+            item != "local" for item in node_ids
+        ):
             raise ValueError(
                 "controller-local model paths can only run on the controller node"
+                if is_local_path else
+                "llama.cpp model artifacts can only run on the controller node"
             )
-        if is_local_path or not repository:
+        if is_local_path or controller_artifact or not repository:
             return
         # A recipe-launched cluster pins its revision in the persisted launch
         # args, not in the deployment identity — prefer that when present.
@@ -1120,6 +1156,86 @@ class SparkDeckService:
                 "model weights are not available on selected node(s): "
                 + ", ".join(missing)
             )
+
+    def _adopt_manager_replacement(
+        self, deployment: dict[str, Any], replacement: dict[str, Any],
+        launch_settings: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Create durable SparkDeck routing for a relocated Manager-only card."""
+        record_id = str(uuid.uuid4())
+        alias = str(
+            deployment.get("alias") or replacement.get("name")
+            or (deployment.get("model") or {}).get("repository") or record_id
+        ).strip()
+        if self.store.deployment(alias):
+            suffix = str(replacement["id"])[:8]
+            candidate = f"{alias} ({suffix})"
+            counter = 2
+            while self.store.deployment(candidate):
+                candidate = f"{alias} ({suffix}-{counter})"
+                counter += 1
+            alias = candidate
+
+        model = deployment.get("model") or {}
+        revision = (
+            model.get("revision") or self._persisted_revision(launch_settings)
+        )
+        layout = self._layout_contract(launch_settings)
+        settings = self._local_configuration({
+            **(launch_settings or {}),
+            **(deployment.get("settings") or {}),
+            **layout,
+            "manager_deployment_id": replacement["id"],
+            "node_ids": list(replacement.get("node_ids") or []),
+            "model_source": replacement.get("model_source") or "unknown",
+        })
+        primary = (replacement.get("members") or [{}])[0]
+        port = replacement.get("api_port")
+        adopted = Deployment(
+            id=record_id,
+            alias=alias,
+            runtime=RuntimeKind(str(deployment.get("runtime") or "vllm")),
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity(
+                repository=str(model.get("repository") or replacement.get("model") or ""),
+                revision=_optional_string(revision),
+                artifact=_optional_string(model.get("artifact")),
+                quantization=_optional_string(model.get("quantization")),
+            ),
+            container_name=primary.get("container_name"),
+            settings=settings,
+        )
+        self.store.add_deployment(
+            adopted,
+            f"http://127.0.0.1:{int(port)}" if port else None,
+            None,
+        )
+
+        # The SQLite manager ID is sufficient for routing. Also persist the
+        # reverse link when possible so later reconciliation can find the card
+        # even if Manager replaces its own deployment ID again.
+        replacement["sparkdeck_record_id"] = record_id
+        persisted_launch = replacement.get("launch_settings")
+        if isinstance(persisted_launch, dict):
+            persisted_launch["sparkdeck_record_id"] = record_id
+        save_deployments = getattr(self.manager, "_save_deployments", None)
+        if callable(save_deployments):
+            try:
+                save_deployments()
+            except Exception:
+                # SQLite already has the durable forward link to this Manager
+                # ID; do not report the successful relocation as failed only
+                # because the optional reverse-link refresh could not flush.
+                pass
+
+        result = self.store.deployment(record_id) or adopted.to_dict()
+        result.update({
+            "status": _deployment_status(replacement.get("status")),
+            "port": int(port) if port else None,
+            "node_ids": list(replacement.get("node_ids") or []),
+            **layout,
+        })
+        return result
 
     async def deployment_action(
         self, deployment_id: str, action: str,
@@ -1150,6 +1266,7 @@ class SparkDeckService:
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
         if node_ids and action == "start":
+            node_ids = self._normalized_start_selection(launch_settings, node_ids)
             if not manager_id and not owner and any(item != "local" for item in node_ids):
                 # A standalone container runs on the node that holds it; only
                 # cluster deployments can be relocated by a start selection.
@@ -1196,6 +1313,11 @@ class SparkDeckService:
                 result = await self.manager.deployment_action(owner["id"], action)
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
+            replacement = result.get("deployment") if isinstance(result, dict) else None
+            if isinstance(replacement, dict) and replacement.get("id"):
+                return self._adopt_manager_replacement(
+                    deployment, replacement, launch_settings,
+                )
             return {**deployment, "status": "running" if action == "start" else "stopped"}
         if not container:
             raise LookupError("managed container not found")

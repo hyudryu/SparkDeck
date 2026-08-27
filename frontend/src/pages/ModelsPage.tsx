@@ -312,8 +312,12 @@ export function ModelsPage() {
   // count, TP×PP for sharded, single otherwise); unknown layouts start on one.
   const deploymentRequiredNodes = (deployment: Deployment) => deployment.required_node_count ?? 1
 
+  const isControllerArtifact = (deployment: Deployment) => (
+    deployment.runtime === 'llama.cpp' || isLocalModelPath(deployment.model_id)
+  )
+
   const deploymentWeightedNodes = (deployment: Deployment) => {
-    if (isLocalModelPath(deployment.model_id)) {
+    if (isControllerArtifact(deployment)) {
       return new Set(localNodeId ? [localNodeId] : [])
     }
     return new Set((modelCache.data?.nodes ?? [])
@@ -785,10 +789,10 @@ export function ModelsPage() {
       {startSelection && (() => {
         const { deployment, nodeIds } = startSelection
         const required = deploymentRequiredNodes(deployment)
-        const localPath = isLocalModelPath(deployment.model_id)
+        const controllerArtifact = isControllerArtifact(deployment)
         const weighted = deploymentWeightedNodes(deployment)
         const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
-        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, controllerArtifact ? 'Local model artifacts are available only on the controller' : 'Model weights not cached']))
         const sharded = deployment.deployment_mode === 'sharded'
         const localRequired = sharded && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === required
@@ -799,14 +803,14 @@ export function ModelsPage() {
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
             <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="start-deployment-title">Start {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} Nodes without the complete model weights are disabled.</p>
+            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : 'Nodes without the complete model weights are disabled.'}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
-            {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
-              loading={nodes.loading || (!localPath && modelCache.loading)}
+              loading={nodes.loading || (!controllerArtifact && modelCache.loading)}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload() }}
               multiple={required > 1}
@@ -819,7 +823,7 @@ export function ModelsPage() {
                 ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
                 : nodeIds[0]}
               legend="Deployment nodes"
-              help={localPath ? 'Local model paths can run only on the controller.' : `Only nodes with ${deployment.model_id} already cached can be selected.`}
+              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : `Only nodes with ${deployment.model_id} already cached can be selected.`}
             />
             {sharded && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {allowedIds.length < required && <p className="field-note">Model weights are cached on only {allowedIds.length} of {required} required {required === 1 ? 'node' : 'nodes'}. Copy the weights in Storage first.</p>}

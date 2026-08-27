@@ -167,6 +167,18 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"logs": "single log line"})
         self.manager.get_cluster_member_logs.assert_awaited_once_with("legacy-model", 300)
 
+    async def test_start_forwards_node_selection_to_manager(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+
+        await self.service.deployment_action("dep-1", "start", node_ids=["a", "b"])
+
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a", "b"])
+
     async def test_concurrent_duplicate_alias_launches_only_one_container(self):
         async def launch(*_args, **_kwargs):
             await asyncio.sleep(0.01)

@@ -3075,13 +3075,19 @@ class Manager:
                 errors.append(message)
         return errors
 
-    async def deployment_action(self, deployment_id: str, action: str) -> dict:
+    async def deployment_action(
+        self, deployment_id: str, action: str,
+        node_ids: list[str] | None = None,
+    ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
-            return await self._deployment_action_locked(deployment_id, action)
+            return await self._deployment_action_locked(deployment_id, action, node_ids)
 
-    async def _deployment_action_locked(self, deployment_id: str, action: str) -> dict:
+    async def _deployment_action_locked(
+        self, deployment_id: str, action: str,
+        node_ids: list[str] | None = None,
+    ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -3101,7 +3107,11 @@ class Manager:
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
 
-        if action == "start" and deployment.get("settings_dirty"):
+        # Containers cannot move between nodes: an explicit node selection (or
+        # any argv-affecting setting change) means removing the old ranks and
+        # relaunching the deployment through the fully validated path.
+        relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
+        if relaunch:
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
             # settings so every node/rank receives a coherent replacement.
@@ -3124,6 +3134,8 @@ class Manager:
             self._save_deployments()
             launch_body = dict(deployment.get("launch_settings") or {})
             launch_body["recipe_id"] = deployment.get("recipe_id")
+            if node_ids:
+                launch_body["node_ids"] = [str(item) for item in node_ids]
             try:
                 replacement = await self.create_deployment(launch_body)
             except Exception:

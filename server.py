@@ -2000,9 +2000,24 @@ async def v1_create_deployment(req: Request):
 
 
 @app.post("/api/v1/deployments/{deployment_id}/{action}")
-async def v1_deployment_action(deployment_id: str, action: str):
+async def v1_deployment_action(deployment_id: str, action: str, req: Request):
     try:
-        return await sparkdeck.deployment_action(deployment_id, action)
+        raw = await req.body()
+        body = json.loads(raw) if raw else {}
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+        node_ids = body.get("node_ids")
+        if node_ids is not None:
+            if (
+                not isinstance(node_ids, list)
+                or not node_ids
+                or any(not isinstance(item, str) or not item.strip() for item in node_ids)
+            ):
+                raise ValueError("node_ids must contain non-empty node IDs")
+            node_ids = [item.strip() for item in node_ids]
+        return await sparkdeck.deployment_action(deployment_id, action, node_ids)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
     except LookupError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:

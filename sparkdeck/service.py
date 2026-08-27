@@ -1025,7 +1025,10 @@ class SparkDeckService:
             # diagnostic record if even local SQLite adoption fails.
             pass
 
-    async def deployment_action(self, deployment_id: str, action: str) -> dict[str, Any]:
+    async def deployment_action(
+        self, deployment_id: str, action: str,
+        node_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
         if not deployment and deployment_id.startswith("container:"):
@@ -1041,7 +1044,10 @@ class SparkDeckService:
             raise ValueError("external endpoints cannot be started or stopped by SparkDeck")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         if manager_id:
-            result = await self.manager.deployment_action(manager_id, action)
+            if node_ids is None:
+                result = await self.manager.deployment_action(manager_id, action)
+            else:
+                result = await self.manager.deployment_action(manager_id, action, node_ids)
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
             replacement = result.get("deployment") if isinstance(result, dict) else None

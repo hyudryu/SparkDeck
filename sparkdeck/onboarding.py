@@ -233,6 +233,7 @@ class OnboardingService:
         self.port = int(port)
         self.assignment = ControllerAssignment(data_dir)
         self._join_attempts: dict[str, deque[float]] = defaultdict(deque)
+        self._membership_lock = asyncio.Lock()
 
     @property
     def role(self) -> str:
@@ -244,6 +245,7 @@ class OnboardingService:
             "Connect the joining system and this entry node to the same Tailscale tailnet.",
             "Open Cluster onboarding on the system you want to join.",
             "Enter one of this node's access URLs and the one-time pairing code.",
+            "Repeat this for every machine; joining one node never imports its former cluster members.",
         ]
 
     def _access_urls(self, request_origin: str) -> list[str]:
@@ -406,8 +408,32 @@ class OnboardingService:
 
     async def _assert_joinable(self) -> None:
         await self._assert_no_owned_workloads("join")
+        registered = getattr(self.manager.node_registry, "nodes", [])
+        registered = registered if isinstance(registered, list) else []
+        children = [
+            node for node in registered
+            if isinstance(node, dict) and str(node.get("id") or "").strip()
+        ]
+        if children:
+            names = ", ".join(
+                str(node.get("name") or node.get("id")) for node in children[:5]
+            )
+            suffix = "" if len(children) <= 5 else f" and {len(children) - 5} more"
+            raise ValueError(
+                f"cannot join while this node still controls {len(children)} joined "
+                f"node{'s' if len(children) != 1 else ''}: {names}{suffix}. Joining "
+                "moves only this machine and never transfers its former cluster members. "
+                "On each member, use Leave cluster and then join it directly to the "
+                "destination controller; remove stale member records before retrying."
+            )
 
     async def register(
+        self, body: dict[str, Any], request_origin: str, client_id: str,
+    ) -> dict[str, Any]:
+        async with self._membership_lock:
+            return await self._register(body, request_origin, client_id)
+
+    async def _register(
         self, body: dict[str, Any], request_origin: str, client_id: str,
     ) -> dict[str, Any]:
         if self.role != "controller":
@@ -445,6 +471,10 @@ class OnboardingService:
         }
 
     async def join(self, body: dict[str, Any], request_origin: str) -> dict[str, Any]:
+        async with self._membership_lock:
+            return await self._join(body, request_origin)
+
+    async def _join(self, body: dict[str, Any], request_origin: str) -> dict[str, Any]:
         if self.assignment.load():
             raise ValueError("this node is already joined to a controller")
         await self._assert_joinable()
@@ -629,15 +659,40 @@ class OnboardingService:
         result["ok"] = True
         return result
 
+    async def detach(self) -> dict[str, Any]:
+        """Honor an authenticated controller request to remove this worker."""
+        await self._assert_no_owned_workloads("leave")
+        self.manager.agent_credentials.revoke_remote_access()
+        self.assignment.clear()
+        adopt_controller = getattr(self.manager, "adopt_controller_role", None)
+        if adopt_controller is not None:
+            adopt_controller()
+        return {"ok": True, "role": "controller", "revoked": True}
+
     def unregister(self, headers: Any) -> dict[str, Any]:
         """Revoke a leaving worker's one-hop grant and inventory record."""
+        node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
+        if self.is_already_unregistered_worker(headers):
+            # Force-forget deliberately deletes the worker and its token hash.
+            # Report that state before token validation so the forgotten worker
+            # can treat its later explicit leave as already unregistered.
+            raise ValueError("worker is not registered")
         valid, detail = self.validate_forward_headers(headers)
         if not valid:
             raise PermissionError(detail)
-        node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
         if not self.manager.remove_cluster_node(node_id):
             raise ValueError("worker is not registered")
         return {"ok": True, "node_id": node_id, "revoked": True}
+
+    def is_already_unregistered_worker(self, headers: Any) -> bool:
+        """Recognize only a one-hop claim for a registry record already absent."""
+        hop = str(headers.get(FORWARD_HOP_HEADER) or "")
+        node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
+        return bool(
+            hop == "1"
+            and node_id
+            and self.manager.node_registry.get(node_id) is None
+        )
 
     def validate_forward_headers(self, headers: Any) -> tuple[bool, str]:
         hop = str(headers.get(FORWARD_HOP_HEADER) or "")

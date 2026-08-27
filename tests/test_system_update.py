@@ -165,7 +165,6 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.start_local.assert_awaited_once_with("main", "b" * 40)
 
     async def test_preflight_fetches_exact_main_ref_and_rejects_non_forward_target(self):
-        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
         commands = []
 
         def command(_root, *args, **_kwargs):
@@ -178,13 +177,35 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("sparkdeck.updater.local_blockers", return_value=[]), \
              patch("sparkdeck.updater._run", side_effect=command), \
-             patch("sparkdeck.updater.subprocess.run", return_value=Mock(returncode=1)):
+             patch("sparkdeck.updater.subprocess.run", side_effect=[
+                 Mock(returncode=0), Mock(returncode=1),
+             ]):
             with self.assertRaisesRegex(RuntimeError, "forward-only"):
                 await self.service.preflight_local("main", "b" * 40)
         self.assertIn((
             "git", "fetch", "--force", "origin",
             "refs/heads/main:refs/remotes/origin/main",
         ), commands)
+
+    async def test_preflight_accepts_pinned_commit_after_main_advances(self):
+        def command(_root, *args, **_kwargs):
+            if args[:2] == ("git", "rev-parse"):
+                return "c" * 40
+            if args[:2] == ("git", "show"):
+                return '{"update_protocol": 1, "data_schema": 1}'
+            return ""
+
+        with patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._run", side_effect=command), \
+             patch("sparkdeck.updater.subprocess.run", side_effect=[
+                 Mock(returncode=0), Mock(returncode=0),
+             ]) as process_run:
+            result = await self.service.preflight_local("main", "b" * 40)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(process_run.call_args_list[0].args[0], [
+            "git", "merge-base", "--is-ancestor", "b" * 40, "c" * 40,
+        ])
 
     async def test_interrupted_local_helper_becomes_retryable(self):
         self.service._write(self.service.agent_path, {

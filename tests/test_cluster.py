@@ -1639,6 +1639,65 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads(instance.recipes_path.read_text())
             self.assertEqual(len(saved), 2)
 
+    async def test_recipe_delete_is_durable_and_clears_transient_launch_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = [{"id": "delete-me"}, {"id": "keep-me"}]
+            instance.recipe_launches = {
+                "delete-me": {"phase": "ready"},
+                "keep-me": {"phase": "starting"},
+            }
+            instance.recipes_path = Path(directory) / "recipes.json"
+
+            self.assertTrue(await instance.delete_recipe("delete-me"))
+            self.assertFalse(await instance.delete_recipe("missing"))
+
+            self.assertEqual(instance.recipes, [{"id": "keep-me"}])
+            self.assertEqual(instance.recipe_launches, {"keep-me": {"phase": "starting"}})
+            self.assertEqual(
+                json.loads(instance.recipes_path.read_text()),
+                [{"id": "keep-me"}],
+            )
+
+    async def test_sglang_launch_survives_recipe_deletion_after_progress_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = [{"id": "delete-me"}]
+            instance.recipe_launches = {}
+            instance.recipes_path = Path(directory) / "recipes.json"
+            instance.settings = {
+                "hf_cache": str(Path(directory) / "huggingface"),
+                "shm_size": "1g",
+            }
+            instance.client = mock.Mock()
+            instance.client.images.get.return_value = mock.Mock()
+            container = mock.Mock()
+            container.reload.return_value = None
+            instance._run_managed_container = mock.Mock(return_value=container)
+            instance._container_summary = mock.Mock(return_value={"name": "sglang-test"})
+            instance._created_container_model_source = mock.Mock(return_value="org/model")
+            instance._cluster_launch_update = mock.Mock()
+            instance._build_volumes = mock.Mock(return_value={})
+            instance._container_hf_environment = mock.Mock(return_value={})
+            instance._allocate_port = mock.AsyncMock(return_value=8001)
+
+            async def delete_during_evict(*, protect: str) -> None:
+                self.assertEqual(protect, "sglang")
+                self.assertTrue(await instance.delete_recipe("delete-me"))
+
+            instance.evict_other_backends = mock.AsyncMock(side_effect=delete_during_evict)
+
+            result = await instance.create_container(
+                "org/model", engine="sglang", recipe_id="delete-me",
+            )
+
+            self.assertEqual(result, {"name": "sglang-test", "model_source": "org/model"})
+            self.assertEqual(instance.recipes, [])
+            self.assertEqual(instance.recipe_launches, {})
+            instance._run_managed_container.assert_called_once()
+
     def test_hf_cache_mount_uses_image_hf_home(self) -> None:
         instance = Manager.__new__(Manager)
         image = type("Image", (), {

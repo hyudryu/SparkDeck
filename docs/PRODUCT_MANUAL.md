@@ -85,7 +85,7 @@ Models manages saved deployment configurations and active model servers for vLLM
 Use it to:
 
 - create an active deployment with **Add model**;
-- pin saved launch recipes and edit their launch arguments and controls;
+- pin, edit, and delete saved launch recipes;
 - choose eligible nodes and deploy a saved recipe;
 - start, stop, rename, or remove deployment records;
 - connect an existing OpenAI-compatible endpoint;
@@ -93,7 +93,7 @@ Use it to:
 - require the correct number of eligible nodes for tensor parallelism; and
 - inspect runtime, model identity, state, target nodes, configuration, and actions.
 
-**Add model** creates a deployment record; it does not create a saved recipe. The current interface does not create, duplicate, or delete saved recipes.
+**Add model** creates a deployment record; it does not create a saved recipe. The current interface can delete saved recipes, but it does not create or duplicate them. Deleting a recipe does not remove existing deployments or cached model weights.
 
 For a TP2 configuration, SparkDeck requires two selected nodes. Nodes without the necessary cached weights are disabled until the weights are downloaded or transferred there.
 

@@ -6728,6 +6728,7 @@ class Manager:
             before = len(self.recipes)
             self.recipes = [r for r in self.recipes if r.get("id") != rid]
             if len(self.recipes) < before:
+                self.recipe_launches.pop(rid, None)
                 self._save_recipes()
                 return True
         return False
@@ -7643,10 +7644,12 @@ class Manager:
             cluster_member and cluster_member.get("mode") == "sharded"
         )
         if engine == "sglang":
+            recipe_launch = None
             if recipe_id:
-                self.recipe_launches[recipe_id] = {
+                recipe_launch = {
                     "phase": "Releasing GPU memory", "started_at": time.time(),
                 }
+                self.recipe_launches[recipe_id] = recipe_launch
             # SGLang has CUDA context conflicts with other engines — always evict.
             await self.evict_other_backends(protect="sglang")
             # Older recipes may have saved their image in ``image`` before
@@ -7698,8 +7701,8 @@ class Manager:
                         name, "checking_image", f"Checking Docker image {image}",
                         model=model, cluster_member=cluster_member,
                     )
-                    if recipe_id:
-                        self.recipe_launches[recipe_id].update({
+                    if recipe_launch is not None:
+                        recipe_launch.update({
                             "phase": "Checking SGLang image", "image": image,
                         })
                     self.client.images.get(image)
@@ -7709,8 +7712,8 @@ class Manager:
                         f"Downloading Docker image {image}; this can take several minutes",
                         model=model, cluster_member=cluster_member,
                     )
-                    if recipe_id:
-                        self.recipe_launches[recipe_id].update({
+                    if recipe_launch is not None:
+                        recipe_launch.update({
                             "phase": "Downloading SGLang image", "image": image,
                         })
                     print(f"[sglang] pulling missing image: {image}")
@@ -7719,8 +7722,8 @@ class Manager:
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
                 )
-                if recipe_id:
-                    self.recipe_launches[recipe_id].update({
+                if recipe_launch is not None:
+                    recipe_launch.update({
                         "phase": "Creating container", "image": image,
                     })
                 labels = {
@@ -7785,8 +7788,8 @@ class Manager:
                     name, "starting", "Container created; starting the model server",
                     model=model, cluster_member=cluster_member,
                 )
-                if recipe_id:
-                    self.recipe_launches[recipe_id].update({"phase": "Starting model"})
+                if recipe_launch is not None:
+                    recipe_launch.update({"phase": "Starting model"})
                 summary = self._container_summary(container)
                 if summary is not None:
                     summary["model_source"] = self._created_container_model_source(

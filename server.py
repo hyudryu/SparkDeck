@@ -1533,6 +1533,14 @@ async def update_recipe(rid: str, req: Request):
         raise HTTPException(status, str(exc)) from exc
 
 
+@app.delete("/api/recipes/{rid}")
+async def delete_recipe(rid: str):
+    """Preserve the legacy recipe deletion contract for existing clients."""
+    if not await manager.delete_recipe(rid):
+        raise HTTPException(404, "recipe not found")
+    return {"ok": True}
+
+
 # ---------- versioned SparkDeck application API ----------
 @app.get("/api/v1/catalog/models")
 async def catalog_models(q: str = "", runtime: str | None = None, limit: int = 24):
@@ -1644,6 +1652,14 @@ async def v1_update_recipe(recipe_id: str, req: Request):
         status = 404 if str(exc) == "recipe not found" else 400
         raise HTTPException(status, str(exc)) from exc
     return _recipe_detail(updated)
+
+
+@app.delete("/api/v1/recipes/{recipe_id}", status_code=204)
+async def v1_delete_recipe(recipe_id: str):
+    """Delete a saved launch recipe without changing existing deployments."""
+    if not await manager.delete_recipe(recipe_id):
+        raise HTTPException(404, "saved configuration not found")
+    return Response(status_code=204)
 
 
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)

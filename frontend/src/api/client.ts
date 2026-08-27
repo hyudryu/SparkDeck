@@ -242,6 +242,10 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(input),
       }),
+    remove: (id: string) => request<void>(
+      `/api/v1/recipes/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
     deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },

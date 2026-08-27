@@ -245,13 +245,23 @@ systemctl --user enable --now sparkdeck.service
 
 Adjust the template if your checkout lives elsewhere. Never place tokens directly in the committed unit file.
 
-### Cluster-wide release updates
+### Cluster-wide main updates
 
-After installing the bundled user service, open **Settings → Software update** to choose from the official GitHub repository's published releases. Select the newest release to upgrade, or an older compatible release to roll back. An install started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
+After installing the bundled user service, open **Settings → Software update** to update the cluster to the immutable commit currently at `origin/main`. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
 
-Self-update is intentionally release-only: it never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled `sparkdeck.service`, and already support the update protocol. A dirty, offline, divergent, or unsupported node blocks the rollout before any node changes. Because older installations do not expose this protocol, install the release containing this feature manually on every node once; later releases can update the whole cluster from the Settings button.
+Self-update never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled `sparkdeck.service`, and already support the update protocol. A dirty, offline, or unsupported node blocks the rollout before any node changes. A clean divergent or non-main checkout is detached at the verified main commit so its branch pointer is preserved and later updates continue tracking verified `origin/main` commits.
 
-SparkDeck resolves the selected release tag to an immutable commit, verifies its updater/data compatibility manifest, and stages the Python and frontend builds in a temporary worktree. Upgrades fast-forward the installed checkout; downgrades use a detached checkout so the user's branch pointer is preserved. Only releases in the same linear history are accepted. After restarting through systemd, SparkDeck verifies the selected revision is healthy and automatically restores the previous revision if that health check fails. If no release exists, Settings reports that honestly and does not fall back to `main`.
+SparkDeck resolves `origin/main` to an immutable commit, verifies its updater/data compatibility manifest, and stages the Python and frontend builds in a temporary worktree. Preflight dry-runs the exact tree transition on every node before rollout. Every clean checkout then uses detached-HEAD mode with ignored-file overwrite protection, so local branch pointers and non-conflicting local files are never moved. After restarting through systemd, SparkDeck verifies the selected revision is healthy and automatically restores the previous revision if that health check fails.
+
+An already-divergent node running the older strict updater cannot bootstrap this behavior through the Settings button because both its preflight and helper reject the target before installing new code. Re-anchor each such node once from its clean checkout, preserving its branch pointer:
+
+```bash
+git fetch --force origin refs/heads/main:refs/remotes/origin/main
+git checkout --detach refs/remotes/origin/main
+systemctl --user restart sparkdeck.service
+```
+
+After that one-time transition, later cluster updates handle clean divergent checkouts automatically.
 
 ## Development
 

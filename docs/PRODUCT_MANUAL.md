@@ -254,7 +254,7 @@ Open the Privacy Policy and Terms & Conditions or create a GitHub issue. The pri
 
 ### Software update
 
-Update the whole cluster to the immutable commit currently at `origin/main`. SparkDeck preflights all nodes, updates workers one at a time, and updates the controller last. Offline nodes, dirty checkouts, unknown revisions, or unmanaged service layouts can block the coordinated update. SparkDeck does not expose arbitrary branches, release selection, or downgrade controls.
+Update the whole cluster to the immutable commit currently at `origin/main`. SparkDeck preflights all nodes, including a dry run of each Git tree transition, then updates workers one at a time and the controller last. Offline nodes, dirty tracked checkouts, local-file collisions, or unmanaged service layouts block the coordinated update before any node changes. Every clean node installs the verified target in detached-HEAD mode with ignored-file overwrite protection, preserving its branch pointer and non-conflicting local files while returning the service to the official main history. Nodes still running the older strict updater require one manual clean-checkout detach to `origin/main`; later updates handle divergence automatically. SparkDeck does not expose arbitrary branches, release selection, or downgrade controls.
 
 ## Logs
 

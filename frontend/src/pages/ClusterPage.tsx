@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Check, Clipboard, Edit3, Link2, Network, RefreshCw, Server, ShieldCheck, Unlink } from 'lucide-react'
+import { Check, Clipboard, Edit3, Link2, Network, RefreshCw, Server, ShieldCheck, Trash2, Unlink } from 'lucide-react'
 import { api } from '../api/client'
 import type { JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -30,6 +30,7 @@ export function ClusterPage() {
   const [editingNodeId, setEditingNodeId] = useState<string>()
   const [nodeName, setNodeName] = useState('')
   const [renamingNodeId, setRenamingNodeId] = useState<string>()
+  const [removingNodeId, setRemovingNodeId] = useState<string>()
   const [nodeError, setNodeError] = useState<{ id: string; message: string }>()
 
   useEffect(() => {
@@ -138,6 +139,30 @@ export function ClusterPage() {
     }
   }
 
+  const removeNode = async (node: NodeInventoryItem) => {
+    const force = node.online === false
+    const warning = force
+      ? `Forget offline node ${node.name}? SparkDeck cannot notify it, so it may still show the old cluster until you use Leave cluster or join it again. Cached weights stay on that machine.`
+      : `Remove ${node.name} from this cluster? SparkDeck will disconnect only this machine and make it a standalone controller. Cached weights stay on that machine.`
+    if (!window.confirm(warning)) return
+
+    setRemovingNodeId(node.id)
+    setNodeError(undefined)
+    setNotice(undefined)
+    try {
+      await api.nodes.remove(node.id, force)
+      nodes.setData((nodes.data ?? []).filter((item) => item.id !== node.id))
+      cancelNodeEdit()
+      setNotice(force
+        ? `Forgot offline node ${node.name}. Its local cluster assignment could not be cleared.`
+        : `Removed ${node.name} from the cluster.`)
+    } catch (reason) {
+      setNodeError({ id: node.id, message: reason instanceof Error ? reason.message : 'Could not remove this node' })
+    } finally {
+      setRemovingNodeId(undefined)
+    }
+  }
+
   const status = resource.data
   const controller = status?.role === 'controller'
   const canRegisterWorkers = Boolean(status?.join_code) && Boolean(controller || status?.controller_reachable)
@@ -159,8 +184,8 @@ export function ClusterPage() {
 
         <section className="node-management" aria-labelledby="node-management-title">
           <div className="section-heading">
-            <div><h2 id="node-management-title">Cluster nodes</h2><p>Use a recognizable name for each system. Runtime status and node identity are unchanged.</p></div>
-            <Button type="button" variant="tertiary" onClick={nodes.reload} disabled={nodes.loading || Boolean(renamingNodeId)}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
+            <div><h2 id="node-management-title">Cluster nodes</h2><p>Membership is per machine. Joining one node does not bring along machines from its former cluster; join each machine separately.</p></div>
+            <Button type="button" variant="tertiary" onClick={nodes.reload} disabled={nodes.loading || Boolean(renamingNodeId) || Boolean(removingNodeId)}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>
           </div>
           {nodes.loading && <LoadingState label="Loading cluster nodes" />}
           {nodes.error && <ErrorState message={nodes.error} onRetry={nodes.reload} />}
@@ -169,7 +194,9 @@ export function ClusterPage() {
             {nodes.data?.map((node) => {
               const editing = editingNodeId === node.id
               const saving = renamingNodeId === node.id
-              return <li key={node.id} className="node-management-row" aria-busy={saving}>
+              const removing = removingNodeId === node.id
+              const removable = !isCurrentEntryNode(node, status) && node.id !== 'local' && !node.local
+              return <li key={node.id} className="node-management-row" aria-busy={saving || removing}>
                 <div className="node-management-icon" aria-hidden="true"><Server size={17} /></div>
                 <div className="node-management-identity">
                   <strong>{node.name}</strong>
@@ -180,10 +207,10 @@ export function ClusterPage() {
                   <Status status={node.online === false ? 'error' : 'running'}>{node.online === false ? 'Offline' : 'Online'}</Status>
                 </div>
                 {editing ? <form className="node-rename-form" noValidate onSubmit={(event) => void renameNode(event, node)}>
-                  <label className="field"><span className="sr-only">New name for {node.name}</span><input autoFocus required maxLength={maximumNodeNameLength} value={nodeName} disabled={saving} onChange={(event) => setNodeName(event.target.value)} aria-invalid={nodeError?.id === node.id} aria-describedby={nodeError?.id === node.id ? `node-error-${node.id}` : undefined} /></label>
-                  <div className="node-rename-actions"><Button type="submit" variant="primary" disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button><Button type="button" disabled={saving} onClick={cancelNodeEdit}>Cancel</Button></div>
+                  <label className="field"><span className="sr-only">New name for {node.name}</span><input autoFocus required maxLength={maximumNodeNameLength} value={nodeName} disabled={saving || removing} onChange={(event) => setNodeName(event.target.value)} aria-invalid={nodeError?.id === node.id} aria-describedby={nodeError?.id === node.id ? `node-error-${node.id}` : undefined} /></label>
+                  <div className="node-rename-actions"><Button type="submit" variant="primary" disabled={saving || removing}>{saving ? 'Saving…' : 'Save'}</Button><Button type="button" disabled={saving || removing} onClick={cancelNodeEdit}>Cancel</Button>{removable && <Button type="button" variant="danger" className="node-remove-button" disabled={saving || removing} onClick={() => void removeNode(node)}><Trash2 size={15} aria-hidden="true" /> {removing ? 'Removing…' : node.online === false ? 'Forget node' : 'Remove node'}</Button>}</div>
                   {nodeError?.id === node.id && <p id={`node-error-${node.id}`} className="inline-error" role="alert">{nodeError.message}</p>}
-                </form> : <Button type="button" className="node-edit-button" onClick={() => editNode(node)} disabled={Boolean(renamingNodeId)} aria-label={`Edit name for ${node.name}`}><Edit3 size={15} aria-hidden="true" /> Edit</Button>}
+                </form> : <Button type="button" className="node-edit-button" onClick={() => editNode(node)} disabled={Boolean(renamingNodeId) || Boolean(removingNodeId)} aria-label={`Edit name for ${node.name}`}><Edit3 size={15} aria-hidden="true" /> Edit</Button>}
               </li>
             })}
           </ul>}
@@ -220,7 +247,7 @@ export function ClusterPage() {
         </div>}
 
         {controller && joining && <Panel className="join-panel">
-          <div><p className="eyebrow">Join an existing cluster</p><h2>Connect this DGX Spark</h2><p>Enter the URL and pairing code shown by either the controller or an online worker in the cluster. The controller remains authoritative.</p></div>
+          <div><p className="eyebrow">Join an existing cluster</p><h2>Connect this DGX Spark</h2><p>Enter the URL and pairing code shown by either the controller or an online worker in the cluster. Only this machine moves; nodes from its previous cluster must join the destination separately.</p></div>
           <form onSubmit={(event) => void join(event)}>
             <div className="field"><label htmlFor="controller-tailnet-url">Existing cluster entry URL</label><input id="controller-tailnet-url" type="url" required aria-describedby="controller-tailnet-url-help" value={form.controller_url} onChange={(event) => setForm({ ...form, controller_url: event.target.value })} placeholder="http://100.x.x.x:7878" /><small id="controller-tailnet-url-help">Use a private Tailscale URL shown by the controller or an online worker, such as <code>http://100.x.x.x:7878</code>.</small></div>
             <label className="field"><span>Pairing code</span><input required autoComplete="one-time-code" value={form.join_code} onChange={(event) => setForm({ ...form, join_code: event.target.value })} /></label>

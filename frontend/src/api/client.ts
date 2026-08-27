@@ -224,6 +224,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(input),
     }),
+    remove: (id: string, force = false) => request<{ ok: boolean; node_id: string; forced: boolean }>(
+      `/api/v1/nodes/${encodeURIComponent(id)}${force ? '?force=true' : ''}`,
+      { method: 'DELETE' },
+    ),
   },
   routeros: {
     presence: (signal?: AbortSignal) => request<RouterOSPresence>('/api/v1/routeros/presence', { signal }),

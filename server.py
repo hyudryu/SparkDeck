@@ -499,6 +499,15 @@ async def agent_rename_node(req: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/api/agent/onboarding/detach")
+async def agent_detach_from_controller(req: Request):
+    _require_agent(req)
+    try:
+        return await onboarding.detach()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.get("/api/agent/temperature-history")
 async def agent_temperature_history(req: Request):
     _require_agent(req)
@@ -830,11 +839,11 @@ async def refresh_cluster_node(node_id: str):
 
 @app.delete("/api/nodes/{node_id}")
 async def remove_cluster_node(node_id: str):
-    if node_id == LOCAL_NODE_ID:
-        raise HTTPException(400, "the coordinator node cannot be removed")
     try:
-        removed = manager.remove_cluster_node(node_id)
+        removed = await manager.detach_cluster_node(node_id)
     except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     if not removed:
         raise HTTPException(404, "node not found")
@@ -1271,6 +1280,19 @@ async def v1_rename_node(node_id: str, req: Request):
         raise HTTPException(404, str(exc)) from exc
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/v1/nodes/{node_id}")
+async def v1_remove_node(node_id: str, force: bool = False):
+    try:
+        removed = await manager.detach_cluster_node(node_id, force=force)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, "node not found")
+    return {"ok": True, "node_id": node_id, "forced": force}
 
 
 @app.post("/api/v1/images/pull", status_code=201)

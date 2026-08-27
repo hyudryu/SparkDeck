@@ -244,6 +244,7 @@ class OnboardingService:
             "Connect the joining system and this entry node to the same Tailscale tailnet.",
             "Open Cluster onboarding on the system you want to join.",
             "Enter one of this node's access URLs and the one-time pairing code.",
+            "Repeat this for every machine; joining one node never imports its former cluster members.",
         ]
 
     def _access_urls(self, request_origin: str) -> list[str]:
@@ -406,6 +407,24 @@ class OnboardingService:
 
     async def _assert_joinable(self) -> None:
         await self._assert_no_owned_workloads("join")
+        registered = getattr(self.manager.node_registry, "nodes", [])
+        registered = registered if isinstance(registered, list) else []
+        children = [
+            node for node in registered
+            if isinstance(node, dict) and str(node.get("id") or "").strip()
+        ]
+        if children:
+            names = ", ".join(
+                str(node.get("name") or node.get("id")) for node in children[:5]
+            )
+            suffix = "" if len(children) <= 5 else f" and {len(children) - 5} more"
+            raise ValueError(
+                f"cannot join while this node still controls {len(children)} joined "
+                f"node{'s' if len(children) != 1 else ''}: {names}{suffix}. Joining "
+                "moves only this machine and never transfers its former cluster members. "
+                "On each member, use Leave cluster and then join it directly to the "
+                "destination controller; remove stale member records before retrying."
+            )
 
     async def register(
         self, body: dict[str, Any], request_origin: str, client_id: str,
@@ -628,6 +647,16 @@ class OnboardingService:
         result = await self.status(request_origin)
         result["ok"] = True
         return result
+
+    async def detach(self) -> dict[str, Any]:
+        """Honor an authenticated controller request to remove this worker."""
+        await self._assert_no_owned_workloads("leave")
+        self.manager.agent_credentials.revoke_remote_access()
+        self.assignment.clear()
+        adopt_controller = getattr(self.manager, "adopt_controller_role", None)
+        if adopt_controller is not None:
+            adopt_controller()
+        return {"ok": True, "role": "controller", "revoked": True}
 
     def unregister(self, headers: Any) -> dict[str, Any]:
         """Revoke a leaving worker's one-hop grant and inventory record."""

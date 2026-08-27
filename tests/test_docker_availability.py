@@ -97,3 +97,19 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["containers"], [])
         self.assertEqual(response.json()["images"], [])
+
+    async def test_liveness_api_does_not_query_docker_or_cluster_state(self):
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            with patch.object(
+                server.manager,
+                "get_state",
+                AsyncMock(side_effect=AssertionError("aggregate state was queried")),
+            ) as get_state:
+                response = await client.get("/healthz")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b"")
+        get_state.assert_not_awaited()

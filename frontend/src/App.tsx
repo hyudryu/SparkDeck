@@ -13,6 +13,7 @@ import { ModelsPage } from './pages/ModelsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StoragePage } from './pages/StoragePage'
 import { UsagePage } from './pages/UsagePage'
+import { SwitchPage } from './pages/SwitchPage'
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
           <Route path="/explore" element={<ExplorePage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/cluster" element={<ClusterPage />} />
+          <Route path="/switch" element={<SwitchPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/compare" element={<ComparePage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />

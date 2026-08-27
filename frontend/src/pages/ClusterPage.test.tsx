@@ -41,6 +41,7 @@ describe('ClusterPage', () => {
     expect(screen.getByText('http://100.64.0.10:7878')).toBeInTheDocument()
     expect(screen.getByText('Use a private Tailscale address')).toBeInTheDocument()
     expect(screen.getByText('http://100.x.x.x:7878')).toBeInTheDocument()
+    expect(screen.getByText(/Membership is per machine/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Join this node to another controller' }))
     expect(screen.getByText(/shown by either the controller or an online worker/)).toBeInTheDocument()
@@ -159,5 +160,41 @@ describe('ClusterPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Name is already in use')
     expect(input).toHaveValue('Studio Spark')
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
+  })
+
+  it('removes an edited worker and force-forgets an offline node with a warning', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/spark-2?force=true') && init?.method === 'DELETE') {
+        return new Response(JSON.stringify({ ok: true, node_id: 'spark-2', forced: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio Spark' }))
+    await user.click(screen.getByRole('button', { name: 'Forget node' }))
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/cannot notify it.*Leave cluster.*Cached weights stay/is))
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes/spark-2?force=true', expect.objectContaining({ method: 'DELETE' }))
+    expect(await screen.findByText(/Forgot offline node Studio Spark/)).toHaveAttribute('role', 'status')
+    expect(screen.queryByText('spark-2')).not.toBeInTheDocument()
+  })
+
+  it('does not offer removal for the current entry node', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio controller' }))
+
+    expect(screen.queryByRole('button', { name: /Remove node|Forget node/ })).not.toBeInTheDocument()
   })
 })

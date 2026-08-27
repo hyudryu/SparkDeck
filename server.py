@@ -102,7 +102,7 @@ class _DequeHandler(logging.Handler):
 
 
 _LOG_SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+"),
     re.compile(
         r'''(?ix)
         ((?:["']?(?:api[_-]?key|access[_-]?token|hf[_-]?token|
@@ -181,9 +181,19 @@ COGNITO_IDP_ORIGIN = urlsplit(COGNITO_ISSUER)._replace(path="", query="", fragme
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    if is_forwardable_path(request.url.path):
+    forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
+    forgotten_unregister = (
+        forwarded
+        and request.method == "POST"
+        and request.url.path == "/api/v1/onboarding/unregister"
+        and onboarding.is_already_unregistered_worker(request.headers)
+    )
+    if forgotten_unregister:
+        # The route turns this exact already-absent state into the 404 that a
+        # force-forgotten worker recognizes as a successful local recovery.
+        response = await call_next(request)
+    elif is_forwardable_path(request.url.path):
         assignment = onboarding.assignment.load()
-        forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
         if assignment:
             response = await forward_management_request(request, manager, assignment)
         elif forwarded:
@@ -515,6 +525,15 @@ async def agent_rename_node(req: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/api/agent/onboarding/detach")
+async def agent_detach_from_controller(req: Request):
+    _require_agent(req)
+    try:
+        return await onboarding.detach()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.get("/api/agent/temperature-history")
 async def agent_temperature_history(req: Request):
     _require_agent(req)
@@ -525,6 +544,45 @@ async def agent_temperature_history(req: Request):
 async def agent_stats(req: Request):
     _require_agent(req)
     return await manager.get_stats()
+
+
+@app.get("/api/agent/routeros")
+async def agent_routeros(req: Request):
+    _require_agent(req)
+    return await manager.routeros.overview()
+
+
+@app.put("/api/agent/routeros/connection")
+async def agent_connect_routeros(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        return await manager.routeros.connect(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.delete("/api/agent/routeros/connection")
+async def agent_disconnect_routeros(req: Request):
+    _require_agent(req)
+    try:
+        return manager.routeros.disconnect()
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
+@app.patch("/api/agent/routeros/fan-settings")
+async def agent_update_routeros_fan(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        return await manager.routeros.update_fan_settings(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.post("/api/agent/images/pull")
@@ -850,11 +908,11 @@ async def refresh_cluster_node(node_id: str):
 
 @app.delete("/api/nodes/{node_id}")
 async def remove_cluster_node(node_id: str):
-    if node_id == LOCAL_NODE_ID:
-        raise HTTPException(400, "the coordinator node cannot be removed")
     try:
-        removed = manager.remove_cluster_node(node_id)
+        removed = await manager.detach_cluster_node(node_id)
     except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     if not removed:
         raise HTTPException(404, "node not found")
@@ -1293,6 +1351,19 @@ async def v1_rename_node(node_id: str, req: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.delete("/api/v1/nodes/{node_id}")
+async def v1_remove_node(node_id: str, force: bool = False):
+    try:
+        removed = await manager.detach_cluster_node(node_id, force=force)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, "node not found")
+    return {"ok": True, "node_id": node_id, "forced": force}
+
+
 @app.post("/api/v1/images/pull", status_code=201)
 async def v1_pull_image(req: Request):
     body = await req.json()
@@ -1465,6 +1536,51 @@ async def v1_recipes():
     return {"items": [_public_recipe(recipe) for recipe in manager.recipes]}
 
 
+def _recipe_detail(recipe: dict) -> dict:
+    """Public saved-configuration contract plus its editable launch inputs."""
+    detail = _public_recipe(recipe)
+    detail["extra_args"] = manager._without_hf_cli_credentials(
+        recipe.get("extra_args") or []
+    )
+    detail["launch_controls"] = manager._deployment_launch_controls(
+        manager._deployment_launch_settings(recipe)
+    )
+    return detail
+
+
+@app.get("/api/v1/recipes/{recipe_id}")
+async def v1_recipe_detail(recipe_id: str):
+    """Return one saved configuration with its editable launch controls."""
+    recipe = await manager.get_recipe(recipe_id)
+    if not recipe:
+        raise HTTPException(404, "saved configuration not found")
+    return _recipe_detail(recipe)
+
+
+@app.put("/api/v1/recipes/{recipe_id}")
+async def v1_update_recipe(recipe_id: str, req: Request):
+    """Update the editable fields of a saved configuration."""
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "name", "extra_args", "launch_controls",
+        "gpu_memory_utilization", "gpu_memory_gb",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        updated = await manager.update_recipe(recipe_id, body)
+    except ValueError as exc:
+        status = 404 if str(exc) == "recipe not found" else 400
+        raise HTTPException(status, str(exc)) from exc
+    return _recipe_detail(updated)
+
+
 @app.post("/api/v1/recipes/{recipe_id}/deploy", status_code=201)
 async def v1_deploy_recipe(recipe_id: str, req: Request):
     recipe = await manager.get_recipe(recipe_id)
@@ -1476,9 +1592,13 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             400,
             recipe.get("error") or contract.get("error") or "saved runtime is unsupported",
         )
-    try:
-        body = await req.json()
-    except json.JSONDecodeError:
+    raw_body = await req.body()
+    if raw_body.strip():
+        try:
+            body = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "request body must be valid JSON") from exc
+    else:
         body = {}
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")
@@ -1566,6 +1686,8 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "community_api_url": "",
+    "default_runtime": "vllm",
+    "default_context_length": 8192,
 }
 
 
@@ -1595,9 +1717,23 @@ async def v1_update_settings(req: Request):
             raise HTTPException(400, "community_api_url must be a valid URL") from e
         if parsed.scheme not in ("http", "https") or not parsed.host:
             raise HTTPException(400, "community_api_url must be an http or https URL")
+    default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
+    if default_runtime not in ("vllm", "llama.cpp", "sglang"):
+        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, or sglang")
+    raw_context_length = body.get(
+        "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
+    )
+    try:
+        default_context_length = int(raw_context_length)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, "default_context_length must be an integer") from e
+    if not 256 <= default_context_length <= 10_000_000:
+        raise HTTPException(400, "default_context_length must be between 256 and 10000000")
     values = {
         "theme": theme,
         "community_api_url": community_api_url,
+        "default_runtime": default_runtime,
+        "default_context_length": default_context_length,
     }
     credential = body.get("hf_token")
     if credential is not None:
@@ -1626,7 +1762,7 @@ async def v1_clear_hf_token():
     return values
 
 
-def _require_same_origin_or_forwarded(req: Request) -> None:
+def _require_same_origin_or_forwarded(req: Request, action: str = "system updates") -> None:
     if any(req.headers.get(name) for name in FORWARD_HEADERS):
         return
     origin = req.headers.get("origin")
@@ -1634,7 +1770,56 @@ def _require_same_origin_or_forwarded(req: Request) -> None:
         return
     parsed = urlsplit(origin)
     if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != req.headers.get("host", "").casefold():
-        raise HTTPException(403, "system updates require a same-origin request")
+        raise HTTPException(403, f"{action} require a same-origin request")
+
+
+@app.get("/api/v1/routeros/presence")
+async def routeros_presence():
+    return await manager.routeros_cluster_presence()
+
+
+@app.get("/api/v1/routeros")
+async def routeros_overview():
+    return await manager.routeros_cluster_overview()
+
+
+@app.put("/api/v1/routeros/nodes/{node_id}/connection")
+async def connect_routeros(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("connection settings must be an object")
+        return await manager.connect_routeros(node_id, body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.delete("/api/v1/routeros/nodes/{node_id}/connection")
+async def disconnect_routeros(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        return await manager.disconnect_routeros(node_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.patch("/api/v1/routeros/nodes/{node_id}/fan-settings")
+async def update_routeros_fan(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("fan settings must be an object")
+        return await manager.update_routeros_fan_settings(node_id, body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/api/v1/system-update")
@@ -1787,6 +1972,22 @@ async def v1_delete_deployment(deployment_id: str):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.patch("/api/v1/deployments/{deployment_id}")
+async def v1_rename_deployment(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    try:
+        return await sparkdeck.rename_deployment(deployment_id, body.get("alias"))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/v1/benchmarks")

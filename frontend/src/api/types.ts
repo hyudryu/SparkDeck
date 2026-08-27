@@ -108,6 +108,60 @@ export interface NodeInventoryItem extends NodeSummary {
   disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
 
+export interface RouterOSPresenceNode {
+  node_id: string
+  node_name: string
+  detected: boolean
+  configured: boolean
+  connected?: boolean
+}
+
+export interface RouterOSPresence {
+  detected: boolean
+  nodes: RouterOSPresenceNode[]
+}
+
+export interface RouterOSDiscoveryCandidate {
+  address: string
+  identity?: string
+  platform?: string
+  version?: string
+  board?: string
+  mac?: string
+}
+
+export interface RouterOSHealthItem {
+  name: string
+  value: unknown
+  type?: string
+}
+
+export interface RouterOSNodeOverview extends RouterOSPresenceNode {
+  connected: boolean
+  discovery?: RouterOSDiscoveryCandidate[]
+  base_url?: string
+  username?: string
+  verify_tls?: boolean
+  error?: string
+  device?: Record<string, unknown>
+  health: RouterOSHealthItem[] | null
+  fan_settings?: Record<string, unknown> | null
+  fan_capabilities?: string[] | null
+  interfaces: Array<Record<string, unknown>>
+}
+
+export interface RouterOSOverview {
+  detected: boolean
+  nodes: RouterOSNodeOverview[]
+}
+
+export interface RouterOSConnectionInput {
+  base_url: string
+  username: string
+  password: string
+  verify_tls: boolean
+}
+
 export interface RenameNodeInput {
   name: string
 }
@@ -200,6 +254,10 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
+  // Retained for backward compatibility with settings saved before these
+  // controls were removed from the Settings page.
+  default_runtime?: RuntimeKind
+  default_context_length?: number
   hf_token?: string
   hf_token_configured?: boolean
   community_api_url?: string
@@ -381,6 +439,29 @@ export interface SavedConfiguration {
   supported?: boolean
   error?: string
   launch?: { phase?: string; image?: string }
+}
+
+export interface LaunchControls {
+  context_window?: number | null
+  max_concurrency?: number | null
+  kv_cache_dtype?: string | null
+  thinking_mode?: string | null
+  dspark_num_speculative_tokens?: number | null
+  max_cudagraph_capture_size?: number | null
+  max_num_batched_tokens?: number | null
+}
+
+export interface SavedConfigurationDetail extends SavedConfiguration {
+  extra_args: string[]
+  launch_controls: LaunchControls
+}
+
+export interface RecipeUpdateInput {
+  name?: string
+  extra_args?: string[]
+  launch_controls?: LaunchControls
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
 }
 
 export interface CreateStorageTransferInput {

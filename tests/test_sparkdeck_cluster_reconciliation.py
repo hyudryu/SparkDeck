@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +63,55 @@ class FakeManager:
     @staticmethod
     def public_target_node(node):
         return Manager.public_target_node(node)
+
+
+class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cluster_rename_persists_service_and_manager_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = Manager.__new__(Manager)
+            manager.http = httpx.AsyncClient()
+            manager.deployments_path = root / "manager-deployments.json"
+            manager.deployments = [{
+                "id": "manager-1",
+                "name": "Old name",
+                "model": "org/model",
+                "launch_settings": {
+                    "deployment_name": "Old name",
+                    "model": "org/model",
+                },
+            }]
+            service = SparkDeckService(manager, root)
+            service.store.add_deployment(Deployment(
+                id="record-1",
+                alias="Old name",
+                runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/model"),
+                settings={"manager_deployment_id": "manager-1"},
+            ))
+            try:
+                renamed = await service.rename_deployment(
+                    "record-1", "Production model"
+                )
+
+                self.assertEqual(renamed["alias"], "Production model")
+                self.assertEqual(manager.deployments[0]["name"], "Production model")
+                self.assertEqual(
+                    manager.deployments[0]["launch_settings"]["deployment_name"],
+                    "Production model",
+                )
+                self.assertEqual(
+                    json.loads(manager.deployments_path.read_text())[0]["name"],
+                    "Production model",
+                )
+                self.assertEqual(
+                    service.store.deployment("record-1")["alias"],
+                    "Production model",
+                )
+            finally:
+                await service.close()
+                await manager.http.aclose()
 
 
 class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):

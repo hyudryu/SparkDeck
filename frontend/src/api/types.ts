@@ -107,6 +107,9 @@ export interface NodeInventoryItem extends NodeSummary {
   docker_ready?: boolean
   fabric_ready?: boolean
   selectable?: boolean
+  // Rename results only: whether the new name reached the node itself
+  // ("pending" means an offline worker still answers with its old name).
+  name_sync?: 'local' | 'synchronized' | 'pending'
   stats?: SystemStats
   disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
@@ -249,6 +252,12 @@ export interface CommunityPairResponse {
 export interface CommunityAuthConfig {
   idp_endpoint: string
   client_id: string
+}
+
+export interface CommunitySession {
+  status: 'signed-in' | 'signed-out' | 'reauth-required'
+  email?: string
+  token_invalid?: boolean
 }
 
 export interface SyncStatus {
@@ -552,6 +561,8 @@ export interface UsageSummary {
   models: Record<string, UsageCounters>
   groups: UsageGroup[]
   total: UsageCounters
+  routing_rules?: Record<string, string>
+  merge_groups?: Record<string, string>
 }
 
 export interface HourlyUsagePoint {

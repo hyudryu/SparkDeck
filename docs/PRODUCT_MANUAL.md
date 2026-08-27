@@ -85,7 +85,7 @@ Models manages saved deployment configurations and active model servers for vLLM
 Use it to:
 
 - create an active deployment with **Add model**;
-- pin saved launch recipes and edit their launch arguments and controls;
+- pin, edit, and delete saved launch recipes;
 - choose eligible nodes and deploy a saved recipe;
 - start, stop, rename, or remove deployment records;
 - connect an existing OpenAI-compatible endpoint;
@@ -93,7 +93,7 @@ Use it to:
 - require the correct number of eligible nodes for tensor parallelism; and
 - inspect runtime, model identity, state, target nodes, configuration, and actions.
 
-**Add model** creates a deployment record; it does not create a saved recipe. The current interface does not create, duplicate, or delete saved recipes.
+**Add model** creates a deployment record; it does not create a saved recipe. The current interface can delete saved recipes, but it does not create or duplicate them. Deleting a recipe does not remove existing deployments or cached model weights.
 
 For a TP2 configuration, SparkDeck requires two selected nodes. Nodes without the necessary cached weights are disabled until the weights are downloaded or transferred there.
 
@@ -184,7 +184,7 @@ It provides:
 - lifetime model or alias share; and
 - sortable detailed accounting for input misses, cache hits, output, requests, average speed, and configured cost.
 
-Aliases and merge groups change how rows are presented; they do not rewrite the underlying counters. **Reset lifetime** is destructive and should be used only when the stored accounting is no longer needed.
+Aliases, merge groups, and routing rules change how rows are presented; they do not rewrite the underlying counters. Routing rules send one model's recorded totals to another model's row and can be set, changed, or removed per model from the **Edit usage model** dialog on this page. **Reset lifetime** is destructive and should be used only when the stored accounting is no longer needed.
 
 ## Images
 
@@ -246,7 +246,7 @@ Open the Switch page to discover or configure a RouterOS device. RouterOS creden
 
 ### Community Features
 
-Create an account, confirm the email address, sign in, reset a password, or sign out. Community data becomes available only after the signed-in user also explicitly enables benchmark sharing on Benchmarks; signing in alone does not grant access.
+Create an account, confirm the email address, sign in, reset a password, or sign out. A successful sign-in is shared with every joined node, including nodes disabled for model workloads, and each node's Settings page restores that paired account without requiring another browser-local sign-in. Account credentials remain in each node's private store and are not returned to the browser. Because sign-out applies across the joined cluster, SparkDeck asks for the paired account password again before it propagates that change. Community data becomes available only after the signed-in user also explicitly enables benchmark sharing on Benchmarks; signing in alone does not grant access.
 
 ### Support and legal
 

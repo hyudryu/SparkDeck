@@ -1,40 +1,27 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, setAuthTokenProvider } from './client'
+import { api } from './client'
 
 afterEach(() => {
-  setAuthTokenProvider(undefined)
   vi.restoreAllMocks()
 })
 
 describe('API client adapters', () => {
-  it('awaits an async bearer provider before protected community requests', async () => {
-    let resolveToken: ((token: string) => void) | undefined
-    setAuthTokenProvider(() => new Promise<string>((resolve) => {
-      resolveToken = resolve
-    }))
+  it('restores sanitized community state from the node session', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
-      items: [], availability: 'available',
-      evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+      status: 'signed-in', email: 'user@example.com', token_invalid: false,
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
 
-    const request = api.benchmarks.aggregates()
-    await Promise.resolve()
-    expect(fetchMock).not.toHaveBeenCalled()
-    resolveToken?.('refreshed-token')
-    await request
+    await expect(api.community.session()).resolves.toEqual({
+      status: 'signed-in', email: 'user@example.com', token_invalid: false,
+    })
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/community/aggregates',
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: 'Bearer refreshed-token' }),
-      }),
-    )
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/session', expect.objectContaining({
+      headers: expect.not.objectContaining({ Authorization: expect.anything() }),
+    }))
   })
 
   it('keeps consent withdrawal independent from Cognito token refresh', async () => {
-    const tokenProvider = vi.fn<() => Promise<string>>().mockRejectedValue(new Error('Cognito unavailable'))
-    setAuthTokenProvider(tokenProvider)
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -47,7 +34,6 @@ describe('API client adapters', () => {
       account_paired: true,
     }))
 
-    expect(tokenProvider).not.toHaveBeenCalled()
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       '/api/v1/community/consent',
       '/api/v1/community/sync',
@@ -57,21 +43,44 @@ describe('API client adapters', () => {
     ))).toBe(true)
   })
 
-  it('uses bearer lookup only for the protected unpair operation', async () => {
-    const tokenProvider = vi.fn().mockResolvedValue('current-token')
-    setAuthTokenProvider(tokenProvider)
+  it('uses fresh Cognito account proof for destructive unpairing', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       pairing: { status: 'not_paired' }, cluster: { applied: [], conflicts: [], errors: [] },
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
 
-    await api.community.unpair()
+    await api.community.unpair('reauthenticated-id-token')
 
-    expect(tokenProvider).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
       method: 'DELETE',
-      headers: expect.objectContaining({ Authorization: 'Bearer current-token' }),
+      headers: expect.objectContaining({ Authorization: 'Bearer reauthenticated-id-token' }),
     }))
+  })
+
+  it('renews the node session once when an aggregate cookie expires', async () => {
+    const aggregate = {
+      items: [], availability: 'available',
+      evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+    }
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'session expired' }), {
+        status: 401, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: 'signed-in', email: 'user@example.com',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(aggregate), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.benchmarks.aggregates()).resolves.toEqual(aggregate)
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      '/api/v1/community/aggregates',
+      '/api/v1/community/session',
+      '/api/v1/community/aggregates',
+    ])
   })
   it('normalizes deployment wire records for the UI', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({

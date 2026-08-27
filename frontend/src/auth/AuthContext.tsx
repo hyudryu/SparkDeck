@@ -1,23 +1,23 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { api, ApiError, setAuthTokenProvider } from '../api/client'
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { api, ApiError } from '../api/client'
 import type { CommunityClusterSync } from '../api/types'
 import {
   confirmForgotPassword,
   confirmSignUp,
   decodeIdToken,
+  forgetStoredTokens,
   forgotPassword,
-  refresh,
   resendCode,
   signIn as cognitoSignIn,
   signOut as cognitoSignOut,
   signUp,
-  storedTokens,
 } from './cognitoAuth'
+
+export const COMMUNITY_SESSION_RENEW_MS = 30 * 60 * 1000
 
 export interface AuthState {
   status: 'restoring' | 'signed-out' | 'signing-in' | 'signed-in' | 'reauth-required'
   email?: string
-  idToken?: string
   /** Cluster fan-out result from the latest sign-in/out, if the backend reported one. */
   clusterSync?: CommunityClusterSync | null
   signIn: (email: string, password: string) => Promise<void>
@@ -26,7 +26,7 @@ export interface AuthState {
   resendCode: (email: string) => Promise<void>
   forgotPassword: (email: string) => Promise<void>
   confirmForgotPassword: (email: string, code: string, newPassword: string) => Promise<void>
-  signOut: () => Promise<void>
+  signOut: (password: string) => Promise<void>
 }
 
 // A signed-out default keeps components usable without a provider (tests,
@@ -35,25 +35,23 @@ const signedOutDefault: AuthState = {
   status: 'signed-out',
   signIn: async (email, password) => {
     const tokens = await cognitoSignIn(email, password)
-    await api.community.pair(tokens.idToken, tokens.refreshToken).catch(() => undefined)
+    await api.community.pair(tokens.idToken, tokens.refreshToken)
+    forgetStoredTokens()
   },
   signUp,
   confirmSignUp,
   resendCode,
   forgotPassword,
   confirmForgotPassword,
-  signOut: () => cognitoSignOut(),
+  signOut: async () => {
+    throw new Error('Community session is unavailable')
+  },
 }
 
 const AuthContext = createContext<AuthState>(signedOutDefault)
 
 export function useAuth(): AuthState {
   return useContext(AuthContext)
-}
-
-function isExpired(idToken: string): boolean {
-  const exp = decodeIdToken(idToken).exp
-  return !exp || exp * 1000 <= Date.now()
 }
 
 function pairingConflictMessage(error: ApiError): Error {
@@ -63,100 +61,68 @@ function pairingConflictMessage(error: ApiError): Error {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthState['status']>('restoring')
-  const [idToken, setIdToken] = useState<string>()
+  const [email, setEmail] = useState<string>()
   const [clusterSync, setClusterSync] = useState<CommunityClusterSync | null>(null)
-  const idTokenRef = useRef<string | undefined>(undefined)
-  const refreshPromiseRef = useRef<Promise<string | undefined> | null>(null)
-  const publishIdToken = useCallback((token: string | undefined) => {
-    idTokenRef.current = token
-    setIdToken(token)
-  }, [])
-
-  const validIdToken = useCallback(async () => {
-    const current = idTokenRef.current
-    if (!current) return undefined
-    const expiresAt = (decodeIdToken(current).exp ?? 0) * 1000
-    if (expiresAt - Date.now() > 60_000) return current
-    if (!refreshPromiseRef.current) {
-      refreshPromiseRef.current = (async () => {
-        const tokens = await refresh()
-        if (!tokens || isExpired(tokens.idToken)) {
-          publishIdToken(undefined)
-          setStatus('reauth-required')
-          throw new Error('Your community session expired before this node could be signed out. Sign in again, then retry Sign out.')
-        }
-        publishIdToken(tokens.idToken)
-        return tokens.idToken
-      })().finally(() => {
-        refreshPromiseRef.current = null
-      })
-    }
-    return refreshPromiseRef.current
-  }, [publishIdToken])
+  const sessionGeneration = useRef(0)
 
   useEffect(() => {
     let cancelled = false
     const restore = async () => {
       try {
-        let tokens = storedTokens()
-        if (tokens && isExpired(tokens.idToken)) tokens = await refresh()
+        // The node is authoritative. Browser-origin tokens from an older
+        // session must never silently re-pair a cluster that was signed out.
+        const session = await api.community.session()
         if (cancelled) return
-        if (tokens && !isExpired(tokens.idToken)) {
-          try {
-            // A refreshed TokenSet omits the refresh token, so the backend
-            // re-pair reads it from storage (the uploader needs it to mint
-            // short-lived ID tokens for consented telemetry).
-            const paired = await api.community.pair(
-              tokens.idToken,
-              storedTokens()?.refreshToken ?? tokens.refreshToken,
-            )
-            if (cancelled) return
-            setClusterSync(paired.cluster ?? null)
-            publishIdToken(tokens.idToken)
-            setStatus('signed-in')
-            return
-          } catch {
-            await cognitoSignOut()
-          }
-        }
+        forgetStoredTokens()
+        setClusterSync(null)
+        setEmail(session.email)
+        setStatus(session.status)
       } catch {
-        // Retryable refresh failures retain browser credentials for the next
-        // restore attempt, but never create an unpaired signed-in UI session.
+        if (cancelled) return
+        setClusterSync(null)
+        setEmail(undefined)
+        setStatus('signed-out')
       }
-      if (cancelled) return
-      setClusterSync(null)
-      publishIdToken(undefined)
-      setStatus('signed-out')
     }
     void restore()
     return () => {
       cancelled = true
     }
-  }, [publishIdToken])
+  }, [])
 
   useEffect(() => {
-    setAuthTokenProvider(validIdToken)
-    return () => {
-      setAuthTokenProvider(undefined)
-    }
-  }, [validIdToken])
+    if (status !== 'signed-in') return
+    const generation = sessionGeneration.current
+    const timer = window.setInterval(() => {
+      void api.community.session().then((session) => {
+        if (sessionGeneration.current !== generation) return
+        forgetStoredTokens()
+        setEmail(session.email)
+        setStatus(session.status)
+      }).catch(() => {
+        // A transient renewal failure must not sign out a working page. The
+        // next interval or a protected-request retry can renew the cookie.
+      })
+    }, COMMUNITY_SESSION_RENEW_MS)
+    return () => window.clearInterval(timer)
+  }, [status])
 
   const value = useMemo<AuthState>(() => ({
     status,
-    idToken,
+    email,
     clusterSync,
-    email: idToken ? decodeIdToken(idToken).email : undefined,
-    signIn: async (email, password) => {
+    signIn: async (accountEmail, password) => {
       if (status === 'restoring') {
         throw new Error('Wait for the saved community session to finish restoring, then try again.')
       }
       setStatus('signing-in')
       setClusterSync(null)
       try {
-        const tokens = await cognitoSignIn(email, password)
+        const tokens = await cognitoSignIn(accountEmail, password)
         try {
           const paired = await api.community.pair(tokens.idToken, tokens.refreshToken)
           setClusterSync(paired.cluster ?? null)
+          forgetStoredTokens()
         } catch (pairError) {
           // Pairing is what makes community features work; if it fails, do not
           // leave the UI looking signed in.
@@ -165,9 +131,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             ? pairingConflictMessage(pairError)
             : pairError
         }
-        publishIdToken(tokens.idToken)
+        setEmail(decodeIdToken(tokens.idToken).email)
         setStatus('signed-in')
       } catch (reason) {
+        setEmail(undefined)
         setStatus('signed-out')
         throw reason
       }
@@ -177,15 +144,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     resendCode,
     forgotPassword,
     confirmForgotPassword,
-    signOut: async () => {
+    signOut: async (password) => {
       setClusterSync(null)
-      const unpaired = await api.community.unpair()
-      await cognitoSignOut()
-      setClusterSync(unpaired?.cluster ?? null)
-      publishIdToken(undefined)
-      setStatus('signed-out')
+      if (!email) throw new Error('The paired account email is unavailable; reload and try again.')
+      const tokens = await cognitoSignIn(email, password)
+      try {
+        const unpaired = await api.community.unpair(tokens.idToken)
+        sessionGeneration.current += 1
+        setClusterSync(unpaired?.cluster ?? null)
+        setEmail(undefined)
+        setStatus('signed-out')
+      } finally {
+        await cognitoSignOut()
+      }
     },
-  }), [status, idToken, clusterSync, publishIdToken])
+  }), [status, email, clusterSync])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

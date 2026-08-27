@@ -125,6 +125,34 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.service.upload_community_once(), 0)
         self.assertEqual(requested, [])
 
+    async def test_invalid_upload_endpoint_is_unconfigured_without_failing_queue(self):
+        requests = []
+        self.service._community_upload_url = "http://community.example/api"
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(202),
+        )
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        self.service._record_response(
+            None, "org/model", "vllm", {"context_size": 4096},
+            time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+
+        self.assertFalse(self.service.community_upload_configured)
+        self.assertEqual(await self.service.upload_community_once(), 0)
+        self.assertEqual(requests, [])
+        self.assertEqual(
+            self.service.store.sync_status()["outbox"],
+            {"pending": 1, "waiting_for_account": 0, "failed": 0, "synced": 0},
+        )
+
     async def test_upload_endpoint_requires_https(self):
         with self.assertRaisesRegex(ValueError, "must use HTTPS"):
             _community_upload_url("http://community.example/api")
@@ -214,6 +242,56 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         status = self.service.store.sync_status()["outbox"]
         self.assertEqual(status["synced"], 1)
         self.assertEqual(status["pending"], 1)
+
+    async def test_deleted_queued_snapshot_is_rechecked_before_its_turn(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        requests = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                first_started.set()
+                await release_first.wait()
+            return httpx.Response(202, request=request)
+
+        self.service._community_upload_url = "https://community.example/api"
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        for model in ("org/model-one", "org/model-two"):
+            self.service._record_response(
+                None, model, "vllm", {"context_size": 4096},
+                time.monotonic() - 0.25,
+                {
+                    "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                    "timings": {"predicted_per_second": 96.0},
+                },
+            )
+        samples, _ = self.service.store.benchmarks()
+        sample_ids = {
+            item["model"]["repository"]: item["id"] for item in samples
+        }
+
+        upload = asyncio.create_task(self.service.upload_community_once())
+        await first_started.wait()
+        first_model = json.loads(requests[0].content)["model_id"]
+        deleted_model = (
+            "org/model-two" if first_model == "org/model-one" else "org/model-one"
+        )
+        # Exercise the storage boundary directly to prove the worker does not
+        # trust the batch payload it captured before the first request.
+        self.assertTrue(self.service.store.delete_benchmark(sample_ids[deleted_model]))
+        release_first.set()
+
+        self.assertEqual(await upload, 1)
+        self.assertEqual(len(requests), 1)
+        remaining, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertNotEqual(remaining[0]["model"]["repository"], deleted_model)
 
     async def test_configured_community_aggregates_are_fetched_and_sanitized(self):
         requested = []

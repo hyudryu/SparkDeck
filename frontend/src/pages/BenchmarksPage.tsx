@@ -17,21 +17,31 @@ export function BenchmarksPage() {
     communityAccess.enabled,
   )
   const [syncBusy, setSyncBusy] = useState(false)
+  const [syncActionError, setSyncActionError] = useState<string>()
   const [reviewingConsent, setReviewingConsent] = useState(false)
   const aggregateResponse = aggregates.data
   const localAggregates = aggregateResponse?.availability === 'local'
 
-  const toggleSharing = async () => {
+  const applyConsent = async (enabled: boolean) => {
     if (!sync.data) return
     setSyncBusy(true)
+    setSyncActionError(undefined)
     try {
-      sync.setData(await api.benchmarks.setConsent(!sync.data.sharing_enabled))
+      const updated = await api.benchmarks.setConsent(enabled)
+      sync.setData(updated)
       communityAccess.reload()
       setReviewingConsent(false)
+      if (updated.cluster_errors?.length) {
+        setSyncActionError(`Sharing was updated on this controller, but not on: ${updated.cluster_errors.join('; ')}. Retry when those nodes are reachable.`)
+      }
+    } catch (reason) {
+      setSyncActionError(reason instanceof Error ? reason.message : 'Could not update community sharing')
     } finally {
       setSyncBusy(false)
     }
   }
+
+  const toggleSharing = () => applyConsent(!sync.data?.sharing_enabled)
 
   const retry = async () => {
     setSyncBusy(true)
@@ -57,9 +67,10 @@ export function BenchmarksPage() {
           <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Share only model name, context window size, and measured inference tok/s.</p></div></div>
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
+          {syncActionError && <p className="inline-error" role="alert">{syncActionError}</p>}
           {sync.data && <>
             <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired && sync.data.upload_configured ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? (sync.data.upload_configured ? 'Sharing enabled' : 'Queued locally') : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
-            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
+            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{syncActionError && !sync.data.sharing_enabled && <Button variant="secondary" disabled={syncBusy} onClick={() => void applyConsent(false)}>Retry turn off everywhere</Button>}{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
           </>}
         </Panel>
         <Panel className="privacy-panel">

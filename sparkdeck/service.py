@@ -221,8 +221,10 @@ def _community_upload_url(endpoint: str) -> httpx.URL:
         url = httpx.URL(endpoint)
     except (TypeError, httpx.InvalidURL) as exc:
         raise ValueError("community upload URL is invalid") from exc
-    if url.scheme != "https":
+    if url.scheme != "https" or not url.host:
         raise ValueError("community upload URL must use HTTPS")
+    if url.userinfo:
+        raise ValueError("community upload URL must not include credentials")
     path = url.path.rstrip("/")
     if not path.endswith("/benchmarks"):
         path = f"{path}/benchmarks"
@@ -370,7 +372,16 @@ class SparkDeckService:
 
     @property
     def community_upload_configured(self) -> bool:
-        return bool(self._community_upload_url and self._community_upload_token)
+        return self._configured_community_upload_url() is not None
+
+    def _configured_community_upload_url(self) -> httpx.URL | None:
+        """Return a syntactically valid HTTPS upload URL, if fully configured."""
+        if not self._community_upload_url or not self._community_upload_token:
+            return None
+        try:
+            return _community_upload_url(self._community_upload_url)
+        except (TypeError, ValueError):
+            return None
 
     async def close(self) -> None:
         if self._community_upload_task is not None:
@@ -386,6 +397,11 @@ class SparkDeckService:
         """Serialize consent withdrawal with all outbound uploads."""
         async with self._community_upload_lock:
             await asyncio.to_thread(self.store.set_community_consent, enabled)
+
+    async def delete_benchmark(self, sample_id: str) -> bool:
+        """Serialize deletion with uploads so deleted samples cannot start later."""
+        async with self._community_upload_lock:
+            return await asyncio.to_thread(self.store.delete_benchmark, sample_id)
 
     async def unpair_community_device(
         self, expected_sub: str,
@@ -411,14 +427,13 @@ class SparkDeckService:
 
     async def _upload_community_once_locked(self) -> int:
         """Drain one bounded outbox batch when consent and credentials exist."""
-        endpoint = self._community_upload_url
         token = self._community_upload_token
-        if not endpoint or not token:
+        upload_url = self._configured_community_upload_url()
+        if upload_url is None:
             return 0
 
         entries = await asyncio.to_thread(self.store.outbox_entries)
         synced = 0
-        upload_url = _community_upload_url(endpoint)
         for entry in entries:
             async with self._community_upload_lock:
                 consent = await asyncio.to_thread(
@@ -431,10 +446,18 @@ class SparkDeckService:
                 if not consent or pairing.get("status") != "paired":
                     break
                 sample_id = entry["sample_id"]
+                # The batch is only a scheduling snapshot. Deletion, consent
+                # withdrawal, or another queue transition may have removed the
+                # row before this item acquired the outbound-upload lock.
+                current = await asyncio.to_thread(
+                    self.store.outbox_entry, sample_id,
+                )
+                if current is None:
+                    continue
                 try:
                     response = await _post_public_community_url(
                         upload_url,
-                        entry["payload"],
+                        current["payload"],
                         token=token,
                         idempotency_key=sample_id,
                         transport=getattr(

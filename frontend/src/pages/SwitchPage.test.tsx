@@ -57,7 +57,7 @@ describe('SwitchPage', () => {
 
     await screen.findByRole('heading', { name: 'Switch not detected' })
     await user.type(screen.getByRole('textbox', { name: 'Username' }), 'admin')
-    await user.type(screen.getByLabelText('Password'), 'secret')
+    await user.type(screen.getByLabelText(/^Password/), 'secret')
     await user.click(screen.getByRole('button', { name: 'Save connection' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/routeros/nodes/local/connection', expect.objectContaining({
@@ -89,6 +89,7 @@ describe('SwitchPage', () => {
       nodes: [{
         ...connected.nodes[0],
         base_url: 'https://router.example.internal',
+        username: 'admin',
         verify_tls: false,
         discovery: [{ address: '192.168.88.1', identity: 'Different Switch' }],
       }],
@@ -98,7 +99,56 @@ describe('SwitchPage', () => {
     render(<SwitchPage />)
 
     expect(await screen.findByRole('textbox', { name: /^RouterOS URL/ })).toHaveValue('https://router.example.internal')
+    expect(screen.getByRole('textbox', { name: 'Username' })).toHaveValue('admin')
     expect(screen.getByRole('checkbox', { name: /Verify TLS certificate/ })).not.toBeChecked()
+  })
+
+  it('requires a password only when the saved endpoint or username changes', async () => {
+    const configured = {
+      detected: true,
+      nodes: [{
+        ...connected.nodes[0],
+        base_url: 'https://router.example.internal', username: 'admin', verify_tls: true,
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(configured)))
+    const user = userEvent.setup()
+
+    render(<SwitchPage />)
+
+    const endpoint = await screen.findByRole('textbox', { name: /^RouterOS URL/ })
+    const username = screen.getByRole('textbox', { name: 'Username' })
+    const password = screen.getByLabelText(/^Password/)
+    expect(password).not.toBeRequired()
+    expect(screen.getByText(/Leave blank to keep the existing password/)).toBeInTheDocument()
+
+    await user.clear(endpoint)
+    await user.type(endpoint, 'https://replacement.example.internal')
+    expect(password).toBeRequired()
+    expect(screen.getByText(/Password required because the RouterOS URL or username changed/)).toBeInTheDocument()
+
+    await user.clear(endpoint)
+    await user.type(endpoint, 'https://router.example.internal/rest/')
+    expect(password).not.toBeRequired()
+
+    await user.clear(username)
+    await user.type(username, 'operator')
+    expect(password).toBeRequired()
+  })
+
+  it('requires a password when the configured response omits the saved username', async () => {
+    const configured = {
+      detected: true,
+      nodes: [{
+        ...connected.nodes[0], base_url: 'https://router.example.internal',
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(configured)))
+
+    render(<SwitchPage />)
+
+    expect(await screen.findByLabelText(/^Password/)).toBeRequired()
+    expect(screen.getByText(/saved username is not exposed/)).toBeInTheDocument()
   })
 
   it('renders RouterOS telemetry and updates supported fan settings', async () => {

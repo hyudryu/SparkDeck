@@ -46,32 +46,62 @@ function discoveredUrl(candidate?: RouterOSDiscoveryCandidate) {
   return `https://${address}`
 }
 
+function normalizedConnectionUrl(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, '')
+  return trimmed.endsWith('/rest') ? trimmed.slice(0, -5) : trimmed
+}
+
 function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onChanged: () => void }) {
   const [form, setForm] = useState<RouterOSConnectionInput>({
     base_url: node.base_url?.trim() || discoveredUrl(node.discovery?.[0]),
-    username: '',
+    username: node.username?.trim() ?? '',
     password: '',
     verify_tls: node.verify_tls ?? true,
   })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
+  const [savedConnection, setSavedConnection] = useState<{
+    baseUrl: string
+    username?: string
+  }>({
+    baseUrl: normalizedConnectionUrl(node.base_url ?? ''),
+    username: node.username?.trim() || undefined,
+  })
 
   useEffect(() => {
+    if (node.configured && node.base_url) {
+      const baseUrl = node.base_url.trim()
+      setSavedConnection((saved) => ({
+        baseUrl: normalizedConnectionUrl(baseUrl),
+        username: node.username?.trim() || saved.username,
+      }))
+      setForm((current) => ({
+        ...current,
+        base_url: baseUrl,
+        username: current.username || node.username?.trim() || '',
+        verify_tls: node.verify_tls ?? true,
+      }))
+      return
+    }
     setForm((current) => {
-      if (node.configured && node.base_url) {
-        return {
-          ...current,
-          base_url: node.base_url.trim(),
-          verify_tls: node.verify_tls ?? true,
-        }
-      }
       return current.base_url ? current : {
         ...current,
         base_url: discoveredUrl(node.discovery?.[0]),
       }
     })
-  }, [node.base_url, node.configured, node.discovery, node.verify_tls])
+  }, [node.base_url, node.configured, node.discovery, node.username, node.verify_tls])
+
+  const endpointChanged = normalizedConnectionUrl(form.base_url) !== savedConnection.baseUrl
+  const usernameChanged = !savedConnection.username || form.username.trim() !== savedConnection.username
+  const passwordRequired = !node.configured || endpointChanged || usernameChanged
+  const passwordHelp = !node.configured
+    ? 'Enter the password for this RouterOS account.'
+    : !savedConnection.username
+      ? 'Enter the password to update this connection because the saved username is not exposed.'
+      : passwordRequired
+        ? 'Password required because the RouterOS URL or username changed.'
+        : 'Leave blank to keep the existing password. Changing the URL or username requires it.'
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -82,6 +112,10 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
       await api.routeros.connect(node.node_id, {
         ...form,
         base_url: form.base_url.trim(),
+        username: form.username.trim(),
+      })
+      setSavedConnection({
+        baseUrl: normalizedConnectionUrl(form.base_url),
         username: form.username.trim(),
       })
       setForm((current) => ({ ...current, password: '' }))
@@ -123,7 +157,7 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
       <div className="switch-connection-fields">
         <label className="field"><span>RouterOS URL</span><input type="url" required value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://192.168.88.1" /><small>Use the REST API address reachable from this SparkDeck node.</small></label>
         <label className="field"><span>Username</span><input required autoComplete="username" value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} /></label>
-        <label className="field"><span>Password</span><input type="password" required={!node.configured} autoComplete="current-password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />{node.configured && <small>Leave blank to keep the existing password.</small>}</label>
+        <label className="field"><span>Password</span><input type="password" required={passwordRequired} autoComplete="current-password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} /><small>{passwordHelp}</small></label>
         <label className="check-field switch-tls"><input type="checkbox" checked={form.verify_tls} onChange={(event) => setForm({ ...form, verify_tls: event.target.checked })} /><span><strong>Verify TLS certificate</strong><small>Keep enabled for a trusted RouterOS certificate.</small></span></label>
       </div>
       {error && <p className="inline-error" role="alert">{error}</p>}

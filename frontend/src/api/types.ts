@@ -113,7 +113,7 @@ export interface RouterOSPresenceNode {
   node_name: string
   detected: boolean
   configured: boolean
-  connected: boolean
+  connected?: boolean
 }
 
 export interface RouterOSPresence {
@@ -137,8 +137,10 @@ export interface RouterOSHealthItem {
 }
 
 export interface RouterOSNodeOverview extends RouterOSPresenceNode {
+  connected: boolean
   discovery?: RouterOSDiscoveryCandidate[]
   base_url?: string
+  username?: string
   verify_tls?: boolean
   error?: string
   device?: Record<string, unknown>

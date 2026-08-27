@@ -174,10 +174,65 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             settings={"manager_deployment_id": "cluster-1"},
         ))
         self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "b", "models": []},
+        ])
 
-        await self.service.deployment_action("dep-1", "start", node_ids=["a", "b"])
+        await self.service.deployment_action("dep-1", "start", node_ids=["a"])
 
-        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a", "b"])
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a"])
+
+    async def test_start_rejects_nodes_without_cached_weights(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "b", "models": []},
+        ])
+
+        with self.assertRaisesRegex(ValueError, "not available on selected node"):
+            await self.service.deployment_action("dep-1", "start", node_ids=["a", "b"])
+
+        self.manager.deployment_action.assert_not_awaited()
+
+    async def test_start_rejects_node_selection_for_standalone_container(self):
+        self.manager.list_containers.return_value = [{
+            "name": "legacy-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "exited", "port": 8000,
+        }]
+
+        with self.assertRaisesRegex(ValueError, "node selection is only available for cluster deployments"):
+            await self.service.deployment_action("container:legacy-model", "start", node_ids=["remote-1"])
+        self.manager.start_container.assert_not_awaited()
+
+    async def test_cluster_member_card_exposes_persisted_layout(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "members": [{"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0}],
+            "launch_settings": {
+                "engine": "vllm", "node_ids": ["local", "node-2"],
+                "deployment_mode": "replicated", "extra_args": [],
+            },
+        }]
+        self.manager.recipe_deployment_contract = lambda recipe: {
+            "required_node_count": 2, "deployment_mode": "replicated",
+        }
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "exited", "port": 8000,
+        }]
+
+        cards = await self.service.deployments()
+
+        self.assertEqual(cards[0]["required_node_count"], 2)
+        self.assertEqual(cards[0]["deployment_mode"], "replicated")
 
     async def test_concurrent_duplicate_alias_launches_only_one_container(self):
         async def launch(*_args, **_kwargs):

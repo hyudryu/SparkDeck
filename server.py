@@ -2016,7 +2016,7 @@ async def v1_deployment_action(deployment_id: str, action: str, req: Request):
                 raise ValueError("node_ids must contain non-empty node IDs")
             node_ids = [item.strip() for item in node_ids]
         return await sparkdeck.deployment_action(deployment_id, action, node_ids)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "request body must be valid JSON")
     except LookupError as e:
         raise HTTPException(404, str(e))

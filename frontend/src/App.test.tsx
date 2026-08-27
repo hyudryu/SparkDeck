@@ -636,6 +636,7 @@ describe('model deployments', () => {
       const body = path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-1', alias: 'Sharded model', runtime: 'vllm', kind: 'managed',
         model: { repository: 'org/model' }, status: 'stopped', settings: { tensor_parallel_size: 2 }, node_ids: [],
+        deployment_mode: 'sharded', required_node_count: 2,
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
@@ -679,6 +680,7 @@ describe('model deployments', () => {
       const body = path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-2', alias: 'Solo model', runtime: 'vllm', kind: 'managed',
         model: { repository: 'org/model' }, status: 'stopped', settings: {}, node_ids: [],
+        deployment_mode: 'single', required_node_count: 1,
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
@@ -700,6 +702,36 @@ describe('model deployments', () => {
       '/api/v1/deployments/dep-2/start',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['node-2'] }) }),
     ))
+  })
+
+  it('keeps the persisted replicated layout even when tensor parallelism is 1', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-3', alias: 'Replica model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: { tensor_parallel_size: 1 }, node_ids: ['local', 'node-2'],
+        deployment_mode: 'replicated', required_node_count: 2,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Replica model' })
+    // A replicated TP1 deployment still runs on its saved two nodes.
+    expect(dialog).toHaveTextContent('exactly 2 nodes')
+    expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
+    expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled()
   })
 
   it('sorts deployments by recency or name and renames them inline', async () => {

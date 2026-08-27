@@ -1,6 +1,14 @@
 import { expect, test } from '@playwright/test'
 
 const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/switch', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
+const benchmarkCurves = [
+  { context: 4096, prompt: [5980, 6120, 5100, 4950], generation: [95, 155, 168, 140] },
+  { context: 8192, prompt: [5600, 5850, 5300, 5050], generation: [100, 162, 148, 110] },
+  { context: 16384, prompt: [5200, 5350, 4800, 4650], generation: [102, 150, 98, 58] },
+  { context: 32768, prompt: [5200, 5450, 3000, 2800], generation: [99, 98, 42, 28] },
+  { context: 65536, prompt: [3500, 3350, 3900, 3600], generation: [96, 80, 12, 5] },
+  { context: 100000, prompt: [2800, 3100, 2500, 2900], generation: [84, 18, 6, 3] },
+]
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
@@ -29,20 +37,26 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/onboarding')) body = { role: 'controller', node: { id: 'local', name: 'Studio controller', port: 7878, access_urls: ['https://controller.tailnet.ts.net:7878'] }, controller_reachable: true, join_code: 'PAIR-123', instructions: [] }
     else if (path.endsWith('/benchmark-models')) body = { items: [{
       model_id: 'nvidia/Qwen3.5-35B-A3B-NVFP4', run_count: 12,
-      best_prompt_tokens_per_second: 5980, best_generation_tokens_per_second: 174,
-      context_windows: [4096, 16384, 32768], tensor_parallel_sizes: [1, 2],
+      best_prompt_tokens_per_second: 6120, best_generation_tokens_per_second: 168,
+      context_windows: benchmarkCurves.map(({ context }) => context), tensor_parallel_sizes: [1, 2],
       latest_at: '2026-08-27T12:00:00Z',
     }] }
     else if (path.includes('/benchmark-models/')) body = {
       model_id: 'nvidia/Qwen3.5-35B-A3B-NVFP4',
-      points: [4096, 16384, 32768].flatMap((context, contextIndex) => [1, 2, 5, 10].map((concurrency, index) => ({
+      points: benchmarkCurves.flatMap(({ context, prompt, generation }) => [1, 2, 5, 10].map((concurrency, index) => ({
         context_window_size: context, concurrency, tensor_parallel_size: 1,
-        prompt_tokens_per_second: 5980 - contextIndex * 900 - index * 280,
-        generation_tokens_per_second: 98 + index * 25 - contextIndex * 12,
+        prompt_tokens_per_second: prompt[index],
+        generation_tokens_per_second: generation[index],
         sample_count: 3,
       }))).concat([{ context_window_size: 16384, concurrency: 1, tensor_parallel_size: 2, prompt_tokens_per_second: 6200, generation_tokens_per_second: 112, sample_count: 2 }]),
     }
-    else if (path.includes('/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+    else if (path.includes('/benchmarks')) body = { items: [{
+      id: 'run-latest', created_at: '2026-08-27T12:00:00Z', deployment_id: 'dep-1',
+      model: { repository: 'nvidia/Qwen3.5-35B-A3B-NVFP4', quantization: 'NVFP4' },
+      runtime: 'vllm', hardware: { hardware_class: 'dgx-spark' }, input_tokens: 12240,
+      output_tokens: 336, latency_ms: 2000, generation_tokens_per_second: 168,
+      cold_start: false, eligible_for_community: true, sync_state: 'synced',
+    }], total: 1, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
     else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured', evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' } }
     else if (path.endsWith('/images')) body = { items: [{ id: 'sha256:remote', repository: 'org/remote-runtime', tag: 'v1', size: 2147483648, runtimes: ['vllm'], node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }] }
@@ -113,7 +127,7 @@ test('renders the benchmark explorer dialog in dark mode without overflow', asyn
   await page.route('**/api/v1/settings', async (route) => route.fulfill({ json: { theme: 'dark', hf_token_configured: false, community_api_url: '' } }))
   await page.goto('/benchmarks')
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
-  await page.getByRole('button', { name: /nvidia\/Qwen3.5-35B-A3B-NVFP4/ }).click()
+  await page.getByRole('button', { name: /^nvidia\/Qwen3.5-35B-A3B-NVFP4 12 runs/ }).click()
   const dialog = page.getByRole('dialog', { name: 'nvidia/Qwen3.5-35B-A3B-NVFP4' })
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('img', { name: /^Prompt throughput/ })).toBeVisible()

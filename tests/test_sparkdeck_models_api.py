@@ -91,6 +91,31 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(invalid.status_code, 400)
 
+    async def test_delete_recipe_delegates_and_returns_no_content(self):
+        delete = AsyncMock(return_value=True)
+        with patch.object(server.manager, "delete_recipe", delete):
+            response = await self.client.delete("/api/v1/recipes/r1")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b"")
+        delete.assert_awaited_once_with("r1")
+
+    async def test_delete_recipe_maps_missing_recipe(self):
+        with patch.object(server.manager, "delete_recipe", AsyncMock(return_value=False)):
+            response = await self.client.delete("/api/v1/recipes/missing")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "saved configuration not found")
+
+    async def test_legacy_delete_recipe_contract_remains_available(self):
+        delete = AsyncMock(return_value=True)
+        with patch.object(server.manager, "delete_recipe", delete):
+            response = await self.client.delete("/api/recipes/r1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True})
+        delete.assert_awaited_once_with("r1")
+
     async def test_rename_deployment_delegates_to_service(self):
         rename = AsyncMock(return_value={"id": "dep-1", "alias": "Renamed"})
         with patch.object(server.sparkdeck, "rename_deployment", rename):

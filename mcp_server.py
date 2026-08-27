@@ -329,6 +329,12 @@ class ControllerClient:
                 for _ in range(repetitions)
                 for prompt in prompt_values
             ]
+            # A C10 data point must actually have ten requests available to run
+            # together. Fill short prompt sets by cycling the supplied prompts;
+            # otherwise the result would only be labelled with the requested
+            # concurrency instead of measuring it.
+            while len(jobs) < concurrency:
+                jobs.append(prompt_values[len(jobs) % len(prompt_values)])
             semaphore = asyncio.Semaphore(concurrency)
 
             async def limited(prompt: str) -> dict[str, Any]:
@@ -349,7 +355,7 @@ class ControllerClient:
         completion_tokens = sum(result["completion_tokens"] for result in results)
         prompt_tokens = sum(result["prompt_tokens"] for result in results)
         latencies = [result["latency_seconds"] for result in results]
-        return {
+        result = {
             "deployment_id": deployment_id,
             "model": model,
             "configuration": {
@@ -373,6 +379,23 @@ class ControllerClient:
             },
             "samples": results,
         }
+        try:
+            recorded = await self._request(
+                "POST", "/api/v1/benchmark-runs",
+                json_body={
+                    "deployment_id": deployment_id,
+                    "concurrency": concurrency,
+                    "request_count": len(results),
+                    "prompt_tokens": prompt_tokens,
+                    "generation_tokens": completion_tokens,
+                    "wall_seconds": wall_seconds,
+                },
+            )
+            result["recording"] = {"status": "recorded", "id": recorded.get("id")}
+        except ControllerError as exc:
+            # Preserve the benchmark result for legacy deployments/controllers.
+            result["recording"] = {"status": "not_recorded", "reason": str(exc)}
+        return result
 
 
 def _save_ab_result(result: dict[str, Any]) -> None:

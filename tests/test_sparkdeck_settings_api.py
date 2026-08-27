@@ -35,7 +35,12 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_returns_only_masked_credential_status_and_live_ui_settings(self):
         sentinel = "hf_get_sentinel_secret"
-        stored = {"theme": "dark", "community_api_url": "https://example.test"}
+        stored = {
+            "theme": "dark",
+            "community_api_url": "https://example.test",
+            "default_runtime": "sglang",
+            "default_context_length": 24576,
+        }
         with (
             patch.object(
                 server.sparkdeck.store,
@@ -50,11 +55,11 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json(), {
             "theme": "dark",
             "community_api_url": "https://example.test",
+            "default_runtime": "sglang",
+            "default_context_length": 24576,
             "hf_token_configured": True,
         })
         self.assertNotIn(sentinel, response.text)
-        self.assertNotIn("default_runtime", response.text)
-        self.assertNotIn("default_context_length", response.text)
 
     async def test_put_stores_credential_on_controller_without_echoing_it(self):
         sentinel = "hf_put_sentinel_secret"
@@ -76,6 +81,8 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json(), {
             "theme": "light",
             "community_api_url": "https://community.example",
+            "default_runtime": "sglang",
+            "default_context_length": 32768,
             "hf_token_configured": True,
         })
         self.assertNotIn(sentinel, response.text)
@@ -83,7 +90,22 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_setting.call_args_list, [
             call("theme", "light"),
             call("community_api_url", "https://community.example"),
+            call("default_runtime", "sglang"),
+            call("default_context_length", 32768),
         ])
+
+    async def test_invalid_deployment_defaults_are_rejected_without_saving(self):
+        with patch.object(server.sparkdeck.store, "set_setting") as set_setting:
+            bad_runtime = await self.client.put(
+                "/api/v1/settings", json={"default_runtime": "tensorrt"},
+            )
+            bad_context = await self.client.put(
+                "/api/v1/settings", json={"default_context_length": 32},
+            )
+
+        self.assertEqual(bad_runtime.status_code, 400)
+        self.assertEqual(bad_context.status_code, 400)
+        set_setting.assert_not_called()
 
     async def test_invalid_credential_does_not_partially_save_other_settings(self):
         sentinel = "hf invalid sentinel"

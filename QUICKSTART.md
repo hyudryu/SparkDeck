@@ -26,7 +26,7 @@ docker info
 nvidia-smi
 ```
 
-SparkDeck requires Python 3.11 or newer and Node.js 20 or newer. Linux with Docker and the NVIDIA Container Toolkit is the recommended GPU-worker environment. You also need Git and permission to run Docker.
+SparkDeck requires Python 3.11 or newer. Its locked Vite toolchain requires Node.js `^20.19.0` or `>=22.12.0`; earlier Node 20 releases are not supported. Linux with Docker and the NVIDIA Container Toolkit is the recommended GPU-worker environment. You also need Git and permission to run Docker.
 
 ## 1. Install Tailscale on both Sparks
 
@@ -200,7 +200,15 @@ tailscale serve status
 
 ## Keep SparkDeck running after logout
 
-The repository includes a user-service template that assumes the checkout is at `~/SparkDeck`:
+The repository includes a user-service template that assumes the checkout is at `~/SparkDeck`. First, return to the terminal where `./run.sh` is still running and press **Ctrl+C**. Do this on each Spark before starting the service so two processes do not compete for port 7878.
+
+Then enable lingering for the signed-in Linux user so its systemd user manager—and SparkDeck—can continue after logout:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Install and start the user service:
 
 ```bash
 mkdir -p ~/.config/systemd/user

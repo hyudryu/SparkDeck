@@ -84,12 +84,16 @@ Models manages saved deployment configurations and active model servers for vLLM
 
 Use it to:
 
-- create, edit, duplicate, or delete saved model configurations;
-- start and stop managed deployments;
+- create an active deployment with **Add model**;
+- pin saved launch recipes and edit their launch arguments and controls;
+- choose eligible nodes and deploy a saved recipe;
+- start, stop, rename, or remove deployment records;
 - connect an existing OpenAI-compatible endpoint;
 - select the node or nodes that should run a deployment;
 - require the correct number of eligible nodes for tensor parallelism; and
 - inspect runtime, model identity, state, endpoints, and actions.
+
+**Add model** creates a deployment record; it does not create a saved recipe. The current interface does not create, duplicate, or delete saved recipes.
 
 For a TP2 configuration, SparkDeck requires two selected nodes. Nodes without the necessary cached weights are disabled until the weights are downloaded or transferred there.
 
@@ -144,7 +148,7 @@ Compare sends the same prompt to two running deployments and displays their resu
 
 ![Compare with two illustrative model responses](screenshots/manual/compare-dark.png)
 
-Use it for qualitative comparisons and observed latency checks. The two deployments can use different models, runtimes, quantizations, or settings. Results remain local; benchmark records contain operational measurements, not the prompt or generated text.
+Use it for qualitative comparisons and observed latency checks. The two deployments can use different models, runtimes, quantizations, or settings. With managed local deployments, prompts and results stay on the systems you control. If either selection is a user-configured external OpenAI-compatible endpoint, SparkDeck sends that prompt to the external provider and receives the generated response from it; review that provider's privacy terms before use. SparkDeck benchmark records contain operational measurements, not the prompt or generated text.
 
 ## Benchmarks
 
@@ -258,7 +262,7 @@ Logs shows redacted application and runtime activity from the local SparkDeck se
 
 ![Logs with illustrative application and runtime events](screenshots/manual/logs-dark.png)
 
-Use severity, source, node, deployment, and text filters to narrow the list. Refresh to fetch new entries and **Export** to download the visible diagnostic set. Review an export before sharing it even though SparkDeck redacts recognized secrets.
+Use the free-text search and severity selector to narrow the list. Refresh to fetch new entries and **Export** to download the visible diagnostic set. Review an export before sharing it even though SparkDeck redacts recognized secrets.
 
 ## Mobile navigation
 

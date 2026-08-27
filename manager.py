@@ -3665,7 +3665,14 @@ class Manager:
     async def get_cluster_member_logs(self, name: str, tail: int = 300) -> str:
         """Combine pre-container launch progress with Docker output."""
         launch_text = self._cluster_launch_text(name)
-        managed = await self.is_managed_container(name)
+        docker_error = None
+        try:
+            managed = await self.is_managed_container(name)
+        except docker.errors.DockerException as exc:
+            if not launch_text:
+                raise
+            managed = False
+            docker_error = exc
         if not launch_text and not managed:
             raise ValueError("cluster member not found")
         sections = [launch_text] if launch_text else []
@@ -3676,7 +3683,12 @@ class Manager:
                 container_logs = f"Could not read container logs: {exc}"
             sections.append("=== Container logs ===\n" + (container_logs or "(no output yet)"))
         elif launch_text:
-            sections.append("=== Container logs ===\nContainer has not been created yet.")
+            detail = (
+                f"Docker is unavailable: {docker_error}"
+                if docker_error is not None
+                else "Container has not been created yet."
+            )
+            sections.append("=== Container logs ===\n" + detail)
         return "\n\n".join(sections)
 
     async def remove_cluster_member(self, name: str) -> dict:
@@ -8159,9 +8171,9 @@ class Manager:
                             replacement.start()
                         replacement.reload()
                         summary = self._container_summary(replacement)
-                        backup.remove(force=True)
                         if ledger is not None and managed:
                             ledger.confirm(name, deployment_id)
+                        backup.remove(force=True)
                         return summary
                     except Exception:
                         try:

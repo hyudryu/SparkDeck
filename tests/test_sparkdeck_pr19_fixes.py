@@ -122,6 +122,46 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         launch.assert_not_awaited()
         self.manager.remove_container.assert_not_awaited()
 
+    async def test_delete_waits_for_inflight_creation_then_removes_container(self):
+        launch_started = asyncio.Event()
+        release_launch = asyncio.Event()
+
+        async def launch(*_args, **_kwargs):
+            launch_started.set()
+            await release_launch.wait()
+            return {
+                "name": "sparkdeck-model-deadbeef",
+                "port": 8000,
+                "status": "running",
+            }
+
+        with patch(
+            "sparkdeck.service.launch_managed_container",
+            AsyncMock(side_effect=launch),
+        ):
+            create_task = asyncio.create_task(self.service.create_deployment({
+                "model": "org/model", "alias": "model", "runtime": "vllm",
+            }))
+            await asyncio.wait_for(launch_started.wait(), 1)
+            provisional = self.service.store.deployment("model")
+            self.assertIsNotNone(provisional)
+
+            delete_task = asyncio.create_task(
+                self.service.delete_deployment(provisional["id"])
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(delete_task.done())
+
+            release_launch.set()
+            created = await create_task
+            removed = await delete_task
+
+        self.assertEqual(removed, {"ok": True, "id": created["id"]})
+        self.manager.remove_container.assert_awaited_once_with(
+            "sparkdeck-model-deadbeef"
+        )
+        self.assertIsNone(self.service.store.deployment(created["id"]))
+
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_sglang_forwards_max_running_requests(self):

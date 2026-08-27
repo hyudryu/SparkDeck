@@ -124,18 +124,40 @@ def _helper_alive(state: dict) -> bool:
         return False
 
 
+def _service_preflight(root: Path) -> None:
+    system = platform.system()
+    if system == "Linux":
+        _run(root, "systemctl", "--user", "is-active", "--quiet", "sparkdeck.service")
+        return
+    if system == "Windows":
+        launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+        if not launcher.is_file():
+            raise RuntimeError("The bundled Windows launcher was not found")
+        _run(
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "status",
+            timeout=30,
+        )
+        return
+    raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
+
+
 def local_blockers(root: Path) -> list[str]:
     blockers: list[str] = []
-    if platform.system() != "Linux":
-        blockers.append("Self-update requires the bundled Linux systemd service")
-        return blockers
     try:
         origin = _run(root, "git", "remote", "get-url", "origin")
         if origin not in TRUSTED_ORIGINS:
             blockers.append("Git origin is not the official SparkDeck repository")
         if _run(root, "git", "status", "--porcelain", "--untracked-files=no"):
             blockers.append("Tracked files have local changes")
-        _run(root, "systemctl", "--user", "is-active", "--quiet", "sparkdeck.service")
+        _service_preflight(root)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         blockers.append(f"Installation preflight failed: {str(exc)[:240]}")
     return blockers

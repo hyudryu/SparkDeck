@@ -16,6 +16,7 @@ from sparkdeck.updater import (
     MAIN_COMMIT_API,
     UpdateService,
     assert_checkout_safe,
+    local_blockers,
 )
 from sparkdeck.update_helper import (
     _prepare_frontend_bundle,
@@ -24,6 +25,7 @@ from sparkdeck.update_helper import (
     fetch_update_target,
     install_release_revision,
     install_revision,
+    restart_service,
 )
 
 
@@ -294,6 +296,45 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview["job"]["phase"], "failed")
 
 
+class LocalUpdatePreflightTests(unittest.TestCase):
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    @patch("sparkdeck.updater._run")
+    def test_windows_preflight_uses_bundled_launcher_status(self, command_run, _system):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("# launcher", encoding="utf-8")
+            command_run.side_effect = ["https://github.com/hyudryu/SparkDeck.git", "", ""]
+
+            self.assertEqual(local_blockers(root), [])
+
+        self.assertEqual(command_run.call_args_list[-1].args, (
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "status",
+        ))
+        self.assertEqual(command_run.call_args_list[-1].kwargs, {"timeout": 30})
+
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    @patch("sparkdeck.updater._run")
+    def test_windows_preflight_requires_bundled_launcher(self, command_run, _system):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command_run.side_effect = ["https://github.com/hyudryu/SparkDeck.git", ""]
+
+            blockers = local_blockers(root)
+
+        self.assertEqual(len(blockers), 1)
+        self.assertIn("bundled Windows launcher", blockers[0])
+
+
 class UpdateHelperTests(unittest.TestCase):
     def test_divergent_checkout_installs_target_without_moving_feature_branch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -409,6 +450,41 @@ class UpdateHelperTests(unittest.TestCase):
                 (root / "secret.env").read_text(encoding="utf-8"),
                 "local secret",
             )
+
+    @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
+    @patch("sparkdeck.update_helper.run")
+    def test_windows_restart_uses_bundled_launcher(self, command_run, _system):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("# launcher", encoding="utf-8")
+
+            restart_service(root)
+
+        command_run.assert_called_once_with(
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "restart",
+            timeout=180,
+        )
+
+    @patch("sparkdeck.update_helper.platform.system", return_value="Linux")
+    @patch("sparkdeck.update_helper.run")
+    def test_linux_restart_still_uses_systemd(self, command_run, _system):
+        root = Path("/sparkdeck")
+
+        restart_service(root)
+
+        command_run.assert_called_once_with(
+            root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60,
+        )
 
     def test_frontend_bundle_publish_and_rollback_preserve_correct_build(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -146,6 +147,32 @@ def wait_for_revision(revision: str, timeout: int = 90) -> bool:
     return False
 
 
+def restart_service(root: Path) -> None:
+    """Restart SparkDeck through the launcher that owns this installation."""
+    system = platform.system()
+    if system == "Linux":
+        run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+        return
+    if system == "Windows":
+        launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+        if not launcher.is_file():
+            raise RuntimeError("The bundled Windows launcher was not found")
+        run(
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "restart",
+            timeout=180,
+        )
+        return
+    raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
+
+
 def fetch_release_target(root: Path, tag: str, revision: str) -> None:
     """Dormant release-mode fetch retained for restoring release updates."""
     run(root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
@@ -218,7 +245,7 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
             had_previous_frontend = _publish_frontend_bundle(root / "frontend" / "dist", frontend_swap)
             frontend_published = True
         write_state(state_path, phase="restarting", message="Update installed; restarting SparkDeck")
-        run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+        restart_service(root)
         if not wait_for_revision(revision):
             raise RuntimeError("SparkDeck did not become healthy on the selected revision")
         write_state(state_path, phase="succeeded", message="Update installed and verified", error=None)
@@ -231,7 +258,7 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
                     _restore_frontend_bundle(
                         root / "frontend" / "dist", frontend_swap, had_previous_frontend,
                     )
-                run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+                restart_service(root)
                 if not wait_for_revision(previous_revision):
                     raise RuntimeError("previous revision did not become healthy")
                 write_state(state_path, phase="rolled_back", error=str(exc)[:500], message="Selected update failed; previous revision restored")

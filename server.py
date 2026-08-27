@@ -25,7 +25,7 @@ from cluster import (
 )
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
-from sparkdeck.storage import COMMUNITY_EVIDENCE_POLICY
+from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.onboarding import (
     FORWARD_HEADERS,
     OnboardingService,
@@ -1710,7 +1710,6 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
-    "community_api_url": "",
     "default_runtime": "vllm",
     "default_context_length": 8192,
 }
@@ -1734,14 +1733,6 @@ async def v1_update_settings(req: Request):
     theme = body.get("theme", _APP_SETTING_DEFAULTS["theme"])
     if theme not in ("system", "light", "dark"):
         raise HTTPException(400, "theme must be system, light, or dark")
-    community_api_url = str(body.get("community_api_url") or "").strip().rstrip("/")
-    if community_api_url:
-        try:
-            parsed = httpx.URL(community_api_url)
-        except Exception as e:
-            raise HTTPException(400, "community_api_url must be a valid URL") from e
-        if parsed.scheme not in ("http", "https") or not parsed.host:
-            raise HTTPException(400, "community_api_url must be an http or https URL")
     default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
     if default_runtime not in ("vllm", "llama.cpp", "sglang"):
         raise HTTPException(400, "default_runtime must be vllm, llama.cpp, or sglang")
@@ -1756,7 +1747,6 @@ async def v1_update_settings(req: Request):
         raise HTTPException(400, "default_context_length must be between 256 and 10000000")
     values = {
         "theme": theme,
-        "community_api_url": community_api_url,
         "default_runtime": default_runtime,
         "default_context_length": default_context_length,
     }
@@ -2091,10 +2081,8 @@ def _community_sync_status() -> dict:
     status = sparkdeck.store.sync_status()
     pairing = sparkdeck.store.get_setting(
         "device_pairing", {"status": "not_paired"})
-    api_url = str(
-        sparkdeck.store.get_setting("community_api_url", "") or "").strip()
     status["upload_configured"] = bool(
-        api_url
+        COMMUNITY_API_URL
         and isinstance(pairing, dict)
         and pairing.get("refresh_token")
     )
@@ -2182,9 +2170,7 @@ async def v1_community_aggregates(req: Request):
     _require_matching_community_pairing(claims)
     if not sparkdeck.store.get_setting("community_consent", False):
         raise HTTPException(403, "community sharing consent is required")
-    api_url = str(
-        sparkdeck.store.get_setting("community_api_url", "") or ""
-    ).strip().rstrip("/")
+    api_url = COMMUNITY_API_URL.strip().rstrip("/")
     if not api_url:
         try:
             return await sparkdeck.community_aggregates()
@@ -2290,9 +2276,7 @@ async def community_upload_once() -> dict:
         if isinstance(pairing, dict) and pairing.get("status") == "paired"
         else None
     )
-    api_url = str(
-        store.get_setting("community_api_url", "") or ""
-    ).strip().rstrip("/")
+    api_url = COMMUNITY_API_URL.strip().rstrip("/")
     if not refresh_token or not api_url:
         return {"uploaded": 0, "failed": 0, "reason": "not_configured"}
     batch = store.outbox_entries(COMMUNITY_UPLOAD_BATCH_SIZE)

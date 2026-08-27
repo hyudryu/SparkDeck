@@ -335,10 +335,14 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             },
             "community_consent": True,
         }.get(key, default)
-        with patch.object(
-            server.sparkdeck, "community_aggregates",
-            AsyncMock(return_value={"items": []}),
-        ) as aggregate:
+        with (
+            # An empty built-in URL exercises the local stub branch.
+            patch.object(server, "COMMUNITY_API_URL", ""),
+            patch.object(
+                server.sparkdeck, "community_aggregates",
+                AsyncMock(return_value={"items": []}),
+            ) as aggregate,
+        ):
             response = await self.client.get(
                 "/api/v1/community/aggregates", headers=_bearer())
 

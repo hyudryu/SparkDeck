@@ -78,9 +78,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             }]}, request=request)
 
         self.manager.community_http_transport = httpx.MockTransport(respond)
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api/v1/community",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api/v1/community",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         result = await self.service.community_aggregates()
 
@@ -105,35 +107,27 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_local_community_database_work_runs_off_event_loop(self):
-        # An explicitly empty URL keeps the installation fully local even
-        # though a default hosted endpoint is seeded.
-        self.service.store.set_setting("community_api_url", "")
+        # An empty constant keeps the installation fully local.
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "",
+        )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
         event_loop_thread = threading.get_ident()
-        setting_threads = []
         aggregate_threads = []
-        get_setting = self.service.store.get_setting
         community_aggregates = self.service.store.community_aggregates
-
-        def tracked_get_setting(*args):
-            setting_threads.append(threading.get_ident())
-            return get_setting(*args)
 
         def tracked_aggregates():
             aggregate_threads.append(threading.get_ident())
             return community_aggregates()
 
-        with (
-            patch.object(self.service.store, "get_setting", tracked_get_setting),
-            patch.object(
-                self.service.store, "community_aggregates", tracked_aggregates,
-            ),
+        with patch.object(
+            self.service.store, "community_aggregates", tracked_aggregates,
         ):
             result = await self.service.community_aggregates()
 
         self.assertEqual(result["availability"], "not_configured")
-        self.assertTrue(setting_threads)
         self.assertTrue(aggregate_threads)
-        self.assertNotIn(event_loop_thread, setting_threads)
         self.assertNotIn(event_loop_thread, aggregate_threads)
 
     async def test_invalid_configured_community_response_fails_visibly(self):
@@ -146,9 +140,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             }]}, request=request)
 
         self.manager.community_http_transport = httpx.MockTransport(respond)
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/aggregates",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/aggregates",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()
@@ -158,9 +154,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager.community_http_transport = httpx.MockTransport(
             lambda request: requests.append(request) or httpx.Response(200),
         )
-        self.service.store.set_setting(
-            "community_api_url", "http://169.254.169.254/latest/meta-data",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "http://169.254.169.254/latest/meta-data",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()
@@ -182,9 +180,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 ("127.0.0.1", port),
             ),
         ]
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()
@@ -203,9 +203,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.manager.community_http_transport = httpx.MockTransport(redirect)
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()
@@ -231,10 +233,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.community_resolver = rebind
         self.manager.community_http_transport = httpx.MockTransport(respond)
-        self.service.store.set_setting(
-            "community_api_url",
-            "https://community.example/api?next=/aggregates",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api?next=/aggregates",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         result = await self.service.community_aggregates()
 
@@ -271,9 +274,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.community_resolver = resolve
         self.manager.community_http_transport = httpx.MockTransport(respond)
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         result = await self.service.community_aggregates()
 
@@ -298,9 +303,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager.community_http_transport = httpx.MockTransport(
             lambda request: httpx.Response(200, content=body, request=request),
         )
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable") as raised:
             await self.service.community_aggregates()
@@ -335,9 +342,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager.community_http_transport = httpx.MockTransport(
             lambda request: httpx.Response(200, stream=body, request=request),
         )
-        self.service.store.set_setting(
-            "community_api_url", "https://community.example/api",
+        url_patch = patch(
+            "sparkdeck.service.COMMUNITY_API_URL", "https://community.example/api",
         )
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
 
         with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
             await self.service.community_aggregates()

@@ -34,7 +34,7 @@ function ProtectedRequestOnSignIn() {
 describe('settings page', () => {
   it('shows the version embedded when the frontend was built', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({
-      theme: 'system', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
+      theme: 'system', default_runtime: 'vllm', default_context_length: 8192,
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
@@ -47,12 +47,11 @@ describe('settings page', () => {
       const path = String(input)
       if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: ['No published GitHub release is available'], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify(init?.method === 'PUT' ? {
-        theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '',
+        theme: 'light', default_runtime: 'vllm', default_context_length: 8192,
       } : {
         theme: 'dark',
         hf_token: '',
         hf_token_configured: false,
-        community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -88,7 +87,7 @@ describe('settings page', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
-        theme: 'system', hf_token: '', hf_token_configured: true, community_api_url: '',
+        theme: 'system', hf_token: '', hf_token_configured: true,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -129,7 +128,6 @@ describe('settings page', () => {
         theme: 'system',
         hf_token: '',
         hf_token_configured: false,
-        community_api_url: '',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -153,7 +151,7 @@ describe('settings page', () => {
       if (String(input).includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (init?.method === 'DELETE') configured = false
       return new Response(JSON.stringify({
-        theme: 'system', hf_token_configured: configured, community_api_url: '',
+        theme: 'system', hf_token_configured: configured,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -258,7 +256,7 @@ describe('community features sign-in', () => {
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       return new Response(JSON.stringify({
-        theme: 'system', hf_token: '', hf_token_configured: false, community_api_url: '',
+        theme: 'system', hf_token: '', hf_token_configured: false,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -279,6 +277,8 @@ describe('community features sign-in', () => {
 
     expect(await screen.findByRole('heading', { name: 'Community Features' })).toBeInTheDocument()
     expect(screen.getByText('Create an account or sign in to share anonymized benchmark telemetry and see community data.')).toBeInTheDocument()
+    expect(screen.getByText('Connected to the SparkDeck community service.')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Community API URL')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Email')).toBeInTheDocument()
     expect(screen.getByLabelText('Password')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()

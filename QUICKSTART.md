@@ -190,7 +190,7 @@ The command prints that machine's URL, normally:
 https://<machine-name>.<tailnet-name>.ts.net
 ```
 
-Use Spark 1's printed HTTPS URL as the controller entry URL and Spark 2's printed HTTPS URL as Spark 2's advertised URL. Each machine has a different machine name even though the Tailscale DNS page shows one shared tailnet suffix. Verify the proxy with:
+Each machine has a different machine name even though the Tailscale DNS page shows one shared tailnet suffix. If you already paired the nodes with the HTTP URLs in step 6, switch the stored cluster URLs by opening Cluster on Spark 2, choosing **Leave cluster**, generating a fresh pairing code on Spark 1, and joining again. During that rejoin, use Spark 1's printed HTTPS URL as **Existing cluster entry URL** and Spark 2's printed HTTPS URL as **This node's advertised Tailscale URL**. Verify the proxy with:
 
 ```bash
 tailscale serve status

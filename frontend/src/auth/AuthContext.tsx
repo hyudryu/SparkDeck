@@ -15,7 +15,7 @@ import {
 } from './cognitoAuth'
 
 export interface AuthState {
-  status: 'signed-out' | 'signing-in' | 'signed-in'
+  status: 'restoring' | 'signed-out' | 'signing-in' | 'signed-in' | 'reauth-required'
   email?: string
   idToken?: string
   /** Cluster fan-out result from the latest sign-in/out, if the backend reported one. */
@@ -62,7 +62,7 @@ function pairingConflictMessage(error: ApiError): Error {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [status, setStatus] = useState<AuthState['status']>('signed-out')
+  const [status, setStatus] = useState<AuthState['status']>('restoring')
   const [idToken, setIdToken] = useState<string>()
   const [clusterSync, setClusterSync] = useState<CommunityClusterSync | null>(null)
   const idTokenRef = useRef<string | undefined>(undefined)
@@ -82,8 +82,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const tokens = await refresh()
         if (!tokens || isExpired(tokens.idToken)) {
           publishIdToken(undefined)
-          setStatus('signed-out')
-          return undefined
+          setStatus('reauth-required')
+          throw new Error('Your community session expired before this node could be signed out. Sign in again, then retry Sign out.')
         }
         publishIdToken(tokens.idToken)
         return tokens.idToken
@@ -141,6 +141,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clusterSync,
     email: idToken ? decodeIdToken(idToken).email : undefined,
     signIn: async (email, password) => {
+      if (status === 'restoring') {
+        throw new Error('Wait for the saved community session to finish restoring, then try again.')
+      }
       setStatus('signing-in')
       setClusterSync(null)
       try {

@@ -134,4 +134,50 @@ describe('BenchmarksPage community privacy', () => {
       String(input).endsWith('/api/v1/community/aggregates')
     ))).toBe(false)
   })
+
+  it('surfaces failed worker consent withdrawal and lets the user retry it', async () => {
+    let consent = true
+    let withdrawalAttempts = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown
+      if (path.includes('/api/v1/benchmarks')) {
+        body = { items: [], total: 0, limit: 100, offset: 0 }
+      } else if (path.endsWith('/api/v1/community/aggregates')) {
+        body = {
+          items: [], availability: 'available',
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+        }
+      } else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
+        consent = false
+        withdrawalAttempts += 1
+        body = {
+          cluster: {
+            applied: ['Spark Two'], conflicts: [],
+            errors: withdrawalAttempts === 1 ? ['Spark Three: unreachable'] : [],
+          },
+        }
+      } else {
+        body = {
+          consent, pairing: { status: 'paired' }, upload_configured: true,
+          outbox: { pending: 0, synced: 0, failed: 0 },
+        }
+      }
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Turn off' }))
+
+    expect(await screen.findByText('Sharing off')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Spark Three: unreachable')
+    const retry = screen.getByRole('button', { name: 'Retry turn off everywhere' })
+    await user.click(retry)
+
+    expect(withdrawalAttempts).toBe(2)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
 })

@@ -31,6 +31,48 @@ describe('API client adapters', () => {
       }),
     )
   })
+
+  it('keeps consent withdrawal independent from Cognito token refresh', async () => {
+    const tokenProvider = vi.fn<() => Promise<string>>().mockRejectedValue(new Error('Cognito unavailable'))
+    setAuthTokenProvider(tokenProvider)
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        consent: false, pairing: { status: 'paired' }, outbox: {},
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.benchmarks.setConsent(false)).resolves.toEqual(expect.objectContaining({
+      sharing_enabled: false,
+      account_paired: true,
+    }))
+
+    expect(tokenProvider).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      '/api/v1/community/consent',
+      '/api/v1/community/sync',
+    ])
+    expect(fetchMock.mock.calls.every(([, init]) => (
+      !('Authorization' in ((init?.headers ?? {}) as Record<string, string>))
+    ))).toBe(true)
+  })
+
+  it('uses bearer lookup only for the protected unpair operation', async () => {
+    const tokenProvider = vi.fn().mockResolvedValue('current-token')
+    setAuthTokenProvider(tokenProvider)
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      pairing: { status: 'not_paired' }, cluster: { applied: [], conflicts: [], errors: [] },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.community.unpair()
+
+    expect(tokenProvider).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/pair', expect.objectContaining({
+      method: 'DELETE',
+      headers: expect.objectContaining({ Authorization: 'Bearer current-token' }),
+    }))
+  })
   it('normalizes deployment wire records for the UI', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       items: [{

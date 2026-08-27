@@ -136,6 +136,41 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.mark_outbox_synced(["sample-2"]), 1)
         self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
 
+    def test_sync_status_redacts_pairing_claims(self):
+        self.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "stable-sub", "email": "person@example.com",
+            "credential": "secret",
+        })
+
+        status = self.store.sync_status()
+
+        self.assertEqual(status["pairing"], {"status": "paired"})
+        self.assertNotIn("stable-sub", str(status))
+        self.assertNotIn("person@example.com", str(status))
+        self.assertNotIn("secret", str(status))
+
+    def test_pairing_promotes_waiting_uploads_to_pending(self):
+        sample = BenchmarkSample(
+            id="sample-waiting", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={"architecture": "x86_64"},
+            configuration={"context_length": 4096},
+            input_tokens=20, output_tokens=30, latency_ms=100,
+            ttft_ms=10, generation_tokens_per_second=300,
+            prompt_tokens_per_second=200, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.set_setting("community_consent", True)
+        self.store.add_benchmark(sample, queue=True)
+        self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 1)
+
+        self.assertEqual(self.store.promote_outbox_for_pairing(), 1)
+
+        self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 0)
+        self.assertEqual(self.store.sync_status()["outbox"]["pending"], 1)
+        self.assertEqual(self.store.promote_outbox_for_pairing(), 0)
+
     def test_consent_queues_existing_samples_and_upload_drops_artifact(self):
         sample = BenchmarkSample(
             id="sample-private", created_at="2026-08-25T00:00:00+00:00",

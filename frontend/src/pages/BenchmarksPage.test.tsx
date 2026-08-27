@@ -1,7 +1,22 @@
 import { cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BenchmarksPage } from './BenchmarksPage'
+
+const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true, loading: false, enabled: true, reload: vi.fn() }))
+
+vi.mock('../hooks/useCommunityAccess', () => ({
+  communityAccessHint: (signedIn: boolean) => signedIn
+    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    : 'Sign in under Settings → Community Features to see community data.',
+  useCommunityAccess: () => communityAccess,
+}))
+
+beforeEach(() => {
+  Object.assign(communityAccess, { signedIn: true, sharingEnabled: true, loading: false, enabled: true })
+  communityAccess.reload.mockClear()
+})
 
 afterEach(() => {
   cleanup()
@@ -23,12 +38,12 @@ describe('BenchmarksPage community privacy', () => {
       else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
         consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
         body = {}
-      } else body = { consent, pairing: { status: 'paired' }, outbox: { pending: 0, synced: 2 } }
+      } else body = { consent, pairing: { status: 'paired' }, upload_configured: true, outbox: { pending: 0, synced: 2 } }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
-    render(<BenchmarksPage />)
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('42.5 tok/s')).toBeInTheDocument()
     expect(screen.getByText('16,384 tokens')).toBeInTheDocument()
@@ -43,6 +58,7 @@ describe('BenchmarksPage community privacy', () => {
     expect(dialog).toHaveTextContent('Not shared: prompts or outputs, runtime, revision, quantization, hardware, settings, host or network identity, or paths.')
     await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
     expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
+    expect(communityAccess.reload).toHaveBeenCalled()
   })
 
   it('refreshes local aggregates after deleting a contributing benchmark', async () => {
@@ -78,12 +94,90 @@ describe('BenchmarksPage community privacy', () => {
     }))
     const user = userEvent.setup()
 
-    render(<BenchmarksPage />)
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect((await screen.findAllByText('42.5 tok/s')).length).toBeGreaterThan(0)
     await user.click(screen.getByRole('button', { name: 'Delete benchmark for org/model' }))
 
     expect(await screen.findByText('No community estimates yet')).toBeInTheDocument()
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
+  })
+
+  it('locks community estimates behind sign-in and telemetry opt-in but keeps the consent path usable', async () => {
+    Object.assign(communityAccess, { signedIn: true, sharingEnabled: false, enabled: false })
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown
+      if (path.includes('/api/v1/benchmarks')) {
+        body = { items: [], total: 0, limit: 100, offset: 0 }
+      } else if (path.endsWith('/api/v1/community/aggregates')) {
+        body = {
+          items: [{ model_id: 'org/model', context_window_size: 16384, inference_tokens_per_second: 42.5, sample_count: 12 }],
+          availability: 'available',
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+        }
+      } else {
+        body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Community estimates are locked')).toBeInTheDocument()
+    expect(screen.getByText('Review and enable community sharing on Benchmarks to see community data.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review sharing' })).toBeInTheDocument()
+    expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).endsWith('/api/v1/community/aggregates')
+    ))).toBe(false)
+  })
+
+  it('surfaces failed worker consent withdrawal and lets the user retry it', async () => {
+    let consent = true
+    let withdrawalAttempts = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown
+      if (path.includes('/api/v1/benchmarks')) {
+        body = { items: [], total: 0, limit: 100, offset: 0 }
+      } else if (path.endsWith('/api/v1/community/aggregates')) {
+        body = {
+          items: [], availability: 'available',
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+        }
+      } else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
+        consent = false
+        withdrawalAttempts += 1
+        body = {
+          cluster: {
+            applied: ['Spark Two'], conflicts: [],
+            errors: withdrawalAttempts === 1 ? ['Spark Three: unreachable'] : [],
+          },
+        }
+      } else {
+        body = {
+          consent, pairing: { status: 'paired' }, upload_configured: true,
+          outbox: { pending: 0, synced: 0, failed: 0 },
+        }
+      }
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Turn off' }))
+
+    expect(await screen.findByText('Sharing off')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Spark Three: unreachable')
+    const retry = screen.getByRole('button', { name: 'Retry turn off everywhere' })
+    await user.click(retry)
+
+    expect(withdrawalAttempts).toBe(2)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 })

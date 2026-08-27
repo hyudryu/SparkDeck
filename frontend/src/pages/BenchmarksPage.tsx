@@ -1,28 +1,47 @@
 import { useState } from 'react'
 import { Check, CloudOff, RotateCw, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
+  const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
   const [syncBusy, setSyncBusy] = useState(false)
+  const [syncActionError, setSyncActionError] = useState<string>()
   const [reviewingConsent, setReviewingConsent] = useState(false)
   const aggregateResponse = aggregates.data
   const localAggregates = aggregateResponse?.availability === 'local'
 
-  const toggleSharing = async () => {
+  const applyConsent = async (enabled: boolean) => {
     if (!sync.data) return
     setSyncBusy(true)
+    setSyncActionError(undefined)
     try {
-      sync.setData(await api.benchmarks.setConsent(!sync.data.sharing_enabled))
+      const updated = await api.benchmarks.setConsent(enabled)
+      sync.setData(updated)
+      communityAccess.reload()
       setReviewingConsent(false)
+      if (updated.cluster_errors?.length) {
+        setSyncActionError(`Sharing was updated on this controller, but not on: ${updated.cluster_errors.join('; ')}. Retry when those nodes are reachable.`)
+      }
+    } catch (reason) {
+      setSyncActionError(reason instanceof Error ? reason.message : 'Could not update community sharing')
     } finally {
       setSyncBusy(false)
     }
   }
+
+  const toggleSharing = () => applyConsent(!sync.data?.sharing_enabled)
 
   const retry = async () => {
     setSyncBusy(true)
@@ -48,9 +67,10 @@ export function BenchmarksPage() {
           <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Share only model name, context window size, and measured inference tok/s.</p></div></div>
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
+          {syncActionError && <p className="inline-error" role="alert">{syncActionError}</p>}
           {sync.data && <>
-            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? 'Sharing enabled' : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
-            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
+            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired && sync.data.upload_configured ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? (sync.data.upload_configured ? 'Sharing enabled' : 'Queued locally') : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
+            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{syncActionError && !sync.data.sharing_enabled && <Button variant="secondary" disabled={syncBusy} onClick={() => void applyConsent(false)}>Retry turn off everywhere</Button>}{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
           </>}
         </Panel>
         <Panel className="privacy-panel">
@@ -61,18 +81,25 @@ export function BenchmarksPage() {
         </Panel>
       </div>
 
-      <div className="section-heading"><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
-      {aggregates.loading && <LoadingState label="Loading community aggregates" />}
-      {aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
-      {!aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
-      {aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
+      <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
+      {!communityAccess.enabled && !communityAccess.loading && <EmptyState
+        title="Community estimates are locked"
+        description={accessHint}
+        action={communityAccess.signedIn
+          ? <Button variant="secondary" onClick={() => setReviewingConsent(true)}>Review sharing</Button>
+          : <Link className="button button-secondary" to="/settings">Open community settings</Link>}
+      />}
+      {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
+      {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
+      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
+      {communityAccess.enabled && aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
         <Panel className="aggregate-item" key={`${item.model_id}-${item.context_window_size}`}>
           <div><p className="aggregate-model">{item.model_id}</p><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>
           <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Context window</dt><dd>{item.context_window_size.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
           {item.sample_count >= aggregateResponse.evidence_policy.minimum_samples ? <span className="proven"><Check size={14} /> Evidence threshold met</span> : <span className="muted">Collecting more evidence</span>}
         </Panel>
       ))}</div>}
-      {aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
+      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
 
       <div className="section-heading"><div><h2>Local history</h2><p>Successful proxied runs are captured automatically.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}

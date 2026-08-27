@@ -76,9 +76,29 @@ Requests made through SparkDeck can be queued, measured, and used to refresh the
 
 SparkDeck records successful proxied inference measurements locally. Benchmark records may include the model revision and artifact, quantization, runtime and version, hardware class, deployment settings, token counts, latency, time to first token, and generation throughput.
 
-Community upload payloads contain exactly three fields: `model_id`, `context_window_size`, and `inference_tokens_per_second`. Richer benchmark details remain local; SparkDeck does **not** upload prompts, generated text, API keys, endpoint URLs, hostnames, IP addresses, hardware details, runtime settings, token counts, revisions, quantization, latency, or local filesystem paths. Community sharing is off by default. When cloud support becomes available, enabling it will require explicit consent, and queued samples will remain reviewable and deletable locally.
+Community upload payloads contain exactly three fields: `model_id`, `context_window_size`, and `inference_tokens_per_second`. Richer benchmark details remain local; SparkDeck does **not** upload prompts, generated text, API keys, endpoint URLs, hostnames, IP addresses, hardware details, runtime settings, token counts, revisions, quantization, latency, or local filesystem paths. Community sharing is off by default and requires explicit consent. Without a trusted ingestion service and node-scoped credential, samples stay queued locally; queued samples remain reviewable and deletable locally.
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
+
+## Community sign-in (Cognito email + password)
+
+Community features (shared benchmark telemetry and community estimates) require an account, created and used from **Settings → Community Features**. The app renders a native email + password form and calls the Amazon Cognito IDP HTTPS API (`https://cognito-idp.us-east-2.amazonaws.com/`) directly — there is no hosted UI, no redirect, and no third-party identity provider. Sign-up uses `SignUp`/`ConfirmSignUp` (Cognito emails a verification code; Cognito's default email sender is used, which is fine for low volume), sign-in uses `InitiateAuth` with the `USER_PASSWORD_AUTH` flow, and sessions refresh with `REFRESH_TOKEN_AUTH`. Password reset is also handled in-app via `ForgotPassword`/`ConfirmForgotPassword` from the same form. All authentication traffic goes straight from the browser to Cognito over HTTPS; passwords never touch the SparkDeck backend.
+
+After a successful sign-in the frontend sends the Cognito ID token to the SparkDeck backend (`POST /api/v1/community/pair`), which verifies it against the pool's JWKS before marking the device paired. Signing out (`DELETE /api/v1/community/pair` via the app's Sign out button, plus a best-effort `RevokeToken` call) returns the device to `not_paired`.
+
+**Sessions are effectively indefinite.** The pool issues refresh tokens valid for 3650 days (the Cognito maximum). Tokens are stored in the browser's localStorage, so sign-in survives browser restarts; an expired ID token is refreshed silently on load without user interaction.
+
+**Sign-in propagates across the cluster.** After pairing locally, the controller pushes the sign-in (and later the sign-out) to every enabled peer node over the cluster-private agent channel (`PUT`/`DELETE /api/agent/community-pairing`). Propagation is best-effort and never blocks sign-in: a node that is already paired with a *different* account is never overridden — this applies to the controller itself too, which refuses the sign-in and tells you which account it holds. Conflicts and unreachable nodes are reported in **Settings → Community Features** and pick up the state on the next sign-in or sign-out. Pairing also promotes any locally queued "waiting for account" benchmark uploads. They are drained by a lifecycle-owned worker when that node has a trusted upload endpoint and node-scoped credential; otherwise the UI reports them honestly as queued locally.
+
+Community upload workers are configured per node with `SPARKDECK_COMMUNITY_UPLOAD_URL` and `SPARKDECK_COMMUNITY_UPLOAD_TOKEN`. The URL is the trusted ingestion API base and the token must be a revocable, upload-only credential for that node. SparkDeck never forwards Cognito browser tokens or refresh tokens to this endpoint or across the cluster. Each request sends one sample containing exactly the three documented fields and places the local sample UUID only in the `Idempotency-Key` header. Redirects and non-public destinations are rejected.
+
+The infrastructure lives in `infra/cognito-community.yml` (CloudFormation stack `sparkdeck-community-auth`): a user pool with email-as-username, self sign-up, and auto-verified email, plus a public app client (no secret; `ALLOW_USER_PASSWORD_AUTH` + `ALLOW_REFRESH_TOKEN_AUTH`; revocation enabled; ID/access tokens 60 minutes, refresh tokens 3650 days).
+
+The backend defaults to the deployed pool and can be pointed at another one with environment variables (these identifiers are not secret):
+
+- `SPARKDECK_COGNITO_USER_POOL_ID` (default `us-east-2_TjntedtdI`)
+- `SPARKDECK_COGNITO_CLIENT_ID` (default `30ihrkeg4k1rn95d4mmkq00fvl`)
+- `SPARKDECK_COGNITO_ISSUER` (default `https://cognito-idp.us-east-2.amazonaws.com/us-east-2_TjntedtdI`)
 
 ## Cluster and MCP automation
 

@@ -99,6 +99,53 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_consent_can_reach_a_disabled_joined_worker(self) -> None:
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200, json={"applied": True, "enabled": False}, request=request,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(Path(directory), client, "controller")
+            registry.nodes = [{
+                "id": "remote-1",
+                "name": "Spark Disabled",
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+                "enabled": False,
+            }]
+            registry._connection_targets = mock.AsyncMock(return_value=[(
+                httpx.URL("https://100.100.20.30:7878/api/agent/community-consent"),
+                {"Host": "worker.tail.example:7878"},
+                {"sni_hostname": "worker.tail.example"},
+            )])
+            try:
+                with self.assertRaisesRegex(ValueError, "is disabled"):
+                    await registry.request(
+                        "remote-1", "PUT", "/api/agent/community-consent",
+                        json_body={"enabled": False},
+                    )
+
+                result = await registry.request(
+                    "remote-1", "PUT", "/api/agent/community-consent",
+                    json_body={"enabled": False}, allow_disabled=True,
+                )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, {"applied": True, "enabled": False})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].headers["authorization"], "Bearer agent-secret",
+        )
+        self.assertEqual(
+            json.loads(requests[0].content), {"enabled": False},
+        )
+
     async def test_authenticated_request_pins_validated_agent_address(self) -> None:
         requests = []
         resolutions = []

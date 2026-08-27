@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import type { BenchmarkAggregate, CatalogModel, NodeInventoryItem, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, formatNumber, formatRate, LoadingState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { formatBytes } from '../utils/format'
 
 type CatalogTab = 'hugging-face' | 'community'
@@ -63,11 +64,13 @@ function ModelRow({
   model,
   capacity,
   expanded,
+  communityEnabled,
   onToggle,
 }: {
   model: DisplayCatalogModel
   capacity: number
   expanded: boolean
+  communityEnabled: boolean
   onToggle: () => void
 }) {
   const tone = fitTone(model.weight_size_bytes, capacity)
@@ -107,7 +110,7 @@ function ModelRow({
           </div>
         </div>
       </div>
-      {model.community && <div className="community-estimate" aria-label={`Community inference-speed estimate for ${model.id}`}>
+      {model.community && communityEnabled && <div className="community-estimate" aria-label={`Community inference-speed estimate for ${model.id}`}>
         <div><span>{model.communityEvidenceSource === 'local' ? 'Aggregated from benchmarks on this controller' : 'Sampled from other SparkDeck users'}</span><strong>{formatRate(model.community.inference_tokens_per_second)}</strong></div>
         <p>Inference-speed estimate at a {formatNumber(model.community.context_window_size)}-token context window · {formatNumber(model.community.sample_count)} {model.communityEvidenceSource === 'local' ? 'local' : 'shared'} samples</p>
         <small>{model.communityEvidenceSource === 'local' ? 'Local benchmark evidence only' : 'Aggregated community benchmark evidence only'} — an estimate, not a guarantee for your system.</small>
@@ -134,7 +137,13 @@ export function ExplorePage() {
     [query, runtime],
   )
   const nodes = useResource((signal) => api.nodes.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
+  const communityAccess = useCommunityAccess()
+  const accessHint = communityAccessHint(communityAccess.signedIn)
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setQuery(draft.trim()), 350)
@@ -203,6 +212,7 @@ export function ExplorePage() {
     return next
   })
 
+  const communityEnabled = communityAccess.enabled
   const communityUnavailable = Boolean(aggregates.error) && tab === 'community'
   const activeError = tab === 'hugging-face' ? catalog.error : aggregates.error
   const loading = tab === 'hugging-face' ? catalog.loading : aggregates.loading
@@ -217,7 +227,7 @@ export function ExplorePage() {
 
       <div className="usage-tabs catalog-tabs" role="tablist" aria-label="Model catalog source">
         <button role="tab" aria-selected={tab === 'hugging-face'} onClick={() => setTab('hugging-face')}>Hugging Face</button>
-        <button role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Community Run Models</button>
+        <button role="tab" aria-selected={tab === 'community'} disabled={!communityEnabled} title={communityEnabled ? undefined : accessHint} onClick={() => setTab('community')}>Community Run Models</button>
       </div>
 
       <div className="catalog-toolbar">
@@ -240,7 +250,7 @@ export function ExplorePage() {
         </form>
         <div className="catalog-filters" aria-label="Model filters">
           <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
-          <label><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
+          <label title={communityEnabled ? undefined : accessHint}><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={!communityEnabled || tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>
@@ -264,7 +274,7 @@ export function ExplorePage() {
       )}
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span><span>Downloads</span><span>Likes</span><span /></div>
-        {displayedModels.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} onToggle={() => toggleExpanded(model.id)} />)}
+        {displayedModels.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} communityEnabled={communityEnabled} onToggle={() => toggleExpanded(model.id)} />)}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}
     </div>

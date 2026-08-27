@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 
-export function useResource<T>(loader: (signal: AbortSignal) => Promise<T>, dependencies: unknown[] = []) {
+export function useResource<T>(
+  loader: (signal: AbortSignal) => Promise<T>,
+  dependencies: unknown[] = [],
+  enabled = true,
+) {
   const [data, setData] = useState<T>()
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(true)
@@ -10,6 +14,12 @@ export function useResource<T>(loader: (signal: AbortSignal) => Promise<T>, depe
 
   useEffect(() => {
     const controller = new AbortController()
+    if (!enabled) {
+      setData(undefined)
+      setError(undefined)
+      setLoading(false)
+      return () => controller.abort()
+    }
     setLoading(true)
     setError(undefined)
     loader(controller.signal)
@@ -25,7 +35,7 @@ export function useResource<T>(loader: (signal: AbortSignal) => Promise<T>, depe
     return () => controller.abort()
     // The caller provides the values that should reload this resource.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...dependencies, version])
+  }, [...dependencies, enabled, version])
 
   return { data, error, loading, reload, setData }
 }

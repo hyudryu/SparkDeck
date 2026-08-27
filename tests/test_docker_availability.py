@@ -32,6 +32,15 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             self.manager = Manager(Path(self.temp.name))
         return self.manager
 
+    async def test_manager_construction_does_not_negotiate_with_docker(self):
+        with patch(
+            "manager.docker.from_env",
+            side_effect=AssertionError("Docker was negotiated eagerly"),
+        ) as negotiate:
+            self.manager = Manager(Path(self.temp.name))
+
+        negotiate.assert_not_called()
+
     async def test_controller_starts_with_explicitly_unavailable_docker_inventory(self):
         manager = self.manager_without_docker()
         unavailable = docker.errors.DockerException("daemon is not running")

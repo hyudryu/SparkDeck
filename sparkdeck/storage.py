@@ -761,8 +761,8 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     )
     if concurrency is not None:
         payload["concurrency"] = concurrency
-    if tensor_parallel_size is not None:
-        payload["tensor_parallel_size"] = tensor_parallel_size
+        if tensor_parallel_size is not None:
+            payload["tensor_parallel_size"] = tensor_parallel_size
     if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
         raise ValueError("community upload payload exceeds the public field contract")
     return payload

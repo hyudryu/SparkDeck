@@ -561,6 +561,16 @@ class SparkDeckService:
         raw_tp = settings.get("tensor_parallel_size")
         if raw_tp is not None:
             tensor_parallel_size = _bounded_benchmark_integer(raw_tp, "tensor_parallel_size")
+        try:
+            prompt_tokens_per_second = prompt_tokens / wall_seconds
+            generation_tokens_per_second = generation_tokens / wall_seconds
+        except OverflowError as exc:
+            raise ValueError("derived benchmark throughput is outside the supported range") from exc
+        if not (
+            math.isfinite(prompt_tokens_per_second)
+            and math.isfinite(generation_tokens_per_second)
+        ):
+            raise ValueError("derived benchmark throughput is outside the supported range")
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -569,8 +579,8 @@ class SparkDeckService:
             "context_window_size": context_window,
             "concurrency": concurrency,
             "tensor_parallel_size": tensor_parallel_size,
-            "prompt_tokens_per_second": prompt_tokens / wall_seconds,
-            "generation_tokens_per_second": generation_tokens / wall_seconds,
+            "prompt_tokens_per_second": prompt_tokens_per_second,
+            "generation_tokens_per_second": generation_tokens_per_second,
             "request_count": request_count,
         }
         await asyncio.to_thread(self.store.add_benchmark_series_point, point)

@@ -23,6 +23,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
     validate_control_url,
 )
+from sparkdeck.workload_ownership import ManagedWorkloadLedger
 
 
 class FakeManager:
@@ -49,6 +50,7 @@ class FakeManager:
         self.adopt_controller_role = Mock()
         self.deployments = []
         self.list_containers = AsyncMock(return_value=[])
+        self.managed_workload_ledger = ManagedWorkloadLedger(data_dir)
 
     @staticmethod
     def _network_interfaces():
@@ -597,6 +599,57 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request.method for request in requests], ["GET", "POST", "GET"])
         manager.adopt_worker_role.assert_awaited_once()
         await http.aclose()
+
+    async def test_join_without_docker_rejects_durable_workload_claim(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.managed_workload_ledger.claim("sparkdeck-orphan", "deployment-1")
+        manager.list_containers.side_effect = DockerException("daemon is not running")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "durable managed workload ownership"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        self.assertEqual(requests, [])
+        await http.aclose()
+
+    async def test_join_clears_stale_claim_after_successful_empty_inventory(self):
+        manager = FakeManager(self.root)
+        manager.managed_workload_ledger.claim("sparkdeck-stale", "deployment-1")
+
+        async def inventory():
+            manager.managed_workload_ledger.reconcile({})
+            return []
+        manager.list_containers.side_effect = inventory
+        service = OnboardingService(manager, self.root)
+
+        await service._assert_no_owned_workloads("join")
+
+        self.assertEqual(manager.managed_workload_ledger.snapshot(), {})
+
+    async def test_join_rejects_corrupt_workload_ledger(self):
+        manager = FakeManager(self.root)
+        manager.managed_workload_ledger.path.write_text("not-json", encoding="utf-8")
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "cannot verify managed workload ownership"):
+            await service.join({
+                "controller_url": "http://127.0.0.1:9000",
+                "join_code": "654321",
+                "advertise_url": "http://127.0.0.1:9001",
+            }, "http://127.0.0.1:7878")
+
+        await manager.http.aclose()
 
     async def test_join_still_surfaces_unexpected_inventory_failures(self):
         manager = FakeManager(self.root)

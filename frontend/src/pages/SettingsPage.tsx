@@ -1,11 +1,12 @@
-import { useEffect, useState, type FormEvent, type KeyboardEvent } from 'react'
-import { Cable, Check, Cloud, DownloadCloud, KeyRound, MonitorCog, Network, RefreshCw, Save } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
+import { LegalDialog } from '../components/LegalDialog'
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
@@ -108,6 +109,7 @@ function CommunitySignInForm() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
+  const [ageConfirmed, setAgeConfirmed] = useState(false)
 
   const switchMode = (next: CommunityAuthMode) => {
     setMode(next)
@@ -141,6 +143,10 @@ function CommunitySignInForm() {
   })
 
   const submitSignUp = () => {
+    if (!ageConfirmed) {
+      setError('You must confirm that you are at least 18 years old')
+      return
+    }
     if (password !== confirmPassword) {
       setError('Passwords do not match')
       return
@@ -205,6 +211,7 @@ function CommunitySignInForm() {
       {mode === 'sign-up' && <>
         <label className="field"><span>Confirm password</span><input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} onKeyDown={onEnter} /></label>
         <small className="muted">At least 8 characters with upper and lower case letters and a number.</small>
+        <label className="check-field community-age-confirm"><input type="checkbox" checked={ageConfirmed} onChange={(event) => setAgeConfirmed(event.target.checked)} /><span><strong>I confirm that I am at least 18 years old.</strong><small>By creating an account, you agree to the Terms & Conditions and acknowledge the Privacy Policy available below.</small></span></label>
       </>}
       {(mode === 'confirm' || mode === 'reset-confirm') && <label className="field"><span>Confirmation code</span><input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} onKeyDown={onEnter} /></label>}
       {mode === 'reset-confirm' && <>
@@ -221,7 +228,7 @@ function CommunitySignInForm() {
           <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('reset-request')}>Forgot password?</Button>
         </>}
         {mode === 'sign-up' && <>
-          <Button type="button" variant="primary" disabled={busy || !email.trim() || !password || !confirmPassword} onClick={submitSignUp}>{busy ? 'Creating…' : 'Create account'}</Button>
+          <Button type="button" variant="primary" disabled={busy || !email.trim() || !password || !confirmPassword || !ageConfirmed} onClick={submitSignUp}>{busy ? 'Creating…' : 'Create account'}</Button>
           <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
         </>}
         {mode === 'confirm' && <>
@@ -252,6 +259,10 @@ export function SettingsPage() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
   const [signingOut, setSigningOut] = useState(false)
+  const [legalDialog, setLegalDialog] = useState<'privacy' | 'terms'>()
+  const privacyButtonRef = useRef<HTMLButtonElement>(null)
+  const termsButtonRef = useRef<HTMLButtonElement>(null)
+  const closeLegalDialog = useCallback(() => setLegalDialog(undefined), [])
 
   useEffect(() => {
     if (resource.data) {
@@ -365,13 +376,13 @@ export function SettingsPage() {
           <div className="settings-fields"><div className="credential-state wide-field"><Cable size={17} /><div><strong>Switch connection</strong><span className="muted">Enter a RouterOS REST API URL manually when discovery cannot cross a routed network.</span></div><Link className="button button-secondary" to="/switch">Open switch setup</Link></div></div>
         </Panel>
         <Panel className="settings-section">
-          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to share anonymized benchmark telemetry and see community data.</p></div></div>
+          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to access community data. Benchmark sharing remains off until you explicitly enable it.</p></div></div>
           <div className="settings-fields">
             <p className="muted wide-field">Connected to the SparkDeck community service.</p>
             {auth.status === 'restoring'
-              ? <p className="muted wide-field" role="status">Restoring community sessionâ€¦</p>
+              ? <p className="muted wide-field" role="status">Restoring community session…</p>
               : auth.status === 'signed-in'
-                ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" disabled={signingOut} onClick={() => void signOut()}>{signingOut ? 'Signing outâ€¦' : 'Sign out'}</Button></div>
+                ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><Button type="button" disabled={signingOut} onClick={() => void signOut()}>{signingOut ? 'Signing out…' : 'Sign out'}</Button></div>
                 : <CommunitySignInForm />}
             {auth.status === 'signed-in' && auth.clusterSync && <>
               {auth.clusterSync.conflicts.map((conflict) => (
@@ -401,6 +412,38 @@ export function SettingsPage() {
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
       <SoftwareUpdatePanel />
+      <Panel className="settings-section support-legal-section">
+        <div className="settings-heading"><span><ShieldCheck size={18} /></span><div><h2>Support & legal</h2><p>Review how Community Features handle data, read the service terms, or report a problem.</p></div></div>
+        <div className="settings-link-list">
+          <div><FileText size={17} /><span><strong>Privacy Policy</strong><small>Optional telemetry, Cognito, retention, and California disclosures.</small></span><button ref={privacyButtonRef} className="button button-secondary" type="button" onClick={() => setLegalDialog('privacy')}>View policy</button></div>
+          <div><FileText size={17} /><span><strong>Terms & Conditions</strong><small>18+ eligibility, acceptable use, benchmark limitations, and disclaimers.</small></span><button ref={termsButtonRef} className="button button-secondary" type="button" onClick={() => setLegalDialog('terms')}>View terms</button></div>
+          <div><Bug size={17} /><span><strong>Report a bug</strong><small>Open a GitHub issue. Never include passwords, tokens, prompts, model outputs, or other sensitive data.</small></span><a className="button button-secondary" href="https://github.com/hyudryu/SparkDeck/issues/new" target="_blank" rel="noopener noreferrer">Report a bug <ExternalLink size={14} /></a></div>
+        </div>
+      </Panel>
+      {legalDialog === 'privacy' && <LegalDialog eyebrow="Your data" title="SparkDeck Privacy Policy" titleId="privacy-policy-title" onClose={closeLegalDialog} returnFocusRef={privacyButtonRef}>
+        <p className="legal-effective">Effective August 27, 2026</p>
+        <section><h3>Local-first by default</h3><p>SparkDeck's core app runs on systems you control. It keeps benchmark history, runtime details, settings, and operational records locally on your device or cluster. Local storage is not collection by SparkDeck's hosted Community Features service.</p><p>If you do not create or sign in to a Community Features account, SparkDeck does not send account data or benchmark telemetry to the Community Features service.</p></section>
+        <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data, and your browser stores session tokens locally to keep you signed in.</p></section>
+        <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly opt in from Benchmarks. When enabled, eligible existing local samples may be queued along with future samples. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>model identifier;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>tensor-parallel (TP) size, when recorded; and</li><li>context-window size.</li></ul><p>Prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
+        <section><h3>How information is used</h3><p>Account information authenticates Community Features. Benchmark telemetry is used to group comparable results, show expected performance for the same model and configuration, detect invalid submissions, and operate the service. Published results may be aggregated with other users' results.</p><p>Telemetry uploads use a node-scoped credential and idempotency identifier. Hosting and network providers may also process ordinary connection metadata such as IP address, request time, and user agent for security and service operation. This metadata is not part of the benchmark JSON.</p></section>
+        <section><h3>Your controls and retention</h3><p>You can turn telemetry off at any time. This stops future uploads and removes unsent queued uploads; it does not delete local benchmark history or recall data already received. Account information and received telemetry are retained only while reasonably needed to provide Community Features, protect the service, meet legal obligations, or maintain aggregated benchmark results. You may request access, correction, or deletion through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. Do not include sensitive personal information in a public issue. Backup and aggregated records may persist where legally permitted or where they can no longer reasonably be linked to an account.</p></section>
+        <section><h3>Service providers and external links</h3><p>Amazon Cognito provides authentication. GitHub receives information under its own privacy notice if you open or submit a bug report. Services you choose separately, including Hugging Face and Tailscale, operate under their own terms and privacy notices. SparkDeck does not sell personal information or share it for cross-context behavioral advertising.</p></section>
+        <section><h3>California privacy disclosures</h3><p>California residents may have rights under applicable law to know, access, correct, or delete personal information; opt out of sale or sharing; limit certain uses of sensitive personal information; and receive equal service when exercising privacy rights. SparkDeck does not sell personal information, use it for targeted advertising, or offer financial incentives for it. Start a request through the GitHub issue tracker without including sensitive personal information; identity may need to be verified before a request is completed.</p><p>SparkDeck does not track people over time across third-party websites for targeted advertising, so it does not respond differently to browser Do Not Track signals. Where legally applicable, Global Privacy Control signals are honored for sale or sharing opt-outs; SparkDeck does not currently conduct either activity.</p></section>
+        <section><h3>Security and changes</h3><p>Reasonable safeguards are used, but no system is completely secure. Protect your local SparkDeck installation and credentials. Material policy changes will be identified by a new effective date and, where required, an in-app notice.</p></section>
+      </LegalDialog>}
+      {legalDialog === 'terms' && <LegalDialog eyebrow="Community Features" title="Terms & Conditions" titleId="terms-title" onClose={closeLegalDialog} returnFocusRef={termsButtonRef}>
+        <p className="legal-effective">Effective August 27, 2026</p>
+        <section><h3>Agreement and eligibility</h3><p>These Terms govern hosted Community Features. Local SparkDeck software remains governed by the license in its repository. By creating an account or using Community Features, you agree to these Terms, confirm you are at least 18 years old, and confirm you can legally enter this agreement. If you do not agree, do not create an account or use Community Features.</p></section>
+        <section><h3>Work in progress</h3><p>SparkDeck and Community Features are works in progress. Features, schemas, model compatibility, benchmark methods, and availability may change, be interrupted, or be discontinued. Community results may be delayed, incomplete, or incorrect.</p></section>
+        <section><h3>Benchmark and operational disclaimer</h3><p>Tokens-per-second results and other comparisons are observations, not guarantees. Results vary with model revision, quantization, runtime, hardware, drivers, networking, thermals, power limits, context length, concurrency, TP size, and workload. Verify results on your own systems before making purchasing, capacity, safety, or operational decisions. SparkDeck is not a substitute for hardware, electrical, thermal, network, or security expertise.</p></section>
+        <section><h3>Your responsibilities</h3><p>Use Community Features only on systems and with models and data you are authorized to use. Keep credentials and local management interfaces secure. Do not disrupt the service, bypass access controls, submit fabricated or manipulated results, probe other users' systems, infringe rights, or use the service unlawfully.</p></section>
+        <section><h3>Submitted telemetry</h3><p>You retain any rights you have in submitted telemetry. By opting in, you grant the SparkDeck project a non-exclusive, worldwide, royalty-free license to host, process, validate, aggregate, analyze, and publish the permitted telemetry solely to operate and improve Community Features and benchmark comparisons. Turning sharing off ends future submissions but does not require already published aggregate statistics to be withdrawn.</p></section>
+        <section><h3>Third-party services</h3><p>Models, runtimes, AWS, GitHub, Hugging Face, Tailscale, and other third-party services are governed by their own terms. SparkDeck is not responsible for third-party services, models, licenses, availability, or content.</p></section>
+        <section><h3>No warranty</h3><p>To the maximum extent permitted by law, SparkDeck, Community Features, and benchmark information are provided "as is" and "as available," without warranties of accuracy, availability, merchantability, fitness for a particular purpose, or non-infringement. Nothing in these Terms limits rights or warranties that cannot lawfully be excluded.</p></section>
+        <section><h3>Limitation of liability</h3><p>To the maximum extent permitted by law, the SparkDeck project maintainer and contributors are not liable for indirect, incidental, special, consequential, exemplary, or punitive damages, or loss of data, profits, use, goodwill, or business opportunity arising from SparkDeck or Community Features. Nothing excludes liability that cannot lawfully be excluded, including liability for fraud or willful misconduct where applicable.</p></section>
+        <section><h3>Suspension, termination, and changes</h3><p>You may sign out and turn off telemetry at any time. Access may be suspended when reasonably necessary to protect users, the service, or benchmark integrity, or to address misuse. Material changes will be identified by a new effective date and reasonable notice where required.</p></section>
+        <section><h3>Contact</h3><p>Questions about these Terms may be submitted through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. Applicable California and United States law applies without limiting mandatory consumer protections in your place of residence.</p></section>
+      </LegalDialog>}
     </div>
   )
 }

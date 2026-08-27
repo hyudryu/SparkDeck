@@ -257,7 +257,8 @@ class NodeRegistry:
                 except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                     last_error = exc
             else:
-                assert last_error is not None
+                if last_error is None:
+                    raise RuntimeError("node agent has no connectable endpoints")
                 raise last_error
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:300]
@@ -385,7 +386,10 @@ class NodeRegistry:
                     raise
                 except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                     last_error = exc
-            assert last_error is not None
+            if last_error is None:
+                raise RuntimeError(
+                    f"{node.get('name', node_id)} agent has no connectable endpoints"
+                )
             raise last_error
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
@@ -442,7 +446,10 @@ class NodeRegistry:
                 raise RuntimeError(
                     f"could not contact {node.get('name', node_id)}: {exc}"
                 ) from exc
-        assert last_error is not None
+        if last_error is None:
+            raise RuntimeError(
+                f"could not contact {node.get('name', node_id)}: no connectable endpoints"
+            )
         raise RuntimeError(
             f"could not contact {node.get('name', node_id)}: {last_error}"
         ) from last_error

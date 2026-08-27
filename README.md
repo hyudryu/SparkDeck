@@ -1,8 +1,56 @@
 # SparkDeck
 
-SparkDeck is a local-first control plane for discovering, running, and comparing open models. It brings vLLM, llama.cpp `llama-server`, and SGLang deployments into one responsive interface and records comparable performance results without storing prompt or response content.
+**Built by a DGX Spark GB10 cluster owner, for other DGX Spark GB10 owners.**
 
-The long-term goal is a public community catalog where people can find a model that fits their hardware, compare measured throughput and latency, and optionally contribute their own benchmark results. Cloud sync is being designed around explicit consent and an authenticated upload queue; sharing is off by default.
+Running one DGX Spark is straightforward. The moment I added more, the practical questions multiplied: Which models actually fit? What inference speed should I expect? Which Spark has the weights? Is every node healthy? Which runtime and configuration really wins?
+
+I built SparkDeck for my own GB10 cluster to answer those questions in one local-first interface. It brings vLLM, llama.cpp `llama-server`, and SGLang together, coordinates paired machines, stages model weights where the work will run, and records comparable performance evidence. I am sharing it so other Spark owners can spend less time coordinating machines and more time running models.
+
+The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
+
+## Example render
+
+![SparkDeck dark-mode dashboard showing a four-node DGX Spark cluster](docs/screenshots/readme/sparkdeck-dashboard-dark.png)
+
+_A four-node SparkDeck dashboard in dark mode. Every value shown in this README is illustrative demo data, not a measured hardware claim._
+
+## Why I built it
+
+### Know what performance to expect before pulling a model
+
+The **Community Run Models** catalog gives me a directional inference tok/s estimate before spending time downloading and deploying a model. Today those estimates are aggregated from the measurements my own cluster records; measurements from other SparkDeck users appear only when SparkDeck is pointed at a separately configured community aggregates service, since hosted community sync is not available in this release. Evidence is matched by exact model ID and context window; it is an estimate, not a GB10-specific guarantee, because runtime, quantization, hardware, parallelism, and other settings still matter.
+
+![Community Run Models with illustrative throughput and cluster-fit evidence](docs/screenshots/readme/community-performance-dark.png)
+
+_Community throughput evidence and per-node fit. Illustrative demo data; estimates are evidence, not guarantees._
+
+### Manage the whole GB10 cluster from one controller
+
+SparkDeck pairs machines over a private network, gives every node a recognizable identity, and shows membership and reachability from one controller. Workers run assigned jobs and provide alternate private entry points, while the controller remains authoritative for cluster management.
+
+![Cluster management with one controller and three DGX Spark workers](docs/screenshots/readme/cluster-management-dark.png)
+
+_Controller and worker membership across a private cluster network. Illustrative demo data._
+
+### Put model weights where the work will run
+
+My Sparks are ConnectX-7-equipped for distributed inference, but a fast fabric is useful only when the right weights are already on the right machines. **Virtual NAS** inventories complete Hugging Face cache copies per node, queues authenticated transfers, and tracks progress without exposing arbitrary host paths.
+
+When SparkDeck node addresses are configured on a private ConnectX-7 network, Virtual NAS traffic can take that path. The current transfer engine streams over SparkDeck's authenticated HTTP transport; it does not yet use RDMA.
+
+![Virtual NAS model inventory across three DGX Spark nodes](docs/screenshots/readme/virtual-nas-inventory-dark.png)
+
+![Virtual NAS transfer progress between paired DGX Spark nodes](docs/screenshots/readme/virtual-nas-transfer-dark.png)
+
+_Complete cached model weights staged across paired nodes, with an active copy in the transfer queue. Illustrative demo data._
+
+### Compare configurations, not hunches — work in progress
+
+SparkDeck already records successful proxied runs with runtime, quantization, throughput, latency, and time to first token. The next step is a faster configuration-benchmark loop: vary context length, parallelism, memory settings, and launch arguments, then rank like-for-like runs side by side.
+
+![Work-in-progress benchmark history with illustrative runtime results](docs/screenshots/readme/benchmark-history-dark.png)
+
+_Work in progress: the shipped history view is shown with illustrative data; configuration-aware comparison and ranking are planned._
 
 ## What SparkDeck does
 
@@ -10,7 +58,7 @@ The long-term goal is a public community catalog where people can find a model t
 - Launch and manage models with vLLM, llama.cpp, or SGLang.
 - Chat with one model or compare model responses side by side.
 - Track host health, model logs, images, queues, and deployment settings.
-- Capture local benchmark measurements such as time to first token, output throughput, token counts, and latency.
+- Capture local benchmark measurements such as time to first token, output throughput, token counts, and latency, with configuration comparison still in progress.
 - Prepare eligible, redacted benchmark samples for future community sync.
 - Coordinate compatible SparkDeck nodes for distributed or replicated inference.
 - Copy Hugging Face cache weights between paired nodes with the opt-in virtual NAS.
@@ -21,11 +69,15 @@ SparkDeck is under active development. The management API is not hardened for di
 
 ### Requirements
 
-- Linux with Docker and the NVIDIA Container Toolkit
 - Python 3.11 or newer
 - Node.js 20 or newer with npm (for the web app build)
-- An NVIDIA GPU for GPU-backed runtimes
+- Linux with Docker and the NVIDIA Container Toolkit for the recommended GPU-worker setup
+- Windows 10/11 with PowerShell 5.1 or newer for a native controller or UI node
+- Docker Desktop using its WSL2/Linux-container engine for experimental local-container actions on Windows
+- An NVIDIA GPU and supported container GPU access for GPU-backed runtimes
 - A Hugging Face account for gated models
+
+### Linux
 
 Create a virtual environment, install the dependencies, and start the application:
 
@@ -35,6 +87,35 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ./run.sh
 ```
+
+### Windows
+
+The Windows launcher bootstraps the virtual environment and frontend, then starts SparkDeck in the background:
+
+```powershell
+.\run-windows.cmd
+```
+
+SparkDeck can run as a controller and manage remote Linux/DGX workers when local Docker is unavailable. Local container inventory and deployment actions remain unavailable until Docker Desktop is running with Linux containers; Linux remains the recommended GPU-worker platform.
+
+To install the command shim into your user PATH, run once from the checkout:
+
+```powershell
+.\sparkdeck.cmd install
+```
+
+Open a new PowerShell window after installation. The launcher then supports:
+
+```powershell
+sparkdeck start
+sparkdeck status
+sparkdeck logs
+sparkdeck stop
+sparkdeck restart
+sparkdeck run       # foreground diagnostics
+```
+
+Background output is stored beneath `data/logs/`. The launcher validates its saved process identity before stopping anything and refuses to take over an unrelated process already using port 7878.
 
 Open `http://localhost:7878`. Application state is written beneath `data/`, which is intentionally excluded from version control.
 
@@ -76,13 +157,17 @@ Requests made through SparkDeck can be queued, measured, and used to refresh the
 
 SparkDeck records successful proxied inference measurements locally. Benchmark records may include the model revision and artifact, quantization, runtime and version, hardware class, deployment settings, token counts, latency, time to first token, and generation throughput.
 
-Community upload payloads contain exactly three fields: `model_id`, `context_window_size`, and `inference_tokens_per_second`. Richer benchmark details remain local; SparkDeck does **not** upload prompts, generated text, API keys, endpoint URLs, hostnames, IP addresses, hardware details, runtime settings, token counts, revisions, quantization, latency, or local filesystem paths. Community sharing is off by default and requires explicit consent. Without a trusted ingestion service and node-scoped credential, samples stay queued locally; queued samples remain reviewable and deletable locally.
+Community upload JSON always contains `model_id`, `context_window_size`, and `inference_tokens_per_second`. Coordinated benchmark runs can additionally include `concurrency` and `tensor_parallel_size`; no other benchmark fields pass the upload allowlist. Richer benchmark details remain local. SparkDeck does **not** put prompts, generated text, API keys, endpoint URLs, account email, hostnames, hardware details, runtime settings, token counts, revisions, quantization, latency, or local filesystem paths in benchmark JSON. Community sharing is off by default and requires an account plus explicit consent. If a software update expands the upload fields, SparkDeck disables the prior consent and requires a fresh review and opt-in. Normal authenticated-request and network metadata may still be processed by the hosted service. Without a trusted ingestion service and node-scoped credential, samples stay queued locally; queued samples remain reviewable and deletable locally.
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
 
+Coordinated runs made through `benchmark_cluster_deployment` are grouped by model, context window, measured concurrency, and TP size. Open a model on **Benchmarks** to compare prompt and generation throughput at C1, C2, C5, and C10. Prompt throughput uses prompt tokens divided by measured time to first token; generation throughput uses completed tokens over the concurrent batch wall time. Runs without first-token timing and prompt-token usage remain local results and are not plotted. Only combinations that were actually measured are shown.
+
+![Dark benchmark explorer showing prompt and text-generation throughput across C1, C2, C5, and C10](docs/screenshots/benchmark-explorer-dark.png)
+
 ## Community sign-in (Cognito email + password)
 
-Community features (shared benchmark telemetry and community estimates) require an account, created and used from **Settings → Community Features**. The app renders a native email + password form and calls the Amazon Cognito IDP HTTPS API (`https://cognito-idp.us-east-2.amazonaws.com/`) directly — there is no hosted UI, no redirect, and no third-party identity provider. Sign-up uses `SignUp`/`ConfirmSignUp` (Cognito emails a verification code; Cognito's default email sender is used, which is fine for low volume), sign-in uses `InitiateAuth` with the `USER_PASSWORD_AUTH` flow, and sessions refresh with `REFRESH_TOKEN_AUTH`. Password reset is also handled in-app via `ForgotPassword`/`ConfirmForgotPassword` from the same form. All authentication traffic goes straight from the browser to Cognito over HTTPS; passwords never touch the SparkDeck backend.
+Community features (shared benchmark telemetry and community estimates) require an account for a person age 18 or older, created and used from **Settings → Community Features**. The app renders a native email + password form and calls the Amazon Cognito IDP HTTPS API (`https://cognito-idp.us-east-2.amazonaws.com/`) directly — there is no hosted UI, no redirect, and no third-party identity provider. Sign-up uses `SignUp`/`ConfirmSignUp` (Cognito emails a verification code; Cognito's default email sender is used, which is fine for low volume), sign-in uses `InitiateAuth` with the `USER_PASSWORD_AUTH` flow, and sessions refresh with `REFRESH_TOKEN_AUTH`. Password reset is also handled in-app via `ForgotPassword`/`ConfirmForgotPassword` from the same form. All authentication traffic goes straight from the browser to Cognito over HTTPS; passwords never touch the SparkDeck backend. The Privacy Policy and Terms & Conditions are available from Settings.
 
 After a successful sign-in the frontend sends the Cognito ID token to the SparkDeck backend (`POST /api/v1/community/pair`), which verifies it against the pool's JWKS before marking the device paired. Signing out (`DELETE /api/v1/community/pair` via the app's Sign out button, plus a best-effort `RevokeToken` call) returns the device to `not_paired`.
 

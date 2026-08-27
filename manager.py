@@ -2944,6 +2944,7 @@ class Manager:
 
         created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []
+        model_sources = []
         for spec, result in zip(member_specs, created):
             if isinstance(result, Exception):
                 spec["status"] = "error"
@@ -2953,6 +2954,22 @@ class Manager:
                 spec["status"] = result.get("status", "starting")
                 spec["container_id"] = result.get("id")
                 spec["port"] = result.get("port") or spec.get("port")
+                model_source = str(result.get("model_source") or "unknown")
+                if model_source not in {"local", "public_repository", "unknown"}:
+                    model_source = "unknown"
+                spec["model_source"] = model_source
+                model_sources.append(model_source)
+        deployment["model_source"] = (
+            "local"
+            if "local" in model_sources
+            else (
+                "public_repository"
+                if model_sources
+                and all(source == "public_repository" for source in model_sources)
+                else "unknown"
+            )
+        )
+        deployment["launch_settings"]["model_source"] = deployment["model_source"]
         deployment["api_port"] = member_specs[0].get("port") if member_specs else None
         deployment["status"] = "error" if errors else "starting"
         if errors:
@@ -3978,6 +3995,21 @@ class Manager:
             return None
         expanded = str(Path(model_path).expanduser().resolve())
         return expanded if Path(expanded).is_dir() else None
+
+    def _created_container_model_source(self, container: Any, model: str) -> str:
+        """Classify the launched model without exposing its filesystem path."""
+        if self._resolve_local_path(model):
+            return "local"
+        if not str(model or "").strip():
+            return "unknown"
+        try:
+            result = container.exec_run(["test", "-e", "--", str(model)])
+            exit_code = getattr(result, "exit_code", None)
+            if exit_code is None and isinstance(result, (tuple, list)) and result:
+                exit_code = result[0]
+        except Exception:
+            return "unknown"
+        return "local" if exit_code == 0 else "public_repository"
 
     def _image_hf_cache_target(self, image: str | None) -> str:
         """Return the Hugging Face cache directory declared by *image*.
@@ -7668,7 +7700,12 @@ class Manager:
                 )
                 if recipe_id:
                     self.recipe_launches[recipe_id].update({"phase": "Starting model"})
-                return self._container_summary(container)
+                summary = self._container_summary(container)
+                if summary is not None:
+                    summary["model_source"] = self._created_container_model_source(
+                        container, model
+                    )
+                return summary
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -7818,7 +7855,12 @@ class Manager:
                     name, "starting", "Container created; starting the model server",
                     model=model, cluster_member=cluster_member,
                 )
-                return self._container_summary(container)
+                summary = self._container_summary(container)
+                if summary is not None:
+                    summary["model_source"] = self._created_container_model_source(
+                        container, model
+                    )
+                return summary
             try:
                 return await asyncio.to_thread(_create)
             except Exception as exc:

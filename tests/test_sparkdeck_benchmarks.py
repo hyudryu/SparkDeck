@@ -1,4 +1,5 @@
 import socket
+import json
 import tempfile
 import threading
 import time
@@ -63,6 +64,63 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
+
+    async def test_upload_worker_drains_exact_privacy_payload_with_idempotency(self):
+        requests = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(202, request=request)
+
+        self.service._community_upload_url = (
+            "https://community.example/api/v1/community"
+        )
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        self.service._record_response(
+            None, "org/model", "vllm", {"context_size": 4096},
+            time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+
+        synced = await self.service.upload_community_once()
+
+        self.assertEqual(synced, 1)
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request.headers["host"], "community.example")
+        self.assertEqual(
+            request.headers["authorization"], "Bearer node-scoped-token",
+        )
+        self.assertTrue(request.headers["idempotency-key"])
+        self.assertEqual(request.url.path, "/api/v1/community/benchmarks")
+        self.assertEqual(set(json.loads(request.content)), {
+            "model_id", "context_window_size",
+            "inference_tokens_per_second",
+        })
+        self.assertEqual(
+            self.service.store.sync_status()["outbox"]["synced"], 1,
+        )
+
+    async def test_upload_worker_requires_node_scoped_configuration(self):
+        requested = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requested.append(request) or httpx.Response(200),
+        )
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+
+        self.assertEqual(await self.service.upload_community_once(), 0)
+        self.assertEqual(requested, [])
 
     async def test_configured_community_aggregates_are_fetched_and_sanitized(self):
         requested = []

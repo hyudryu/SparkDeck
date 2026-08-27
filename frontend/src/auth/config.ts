@@ -1,14 +1,21 @@
-// Cognito IDP configuration for community sign-in. The defaults point at the
-// deployed sparkdeck-community-auth stack; localStorage overrides exist so
-// forks can point a dev build at their own pool without rebuilding.
+// The backend owns Cognito runtime configuration so its verifier, CSP, and the
+// browser always target the same pool after environment overrides.
+import { api } from '../api/client'
+import type { CommunityAuthConfig } from '../api/types'
 
-const DEFAULT_COGNITO_IDP_ENDPOINT = 'https://cognito-idp.us-east-2.amazonaws.com/'
-const DEFAULT_COGNITO_CLIENT_ID = '30ihrkeg4k1rn95d4mmkq00fvl'
-
-export function cognitoIdpEndpoint(): string {
-  return localStorage.getItem('sparkdeck.cognito.idp_endpoint') ?? DEFAULT_COGNITO_IDP_ENDPOINT
-}
-
-export function cognitoClientId(): string {
-  return localStorage.getItem('sparkdeck.cognito.client_id') ?? DEFAULT_COGNITO_CLIENT_ID
+export async function cognitoConfig(): Promise<CommunityAuthConfig> {
+  const config = await api.community.authConfig()
+  let endpoint: URL
+  try {
+    endpoint = new URL(config.idp_endpoint)
+  } catch {
+    throw new Error('The community sign-in configuration is invalid')
+  }
+  if (endpoint.protocol !== 'https:' || !config.client_id.trim()) {
+    throw new Error('The community sign-in configuration is invalid')
+  }
+  return {
+    idp_endpoint: endpoint.toString(),
+    client_id: config.client_id.trim(),
+  }
 }

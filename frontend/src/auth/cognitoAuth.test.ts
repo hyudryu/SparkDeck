@@ -17,6 +17,13 @@ import {
 const IDP_ENDPOINT = 'https://cognito-idp.us-east-2.amazonaws.com/'
 const CLIENT_ID = '30ihrkeg4k1rn95d4mmkq00fvl'
 
+vi.mock('./config', () => ({
+  cognitoConfig: async () => ({
+    idp_endpoint: 'https://cognito-idp.us-east-2.amazonaws.com/',
+    client_id: '30ihrkeg4k1rn95d4mmkq00fvl',
+  }),
+}))
+
 function fakeIdToken(claims: Record<string, unknown>) {
   const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
     .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
@@ -126,6 +133,37 @@ describe('cognito IDP calls', () => {
       AuthParameters: { REFRESH_TOKEN: 'saved-refresh-token' },
     })
     expect(tokens?.idToken).toBeTruthy()
+  })
+
+  it('preserves stored tokens when refresh fails transiently', async () => {
+    const expired = fakeIdToken({ exp: 1 })
+    localStorage.setItem('sparkdeck.cognito.id_token', expired)
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('offline')))
+
+    await expect(refresh()).rejects.toMatchObject({ code: 'NetworkError' })
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBe(expired)
+    expect(localStorage.getItem('sparkdeck.cognito.refresh_token')).toBe('saved-refresh-token')
+  })
+
+  it('clears stored tokens only when Cognito rejects the refresh token', async () => {
+    localStorage.setItem('sparkdeck.cognito.id_token', fakeIdToken({ exp: 1 }))
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'revoked-refresh-token')
+    stubFetch(cognitoError('NotAuthorizedException'))
+
+    await expect(refresh()).resolves.toBeNull()
+    expect(storedTokens()).toBeNull()
+  })
+
+  it('preserves stored tokens when Cognito throttles refresh', async () => {
+    const expired = fakeIdToken({ exp: 1 })
+    localStorage.setItem('sparkdeck.cognito.id_token', expired)
+    localStorage.setItem('sparkdeck.cognito.refresh_token', 'saved-refresh-token')
+    stubFetch(cognitoError('TooManyRequestsException', 'slow down', 429))
+
+    await expect(refresh()).rejects.toMatchObject({ code: 'TooManyRequestsException' })
+    expect(localStorage.getItem('sparkdeck.cognito.id_token')).toBe(expired)
+    expect(localStorage.getItem('sparkdeck.cognito.refresh_token')).toBe('saved-refresh-token')
   })
 
   it('persists tokens in local storage so sessions survive browser restarts', async () => {

@@ -137,7 +137,12 @@ export function ExplorePage() {
     [query, runtime],
   )
   const nodes = useResource((signal) => api.nodes.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
+  const communityAccess = useCommunityAccess()
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setQuery(draft.trim()), 350)
@@ -206,7 +211,6 @@ export function ExplorePage() {
     return next
   })
 
-  const communityAccess = useCommunityAccess()
   const communityEnabled = communityAccess.enabled
   const communityUnavailable = Boolean(aggregates.error) && tab === 'community'
   const activeError = tab === 'hugging-face' ? catalog.error : aggregates.error

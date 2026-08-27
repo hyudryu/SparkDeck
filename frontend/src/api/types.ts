@@ -251,6 +251,8 @@ export interface CommunityAuthConfig {
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean
+  /** The stored refresh token was rejected; the account must sign in again. */
+  token_invalid: boolean
   upload_configured: boolean
   pending_count: number
   synced_count: number

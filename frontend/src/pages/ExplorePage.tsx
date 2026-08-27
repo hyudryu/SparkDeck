@@ -213,7 +213,8 @@ export function ExplorePage() {
   })
 
   const communityEnabled = communityAccess.enabled
-  const communityUnavailable = Boolean(aggregates.error) && tab === 'community'
+  const communityUnavailable = tab === 'community'
+    && (Boolean(aggregates.error) || aggregates.data?.availability === 'unavailable')
   const activeError = tab === 'hugging-face' ? catalog.error : aggregates.error
   const loading = tab === 'hugging-face' ? catalog.loading : aggregates.loading
 
@@ -265,7 +266,7 @@ export function ExplorePage() {
 
       {loading && <LoadingState label={tab === 'community' ? 'Loading community models' : 'Searching Hugging Face'} />}
       {catalog.error && tab === 'hugging-face' && <ErrorState message={catalog.error} onRetry={catalog.reload} />}
-      {communityUnavailable && <ErrorState message={aggregates.error ?? 'Community data unavailable'} onRetry={aggregates.reload} />}
+      {communityUnavailable && <ErrorState message={aggregates.error ?? 'The community service is unavailable right now — try again later.'} onRetry={aggregates.reload} />}
       {!loading && !activeError && !communityUnavailable && models.length === 0 && (
         <EmptyState
           title={tab === 'community' ? 'No community-run models yet' : 'No models found'}

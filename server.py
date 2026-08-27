@@ -26,6 +26,10 @@ from cluster import (
 )
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
+from sparkdeck.service import (
+    _COMMUNITY_MAX_RESPONSE_BYTES,
+    _public_community_aggregates,
+)
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.onboarding import (
     FORWARD_HEADERS,
@@ -763,6 +767,15 @@ async def agent_apply_community_pairing(req: Request):
             "device_pairing", {"status": "not_paired"})
         if existing.get("status") == "paired":
             if existing.get("sub") == sub:
+                if refresh_token and refresh_token != existing.get("refresh_token"):
+                    # Merge a rotated token into the existing pairing; a fresh
+                    # token also clears a stale token_invalid flag.
+                    sparkdeck.store.set_setting("device_pairing", {
+                        "status": "paired",
+                        "sub": sub,
+                        "email": email or existing.get("email"),
+                        "refresh_token": refresh_token,
+                    })
                 sparkdeck.store.promote_outbox_for_pairing()
                 return {"applied": True, "already": True}
             return {"applied": False, "existing": {"email": existing.get("email")}}
@@ -2125,7 +2138,7 @@ def _community_sync_status() -> dict:
     pairing = sparkdeck.store.get_setting(
         "device_pairing", {"status": "not_paired"})
     status["upload_configured"] = bool(
-        COMMUNITY_API_URL
+        _validated_community_api_url()
         and isinstance(pairing, dict)
         and pairing.get("refresh_token")
     )
@@ -2173,20 +2186,28 @@ async def v1_community_pair(req: Request):
                 {"error": "already_paired", "existing": {"email": existing.get("email")}},
                 status_code=409,
             )
+        retained = (
+            existing.get("refresh_token")
+            if existing.get("status") == "paired"
+            and existing.get("sub") == claims.get("sub")
+            else None
+        )
+        # Stored locally (never echoed back) so the uploader can mint ID
+        # tokens for consented telemetry uploads. A re-pair that omits the
+        # token keeps the stored one.
+        effective_refresh_token = refresh_token or retained
         pairing = {
             "status": "paired",
             "sub": claims.get("sub"),
             "email": claims.get("email"),
         }
-        if refresh_token:
-            # Stored locally (never echoed back) so the uploader can mint ID
-            # tokens for consented telemetry uploads.
-            pairing["refresh_token"] = refresh_token
+        if effective_refresh_token:
+            pairing["refresh_token"] = effective_refresh_token
         sparkdeck.store.set_setting("device_pairing", pairing)
         sparkdeck.store.promote_outbox_for_pairing()
     # Best-effort cluster propagation; failures are reported, never raised.
     cluster = await manager.push_community_pairing(
-        pairing["sub"], pairing["email"], refresh_token)
+        pairing["sub"], pairing["email"], effective_refresh_token)
     public_pairing = {k: v for k, v in pairing.items() if k != "refresh_token"}
     return {"pairing": public_pairing, "cluster": cluster}
 
@@ -2213,7 +2234,7 @@ async def v1_community_aggregates(req: Request):
     _require_matching_community_pairing(claims)
     if not sparkdeck.store.get_setting("community_consent", False):
         raise HTTPException(403, "community sharing consent is required")
-    api_url = COMMUNITY_API_URL.strip().rstrip("/")
+    api_url = _validated_community_api_url()
     if not api_url:
         try:
             return await sparkdeck.community_aggregates()
@@ -2232,7 +2253,24 @@ async def v1_community_aggregates(req: Request):
         raise HTTPException(401, "community aggregates require sign-in")
     if upstream.status_code != 200:
         return _community_aggregates_unavailable()
-    return upstream.json()
+    # Never pass an unvalidated or oversized upstream payload to the UI.
+    if len(upstream.content) > _COMMUNITY_MAX_RESPONSE_BYTES:
+        return _community_aggregates_unavailable()
+    try:
+        body = upstream.json()
+        items = _public_community_aggregates(body)
+    except (TypeError, ValueError):
+        return _community_aggregates_unavailable()
+    evidence_policy = body.get("evidence_policy")
+    return {
+        "items": items,
+        "availability": str(body.get("availability") or "ok"),
+        "evidence_policy": (
+            evidence_policy
+            if isinstance(evidence_policy, dict)
+            else COMMUNITY_EVIDENCE_POLICY
+        ),
+    }
 
 
 def _community_aggregates_unavailable() -> dict:
@@ -2250,12 +2288,46 @@ _community_http = httpx.AsyncClient(timeout=5)
 
 COMMUNITY_UPLOAD_BATCH_SIZE = 50
 COMMUNITY_UPLOAD_INTERVAL_SECONDS = 60
+_COMMUNITY_UPLOAD_PACING_SECONDS = 0.15
 
 logger = logging.getLogger(__name__)
 
 _community_token_cache: dict = {
     "refresh_token": None, "id_token": None, "expires_at": 0.0,
 }
+# Rate limiting: skip uploads until this timestamp after a 429.
+_community_upload_not_before = 0.0
+
+
+def _validated_community_api_url() -> str | None:
+    """Return the built-in community API base, or None when misconfigured.
+
+    The URL is server-side configuration; an invalid override (non-HTTPS,
+    missing host, embedded credentials) must not receive account tokens.
+    """
+    try:
+        url = httpx.URL(COMMUNITY_API_URL.strip())
+    except (TypeError, httpx.InvalidURL):
+        return None
+    if url.scheme != "https" or not url.host or url.userinfo:
+        return None
+    return str(url).rstrip("/")
+
+
+def _mark_community_token_invalid(refresh_token: str) -> None:
+    """Flag the stored pairing when Cognito rejects its refresh token for good."""
+    pairing = sparkdeck.store.get_setting(
+        "device_pairing", {"status": "not_paired"})
+    if (
+        isinstance(pairing, dict)
+        and pairing.get("refresh_token") == refresh_token
+        and not pairing.get("token_invalid")
+    ):
+        sparkdeck.store.set_setting(
+            "device_pairing", {**pairing, "token_invalid": True})
+    _community_token_cache.update({
+        "refresh_token": None, "id_token": None, "expires_at": 0.0,
+    })
 
 
 async def _community_id_token(refresh_token: str, force: bool = False) -> str | None:
@@ -2284,6 +2356,16 @@ async def _community_id_token(refresh_token: str, force: bool = False) -> str | 
     except httpx.HTTPError:
         return None
     if response.status_code != 200:
+        error_code = ""
+        try:
+            body = response.json()
+            error_code = str(body.get("__type") or body.get("error") or "")
+        except (ValueError, AttributeError):
+            pass
+        if "NotAuthorizedException" in error_code or "invalid_grant" in error_code:
+            # The refresh token is revoked or expired; retrying is pointless
+            # until the account pairs again.
+            _mark_community_token_invalid(refresh_token)
         return None
     result = response.json().get("AuthenticationResult") or {}
     id_token = result.get("IdToken")
@@ -2297,12 +2379,17 @@ async def _community_id_token(refresh_token: str, force: bool = False) -> str | 
     return id_token
 
 
-async def _post_community_sample(api_url: str, id_token: str, payload: dict) -> httpx.Response | None:
+async def _post_community_sample(
+    api_url: str, id_token: str, payload: dict, sample_id: str,
+) -> httpx.Response | None:
     try:
         return await _community_http.post(
             f"{api_url}/v1/samples",
             json=payload,
-            headers={"Authorization": f"Bearer {id_token}"},
+            headers={
+                "Authorization": f"Bearer {id_token}",
+                "Idempotency-Key": sample_id,
+            },
         )
     except httpx.HTTPError:
         return None
@@ -2310,21 +2397,28 @@ async def _post_community_sample(api_url: str, id_token: str, payload: dict) -> 
 
 async def community_upload_once() -> dict:
     """Upload one batch of pending consented samples; transient errors stay pending."""
+    global _community_upload_not_before
+    if time.time() < _community_upload_not_before:
+        return {"uploaded": 0, "failed": 0, "reason": "rate_limited"}
     store = sparkdeck.store
     if not store.get_setting("community_consent", False):
         return {"uploaded": 0, "failed": 0, "reason": "consent_off"}
     pairing = store.get_setting("device_pairing", {"status": "not_paired"})
+    if isinstance(pairing, dict) and pairing.get("token_invalid"):
+        # The stored refresh token was rejected for good; wait for re-pairing.
+        return {"uploaded": 0, "failed": 0, "reason": "token_invalid"}
     refresh_token = (
         pairing.get("refresh_token")
         if isinstance(pairing, dict) and pairing.get("status") == "paired"
         else None
     )
-    api_url = COMMUNITY_API_URL.strip().rstrip("/")
+    api_url = _validated_community_api_url()
     if not refresh_token or not api_url:
         return {"uploaded": 0, "failed": 0, "reason": "not_configured"}
     batch = store.outbox_entries(COMMUNITY_UPLOAD_BATCH_SIZE)
     if not batch:
         return {"uploaded": 0, "failed": 0, "reason": "idle"}
+    batch_sub = pairing.get("sub")
     id_token = await _community_id_token(refresh_token)
     if not id_token:
         return {"uploaded": 0, "failed": 0, "reason": "token_unavailable"}
@@ -2333,32 +2427,54 @@ async def community_upload_once() -> dict:
     failed: list[str] = []
     for entry in batch:
         sample_id = entry["sample_id"]
-        # The batch is only a scheduling snapshot. Deletion, consent
-        # withdrawal, or another queue transition may have removed the row
-        # before this sample's turn; re-read it at the outbound boundary.
+        # Consent, pairing, or deletion may change mid-batch. Stop rather than
+        # upload under stale authorization.
+        if not store.get_setting("community_consent", False):
+            break
+        current_pairing = store.get_setting(
+            "device_pairing", {"status": "not_paired"})
+        if (
+            not isinstance(current_pairing, dict)
+            or current_pairing.get("status") != "paired"
+            or current_pairing.get("sub") != batch_sub
+            or current_pairing.get("refresh_token") != refresh_token
+        ):
+            break
+        # The batch is only a scheduling snapshot; re-read the row at the
+        # outbound boundary so a deleted or transitioned sample never sends.
         current = store.outbox_entry(sample_id)
         if current is None:
             continue
         response = await _post_community_sample(
-            api_url, id_token, current["payload"])
+            api_url, id_token, current["payload"], sample_id)
         if response is not None and response.status_code == 401:
             # The cached token expired early; mint once and retry this sample.
             id_token = await _community_id_token(refresh_token, force=True)
             if not id_token:
                 break
             response = await _post_community_sample(
-                api_url, id_token, current["payload"])
+                api_url, id_token, current["payload"], sample_id)
         if response is None:
             continue  # transient transport error: leave pending
-        if response.status_code in (200, 201):
+        if response.is_success:
             synced.append(sample_id)
         elif response.status_code == 401:
-            continue  # still unauthorized after one refresh: leave pending
+            break  # still unauthorized after one refresh: stop the batch
+        elif response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            delay = (
+                float(retry_after)
+                if retry_after and retry_after.isdigit()
+                else float(COMMUNITY_UPLOAD_INTERVAL_SECONDS)
+            )
+            _community_upload_not_before = time.time() + delay
+            break  # rate limited: everything stays pending until the next tick
         elif 400 <= response.status_code < 500:
             # Definitive rejection (e.g. schema validation): retryable via the
             # existing retry button, not hot-looped.
             failed.append(sample_id)
         # 5xx: leave pending for the next tick.
+        await asyncio.sleep(_COMMUNITY_UPLOAD_PACING_SECONDS)
     store.mark_outbox_synced(synced)
     if failed:
         store.mark_outbox_failed(failed, "community API rejected the sample")

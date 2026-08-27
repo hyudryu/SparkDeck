@@ -62,3 +62,15 @@ jobs:
           else
             echo "No npm lockfile found; frontend validation is not required yet."
           fi
+
+  windows-launcher:
+    name: Windows launcher
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Pester
+        shell: powershell
+        run: Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+      - name: Validate launcher
+        shell: powershell
+        run: Invoke-Pester -Path tests/windows/SparkDeck.Windows.Tests.ps1 -CI

@@ -14,6 +14,7 @@ import type {
   AdmissionStats,
   LogEntry,
   SyncStatus,
+  CommunityPairResponse,
   NodeInventoryItem,
   RenameNodeInput,
   ImagePullResult,
@@ -41,12 +42,22 @@ export class ApiError extends Error {
   }
 }
 
+type AuthTokenProvider = () => string | undefined
+
+let authTokenProvider: AuthTokenProvider | undefined
+
+export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
+  authTokenProvider = provider
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = path.startsWith('/api/v1/community/') ? authTokenProvider?.() : undefined
   const response = await fetch(path, {
     ...init,
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   })
@@ -285,6 +296,13 @@ export const api = {
     },
     deleteLocal: (id: string) =>
       request<void>(`/api/v1/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
+  community: {
+    pair: (idToken: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
+      method: 'POST',
+      body: JSON.stringify({ id_token: idToken }),
+    }),
+    unpair: () => request<CommunityPairResponse>('/api/v1/community/pair', { method: 'DELETE' }),
   },
   images: {
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {

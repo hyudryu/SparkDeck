@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
+import { AuthProvider } from './auth/AuthContext'
 import { AppShell } from './components/AppShell'
 import { BenchmarksPage } from './pages/BenchmarksPage'
 import { ChatPage } from './pages/ChatPage'
@@ -15,23 +16,25 @@ import { UsagePage } from './pages/UsagePage'
 
 export default function App() {
   return (
-    <AppShell>
-      <Routes>
-        <Route path="/" element={<DashboardPage />} />
-        <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/explore" element={<ExplorePage />} />
-        <Route path="/models" element={<ModelsPage />} />
-        <Route path="/cluster" element={<ClusterPage />} />
-        <Route path="/chat" element={<ChatPage />} />
-        <Route path="/compare" element={<ComparePage />} />
-        <Route path="/benchmarks" element={<BenchmarksPage />} />
-        <Route path="/usage" element={<UsagePage />} />
-        <Route path="/images" element={<ImagesPage />} />
-        <Route path="/storage" element={<StoragePage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="/logs" element={<LogsPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </AppShell>
+    <AuthProvider>
+      <AppShell>
+        <Routes>
+          <Route path="/" element={<DashboardPage />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/explore" element={<ExplorePage />} />
+          <Route path="/models" element={<ModelsPage />} />
+          <Route path="/cluster" element={<ClusterPage />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/compare" element={<ComparePage />} />
+          <Route path="/benchmarks" element={<BenchmarksPage />} />
+          <Route path="/usage" element={<UsagePage />} />
+          <Route path="/images" element={<ImagesPage />} />
+          <Route path="/storage" element={<StoragePage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/logs" element={<LogsPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AppShell>
+    </AuthProvider>
   )
 }

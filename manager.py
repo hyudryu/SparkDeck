@@ -332,6 +332,25 @@ def _is_atlas_serving_container(name: str, image: str) -> bool:
     )
 
 
+def _community_pairing_fanout(nodes: list[dict], results: list) -> dict:
+    """Merge per-node community pairing fan-out results for reporting."""
+    applied: list[str] = []
+    conflicts: list[dict] = []
+    errors: list[str] = []
+    for node, result in zip(nodes, results):
+        name = node.get("name", node["id"])
+        if isinstance(result, Exception):
+            errors.append(f"{name}: {result}")
+        elif isinstance(result, dict) and result.get("applied"):
+            applied.append(name)
+        elif isinstance(result, dict):
+            conflicts.append({
+                "node": name,
+                "email": (result.get("existing") or {}).get("email"),
+            })
+    return {"applied": applied, "conflicts": conflicts, "errors": errors}
+
+
 class Manager:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -1237,6 +1256,38 @@ class Manager:
             "error": "; ".join(errors) if errors else None,
         })
         return dict(status)
+
+    async def push_community_pairing(self, sub: str, email: str | None) -> dict:
+        """Best-effort fan-out of a community sign-in to every enabled peer."""
+        nodes = [
+            node for node in self.node_registry.nodes
+            if node.get("enabled", True)
+        ]
+        results = await asyncio.gather(*(
+            self.node_registry.request(
+                node["id"], "PUT", "/api/agent/community-pairing",
+                json_body={"sub": sub, "email": email},
+                timeout=5,
+            )
+            for node in nodes
+        ), return_exceptions=True)
+        return _community_pairing_fanout(nodes, results)
+
+    async def push_community_unpair(self, sub: str | None) -> dict:
+        """Best-effort fan-out of a community sign-out to every enabled peer."""
+        nodes = [
+            node for node in self.node_registry.nodes
+            if node.get("enabled", True)
+        ]
+        results = await asyncio.gather(*(
+            self.node_registry.request(
+                node["id"], "DELETE", "/api/agent/community-pairing",
+                json_body={"sub": sub},
+                timeout=5,
+            )
+            for node in nodes
+        ), return_exceptions=True)
+        return _community_pairing_fanout(nodes, results)
 
     async def _token_usage_sync_loop(self) -> None:
         while True:

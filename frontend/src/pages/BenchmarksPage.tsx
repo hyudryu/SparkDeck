@@ -1,13 +1,16 @@
 import { useState } from 'react'
 import { Check, CloudOff, RotateCw, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunityAccess'
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
   const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
+  const communityAccess = useCommunityAccess()
   const [syncBusy, setSyncBusy] = useState(false)
   const [reviewingConsent, setReviewingConsent] = useState(false)
   const aggregateResponse = aggregates.data
@@ -61,18 +64,23 @@ export function BenchmarksPage() {
         </Panel>
       </div>
 
-      <div className="section-heading"><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
-      {aggregates.loading && <LoadingState label="Loading community aggregates" />}
-      {aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
-      {!aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
-      {aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
+      <div className="section-heading" title={communityAccess.enabled ? undefined : COMMUNITY_ACCESS_HINT}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
+      {!communityAccess.enabled && !communityAccess.loading && <EmptyState
+        title="Community estimates are locked"
+        description={COMMUNITY_ACCESS_HINT}
+        action={<Link className="button button-secondary" to="/settings">Open community settings</Link>}
+      />}
+      {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
+      {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
+      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
+      {communityAccess.enabled && aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
         <Panel className="aggregate-item" key={`${item.model_id}-${item.context_window_size}`}>
           <div><p className="aggregate-model">{item.model_id}</p><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>
           <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Context window</dt><dd>{item.context_window_size.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
           {item.sample_count >= aggregateResponse.evidence_policy.minimum_samples ? <span className="proven"><Check size={14} /> Evidence threshold met</span> : <span className="muted">Collecting more evidence</span>}
         </Panel>
       ))}</div>}
-      {aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
+      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
 
       <div className="section-heading"><div><h2>Local history</h2><p>Successful proxied runs are captured automatically.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}

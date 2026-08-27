@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -43,7 +44,9 @@ _SAFE_CONFIGURATION_KEYS = {
     "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
-_LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
+_LOCAL_ROUTING_KEYS = {
+    "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
+}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -534,6 +537,203 @@ class SparkDeckService:
             "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
         }
 
+    async def record_benchmark_series_point(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Record aggregate benchmark counters; raw prompts and outputs are rejected upstream."""
+        deployment_id = str(body.get("deployment_id") or "").strip()
+        if not deployment_id:
+            raise ValueError("deployment_id is required")
+        deployment = await self._benchmark_deployment(deployment_id)
+        settings = deployment.get("settings") or {}
+        context_window = community_context_window(settings)
+        if context_window is None:
+            raise ValueError("deployment does not declare a context window")
+
+        concurrency = _bounded_benchmark_integer(body.get("concurrency"), "concurrency")
+        if concurrency not in {1, 2, 5, 10}:
+            raise ValueError("concurrency must be one of 1, 2, 5, or 10")
+        request_count = _bounded_benchmark_integer(body.get("request_count"), "request_count")
+        if request_count < concurrency:
+            raise ValueError("request_count must be at least the measured concurrency")
+        if request_count % concurrency:
+            raise ValueError("request_count must be divisible by the measured concurrency")
+        prompt_tokens = _bounded_benchmark_integer(body.get("prompt_tokens"), "prompt_tokens", allow_zero=True)
+        generation_tokens = _bounded_benchmark_integer(body.get("generation_tokens"), "generation_tokens", allow_zero=True)
+        prompt_seconds = _positive_finite(body.get("prompt_seconds"), "prompt_seconds")
+        wall_seconds = _positive_finite(body.get("wall_seconds"), "wall_seconds")
+        if prompt_tokens == 0:
+            raise ValueError("prompt throughput is unavailable without measured prompt tokens")
+
+        tensor_parallel_size = 1
+        raw_tp = settings.get("tensor_parallel_size")
+        if raw_tp is not None:
+            tensor_parallel_size = _bounded_benchmark_integer(raw_tp, "tensor_parallel_size")
+        try:
+            prompt_tokens_per_second = prompt_tokens / prompt_seconds
+            generation_tokens_per_second = generation_tokens / wall_seconds
+        except OverflowError as exc:
+            raise ValueError("derived benchmark throughput is outside the supported range") from exc
+        if not (
+            math.isfinite(prompt_tokens_per_second)
+            and math.isfinite(generation_tokens_per_second)
+        ):
+            raise ValueError("derived benchmark throughput is outside the supported range")
+        raw_model_id = str(
+            (deployment.get("model") or {}).get("repository") or "local-model"
+        ).strip()
+        upload_model_id = _public_model_id(raw_model_id)
+        if (
+            upload_model_id != "local-model"
+            and deployment.get("kind") == DeploymentKind.MANAGED.value
+            and settings.get("model_source") != "public_repository"
+        ):
+            upload_model_id = "local-model"
+        local_model_id = _local_benchmark_model_id(
+            raw_model_id, deployment.get("id") or deployment_id,
+            upload_model_id=upload_model_id,
+        )
+        point = {
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "deployment_id": deployment.get("id"),
+            "model_id": local_model_id,
+            "context_window_size": context_window,
+            "concurrency": concurrency,
+            "tensor_parallel_size": tensor_parallel_size,
+            "prompt_tokens_per_second": prompt_tokens_per_second,
+            "generation_tokens_per_second": generation_tokens_per_second,
+            "request_count": request_count,
+        }
+        runtime = RuntimeKind(str(deployment.get("runtime") or RuntimeKind.VLLM.value))
+        configuration = self._safe_configuration({
+            **settings,
+            "context_length": context_window,
+            "tensor_parallel_size": tensor_parallel_size,
+        })
+        # This marker is trusted run metadata, not a deployment setting. Keep
+        # it out of the general configuration allowlist so ordinary proxy
+        # samples cannot impersonate coordinated runs.
+        configuration["benchmark_concurrency"] = concurrency
+        hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
+        eligible_for_community = bool(
+            upload_model_id != "local-model"
+            and prompt_tokens > 0
+            and generation_tokens >= 16
+            and runtime.value in self.registry.kinds
+            and hardware_verified
+        )
+        sample = BenchmarkSample(
+            id=str(uuid.uuid4()), created_at=point["created_at"],
+            deployment_id=deployment.get("id"),
+            model=ModelIdentity(repository=upload_model_id), runtime=runtime,
+            runtime_version=_optional_string(settings.get("runtime_version")),
+            hardware=hardware, configuration=configuration,
+            input_tokens=prompt_tokens, output_tokens=generation_tokens,
+            latency_ms=wall_seconds * 1000, ttft_ms=None,
+            generation_tokens_per_second=point["generation_tokens_per_second"],
+            prompt_tokens_per_second=point["prompt_tokens_per_second"],
+            cold_start=False, eligible_for_community=eligible_for_community,
+        )
+        # Keep the consent decision and outbox insertion in the same critical
+        # section as opt-in/withdrawal and outbound uploads. Otherwise a
+        # consent transition can scan or clear the outbox between these two
+        # operations and leave sharing state inconsistent.
+        async with self._community_upload_lock:
+            consent = bool(await asyncio.to_thread(
+                self.store.get_setting, "community_consent", False,
+            ))
+            await asyncio.to_thread(
+                self.store.add_coordinated_benchmark, point, sample,
+                sample.eligible_for_community and consent,
+            )
+        return point
+
+    async def _benchmark_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Resolve both SparkDeck records and Manager-only MCP deployments."""
+        registered = self.store.deployments(include_private=True)
+        deployment = next((item for item in registered if (
+            item.get("id") == deployment_id
+            or (item.get("settings") or {}).get("manager_deployment_id") == deployment_id
+        )), None)
+        manager_id = (
+            (deployment.get("settings") or {}).get("manager_deployment_id")
+            if deployment else deployment_id
+        )
+        if deployment is not None and not manager_id:
+            return deployment
+
+        lookup_manager_deployment = getattr(self.manager, "_deployment", None)
+        manager_deployment = (
+            lookup_manager_deployment(manager_id)
+            if callable(lookup_manager_deployment) else None
+        )
+        if manager_deployment is None and deployment is not None:
+            manager_deployment = next((item for item in getattr(self.manager, "deployments", []) if (
+                isinstance(item, dict)
+                and item.get("sparkdeck_record_id") == deployment.get("id")
+            )), None)
+        if manager_deployment is not None and not manager_deployment.get("launch_settings"):
+            try:
+                state = await self.manager.get_state()
+                manager_deployment = next((item for item in state.get("deployments", []) if (
+                    isinstance(item, dict)
+                    and item.get("id") == manager_deployment.get("id")
+                )), manager_deployment)
+            except Exception:
+                pass
+        if manager_deployment is None:
+            if deployment is not None:
+                return deployment
+            raise LookupError("deployment not found")
+
+        launch_settings = manager_deployment.get("launch_settings") or {}
+        launch_controls = self.manager._deployment_launch_controls(launch_settings)
+        settings = dict((deployment or {}).get("settings") or {})
+        settings["manager_deployment_id"] = manager_deployment.get("id")
+        model_source = str(
+            manager_deployment.get("model_source")
+            or launch_settings.get("model_source")
+            or settings.get("model_source")
+            or "unknown"
+        )
+        settings["model_source"] = (
+            model_source
+            if model_source in {"local", "public_repository", "unknown"}
+            else "unknown"
+        )
+        context_window = launch_controls.get("context_window") or launch_settings.get("sg_context_length")
+        if context_window is not None:
+            for key in ("max_model_len", "context_length", "context_size"):
+                settings.pop(key, None)
+            settings["context_length"] = context_window
+        contract = self.manager.recipe_deployment_contract(launch_settings)
+        if not contract.get("supported", True):
+            raise ValueError(contract.get("error") or "deployment launch metadata is unsupported")
+        tensor_parallel_size = contract.get("tensor_parallel_size")
+        if tensor_parallel_size is not None:
+            settings["tensor_parallel_size"] = tensor_parallel_size
+
+        model_id = str(
+            manager_deployment.get("model")
+            or launch_settings.get("model")
+            or ((deployment or {}).get("model") or {}).get("repository")
+            or "local-model"
+        ).strip()
+        runtime = str(
+            manager_deployment.get("engine")
+            or launch_settings.get("engine")
+            or (deployment or {}).get("runtime")
+            or RuntimeKind.VLLM.value
+        )
+        return {
+            **(deployment or {}),
+            "id": (deployment or {}).get("id") or manager_deployment.get("id"),
+            "kind": (deployment or {}).get("kind") or DeploymentKind.MANAGED.value,
+            "runtime": runtime,
+            "model": {**((deployment or {}).get("model") or {}), "repository": model_id},
+            "settings": settings,
+            "status": _deployment_status(manager_deployment.get("status")),
+        }
+
     async def catalog_search(
         self, query: str, limit: int, runtime: str | None = None
     ) -> dict[str, Any]:
@@ -879,6 +1079,7 @@ class SparkDeckService:
                     "deployment_mode": mode,
                     "node_ids": requested_node_ids,
                     "manager_deployment_id": manager_id,
+                    "model_source": cluster.get("model_source") or "unknown",
                 })
                 port = cluster.get("api_port")
                 if not manager_id or not deployment.container_name or not port:
@@ -916,6 +1117,10 @@ class SparkDeckService:
                     },
                 )
                 deployment.container_name = launched.get("name")
+                deployment.settings = self._local_configuration({
+                    **settings,
+                    "model_source": launched.get("model_source") or "unknown",
+                })
                 port = launched.get("port")
                 if not deployment.container_name or not port:
                     raise RuntimeError("runtime launched without a discoverable container endpoint")
@@ -1510,6 +1715,8 @@ class SparkDeckService:
         self, deployment: dict[str, Any]
     ) -> tuple[dict[str, Any], bool]:
         """Resolve benchmark hardware from the cluster member that serves requests."""
+        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+            return self._unknown_hardware_snapshot(), False
         manager_id = (deployment.get("settings") or {}).get("manager_deployment_id")
         if not manager_id:
             return self._hardware_snapshot(), True
@@ -1598,6 +1805,40 @@ def _optional_string(value: Any) -> str | None:
     return text or None
 
 
+def _bounded_benchmark_integer(value: Any, name: str, *, allow_zero: bool = False) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be an integer")
+        parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not text.lstrip("+-").isdigit():
+            raise ValueError(f"{name} must be an integer")
+        parsed = int(text)
+    else:
+        raise ValueError(f"{name} must be an integer")
+    minimum = 0 if allow_zero else 1
+    if parsed < minimum or parsed > 100_000_000:
+        raise ValueError(f"{name} is outside the supported range")
+    return parsed
+
+
+def _positive_finite(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > 86_400:
+        raise ValueError(f"{name} is outside the supported range")
+    return parsed
+
+
 def _requested_node_ids(body: dict[str, Any]) -> list[str] | None:
     raw = body.get("node_ids")
     scalar = body.get("node_id")
@@ -1659,7 +1900,7 @@ def _is_missing_container_error(exc: Exception) -> bool:
 
 
 def _public_model_id(value: str) -> str:
-    """Exclude endpoint URLs and local paths from persistent benchmark identity."""
+    """Exclude endpoint URLs and local paths from the upload-facing identity."""
     text = str(value or "").strip()
     if (
         not text
@@ -1675,6 +1916,25 @@ def _public_model_id(value: str) -> str:
     ):
         return "local-model"
     return text
+
+
+def _local_benchmark_model_id(
+    value: str, deployment_id: str | None, *, upload_model_id: str | None = None,
+) -> str:
+    """Return a local grouping key without exposing private model identifiers."""
+    public_model_id = upload_model_id or _public_model_id(value)
+    if public_model_id != "local-model":
+        return public_model_id
+    identity = json.dumps(
+        [str(deployment_id or "").strip(), str(value or "").strip()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    # This deliberately does not resemble an owner/repository ID, so the
+    # upload-facing sanitizer will still collapse it to ``local-model`` if it
+    # ever reaches that boundary.
+    return f"local-model-{digest}"
 
 
 def _parse_sse(line: str) -> dict[str, Any] | None:

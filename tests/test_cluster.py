@@ -1059,6 +1059,24 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(settings["max_retries"], 7)
 
+    def test_legacy_hf_cache_migration_keeps_parsed_settings_when_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "hf_cache": "/home/hyudryu/.cache/huggingface",
+                "max_retries": 7,
+            }))
+
+            with mock.patch(
+                "manager._atomic_private_json_write",
+                side_effect=OSError("read only"),
+            ):
+                settings = instance._load_settings()
+
+        self.assertEqual(settings["max_retries"], 7)
+        self.assertEqual(settings["hf_cache"], str(Path.home() / ".cache" / "huggingface"))
+
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

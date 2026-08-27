@@ -442,6 +442,11 @@ export interface StorageTransferJob {
   target_node_id: string
   target_node_name: string
   status: string
+  kind?: 'download' | 'transfer'
+  revision?: string
+  depends_on_job_id?: string | null
+  workflow_id?: string | null
+  workflow_node_ids?: string[]
   bytes_total: number
   bytes_transferred: number
   progress?: number
@@ -467,6 +472,15 @@ export interface StorageTransferPreflightTarget {
   required_free_bytes?: number | null
   active_job_id?: string | null
   active_job_status?: string | null
+  active_job_kind?: string | null
+  has_required_weights?: boolean
+  has_model_cache?: boolean
+  download_eligible?: boolean
+  download_reason?: string | null
+  download_required_free_bytes?: number | null
+  transfer_after_download_eligible?: boolean
+  transfer_after_download_reason?: string | null
+  transfer_after_download_required_free_bytes?: number | null
 }
 
 export interface StorageTransferPreflight {
@@ -474,13 +488,30 @@ export interface StorageTransferPreflight {
   model_id: string
   revision: string
   source?: { node_id: string; node_name: string; size_bytes: number } | null
+  sources?: { node_id: string; node_name: string; size_bytes: number }[]
+  download?: { size_bytes: number; required_free_bytes: number } | null
+  download_error?: string | null
   targets: StorageTransferPreflightTarget[]
   staging_reserve_bytes: number
+}
+
+export interface RecipePreparationPlan extends StorageTransferPreflight {
+  node_ids: string[]
+  eligible: boolean
+  action: 'ready' | 'transfer' | 'download'
+  download_node_id?: string | null
+  transfer_target_node_ids: string[]
+  reason?: string | null
 }
 
 export interface StorageTransferResult {
   job_ids: string[]
   jobs: StorageTransferJob[]
+}
+
+export interface RecipePreparationResult extends StorageTransferResult {
+  workflow_id?: string | null
+  plan?: RecipePreparationPlan
 }
 
 export interface ModelCacheState {
@@ -539,6 +570,7 @@ export interface CreateStorageTransferInput {
   model_id: string
   source_node_id: string
   target_node_ids: string[]
+  revision?: string
 }
 
 export interface UsageCounters {

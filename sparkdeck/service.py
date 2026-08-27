@@ -464,6 +464,13 @@ class SparkDeckService:
             stored["status"] = _deployment_status(cluster.get("status"))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
+            created_at = cluster.get("created_at")
+            if isinstance(created_at, (int, float)) and created_at:
+                stored["created_at"] = datetime.fromtimestamp(
+                    created_at, timezone.utc
+                ).isoformat()
+            elif isinstance(created_at, str) and created_at:
+                stored["created_at"] = created_at
             stored["node_ids"] = list(cluster.get("node_ids") or [])
             stored["selected_nodes"] = [
                 self.manager.public_target_node(cluster_nodes[node_id])
@@ -839,6 +846,28 @@ class SparkDeckService:
             self._delete_credential(deployment_id, deployment.get("_credential_ref"))
             self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
+
+    async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
+        alias = str(alias or "").strip()
+        if not alias:
+            raise ValueError("alias is required")
+        if deployment_id.startswith("container:"):
+            raise ValueError("discovered containers cannot be renamed")
+        stored = self.store.deployment(deployment_id, include_private=True)
+        if not stored:
+            raise LookupError("deployment not found")
+        existing = self.store.deployment(alias)
+        if existing and existing["id"] != stored["id"]:
+            raise ValueError(f"deployment alias '{alias}' is already in use")
+        manager_id = stored.get("settings", {}).get("manager_deployment_id")
+        if manager_id:
+            # Keep the Manager record in sync so /api/state and MCP cluster
+            # listings (and future Manager-driven rebuilds) use the new name.
+            self.manager.update_deployment_alias(manager_id, alias)
+        self.store.update_alias(stored["id"], alias)
+        stored.pop("_base_url", None)
+        stored.pop("_credential_ref", None)
+        return {**stored, "alias": alias}
 
     async def _resolve_discovered_container(self, deployment_id: str) -> dict[str, Any]:
         name = deployment_id.removeprefix("container:")

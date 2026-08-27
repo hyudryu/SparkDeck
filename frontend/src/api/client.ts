@@ -19,6 +19,7 @@ import type {
   CommunityClusterSync,
   CommunityPairResponse,
   CommunityAuthConfig,
+  CommunitySession,
   NodeInventoryItem,
   RenameNodeInput,
   ImagePullResult,
@@ -53,32 +54,13 @@ export class ApiError extends Error {
   }
 }
 
-type AuthTokenProvider = () => string | undefined | Promise<string | undefined>
-
-let authTokenProvider: AuthTokenProvider | undefined
-
-export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
-  authTokenProvider = provider
-}
-
-function requiresCommunityBearer(path: string, method = 'GET'): boolean {
-  const normalizedMethod = method.toUpperCase()
-  return (
-    (path === '/api/v1/community/aggregates' && normalizedMethod === 'GET')
-    || (path === '/api/v1/community/pair' && normalizedMethod === 'DELETE')
-  )
-}
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = requiresCommunityBearer(path, init?.method)
-    ? await authTokenProvider?.()
-    : undefined
   const response = await fetch(path, {
+    credentials: 'same-origin',
     ...init,
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   })
@@ -340,8 +322,16 @@ export const api = {
     },
     model: (modelId: string, signal?: AbortSignal): Promise<BenchmarkModelDetail> =>
       request<BenchmarkModelDetail>(`/api/v1/benchmark-models/${encodeURIComponent(modelId)}`, { signal }),
-    aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
-      request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
+    aggregates: async (signal?: AbortSignal): Promise<CommunityAggregatesResponse> => {
+      try {
+        return await request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal })
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 401) throw error
+        const session = await request<CommunitySession>('/api/v1/community/session', { signal })
+        if (session.status !== 'signed-in') throw error
+        return request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal })
+      }
+    },
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
       const data = await request<{ consent: boolean; pairing?: { status?: string; token_invalid?: boolean }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
       return {
@@ -373,6 +363,7 @@ export const api = {
   },
   community: {
     authConfig: () => request<CommunityAuthConfig>('/api/v1/community/auth-config'),
+    session: () => request<CommunitySession>('/api/v1/community/session'),
     pair: (idToken: string, refreshToken?: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
       method: 'POST',
       body: JSON.stringify({
@@ -380,7 +371,10 @@ export const api = {
         ...(refreshToken ? { refresh_token: refreshToken } : {}),
       }),
     }),
-    unpair: () => request<CommunityPairResponse>('/api/v1/community/pair', { method: 'DELETE' }),
+    unpair: (idToken: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${idToken}` },
+    }),
   },
   images: {
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {

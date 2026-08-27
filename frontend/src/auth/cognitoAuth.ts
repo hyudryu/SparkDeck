@@ -1,7 +1,7 @@
 // Native Cognito email+password authentication: the frontend calls the Cognito
 // IDP HTTPS API directly (no hosted UI, no redirect, no PKCE). Tokens live in
-// localStorage so the session survives browser restarts; the refresh token is
-// valid for years and expired ID tokens are refreshed silently on load.
+// localStorage only while a direct sign-in is being paired. AuthProvider
+// removes the browser copy after the backend accepts the node-owned session.
 
 import { cognitoConfig } from './config'
 
@@ -82,6 +82,12 @@ function clearTokens() {
   localStorage.removeItem(ID_TOKEN_KEY)
   localStorage.removeItem(ACCESS_TOKEN_KEY)
   localStorage.removeItem(REFRESH_TOKEN_KEY)
+}
+
+// Once the backend owns a paired session, remove the browser copy without
+// revoking the same refresh token the node still needs.
+export function forgetStoredTokens(): void {
+  clearTokens()
 }
 
 async function callIdp(operation: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {

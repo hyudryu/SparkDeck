@@ -6,41 +6,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
-import jwt as pyjwt
-from cryptography.hazmat.primitives.asymmetric import rsa
-
 from sparkdeck.models import BenchmarkSample, ModelIdentity, RuntimeKind
 from sparkdeck.storage import SparkDeckStore
 
 
 with patch("docker.from_env", return_value=Mock()):
     import server
-
-
-SIGNING_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-def _id_token():
-    return pyjwt.encode({
-        "sub": "user-sub-123",
-        "email": "user@example.com",
-        "iss": server.COGNITO_ISSUER,
-        "aud": server.COGNITO_CLIENT_ID,
-        "exp": int(time.time()) + 3600,
-        "iat": int(time.time()),
-        "token_use": "id",
-    }, SIGNING_KEY, algorithm="RS256", headers={"kid": "test-key"})
-
-
-def _jwks_stub():
-    client = Mock()
-    client.get_signing_key_from_jwt.return_value = Mock(
-        key=SIGNING_KEY.public_key())
-    return client
-
-
-def _bearer():
-    return {"Authorization": f"Bearer {_id_token()}"}
 
 
 def _sample(sample_id="sample-1"):
@@ -67,6 +38,7 @@ def _stub_http(test_case, handler):
 
 class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        server._community_browser_sessions.clear()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server.app),
             base_url="http://test",
@@ -87,17 +59,28 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         )
         api_url_patch.start()
         self.addCleanup(api_url_patch.stop)
-        self.jwks_patch = patch.object(
-            server, "_cognito_jwks", return_value=_jwks_stub(),
+        self.mint_patch = patch.object(
+            server, "_community_id_token",
+            AsyncMock(return_value="server-id-token"),
         )
-        self.jwks_patch.start()
+        self.mint = self.mint_patch.start()
+        token = "aggregate-browser-session"
+        server._community_browser_sessions[token] = (
+            "user-sub-123", time.time() + 3600,
+        )
+        self.client.cookies.set(
+            server._COMMUNITY_SESSION_COOKIE,
+            token,
+            path="/api/v1/community",
+        )
 
     async def asyncTearDown(self):
         await self.client.aclose()
-        self.jwks_patch.stop()
+        self.mint_patch.stop()
         self.get_setting_patch.stop()
+        server._community_browser_sessions.clear()
 
-    async def test_passthrough_forwards_the_authorization_header(self):
+    async def test_proxy_uses_the_backend_owned_session_token(self):
         seen = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -116,17 +99,14 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        authorization = _bearer()["Authorization"]
-        response = await self.client.get(
-            "/api/v1/community/aggregates",
-            headers={"Authorization": authorization},
-        )
+        response = await self.client.get("/api/v1/community/aggregates")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "ok")
         self.assertEqual(response.json()["items"][0]["model_id"], "org/model")
         self.assertEqual(str(seen[0].url), "https://community.example/v1/aggregates")
-        self.assertEqual(seen[0].headers["authorization"], authorization)
+        self.assertEqual(seen[0].headers["authorization"], "Bearer server-id-token")
+        self.mint.assert_awaited_once_with("refresh-1")
 
     async def test_upstream_unauthorized_maps_to_401(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -135,8 +115,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        response = await self.client.get(
-            "/api/v1/community/aggregates", headers=_bearer())
+        response = await self.client.get("/api/v1/community/aggregates")
 
         self.assertEqual(response.status_code, 401)
 
@@ -156,8 +135,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
                 "evidence_policy": {},
             }),
         ):
-            return await self.client.get(
-                "/api/v1/community/aggregates", headers=_bearer())
+            return await self.client.get("/api/v1/community/aggregates")
 
     async def test_malformed_upstream_payload_reports_unavailable(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -175,8 +153,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        response = await self.client.get(
-            "/api/v1/community/aggregates", headers=_bearer())
+        response = await self.client.get("/api/v1/community/aggregates")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "unavailable")
@@ -189,8 +166,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         http = _stub_http(self, handler)
         self.addAsyncCleanup(http.aclose)
 
-        response = await self.client.get(
-            "/api/v1/community/aggregates", headers=_bearer())
+        response = await self.client.get("/api/v1/community/aggregates")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "unavailable")
@@ -389,6 +365,35 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, "id-1")
         self.assertEqual(second, "id-1")
         self.assertEqual(len(self.idp_requests()), 1)
+
+    async def test_backend_sign_out_revokes_the_shared_refresh_token(self):
+        requests = []
+
+        def revoke(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={})
+
+        http = _stub_http(self, revoke)
+        self.addAsyncCleanup(http.aclose)
+        server._community_token_cache.update({
+            "refresh_token": "refresh-1", "id_token": "id-1",
+            "expires_at": time.time() + 3600,
+        })
+
+        revoked = await server._revoke_community_refresh_token("refresh-1")
+
+        self.assertTrue(revoked)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].headers["x-amz-target"],
+            "AWSCognitoIdentityProviderService.RevokeToken",
+        )
+        self.assertEqual(json.loads(requests[0].content), {
+            "ClientId": server.COGNITO_CLIENT_ID,
+            "Token": "refresh-1",
+        })
+        self.assertIsNone(server._community_token_cache["refresh_token"])
+        self.assertIsNone(server._community_token_cache["id_token"])
 
     async def test_any_2xx_marks_the_sample_synced(self):
         self.configure()

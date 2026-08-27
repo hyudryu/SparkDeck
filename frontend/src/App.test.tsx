@@ -302,7 +302,7 @@ describe('model deployments', () => {
     expect(dialog).toHaveTextContent('Model weights not cached')
 
     await user.click(secondNode)
-    expect(within(dialog).getByRole('button', { name: 'Deploy on 2 nodes' })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Prepare selected nodes' })).toBeDisabled()
     expect(dialog).toHaveTextContent('Select exactly 2 nodes to continue')
     await user.click(secondNode)
     await user.click(within(dialog).getByRole('button', { name: 'Deploy on 2 nodes' }))
@@ -314,7 +314,7 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
-  it('confirms an eligible recipe weight transfer and rejects insufficient targets', async () => {
+  it('confirms one selected-set preparation and rejects insufficient targets', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -327,12 +327,18 @@ describe('model deployments', () => {
         source: { node_id: 'local', node_name: 'Source', size_bytes: 2 * gib },
         staging_reserve_bytes: 64 * 1024 ** 2,
         targets: [
-          { node_id: 'local', node_name: 'Source', eligible: false, reason: 'Required model weights are already available', free_bytes: 20 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
-          { node_id: 'enough', node_name: 'Enough', eligible: true, free_bytes: 10 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
-          { node_id: 'short', node_name: 'Short', eligible: false, reason: 'Not enough free cache space', free_bytes: 4 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+          { node_id: 'local', node_name: 'Source', eligible: false, has_required_weights: true, reason: 'Required model weights are already available', free_bytes: 20 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+          { node_id: 'enough', node_name: 'Enough', eligible: true, has_required_weights: false, free_bytes: 10 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+          { node_id: 'short', node_name: 'Short', eligible: false, has_required_weights: false, reason: 'Not enough free cache space', free_bytes: 4 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') return new Response(JSON.stringify({
+      if (path.endsWith('/api/v1/recipes/recipe-transfer/prepare/preflight')) return new Response(JSON.stringify({
+        enabled: true, model_id: 'org/model', revision: 'main', eligible: true, action: 'transfer',
+        node_ids: ['enough'], source: { node_id: 'local', node_name: 'Source', size_bytes: 2 * gib },
+        transfer_target_node_ids: ['enough'], targets: [], staging_reserve_bytes: 64 * 1024 ** 2,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/recipes/recipe-transfer/prepare') && init?.method === 'POST') return new Response(JSON.stringify({
+        workflow_id: 'workflow-1',
         job_ids: ['job-1'],
         jobs: [{
           id: 'job-1', model_id: 'org/model', source_node_id: 'local', source_node_name: 'Source',
@@ -368,22 +374,138 @@ describe('model deployments', () => {
     await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Transfer recipe' })
-    const transfer = await within(dialog).findByRole('button', { name: 'Transfer weights' })
+    const prepare = await within(dialog).findByRole('button', { name: 'Prepare selected nodes' })
 
     expect(dialog).toHaveTextContent('Not enough free cache space')
-    expect(within(dialog).getAllByRole('button', { name: 'Transfer weights' })).toHaveLength(1)
-    await user.click(transfer)
+    expect(within(dialog).getByRole('radio', { name: /Short/ })).toBeDisabled()
+    await user.click(prepare)
 
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Transfer org/model (2.0 GB) from Source to Enough via Virtual NAS?'))
-    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/api/v1/storage/transfers/preflight')).length).toBeGreaterThanOrEqual(2)
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Transfer org/model from Source via Virtual NAS to Enough?'))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/storage/transfers',
+      '/api/v1/recipes/recipe-transfer/prepare',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ model_id: 'org/model', source_node_id: 'local', target_node_ids: ['enough'] }),
+        body: JSON.stringify({ node_ids: ['enough'] }),
       }),
     ))
-    expect(await within(dialog).findByText('Transfer queued to Enough. The node will unlock when the copy completes.')).toBeInTheDocument()
+    expect(await within(dialog).findByText('Virtual NAS transfer queued to Enough.')).toBeInTheDocument()
+  })
+
+  it('queues one Hugging Face seed followed by Virtual NAS fan-out for selected nodes', async () => {
+    const user = userEvent.setup()
+    const gib = 1024 ** 3
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      const targets = [
+        { node_id: 'node-a', node_name: 'Node A', eligible: false, has_required_weights: false, has_model_cache: false, download_eligible: true, transfer_after_download_eligible: true, free_bytes: 20 * gib, download_required_free_bytes: 8 * gib, transfer_after_download_required_free_bytes: 8 * gib },
+        { node_id: 'node-b', node_name: 'Node B', eligible: false, has_required_weights: false, has_model_cache: false, download_eligible: true, transfer_after_download_eligible: true, free_bytes: 20 * gib, download_required_free_bytes: 8 * gib, transfer_after_download_required_free_bytes: 8 * gib },
+      ]
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: true, model_id: 'org/new-model', revision: 'main', source: null,
+        download: { size_bytes: 4 * gib, required_free_bytes: 8 * gib },
+        targets, staging_reserve_bytes: 64 * 1024 ** 2,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/recipes/recipe-seed/prepare/preflight')) return new Response(JSON.stringify({
+        enabled: true, model_id: 'org/new-model', revision: 'main', eligible: true, action: 'download',
+        node_ids: ['node-a', 'node-b'], download_node_id: 'node-a', transfer_target_node_ids: ['node-b'],
+        source: null, download: { size_bytes: 4 * gib, required_free_bytes: 8 * gib }, targets,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/recipes/recipe-seed/prepare') && init?.method === 'POST') return new Response(JSON.stringify({
+        workflow_id: 'workflow-seed', job_ids: ['download-1', 'transfer-1'], jobs: [
+          { id: 'download-1', kind: 'download', model_id: 'org/new-model', source_node_id: 'huggingface', source_node_name: 'Hugging Face', target_node_id: 'node-a', target_node_name: 'Node A', status: 'queued', bytes_total: 4 * gib, bytes_transferred: 0, created_at: 1 },
+          { id: 'transfer-1', kind: 'transfer', model_id: 'org/new-model', source_node_id: 'node-a', source_node_name: 'Node A', target_node_id: 'node-b', target_node_name: 'Node B', status: 'queued', bytes_total: 4 * gib, bytes_transferred: 0, created_at: 1 },
+        ],
+      }), { status: 202, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/storage')) return new Response(JSON.stringify({
+        enabled: true, nodes: [], instructions: [], jobs: [
+          { id: 'download-1', status: 'running' }, { id: 'transfer-1', status: 'queued' },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'node-a', name: 'Node A', online: true, cache_free_size: 20 * gib, models: [] },
+        { id: 'node-b', name: 'Node B', online: true, cache_free_size: 20 * gib, models: [] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-seed', name: 'Seed recipe', model: 'org/new-model', engine: 'vllm',
+        deployment_mode: 'replicated', required_node_count: 2, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['node-a', 'node-b'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'node-a', name: 'Node A', online: true, docker_ready: true, selectable: true },
+          { id: 'node-b', name: 'Node B', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Seed recipe' })
+    expect(within(dialog).getByRole('checkbox', { name: /Node A/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Node B/ })).toBeChecked()
+    await user.click(await within(dialog).findByRole('button', { name: 'Prepare selected nodes' }))
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
+      'Download org/new-model revision main (4.0 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
+    ))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-seed/prepare',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['node-a', 'node-b'] }) }),
+    ))
+    expect(await within(dialog).findByText('Hugging Face seed download queued on Node A. Virtual NAS fan-out will follow automatically.')).toBeInTheDocument()
+  })
+
+  it('resumes an active recipe preparation and refreshes preflight after failure', async () => {
+    const user = userEvent.setup()
+    let preflightCalls = 0
+    let cacheCalls = 0
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) {
+        preflightCalls++
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main', source: null,
+          download: { size_bytes: 20, required_free_bytes: 100 }, staging_reserve_bytes: 64,
+          targets: [{
+            node_id: 'worker', node_name: 'Worker', eligible: false,
+            active_job_id: 'job-failed', active_job_status: 'running', active_job_kind: 'download',
+            has_required_weights: false, free_bytes: 1000,
+          }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/storage')) return new Response(JSON.stringify({
+        enabled: true, nodes: [], instructions: [], jobs: [{
+          id: 'job-failed', model_id: 'org/model', target_node_id: 'worker',
+          status: 'failed', error: 'seed download failed', bytes_total: 20,
+          bytes_transferred: 0, created_at: 1,
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/api/v1/model-cache')) {
+        cacheCalls++
+        return new Response(JSON.stringify({ nodes: [
+          { id: 'worker', name: 'Worker', online: true, cache_free_size: 1000, models: [] },
+        ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-resume', name: 'Resume recipe', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['worker'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Resume recipe' })
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('seed download failed')
+    await waitFor(() => expect(preflightCalls).toBeGreaterThanOrEqual(2))
+    expect(cacheCalls).toBeGreaterThanOrEqual(2)
   })
 
   it('requires the main cache ref for an unpinned saved configuration', async () => {
@@ -411,7 +533,11 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved main' })
 
     expect(within(dialog).getByRole('radio', { name: /Snapshot only/ })).toBeDisabled()
-    expect(within(dialog).getByRole('radio', { name: /Default branch/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Snapshot only/ })).toBeChecked()
+    const defaultBranch = within(dialog).getByRole('radio', { name: /Default branch/ })
+    expect(defaultBranch).not.toBeChecked()
+    await user.click(defaultBranch)
+    expect(defaultBranch).toBeChecked()
   })
 
   it('allows a saved local model path on the controller without cache inventory', async () => {

@@ -138,7 +138,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate.status_code, 400)
         self.assertEqual(response.status_code, 202)
         self.assertNotIn("token", str(response.json()))
-        queue.assert_awaited_once_with("org/model", "local", ["worker-1"])
+        queue.assert_awaited_once_with("org/model", "local", ["worker-1"], None)
 
     async def test_recipe_transfer_preflight_is_available_before_queueing(self):
         preflight = AsyncMock(return_value={
@@ -162,6 +162,43 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["targets"][0]["eligible"])
         preflight.assert_awaited_once_with("org/model", "main")
+
+    async def test_recipe_preparation_derives_model_contract_and_rejects_duplicate_nodes(self):
+        recipe = {
+            "id": "recipe-1", "model": "org/model", "engine": "vllm",
+            "node_ids": ["local", "worker-1"],
+        }
+        contract = {
+            "supported": True, "required_node_count": 2,
+            "deployment_mode": "replicated", "model_revision": "release-1",
+        }
+        preflight = AsyncMock(return_value={
+            "enabled": True, "eligible": True, "action": "download",
+            "model_id": "org/model", "revision": "release-1",
+            "node_ids": ["local", "worker-1"], "targets": [],
+            "transfer_target_node_ids": ["worker-1"],
+        })
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "recipe_deployment_contract", return_value=contract),
+            patch.object(server.manager, "_resolve_local_path", return_value=None),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[])),
+            patch.object(server.manager, "recipe_model_preparation_preflight", preflight),
+        ):
+            response = await self.client.post(
+                "/api/v1/recipes/recipe-1/prepare/preflight",
+                json={"node_ids": ["local", "worker-1"]},
+            )
+            duplicate = await self.client.post(
+                "/api/v1/recipes/recipe-1/prepare/preflight",
+                json={"node_ids": ["local", "local"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(duplicate.status_code, 400)
+        preflight.assert_awaited_once_with(
+            "org/model", "release-1", ["local", "worker-1"],
+        )
 
     async def test_delete_maps_absent_and_in_use_without_exposing_core_details(self):
         delete = AsyncMock(side_effect=[
@@ -213,6 +250,10 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             responses = [
                 await self.client.get("/api/agent/virtual-nas/inventory"),
+                await self.client.post(
+                    "/api/agent/virtual-nas/models/org/model/download",
+                    json={"revision": "main", "hf_token": ""},
+                ),
                 await self.client.get(
                     "/api/agent/virtual-nas/models/org/model/export"
                 ),
@@ -226,6 +267,24 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(all(item.status_code == 401 for item in responses))
 
+    async def test_agent_download_uses_local_capacity_checked_operation(self):
+        checked = AsyncMock(return_value={
+            "ok": True, "model_id": "org/model", "revision": "main",
+            "size_bytes": 20,
+        })
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={"revision": "main", "hf_token": "ephemeral"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        checked.assert_awaited_once_with("org/model", "main", "ephemeral")
+        self.assertNotIn("ephemeral", response.text)
+
     async def test_agent_inventory_export_import_and_delete_contracts(self):
         async def export(_model_id):
             yield b"tar-"
@@ -233,7 +292,9 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         received = {}
 
-        async def import_model(model_id, chunks, expected_bytes=None):
+        async def import_model(
+            model_id, chunks, expected_bytes=None, required_model_bytes=None,
+        ):
             received["model_id"] = model_id
             received["expected_bytes"] = expected_bytes
             received["body"] = b"".join([chunk async for chunk in chunks])

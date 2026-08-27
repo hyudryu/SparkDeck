@@ -36,9 +36,11 @@ from cluster import (
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import (
+    DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
     VirtualNAS,
     validate_model_id,
+    validate_revision,
 )
 from sparkdeck.updater import CAPABILITY, current_revision
 from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
@@ -575,6 +577,7 @@ class Manager:
             lambda: Path(self.settings.get("hf_cache") or "") / "hub",
             self.node_registry,
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
+            self._resolved_hf_token,
         )
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
@@ -1380,10 +1383,13 @@ class Manager:
 
     async def queue_virtual_nas_transfer(
         self, model_id: str, source_node_id: str,
-        target_node_ids: list[str],
+        target_node_ids: list[str], revision: str | None = None,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
     ) -> dict:
         result = await self.virtual_nas.queue_transfer(
-            model_id, source_node_id, target_node_ids,
+            model_id, source_node_id, target_node_ids, revision,
+            workflow_id, workflow_node_ids,
         )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
@@ -1393,14 +1399,21 @@ class Manager:
     ) -> dict:
         """Return authoritative recipe-transfer choices without exposing paths."""
         model_id = validate_model_id(model_id)
-        required_revision = str(revision or "main").strip() or "main"
+        required_revision = validate_revision(revision)
         nodes = await self.model_cache_inventory()
-        active_jobs = {
-            job["target_node_id"]: job
-            for job in self.virtual_nas_transfers()["items"]
-            if job.get("model_id") == model_id
-            and job.get("status") in {"queued", "running"}
-        }
+        active_jobs = {}
+        for job in self.virtual_nas_transfers()["items"]:
+            if (
+                job.get("model_id") != model_id
+                or job.get("status") not in {"queued", "running"}
+            ):
+                continue
+            try:
+                job_revision = validate_revision(job.get("revision"))
+            except ValueError:
+                continue
+            if job_revision == required_revision:
+                active_jobs[job["target_node_id"]] = job
         sources = []
         for node in nodes:
             if not node.get("online"):
@@ -1420,9 +1433,26 @@ class Manager:
                 })
         sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
         source = sources[0] if sources else None
+        download_size = None
+        download_error = None
+        if self.virtual_nas_enabled():
+            try:
+                download_size = await self.virtual_nas.estimate_download_size(
+                    model_id, required_revision,
+                )
+            except RuntimeError as exc:
+                download_error = str(exc)
         required_free = (
             source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if source else None
+        )
+        download_required_free = (
+            download_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            if download_size else None
+        )
+        transfer_after_download_required_free = (
+            download_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            if download_size else None
         )
         targets = []
         for node in nodes:
@@ -1436,6 +1466,9 @@ class Manager:
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
             active = active_jobs.get(node_id)
+            has_required_weights = bool(existing and not existing.get("partial") and (
+                required_revision in (existing.get("revisions") or [])
+            ))
             eligible = True
             reason = None
             if not self.virtual_nas_enabled():
@@ -1462,6 +1495,56 @@ class Manager:
             elif required_free is not None and free_bytes < required_free:
                 eligible = False
                 reason = "Not enough free cache space"
+            download_eligible = True
+            download_reason = None
+            if not self.virtual_nas_enabled():
+                download_eligible = False
+                download_reason = "Virtual NAS is disabled"
+            elif has_required_weights:
+                download_eligible = False
+                download_reason = "Required model weights are already available"
+            elif download_error:
+                download_eligible = False
+                download_reason = download_error
+            elif download_required_free is None:
+                download_eligible = False
+                download_reason = "Hugging Face download size is unavailable"
+            elif not node.get("online"):
+                download_eligible = False
+                download_reason = "Node is offline"
+            elif active is not None:
+                download_eligible = False
+                download_reason = f"Model preparation already {active['status']}"
+            elif free_bytes is None:
+                download_eligible = False
+                download_reason = "Free cache capacity is unavailable"
+            elif free_bytes < download_required_free:
+                download_eligible = False
+                download_reason = "Not enough free cache space for the Hugging Face download"
+
+            transfer_after_download_eligible = True
+            transfer_after_download_reason = None
+            if has_required_weights:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = "Required model weights are already available"
+            elif download_error or transfer_after_download_required_free is None:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = download_error or "Hugging Face download size is unavailable"
+            elif existing is not None:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = "A cache for this model already exists on the target"
+            elif not node.get("online"):
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = "Node is offline"
+            elif active is not None:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = f"Model preparation already {active['status']}"
+            elif free_bytes is None:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = "Free cache capacity is unavailable"
+            elif free_bytes < transfer_after_download_required_free:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = "Not enough free cache space for Virtual NAS staging"
             targets.append({
                 "node_id": node_id,
                 "node_name": node.get("name"),
@@ -1471,15 +1554,208 @@ class Manager:
                 "required_free_bytes": required_free,
                 "active_job_id": active.get("id") if active else None,
                 "active_job_status": active.get("status") if active else None,
+                "active_job_kind": active.get("kind") if active else None,
+                "has_required_weights": has_required_weights,
+                "has_model_cache": existing is not None,
+                "download_eligible": download_eligible,
+                "download_reason": download_reason,
+                "download_required_free_bytes": download_required_free,
+                "transfer_after_download_eligible": transfer_after_download_eligible,
+                "transfer_after_download_reason": transfer_after_download_reason,
+                "transfer_after_download_required_free_bytes": transfer_after_download_required_free,
             })
         return {
             "enabled": self.virtual_nas_enabled(),
             "model_id": model_id,
             "revision": required_revision,
             "source": source,
+            "sources": sources,
+            "download": ({
+                "size_bytes": download_size,
+                "required_free_bytes": download_required_free,
+            } if download_size else None),
+            "download_error": download_error,
             "targets": targets,
             "staging_reserve_bytes": TRANSFER_STAGING_RESERVE_BYTES,
         }
+
+    async def recipe_model_preparation_preflight(
+        self, model_id: str, revision: str | None, node_ids: list[str],
+    ) -> dict:
+        """Plan one selected-set preparation without mutating cluster state."""
+        selected_ids = list(dict.fromkeys(str(value).strip() for value in node_ids if str(value).strip()))
+        if not selected_ids:
+            raise ValueError("node_ids must contain at least one node")
+        preflight = await self.virtual_nas_transfer_preflight(model_id, revision)
+        options = {item["node_id"]: item for item in preflight["targets"]}
+        unknown = [node_id for node_id in selected_ids if node_id not in options]
+        if unknown:
+            raise ValueError(f"unknown cluster node(s): {', '.join(unknown)}")
+        selected_sources = [
+            item for item in preflight.get("sources", [])
+            if item["node_id"] in selected_ids
+        ]
+        missing_ids = [
+            node_id for node_id in selected_ids
+            if not options[node_id].get("has_required_weights")
+        ]
+        if not missing_ids:
+            return {
+                **preflight, "node_ids": selected_ids, "eligible": True,
+                "action": "ready", "download_node_id": None,
+                "transfer_target_node_ids": [], "reason": None,
+            }
+
+        if selected_sources:
+            selected_sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
+            source = selected_sources[0]
+            transfer_required = source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            blocked_reasons = []
+            for node_id in missing_ids:
+                option = options[node_id]
+                free_bytes = self._byte_count(option.get("free_bytes"))
+                if option.get("has_model_cache"):
+                    blocked_reasons.append("A cache for this model already exists on the target")
+                elif option.get("active_job_id"):
+                    blocked_reasons.append("Model preparation is already active")
+                elif free_bytes is None:
+                    blocked_reasons.append("Free cache capacity is unavailable")
+                elif free_bytes < transfer_required:
+                    blocked_reasons.append("Not enough free cache space for Virtual NAS staging")
+            return {
+                **preflight, "node_ids": selected_ids,
+                "eligible": not blocked_reasons, "action": "transfer",
+                "source": source, "download_node_id": None,
+                "transfer_target_node_ids": missing_ids,
+                "reason": blocked_reasons[0] if blocked_reasons else None,
+            }
+
+        # None of the selected nodes has the requested revision. Seed exactly
+        # one selected node from the Hub, then fan out only inside that set.
+        download = preflight.get("download")
+        download_error = preflight.get("download_error")
+        if not download:
+            try:
+                size_bytes = await self.virtual_nas.estimate_download_size(
+                    preflight["model_id"], preflight["revision"],
+                )
+                download = {
+                    "size_bytes": size_bytes,
+                    "required_free_bytes": size_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES,
+                }
+            except RuntimeError as exc:
+                download_error = str(exc)
+        if not download:
+            return {
+                **preflight, "node_ids": selected_ids, "eligible": False,
+                "action": "download", "download_node_id": None,
+                "transfer_target_node_ids": missing_ids,
+                "reason": download_error or "Hugging Face download size is unavailable",
+            }
+
+        download_required = download["required_free_bytes"]
+        transfer_required = (
+            download["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        )
+        candidate_reasons: list[str] = []
+        chosen = None
+        for candidate_id in selected_ids:
+            candidate = options[candidate_id]
+            free_bytes = self._byte_count(candidate.get("free_bytes"))
+            if candidate.get("active_job_id"):
+                candidate_reasons.append(candidate.get("reason") or "Model preparation is already active")
+                continue
+            if free_bytes is None:
+                candidate_reasons.append("Free cache capacity is unavailable")
+                continue
+            if free_bytes < download_required:
+                candidate_reasons.append("Not enough free cache space for the Hugging Face download")
+                continue
+            other_ids = [node_id for node_id in missing_ids if node_id != candidate_id]
+            blocked = []
+            for target_id in other_ids:
+                target = options[target_id]
+                target_free = self._byte_count(target.get("free_bytes"))
+                if target.get("has_model_cache"):
+                    blocked.append("A cache for this model already exists on a transfer target")
+                elif target.get("active_job_id"):
+                    blocked.append("Model preparation is already active")
+                elif target_free is None:
+                    blocked.append("Free cache capacity is unavailable")
+                elif target_free < transfer_required:
+                    blocked.append("Not enough free cache space for Virtual NAS staging")
+            if not blocked:
+                chosen = candidate_id
+                break
+            candidate_reasons.extend(blocked)
+        return {
+            **preflight, "download": download, "download_error": download_error,
+            "node_ids": selected_ids, "eligible": chosen is not None,
+            "action": "download", "download_node_id": chosen,
+            "transfer_target_node_ids": [
+                node_id for node_id in missing_ids if node_id != chosen
+            ],
+            "reason": None if chosen else (
+                candidate_reasons[0] if candidate_reasons
+                else "No selected node can seed the Hugging Face download"
+            ),
+        }
+
+    async def queue_recipe_model_preparation(
+        self, model_id: str, revision: str | None, node_ids: list[str],
+    ) -> dict:
+        """Revalidate and persist the selected-set preparation atomically."""
+        normalized_nodes = [str(value).strip() for value in node_ids]
+        if len(set(normalized_nodes)) != len(normalized_nodes):
+            raise ValueError("node_ids must not contain duplicates")
+        normalized_revision = validate_revision(revision)
+        lock = getattr(self, "_recipe_preparation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._recipe_preparation_lock = lock
+        async with lock:
+            active = [
+                job for job in self.virtual_nas.list_transfers()["items"]
+                if job.get("model_id") == model_id
+                and (job.get("revision") or "main") == normalized_revision
+                and job.get("workflow_node_ids") == normalized_nodes
+                and job.get("status") in {"queued", "running"}
+            ]
+            if active:
+                workflow_id = active[0].get("workflow_id")
+                workflow_jobs = [
+                    job for job in self.virtual_nas.list_transfers()["items"]
+                    if job.get("workflow_id") == workflow_id
+                ]
+                return {
+                    "workflow_id": workflow_id,
+                    "job_ids": [job["id"] for job in workflow_jobs],
+                    "jobs": [self._public_virtual_nas_job(job) for job in workflow_jobs],
+                }
+            plan = await self.recipe_model_preparation_preflight(
+                model_id, normalized_revision, normalized_nodes,
+            )
+            if not plan.get("eligible"):
+                raise RuntimeError(str(plan.get("reason") or "selected nodes are not eligible"))
+            if plan["action"] == "ready":
+                return {"workflow_id": None, "job_ids": [], "jobs": [], "plan": plan}
+            workflow_id = uuid.uuid4().hex
+            if plan["action"] == "transfer":
+                result = await self.queue_virtual_nas_transfer(
+                    plan["model_id"], plan["source"]["node_id"],
+                    plan["transfer_target_node_ids"], plan["revision"],
+                    workflow_id, plan["node_ids"],
+                )
+            else:
+                result = await self.virtual_nas.queue_download_and_transfer(
+                    plan["model_id"], plan["revision"], plan["download_node_id"],
+                    plan["transfer_target_node_ids"], plan["download"]["size_bytes"],
+                    workflow_id, plan["node_ids"],
+                )
+                result["jobs"] = [
+                    self._public_virtual_nas_job(job) for job in result["jobs"]
+                ]
+            return {**result, "workflow_id": workflow_id, "plan": plan}
 
     def virtual_nas_transfers(self) -> dict:
         return {
@@ -1496,6 +1772,8 @@ class Manager:
 
     def _public_virtual_nas_job(self, job: dict) -> dict:
         def node_name(node_id: str) -> str:
+            if node_id == "huggingface":
+                return "Hugging Face"
             if node_id == LOCAL_NODE_ID:
                 return str(self.settings.get("cluster_node_name") or "This node")
             node = self.node_registry.get(node_id) or {}
@@ -4431,7 +4709,12 @@ class Manager:
                     and DEFAULT_HF_CACHE != LEGACY_DEFAULT_HF_CACHE
                 ):
                     data["hf_cache"] = DEFAULT_HF_CACHE
-                    _atomic_private_json_write(self.settings_path, data)
+                    try:
+                        _atomic_private_json_write(self.settings_path, data)
+                    except OSError:
+                        # The parsed user settings remain valid even when a
+                        # read-only disk prevents persisting this migration.
+                        pass
                 return {**DEFAULT_SETTINGS, **data}
             except Exception:
                 pass

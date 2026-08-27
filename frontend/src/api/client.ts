@@ -29,6 +29,8 @@ import type {
   StorageState,
   StorageTransferPreflight,
   StorageTransferResult,
+  RecipePreparationPlan,
+  RecipePreparationResult,
   ModelCacheState,
   SavedConfiguration,
   SavedConfigurationDetail,
@@ -424,6 +426,14 @@ export const api = {
     transfer: (input: CreateStorageTransferInput) => request<StorageTransferResult>('/api/v1/storage/transfers', {
       method: 'POST',
       body: JSON.stringify(input),
+    }),
+    preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
+      method: 'POST',
+      body: JSON.stringify({ node_ids: nodeIds }),
+    }),
+    prepareRecipe: (recipeId: string, nodeIds: string[]) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
+      method: 'POST',
+      body: JSON.stringify({ node_ids: nodeIds }),
     }),
     cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
       method: 'DELETE',

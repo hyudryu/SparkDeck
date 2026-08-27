@@ -60,6 +60,7 @@ class FakeRegistry:
         self.active = 0
         self.max_active = 0
         self.received: dict[str, bytes] = {}
+        self.remote_models: dict[str, list[dict]] = {}
 
     def get(self, node_id):
         return self.nodes.get(node_id)
@@ -71,7 +72,10 @@ class FakeRegistry:
         }
 
     async def request(self, node_id, method, path, **_kwargs):
-        return {"models": [], "free_size": 10 * 1024 * 1024 * 1024}
+        return {
+            "models": self.remote_models.get(node_id, []),
+            "free_size": 10 * 1024 * 1024 * 1024,
+        }
 
     async def open_stream(self, node_id, method, path, **kwargs):
         if node_id == self.fail_target:
@@ -92,6 +96,10 @@ class FakeRegistry:
         finally:
             self.active -= 1
         self.received[node_id] = bytes(body)
+        self.remote_models[node_id] = [{
+            "model_id": "org/model", "size_bytes": len(body),
+            "partial": False, "revisions": ["revision-1", "main"],
+        }]
         return FakeResponse()
 
 
@@ -359,6 +367,19 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["jobs"]), 1)
         await nas.stop()
 
+    async def test_agent_checked_download_fails_closed_on_local_cache_capacity(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.estimate_download_size = AsyncMock(return_value=100)
+        nas.free_bytes = Mock(return_value=1)
+        nas.download_model = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
+            await nas.download_model_checked("other/model", "main", "ephemeral")
+
+        nas.download_model.assert_not_called()
+
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
@@ -396,6 +417,8 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             },
         ])
         manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.estimate_download_size = AsyncMock(return_value=20)
 
         result = await manager.virtual_nas_transfer_preflight("org/model", "main")
         targets = {item["node_id"]: item for item in result["targets"]}
@@ -412,6 +435,38 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             targets["generic-only"]["reason"],
             "Free cache capacity is unavailable",
         )
+
+    async def test_recipe_transfer_preflight_ignores_active_job_for_other_revision(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        required = 20 * 2 + 64 * 1024 * 1024
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {
+                "id": "source", "name": "Source", "online": True,
+                "cache_free_size": required,
+                "models": [{
+                    "model_id": "org/model", "size_bytes": 20,
+                    "partial": False, "revisions": ["rev-b"],
+                }],
+            },
+            {
+                "id": "target", "name": "Target", "online": True,
+                "cache_free_size": required, "models": [],
+            },
+        ])
+        manager.virtual_nas_transfers = Mock(return_value={"items": [{
+            "id": "rev-a-job", "model_id": "org/model", "revision": "rev-a",
+            "target_node_id": "target", "status": "running",
+        }]})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.estimate_download_size = AsyncMock(return_value=20)
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "rev-b")
+        target = next(item for item in result["targets"] if item["node_id"] == "target")
+
+        self.assertTrue(target["eligible"])
+        self.assertTrue(target["download_eligible"])
+        self.assertIsNone(target["active_job_id"])
 
     async def test_manager_refuses_active_container_then_deletes_exact_cache(self):
         with tempfile.TemporaryDirectory() as directory:

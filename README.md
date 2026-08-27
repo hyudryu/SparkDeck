@@ -8,6 +8,52 @@ I built SparkDeck for my own GB10 cluster to answer those questions in one local
 
 The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
 
+## Install
+
+Every install needs **Python 3.11 or newer**, **Node.js 20 or newer with npm** (for the web app build), and a **running Docker engine** — the server talks to the Docker API at startup. GPU-backed model serving additionally needs an NVIDIA GPU: natively on Ubuntu, or through Docker Desktop's WSL2 backend on Windows. It is not available on macOS.
+
+### macOS
+
+Use a Mac as the SparkDeck console for a cluster that runs on Linux nodes. Serving models on the Mac itself is not supported because Docker on macOS has no NVIDIA GPU access.
+
+```bash
+brew install python node
+brew install --cask docker  # then start Docker Desktop
+git clone https://github.com/hyudryu/SparkDeck.git
+cd SparkDeck
+./run.sh
+```
+
+### Ubuntu
+
+Ubuntu is the reference platform and gets the full experience, including GPU-backed serving of vLLM, llama.cpp, and SGLang.
+
+```bash
+# Install Docker Engine and, for GPU runtimes, the NVIDIA Container Toolkit:
+#   https://docs.docker.com/engine/install/ubuntu/
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+git clone https://github.com/hyudryu/SparkDeck.git
+cd SparkDeck
+./run.sh
+```
+
+### Windows
+
+Run from PowerShell with Docker Desktop (WSL2 backend) installed and running. Fan control and the cluster-wide self-update service are Linux-only.
+
+```powershell
+git clone https://github.com/hyudryu/SparkDeck.git
+cd SparkDeck
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
+python server.py
+```
+
+Then open `http://localhost:7878`. Application state is written beneath `data/`, which is intentionally excluded from version control. A Hugging Face account is only needed to pull gated models.
+
 ## Example render
 
 ![SparkDeck dark-mode dashboard showing a four-node DGX Spark cluster](docs/screenshots/readme/sparkdeck-dashboard-dark.png)
@@ -64,27 +110,6 @@ _Work in progress: the shipped history view is shown with illustrative data; con
 - Copy Hugging Face cache weights between paired nodes with the opt-in virtual NAS.
 
 SparkDeck is under active development. The management API is not hardened for direct public-internet exposure. Run it on a trusted network or behind an authenticated reverse proxy.
-
-## Quick start
-
-### Requirements
-
-- Linux with Docker and the NVIDIA Container Toolkit
-- Python 3.11 or newer
-- Node.js 20 or newer with npm (for the web app build)
-- An NVIDIA GPU for GPU-backed runtimes
-- A Hugging Face account for gated models
-
-Create a virtual environment, install the dependencies, and start the application:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-./run.sh
-```
-
-Open `http://localhost:7878`. Application state is written beneath `data/`, which is intentionally excluded from version control.
 
 ## Supported runtimes
 
@@ -143,14 +168,6 @@ _Representative RouterOS fixture showing switch identity, live health sensors, s
 Automatic discovery uses MNDP and is limited to the local Layer-2 broadcast domain. Routed VLANs, remote cluster nodes, and many Tailscale layouts therefore require the switch's HTTPS URL to be entered manually. See [RouterOS neighbor discovery](https://help.mikrotik.com/docs/spaces/ROS/pages/24805517/Neighbor%2Bdiscovery).
 
 Available telemetry and controls depend on the switch model, sensors, fan controller, and RouterOS version. SparkDeck shows only the temperature, voltage, power, fan-speed, and fan-setting fields reported by that device; unsupported controls remain unavailable. MikroTik documents the model and version limitations in [System Health](https://help.mikrotik.com/docs/spaces/ROS/pages/25690117/Health). Switches booted into SwOS are not supported because [SwOS has no API or other programmatic management interface](https://help.mikrotik.com/docs/spaces/SWOS/overview); a dual-boot model must be running RouterOS for this integration.
-
-### Virtual NAS model transfers
-
-Virtual NAS is an opt-in cluster feature for copying model weights that are already in the Hugging Face cache on one SparkDeck node to another. Open **Storage** in the app, enable virtual NAS, choose a source model, and select one or more online target nodes. A joined worker forwards its normal Storage view to the controller, so every node shows the same cluster-wide inventory and transfer jobs.
-
-Keep every node and transfer on a cluster-private network, preferably Tailscale. The transfer endpoints use the paired node-agent credentials, but SparkDeck is not a public file server and these routes should never be exposed directly to the internet. Pair the nodes first, confirm that their Tailscale addresses report online, and allow enough free space for a complete copy before starting a transfer.
-
-Only complete Hugging Face cache model weights are shown and transferable. Virtual NAS does not browse arbitrary directories, expose cache paths or Hugging Face tokens, or copy unrelated files. Deletion is similarly limited to an exact cached model ID and is refused while the model is serving or participating in an active transfer.
 
 The optional MCP endpoint is served on the application port:
 

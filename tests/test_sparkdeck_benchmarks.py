@@ -206,6 +206,12 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                         **base, field: 1.9,
                     })
 
+        with self.assertRaisesRegex(ValueError, "derived benchmark throughput"):
+            await self.service.record_benchmark_series_point({
+                **base, "wall_seconds": 5e-324,
+            })
+        self.assertIsNone(self.service.store.benchmark_model_detail("org/model"))
+
     async def test_coordinated_run_applies_community_evidence_quality_gates(self):
         self.service.store.add_deployment(Deployment(
             id="dep-quality", alias="quality", runtime=RuntimeKind.VLLM,

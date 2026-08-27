@@ -1,13 +1,15 @@
 import { expect, test } from '@playwright/test'
 
-const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
+const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/switch', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
 
 test.beforeEach(async ({ page }) => {
   let settings = { theme: 'light', default_runtime: 'vllm', default_context_length: 8192, community_api_url: '' }
   await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
     const path = new URL(route.request().url()).pathname
     let body: unknown = {}
-    if (path.includes('/catalog/models')) body = { items: [], total: 0, next_cursor: null }
+    if (path.endsWith('/routeros/presence')) body = { detected: false, nodes: [{ node_id: 'local', node_name: 'This device', detected: false, configured: false, connected: false }] }
+    else if (path.endsWith('/routeros')) body = { detected: false, nodes: [{ node_id: 'local', node_name: 'This device', detected: false, configured: false, connected: false, discovery: [], health: [], interfaces: [] }] }
+    else if (path.includes('/catalog/models')) body = { items: [], total: 0, next_cursor: null }
     else if (path === '/api/token-stats') body = {
       models: { 'org/test-model': { input: 1500, cached: 500, output: 750, requests: 12, gen_time_s: 25 } },
       total: { input: 1500, cached: 500, output: 750, requests: 12 },
@@ -61,11 +63,10 @@ test('keeps every primary route within the viewport', async ({ page }) => {
 
 test('renders lifetime and analysis usage without horizontal overflow', async ({ page }) => {
   await page.goto('/usage')
-  await expect(page.getByRole('heading', { name: 'Usage' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Usage stats', exact: true })).toBeVisible()
   await expect(page.getByRole('table', { name: 'Lifetime model usage' })).toContainText('Test workload')
-  await expect(page.getByLabel('Lifetime totals')).toContainText('$1.25')
-  await page.getByRole('tab', { name: 'Analysis' }).click()
-  await expect(page.getByRole('img', { name: 'Hourly input and output token activity' })).toBeVisible()
+  await expect(page.getByRole('table', { name: 'Lifetime model usage' })).toContainText('$1.25')
+  await expect(page.getByRole('img', { name: 'Daily model token trend for the last 30 days' })).toBeVisible()
   await expect(page.getByText('Aug 26')).toBeVisible()
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)
@@ -74,7 +75,7 @@ test('renders lifetime and analysis usage without horizontal overflow', async ({
 test('uses Dashboard as home and keeps Explore on its own route', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
-  await expect(page.getByText('52.0°C')).toBeVisible()
+  await expect(page.getByLabel('System overview').getByText('52.0°C')).toBeVisible()
   await expect(page.getByText('2 active · 3 queued requests')).toBeVisible()
   await expect(page.getByText('Test model')).toBeVisible()
   await page.goto('/explore')

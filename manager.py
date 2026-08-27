@@ -36,6 +36,7 @@ from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
 from sparkdeck.updater import CAPABILITY, current_revision
+from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -176,6 +177,21 @@ VLLM_MAX_CONCURRENCY_RE = re.compile(
 FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
 FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
 FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
+
+# Remote controller calls must cover each worker-side RouterOS request phase
+# plus agent transport/serialization overhead. An overview has three phases
+# (resource, gathered details, then traffic); connection setup adds device
+# validation; and a fan update wraps its write in two complete overviews.
+ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS = 10.0
+ROUTEROS_OVERVIEW_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 3 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
+ROUTEROS_CONNECT_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 4 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
+ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS = (
+    ROUTEROS_TIMEOUT_SECONDS * 7 + ROUTEROS_CONTROLLER_TIMEOUT_MARGIN_SECONDS
+)
 
 # CPU/GPU chart history.  Thirty-second samples keep the payload small while
 # retaining enough detail for a useful two-hour view (including both ends of
@@ -415,6 +431,7 @@ class Manager:
             self.data_dir, self.http, self.agent_credentials.node_id,
             connection_resolver=resolve_agent_connection,
         )
+        self.routeros = RouterOSService(self.data_dir)
         self.virtual_nas = VirtualNAS(
             self.data_dir,
             lambda: Path(self.settings.get("hf_cache") or "") / "hub",
@@ -594,6 +611,9 @@ class Manager:
         self.virtual_nas.start()
 
     async def start(self):
+        routeros = getattr(self, "routeros", None)
+        if routeros is not None:
+            await routeros.start()
         if not self.is_joined_worker():
             self._start_controller_tasks()
             self.virtual_nas.start()
@@ -606,6 +626,9 @@ class Manager:
         self._start_mem_bw_monitor()
 
     async def stop(self):
+        routeros = getattr(self, "routeros", None)
+        if routeros is not None:
+            await routeros.stop()
         await self.virtual_nas.stop()
         for t in (
             self.worker_task,
@@ -817,6 +840,7 @@ class Manager:
             "docker_ready": docker_ready,
             "fabric_ready": fabric_ready,
             "interfaces": interfaces,
+            "routeros": self.routeros.presence(),
             "stats": stats,
             "disk": disk,
             "containers": containers,
@@ -925,6 +949,7 @@ class Manager:
                 "id", "name", "local", "enabled", "status", "online",
                 "last_seen", "protocol_version", "docker_ready", "fabric_ready",
                 "stats", "disk",
+                "routeros",
             )
         } | {
             "selectable": bool(
@@ -960,6 +985,119 @@ class Manager:
             names = [available[node_id].get("name", node_id) for node_id in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
         return [available[node_id] for node_id in requested]
+
+    # ---------- RouterOS switch management ----------
+    async def routeros_cluster_presence(self) -> dict:
+        nodes = await self.cluster_nodes()
+        summaries = []
+        for node in nodes:
+            state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
+            # Presence is intentionally local and lightweight. Connectivity is
+            # unknown until routeros_cluster_overview authenticates to the switch.
+            summaries.append({
+                "node_id": node.get("id"),
+                "node_name": node.get("name"),
+                "online": bool(node.get("online")),
+                "detected": bool(state.get("detected")),
+                "configured": bool(state.get("configured")),
+            })
+        return {
+            "detected": any(item["detected"] for item in summaries),
+            "nodes": summaries,
+        }
+
+    async def routeros_cluster_overview(self) -> dict:
+        nodes = await self.cluster_nodes()
+
+        async def load(node: dict) -> dict:
+            node_id = str(node.get("id") or "")
+            node_name = str(node.get("name") or node_id)
+            presence = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
+            if not node.get("online"):
+                return {
+                    **presence,
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "connected": False,
+                    "error": node.get("status_message") or "SparkDeck node is offline",
+                    "health": [],
+                    "interfaces": [],
+                }
+            if not presence.get("detected") and not presence.get("configured"):
+                return {
+                    **presence,
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "connected": False,
+                    "health": [],
+                    "interfaces": [],
+                }
+            try:
+                if node_id == LOCAL_NODE_ID:
+                    result = await self.routeros.overview()
+                else:
+                    result = await self.node_registry.request(
+                        node_id, "GET", "/api/agent/routeros",
+                        timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
+                    )
+                return {**result, "node_id": node_id, "node_name": node_name}
+            except Exception as exc:
+                return {
+                    **presence,
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "connected": False,
+                    "error": str(exc),
+                    "health": [],
+                    "interfaces": [],
+                }
+
+        overviews = await asyncio.gather(*(load(node) for node in nodes))
+        return {
+            "detected": any(bool(item.get("detected")) for item in overviews),
+            "nodes": overviews,
+        }
+
+    async def _routeros_target(self, node_id: str) -> dict:
+        normalized = str(node_id or "").strip()
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        node = available.get(normalized)
+        if not node:
+            raise ValueError("cluster node not found")
+        if not node.get("online"):
+            raise RuntimeError(f"{node.get('name', normalized)} is offline")
+        return node
+
+    async def connect_routeros(self, node_id: str, body: dict) -> dict:
+        node = await self._routeros_target(node_id)
+        if node["id"] == LOCAL_NODE_ID:
+            return await self.routeros.connect(body)
+        result = await self.node_registry.request(
+            node["id"], "PUT", "/api/agent/routeros/connection",
+            json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
+        )
+        # _routeros_target() just populated the four-second agent-status cache.
+        # Drop that pre-connection snapshot so the immediate UI reload probes
+        # the worker and observes its newly configured RouterOS state.
+        self.node_registry._status_cache.pop(node["id"], None)
+        return result
+
+    async def disconnect_routeros(self, node_id: str) -> dict:
+        node = await self._routeros_target(node_id)
+        if node["id"] == LOCAL_NODE_ID:
+            return self.routeros.disconnect()
+        return await self.node_registry.request(
+            node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+        )
+
+    async def update_routeros_fan_settings(self, node_id: str, body: dict) -> dict:
+        node = await self._routeros_target(node_id)
+        if node["id"] == LOCAL_NODE_ID:
+            return await self.routeros.update_fan_settings(body)
+        return await self.node_registry.request(
+            node["id"], "PATCH", "/api/agent/routeros/fan-settings",
+            json_body=body, timeout=ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS,
+        )
 
     async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
         """Durably rename a local or paired node without exposing credentials.

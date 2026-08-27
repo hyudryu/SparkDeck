@@ -108,6 +108,60 @@ export interface NodeInventoryItem extends NodeSummary {
   disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
 
+export interface RouterOSPresenceNode {
+  node_id: string
+  node_name: string
+  detected: boolean
+  configured: boolean
+  connected?: boolean
+}
+
+export interface RouterOSPresence {
+  detected: boolean
+  nodes: RouterOSPresenceNode[]
+}
+
+export interface RouterOSDiscoveryCandidate {
+  address: string
+  identity?: string
+  platform?: string
+  version?: string
+  board?: string
+  mac?: string
+}
+
+export interface RouterOSHealthItem {
+  name: string
+  value: unknown
+  type?: string
+}
+
+export interface RouterOSNodeOverview extends RouterOSPresenceNode {
+  connected: boolean
+  discovery?: RouterOSDiscoveryCandidate[]
+  base_url?: string
+  username?: string
+  verify_tls?: boolean
+  error?: string
+  device?: Record<string, unknown>
+  health: RouterOSHealthItem[] | null
+  fan_settings?: Record<string, unknown> | null
+  fan_capabilities?: string[] | null
+  interfaces: Array<Record<string, unknown>>
+}
+
+export interface RouterOSOverview {
+  detected: boolean
+  nodes: RouterOSNodeOverview[]
+}
+
+export interface RouterOSConnectionInput {
+  base_url: string
+  username: string
+  password: string
+  verify_tls: boolean
+}
+
 export interface RenameNodeInput {
   name: string
 }

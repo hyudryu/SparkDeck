@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import platform
@@ -30,6 +31,29 @@ TRUSTED_ORIGINS = {
 CAPABILITY = "cluster_update_main_v1"
 CONFIRMATION = "update-entire-cluster"
 UPDATE_STATE_FILENAME = "system-update-agent.json"
+
+_WINDOWS_HELPER_BOOTSTRAP = r"""
+import json
+import subprocess
+import sys
+
+command = json.loads(sys.argv[1])
+flags = (
+    getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+)
+process = subprocess.Popen(
+    command,
+    cwd=sys.argv[2],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    creationflags=flags,
+    close_fds=True,
+)
+print(process.pid, flush=True)
+"""
 
 
 def _valid_release_tag(tag: str) -> bool:
@@ -113,9 +137,57 @@ def _boot_id() -> str | None:
         return None
 
 
+def _windows_process_started(pid: int) -> int | None:
+    """Return a Windows process creation timestamp without signaling it."""
+    if platform.system() != "Windows":
+        return None
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # PROCESS_QUERY_LIMITED_INFORMATION is sufficient for GetProcessTimes and
+    # cannot be used to terminate or otherwise modify the helper process.
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _helper_alive(state: dict) -> bool:
     pid = state.get("helper_pid")
-    if not isinstance(pid, int) or pid <= 0 or state.get("boot_id") != _boot_id():
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        expected = state.get("helper_started_at")
+        return isinstance(expected, int) and _windows_process_started(pid) == expected
+    if state.get("boot_id") != _boot_id():
         return False
     try:
         os.kill(pid, 0)
@@ -124,18 +196,74 @@ def _helper_alive(state: dict) -> bool:
         return False
 
 
+def _spawn_update_helper(root: Path, command: list[str]) -> int:
+    """Start the updater outside the service process tree on Windows."""
+    if platform.system() == "Windows":
+        bootstrap = subprocess.run(
+            [sys.executable, "-c", _WINDOWS_HELPER_BOOTSTRAP, json.dumps(command), str(root)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if bootstrap.returncode:
+            detail = (bootstrap.stderr or bootstrap.stdout).strip()[:500]
+            raise RuntimeError(detail or "Could not detach the Windows update helper")
+        try:
+            pid = int(bootstrap.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError("Windows update helper did not report a process ID") from exc
+        if pid <= 0:
+            raise RuntimeError("Windows update helper reported an invalid process ID")
+        return pid
+
+    process = subprocess.Popen(
+        command,
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return process.pid
+
+
+def _service_preflight(root: Path) -> None:
+    system = platform.system()
+    if system == "Linux":
+        _run(root, "systemctl", "--user", "is-active", "--quiet", "sparkdeck.service")
+        return
+    if system == "Windows":
+        launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+        if not launcher.is_file():
+            raise RuntimeError("The bundled Windows launcher was not found")
+        _run(
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "status",
+            timeout=30,
+        )
+        return
+    raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
+
+
 def local_blockers(root: Path) -> list[str]:
     blockers: list[str] = []
-    if platform.system() != "Linux":
-        blockers.append("Self-update requires the bundled Linux systemd service")
-        return blockers
     try:
         origin = _run(root, "git", "remote", "get-url", "origin")
         if origin not in TRUSTED_ORIGINS:
             blockers.append("Git origin is not the official SparkDeck repository")
         if _run(root, "git", "status", "--porcelain", "--untracked-files=no"):
             blockers.append("Tracked files have local changes")
-        _run(root, "systemctl", "--user", "is-active", "--quiet", "sparkdeck.service")
+        _service_preflight(root)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         blockers.append(f"Installation preflight failed: {str(exc)[:240]}")
     return blockers
@@ -531,12 +659,17 @@ class UpdateService:
                 return state
             state = {"phase": "accepted", "target_branch": branch, "target_revision": revision.lower(), "message": "Update accepted"}
             self._write(self.agent_path, state)
-            process = subprocess.Popen(
-                [sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
-                 "--state", str(self.agent_path), "--branch", branch, "--revision", revision.lower()],
-                cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True,
-            )
-            state.update(helper_pid=process.pid, boot_id=_boot_id())
+            command = [
+                sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
+                "--state", str(self.agent_path), "--branch", branch,
+                "--revision", revision.lower(),
+            ]
+            helper_pid = _spawn_update_helper(self.root, command)
+            state.update(helper_pid=helper_pid, boot_id=_boot_id())
+            if platform.system() == "Windows":
+                helper_started_at = _windows_process_started(helper_pid)
+                if helper_started_at is None:
+                    raise RuntimeError("Could not verify the detached Windows update helper")
+                state["helper_started_at"] = helper_started_at
             self._write(self.agent_path, state)
             return state

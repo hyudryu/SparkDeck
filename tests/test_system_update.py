@@ -15,6 +15,8 @@ from sparkdeck.updater import (
     MAIN_BRANCH,
     MAIN_COMMIT_API,
     UpdateService,
+    _helper_alive,
+    _spawn_update_helper,
     assert_checkout_safe,
     local_blockers,
 )
@@ -25,6 +27,8 @@ from sparkdeck.update_helper import (
     fetch_update_target,
     install_release_revision,
     install_revision,
+    npm_executable,
+    publish_windows_frontend_stamp,
     restart_service,
 )
 
@@ -295,6 +299,55 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(overview["job"]["active"])
         self.assertEqual(overview["job"]["phase"], "failed")
 
+    async def test_windows_start_records_verified_helper_identity(self):
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.platform.system", return_value="Windows"), \
+             patch("sparkdeck.updater._spawn_update_helper", return_value=4321), \
+             patch("sparkdeck.updater._windows_process_started", return_value=987654321):
+            state = await self.service.start_local("main", "b" * 40)
+
+        self.assertEqual(state["helper_pid"], 4321)
+        self.assertEqual(state["helper_started_at"], 987654321)
+
+
+class UpdateHelperProcessTests(unittest.TestCase):
+    @patch("sparkdeck.updater.os.kill")
+    @patch("sparkdeck.updater._windows_process_started", return_value=123456)
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    def test_windows_liveness_uses_creation_time_without_signaling(
+        self, _system, _started, process_signal,
+    ):
+        self.assertTrue(_helper_alive({
+            "helper_pid": 4321,
+            "helper_started_at": 123456,
+        }))
+        process_signal.assert_not_called()
+
+    @patch("sparkdeck.updater._windows_process_started", return_value=654321)
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    def test_windows_liveness_rejects_reused_pid(self, _system, _started):
+        self.assertFalse(_helper_alive({
+            "helper_pid": 4321,
+            "helper_started_at": 123456,
+        }))
+
+    @patch("sparkdeck.updater.subprocess.run")
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    def test_windows_helper_is_spawned_through_detaching_bootstrap(self, _system, process_run):
+        process_run.return_value = Mock(returncode=0, stdout="4321\n", stderr="")
+        root = Path("C:/SparkDeck")
+        command = ["python.exe", "-m", "sparkdeck.update_helper"]
+
+        pid = _spawn_update_helper(root, command)
+
+        self.assertEqual(pid, 4321)
+        invocation = process_run.call_args.args[0]
+        self.assertEqual(invocation[0:2], [os.sys.executable, "-c"])
+        self.assertIn("DETACHED_PROCESS", invocation[2])
+        self.assertEqual(invocation[-1], str(root))
+        self.assertEqual(process_run.call_args.kwargs["cwd"], root)
+
 
 class LocalUpdatePreflightTests(unittest.TestCase):
     @patch("sparkdeck.updater.platform.system", return_value="Windows")
@@ -336,6 +389,39 @@ class LocalUpdatePreflightTests(unittest.TestCase):
 
 
 class UpdateHelperTests(unittest.TestCase):
+    @patch("sparkdeck.update_helper.shutil.which", return_value="C:\\Node\\npm.cmd")
+    @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
+    def test_windows_npm_resolves_cmd_shim(self, _system, which):
+        self.assertEqual(npm_executable(), "C:\\Node\\npm.cmd")
+        which.assert_called_once_with("npm.cmd")
+
+    @patch("sparkdeck.update_helper.run", return_value="a" * 64)
+    @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
+    def test_windows_frontend_stamp_matches_launcher_fingerprint(self, _system, command_run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "scripts" / "windows" / "SparkDeck.Windows.psm1"
+            module.parent.mkdir(parents=True)
+            module.write_text("# launcher module", encoding="utf-8")
+            dist = root / "frontend" / "dist"
+            dist.mkdir(parents=True)
+            environment = {"SPARKDECK_VERSION": "main-12345678"}
+
+            publish_windows_frontend_stamp(root, environment)
+
+            self.assertEqual(
+                (dist / ".sparkdeck-source.stamp").read_text(encoding="utf-8"),
+                "a" * 64,
+            )
+            self.assertEqual(
+                command_run.call_args.kwargs["env"]["SPARKDECK_FINGERPRINT_ROOT"],
+                str(root),
+            )
+            self.assertEqual(
+                command_run.call_args.kwargs["env"]["SPARKDECK_VERSION"],
+                "main-12345678",
+            )
+
     def test_divergent_checkout_installs_target_without_moving_feature_branch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

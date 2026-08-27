@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -50,6 +52,15 @@ def run(root: Path, *args: str, timeout: int = 600, env: dict[str, str] | None =
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip()[:500] or f"{' '.join(args)} failed")
     return result.stdout.strip()
+
+
+def npm_executable() -> str:
+    """Resolve npm's platform-specific executable for shell-free subprocesses."""
+    name = "npm.cmd" if platform.system() == "Windows" else "npm"
+    executable = shutil.which(name)
+    if not executable:
+        raise RuntimeError("Node.js and npm are required to build the SparkDeck web app")
+    return executable
 
 
 def _remove_path(path: Path) -> None:
@@ -100,6 +111,41 @@ def _restore_frontend_bundle(live_dist: Path, swap_root: Path, had_previous: boo
         os.replace(previous, live_dist)
 
 
+def publish_windows_frontend_stamp(root: Path, env: dict[str, str]) -> None:
+    """Mark the published bundle with the Windows launcher's exact cache key."""
+    if platform.system() != "Windows":
+        return
+    module = root / "scripts" / "windows" / "SparkDeck.Windows.psm1"
+    if not module.is_file():
+        raise RuntimeError("The bundled Windows launcher module was not found")
+    fingerprint_environment = env.copy()
+    fingerprint_environment["SPARKDECK_FINGERPRINT_ROOT"] = str(root)
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "$root=[IO.Path]::GetFullPath($env:SPARKDECK_FINGERPRINT_ROOT); "
+        "Import-Module (Join-Path $root 'scripts\\windows\\SparkDeck.Windows.psm1') -Force; "
+        "$paths=Get-SparkDeckPaths -Root $root; "
+        "Get-SparkDeckFrontendFingerprint -Paths $paths"
+    )
+    fingerprint = run(
+        root,
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+        timeout=60,
+        env=fingerprint_environment,
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise RuntimeError("The Windows launcher returned an invalid frontend fingerprint")
+    (root / "frontend" / "dist" / ".sparkdeck-source.stamp").write_text(
+        fingerprint, encoding="utf-8",
+    )
+
+
 def install_release_revision(root: Path, revision: str) -> str:
     """Dormant release-mode install retained for restoring release updates."""
     forward = subprocess.run(
@@ -144,6 +190,32 @@ def wait_for_revision(revision: str, timeout: int = 90) -> bool:
             pass
         time.sleep(2)
     return False
+
+
+def restart_service(root: Path) -> None:
+    """Restart SparkDeck through the launcher that owns this installation."""
+    system = platform.system()
+    if system == "Linux":
+        run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+        return
+    if system == "Windows":
+        launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+        if not launcher.is_file():
+            raise RuntimeError("The bundled Windows launcher was not found")
+        run(
+            root,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "restart",
+            timeout=180,
+        )
+        return
+    raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
 
 
 def fetch_release_target(root: Path, tag: str, revision: str) -> None:
@@ -201,11 +273,13 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
         if not update_source.exists() or CAPABILITY not in update_source.read_text(encoding="utf-8"):
             raise RuntimeError("Selected origin/main revision does not support safe cluster updates")
         run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
+        build_environment = os.environ.copy()
         if (stage_dir / "frontend" / "package-lock.json").exists():
-            run(stage_dir, "npm", "--prefix", "frontend", "ci", "--ignore-scripts")
-            build_environment = os.environ.copy()
-            build_environment["SPARKDECK_VERSION"] = f"{branch}-{revision[:8]}"
-            run(stage_dir, "npm", "--prefix", "frontend", "run", "build", env=build_environment)
+            npm = npm_executable()
+            run(stage_dir, npm, "--prefix", "frontend", "ci", "--ignore-scripts")
+            if platform.system() != "Windows":
+                build_environment["SPARKDECK_VERSION"] = f"{branch}-{revision[:8]}"
+            run(stage_dir, npm, "--prefix", "frontend", "run", "build", env=build_environment)
             frontend_swap = _prepare_frontend_bundle(
                 stage_dir / "frontend" / "dist", root / "frontend" / "dist",
             )
@@ -217,8 +291,9 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
         if frontend_swap:
             had_previous_frontend = _publish_frontend_bundle(root / "frontend" / "dist", frontend_swap)
             frontend_published = True
+            publish_windows_frontend_stamp(root, build_environment)
         write_state(state_path, phase="restarting", message="Update installed; restarting SparkDeck")
-        run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+        restart_service(root)
         if not wait_for_revision(revision):
             raise RuntimeError("SparkDeck did not become healthy on the selected revision")
         write_state(state_path, phase="succeeded", message="Update installed and verified", error=None)
@@ -231,7 +306,7 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
                     _restore_frontend_bundle(
                         root / "frontend" / "dist", frontend_swap, had_previous_frontend,
                     )
-                run(root, "systemctl", "--user", "restart", "sparkdeck.service", timeout=60)
+                restart_service(root)
                 if not wait_for_revision(previous_revision):
                     raise RuntimeError("previous revision did not become healthy")
                 write_state(state_path, phase="rolled_back", error=str(exc)[:500], message="Selected update failed; previous revision restored")

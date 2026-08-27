@@ -394,7 +394,8 @@ class NodeRegistry:
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
             raise RuntimeError(
-                f"{node.get('name', node_id)} agent error: {detail}"
+                f"{node.get('name', node_id)} agent error: "
+                f"HTTP {exc.response.status_code}: {detail}"
             ) from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(

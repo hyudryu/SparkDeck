@@ -434,6 +434,46 @@ describe('community features sign-in', () => {
     ))).toHaveLength(2))
   })
 
+  it('ignores a delayed session renewal after sign-out completes', async () => {
+    const callbacks: Array<() => void> = []
+    vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
+      if (typeof handler === 'function') callbacks.push(handler as () => void)
+      return 1
+    })
+    let sessionCalls = 0
+    let resolveRenewal: ((response: Response) => void) | undefined
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      sessionResponse: () => {
+        sessionCalls += 1
+        if (sessionCalls === 1) {
+          return new Response(JSON.stringify({
+            status: 'signed-in', email: 'driver@example.com', token_invalid: false,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        return new Promise<Response>((resolve) => {
+          resolveRenewal = resolve
+        })
+      },
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
+    act(() => callbacks.at(-1)?.())
+    await waitFor(() => expect(resolveRenewal).toBeDefined())
+    await submitCommunitySignOut(user)
+    expect(await screen.findByLabelText('Email')).toBeInTheDocument()
+
+    await act(async () => resolveRenewal?.(new Response(JSON.stringify({
+      status: 'signed-in', email: 'driver@example.com', token_invalid: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    expect(screen.getByLabelText('Email')).toBeInTheDocument()
+    expect(screen.queryByText('Signed in')).not.toBeInTheDocument()
+    expect(screen.queryByText('driver@example.com')).not.toBeInTheDocument()
+  })
+
   it('requires sign-in again when the node reports an invalid shared session', async () => {
     stubSettingsFetch(vi.fn<typeof fetch>(), {
       session: { status: 'reauth-required', email: 'driver@example.com', token_invalid: true },

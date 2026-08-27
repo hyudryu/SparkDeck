@@ -8,6 +8,12 @@ import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from manager import Manager
+from sparkdeck.onboarding import (
+    FORWARD_HOP_HEADER,
+    FORWARD_NODE_HEADER,
+    FORWARD_SCHEME_HEADER,
+    FORWARD_TOKEN_HEADER,
+)
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -147,6 +153,76 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("refresh-secret", response.text)
         self.assertNotIn(minted, response.text)
         mint.assert_awaited_once_with("refresh-secret")
+
+    async def test_node_session_reuses_the_presented_valid_browser_session(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret",
+        }
+        with patch.object(
+            server, "_community_id_token", AsyncMock(return_value=_id_token()),
+        ):
+            first = await self.client.get("/api/v1/community/session")
+            first_token = first.cookies.get(server._COMMUNITY_SESSION_COOKIE)
+            second = await self.client.get("/api/v1/community/session")
+
+        self.assertEqual(
+            second.cookies.get(server._COMMUNITY_SESSION_COOKIE), first_token,
+        )
+        self.assertEqual(len(server._community_browser_sessions), 1)
+
+    async def test_node_session_allocation_has_a_global_bound(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret",
+        }
+        with (
+            patch.object(server, "_COMMUNITY_SESSION_LIMIT", 2),
+            patch.object(
+                server, "_community_id_token", AsyncMock(return_value=_id_token()),
+            ),
+        ):
+            for _ in range(3):
+                self.client.cookies.clear()
+                response = await self.client.get("/api/v1/community/session")
+                self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(len(server._community_browser_sessions), 2)
+
+    async def test_forwarded_http_session_cookie_is_not_secure(self):
+        self.get_setting.return_value = {
+            "status": "paired", "sub": "user-sub-123",
+            "email": "user@example.com", "refresh_token": "refresh-secret",
+        }
+        headers = {
+            FORWARD_HOP_HEADER: "1",
+            FORWARD_NODE_HEADER: "worker-id",
+            FORWARD_TOKEN_HEADER: "worker-secret",
+            FORWARD_SCHEME_HEADER: "http",
+        }
+        secure_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app),
+            base_url="https://controller.test",
+        )
+        try:
+            with (
+                patch.object(
+                    server.onboarding, "validate_forward_headers",
+                    return_value=(True, ""),
+                ),
+                patch.object(
+                    server, "_community_id_token",
+                    AsyncMock(return_value=_id_token()),
+                ),
+            ):
+                response = await secure_client.get(
+                    "/api/v1/community/session", headers=headers,
+                )
+        finally:
+            await secure_client.aclose()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Secure", response.headers["set-cookie"])
 
     async def test_node_session_requires_reauth_for_an_invalid_token(self):
         self.get_setting.return_value = {

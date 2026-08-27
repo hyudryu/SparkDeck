@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, ApiError } from '../api/client'
 import type { CommunityClusterSync } from '../api/types'
 import {
@@ -63,6 +63,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthState['status']>('restoring')
   const [email, setEmail] = useState<string>()
   const [clusterSync, setClusterSync] = useState<CommunityClusterSync | null>(null)
+  const sessionGeneration = useRef(0)
 
   useEffect(() => {
     let cancelled = false
@@ -91,8 +92,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (status !== 'signed-in') return
+    const generation = sessionGeneration.current
     const timer = window.setInterval(() => {
       void api.community.session().then((session) => {
+        if (sessionGeneration.current !== generation) return
         forgetStoredTokens()
         setEmail(session.email)
         setStatus(session.status)
@@ -147,6 +150,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const tokens = await cognitoSignIn(email, password)
       try {
         const unpaired = await api.community.unpair(tokens.idToken)
+        sessionGeneration.current += 1
         setClusterSync(unpaired?.cluster ?? null)
         setEmail(undefined)
         setStatus('signed-out')

@@ -34,6 +34,7 @@ from sparkdeck.service import (
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.onboarding import (
     FORWARD_HEADERS,
+    FORWARD_SCHEME_HEADER,
     OnboardingService,
     forward_management_request,
     is_forwardable_path,
@@ -188,6 +189,7 @@ COGNITO_ISSUER = os.environ.get(
 COGNITO_IDP_ORIGIN = urlsplit(COGNITO_ISSUER)._replace(path="", query="", fragment="").geturl()
 _COMMUNITY_SESSION_COOKIE = "sparkdeck_community_session"
 _COMMUNITY_SESSION_MAX_AGE = 3600
+_COMMUNITY_SESSION_LIMIT = 256
 _community_browser_sessions: dict[str, tuple[str, float]] = {}
 
 
@@ -2140,16 +2142,33 @@ def _community_session_response(
     response = JSONResponse(body, headers={"Cache-Control": "no-store"})
     if sub:
         _prune_community_browser_sessions()
-        token = secrets.token_urlsafe(32)
+        token = req.cookies.get(_COMMUNITY_SESSION_COOKIE)
+        session = _community_browser_sessions.get(token or "")
+        if not session or session[0] != sub:
+            while len(_community_browser_sessions) >= _COMMUNITY_SESSION_LIMIT:
+                oldest = min(
+                    _community_browser_sessions,
+                    key=lambda candidate: _community_browser_sessions[candidate][1],
+                )
+                _community_browser_sessions.pop(oldest, None)
+            token = secrets.token_urlsafe(32)
         _community_browser_sessions[token] = (
             sub, time.time() + _COMMUNITY_SESSION_MAX_AGE,
+        )
+        forwarded_scheme = (
+            req.headers.get(FORWARD_SCHEME_HEADER) or ""
+        ).casefold()
+        browser_scheme = (
+            forwarded_scheme
+            if forwarded_scheme in {"http", "https"}
+            else req.url.scheme
         )
         response.set_cookie(
             _COMMUNITY_SESSION_COOKIE,
             token,
             max_age=_COMMUNITY_SESSION_MAX_AGE,
             httponly=True,
-            secure=req.url.scheme == "https",
+            secure=browser_scheme == "https",
             samesite="strict",
             path="/api/v1/community",
         )

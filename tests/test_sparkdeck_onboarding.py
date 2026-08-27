@@ -16,6 +16,7 @@ from manager import Manager
 from sparkdeck.onboarding import (
     FORWARD_HOP_HEADER,
     FORWARD_NODE_HEADER,
+    FORWARD_SCHEME_HEADER,
     FORWARD_TOKEN_HEADER,
     ControllerAssignment,
     OnboardingService,
@@ -1253,6 +1254,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0].content, b'{"image":"x"}')
         self.assertEqual(captured[0].headers[FORWARD_HOP_HEADER], "1")
         self.assertEqual(captured[0].headers[FORWARD_NODE_HEADER], "worker-id")
+        self.assertEqual(captured[0].headers[FORWARD_SCHEME_HEADER], "http")
         self.assertEqual(captured[0].headers[FORWARD_TOKEN_HEADER], "worker-secret")
         await http.aclose()
 
@@ -1271,6 +1273,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             valid, _ = service.validate_forward_headers({
                 FORWARD_HOP_HEADER: "1",
                 FORWARD_NODE_HEADER: "worker-id",
+                FORWARD_SCHEME_HEADER: "http",
                 FORWARD_TOKEN_HEADER: "secret",
             })
             self.assertTrue(valid)
@@ -1284,6 +1287,14 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertFalse(valid)
             self.assertIn("exactly 1", detail)
+            valid, detail = service.validate_forward_headers({
+                FORWARD_HOP_HEADER: "1",
+                FORWARD_NODE_HEADER: "worker-id",
+                FORWARD_SCHEME_HEADER: "ftp",
+                FORWARD_TOKEN_HEADER: "secret",
+            })
+            self.assertFalse(valid)
+            self.assertIn("http or https", detail)
 
 
 class WorkerSchedulerTests(unittest.IsolatedAsyncioTestCase):

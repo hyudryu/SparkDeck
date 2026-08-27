@@ -2610,6 +2610,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 return replacement
 
             instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
             instance.create_deployment = create_deployment
 
             result = await instance.deployment_action("deployment-old", "start")
@@ -2693,6 +2694,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("launch_settings_error", persisted[0])
 
             instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
 
             async def create_deployment(body):
                 replacement = {
@@ -2712,6 +2714,68 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 [deployment["id"] for deployment in instance.deployments],
                 ["deployment-new"],
             )
+
+    async def test_relaunch_preflight_preserves_ranks_when_worker_has_no_fabric_ip(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            old = {
+                "id": "deployment-old", "name": "Sharded model",
+                "model": "example/Model", "engine": "vllm",
+                "mode": "sharded", "node_ids": ["local", "remote-1"],
+                "status": "stopped", "settings_dirty": False,
+                "members": [
+                    {"node_id": "local", "container_name": "old-r0", "rank": 0},
+                    {"node_id": "remote-1", "container_name": "old-r1", "rank": 1},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Sharded model",
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": ["--tensor-parallel-size", "2"],
+                    "port": 8000,
+                },
+            }
+            instance.deployments = [old]
+            instance.cluster_nodes = mock.AsyncMock(return_value=[
+                {
+                    "id": "local", "name": "Controller", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.1",
+                    "fabric_interface": "cx7-local", "interfaces": [],
+                },
+                {
+                    "id": "remote-1", "name": "Worker without fabric",
+                    "online": True, "docker_ready": True,
+                    "fabric_ip": None, "fabric_interface": None,
+                    "interfaces": [],
+                },
+            ])
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+
+            with self.assertRaisesRegex(
+                ValueError, "could not determine fabric IP for Worker without fabric",
+            ):
+                await instance.deployment_action(
+                    "deployment-old", "start",
+                    node_ids=["local", "remote-1"],
+                )
+
+            instance._member_action.assert_not_awaited()
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(instance.deployments, [old])
+            self.assertEqual(
+                [member["container_name"] for member in old["members"]],
+                ["old-r0", "old-r1"],
+            )
+            self.assertEqual(old["status"], "stopped")
 
     def test_explicit_args_repair_preserves_unrelated_deployment_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -54,6 +54,80 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Switch' })).not.toHaveAttribute('aria-disabled')
   })
 
+  it('shows this node name next to Dashboard in the navigation', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: 'gx10-node-1', port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    // The exact accessible-name spacing across the two spans is a jsdom
+    // computation quirk, so assert on the chip inside the Dashboard link.
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(dashboard).toHaveAttribute('href', '/')
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+    // Other destinations stay untouched by the node name.
+    expect(screen.getByRole('link', { name: 'Explore' })).toHaveAttribute('href', '/explore')
+  })
+
+  it('names the chip after the entry node even when a joined worker forwards the controller name', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'gx10-worker-2', port: 7878, access_urls: ['http://100.64.0.11:7878'] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      // A joined worker forwards /api/v1/settings to the controller, so any
+      // node name in that response identifies the controller, not the node
+      // serving the browser.
+      if (path.includes('/api/v1/settings')) {
+        return new Response(JSON.stringify({ cluster_node_name: 'gx10-controller' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-worker-2')).toBeInTheDocument()
+    expect(within(dashboard).queryByText('gx10-controller')).not.toBeInTheDocument()
+  })
+
+  it('refreshes the sidebar node name when the entry node is renamed', async () => {
+    let nodeName = 'gx10-node-1'
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: nodeName, port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+
+    nodeName = 'renamed-gx10'
+    window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
+    await waitFor(() => expect(within(screen.getByRole('link', { name: /Dashboard/ })).getByText('renamed-gx10')).toBeInTheDocument())
+  })
+
   it('ignores an older aborted presence failure after a newer refresh succeeds', async () => {
     const presenceRequests: Array<{
       signal?: AbortSignal
@@ -855,6 +929,170 @@ describe('model deployments', () => {
 
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog', { name: 'Loud model' })).not.toBeInTheDocument()
+  })
+
+  it('asks which nodes to start on and defaults to the weighted ones', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments/dep-1/start') {
+        return new Response(JSON.stringify({
+          id: 'dep-1', alias: 'Sharded model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local', 'node-2'],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-1', alias: 'Sharded model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: { tensor_parallel_size: 2 }, node_ids: [],
+        deployment_mode: 'sharded', required_node_count: 2,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-3', name: 'Spark Three', online: true, models: [{ model_id: 'org/model', size_bytes: 1_000_000_000, revisions: ['main'], partial: true }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Sharded model' })
+    expect(dialog).toHaveTextContent('TP2 requires exactly 2 nodes')
+    // Exactly two nodes hold complete weights, so both start selected; a
+    // partial cache entry does not count as usable weights.
+    expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Three/ })).toBeDisabled()
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-1/start',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['local', 'node-2'] }) }),
+    ))
+    expect(await screen.findByText('Starting Sharded model on This device, Spark Two.')).toBeInTheDocument()
+  })
+
+  it('defaults a single-node start to the one node holding the weights', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments/dep-2/start') {
+        return new Response(JSON.stringify({
+          id: 'dep-2', alias: 'Solo model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['node-2'],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-2', alias: 'Solo model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: {}, node_ids: [],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Solo model' })
+    expect(within(dialog).getByRole('radio', { name: /Spark Two/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeDisabled()
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 1 node' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-2/start',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['node-2'] }) }),
+    ))
+  })
+
+  it('uses the persisted deployment revision when choosing start nodes', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-pinned', alias: 'Pinned model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, model_revision: 'release-b',
+        status: 'stopped', settings: {}, node_ids: [],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Default branch', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Pinned revision', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Default branch', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Pinned revision', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['release-b'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Pinned model' })
+    expect(within(dialog).getByRole('radio', { name: /Default branch/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /Pinned revision/ })).toBeChecked()
+  })
+
+  it('starts controller-owned llama.cpp artifacts without an HF cache entry', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-llama', alias: 'Local GGUF', runtime: 'llama.cpp', kind: 'managed',
+        model: { repository: 'org/llama-artifact' }, status: 'stopped', settings: {},
+        node_ids: ['local'], deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Worker', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Local GGUF' })
+    expect(within(dialog).getByRole('radio', { name: /Controller/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Worker/ })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Start on 1 node' })).toBeEnabled()
+    expect(dialog).toHaveTextContent('This local artifact can run only on the controller')
+  })
+
+  it('keeps the persisted replicated layout even when tensor parallelism is 1', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-3', alias: 'Replica model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: { tensor_parallel_size: 1 }, node_ids: ['local', 'node-2'],
+        deployment_mode: 'replicated', required_node_count: 2,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Replica model' })
+    // A replicated TP1 deployment still runs on its saved two nodes.
+    expect(dialog).toHaveTextContent('exactly 2 nodes')
+    expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
+    expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled()
   })
 
   it('sorts deployments by recency or name and renames them inline', async () => {

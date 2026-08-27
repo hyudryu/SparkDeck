@@ -119,6 +119,9 @@ interface WireDeployment {
   port?: number
   node_ids?: string[]
   selected_nodes?: Deployment['selected_nodes']
+  deployment_mode?: string
+  required_node_count?: number
+  model_revision?: string
   created_at?: string
 }
 
@@ -145,11 +148,13 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     id: item.id,
     alias: item.alias,
     model_id: item.model.repository,
-    model_revision: item.model.revision,
+    model_revision: item.model_revision ?? item.model.revision,
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
     settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    deployment_mode: item.deployment_mode,
+    required_node_count: item.required_node_count,
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
@@ -214,11 +219,15 @@ export const api = {
       })
       return deploymentFromWire(data)
     },
-    action: async (id: string, action: 'start' | 'stop' | 'remove') => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(`/api/v1/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
       }
-      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
+      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
+        method: 'POST',
+        body,
+      })
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {
@@ -457,11 +466,22 @@ export const api = {
       return { hourly, daily }
     },
     reset: () => request<UsageSummary>('/api/token-stats/reset', { method: 'POST' }),
-    updateAlias: (model: string, alias: string | null, merge_group: string | null) =>
+    updateAlias: (model: string, alias: string | null, merge_group?: string | null) =>
       request<void>('/api/token-stats/alias', {
         method: 'PUT',
+        // An undefined merge_group is dropped from the JSON body, which tells
+        // the backend to leave the stored merge group untouched.
         body: JSON.stringify({ model, alias, merge_group }),
       }),
+    setRoute: (source: string, destination: string) =>
+      request<void>('/api/token-stats/rules', {
+        method: 'PUT',
+        body: JSON.stringify({ source, destination }),
+      }),
+    deleteRoute: (source: string) => request<void>(
+      `/api/token-stats/rules/${encodeURIComponent(source)}`,
+      { method: 'DELETE' },
+    ),
     erase: (model: string) => request<void>(
       `/api/token-stats/${encodeURIComponent(model)}`,
       { method: 'DELETE' },

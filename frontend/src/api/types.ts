@@ -75,6 +75,8 @@ export interface Deployment {
   runtime_version?: string
   image?: string
   settings: DeploymentSettings
+  deployment_mode?: string
+  required_node_count?: number
   last_error?: string
   created_at?: string
   updated_at?: string
@@ -105,6 +107,9 @@ export interface NodeInventoryItem extends NodeSummary {
   docker_ready?: boolean
   fabric_ready?: boolean
   selectable?: boolean
+  // Rename results only: whether the new name reached the node itself
+  // ("pending" means an offline worker still answers with its old name).
+  name_sync?: 'local' | 'synchronized' | 'pending'
   stats?: SystemStats
   disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
@@ -614,6 +619,8 @@ export interface UsageSummary {
   models: Record<string, UsageCounters>
   groups: UsageGroup[]
   total: UsageCounters
+  routing_rules?: Record<string, string>
+  merge_groups?: Record<string, string>
 }
 
 export interface HourlyUsagePoint {

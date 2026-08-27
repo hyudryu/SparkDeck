@@ -119,6 +119,40 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
 
+    def test_inventory_requires_matching_index_for_complete_transformer_shards(self):
+        cases = (
+            ("model", ".safetensors", None, False),
+            ("pytorch_model", ".bin", "other.bin.index.json", False),
+            ("model", ".safetensors", None, True),
+        )
+        for prefix, suffix, index_name, with_gguf in cases:
+            with (
+                self.subTest(suffix=suffix, with_gguf=with_gguf),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                hub = root / "hub"
+                snapshot = (
+                    hub / "models--org--model" / "snapshots" / "revision-1"
+                )
+                snapshot.mkdir(parents=True)
+                (snapshot.parent.parent / "blobs").mkdir()
+                (snapshot / "config.json").write_text("{}", encoding="utf-8")
+                (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+                first = f"{prefix}-00001-of-00002{suffix}"
+                second = f"{prefix}-00002-of-00002{suffix}"
+                (snapshot / first).write_bytes(b"one")
+                (snapshot / second).write_bytes(b"two")
+                if with_gguf:
+                    (snapshot / "model.gguf").write_bytes(b"standalone")
+                if index_name:
+                    (snapshot / index_name).write_text(json.dumps({
+                        "weight_map": {"a": first, "b": second},
+                    }), encoding="utf-8")
+                nas = VirtualNAS(root, lambda: hub, FakeRegistry(), lambda: False)
+
+                self.assertEqual(nas.inventory(), [])
+
     async def test_streamed_export_import_uses_exact_repository(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
             source_hub = Path(source_dir) / "hub"

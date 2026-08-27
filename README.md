@@ -102,6 +102,18 @@ The backend defaults to the deployed pool and can be pointed at another one with
 
 SparkDeck nodes can be paired over a trusted management network for distributed and replicated deployments. Pairing credentials are stored locally beneath `data/`; do not commit or share that directory. The controller is the authoritative cluster registry, but every online worker can also display the controller's current one-time pairing code and act as an onboarding entry point at its own Tailscale URL. The joining node verifies the worker's pinned controller referral, registers directly with that controller, and then uses the controller directly for normal management traffic.
 
+### RouterOS switch integration
+
+The **Switch** view supports MikroTik switches running RouterOS v7 with its [REST API](https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST%2BAPI). Configure a certificate and enable the `www-ssl` HTTPS service as described in [RouterOS Services](https://help.mikrotik.com/docs/spaces/ROS/pages/103841820/Services); do not expose credentials through the unencrypted `www` service. Create a dedicated RouterOS user in a custom, least-privilege group with only the `rest-api` and read/write policies SparkDeck needs, restrict its allowed source addresses, and keep the management endpoint on a private LAN or Tailscale-routed network. See the [RouterOS user and policy guide](https://help.mikrotik.com/docs/spaces/ROS/pages/8978504/User).
+
+![RouterOS switch monitoring and fan settings](docs/screenshots/routeros-switch.png)
+
+_Representative RouterOS fixture showing switch identity, live health sensors, supported fan controls, and per-interface traffic statistics._
+
+Automatic discovery uses MNDP and is limited to the local Layer-2 broadcast domain. Routed VLANs, remote cluster nodes, and many Tailscale layouts therefore require the switch's HTTPS URL to be entered manually. See [RouterOS neighbor discovery](https://help.mikrotik.com/docs/spaces/ROS/pages/24805517/Neighbor%2Bdiscovery).
+
+Available telemetry and controls depend on the switch model, sensors, fan controller, and RouterOS version. SparkDeck shows only the temperature, voltage, power, fan-speed, and fan-setting fields reported by that device; unsupported controls remain unavailable. MikroTik documents the model and version limitations in [System Health](https://help.mikrotik.com/docs/spaces/ROS/pages/25690117/Health). Switches booted into SwOS are not supported because [SwOS has no API or other programmatic management interface](https://help.mikrotik.com/docs/spaces/SWOS/overview); a dual-boot model must be running RouterOS for this integration.
+
 ### Virtual NAS model transfers
 
 Virtual NAS is an opt-in cluster feature for copying model weights that are already in the Hugging Face cache on one SparkDeck node to another. Open **Storage** in the app, enable virtual NAS, choose a source model, and select one or more online target nodes. A joined worker forwards its normal Storage view to the controller, so every node shows the same cluster-wide inventory and transfer jobs.

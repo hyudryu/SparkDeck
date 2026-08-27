@@ -246,7 +246,7 @@ Open the Switch page to discover or configure a RouterOS device. RouterOS creden
 
 ### Community Features
 
-Create an account, confirm the email address, sign in, reset a password, or sign out. Community data becomes available only after the signed-in user also explicitly enables benchmark sharing on Benchmarks; signing in alone does not grant access.
+Create an account, confirm the email address, sign in, reset a password, or sign out. A successful sign-in is shared with every joined node, including nodes disabled for model workloads, and each node's Settings page restores that paired account without requiring another browser-local sign-in. Account credentials remain in each node's private store and are not returned to the browser. Because sign-out applies across the joined cluster, SparkDeck asks for the paired account password again before it propagates that change. Community data becomes available only after the signed-in user also explicitly enables benchmark sharing on Benchmarks; signing in alone does not grant access.
 
 ### Support and legal
 

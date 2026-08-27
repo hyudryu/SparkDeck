@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, Server, Settings2, Trash2, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
@@ -172,6 +172,11 @@ export function ModelsPage() {
   const [pinned, setPinned] = useState<string[]>(readPinned)
   const [expandedGroups, setExpandedGroups] = useState<string[]>([])
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
+  const logRequestRef = useRef(0)
+  const [logViewer, setLogViewer] = useState<{ id: string; alias: string }>()
+  const [logText, setLogText] = useState('')
+  const [logLoading, setLogLoading] = useState(false)
+  const [logError, setLogError] = useState<string>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -298,6 +303,30 @@ export function ModelsPage() {
     } finally {
       setBusy(undefined)
     }
+  }
+
+  const loadLogs = async (id: string) => {
+    // A slower request for a previously viewed deployment must never
+    // overwrite the currently displayed one.
+    const requestId = ++logRequestRef.current
+    setLogLoading(true)
+    setLogError(undefined)
+    try {
+      const logs = await api.deployments.logs(id)
+      if (logRequestRef.current !== requestId) return
+      setLogText(logs)
+    } catch (reason) {
+      if (logRequestRef.current !== requestId) return
+      setLogError(reason instanceof Error ? reason.message : 'Could not load logs')
+    } finally {
+      if (logRequestRef.current === requestId) setLogLoading(false)
+    }
+  }
+
+  const openLogs = (deployment: Deployment) => {
+    setLogViewer({ id: deployment.id, alias: deployment.alias })
+    setLogText('')
+    void loadLogs(deployment.id)
   }
 
   const changeSortMode = (mode: SortMode) => {
@@ -570,9 +599,10 @@ export function ModelsPage() {
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
                   <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
                   <div role="cell" data-label="Actions" className="row-actions">
-                    {deployment.managed && (deployment.status === 'running'
+                    {deployment.managed && (deployment.status === 'running' || deployment.status === 'starting'
                       ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
+                    {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
                       if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')
@@ -752,6 +782,24 @@ export function ModelsPage() {
               </>}
               <div className="modal-actions"><Button type="button" onClick={() => setCreating(false)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy === 'create' || (form.managed && !selectionReady)}>{busy === 'create' ? 'Adding…' : <><Server size={16} /> Add to {form.node_ids?.length ?? 1} {(form.node_ids?.length ?? 1) === 1 ? 'node' : 'nodes'}</>}</Button></div>
             </form>
+          </section>
+        </div>
+      )}
+
+      {logViewer && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setLogViewer(undefined)}>
+          <section className="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="deployment-logs-title">
+            <div className="modal-heading"><div><p className="eyebrow">Deployment logs</p><h2 id="deployment-logs-title">{logViewer.alias}</h2></div><button className="icon-button" onClick={() => setLogViewer(undefined)} aria-label="Close dialog">×</button></div>
+            {logError && <p className="form-error" role="alert">{logError}</p>}
+            <div className="log-view deployment-log-view" aria-label={`Logs for ${logViewer.alias}`} tabIndex={0}>
+              {logLoading
+                ? <span className="deployment-log-status">Loading logs…</span>
+                : <pre>{logText || 'No log output.'}</pre>}
+            </div>
+            <div className="modal-actions">
+              <Button type="button" disabled={logLoading} onClick={() => void loadLogs(logViewer.id)}><ScrollText size={15} /> Refresh</Button>
+              <Button type="button" onClick={() => setLogViewer(undefined)}>Close</Button>
+            </div>
           </section>
         </div>
       )}

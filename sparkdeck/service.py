@@ -639,6 +639,13 @@ class SparkDeckService:
             for item in manager_deployments
             if isinstance(item, dict) and item.get("sparkdeck_record_id")
         }
+        cluster_by_container = {
+            member.get("container_name"): item
+            for item in manager_deployments
+            if isinstance(item, dict)
+            for member in (item.get("members") or [])
+            if isinstance(member, dict) and member.get("container_name")
+        }
         cluster_nodes: dict[str, dict[str, Any]] = {}
         if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
             try:
@@ -733,7 +740,13 @@ class SparkDeckService:
             model = container.get("model") or container.get("served_model")
             if not model:
                 continue
-            registered.append(self._discovered_deployment(container, runtime, model))
+            discovered = self._discovered_deployment(container, runtime, model)
+            owner = cluster_by_container.get(container.get("name"))
+            if owner:
+                # One rank of a multi-node cluster: the card reports the whole
+                # deployment's state, not just this node's rank container.
+                discovered["status"] = _deployment_status(owner.get("status"))
+            registered.append(discovered)
         for deployment in registered:
             if (
                 deployment.get("kind") == DeploymentKind.MANAGED.value
@@ -1062,6 +1075,16 @@ class SparkDeckService:
                 raise LookupError("managed container is unavailable") from exc
             if current is None:
                 raise LookupError("managed container not found")
+        owner = self._owning_cluster_deployment(container)
+        if owner:
+            # A discovered card can be one rank of a managed cluster. Acting
+            # on the single rank leaves the remaining ranks running, and the
+            # cluster health monitor restarts the whole deployment — so the
+            # action must address the cluster instead.
+            result = await self.manager.deployment_action(owner["id"], action)
+            if not result.get("ok"):
+                raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
+            return {**deployment, "status": "running" if action == "start" else "stopped"}
         if action == "start":
             await self.manager.start_container(container)
         elif action == "stop":
@@ -1071,6 +1094,59 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    async def deployment_logs(self, deployment_id: str, tail: Any = 300) -> dict[str, Any]:
+        """Return recent container logs for a deployment, all ranks included."""
+        deployment = self.store.deployment(deployment_id, include_private=True)
+        if not deployment and deployment_id.startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            deployment = self._discovered_deployment(
+                container, self._container_runtime(container),
+                container.get("model") or container.get("served_model"),
+            )
+        if not deployment:
+            raise LookupError("deployment not found")
+        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+            raise ValueError("external endpoints have no managed logs")
+        try:
+            bounded_tail = min(100_000, max(1, int(tail)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tail must be an integer") from exc
+
+        manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        cluster = next(
+            (
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ),
+            None,
+        ) if manager_id else None
+        if cluster is None:
+            cluster = self._owning_cluster_deployment(deployment.get("container_name"))
+
+        if cluster:
+            members = [
+                member for member in (cluster.get("members") or [])
+                if isinstance(member, dict) and member.get("container_name")
+            ]
+            if members:
+                results = await asyncio.gather(
+                    *(self.manager._member_action(member, "logs", log_tail=bounded_tail)
+                      for member in members),
+                    return_exceptions=True,
+                )
+                sections = []
+                for member, result in zip(members, results):
+                    label = f"rank {member.get('rank')} · node {member.get('node_id')}"
+                    logs = result.get("logs") if isinstance(result, dict) else None
+                    body = logs if isinstance(logs, str) and logs else f"logs unavailable: {result}"
+                    sections.append(f"===== {label} ({member.get('container_name')}) =====\n{body}")
+                return {"logs": "\n\n".join(sections)}
+
+        container = deployment.get("container_name")
+        if not container:
+            raise LookupError("managed container not found")
+        return {"logs": await self.manager.get_cluster_member_logs(container, bounded_tail)}
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
         # A provisional row is visible while Docker launch is in flight. Wait
@@ -1097,8 +1173,15 @@ class SparkDeckService:
                 "unmanaged discovered containers cannot be removed by SparkDeck"
             )
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        owner = self._owning_cluster_deployment(deployment.get("container_name"))
         if manager_id:
             result = await self.manager.deployment_action(manager_id, "remove")
+            if not result.get("ok"):
+                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
+        elif owner:
+            # Removing one rank of a cluster would leave the health monitor to
+            # resurrect the deployment; remove the whole cluster instead.
+            result = await self.manager.deployment_action(owner["id"], "remove")
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
         elif deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
@@ -1133,6 +1216,23 @@ class SparkDeckService:
         stored.pop("_base_url", None)
         stored.pop("_credential_ref", None)
         return {**stored, "alias": alias}
+
+    def _owning_cluster_deployment(self, container_name: str | None) -> dict[str, Any] | None:
+        """Return the managed cluster deployment a container is a rank of."""
+        if not container_name:
+            return None
+        return next(
+            (
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id")
+                and any(
+                    isinstance(member, dict)
+                    and member.get("container_name") == container_name
+                    for member in (item.get("members") or [])
+                )
+            ),
+            None,
+        )
 
     async def _resolve_discovered_container(self, deployment_id: str) -> dict[str, Any]:
         name = deployment_id.removeprefix("container:")
@@ -1702,11 +1802,11 @@ def _deployment_status(value: Any) -> str:
     status = str(value or "unknown").casefold()
     if status in ("running", "ready"):
         return "running"
-    if status in ("created", "restarting", "launching", "starting"):
+    if status in ("created", "restarting", "launching", "starting", "recovering"):
         return "starting"
     if status in ("exited", "dead", "removed", "stopped"):
         return "stopped"
-    if status in ("error", "unhealthy"):
+    if status in ("error", "unhealthy", "degraded"):
         return "error"
     return "unknown"
 

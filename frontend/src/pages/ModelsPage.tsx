@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
@@ -154,20 +154,36 @@ const readSortMode = (): SortMode => {
 
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
   const resource = useResource((signal) => api.deployments.list(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
   const appSettings = useResource((signal) => api.settings.get(signal))
   const modelCache = useResource((signal) => api.modelCache.get(signal))
   const recipes = useResource((signal) => api.recipes.list(signal))
+  const transferPreflight = useResource(
+    (signal) => {
+      if (!recipeDeployment) throw new Error('No recipe selected')
+      return api.storage.preflight(
+        recipeDeployment.recipe.model,
+        recipeDeployment.recipe.model_revision ?? 'main',
+        signal,
+      )
+    },
+    [recipeDeployment?.recipe.id],
+    Boolean(recipeDeployment && !isLocalModelPath(recipeDeployment.recipe.model)),
+  )
+  const reloadModelCache = modelCache.reload
+  const reloadTransferPreflight = transferPreflight.reload
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<CreateDeploymentInput>(initialForm)
   const [busy, setBusy] = useState<string>()
   const [formError, setFormError] = useState<string>()
   const [actionError, setActionError] = useState<string>()
   const [actionNotice, setActionNotice] = useState<string>()
-  const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
   const [recipeError, setRecipeError] = useState<string>()
+  const [recipeTransferNotice, setRecipeTransferNotice] = useState<string>()
+  const [recipeTransferJobs, setRecipeTransferJobs] = useState<Record<string, string>>({})
   const [sortMode, setSortMode] = useState<SortMode>(readSortMode)
   const [pinned, setPinned] = useState<string[]>(readPinned)
   const [expandedGroups, setExpandedGroups] = useState<string[]>([])
@@ -184,6 +200,76 @@ export function ModelsPage() {
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
+
+  useEffect(() => {
+    const active = (transferPreflight.data?.targets ?? [])
+      .filter((target) => target.active_job_id && (target.active_job_status === 'queued' || target.active_job_status === 'running'))
+    if (!active.length) return
+    setRecipeTransferJobs((current) => {
+      const next = { ...current }
+      let changed = false
+      for (const target of active) {
+        if (next[target.node_id] !== target.active_job_id) {
+          next[target.node_id] = target.active_job_id as string
+          changed = true
+        }
+      }
+      return changed ? next : current
+    })
+  }, [transferPreflight.data])
+
+  useEffect(() => {
+    const tracked = Object.entries(recipeTransferJobs)
+    if (!tracked.length) return
+    let disposed = false
+    let timer: number | undefined
+    const poll = async () => {
+      try {
+        const state = await api.storage.get()
+        if (disposed) return
+        const completedTargets: string[] = []
+        const finalTargets: string[] = []
+        const failedMessages: string[] = []
+        let active = false
+        for (const [targetId, jobId] of tracked) {
+          const job = state.jobs.find((item) => item.id === jobId)
+          if (!job || job.status === 'queued' || job.status === 'running') {
+            active = true
+          } else if (job.status === 'completed') {
+            completedTargets.push(targetId)
+            finalTargets.push(targetId)
+          } else {
+            finalTargets.push(targetId)
+            failedMessages.push(job.error || `Transfer ${job.status}`)
+          }
+        }
+        if (finalTargets.length) {
+          const finalTargetIds = new Set(finalTargets)
+          setRecipeTransferJobs((current) => Object.fromEntries(
+            Object.entries(current).filter(([targetId]) => !finalTargetIds.has(targetId)),
+          ))
+        }
+        if (completedTargets.length) {
+          const names = completedTargets.map((id) => nodes.data?.find((node) => node.id === id)?.name ?? id)
+          setRecipeTransferNotice(`Weights transferred to ${names.join(', ')}. The node is now available for deployment.`)
+          reloadModelCache()
+          reloadTransferPreflight()
+        }
+        if (failedMessages.length) setRecipeError(failedMessages.join(' '))
+        if (active) timer = window.setTimeout(() => void poll(), 3000)
+      } catch (reason) {
+        if (!disposed) {
+          setRecipeError(reason instanceof Error ? reason.message : 'Could not check model transfer status')
+          timer = window.setTimeout(() => void poll(), 3000)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      disposed = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [recipeTransferJobs, nodes.data, reloadModelCache, reloadTransferPreflight])
 
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
@@ -497,7 +583,44 @@ export function ModelsPage() {
     const nodeIds = [...preferred, ...eligible.map((node) => node.id).filter((id) => !preferred.includes(id))]
       .slice(0, recipe.required_node_count)
     setRecipeError(undefined)
+    setRecipeTransferNotice(undefined)
     setRecipeDeployment({ recipe, nodeIds })
+  }
+
+  const queueRecipeTransfer = async (targetNodeId: string) => {
+    if (!recipeDeployment) return
+    const { recipe } = recipeDeployment
+    setBusy(`recipe-transfer:${targetNodeId}`)
+    setRecipeError(undefined)
+    try {
+      const latest = await api.storage.preflight(recipe.model, recipe.model_revision ?? 'main')
+      const source = latest.source
+      const target = latest.targets.find((item) => item.node_id === targetNodeId)
+      if (!source || !target?.eligible || target.free_bytes == null || target.required_free_bytes == null) {
+        reloadTransferPreflight()
+        throw new Error(target?.reason || 'This node is no longer eligible for a model transfer')
+      }
+      const targetName = nodes.data?.find((node) => node.id === targetNodeId)?.name ?? target.node_name ?? targetNodeId
+      const confirmed = window.confirm(
+        `Transfer ${recipe.model} (${formatBytes(source.size_bytes)}) from ${source.node_name} to ${targetName} via Virtual NAS?\n\n${formatBytes(target.free_bytes)} is free; ${formatBytes(target.required_free_bytes)} is required for archive staging and extraction.`,
+      )
+      if (!confirmed) return
+      setRecipeTransferNotice(undefined)
+      const result = await api.storage.transfer({
+        model_id: recipe.model,
+        source_node_id: source.node_id,
+        target_node_ids: [targetNodeId],
+      })
+      const job = result.jobs.find((item) => item.target_node_id === targetNodeId) ?? result.jobs[0]
+      if (!job) throw new Error('Virtual NAS did not return a transfer job')
+      setRecipeTransferJobs((current) => ({ ...current, [targetNodeId]: job.id }))
+      setRecipeTransferNotice(`Transfer queued to ${targetName}. The node will unlock when the copy completes.`)
+      reloadTransferPreflight()
+    } catch (reason) {
+      setRecipeError(reason instanceof Error ? reason.message : 'Could not queue model transfer')
+    } finally {
+      setBusy(undefined)
+    }
   }
 
   const deployRecipe = async () => {
@@ -724,7 +847,16 @@ export function ModelsPage() {
         const localPath = isLocalModelPath(recipe.model)
         const weighted = nodesWithWeights(recipe)
         const allowedIds = (nodes.data ?? []).filter((node) => weighted.has(node.id)).map((node) => node.id)
-        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !weighted.has(node.id)).map((node) => [node.id, localPath ? 'Local paths are available only on the controller' : 'Model weights not cached']))
+        const preflightTargets = new Map((transferPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
+        const missingNodes = (nodes.data ?? []).filter((node) => !weighted.has(node.id))
+        const unavailableReasons = Object.fromEntries(missingNodes.map((node) => [
+          node.id,
+          localPath
+            ? 'Local paths are available only on the controller'
+            : preflightTargets.get(node.id)?.active_job_status
+              ? `Model transfer ${preflightTargets.get(node.id)?.active_job_status}`
+              : preflightTargets.get(node.id)?.reason ?? 'Model weights not cached',
+        ]))
         const localRequired = recipe.deployment_mode === 'sharded' && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === recipe.required_node_count
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
@@ -734,8 +866,9 @@ export function ModelsPage() {
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
             <div className="modal-heading"><div><p className="eyebrow">Recipe</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights are disabled.</p>
+            <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights remain disabled until an eligible Virtual NAS transfer finishes.</p>
             {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
+            {recipeTransferNotice && <p className="inline-success" role="status">{recipeTransferNotice}</p>}
             {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
@@ -754,8 +887,34 @@ export function ModelsPage() {
                 ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
                 : nodeIds[0]}
               legend="Deployment nodes"
-              help={localPath ? 'Local model paths can run only on the controller.' : `Only nodes with ${recipe.model} already cached can be selected.`}
+              help={localPath ? 'Local model paths can run only on the controller.' : `Select a node with ${recipe.model} cached, or transfer it to an eligible node below.`}
             />
+            {!localPath && missingNodes.length > 0 && <div className="recipe-transfer-options" aria-label="Virtual NAS transfer options">
+              <div><strong>Transfer missing weights</strong><small>Virtual NAS copies the exact cached repository inside your paired cluster.</small></div>
+              {transferPreflight.loading && <p role="status">Checking source weights and target capacity…</p>}
+              {transferPreflight.error && <div className="recipe-transfer-error" role="alert"><span>{transferPreflight.error}</span><Button type="button" variant="tertiary" onClick={transferPreflight.reload}>Retry</Button></div>}
+              {transferPreflight.data && !transferPreflight.data.enabled && <p>Virtual NAS is disabled. Enable it on the Storage page before transferring weights.</p>}
+              {transferPreflight.data?.enabled && !transferPreflight.data.source && <p>No online node has a complete {recipe.model} revision {recipe.model_revision ?? 'main'}, so there is no source to transfer.</p>}
+              {transferPreflight.data?.enabled && transferPreflight.data.source && <div className="recipe-transfer-targets">
+                {missingNodes.map((node) => {
+                  const option = preflightTargets.get(node.id)
+                  const selectable = isNodeSelectable(node)
+                  const trackedJob = recipeTransferJobs[node.id]
+                  const eligible = Boolean(option?.eligible && selectable && !trackedJob)
+                  const capacity = option?.free_bytes != null && option.required_free_bytes != null
+                    ? `${formatBytes(option.free_bytes)} free · ${formatBytes(option.required_free_bytes)} required`
+                    : undefined
+                  const reason = !selectable
+                    ? node.online === false ? 'Node is offline' : node.docker_ready === false ? 'Docker unavailable' : 'Node unavailable for deployment'
+                    : trackedJob ? `Model transfer ${option?.active_job_status ?? 'queued'}` : option?.reason
+                  const transferBusy = busy === `recipe-transfer:${node.id}`
+                  return <div className={`recipe-transfer-target${eligible ? '' : ' unavailable'}`} key={node.id}>
+                    <span><strong>{node.name}</strong><small>{reason ?? capacity}{reason && capacity ? ` · ${capacity}` : ''}</small></span>
+                    {eligible && <Button type="button" variant="tertiary" disabled={Boolean(busy)} onClick={() => void queueRecipeTransfer(node.id)}><UploadCloud size={14} /> {transferBusy ? 'Queueing…' : 'Transfer weights'}</Button>}
+                  </div>
+                })}
+              </div>}
+            </div>}
             {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || recipeBusy} onClick={() => void deployRecipe()}><Play size={15} /> {recipeBusy ? 'Deploying…' : `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}`}</Button></div>

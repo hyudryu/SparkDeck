@@ -27,7 +27,8 @@ import type {
   JoinClusterInput,
   CreateStorageTransferInput,
   StorageState,
-  StorageTransferJob,
+  StorageTransferPreflight,
+  StorageTransferResult,
   ModelCacheState,
   SavedConfiguration,
   SavedConfigurationDetail,
@@ -415,7 +416,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ enabled }),
     }),
-    transfer: (input: CreateStorageTransferInput) => request<StorageTransferJob | { jobs: StorageTransferJob[] }>('/api/v1/storage/transfers', {
+    preflight: (modelId: string, revision = 'main', signal?: AbortSignal) => request<StorageTransferPreflight>('/api/v1/storage/transfers/preflight', {
+      method: 'POST',
+      body: JSON.stringify({ model_id: modelId, revision }),
+      signal,
+    }),
+    transfer: (input: CreateStorageTransferInput) => request<StorageTransferResult>('/api/v1/storage/transfers', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

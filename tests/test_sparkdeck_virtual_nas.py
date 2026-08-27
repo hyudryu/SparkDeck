@@ -71,7 +71,7 @@ class FakeRegistry:
         }
 
     async def request(self, node_id, method, path, **_kwargs):
-        return {"models": []}
+        return {"models": [], "free_size": 10 * 1024 * 1024 * 1024}
 
     async def open_stream(self, node_id, method, path, **kwargs):
         if node_id == self.fail_target:
@@ -320,10 +320,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_insufficient_target_capacity_is_rejected_without_jobs(self):
         registry = FakeRegistry()
 
-        async def low_capacity(node, force=False):
-            return {**node, "online": True, "disk": {"free": 1}}
+        async def low_capacity(node_id, method, path, **kwargs):
+            return {"models": [], "free_size": 1}
 
-        registry.probe = low_capacity
+        registry.request = low_capacity
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
 
         with self.assertRaisesRegex(RuntimeError, "insufficient free disk space"):
@@ -334,10 +334,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_target_capacity_fails_closed(self):
         registry = FakeRegistry()
 
-        async def unknown_capacity(node, force=False):
-            return {**node, "online": True}
+        async def unknown_capacity(node_id, method, path, **kwargs):
+            return {"models": []}
 
-        registry.probe = unknown_capacity
+        registry.request = unknown_capacity
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
 
         with self.assertRaisesRegex(RuntimeError, "did not report free disk capacity"):
@@ -345,8 +345,74 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
 
+    async def test_capacity_uses_cache_mount_instead_of_generic_node_disk(self):
+        registry = FakeRegistry()
+
+        async def small_root_disk(node, force=False):
+            return {**node, "online": True, "disk": {"free": 1}}
+
+        registry.probe = small_root_disk
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+
+        result = await nas.queue_transfer("org/model", "local", ["worker-a"])
+
+        self.assertEqual(len(result["jobs"]), 1)
+        await nas.stop()
+
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        required = 20 * 2 + 64 * 1024 * 1024
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {
+                "id": "source", "name": "Source", "online": True,
+                "free_size": required, "cache_free_size": required,
+                "models": [{
+                    "model_id": "org/model", "size_bytes": 20,
+                    "partial": False, "revisions": ["main"],
+                }],
+            },
+            {
+                "id": "enough", "name": "Enough", "online": True,
+                "free_size": required, "cache_free_size": required, "models": [],
+            },
+            {
+                "id": "short", "name": "Short", "online": True,
+                "free_size": required - 1, "cache_free_size": required - 1, "models": [],
+            },
+            {
+                "id": "wrong-revision", "name": "Wrong revision", "online": True,
+                "free_size": required, "cache_free_size": required,
+                "models": [{
+                    "model_id": "org/model", "size_bytes": 20,
+                    "partial": False, "revisions": ["snapshot-a"],
+                }],
+            },
+            {
+                "id": "generic-only", "name": "Legacy worker", "online": True,
+                "free_size": required, "models": [],
+            },
+        ])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+        targets = {item["node_id"]: item for item in result["targets"]}
+
+        self.assertEqual(result["source"]["node_id"], "source")
+        self.assertEqual(targets["enough"]["required_free_bytes"], required)
+        self.assertTrue(targets["enough"]["eligible"])
+        self.assertFalse(targets["short"]["eligible"])
+        self.assertEqual(targets["short"]["reason"], "Not enough free cache space")
+        self.assertFalse(targets["wrong-revision"]["eligible"])
+        self.assertIn("already exists", targets["wrong-revision"]["reason"])
+        self.assertFalse(targets["generic-only"]["eligible"])
+        self.assertEqual(
+            targets["generic-only"]["reason"],
+            "Free cache capacity is unavailable",
+        )
+
     async def test_manager_refuses_active_container_then_deletes_exact_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

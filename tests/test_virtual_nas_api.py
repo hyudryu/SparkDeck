@@ -140,6 +140,29 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("token", str(response.json()))
         queue.assert_awaited_once_with("org/model", "local", ["worker-1"])
 
+    async def test_recipe_transfer_preflight_is_available_before_queueing(self):
+        preflight = AsyncMock(return_value={
+            "enabled": True,
+            "model_id": "org/model",
+            "revision": "main",
+            "source": {"node_id": "local", "node_name": "Controller", "size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-1", "node_name": "Worker", "eligible": True,
+                "free_bytes": 100, "required_free_bytes": 80,
+            }],
+        })
+        with patch.object(
+            server.manager, "virtual_nas_transfer_preflight", preflight,
+        ):
+            response = await self.client.post(
+                "/api/v1/storage/transfers/preflight",
+                json={"model_id": " org/model ", "revision": "main"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["targets"][0]["eligible"])
+        preflight.assert_awaited_once_with("org/model", "main")
+
     async def test_delete_maps_absent_and_in_use_without_exposing_core_details(self):
         delete = AsyncMock(side_effect=[
             LookupError("cached model not found"),

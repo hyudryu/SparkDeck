@@ -1038,6 +1038,27 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sync_token_usage", settings)
         self.assertEqual(settings["max_retries"], 7)
 
+    def test_legacy_linux_hf_cache_default_is_migrated_to_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "hf_cache": "/home/hyudryu/.cache/huggingface",
+                "max_retries": 7,
+            }))
+
+            settings = instance._load_settings()
+
+            self.assertEqual(
+                settings["hf_cache"],
+                str(Path.home() / ".cache" / "huggingface"),
+            )
+            self.assertEqual(
+                json.loads(instance.settings_path.read_text())["hf_cache"],
+                str(Path.home() / ".cache" / "huggingface"),
+            )
+            self.assertEqual(settings["max_retries"], 7)
+
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -314,6 +314,78 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
+  it('confirms an eligible recipe weight transfer and rejects insufficient targets', async () => {
+    const user = userEvent.setup()
+    const gib = 1024 ** 3
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: true,
+        model_id: 'org/model',
+        revision: 'main',
+        source: { node_id: 'local', node_name: 'Source', size_bytes: 2 * gib },
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Source', eligible: false, reason: 'Required model weights are already available', free_bytes: 20 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+          { node_id: 'enough', node_name: 'Enough', eligible: true, free_bytes: 10 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+          { node_id: 'short', node_name: 'Short', eligible: false, reason: 'Not enough free cache space', free_bytes: 4 * gib, required_free_bytes: 4 * gib + 64 * 1024 ** 2 },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') return new Response(JSON.stringify({
+        job_ids: ['job-1'],
+        jobs: [{
+          id: 'job-1', model_id: 'org/model', source_node_id: 'local', source_node_name: 'Source',
+          target_node_id: 'enough', target_node_name: 'Enough', status: 'queued',
+          bytes_total: 2 * gib, bytes_transferred: 0, created_at: 1,
+        }],
+      }), { status: 202, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/storage')) return new Response(JSON.stringify({
+        enabled: true, nodes: [], instructions: [], jobs: [{
+          id: 'job-1', model_id: 'org/model', source_node_id: 'local', source_node_name: 'Source',
+          target_node_id: 'enough', target_node_name: 'Enough', status: 'running',
+          bytes_total: 2 * gib, bytes_transferred: gib, created_at: 1,
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Source', online: true, free_size: 20 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib, revisions: ['main'] }] },
+        { id: 'enough', name: 'Enough', online: true, free_size: 10 * gib, models: [] },
+        { id: 'short', name: 'Short', online: true, free_size: 4 * gib, models: [] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-transfer', name: 'Transfer recipe', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['enough'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Source', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'enough', name: 'Enough', online: true, docker_ready: true, selectable: true },
+          { id: 'short', name: 'Short', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Transfer recipe' })
+    const transfer = await within(dialog).findByRole('button', { name: 'Transfer weights' })
+
+    expect(dialog).toHaveTextContent('Not enough free cache space')
+    expect(within(dialog).getAllByRole('button', { name: 'Transfer weights' })).toHaveLength(1)
+    await user.click(transfer)
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Transfer org/model (2.0 GB) from Source to Enough via Virtual NAS?'))
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/api/v1/storage/transfers/preflight')).length).toBeGreaterThanOrEqual(2)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/storage/transfers',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ model_id: 'org/model', source_node_id: 'local', target_node_ids: ['enough'] }),
+      }),
+    ))
+    expect(await within(dialog).findByText('Transfer queued to Enough. The node will unlock when the copy completes.')).toBeInTheDocument()
+  })
+
   it('requires the main cache ref for an unpinned saved configuration', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

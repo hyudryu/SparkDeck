@@ -35,17 +35,24 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
-from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
+from sparkdeck.virtual_nas import (
+    TRANSFER_STAGING_RESERVE_BYTES,
+    VirtualNAS,
+    validate_model_id,
+)
 from sparkdeck.updater import CAPABILITY, current_revision
 from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 from sparkdeck.workload_ownership import ManagedWorkloadLedger
+
+LEGACY_DEFAULT_HF_CACHE = "/home/hyudryu/.cache/huggingface"
+DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
     "max_retries": 2,
     "idle_timeout_seconds": 30,  # 0 disables auto-stop
     "vllm_image": "nvcr.io/nvidia/vllm:26.03.post1-py3",
-    "hf_cache": "/home/hyudryu/.cache/huggingface",
+    "hf_cache": DEFAULT_HF_CACHE,
     # Stored server-side and never returned by the settings/state APIs. An
     # empty value falls back to the process environment or the HF cache token.
     "hf_token": "",
@@ -1363,6 +1370,7 @@ class Manager:
                 "id": node.get("id"), "name": node.get("name"),
                 "online": online,
                 "total_size": self._byte_count(raw_total),
+                "cache_free_size": cache_free,
                 "free_size": cache_free if cache_free is not None else self._byte_count(raw_free),
                 "models": models,
             }
@@ -1379,6 +1387,99 @@ class Manager:
         )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
+
+    async def virtual_nas_transfer_preflight(
+        self, model_id: str, revision: str | None = None,
+    ) -> dict:
+        """Return authoritative recipe-transfer choices without exposing paths."""
+        model_id = validate_model_id(model_id)
+        required_revision = str(revision or "main").strip() or "main"
+        nodes = await self.model_cache_inventory()
+        active_jobs = {
+            job["target_node_id"]: job
+            for job in self.virtual_nas_transfers()["items"]
+            if job.get("model_id") == model_id
+            and job.get("status") in {"queued", "running"}
+        }
+        sources = []
+        for node in nodes:
+            if not node.get("online"):
+                continue
+            model = next((
+                item for item in node.get("models", [])
+                if item.get("model_id") == model_id
+                and not item.get("partial")
+                and required_revision in (item.get("revisions") or [])
+                and self._byte_count(item.get("size_bytes"))
+            ), None)
+            if model:
+                sources.append({
+                    "node_id": node.get("id"),
+                    "node_name": node.get("name"),
+                    "size_bytes": self._byte_count(model.get("size_bytes")),
+                })
+        sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
+        source = sources[0] if sources else None
+        required_free = (
+            source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            if source else None
+        )
+        targets = []
+        for node in nodes:
+            node_id = node.get("id")
+            existing = next((
+                item for item in node.get("models", [])
+                if item.get("model_id") == model_id
+            ), None)
+            # Transfers stage and extract on the Hugging Face cache mount.
+            # Generic node-disk telemetry is display-only and must never make
+            # a transfer eligible when the cache mount did not report space.
+            free_bytes = self._byte_count(node.get("cache_free_size"))
+            active = active_jobs.get(node_id)
+            eligible = True
+            reason = None
+            if not self.virtual_nas_enabled():
+                eligible = False
+                reason = "Virtual NAS is disabled"
+            elif source is None:
+                eligible = False
+                reason = f"No online node has complete revision {required_revision}"
+            elif node_id == source["node_id"]:
+                eligible = False
+                reason = "Required model weights are already available"
+            elif existing is not None:
+                eligible = False
+                reason = "A cache for this model already exists on the target"
+            elif not node.get("online"):
+                eligible = False
+                reason = "Node is offline"
+            elif active is not None:
+                eligible = False
+                reason = f"Transfer already {active['status']}"
+            elif free_bytes is None:
+                eligible = False
+                reason = "Free cache capacity is unavailable"
+            elif required_free is not None and free_bytes < required_free:
+                eligible = False
+                reason = "Not enough free cache space"
+            targets.append({
+                "node_id": node_id,
+                "node_name": node.get("name"),
+                "eligible": eligible,
+                "reason": reason,
+                "free_bytes": free_bytes,
+                "required_free_bytes": required_free,
+                "active_job_id": active.get("id") if active else None,
+                "active_job_status": active.get("status") if active else None,
+            })
+        return {
+            "enabled": self.virtual_nas_enabled(),
+            "model_id": model_id,
+            "revision": required_revision,
+            "source": source,
+            "targets": targets,
+            "staging_reserve_bytes": TRANSFER_STAGING_RESERVE_BYTES,
+        }
 
     def virtual_nas_transfers(self) -> dict:
         return {
@@ -4322,6 +4423,15 @@ class Manager:
                 # opt-out so an older settings file cannot silently leave a
                 # node out of Usage totals.
                 data.pop("sync_token_usage", None)
+                # Early builds persisted the original developer's Linux home
+                # as the default on every platform. Migrate only that exact
+                # legacy value so explicit custom cache locations are kept.
+                if (
+                    data.get("hf_cache") == LEGACY_DEFAULT_HF_CACHE
+                    and DEFAULT_HF_CACHE != LEGACY_DEFAULT_HF_CACHE
+                ):
+                    data["hf_cache"] = DEFAULT_HF_CACHE
+                    _atomic_private_json_write(self.settings_path, data)
                 return {**DEFAULT_SETTINGS, **data}
             except Exception:
                 pass

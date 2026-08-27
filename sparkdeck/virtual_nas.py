@@ -37,7 +37,7 @@ _TOKENIZER_FILES = {
 # Imports hold both the received tar and the extracted repository until the
 # final atomic rename. Reserve additional room for tar headers, metadata, and
 # filesystem allocation rounding rather than admitting at an exact 2x edge.
-_TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
+TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 
 
 class TransferCanceled(Exception):
@@ -455,7 +455,8 @@ class VirtualNAS:
             target_statuses[target] = await self._validate_online_node(target)
             if target == source_node_id:
                 raise ValueError("source and target nodes must be different")
-        source_inventory = await self._node_inventory(source_node_id)
+        source_storage = await self._node_storage(source_node_id)
+        source_inventory = source_storage["models"]
         source_model = next(
             (item for item in source_inventory if item.get("model_id") == model_id),
             None,
@@ -468,6 +469,7 @@ class VirtualNAS:
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")
         existing_targets: list[str] = []
+        target_storage: dict[str, dict[str, Any]] = {}
         for target in targets:
             duplicate = next((
                 job for job in self.jobs
@@ -480,7 +482,9 @@ class VirtualNAS:
                 raise ValueError(
                     f"an active transfer for '{model_id}' to node '{target}' already exists"
                 )
-            target_inventory = await self._node_inventory(target)
+            storage = await self._node_storage(target)
+            target_storage[target] = storage
+            target_inventory = storage["models"]
             if any(
                 item.get("model_id") == model_id for item in target_inventory
             ):
@@ -489,9 +493,10 @@ class VirtualNAS:
             raise FileExistsError(
                 f"cached model already exists on target node(s): {', '.join(existing_targets)}"
             )
-        required_free = model_size * 2 + _TRANSFER_STAGING_RESERVE_BYTES
-        for target, status in target_statuses.items():
-            free_bytes = _disk_free_bytes(status.get("disk"))
+        required_free = model_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        for target in target_statuses:
+            raw_free = target_storage[target].get("free_size")
+            free_bytes = None if raw_free is None else _nonnegative_int(raw_free)
             if free_bytes is None:
                 raise RuntimeError(
                     f"target node '{target}' did not report free disk capacity"
@@ -585,13 +590,19 @@ class VirtualNAS:
             raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
         return status
 
-    async def _node_inventory(self, node_id: str) -> list[dict[str, Any]]:
+    async def _node_storage(self, node_id: str) -> dict[str, Any]:
         if node_id == LOCAL_NODE_ID:
-            return await asyncio.to_thread(self.inventory)
+            return {
+                "models": await asyncio.to_thread(self.inventory),
+                "free_size": await asyncio.to_thread(self.free_bytes),
+            }
         payload = await self.node_registry.request(
             node_id, "GET", "/api/agent/virtual-nas/inventory", timeout=30,
         )
-        return list((payload or {}).get("models") or [])
+        return {
+            "models": list((payload or {}).get("models") or []),
+            "free_size": (payload or {}).get("free_size"),
+        }
 
     async def _dispatch_loop(self) -> None:
         try:

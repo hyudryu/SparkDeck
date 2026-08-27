@@ -1952,6 +1952,31 @@ async def v1_storage_settings(req: Request):
     return await v1_storage()
 
 
+@app.post("/api/v1/storage/transfers/preflight")
+async def v1_storage_transfer_preflight(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        if set(body) - {"model_id", "revision"}:
+            raise ValueError("request may contain only model_id and revision")
+        model_id = body.get("model_id")
+        revision = body.get("revision")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("model_id must be a non-empty model ID")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        return _public_storage_payload(
+            await manager.virtual_nas_transfer_preflight(
+                model_id.strip(), revision,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
 @app.post("/api/v1/storage/transfers", status_code=202)
 async def v1_storage_transfer(req: Request):
     _require_virtual_nas_enabled()

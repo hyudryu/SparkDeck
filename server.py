@@ -101,7 +101,7 @@ class _DequeHandler(logging.Handler):
 
 
 _LOG_SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+"),
     re.compile(
         r'''(?ix)
         ((?:["']?(?:api[_-]?key|access[_-]?token|hf[_-]?token|
@@ -509,6 +509,45 @@ async def agent_temperature_history(req: Request):
 async def agent_stats(req: Request):
     _require_agent(req)
     return await manager.get_stats()
+
+
+@app.get("/api/agent/routeros")
+async def agent_routeros(req: Request):
+    _require_agent(req)
+    return await manager.routeros.overview()
+
+
+@app.put("/api/agent/routeros/connection")
+async def agent_connect_routeros(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        return await manager.routeros.connect(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.delete("/api/agent/routeros/connection")
+async def agent_disconnect_routeros(req: Request):
+    _require_agent(req)
+    try:
+        return manager.routeros.disconnect()
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
+@app.patch("/api/agent/routeros/fan-settings")
+async def agent_update_routeros_fan(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        return await manager.routeros.update_fan_settings(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.post("/api/agent/images/pull")
@@ -1612,7 +1651,7 @@ async def v1_clear_hf_token():
     return values
 
 
-def _require_same_origin_or_forwarded(req: Request) -> None:
+def _require_same_origin_or_forwarded(req: Request, action: str = "system updates") -> None:
     if any(req.headers.get(name) for name in FORWARD_HEADERS):
         return
     origin = req.headers.get("origin")
@@ -1620,7 +1659,56 @@ def _require_same_origin_or_forwarded(req: Request) -> None:
         return
     parsed = urlsplit(origin)
     if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != req.headers.get("host", "").casefold():
-        raise HTTPException(403, "system updates require a same-origin request")
+        raise HTTPException(403, f"{action} require a same-origin request")
+
+
+@app.get("/api/v1/routeros/presence")
+async def routeros_presence():
+    return await manager.routeros_cluster_presence()
+
+
+@app.get("/api/v1/routeros")
+async def routeros_overview():
+    return await manager.routeros_cluster_overview()
+
+
+@app.put("/api/v1/routeros/nodes/{node_id}/connection")
+async def connect_routeros(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("connection settings must be an object")
+        return await manager.connect_routeros(node_id, body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.delete("/api/v1/routeros/nodes/{node_id}/connection")
+async def disconnect_routeros(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        return await manager.disconnect_routeros(node_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.patch("/api/v1/routeros/nodes/{node_id}/fan-settings")
+async def update_routeros_fan(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "RouterOS changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("fan settings must be an object")
+        return await manager.update_routeros_fan_settings(node_id, body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/api/v1/system-update")

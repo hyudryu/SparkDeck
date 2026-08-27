@@ -20,6 +20,7 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/cluster", SPA_PATHS)
         self.assertIn("/storage", SPA_PATHS)
         self.assertIn("/usage", SPA_PATHS)
+        self.assertIn("/switch", SPA_PATHS)
 
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

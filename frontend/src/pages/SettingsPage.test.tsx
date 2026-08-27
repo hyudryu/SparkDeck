@@ -48,6 +48,7 @@ describe('settings page', () => {
     expect(save).toBeDisabled()
     expect(document.documentElement.dataset.theme).toBe('dark')
     expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('dark')
+    expect(screen.getByRole('link', { name: 'Open switch setup' })).toHaveAttribute('href', '/switch')
 
     await user.selectOptions(appearance, 'light')
     expect(save).toBeEnabled()

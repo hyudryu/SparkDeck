@@ -30,11 +30,61 @@ describe('SparkDeck application shell', () => {
 
     expect(screen.getByRole('link', { name: 'SparkDeck home' })).toBeInTheDocument()
     expect(screen.queryByText('Local service')).not.toBeInTheDocument()
-    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Chat', 'Compare', 'Benchmarks', 'Usage', 'Images', 'Storage', 'Settings', 'Logs']) {
+    for (const label of ['Dashboard', 'Explore', 'Models', 'Cluster', 'Switch', 'Chat', 'Compare', 'Benchmarks', 'Usage', 'Images', 'Storage', 'Settings', 'Logs']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
+    expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('title', 'Switch is not detected')
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: 'System overview' })).toBeInTheDocument()
+  })
+
+  it('enables the Switch destination when RouterOS is detected', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/routeros/presence')) {
+        return new Response(JSON.stringify({ detected: true, nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('href', '/switch'))
+    expect(screen.getByRole('link', { name: 'Switch' })).not.toHaveAttribute('aria-disabled')
+  })
+
+  it('ignores an older aborted presence failure after a newer refresh succeeds', async () => {
+    const presenceRequests: Array<{
+      signal?: AbortSignal
+      resolve: (response: Response) => void
+      reject: (reason: Error) => void
+    }> = []
+    fetchMock.mockImplementation(async (input, init) => {
+      if (!String(input).includes('/api/v1/routeros/presence')) {
+        return new Response(JSON.stringify({ items: [], total: 0 }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await new Promise<Response>((resolve, reject) => {
+        presenceRequests.push({ signal: init?.signal ?? undefined, resolve, reject })
+      })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    await waitFor(() => expect(presenceRequests).toHaveLength(1))
+
+    window.dispatchEvent(new Event('sparkdeck:routeros-presence-changed'))
+    await waitFor(() => expect(presenceRequests).toHaveLength(2))
+    expect(presenceRequests[0].signal?.aborted).toBe(true)
+
+    presenceRequests[1].resolve(new Response(JSON.stringify({ detected: true, nodes: [] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('href', '/switch'))
+
+    presenceRequests[0].reject(new Error('late aborted request'))
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('href', '/switch'))
   })
 
   it('opens and closes the mobile navigation with accessible controls', async () => {

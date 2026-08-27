@@ -74,7 +74,7 @@ The page provides:
 - **Only with community data**, available when Community Features are enabled; and
 - fit colors: green for comfortable fit, orange for tight fit, and red when the weights do not fit.
 
-Community speed is displayed only when enough samples match the exact model name and context-window size. It is phrased as sampled from other SparkDeck users and is an estimate, not a guarantee.
+When matching community data exists, SparkDeck displays an inference-speed estimate for the exact model name and context-window size together with the number of shared samples. It is phrased as sampled from other SparkDeck users and is an estimate, not a guarantee.
 
 ## Models
 
@@ -91,7 +91,7 @@ Use it to:
 - connect an existing OpenAI-compatible endpoint;
 - select the node or nodes that should run a deployment;
 - require the correct number of eligible nodes for tensor parallelism; and
-- inspect runtime, model identity, state, endpoints, and actions.
+- inspect runtime, model identity, state, target nodes, configuration, and actions.
 
 **Add model** creates a deployment record; it does not create a saved recipe. The current interface does not create, duplicate, or delete saved recipes.
 
@@ -167,7 +167,7 @@ The page includes:
 
 ![Benchmark detail charts using illustrative measurements](screenshots/benchmark-explorer-dark.png)
 
-Community benchmark JSON is restricted to the model identifier, context-window size, and measured inference tok/s. Prompts and outputs are never included. Turning sharing off stops future uploads and removes unsent uploads; it does not delete local benchmark history or recall already received data.
+Community benchmark JSON includes the model identifier, context-window size, and measured inference tok/s. Coordinated runs also include request concurrency and, when recorded, tensor-parallel size. Prompts and outputs are never included. Turning sharing off stops future uploads and removes unsent uploads; it does not delete local benchmark history or recall already received data.
 
 ## Usage
 
@@ -178,7 +178,7 @@ Usage combines accounting from paired nodes without discarding each node's raw c
 It provides:
 
 - lifetime token and request totals;
-- longest-session and activity summaries;
+- peak-day, active-day, current-streak, and longest-streak summaries;
 - a one-year daily activity heatmap;
 - 7-day and 30-day trend charts;
 - lifetime model or alias share; and
@@ -213,7 +213,7 @@ Use it to:
 - drag model weights from one node card to another on desktop;
 - use the keyboard- and touch-friendly transfer form on any device;
 - send one cached model to multiple online target nodes;
-- monitor, cancel, and retry transfer jobs; and
+- monitor and cancel active transfer jobs, then manually re-queue a failed or cancelled transfer when needed; and
 - delete one node's copy without affecting copies on other nodes.
 
 ![Storage transfer queue with illustrative progress](screenshots/readme/virtual-nas-transfer-dark.png)
@@ -230,7 +230,7 @@ The **Save settings** button is enabled only after an editable value changes or 
 
 ### Interface
 
-Choose **Follow system**, **Light**, or **Dark**. The selection is stored for the current browser. The theme toggle at the bottom of the left navigation changes and persists the same setting.
+Choose **Follow system**, **Light**, or **Dark**. The selection is saved on the SparkDeck controller and becomes the loaded theme for browsers connected to that controller. The theme toggle at the bottom of the left navigation changes and persists the same controller setting.
 
 ### DGX Spark cluster settings
 
@@ -246,7 +246,7 @@ Open the Switch page to discover or configure a RouterOS device. RouterOS creden
 
 ### Community Features
 
-Create an account, confirm the email address, sign in, reset a password, or sign out. Account sign-in is distinct from benchmark consent: signing in unlocks eligible community data, while sharing remains off until explicitly enabled on Benchmarks.
+Create an account, confirm the email address, sign in, reset a password, or sign out. Community data becomes available only after the signed-in user also explicitly enables benchmark sharing on Benchmarks; signing in alone does not grant access.
 
 ### Support and legal
 
@@ -258,7 +258,7 @@ Update the whole cluster to the immutable commit currently at `origin/main`. Spa
 
 ## Logs
 
-Logs shows redacted application and runtime activity from the local SparkDeck service.
+Logs shows redacted application and runtime activity from the controller's SparkDeck service. Opening the UI through a joined worker still forwards this request to the controller; it does not show that worker's local service logs.
 
 ![Logs with illustrative application and runtime events](screenshots/manual/logs-dark.png)
 

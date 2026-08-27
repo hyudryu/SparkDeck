@@ -334,6 +334,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
             models = nas.inventory()
             self.assertEqual(len(models), 1)
             self.assertTrue(models[0]["partial"])
+            self.assertEqual(models[0]["revisions"], [])
 
     def test_inventory_requires_config_tokenizer_and_all_indexed_weights(self):
         with tempfile.TemporaryDirectory() as directory:

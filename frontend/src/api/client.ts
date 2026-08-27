@@ -14,6 +14,9 @@ import type {
   AdmissionStats,
   LogEntry,
   SyncStatus,
+  CommunityClusterSync,
+  CommunityPairResponse,
+  CommunityAuthConfig,
   NodeInventoryItem,
   RenameNodeInput,
   ImagePullResult,
@@ -41,30 +44,53 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body?: unknown,
   ) {
     super(message)
     this.name = 'ApiError'
   }
 }
 
+type AuthTokenProvider = () => string | undefined | Promise<string | undefined>
+
+let authTokenProvider: AuthTokenProvider | undefined
+
+export function setAuthTokenProvider(provider: AuthTokenProvider | undefined) {
+  authTokenProvider = provider
+}
+
+function requiresCommunityBearer(path: string, method = 'GET'): boolean {
+  const normalizedMethod = method.toUpperCase()
+  return (
+    (path === '/api/v1/community/aggregates' && normalizedMethod === 'GET')
+    || (path === '/api/v1/community/pair' && normalizedMethod === 'DELETE')
+  )
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = requiresCommunityBearer(path, init?.method)
+    ? await authTokenProvider?.()
+    : undefined
   const response = await fetch(path, {
     ...init,
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   })
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`
+    let body: { detail?: unknown; message?: string } | undefined
     try {
-      const body = (await response.json()) as { detail?: string; message?: string }
-      message = body.detail ?? body.message ?? message
+      body = (await response.json()) as { detail?: unknown; message?: string }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.message) message = body.message
     } catch {
       // The status text is still useful for non-JSON failures.
     }
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, body)
   }
   if (response.status === 204) return undefined as T
   if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T
@@ -305,21 +331,25 @@ export const api = {
     aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
       request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
-      const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number> }>('/api/v1/community/sync', { signal })
+      const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
       return {
         sharing_enabled: data.consent,
         account_paired: data.pairing?.status === 'paired',
+        upload_configured: Boolean(data.upload_configured),
         pending_count: (data.outbox?.pending ?? 0) + (data.outbox?.waiting_for_account ?? 0),
         synced_count: data.outbox?.synced ?? 0,
         failed_count: data.outbox?.failed ?? 0,
       }
     },
     setConsent: async (sharing_enabled: boolean) => {
-      await request<unknown>('/api/v1/community/consent', {
+      const result = await request<{ cluster?: CommunityClusterSync }>('/api/v1/community/consent', {
         method: 'PUT',
         body: JSON.stringify({ enabled: sharing_enabled }),
       })
-      return api.benchmarks.syncStatus()
+      return {
+        ...await api.benchmarks.syncStatus(),
+        cluster_errors: result.cluster?.errors ?? [],
+      }
     },
     retry: async () => {
       await request<unknown>('/api/v1/community/retry', { method: 'POST' })
@@ -327,6 +357,14 @@ export const api = {
     },
     deleteLocal: (id: string) =>
       request<void>(`/api/v1/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
+  community: {
+    authConfig: () => request<CommunityAuthConfig>('/api/v1/community/auth-config'),
+    pair: (idToken: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
+      method: 'POST',
+      body: JSON.stringify({ id_token: idToken }),
+    }),
+    unpair: () => request<CommunityPairResponse>('/api/v1/community/pair', { method: 'DELETE' }),
   },
   images: {
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {

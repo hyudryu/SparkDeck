@@ -202,14 +202,39 @@ export interface BenchmarkSample {
   created_at: string
 }
 
+export interface DevicePairing {
+  status: 'paired' | 'not_paired'
+  sub?: string
+  email?: string
+}
+
+export interface CommunityClusterSync {
+  applied: string[]
+  conflicts: { node: string; email?: string }[]
+  errors: string[]
+}
+
+export interface CommunityPairResponse {
+  pairing: DevicePairing
+  cluster?: CommunityClusterSync
+}
+
+export interface CommunityAuthConfig {
+  idp_endpoint: string
+  client_id: string
+}
+
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean
+  upload_configured: boolean
   pending_count: number
   synced_count: number
   failed_count: number
   last_sync_at?: string | null
   last_error?: string | null
+  /** Joined nodes that did not apply the latest consent change. */
+  cluster_errors?: string[]
 }
 
 export interface ContainerImage {

@@ -422,6 +422,7 @@ export interface StorageNode {
   name: string
   online: boolean
   total_size: number
+  free_size?: number
   models: StorageModel[]
 }
 

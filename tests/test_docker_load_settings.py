@@ -334,6 +334,48 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original.status, "running")
         self.assertFalse(original.removed)
 
+    async def test_failed_ownership_confirmation_restores_original_container(self):
+        name = "managed-vllm"
+        model = "example/Model"
+        command = ["vllm", "serve", model, "--max-num-seqs", "8"]
+        config = {
+            "Image": "example/vllm:latest",
+            "Cmd": command,
+            "Labels": {"vllm-model": model, "io.sparkdeck.managed": "1"},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {}, status="running"
+        )
+        containers.add(original)
+        self.manager.client = SimpleNamespace(
+            containers=containers, api=FakeAPI(containers)
+        )
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+        ledger = mock.MagicMock()
+        ledger.confirm.side_effect = OSError("ledger write failed")
+        self.manager.managed_workload_ledger = ledger
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaisesRegex(OSError, "ledger write failed"):
+                await self.manager.update_container_settings(
+                    name,
+                    {
+                        **self.manager._container_load_settings(command, "vllm", model),
+                        "max_concurrency": 2,
+                    },
+                )
+
+        self.assertIs(containers.get(name), original)
+        self.assertEqual(original.status, "running")
+        self.assertFalse(original.removed)
+
 
 if __name__ == "__main__":
     unittest.main()

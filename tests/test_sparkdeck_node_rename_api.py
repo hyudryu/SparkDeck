@@ -3,6 +3,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
+from sparkdeck.onboarding import (
+    FORWARD_HOP_HEADER,
+    FORWARD_NODE_HEADER,
+    FORWARD_TOKEN_HEADER,
+)
+
 
 with patch("docker.from_env", return_value=Mock()):
     import server
@@ -127,6 +133,33 @@ class NodeRenameApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(accepted.status_code, 200)
         detach.assert_awaited_once()
+
+    async def test_force_forgotten_unregister_bypasses_only_its_auth_gate(self):
+        headers = {
+            FORWARD_HOP_HEADER: "1",
+            FORWARD_NODE_HEADER: "forgotten-worker",
+            FORWARD_TOKEN_HEADER: "stale-token",
+        }
+        with (
+            patch.object(server.onboarding.assignment, "load", return_value=None),
+            patch.object(server.manager.node_registry, "get", return_value=None),
+            patch.object(
+                server.manager.node_registry,
+                "accepts_forward_token",
+                return_value=False,
+            ),
+        ):
+            unregister = await self.client.post(
+                "/api/v1/onboarding/unregister", headers=headers,
+            )
+            rejected = await self.client.get("/api/state", headers=headers)
+
+        self.assertEqual(unregister.status_code, 404)
+        self.assertEqual(unregister.json(), {"detail": "worker is not registered"})
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(
+            rejected.json(), {"detail": "invalid worker forwarding credential"},
+        )
 
     async def test_legacy_patch_preserves_general_registry_updates(self):
         update = Mock(return_value={"id": "remote-1", "enabled": False})

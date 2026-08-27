@@ -2846,6 +2846,30 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         instance.node_registry.request.assert_not_awaited()
         instance.node_registry.remove.assert_called_once_with("remote-1")
 
+    async def test_protocol_v1_worker_without_detach_endpoint_uses_legacy_removal(self) -> None:
+        request = httpx.Request("POST", "http://worker/api/agent/onboarding/detach")
+        response = httpx.Response(404, request=request)
+        missing_endpoint = httpx.HTTPStatusError(
+            "not found", request=request, response=response,
+        )
+        agent_error = RuntimeError("Worker agent error: not found")
+        agent_error.__cause__ = missing_endpoint
+        instance = Manager.__new__(Manager)
+        instance.deployments = []
+        instance.node_registry = mock.Mock()
+        instance.node_registry.get.return_value = {
+            "id": "remote-1",
+            "name": "Worker",
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+        }
+        instance.node_registry.request = mock.AsyncMock(side_effect=agent_error)
+        instance.node_registry.remove.return_value = True
+
+        removed = await instance.detach_cluster_node("remote-1")
+
+        self.assertTrue(removed)
+        instance.node_registry.remove.assert_called_once_with("remote-1")
+
 
 if __name__ == "__main__":
     unittest.main()

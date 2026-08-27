@@ -5,7 +5,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from manager import DEFAULT_SETTINGS, Manager
 from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
@@ -106,6 +106,34 @@ class FakeRegistry:
 class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
+
+    def test_download_uses_the_configured_hub_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "configured-cache" / "hub"
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            def download_into_cache(**kwargs):
+                cache_dir = Path(kwargs["cache_dir"])
+                create_cached_model(cache_dir)
+                return str(
+                    cache_dir / "models--org--model" / "snapshots" / "revision-1"
+                )
+
+            snapshot_download = Mock(side_effect=download_into_cache)
+            huggingface_hub = Mock(snapshot_download=snapshot_download)
+            with patch.dict(
+                "sys.modules", {"huggingface_hub": huggingface_hub},
+            ):
+                result = nas.download_model("org/model", "revision-1")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["revision"], "revision-1")
+            self.assertEqual(
+                snapshot_download.call_args.kwargs["cache_dir"], str(hub.resolve()),
+            )
+            self.assertTrue((hub / "models--org--model").is_dir())
 
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:

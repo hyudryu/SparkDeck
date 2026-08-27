@@ -363,7 +363,7 @@ class VirtualNAS:
                 snapshot_download(
                     repo_id=model_id,
                     revision=revision,
-                    cache_dir=str(self._hub().parent),
+                    cache_dir=str(self._hub()),
                     token=token or None,
                 )
         except Exception as exc:

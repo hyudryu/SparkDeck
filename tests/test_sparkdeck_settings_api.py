@@ -57,8 +57,11 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "default_runtime": "sglang",
             "default_context_length": 24576,
             "hf_token_configured": True,
-            "cluster_node_name": "gx10-node-1",
         })
+        # The node name must never ride the settings response: on joined
+        # workers it is forwarded to the controller and would name the wrong
+        # machine. The unforwarded onboarding status carries it instead.
+        self.assertNotIn("cluster_node_name", response.json())
         self.assertNotIn(sentinel, response.text)
 
     async def test_put_stores_credential_on_controller_without_echoing_it(self):

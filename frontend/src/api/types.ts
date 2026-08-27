@@ -105,6 +105,9 @@ export interface NodeInventoryItem extends NodeSummary {
   docker_ready?: boolean
   fabric_ready?: boolean
   selectable?: boolean
+  // Rename results only: whether the new name reached the node itself
+  // ("pending" means an offline worker still answers with its old name).
+  name_sync?: 'local' | 'synchronized' | 'pending'
   stats?: SystemStats
   disk?: { total?: number; total_bytes?: number; free?: number; free_bytes?: number }
 }
@@ -289,7 +292,6 @@ export interface ImagePullResult {
 
 export interface AppSettings {
   theme?: 'system' | 'light' | 'dark'
-  cluster_node_name?: string
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.
   default_runtime?: RuntimeKind

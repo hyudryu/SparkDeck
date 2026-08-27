@@ -70,17 +70,25 @@ export function AppShell({ children }: { children: ReactNode }) {
       const requestController = new AbortController()
       const requestId = ++latestRequest
       controller = requestController
+      const isFresh = () => !disposed && requestId === latestRequest && !requestController.signal.aborted
       api.settings.get(requestController.signal).then((settings) => {
-        if (!disposed && requestId === latestRequest && !requestController.signal.aborted) {
-          const name = settings.cluster_node_name
-          setNodeName(typeof name === 'string' ? name.trim() : '')
-          if (!themeInteractedRef.current) {
-            persistTheme(settings.theme ?? storedTheme())
-            setTheme(resolvedTheme())
-          }
+        if (!isFresh()) return
+        if (!themeInteractedRef.current) {
+          persistTheme(settings.theme ?? storedTheme())
+          setTheme(resolvedTheme())
         }
       }).catch(() => {
         // The locally stored preference remains authoritative while offline.
+      })
+      // On a joined worker the settings request is forwarded to the controller,
+      // so the sidebar name comes from the unforwarded onboarding status that
+      // whichever node serves the browser answers for itself.
+      api.onboarding.get(requestController.signal).then((status) => {
+        if (!isFresh()) return
+        const name = status.node?.name
+        setNodeName(typeof name === 'string' ? name.trim() : '')
+      }).catch(() => {
+        // The chip stays empty until the next refresh; theme sync is unaffected.
       })
     }
     refreshSettings()

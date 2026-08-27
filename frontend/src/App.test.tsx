@@ -57,8 +57,12 @@ describe('SparkDeck application shell', () => {
   it('shows this node name next to Dashboard in the navigation', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
-      if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
-        return new Response(JSON.stringify({ cluster_node_name: 'gx10-node-1' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: 'gx10-node-1', port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -74,12 +78,43 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Explore' })).toHaveAttribute('href', '/explore')
   })
 
-  it('refreshes the sidebar node name when the local node is renamed', async () => {
+  it('names the chip after the entry node even when a joined worker forwards the controller name', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'gx10-worker-2', port: 7878, access_urls: ['http://100.64.0.11:7878'] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      // A joined worker forwards /api/v1/settings to the controller, so any
+      // node name in that response identifies the controller, not the node
+      // serving the browser.
+      if (path.includes('/api/v1/settings')) {
+        return new Response(JSON.stringify({ cluster_node_name: 'gx10-controller' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-worker-2')).toBeInTheDocument()
+    expect(within(dashboard).queryByText('gx10-controller')).not.toBeInTheDocument()
+  })
+
+  it('refreshes the sidebar node name when the entry node is renamed', async () => {
     let nodeName = 'gx10-node-1'
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
-      if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
-        return new Response(JSON.stringify({ cluster_node_name: nodeName }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: nodeName, port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })

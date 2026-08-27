@@ -8,6 +8,18 @@ import httpx
 from mcp_server import ControllerClient, ControllerError, build_server
 
 
+class CountingErrorStream(httpx.AsyncByteStream):
+    def __init__(self, chunk: bytes = b"private-error-detail-", count: int = 100):
+        self.chunk = chunk
+        self.count = count
+        self.chunks_yielded = 0
+
+    async def __aiter__(self):
+        for _ in range(self.count):
+            self.chunks_yielded += 1
+            yield self.chunk
+
+
 class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_clone_gets_distinct_recipe_id_and_preserves_controls(self) -> None:
         requests = []
@@ -207,7 +219,11 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path == "/v1/models":
                 return httpx.Response(200, json={"data": [{"id": "served-model"}]})
             request_body = json.loads(request.content)
-            attempts.append(("stream_options" in request_body, request_body["max_tokens"]))
+            attempts.append((
+                "stream_options" in request_body,
+                request_body["max_tokens"],
+                request_body["messages"][0]["content"],
+            ))
             if "stream_options" in request_body:
                 await asyncio.sleep(0.2)
                 return httpx.Response(400, json={"detail": "unsupported stream_options"})
@@ -232,14 +248,95 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             concurrency=2, max_tokens=10, warmup_requests=0,
         )
 
-        self.assertEqual(attempts, [
-            (True, 1), (False, 1), (False, 10), (False, 10),
-        ])
+        self.assertEqual(
+            [(with_options, tokens) for with_options, tokens, _ in attempts],
+            [(True, 1), (False, 1), (False, 10), (False, 10)],
+        )
+        probe_prompt = attempts[0][2]
+        self.assertEqual(attempts[1][2], probe_prompt)
+        self.assertNotEqual(probe_prompt, "one")
+        self.assertEqual([attempt[2] for attempt in attempts[2:]], ["one", "one"])
         self.assertLess(result["metrics"]["wall_seconds"], 0.1)
         self.assertEqual(result["recording"], {
             "status": "recorded", "id": "run-fallback",
         })
         self.assertEqual(recorded_bodies[0]["request_count"], 2)
+
+    async def test_benchmark_bounds_streaming_capability_error_body(self) -> None:
+        error_stream = CountingErrorStream()
+
+        async def controller_handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "deployments": [{
+                    "id": "mcp-1", "status": "ready", "api_port": 8000,
+                }]
+            })
+
+        async def inference_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "served-model"}]})
+            return httpx.Response(503, stream=error_stream)
+
+        client = ControllerClient(
+            transport=httpx.MockTransport(controller_handler),
+            inference_transport=httpx.MockTransport(inference_handler),
+        )
+        with self.assertRaises(ControllerError) as raised:
+            await client.benchmark(
+                "mcp-1", prompts=["one"], repetitions=1,
+                concurrency=1, warmup_requests=0,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("benchmark capability probe failed (503)", message)
+        self.assertIn("private-error-detail", message)
+        self.assertLess(len(message), 650)
+        self.assertLess(error_stream.chunks_yielded, error_stream.count)
+
+    async def test_benchmark_bounds_streaming_measured_request_error_body(self) -> None:
+        error_stream = CountingErrorStream(chunk=b"measured-error-detail-")
+        inference_calls = 0
+
+        async def controller_handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "deployments": [{
+                    "id": "mcp-1", "status": "ready", "api_port": 8000,
+                }]
+            })
+
+        async def inference_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal inference_calls
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "served-model"}]})
+            inference_calls += 1
+            if inference_calls == 1:
+                return httpx.Response(
+                    200,
+                    content=(
+                        'data: {"choices":[{"delta":{"content":"probe"}}]}\n\n'
+                        'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                        '"completion_tokens":1}}\n\n'
+                        'data: [DONE]\n\n'
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return httpx.Response(502, stream=error_stream)
+
+        client = ControllerClient(
+            transport=httpx.MockTransport(controller_handler),
+            inference_transport=httpx.MockTransport(inference_handler),
+        )
+        with self.assertRaises(ControllerError) as raised:
+            await client.benchmark(
+                "mcp-1", prompts=["one"], repetitions=1,
+                concurrency=1, warmup_requests=0,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("inference request failed (502)", message)
+        self.assertIn("measured-error-detail", message)
+        self.assertLess(len(message), 650)
+        self.assertLess(error_stream.chunks_yielded, error_stream.count)
 
     async def test_benchmark_does_not_record_without_stream_usage(self) -> None:
         recorded_bodies = []

@@ -28,6 +28,7 @@ OWNER = "sparkdeck-mcp"
 # safely stop or remove them through the same ownership guard.
 LEGACY_OWNERS = frozenset({"vllm-controller-mcp"})
 DEFAULT_CONTROLLER_URL = "http://127.0.0.1:7878"
+MAX_INFERENCE_ERROR_BYTES = 500
 DEFAULT_PROMPTS = [
     "Explain why speculative decoding can improve language-model serving throughput.",
     "Write a concise checklist for diagnosing a distributed GPU inference launch.",
@@ -67,6 +68,32 @@ def _stream_output_text(event: dict[str, Any]) -> str:
 
 class ControllerError(RuntimeError):
     """A controller or inference endpoint returned an actionable error."""
+
+
+class _InferenceHTTPError(RuntimeError):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+async def _bounded_stream_error(response: httpx.Response) -> str:
+    """Read enough of a streaming error to diagnose it without unbounded buffering."""
+    content = bytearray()
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        remaining = MAX_INFERENCE_ERROR_BYTES - len(content)
+        if remaining <= 0:
+            truncated = True
+            break
+        content.extend(chunk[:remaining])
+        if len(chunk) > remaining or len(content) == MAX_INFERENCE_ERROR_BYTES:
+            truncated = True
+            break
+    detail = bytes(content).decode("utf-8", errors="replace").strip()
+    if truncated:
+        detail += "..."
+    return detail or response.reason_phrase
 
 
 class StaticTokenVerifier:
@@ -365,7 +392,9 @@ class ControllerClient:
                     async with client.stream(
                         "POST", f"{base_url}/v1/chat/completions", json=body,
                     ) as response:
-                        response.raise_for_status()
+                        if not 200 <= response.status_code < 300:
+                            detail = await _bounded_stream_error(response)
+                            raise _InferenceHTTPError(response.status_code, detail)
                         async for line in response.aiter_lines():
                             event = _stream_event(line)
                             if event is None:
@@ -401,23 +430,34 @@ class ControllerClient:
             # inflate batch wall time or generation/request throughput.
             stream_usage_supported = True
             probe_max_tokens = max_tokens if warmup_requests else 1
+            probe_prompt = (
+                prompt_values[0] if warmup_requests
+                else f"__sparkdeck_capability_probe_{uuid.uuid4().hex}__"
+            )
+            while not warmup_requests and probe_prompt in prompt_values:
+                probe_prompt = f"__sparkdeck_capability_probe_{uuid.uuid4().hex}__"
             try:
                 await request_once(
-                    prompt_values[0], include_stream_usage=True,
+                    probe_prompt, include_stream_usage=True,
                     request_max_tokens=probe_max_tokens,
                 )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code not in {400, 422}:
+            except _InferenceHTTPError as exc:
+                if exc.status_code not in {400, 422}:
                     raise ControllerError(
                         f"benchmark capability probe failed "
-                        f"({exc.response.status_code}): {exc.response.text[:500]}"
+                        f"({exc.status_code}): {exc.detail}"
                     ) from exc
                 stream_usage_supported = False
                 try:
                     await request_once(
-                        prompt_values[0], include_stream_usage=False,
+                        probe_prompt, include_stream_usage=False,
                         request_max_tokens=probe_max_tokens,
                     )
+                except _InferenceHTTPError as fallback_exc:
+                    raise ControllerError(
+                        f"benchmark capability fallback failed "
+                        f"({fallback_exc.status_code}): {fallback_exc.detail}"
+                    ) from fallback_exc
                 except httpx.HTTPError as fallback_exc:
                     raise ControllerError(
                         f"benchmark capability fallback failed: {fallback_exc}"
@@ -431,6 +471,10 @@ class ControllerClient:
                         prompt_values[index % len(prompt_values)],
                         include_stream_usage=stream_usage_supported,
                     )
+                except _InferenceHTTPError as exc:
+                    raise ControllerError(
+                        f"benchmark warmup failed ({exc.status_code}): {exc.detail}"
+                    ) from exc
                 except httpx.HTTPError as exc:
                     raise ControllerError(f"benchmark warmup failed: {exc}") from exc
 
@@ -453,9 +497,9 @@ class ControllerClient:
                         return await request_once(
                             prompt, include_stream_usage=stream_usage_supported,
                         )
-                    except httpx.HTTPStatusError as exc:
+                    except _InferenceHTTPError as exc:
                         raise ControllerError(
-                            f"inference request failed ({exc.response.status_code}): {exc.response.text[:500]}"
+                            f"inference request failed ({exc.status_code}): {exc.detail}"
                         ) from exc
                     except httpx.HTTPError as exc:
                         raise ControllerError(f"inference request failed: {exc}") from exc

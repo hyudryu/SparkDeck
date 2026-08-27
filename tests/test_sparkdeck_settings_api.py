@@ -37,7 +37,6 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         sentinel = "hf_get_sentinel_secret"
         stored = {
             "theme": "dark",
-            "community_api_url": "https://example.test",
             "default_runtime": "sglang",
             "default_context_length": 24576,
         }
@@ -54,7 +53,6 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
             "theme": "dark",
-            "community_api_url": "https://example.test",
             "default_runtime": "sglang",
             "default_context_length": 24576,
             "hf_token_configured": True,
@@ -77,10 +75,12 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
                 "default_context_length": 32768,
             })
 
+        # A legacy community_api_url field is ignored, not stored or echoed.
+        self.assertNotIn("https://community.example", response.text)
+
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
             "theme": "light",
-            "community_api_url": "https://community.example",
             "default_runtime": "sglang",
             "default_context_length": 32768,
             "hf_token_configured": True,
@@ -89,7 +89,6 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         update_settings.assert_awaited_once_with({"hf_token": sentinel})
         self.assertEqual(set_setting.call_args_list, [
             call("theme", "light"),
-            call("community_api_url", "https://community.example"),
             call("default_runtime", "sglang"),
             call("default_context_length", 32768),
         ])
@@ -116,7 +115,6 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             response = await self.client.put("/api/v1/settings", json={
                 "theme": "dark",
-                "community_api_url": "",
                 "hf_token": sentinel,
             })
 
@@ -136,7 +134,6 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             response = await self.client.put("/api/v1/settings", json={
                 "theme": "system",
-                "community_api_url": "",
                 "hf_token": "   ",
             })
 

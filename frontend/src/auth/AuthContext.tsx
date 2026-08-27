@@ -35,7 +35,7 @@ const signedOutDefault: AuthState = {
   status: 'signed-out',
   signIn: async (email, password) => {
     const tokens = await cognitoSignIn(email, password)
-    await api.community.pair(tokens.idToken).catch(() => undefined)
+    await api.community.pair(tokens.idToken, tokens.refreshToken).catch(() => undefined)
   },
   signUp,
   confirmSignUp,
@@ -103,7 +103,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (cancelled) return
         if (tokens && !isExpired(tokens.idToken)) {
           try {
-            const paired = await api.community.pair(tokens.idToken)
+            // A refreshed TokenSet omits the refresh token, so the backend
+            // re-pair reads it from storage (the uploader needs it to mint
+            // short-lived ID tokens for consented telemetry).
+            const paired = await api.community.pair(
+              tokens.idToken,
+              storedTokens()?.refreshToken ?? tokens.refreshToken,
+            )
             if (cancelled) return
             setClusterSync(paired.cluster ?? null)
             publishIdToken(tokens.idToken)
@@ -149,7 +155,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       try {
         const tokens = await cognitoSignIn(email, password)
         try {
-          const paired = await api.community.pair(tokens.idToken)
+          const paired = await api.community.pair(tokens.idToken, tokens.refreshToken)
           setClusterSync(paired.cluster ?? null)
         } catch (pairError) {
           // Pairing is what makes community features work; if it fails, do not

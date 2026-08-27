@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -24,7 +25,22 @@ COMMUNITY_EVIDENCE_POLICY = {
     "exact_match_dimensions": ["model_id", "context_window_size"],
     "metric": "inference_tokens_per_second",
 }
+# The community backend is built in — every installation talks to the hosted
+# SparkDeck community API. Not user-configurable; the env override exists for
+# development and forks (set it empty to stay fully local while developing).
+COMMUNITY_API_URL = os.environ.get(
+    "SPARKDECK_COMMUNITY_API_URL",
+    "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
+)
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
+
+
+def _restrict_permissions(path: Path, mode: int) -> None:
+    """Best-effort owner-only permissions; Windows has no POSIX modes."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
 
 
 class SparkDeckStore:
@@ -33,12 +49,19 @@ class SparkDeckStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_permissions(self.path.parent, 0o700)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._migrate()
+        # The store holds the community refresh token; keep it owner-only.
+        _restrict_permissions(self.path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.exists():
+                _restrict_permissions(sidecar, 0o600)
 
     def close(self) -> None:
         with self._lock:
@@ -745,9 +768,11 @@ class SparkDeckStore:
         pairing = self.get_setting("device_pairing", {"status": "not_paired"})
         return {
             "consent": bool(self.get_setting("community_consent", False)),
-            # Account claims and upload credentials are private service state.
+            # Account claims and upload credentials are private service state;
+            # only the status and a re-authentication flag leave the store.
             "pairing": {
                 "status": "paired" if pairing.get("status") == "paired" else "not_paired",
+                "token_invalid": bool(pairing.get("token_invalid")),
             },
             "outbox": {
                 "pending": counts.get("pending", 0),
@@ -755,7 +780,7 @@ class SparkDeckStore:
                 "failed": counts.get("failed", 0),
                 "synced": counts.get("synced", 0),
             },
-            "cloud_endpoint_configured": bool(self.get_setting("community_api_url", None)),
+            "cloud_endpoint_configured": bool(COMMUNITY_API_URL),
         }
 
     def set_community_consent(self, enabled: bool) -> None:

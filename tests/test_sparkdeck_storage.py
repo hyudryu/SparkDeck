@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import tempfile
 import threading
@@ -137,18 +138,33 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.mark_outbox_synced(["sample-2"]), 1)
         self.assertEqual(self.store.sync_status()["outbox"]["synced"], 1)
 
+    def test_store_files_are_owner_only(self):
+        if os.name == "nt":
+            self.skipTest("POSIX modes do not exist on Windows")
+
+        self.assertEqual(
+            oct(self.store.path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(
+            oct(self.store.path.parent.stat().st_mode & 0o777), "0o700")
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.store.path}{suffix}")
+            if sidecar.exists():
+                self.assertEqual(
+                    oct(sidecar.stat().st_mode & 0o777), "0o600")
+
     def test_sync_status_redacts_pairing_claims(self):
         self.store.set_setting("device_pairing", {
             "status": "paired", "sub": "stable-sub", "email": "person@example.com",
-            "credential": "secret",
+            "credential": "secret", "refresh_token": "refresh-secret-1",
         })
 
         status = self.store.sync_status()
 
-        self.assertEqual(status["pairing"], {"status": "paired"})
+        self.assertEqual(status["pairing"], {"status": "paired", "token_invalid": False})
         self.assertNotIn("stable-sub", str(status))
         self.assertNotIn("person@example.com", str(status))
         self.assertNotIn("secret", str(status))
+        self.assertNotIn("refresh-secret-1", str(status))
 
     def test_pairing_promotes_waiting_uploads_to_pending(self):
         sample = BenchmarkSample(

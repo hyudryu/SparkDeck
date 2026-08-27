@@ -22,7 +22,7 @@ export interface CommunityEvidencePolicy {
 
 export interface CommunityAggregatesResponse {
   items: BenchmarkAggregate[]
-  availability: 'available' | 'local' | 'not_configured'
+  availability: 'available' | 'local' | 'not_configured' | 'ok' | 'unavailable'
   evidence_policy: CommunityEvidencePolicy
 }
 
@@ -251,6 +251,8 @@ export interface CommunityAuthConfig {
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean
+  /** The stored refresh token was rejected; the account must sign in again. */
+  token_invalid: boolean
   upload_configured: boolean
   pending_count: number
   synced_count: number
@@ -292,7 +294,6 @@ export interface AppSettings {
   default_context_length?: number
   hf_token?: string
   hf_token_configured?: boolean
-  community_api_url?: string
   telemetry_interval_seconds?: number
   [key: string]: unknown
 }

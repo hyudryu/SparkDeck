@@ -339,10 +339,11 @@ export const api = {
     aggregates: (signal?: AbortSignal): Promise<CommunityAggregatesResponse> =>
       request<CommunityAggregatesResponse>('/api/v1/community/aggregates', { signal }),
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
-      const data = await request<{ consent: boolean; pairing?: { status?: string }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
+      const data = await request<{ consent: boolean; pairing?: { status?: string; token_invalid?: boolean }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
       return {
         sharing_enabled: data.consent,
         account_paired: data.pairing?.status === 'paired',
+        token_invalid: Boolean(data.pairing?.token_invalid),
         upload_configured: Boolean(data.upload_configured),
         pending_count: (data.outbox?.pending ?? 0) + (data.outbox?.waiting_for_account ?? 0),
         synced_count: data.outbox?.synced ?? 0,
@@ -368,9 +369,12 @@ export const api = {
   },
   community: {
     authConfig: () => request<CommunityAuthConfig>('/api/v1/community/auth-config'),
-    pair: (idToken: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
+    pair: (idToken: string, refreshToken?: string) => request<CommunityPairResponse>('/api/v1/community/pair', {
       method: 'POST',
-      body: JSON.stringify({ id_token: idToken }),
+      body: JSON.stringify({
+        id_token: idToken,
+        ...(refreshToken ? { refresh_token: refreshToken } : {}),
+      }),
     }),
     unpair: () => request<CommunityPairResponse>('/api/v1/community/pair', { method: 'DELETE' }),
   },

@@ -129,6 +129,9 @@ export function ClusterPage() {
       if (resource.data && isCurrentEntryNode(node, resource.data)) {
         resource.setData({ ...resource.data, node: { ...resource.data.node, name: updated.name } })
       }
+      // The shell caches this node's name for the sidebar; renaming the local
+      // node must reach it without waiting for a full page reload.
+      if (node.local) window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
       setEditingNodeId(undefined)
       setNodeName('')
       setNotice(`Renamed ${node.name} to ${updated.name}.`)

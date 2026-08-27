@@ -62,17 +62,35 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => setDrawerOpen(false), [location.pathname])
 
   useEffect(() => {
-    const controller = new AbortController()
-    api.settings.get(controller.signal).then((settings) => {
-      const name = settings.cluster_node_name
-      setNodeName(typeof name === 'string' ? name.trim() : '')
-      if (themeInteractedRef.current) return
-      persistTheme(settings.theme ?? storedTheme())
-      setTheme(resolvedTheme())
-    }).catch(() => {
-      // The locally stored preference remains authoritative while offline.
-    })
-    return () => controller.abort()
+    let disposed = false
+    let controller: AbortController | undefined
+    let latestRequest = 0
+    const refreshSettings = () => {
+      controller?.abort()
+      const requestController = new AbortController()
+      const requestId = ++latestRequest
+      controller = requestController
+      api.settings.get(requestController.signal).then((settings) => {
+        if (!disposed && requestId === latestRequest && !requestController.signal.aborted) {
+          const name = settings.cluster_node_name
+          setNodeName(typeof name === 'string' ? name.trim() : '')
+          if (!themeInteractedRef.current) {
+            persistTheme(settings.theme ?? storedTheme())
+            setTheme(resolvedTheme())
+          }
+        }
+      }).catch(() => {
+        // The locally stored preference remains authoritative while offline.
+      })
+    }
+    refreshSettings()
+    window.addEventListener('sparkdeck:node-name-changed', refreshSettings)
+    return () => {
+      disposed = true
+      latestRequest += 1
+      controller?.abort()
+      window.removeEventListener('sparkdeck:node-name-changed', refreshSettings)
+    }
   }, [])
 
   useEffect(() => {

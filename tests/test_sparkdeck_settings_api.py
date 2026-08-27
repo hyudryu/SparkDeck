@@ -47,6 +47,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda key, default: stored.get(key, default),
             ),
             patch.object(server.manager, "_resolved_hf_token", return_value=sentinel),
+            patch.dict(server.manager.settings, {"cluster_node_name": "gx10-node-1"}),
         ):
             response = await self.client.get("/api/v1/settings")
 
@@ -56,6 +57,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "default_runtime": "sglang",
             "default_context_length": 24576,
             "hf_token_configured": True,
+            "cluster_node_name": "gx10-node-1",
         })
         self.assertNotIn(sentinel, response.text)
 

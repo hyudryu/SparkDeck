@@ -102,11 +102,11 @@ class _RetryingDockerClient:
 
     Docker's ``from_env`` constructor negotiates an API version immediately,
     so constructing the process-wide manager used to prevent controller-only
-    installations from starting at all. Keep the normal eager client when it
-    works, but use this small proxy after a connection failure. Failed attempts
-    are cached briefly and only one caller may negotiate at a time, so aggregate
-    state polling cannot fill the thread pool while a daemon is hung. A later
-    access retries and permanently caches the first working client.
+    installations from starting at all. Defer even the first negotiation until
+    an operation actually needs Docker. Failed attempts are cached briefly and
+    only one caller may negotiate at a time, so aggregate state polling cannot
+    fill the thread pool while a daemon is hung. A later access retries and
+    permanently caches the first working client.
     """
 
     RETRY_INTERVAL_SECONDS = 5.0
@@ -503,14 +503,10 @@ class Manager:
         self.hourly_token_stats: dict[str, dict] = self._load_hourly_token_stats()
         # In-flight Spark Run executions (run_id -> run dict). Not persisted.
         self.spark_runs: dict[str, dict] = {}
-        try:
-            self.client = docker.from_env()
-        except docker.errors.DockerException as exc:
-            logger.warning(
-                "Docker is unavailable; starting in controller-only mode: %s",
-                exc,
-            )
-            self.client = _RetryingDockerClient(initial_error=exc)
+        # docker.from_env() negotiates the daemon API version synchronously.
+        # Keep construction non-blocking so a hung Docker Desktop cannot delay
+        # the controller UI from binding and serving its liveness endpoint.
+        self.client = _RetryingDockerClient()
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.lock = asyncio.Lock()

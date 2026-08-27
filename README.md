@@ -1,8 +1,56 @@
 # SparkDeck
 
-SparkDeck is a local-first control plane for discovering, running, and comparing open models. It brings vLLM, llama.cpp `llama-server`, and SGLang deployments into one responsive interface and records comparable performance results without storing prompt or response content.
+**Built by a DGX Spark GB10 cluster owner, for other DGX Spark GB10 owners.**
 
-The long-term goal is a public community catalog where people can find a model that fits their hardware, compare measured throughput and latency, and optionally contribute their own benchmark results. Cloud sync is being designed around explicit consent and an authenticated upload queue; sharing is off by default.
+Running one DGX Spark is straightforward. The moment I added more, the practical questions multiplied: Which models actually fit? What inference speed should I expect? Which Spark has the weights? Is every node healthy? Which runtime and configuration really wins?
+
+I built SparkDeck for my own GB10 cluster to answer those questions in one local-first interface. It brings vLLM, llama.cpp `llama-server`, and SGLang together, coordinates paired machines, stages model weights where the work will run, and records comparable performance evidence. I am sharing it so other Spark owners can spend less time coordinating machines and more time running models.
+
+The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
+
+## Example render
+
+![SparkDeck dark-mode dashboard showing a four-node DGX Spark cluster](docs/screenshots/readme/sparkdeck-dashboard-dark.png)
+
+_A four-node SparkDeck dashboard in dark mode. Every value shown in this README is illustrative demo data, not a measured hardware claim._
+
+## Why I built it
+
+### Know what performance to expect before pulling a model
+
+The **Community Run Models** catalog gives me a directional inference tok/s estimate before spending time downloading and deploying a model. Today those estimates are aggregated from the measurements my own cluster records; measurements from other SparkDeck users appear only when SparkDeck is pointed at a separately configured community aggregates service, since hosted community sync is not available in this release. Evidence is matched by exact model ID and context window; it is an estimate, not a GB10-specific guarantee, because runtime, quantization, hardware, parallelism, and other settings still matter.
+
+![Community Run Models with illustrative throughput and cluster-fit evidence](docs/screenshots/readme/community-performance-dark.png)
+
+_Community throughput evidence and per-node fit. Illustrative demo data; estimates are evidence, not guarantees._
+
+### Manage the whole GB10 cluster from one controller
+
+SparkDeck pairs machines over a private network, gives every node a recognizable identity, and shows membership and reachability from one controller. Workers run assigned jobs and provide alternate private entry points, while the controller remains authoritative for cluster management.
+
+![Cluster management with one controller and three DGX Spark workers](docs/screenshots/readme/cluster-management-dark.png)
+
+_Controller and worker membership across a private cluster network. Illustrative demo data._
+
+### Put model weights where the work will run
+
+My Sparks are ConnectX-7-equipped for distributed inference, but a fast fabric is useful only when the right weights are already on the right machines. **Virtual NAS** inventories complete Hugging Face cache copies per node, queues authenticated transfers, and tracks progress without exposing arbitrary host paths.
+
+When SparkDeck node addresses are configured on a private ConnectX-7 network, Virtual NAS traffic can take that path. The current transfer engine streams over SparkDeck's authenticated HTTP transport; it does not yet use RDMA.
+
+![Virtual NAS model inventory across three DGX Spark nodes](docs/screenshots/readme/virtual-nas-inventory-dark.png)
+
+![Virtual NAS transfer progress between paired DGX Spark nodes](docs/screenshots/readme/virtual-nas-transfer-dark.png)
+
+_Complete cached model weights staged across paired nodes, with an active copy in the transfer queue. Illustrative demo data._
+
+### Compare configurations, not hunches — work in progress
+
+SparkDeck already records successful proxied runs with runtime, quantization, throughput, latency, and time to first token. The next step is a faster configuration-benchmark loop: vary context length, parallelism, memory settings, and launch arguments, then rank like-for-like runs side by side.
+
+![Work-in-progress benchmark history with illustrative runtime results](docs/screenshots/readme/benchmark-history-dark.png)
+
+_Work in progress: the shipped history view is shown with illustrative data; configuration-aware comparison and ranking are planned._
 
 ## What SparkDeck does
 
@@ -10,7 +58,7 @@ The long-term goal is a public community catalog where people can find a model t
 - Launch and manage models with vLLM, llama.cpp, or SGLang.
 - Chat with one model or compare model responses side by side.
 - Track host health, model logs, images, queues, and deployment settings.
-- Capture local benchmark measurements such as time to first token, output throughput, token counts, and latency.
+- Capture local benchmark measurements such as time to first token, output throughput, token counts, and latency, with configuration comparison still in progress.
 - Prepare eligible, redacted benchmark samples for future community sync.
 - Coordinate compatible SparkDeck nodes for distributed or replicated inference.
 - Copy Hugging Face cache weights between paired nodes with the opt-in virtual NAS.

@@ -35,6 +35,36 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def _stream_event(line: str) -> dict[str, Any] | None:
+    if not line.startswith("data:"):
+        return None
+    payload = line[5:].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _stream_output_text(event: dict[str, Any]) -> str:
+    values: list[str] = []
+    for choice in event.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            for key in ("content", "reasoning_content"):
+                value = delta.get(key)
+                if isinstance(value, str) and value:
+                    values.append(value)
+        value = choice.get("text")
+        if isinstance(value, str) and value:
+            values.append(value)
+    return "".join(values)
+
+
 class ControllerError(RuntimeError):
     """A controller or inference endpoint returned an actionable error."""
 
@@ -297,27 +327,66 @@ class ControllerClient:
                 raise ControllerError(f"could not discover served model at {base_url}: {exc}") from exc
 
             async def request_once(prompt: str) -> dict[str, Any]:
+                request_body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
                 started = time.perf_counter()
-                response = await client.post(
-                    f"{base_url}/v1/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "stream": False,
-                    },
+                first_token_at: float | None = None
+                usage: dict[str, Any] = {}
+                text_parts: list[str] = []
+
+                async def consume(body: dict[str, Any]) -> bool:
+                    nonlocal first_token_at, usage
+                    async with client.stream(
+                        "POST", f"{base_url}/v1/chat/completions", json=body,
+                    ) as response:
+                        if response.status_code in {400, 422} and body.get("stream_options"):
+                            # Some OpenAI-compatible servers can stream but do
+                            # not implement include_usage. Retry without that
+                            # option; if usage never arrives, prompt throughput
+                            # is explicitly unavailable and is not persisted.
+                            await response.aread()
+                            return False
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            event = _stream_event(line)
+                            if event is None:
+                                continue
+                            event_usage = event.get("usage")
+                            if isinstance(event_usage, dict):
+                                usage = event_usage
+                            output = _stream_output_text(event)
+                            if output:
+                                if first_token_at is None:
+                                    first_token_at = time.perf_counter()
+                                if sum(len(value) for value in text_parts) < 240:
+                                    text_parts.append(output)
+                    return True
+
+                if not await consume(request_body):
+                    started = time.perf_counter()
+                    first_token_at = None
+                    usage = {}
+                    text_parts = []
+                    await consume({
+                        key: value for key, value in request_body.items()
+                        if key != "stream_options"
+                    })
+                completed = time.perf_counter()
+                first_token_seconds = (
+                    first_token_at - started if first_token_at is not None else None
                 )
-                response.raise_for_status()
-                elapsed = time.perf_counter() - started
-                body = response.json()
-                usage = body.get("usage") or {}
-                text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
                 return {
-                    "latency_seconds": elapsed,
+                    "latency_seconds": completed - started,
+                    "time_to_first_token_seconds": first_token_seconds,
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage.get("completion_tokens") or 0),
-                    "sample": text[:240],
+                    "sample": "".join(text_parts)[:240],
                 }
 
             for index in range(warmup_requests):
@@ -357,6 +426,21 @@ class ControllerClient:
         completion_tokens = sum(result["completion_tokens"] for result in results)
         prompt_tokens = sum(result["prompt_tokens"] for result in results)
         latencies = [result["latency_seconds"] for result in results]
+        first_token_times = [
+            result["time_to_first_token_seconds"] for result in results
+            if result["time_to_first_token_seconds"] is not None
+        ]
+        prompt_metric_available = bool(
+            prompt_tokens > 0
+            and len(first_token_times) == len(results)
+            and all(value > 0 for value in first_token_times)
+            and all(result["prompt_tokens"] > 0 for result in results)
+        )
+        prompt_seconds = sum(first_token_times) if prompt_metric_available else None
+        prompt_tokens_per_second = (
+            prompt_tokens / prompt_seconds
+            if prompt_seconds is not None and prompt_seconds > 0 else None
+        )
         result = {
             "deployment_id": deployment_id,
             "model": model,
@@ -373,14 +457,31 @@ class ControllerClient:
                 "wall_seconds": wall_seconds,
                 "completion_tokens": completion_tokens,
                 "prompt_tokens": prompt_tokens,
+                "prompt_seconds": prompt_seconds,
+                "prompt_tokens_per_second": prompt_tokens_per_second,
                 "output_tokens_per_second": completion_tokens / wall_seconds if wall_seconds else 0.0,
                 "requests_per_second": len(results) / wall_seconds if wall_seconds else 0.0,
                 "mean_latency_seconds": statistics.fmean(latencies),
                 "p50_latency_seconds": self._percentile(latencies, 0.50),
                 "p95_latency_seconds": self._percentile(latencies, 0.95),
+                "mean_time_to_first_token_seconds": (
+                    statistics.fmean(first_token_times) if prompt_metric_available else None
+                ),
+                "p50_time_to_first_token_seconds": (
+                    self._percentile(first_token_times, 0.50) if prompt_metric_available else None
+                ),
+                "p95_time_to_first_token_seconds": (
+                    self._percentile(first_token_times, 0.95) if prompt_metric_available else None
+                ),
             },
             "samples": results,
         }
+        if not prompt_metric_available:
+            result["recording"] = {
+                "status": "not_recorded",
+                "reason": "prompt throughput unavailable because a request lacked first-token timing or prompt-token usage",
+            }
+            return result
         try:
             recorded = await self._request(
                 "POST", "/api/v1/benchmark-runs",
@@ -390,6 +491,7 @@ class ControllerClient:
                     "request_count": len(results),
                     "prompt_tokens": prompt_tokens,
                     "generation_tokens": completion_tokens,
+                    "prompt_seconds": prompt_seconds,
                     "wall_seconds": wall_seconds,
                 },
             )

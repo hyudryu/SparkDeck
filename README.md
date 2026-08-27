@@ -161,7 +161,7 @@ Community upload JSON always contains `model_id`, `context_window_size`, and `in
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
 
-Coordinated runs made through `benchmark_cluster_deployment` are grouped by model, context window, measured concurrency, and TP size. Open a model on **Benchmarks** to compare prompt and generation throughput at C1, C2, C5, and C10. Only combinations that were actually measured are plotted.
+Coordinated runs made through `benchmark_cluster_deployment` are grouped by model, context window, measured concurrency, and TP size. Open a model on **Benchmarks** to compare prompt and generation throughput at C1, C2, C5, and C10. Prompt throughput uses prompt tokens divided by measured time to first token; generation throughput uses completed tokens over the concurrent batch wall time. Runs without first-token timing and prompt-token usage remain local results and are not plotted. Only combinations that were actually measured are shown.
 
 ![Dark benchmark explorer showing prompt and text-generation throughput across C1, C2, C5, and C10](docs/screenshots/benchmark-explorer-dark.png)
 

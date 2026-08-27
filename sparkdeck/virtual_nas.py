@@ -245,8 +245,7 @@ class VirtualNAS:
             except ValueError:
                 continue
             snapshot_revisions = _complete_snapshot_revisions(repository)
-            if not snapshot_revisions:
-                continue
+            partial = not bool(snapshot_revisions)
             size_bytes = 0
             file_count = 0
             last_modified = 0.0
@@ -264,6 +263,13 @@ class VirtualNAS:
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
             revisions = set(snapshot_revisions)
+            if partial:
+                snapshots_root = repository / "snapshots"
+                if snapshots_root.is_dir() and not snapshots_root.is_symlink():
+                    revisions.update(
+                        item.name for item in snapshots_root.iterdir()
+                        if item.is_dir() and not item.is_symlink()
+                    )
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
                 for ref in refs_root.rglob("*"):
@@ -271,7 +277,7 @@ class VirtualNAS:
                         if not ref.is_file() or ref.is_symlink() or ref.stat().st_size > 4096:
                             continue
                         target = ref.read_text(encoding="utf-8").strip()
-                        if target in snapshot_revisions:
+                        if target in snapshot_revisions or partial:
                             revisions.add(ref.relative_to(refs_root).as_posix())
                     except (OSError, UnicodeError, ValueError):
                         continue
@@ -279,6 +285,7 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
+                "partial": partial,
                 "revisions": sorted(revisions),
                 "last_modified": (
                     datetime.fromtimestamp(last_modified, timezone.utc).isoformat()
@@ -451,6 +458,8 @@ class VirtualNAS:
         )
         if source_model is None:
             raise LookupError("cached source model not found")
+        if source_model.get("partial"):
+            raise RuntimeError("partial cached models cannot be transferred")
         model_size = _nonnegative_int(source_model.get("size_bytes"))
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")

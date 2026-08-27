@@ -23,9 +23,10 @@ COMMUNITY_EVIDENCE_POLICY = {
     "exact_match_dimensions": ["model_id", "context_window_size"],
     "metric": "inference_tokens_per_second",
 }
-# The hosted community API works out of the box; clearing the setting keeps
-# the installation fully local.
-DEFAULT_COMMUNITY_API_URL = os.environ.get(
+# The community backend is built in — every installation talks to the hosted
+# SparkDeck community API. Not user-configurable; the env override exists for
+# development and forks (set it empty to stay fully local while developing).
+COMMUNITY_API_URL = os.environ.get(
     "SPARKDECK_COMMUNITY_API_URL",
     "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
 )
@@ -115,10 +116,6 @@ class SparkDeckStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
-            )
-            self._connection.execute(
-                "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
-                ("community_api_url", json.dumps(DEFAULT_COMMUNITY_API_URL)),
             )
             deployment_columns = {
                 row[1] for row in self._connection.execute(
@@ -510,7 +507,7 @@ class SparkDeckStore:
                 "failed": counts.get("failed", 0),
                 "synced": counts.get("synced", 0),
             },
-            "cloud_endpoint_configured": bool(self.get_setting("community_api_url", None)),
+            "cloud_endpoint_configured": bool(COMMUNITY_API_URL),
         }
 
     def set_community_consent(self, enabled: bool) -> None:

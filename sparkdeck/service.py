@@ -29,6 +29,7 @@ from .runtimes import (
     safe_container_name,
 )
 from .storage import (
+    COMMUNITY_API_URL,
     COMMUNITY_EVIDENCE_POLICY,
     SparkDeckStore,
     community_context_window,
@@ -303,11 +304,7 @@ class SparkDeckService:
 
     async def community_aggregates(self) -> dict[str, Any]:
         """Return configured community evidence or privacy-safe local evidence."""
-        endpoint = str(
-            await asyncio.to_thread(
-                self.store.get_setting, "community_api_url", ""
-            ) or ""
-        ).strip().rstrip("/")
+        endpoint = COMMUNITY_API_URL.strip().rstrip("/")
         if not endpoint:
             items = await asyncio.to_thread(self.store.community_aggregates)
             return {

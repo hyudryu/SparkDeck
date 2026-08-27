@@ -102,7 +102,7 @@ describe('SparkDeck application shell', () => {
 
   it('persists the sidebar theme toggle locally and through settings', async () => {
     const user = userEvent.setup()
-    let settings = { theme: 'light', hf_token: '', hf_token_configured: false, community_api_url: 'https://community.example' }
+    let settings = { theme: 'light', hf_token: '', hf_token_configured: false }
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {

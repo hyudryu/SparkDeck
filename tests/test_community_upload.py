@@ -76,13 +76,17 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.get_setting = self.get_setting_patch.start()
         self.get_setting.side_effect = lambda key, default=None: {
-            "community_api_url": "https://community.example",
             "community_consent": True,
             "device_pairing": {
                 "status": "paired", "sub": "user-sub-123",
                 "email": "user@example.com", "refresh_token": "refresh-1",
             },
         }.get(key, default)
+        api_url_patch = patch.object(
+            server, "COMMUNITY_API_URL", "https://community.example",
+        )
+        api_url_patch.start()
+        self.addCleanup(api_url_patch.stop)
         self.jwks_patch = patch.object(
             server, "_cognito_jwks", return_value=_jwks_stub(),
         )
@@ -137,13 +141,12 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
 
     async def test_unconfigured_falls_back_to_the_local_stub(self):
-        self.get_setting.side_effect = lambda key, default=None: {
-            "community_consent": True,
-            "device_pairing": {
-                "status": "paired", "sub": "user-sub-123",
-                "email": "user@example.com", "refresh_token": "refresh-1",
-            },
-        }.get(key, default)
+        with patch.object(server, "COMMUNITY_API_URL", ""):
+            response = await self._request_unconfigured()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["availability"], "not_configured")
+
+    async def _request_unconfigured(self):
         http = _stub_http(self, Mock(side_effect=AssertionError("no HTTP")))
         self.addAsyncCleanup(http.aclose)
         with patch.object(
@@ -153,11 +156,8 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
                 "evidence_policy": {},
             }),
         ):
-            response = await self.client.get(
+            return await self.client.get(
                 "/api/v1/community/aggregates", headers=_bearer())
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["availability"], "not_configured")
 
     async def test_upstream_outage_reports_unavailable(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -180,12 +180,17 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         self.store = SparkDeckStore(Path(self.temp.name) / "sparkdeck.sqlite3")
         self.store_patch = patch.object(server.sparkdeck, "store", self.store)
         self.store_patch.start()
+        self.api_url_patch = patch.object(
+            server, "COMMUNITY_API_URL", "https://community.example",
+        )
+        self.api_url_patch.start()
         self.requests: list[httpx.Request] = []
         server._community_token_cache.update({
             "refresh_token": None, "id_token": None, "expires_at": 0.0,
         })
 
     async def asyncTearDown(self):
+        self.api_url_patch.stop()
         self.store_patch.stop()
         self.store.close()
         self.temp.cleanup()
@@ -195,7 +200,6 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
 
     def configure(self, consent=True, paired=True):
         self.store.set_setting("community_consent", consent)
-        self.store.set_setting("community_api_url", "https://community.example")
         if paired:
             self.store.set_setting("device_pairing", {
                 "status": "paired", "sub": "user-sub-123",

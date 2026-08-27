@@ -268,7 +268,6 @@ export interface AppSettings {
   default_context_length?: number
   hf_token?: string
   hf_token_configured?: boolean
-  community_api_url?: string
   telemetry_interval_seconds?: number
   [key: string]: unknown
 }

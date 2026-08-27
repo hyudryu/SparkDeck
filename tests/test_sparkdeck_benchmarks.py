@@ -1,3 +1,5 @@
+import asyncio
+import json
 import socket
 import tempfile
 import threading
@@ -5,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -13,6 +15,8 @@ from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeK
 from sparkdeck.service import (
     SparkDeckService,
     _COMMUNITY_MAX_RESPONSE_BYTES,
+    _community_upload_url,
+    _post_public_community_url,
     _read_bounded_community_response,
 )
 
@@ -63,6 +67,231 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
+
+    async def test_upload_worker_drains_exact_privacy_payload_with_idempotency(self):
+        requests = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(202, request=request)
+
+        self.service._community_upload_url = (
+            "https://community.example/api/v1/community"
+        )
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        self.service._record_response(
+            None, "org/model", "vllm", {"context_size": 4096},
+            time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+
+        synced = await self.service.upload_community_once()
+
+        self.assertEqual(synced, 1)
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request.headers["host"], "community.example")
+        self.assertEqual(
+            request.headers["authorization"], "Bearer node-scoped-token",
+        )
+        self.assertTrue(request.headers["idempotency-key"])
+        self.assertEqual(request.url.path, "/api/v1/community/benchmarks")
+        self.assertEqual(set(json.loads(request.content)), {
+            "model_id", "context_window_size",
+            "inference_tokens_per_second",
+        })
+        self.assertEqual(
+            self.service.store.sync_status()["outbox"]["synced"], 1,
+        )
+
+    async def test_upload_worker_requires_node_scoped_configuration(self):
+        requested = []
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requested.append(request) or httpx.Response(200),
+        )
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+
+        self.assertEqual(await self.service.upload_community_once(), 0)
+        self.assertEqual(requested, [])
+
+    async def test_invalid_upload_endpoint_is_unconfigured_without_failing_queue(self):
+        requests = []
+        self.service._community_upload_url = "http://community.example/api"
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(202),
+        )
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        self.service._record_response(
+            None, "org/model", "vllm", {"context_size": 4096},
+            time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+
+        self.assertFalse(self.service.community_upload_configured)
+        self.assertEqual(await self.service.upload_community_once(), 0)
+        self.assertEqual(requests, [])
+        self.assertEqual(
+            self.service.store.sync_status()["outbox"],
+            {"pending": 1, "waiting_for_account": 0, "failed": 0, "synced": 0},
+        )
+
+    async def test_upload_endpoint_requires_https(self):
+        with self.assertRaisesRegex(ValueError, "must use HTTPS"):
+            _community_upload_url("http://community.example/api")
+
+        resolver = Mock(side_effect=AssertionError("must not resolve"))
+        with self.assertRaisesRegex(ValueError, "must use HTTPS"):
+            await _post_public_community_url(
+                "http://community.example/benchmarks",
+                {"model_id": "org/model", "context_window_size": 4096,
+                 "inference_tokens_per_second": 96.0},
+                token="node-token", idempotency_key="sample-1",
+                resolver=resolver,
+            )
+        resolver.assert_not_called()
+
+    async def test_upload_status_does_not_read_untrusted_response_body(self):
+        class NeverReadBody(httpx.AsyncByteStream):
+            def __init__(self):
+                self.iterated = False
+                self.closed = False
+
+            async def __aiter__(self):
+                self.iterated = True
+                raise AssertionError("upload response body must not be read")
+                yield b"unreachable"
+
+            async def aclose(self):
+                self.closed = True
+
+        body = NeverReadBody()
+        response = await _post_public_community_url(
+            "https://community.example/api/v1/community/benchmarks",
+            {"model_id": "org/model", "context_window_size": 4096,
+             "inference_tokens_per_second": 96.0},
+            token="node-token",
+            idempotency_key="sample-1",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(204, stream=body, request=request),
+            ),
+            resolver=self.manager.community_resolver,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(body.iterated)
+        self.assertTrue(body.closed)
+
+    async def test_unpair_stops_a_multi_item_upload_after_in_flight_request(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        requests = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                first_started.set()
+                await release_first.wait()
+            return httpx.Response(202, request=request)
+
+        self.service._community_upload_url = "https://community.example/api"
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        for model in ("org/model-one", "org/model-two"):
+            self.service._record_response(
+                None, model, "vllm", {"context_size": 4096},
+                time.monotonic() - 0.25,
+                {
+                    "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                    "timings": {"predicted_per_second": 96.0},
+                },
+            )
+
+        upload = asyncio.create_task(self.service.upload_community_once())
+        await first_started.wait()
+        unpair = asyncio.create_task(
+            self.service.unpair_community_device("user-sub-123"),
+        )
+        await asyncio.sleep(0)
+        release_first.set()
+
+        self.assertEqual((await unpair)[0], "unpaired")
+        self.assertEqual(await upload, 1)
+        self.assertEqual(len(requests), 1)
+        status = self.service.store.sync_status()["outbox"]
+        self.assertEqual(status["synced"], 1)
+        self.assertEqual(status["pending"], 1)
+
+    async def test_deleted_queued_snapshot_is_rechecked_before_its_turn(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        requests = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                first_started.set()
+                await release_first.wait()
+            return httpx.Response(202, request=request)
+
+        self.service._community_upload_url = "https://community.example/api"
+        self.service._community_upload_token = "node-scoped-token"
+        self.manager.community_http_transport = httpx.MockTransport(respond)
+        self.service.store.set_setting("device_pairing", {
+            "status": "paired", "sub": "user-sub-123",
+        })
+        self.service.store.set_community_consent(True)
+        for model in ("org/model-one", "org/model-two"):
+            self.service._record_response(
+                None, model, "vllm", {"context_size": 4096},
+                time.monotonic() - 0.25,
+                {
+                    "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                    "timings": {"predicted_per_second": 96.0},
+                },
+            )
+        samples, _ = self.service.store.benchmarks()
+        sample_ids = {
+            item["model"]["repository"]: item["id"] for item in samples
+        }
+
+        upload = asyncio.create_task(self.service.upload_community_once())
+        await first_started.wait()
+        first_model = json.loads(requests[0].content)["model_id"]
+        deleted_model = (
+            "org/model-two" if first_model == "org/model-one" else "org/model-one"
+        )
+        # Exercise the storage boundary directly to prove the worker does not
+        # trust the batch payload it captured before the first request.
+        self.assertTrue(self.service.store.delete_benchmark(sample_ids[deleted_model]))
+        release_first.set()
+
+        self.assertEqual(await upload, 1)
+        self.assertEqual(len(requests), 1)
+        remaining, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertNotEqual(remaining[0]["model"]["repository"], deleted_model)
 
     async def test_configured_community_aggregates_are_fetched_and_sanitized(self):
         requested = []

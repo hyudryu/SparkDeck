@@ -350,11 +350,12 @@ class NodeRegistry:
         *,
         json_body: dict | None = None,
         timeout: float = 30,
+        allow_disabled: bool = False,
     ) -> Any:
         node = self.get(node_id)
         if not node or node_id == LOCAL_NODE_ID:
             raise ValueError("remote node not found")
-        if not node.get("enabled", True):
+        if not allow_disabled and not node.get("enabled", True):
             raise ValueError(f"node {node.get('name', node_id)} is disabled")
         try:
             targets = await self._connection_targets(

@@ -254,6 +254,7 @@ describe('model deployments', () => {
 
     expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Recipes' })).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
     expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved cluster' })
@@ -297,6 +298,7 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved main' })
 
@@ -326,6 +328,7 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Other 1' }))
     await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Local weights' })
 
@@ -356,6 +359,7 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved local' })
     await user.click(within(dialog).getByRole('button', { name: 'Deploy on 1 node' }))
@@ -400,6 +404,7 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved replicas' })
 
@@ -537,12 +542,45 @@ describe('model deployments', () => {
 
     expect(await screen.findByRole('heading', { name: 'deepseek-ai 1' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Qwen 1' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'deepseek-ai 1' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Pin DS config' })).not.toBeInTheDocument()
 
+    await user.click(screen.getByRole('button', { name: 'deepseek-ai 1' }))
     const pin = screen.getByRole('button', { name: 'Pin DS config' })
     expect(pin).toHaveAttribute('aria-pressed', 'false')
     await user.click(pin)
     expect(screen.getByRole('button', { name: 'Unpin DS config' })).toHaveAttribute('aria-pressed', 'true')
     expect(JSON.parse(localStorage.getItem('sparkdeck:pinned-recipes') ?? '[]')).toContain('recipe-ds')
+  })
+
+  it('collapses recipe groups by default and toggles card visibility', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 2,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    const toggle = await screen.findByRole('button', { name: 'org 1' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Choose nodes & deploy' })).not.toBeInTheDocument()
+
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: 'org 1' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('button', { name: 'Choose nodes & deploy' })).toBeInTheDocument()
+    expect(screen.getByText('2 saved')).toBeInTheDocument()
+
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    expect(screen.queryByRole('button', { name: 'Choose nodes & deploy' })).not.toBeInTheDocument()
   })
 
   it('sorts deployments by recency or name and renames them inline', async () => {
@@ -642,6 +680,7 @@ describe('model deployments', () => {
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
 
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(await screen.findByRole('button', { name: 'Arguments' }))
     const contextWindow = await screen.findByRole('spinbutton', { name: 'Context window' })
     expect(contextWindow).toHaveValue(32768)

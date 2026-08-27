@@ -61,6 +61,56 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["status_message"], "Docker is unavailable")
         self.assertFalse(status["docker_ready"])
 
+    async def test_agent_status_rejects_windows_container_daemon(self):
+        manager = self.manager_without_docker()
+        client = Mock()
+        client.ping.return_value = True
+        client.info.return_value = {"OSType": "windows"}
+        client.containers.list.return_value = []
+        manager.client._client = client
+        manager.get_disk = AsyncMock(return_value={})
+
+        status = await manager.agent_status(stats={})
+
+        self.assertFalse(status["docker_ready"])
+        self.assertEqual(status["status"], "degraded")
+        self.assertEqual(
+            status["status_message"],
+            "Docker must be configured to use Linux containers",
+        )
+
+    async def test_linux_container_daemon_is_ready(self):
+        manager = self.manager_without_docker()
+        client = Mock()
+        client.ping.return_value = True
+        client.info.return_value = {"OSType": "linux"}
+        client.containers.list.return_value = []
+        manager.client._client = client
+        manager.get_disk = AsyncMock(return_value={})
+
+        status = await manager.agent_status(stats={})
+
+        self.assertTrue(status["docker_ready"])
+        self.assertEqual(status["status"], "online")
+        self.assertIsNone(status["status_message"])
+
+    async def test_state_rejects_windows_container_daemon(self):
+        manager = self.manager_without_docker()
+        client = Mock()
+        client.ping.return_value = True
+        client.info.return_value = {"OSType": "windows"}
+        client.containers.list.return_value = []
+        client.images.list.return_value = []
+        manager.client._client = client
+        manager.get_stats = AsyncMock(return_value={})
+        manager.get_disk = AsyncMock(return_value={})
+
+        state = await manager.get_state()
+
+        local = next(node for node in state["nodes"] if node.get("local"))
+        self.assertFalse(local["docker_ready"])
+        self.assertFalse(state["docker_ready"])
+
     async def test_docker_inventory_recovers_without_restarting_manager(self):
         manager = self.manager_without_docker()
         manager.client._retry_after = 0.0
@@ -193,7 +243,52 @@ class RetryingDockerClientTests(unittest.TestCase):
         reconnect.assert_called_once_with()
         self.assertEqual(client.ping.call_count, 2)
 
-    def test_in_progress_reconnect_does_not_queue_another_caller(self):
+    def test_concurrent_caller_shares_first_successful_connection(self):
+        entered = threading.Event()
+        release = threading.Event()
+        waiter_entered = threading.Event()
+        client = Mock()
+        client.ping.return_value = True
+
+        def connect():
+            entered.set()
+            release.wait(timeout=2)
+            return client
+
+        proxy = _RetryingDockerClient(connect_wait_timeout=1)
+        original_wait_for = proxy._condition.wait_for
+
+        def observed_wait_for(predicate, timeout=None):
+            waiter_entered.set()
+            return original_wait_for(predicate, timeout)
+
+        proxy._condition.wait_for = observed_wait_for
+        results = []
+
+        def call_ping():
+            try:
+                results.append(proxy.ping())
+            except Exception as exc:
+                results.append(exc)
+
+        with patch("manager.docker.from_env", side_effect=connect) as reconnect:
+            first = threading.Thread(target=call_ping)
+            second = threading.Thread(target=call_ping)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            self.assertTrue(waiter_entered.wait(timeout=1))
+            release.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(results, [True, True])
+        reconnect.assert_called_once_with()
+        self.assertEqual(client.ping.call_count, 2)
+
+    def test_hung_reconnect_only_blocks_another_caller_for_bounded_wait(self):
         entered = threading.Event()
         release = threading.Event()
         first_error = []
@@ -203,7 +298,10 @@ class RetryingDockerClientTests(unittest.TestCase):
             release.wait(timeout=2)
             raise docker.errors.DockerException("daemon timed out")
 
-        proxy = _RetryingDockerClient(retry_interval=5)
+        proxy = _RetryingDockerClient(
+            retry_interval=5,
+            connect_wait_timeout=0.05,
+        )
 
         def first_caller():
             try:
@@ -225,6 +323,7 @@ class RetryingDockerClientTests(unittest.TestCase):
             thread.join(timeout=1)
 
         self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(elapsed, 0.04)
         self.assertLess(elapsed, 0.5)
         self.assertEqual(reconnect.call_count, 1)
         self.assertEqual(len(first_error), 1)

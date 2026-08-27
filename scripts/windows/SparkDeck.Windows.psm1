@@ -375,10 +375,35 @@ function Get-SparkDeckFrontendFingerprint {
     if ([IO.Directory]::Exists($sourceDirectory)) {
         Get-ChildItem -LiteralPath $sourceDirectory -File -Recurse | ForEach-Object { $files.Add($_) }
     }
-    $lines = $files | Sort-Object FullName | ForEach-Object {
+    $lines = @($files | Sort-Object FullName | ForEach-Object {
         $relative = $_.FullName.Substring($Paths.Frontend.Length).TrimStart('\', '/')
         $contentHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         "{0}|{1}" -f $relative, $contentHash
+    })
+    # vite.config.ts embeds buildVersion() into the generated JavaScript. Keep
+    # the launcher cache key aligned with every input that function reads so a
+    # new backend revision (or an explicit release version) cannot keep serving
+    # an older version string from frontend/dist.
+    foreach ($name in @("SPARKDECK_VERSION", "GITHUB_REF_TYPE", "GITHUB_REF_NAME", "GITHUB_SHA")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        $lines += "environment:{0}|{1}" -f $name, [string]$value
+    }
+    $git = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($null -ne $git) {
+        foreach ($probe in @(
+            [pscustomobject]@{ Name = "revision"; Arguments = @("-C", $Paths.Root, "rev-parse", "HEAD") },
+            [pscustomobject]@{ Name = "status"; Arguments = @("-C", $Paths.Root, "status", "--porcelain", "--untracked-files=no") },
+            [pscustomobject]@{ Name = "exact-tag"; Arguments = @("-C", $Paths.Root, "describe", "--tags", "--exact-match", "HEAD") }
+        )) {
+            try {
+                $result = Invoke-SparkDeckNativeCapture -FilePath $git.Source -Arguments $probe.Arguments
+                $value = if ($result.ExitCode -eq 0) { $result.Stdout.Trim() } else { "" }
+                $lines += "git:{0}|{1}" -f $probe.Name, $value
+            }
+            catch {
+                $lines += "git:{0}|" -f $probe.Name
+            }
+        }
     }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -468,6 +493,66 @@ function Quote-SparkDeckProcessArgument {
     return '"' + (($Value -replace '(\\+)$', '$1$1') -replace '"', '\"') + '"'
 }
 
+function Stop-SparkDeckProcessTree {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        $ExpectedStartTimeUtc = $null,
+        [int]$TimeoutSeconds = 5
+    )
+
+    $Process.Refresh()
+    if ($Process.HasExited) { return }
+    if ($null -ne $ExpectedStartTimeUtc) {
+        $expected = ([DateTime]$ExpectedStartTimeUtc).ToUniversalTime()
+        if ([Math]::Abs(($Process.StartTime.ToUniversalTime() - $expected).TotalSeconds) -gt 5) {
+            throw ("refusing to terminate PID {0} because its start time no longer matches" -f $Process.Id)
+        }
+    }
+
+    # A Windows venv python.exe is a redirector that can leave the real base
+    # interpreter running as its child. taskkill /T terminates that complete
+    # tree; the exact Process/start time check above prevents acting on a stale
+    # PID. Invoke-SparkDeckNativeCapture also bounds a hung taskkill command.
+    if ($env:OS -eq "Windows_NT") {
+        $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        if (-not [IO.File]::Exists($taskkill)) {
+            throw "Windows taskkill.exe was not found"
+        }
+        $result = Invoke-SparkDeckNativeCapture -FilePath $taskkill `
+            -Arguments @("/PID", [string]$Process.Id, "/T", "/F") `
+            -TimeoutSeconds $TimeoutSeconds
+        $Process.Refresh()
+        if ($result.ExitCode -ne 0 -and -not $Process.HasExited) {
+            throw ("could not terminate SparkDeck process tree for PID {0}: {1}" -f $Process.Id, $result.Stderr.Trim())
+        }
+    }
+    else {
+        $Process.Kill()
+    }
+
+    if (-not $Process.WaitForExit($TimeoutSeconds * 1000)) {
+        throw ("timed out waiting for SparkDeck process tree rooted at PID {0} to exit" -f $Process.Id)
+    }
+}
+
+function Stop-SparkDeckValidatedProcessTree {
+    param($Paths, $Record, [int]$TimeoutSeconds = 5)
+
+    if (-not (Test-SparkDeckProcessIdentity $Paths $Record)) { return $false }
+    try {
+        $process = Get-Process -Id ([int]$Record.pid) -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    # Revalidate after acquiring the Process object, then pass both that exact
+    # object and its recorded start time to the tree terminator.
+    if (-not (Test-SparkDeckProcessIdentity $Paths $Record)) { return $false }
+    $expectedStart = [DateTime]::Parse([string]$Record.started_at_utc).ToUniversalTime()
+    Stop-SparkDeckProcessTree -Process $process -ExpectedStartTimeUtc $expectedStart -TimeoutSeconds $TimeoutSeconds
+    return $true
+}
+
 function Start-SparkDeck {
     $paths = Get-SparkDeckPaths
     $result = Invoke-WithSparkDeckLock $paths {
@@ -502,24 +587,22 @@ function Start-SparkDeck {
             -RedirectStandardError $paths.StderrLog `
             -WindowStyle Hidden `
             -PassThru
+        $processStartTimeUtc = $process.StartTime.ToUniversalTime()
         try {
             Write-SparkDeckPidRecord $paths $process
         }
         catch {
+            $pidRecordError = $_.Exception
             # This is the exact Process instance returned above. Do not use a
             # PID lookup here because the PID record was never persisted and a
             # later lookup could target a reused PID.
             try {
-                $process.Refresh()
-                if (-not $process.HasExited) {
-                    $process.Kill()
-                }
-                $process.WaitForExit()
+                Stop-SparkDeckProcessTree -Process $process -ExpectedStartTimeUtc $processStartTimeUtc
             }
             catch {
-                # Preserve the PID-record exception that made startup unsafe.
+                throw ("SparkDeck could not write its PID record ({0}) and could not terminate the new process tree safely ({1})" -f $pidRecordError.Message, $_.Exception.Message)
             }
-            throw
+            throw $pidRecordError
         }
 
         $timeout = 60
@@ -546,9 +629,7 @@ function Start-SparkDeck {
         }
 
         $current = Get-SparkDeckPidRecord $paths
-        if (Test-SparkDeckProcessIdentity $paths $current) {
-            Stop-Process -Id ([int]$current.pid) -Force -ErrorAction SilentlyContinue
-        }
+        Stop-SparkDeckValidatedProcessTree -Paths $paths -Record $current | Out-Null
         Remove-SparkDeckPidRecord $paths
         throw ("SparkDeck did not become healthy within {0} seconds. See {1}" -f $timeout, $paths.StderrLog)
     }
@@ -577,8 +658,7 @@ function Stop-SparkDeck {
         $current = Get-SparkDeckPidRecord $paths
         if (Test-SparkDeckProcessIdentity $paths $current) {
             Write-Warning "SparkDeck did not stop gracefully; forcing its validated process to exit."
-            Stop-Process -Id ([int]$current.pid) -Force -ErrorAction Stop
-            try { Wait-Process -Id ([int]$current.pid) -Timeout 5 -ErrorAction SilentlyContinue } catch { }
+            Stop-SparkDeckValidatedProcessTree -Paths $paths -Record $current | Out-Null
         }
         if ([IO.File]::Exists($paths.ShutdownFile)) {
             Remove-Item -LiteralPath $paths.ShutdownFile -Force
@@ -778,6 +858,7 @@ Export-ModuleMember -Function @(
     "Test-SparkDeckPortOpen",
     "Invoke-SparkDeckCheckedCommand",
     "Get-SparkDeckFrontendFingerprint",
+    "Stop-SparkDeckProcessTree",
     "Add-SparkDeckPathEntry",
     "Remove-SparkDeckPathEntry",
     "Invoke-SparkDeckCommand"

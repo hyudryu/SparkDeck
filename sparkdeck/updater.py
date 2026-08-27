@@ -57,6 +57,55 @@ def current_revision(root: Path) -> str | None:
         return None
 
 
+def assert_checkout_safe(root: Path, revision: str) -> None:
+    """Dry-run Git's live tree transition before any cluster node changes."""
+    result = subprocess.run(
+        ["git", "read-tree", "--dry-run", "-m", "-u", "HEAD", revision],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[:400]
+        raise RuntimeError(
+            "origin/main cannot be installed without overwriting local files"
+            + (f": {detail}" if detail else "")
+        )
+
+    # unpack-trees deliberately permits ignored files to be replaced. The
+    # helper uses --no-overwrite-ignore, so mirror that stricter behavior in
+    # preflight by checking newly tracked target paths that already exist.
+    additions = _run(
+        root, "git", "diff", "--name-only", "--diff-filter=A", "-z",
+        "HEAD", revision,
+    ).split("\0")
+    candidates: set[str] = set()
+    for relative in (item for item in additions if item):
+        candidate = root / relative
+        if os.path.lexists(candidate):
+            candidates.add(relative)
+        parent = candidate.parent
+        while parent != root and root in parent.parents:
+            if os.path.lexists(parent) and not parent.is_dir():
+                candidates.add(parent.relative_to(root).as_posix())
+                break
+            parent = parent.parent
+    if not candidates:
+        return
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-z", "--stdin"],
+        cwd=root, input="\0".join(sorted(candidates)) + "\0",
+        capture_output=True, text=True, check=False,
+    )
+    if ignored.returncode not in {0, 1}:
+        detail = (ignored.stderr or ignored.stdout).strip()[:400]
+        raise RuntimeError(detail or "Could not verify ignored-file checkout safety")
+    collisions = [item for item in ignored.stdout.split("\0") if item]
+    if collisions:
+        raise RuntimeError(
+            "origin/main cannot be installed without overwriting ignored local files: "
+            + ", ".join(collisions[:10])
+        )
+
+
 def _boot_id() -> str | None:
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
@@ -426,18 +475,13 @@ class UpdateService:
         ).returncode == 0
         if not still_on_main:
             raise RuntimeError("The approved commit is no longer in origin/main history")
-        forward = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", "HEAD", revision], cwd=self.root,
-            capture_output=True, text=True, check=False,
-        ).returncode == 0
-        if not forward:
-            raise RuntimeError("origin/main is not a forward-only update from the installed revision")
         try:
             manifest = json.loads(_run(self.root, "git", "show", f"{revision}:sparkdeck-update.json"))
         except (RuntimeError, ValueError) as exc:
             raise RuntimeError("origin/main has no valid update compatibility manifest") from exc
         if manifest.get("update_protocol") != 1 or manifest.get("data_schema") != 1:
             raise RuntimeError("origin/main is not compatible with this updater or data schema")
+        assert_checkout_safe(self.root, revision)
         return {"ok": True, "capability": CAPABILITY, "target_revision": revision.lower()}
 
     async def preflight_release_local(self, tag: str, revision: str) -> dict:

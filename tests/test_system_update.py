@@ -1,14 +1,22 @@
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 
-from sparkdeck.updater import CAPABILITY, CONFIRMATION, MAIN_BRANCH, MAIN_COMMIT_API, UpdateService
+from sparkdeck.updater import (
+    CAPABILITY,
+    CONFIRMATION,
+    MAIN_BRANCH,
+    MAIN_COMMIT_API,
+    UpdateService,
+    assert_checkout_safe,
+)
 from sparkdeck.update_helper import (
     _prepare_frontend_bundle,
     _publish_frontend_bundle,
@@ -32,6 +40,23 @@ class FakeManager:
 
 def response(status, value):
     return httpx.Response(status, json=value, request=httpx.Request("GET", "https://api.github.com/test"))
+
+
+def git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def initialize_git_repository(root: Path) -> None:
+    git(root, "init")
+    git(root, "config", "user.name", "SparkDeck Tests")
+    git(root, "config", "user.email", "sparkdeck-tests@example.invalid")
+    git(root, "checkout", "-b", "main")
+    (root / "state.txt").write_text("base", encoding="utf-8")
+    git(root, "add", "state.txt")
+    git(root, "commit", "-m", "base")
 
 
 class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -164,7 +189,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.node_registry.request.await_args_list[1].kwargs["json_body"], expected)
         self.service.start_local.assert_awaited_once_with("main", "b" * 40)
 
-    async def test_preflight_fetches_exact_main_ref_and_rejects_non_forward_target(self):
+    async def test_preflight_accepts_divergent_clean_checkout(self):
         commands = []
 
         def command(_root, *args, **_kwargs):
@@ -177,15 +202,35 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("sparkdeck.updater.local_blockers", return_value=[]), \
              patch("sparkdeck.updater._run", side_effect=command), \
-             patch("sparkdeck.updater.subprocess.run", side_effect=[
-                 Mock(returncode=0), Mock(returncode=1),
-             ]):
-            with self.assertRaisesRegex(RuntimeError, "forward-only"):
-                await self.service.preflight_local("main", "b" * 40)
+             patch(
+                 "sparkdeck.updater.subprocess.run", return_value=Mock(returncode=0)
+             ) as process_run:
+            result = await self.service.preflight_local("main", "b" * 40)
+        self.assertTrue(result["ok"])
         self.assertIn((
             "git", "fetch", "--force", "origin",
             "refs/heads/main:refs/remotes/origin/main",
         ), commands)
+        self.assertEqual(process_run.call_count, 2)
+        process_run.assert_called_with(
+            ["git", "read-tree", "--dry-run", "-m", "-u", "HEAD", "b" * 40],
+            cwd=self.root, capture_output=True, text=True, check=False,
+        )
+
+    async def test_preflight_rejects_approved_commit_removed_from_main(self):
+        def command(_root, *args, **_kwargs):
+            if args[:2] == ("git", "rev-parse"):
+                return "c" * 40
+            return ""
+
+        with patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._run", side_effect=command), \
+             patch(
+                 "sparkdeck.updater.subprocess.run",
+                 side_effect=[Mock(returncode=1), Mock(returncode=0)],
+             ):
+            with self.assertRaisesRegex(RuntimeError, "no longer in origin/main"):
+                await self.service.preflight_local("main", "b" * 40)
 
     async def test_preflight_accepts_pinned_commit_after_main_advances(self):
         def command(_root, *args, **_kwargs):
@@ -206,6 +251,23 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(process_run.call_args_list[0].args[0], [
             "git", "merge-base", "--is-ancestor", "b" * 40, "c" * 40,
         ])
+
+    async def test_preflight_rejects_checkout_collision(self):
+        def command(_root, *args, **_kwargs):
+            if args[:2] == ("git", "rev-parse"):
+                return "b" * 40
+            if args[:2] == ("git", "show"):
+                return '{"update_protocol": 1, "data_schema": 1}'
+            return ""
+
+        with patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._run", side_effect=command), \
+             patch("sparkdeck.updater.subprocess.run", side_effect=[
+                 Mock(returncode=0),
+                 Mock(returncode=1, stderr="untracked file would be overwritten"),
+             ]):
+            with self.assertRaisesRegex(RuntimeError, "overwriting local files"):
+                await self.service.preflight_local("main", "b" * 40)
 
     async def test_interrupted_local_helper_becomes_retryable(self):
         self.service._write(self.service.agent_path, {
@@ -233,6 +295,121 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpdateHelperTests(unittest.TestCase):
+    def test_divergent_checkout_installs_target_without_moving_feature_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialize_git_repository(root)
+            git(root, "branch", "feature/work")
+            (root / "state.txt").write_text("main", encoding="utf-8")
+            git(root, "commit", "-am", "main update")
+            target = git(root, "rev-parse", "HEAD")
+            git(root, "checkout", "feature/work")
+            (root / "feature.txt").write_text("preserve me", encoding="utf-8")
+            git(root, "add", "feature.txt")
+            git(root, "commit", "-m", "feature work")
+            feature_tip = git(root, "rev-parse", "HEAD")
+
+            mode = install_revision(root, target)
+
+            self.assertEqual(mode, "detached")
+            self.assertEqual(git(root, "rev-parse", "HEAD"), target)
+            self.assertEqual(git(root, "rev-parse", "feature/work"), feature_tip)
+            branch = subprocess.run(
+                ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+                cwd=root, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(branch.returncode, 0)
+
+    def test_main_branch_detaches_without_moving_main_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialize_git_repository(root)
+            git(root, "checkout", "-b", "target")
+            (root / "main.txt").write_text("target", encoding="utf-8")
+            git(root, "add", "main.txt")
+            git(root, "commit", "-m", "target")
+            target = git(root, "rev-parse", "HEAD")
+            git(root, "checkout", "main")
+            local_main = git(root, "rev-parse", "main")
+
+            mode = install_revision(root, target)
+
+            self.assertEqual(mode, "detached")
+            self.assertEqual(git(root, "rev-parse", "HEAD"), target)
+            self.assertEqual(git(root, "branch", "--show-current"), "")
+            self.assertEqual(git(root, "rev-parse", "main"), local_main)
+
+    def test_divergent_main_detaches_without_moving_main_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialize_git_repository(root)
+            git(root, "checkout", "-b", "target")
+            (root / "target.txt").write_text("target", encoding="utf-8")
+            git(root, "add", "target.txt")
+            git(root, "commit", "-m", "target")
+            target = git(root, "rev-parse", "HEAD")
+            git(root, "checkout", "main")
+            (root / "local.txt").write_text("local", encoding="utf-8")
+            git(root, "add", "local.txt")
+            git(root, "commit", "-m", "local main")
+            local_main = git(root, "rev-parse", "HEAD")
+
+            mode = install_revision(root, target)
+
+            self.assertEqual(mode, "detached")
+            self.assertEqual(git(root, "rev-parse", "HEAD"), target)
+            self.assertEqual(git(root, "rev-parse", "main"), local_main)
+
+    def test_untracked_collision_blocks_detach_without_moving_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialize_git_repository(root)
+            git(root, "checkout", "-b", "target")
+            (root / "collision.txt").write_text("target", encoding="utf-8")
+            git(root, "add", "collision.txt")
+            git(root, "commit", "-m", "target")
+            target = git(root, "rev-parse", "HEAD")
+            git(root, "checkout", "main")
+            (root / "collision.txt").write_text("local untracked", encoding="utf-8")
+            original = git(root, "rev-parse", "HEAD")
+
+            with self.assertRaisesRegex(RuntimeError, "would be overwritten"):
+                install_revision(root, target)
+
+            self.assertEqual(git(root, "rev-parse", "HEAD"), original)
+            self.assertEqual(git(root, "branch", "--show-current"), "main")
+            self.assertEqual(
+                (root / "collision.txt").read_text(encoding="utf-8"),
+                "local untracked",
+            )
+
+    def test_preflight_and_install_refuse_ignored_file_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialize_git_repository(root)
+            (root / ".gitignore").write_text("secret.env\n", encoding="utf-8")
+            git(root, "add", ".gitignore")
+            git(root, "commit", "-m", "ignore local secret")
+            git(root, "checkout", "-b", "target")
+            (root / "secret.env").write_text("target", encoding="utf-8")
+            git(root, "add", "--force", "secret.env")
+            git(root, "commit", "-m", "target tracks path")
+            target = git(root, "rev-parse", "HEAD")
+            git(root, "checkout", "main")
+            (root / "secret.env").write_text("local secret", encoding="utf-8")
+            original = git(root, "rev-parse", "HEAD")
+
+            with self.assertRaisesRegex(RuntimeError, "overwriting ignored local files"):
+                assert_checkout_safe(root, target)
+            with self.assertRaisesRegex(RuntimeError, "would be overwritten"):
+                install_revision(root, target)
+
+            self.assertEqual(git(root, "rev-parse", "HEAD"), original)
+            self.assertEqual(
+                (root / "secret.env").read_text(encoding="utf-8"),
+                "local secret",
+            )
+
     def test_frontend_bundle_publish_and_rollback_preserve_correct_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -303,10 +480,21 @@ class UpdateHelperTests(unittest.TestCase):
 
     @patch("sparkdeck.update_helper.run")
     @patch("sparkdeck.update_helper.subprocess.run")
-    def test_main_install_rejects_backward_revision(self, process_run, command_run):
+    def test_main_fetch_rejects_target_removed_from_main(self, process_run, command_run):
+        command_run.side_effect = ["", "c" * 40]
         process_run.return_value = Mock(returncode=1)
 
-        with self.assertRaisesRegex(RuntimeError, "forward-only"):
-            install_revision(Path("/sparkdeck"), "b" * 40)
+        with self.assertRaisesRegex(RuntimeError, "no longer in origin/main"):
+            fetch_update_target(Path("/sparkdeck"), MAIN_BRANCH, "b" * 40)
 
-        command_run.assert_not_called()
+    @patch("sparkdeck.update_helper.run")
+    def test_main_install_detaches_divergent_checkout(self, command_run):
+        command_run.return_value = ""
+
+        mode = install_revision(Path("/sparkdeck"), "b" * 40)
+
+        self.assertEqual(mode, "detached")
+        command_run.assert_called_once_with(
+            Path("/sparkdeck"), "git", "checkout", "--no-overwrite-ignore",
+            "--detach", "b" * 40,
+        )

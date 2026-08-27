@@ -52,6 +52,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [themeSyncing, setThemeSyncing] = useState(false)
   const [themeStatus, setThemeStatus] = useState('')
   const [switchDetected, setSwitchDetected] = useState(false)
+  const [nodeName, setNodeName] = useState('')
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
   const themeInteractedRef = useRef(false)
@@ -63,6 +64,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     const controller = new AbortController()
     api.settings.get(controller.signal).then((settings) => {
+      const name = settings.cluster_node_name
+      setNodeName(typeof name === 'string' ? name.trim() : '')
       if (themeInteractedRef.current) return
       persistTheme(settings.theme ?? storedTheme())
       setTheme(resolvedTheme())
@@ -200,6 +203,10 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <Icon size={19} aria-hidden="true" />
               <span>{label}</span>
+              {/* The leading space separates the node name in the accessible
+                  name: JSX strips inter-element whitespace and jsdom has no
+                  layout-based word spacing. */}
+              {to === '/' && nodeName && <span className="nav-node-name">{' '}{nodeName}</span>}
             </NavLink>
           })}
         </nav>

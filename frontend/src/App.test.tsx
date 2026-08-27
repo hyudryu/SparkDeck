@@ -54,6 +54,26 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Switch' })).not.toHaveAttribute('aria-disabled')
   })
 
+  it('shows this node name next to Dashboard in the navigation', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/settings') || path.includes('/api/settings')) {
+        return new Response(JSON.stringify({ cluster_node_name: 'gx10-node-1' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    // The exact accessible-name spacing across the two spans is a jsdom
+    // computation quirk, so assert on the chip inside the Dashboard link.
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(dashboard).toHaveAttribute('href', '/')
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+    // Other destinations stay untouched by the node name.
+    expect(screen.getByRole('link', { name: 'Explore' })).toHaveAttribute('href', '/explore')
+  })
+
   it('ignores an older aborted presence failure after a newer refresh succeeds', async () => {
     const presenceRequests: Array<{
       signal?: AbortSignal

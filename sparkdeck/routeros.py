@@ -441,7 +441,8 @@ class RouterOSService:
                     continue
                 break
             else:
-                assert last_connect_error is not None
+                if last_connect_error is None:
+                    raise RuntimeError("router has no connectable endpoints")
                 raise last_connect_error
             response.raise_for_status()
             if not response.content:

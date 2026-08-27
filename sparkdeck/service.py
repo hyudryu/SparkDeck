@@ -181,7 +181,8 @@ async def _get_public_community_url(
                     await streamed.aclose()
                 break
         if response is None:
-            assert last_connect_error is not None
+            if last_connect_error is None:
+                raise RuntimeError("community aggregate service has no connectable endpoints")
             raise last_connect_error
 
         if (
@@ -286,7 +287,8 @@ async def _post_public_community_url(
             if response.status_code in _COMMUNITY_REDIRECT_STATUSES:
                 raise ValueError("community upload service must not redirect")
             return response
-    assert last_connect_error is not None
+    if last_connect_error is None:
+        raise RuntimeError("community upload service has no connectable endpoints")
     raise last_connect_error
 
 

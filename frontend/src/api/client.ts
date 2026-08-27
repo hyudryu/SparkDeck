@@ -116,6 +116,9 @@ interface WireDeployment {
   port?: number
   node_ids?: string[]
   selected_nodes?: Deployment['selected_nodes']
+  deployment_mode?: string
+  required_node_count?: number
+  model_revision?: string
   created_at?: string
 }
 
@@ -142,11 +145,13 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     id: item.id,
     alias: item.alias,
     model_id: item.model.repository,
-    model_revision: item.model.revision,
+    model_revision: item.model_revision ?? item.model.revision,
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
     settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    deployment_mode: item.deployment_mode,
+    required_node_count: item.required_node_count,
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
@@ -211,11 +216,15 @@ export const api = {
       })
       return deploymentFromWire(data)
     },
-    action: async (id: string, action: 'start' | 'stop' | 'remove') => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(`/api/v1/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
       }
-      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
+      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
+        method: 'POST',
+        body,
+      })
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {

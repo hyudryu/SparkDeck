@@ -30,14 +30,17 @@ export function BenchmarksPage() {
     [selectedModel],
     Boolean(selectedModel),
   )
+  const activeModelDetail = modelDetail.data?.model_id === selectedModel
+    ? modelDetail.data
+    : undefined
   const closeModelDetail = useCallback(() => setSelectedModel(undefined), [])
   const aggregateResponse = aggregates.data
   const localAggregates = aggregateResponse?.availability === 'local'
 
   useEffect(() => {
-    const sizes = [...new Set(modelDetail.data?.points.map((point) => point.tensor_parallel_size) ?? [])]
+    const sizes = [...new Set(activeModelDetail?.points.map((point) => point.tensor_parallel_size) ?? [])]
     if (sizes.length && !sizes.includes(selectedTp ?? -1)) setSelectedTp(sizes[0])
-  }, [modelDetail.data, selectedTp])
+  }, [activeModelDetail, selectedTp])
 
   const applyConsent = async (enabled: boolean) => {
     if (!sync.data) return
@@ -108,7 +111,7 @@ export function BenchmarksPage() {
           type="button"
           aria-haspopup="dialog"
           key={model.model_id}
-          onClick={(event) => { modelTriggerRef.current = event.currentTarget; setSelectedModel(model.model_id) }}
+          onClick={(event) => { modelTriggerRef.current = event.currentTarget; setSelectedTp(undefined); setSelectedModel(model.model_id) }}
         >
           <span className="benchmark-model-icon"><BarChart3 size={17} /></span>
           <span className="benchmark-model-main"><strong>{model.model_id}</strong><small>{model.run_count} run{model.run_count === 1 ? '' : 's'} · Updated {new Date(model.latest_at).toLocaleString()}</small></span>
@@ -159,11 +162,11 @@ export function BenchmarksPage() {
         <p className="modal-description">Measured results only. Missing concurrency or context combinations remain blank.</p>
         {modelDetail.loading && <LoadingState label="Loading model benchmark" />}
         {modelDetail.error && <ErrorState message={modelDetail.error} onRetry={modelDetail.reload} />}
-        {modelDetail.data && <>
-          {[...new Set(modelDetail.data.points.map((point) => point.tensor_parallel_size))].length > 1 && <div className="benchmark-tp-tabs" role="tablist" aria-label="Tensor parallel size">{[...new Set(modelDetail.data.points.map((point) => point.tensor_parallel_size))].map((size) => <button type="button" role="tab" aria-selected={selectedTp === size} key={size} onClick={() => setSelectedTp(size)}>TP {size}</button>)}</div>}
+        {activeModelDetail && <>
+          {[...new Set(activeModelDetail.points.map((point) => point.tensor_parallel_size))].length > 1 && <div className="benchmark-tp-tabs" role="tablist" aria-label="Tensor parallel size">{[...new Set(activeModelDetail.points.map((point) => point.tensor_parallel_size))].map((size) => <button type="button" role="tab" aria-selected={selectedTp === size} key={size} onClick={() => setSelectedTp(size)}>TP {size}</button>)}</div>}
           <div className="benchmark-chart-stack">
-            <BenchmarkLineChart title="Prompt throughput" metric="prompt_tokens_per_second" points={modelDetail.data.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
-            <BenchmarkLineChart title="Text generation throughput" metric="generation_tokens_per_second" points={modelDetail.data.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
+            <BenchmarkLineChart title="Prompt throughput" metric="prompt_tokens_per_second" points={activeModelDetail.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
+            <BenchmarkLineChart title="Text generation throughput" metric="generation_tokens_per_second" points={activeModelDetail.points.filter((point) => point.tensor_parallel_size === selectedTp)} />
           </div>
           <p className="benchmark-method-note">Each point is the average of completed coordinated runs for the exact model, context window, concurrency, and TP size. Results vary with runtime, thermals, networking, and workload.</p>
         </>}

@@ -102,7 +102,8 @@ class SparkDeckStore:
                     tensor_parallel_size INTEGER NOT NULL,
                     prompt_tps REAL NOT NULL,
                     generation_tps REAL NOT NULL,
-                    request_count INTEGER NOT NULL
+                    request_count INTEGER NOT NULL,
+                    sample_id TEXT REFERENCES benchmark_samples(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_series_model
                     ON benchmark_series_points(model_id, tensor_parallel_size, context_window_size, concurrency);
@@ -138,6 +139,21 @@ class SparkDeckStore:
                 "WHERE created_at IS NULL OR TRIM(created_at) = ''",
                 (datetime.now(timezone.utc).isoformat(),),
             )
+            series_columns = {
+                row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(benchmark_series_points)"
+                )
+            }
+            if "sample_id" not in series_columns:
+                self._connection.execute(
+                    "ALTER TABLE benchmark_series_points ADD COLUMN sample_id TEXT "
+                    "REFERENCES benchmark_samples(id) ON DELETE CASCADE"
+                )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS benchmark_series_sample "
+                "ON benchmark_series_points(sample_id) WHERE sample_id IS NOT NULL"
+            )
+            self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
             # opening an existing database and discard only their unsent upload
@@ -167,6 +183,40 @@ class SparkDeckStore:
                     f"DELETE FROM upload_outbox WHERE sample_id IN ({marks}) "
                     "AND status IN ('pending', 'failed', 'waiting_for_account')",
                     tuple(invalid_sample_ids),
+                )
+
+    def _backfill_benchmark_series_links(self) -> None:
+        """Link legacy coordinated rows when their local sample is unambiguous."""
+        points = self._connection.execute(
+            """SELECT id, created_at, deployment_id, model_id,
+                      context_window_size, concurrency, tensor_parallel_size
+               FROM benchmark_series_points WHERE sample_id IS NULL"""
+        ).fetchall()
+        point_matches: dict[str, list[str]] = {}
+        sample_match_counts: dict[str, int] = {}
+        for point in points:
+            candidates = self._connection.execute(
+                """SELECT id, model_json, configuration_json
+                   FROM benchmark_samples
+                   WHERE created_at = ? AND deployment_id IS ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM benchmark_series_points linked
+                         WHERE linked.sample_id = benchmark_samples.id
+                     )""",
+                (point["created_at"], point["deployment_id"]),
+            ).fetchall()
+            matches = [
+                row["id"] for row in candidates
+                if _benchmark_matches_series_point(row, point)
+            ]
+            point_matches[point["id"]] = matches
+            for sample_id in matches:
+                sample_match_counts[sample_id] = sample_match_counts.get(sample_id, 0) + 1
+        for point_id, matches in point_matches.items():
+            if len(matches) == 1 and sample_match_counts[matches[0]] == 1:
+                self._connection.execute(
+                    "UPDATE benchmark_series_points SET sample_id = ? WHERE id = ?",
+                    (matches[0], point_id),
                 )
 
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -300,6 +350,7 @@ class SparkDeckStore:
                     int(community_eligible),
                 ),
             )
+            self._link_benchmark_series_point(sample)
             if queue and community_eligible:
                 pairing = self.get_setting("device_pairing", {"status": "not_paired"})
                 status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
@@ -307,6 +358,30 @@ class SparkDeckStore:
                     "INSERT INTO upload_outbox(sample_id, status, created_at) VALUES (?, ?, ?)",
                     (sample.id, status, sample.created_at),
                 )
+
+    def _link_benchmark_series_point(self, sample: BenchmarkSample) -> None:
+        """Connect a coordinated chart point to its Local history sample."""
+        value = sample.to_dict()
+        candidates = self._connection.execute(
+            """SELECT id, created_at, deployment_id, model_id,
+                      context_window_size, concurrency, tensor_parallel_size
+               FROM benchmark_series_points
+               WHERE sample_id IS NULL AND created_at = ? AND deployment_id IS ?""",
+            (sample.created_at, sample.deployment_id),
+        ).fetchall()
+        matches = [
+            point["id"] for point in candidates
+            if _benchmark_matches_series_point({
+                "id": sample.id,
+                "model_json": json.dumps(value["model"]),
+                "configuration_json": json.dumps(value["configuration"]),
+            }, point)
+        ]
+        if len(matches) == 1:
+            self._connection.execute(
+                "UPDATE benchmark_series_points SET sample_id = ? WHERE id = ?",
+                (sample.id, matches[0]),
+            )
 
     def benchmarks(self, limit: int = 100, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
         limit = min(500, max(1, int(limit)))
@@ -613,6 +688,28 @@ class SparkDeckStore:
                    SELECT id, ?, created_at FROM benchmark_samples WHERE eligible = 1""",
                 (status,),
             )
+
+
+def _benchmark_matches_series_point(
+    sample_row: sqlite3.Row | dict[str, Any],
+    point_row: sqlite3.Row,
+) -> bool:
+    """Return whether a local sample is the series row created for the same run."""
+    try:
+        model = json.loads(sample_row["model_json"] or "{}")
+        configuration = json.loads(sample_row["configuration_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(model, dict) or not isinstance(configuration, dict):
+        return False
+    return (
+        str(model.get("repository") or "").strip() == point_row["model_id"]
+        and community_context_window(configuration) == point_row["context_window_size"]
+        and _positive_integer(configuration.get("benchmark_concurrency"))
+        == point_row["concurrency"]
+        and _positive_integer(configuration.get("tensor_parallel_size"))
+        == point_row["tensor_parallel_size"]
+    )
 
 
 def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:

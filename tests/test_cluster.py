@@ -1522,7 +1522,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         instance.usage_aliases = {}
-        instance.usage_merge_groups = {}
+        instance.usage_merge_groups = {"xxx/abcdefg": "Fleet"}
         instance.usage_routing_rules = {"xxx/abcdefg": "xxx/1234567"}
         instance.speed_samples = {}
         instance.deployments = []
@@ -1531,6 +1531,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         stats = instance.get_token_stats()
 
         self.assertEqual(stats["routing_rules"], {"xxx/abcdefg": "xxx/1234567"})
+        self.assertEqual(stats["merge_groups"], {"xxx/abcdefg": "Fleet"})
         self.assertEqual(stats["groups"][0]["key"], "model:xxx/1234567")
 
     def test_rolling_speed_uses_only_newest_one_million_output_tokens(self) -> None:

@@ -439,9 +439,11 @@ export const api = {
       return { hourly, daily }
     },
     reset: () => request<UsageSummary>('/api/token-stats/reset', { method: 'POST' }),
-    updateAlias: (model: string, alias: string | null, merge_group: string | null) =>
+    updateAlias: (model: string, alias: string | null, merge_group?: string | null) =>
       request<void>('/api/token-stats/alias', {
         method: 'PUT',
+        // An undefined merge_group is dropped from the JSON body, which tells
+        // the backend to leave the stored merge group untouched.
         body: JSON.stringify({ model, alias, merge_group }),
       }),
     setRoute: (source: string, destination: string) =>

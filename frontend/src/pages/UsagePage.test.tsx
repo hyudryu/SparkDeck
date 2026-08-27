@@ -169,6 +169,72 @@ describe('UsagePage', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
   })
 
+  it('keeps a route-only save from overwriting the source merge group', async () => {
+    const routed = {
+      ...summary,
+      models: { 'org/model': summary.models['org/model'], 'org/target': { input: 900, cached: 100, output: 400, requests: 5 } },
+      merge_groups: {},
+      groups: [{
+        key: 'group:Workspace', label: 'Workspace', merge_group: 'Workspace',
+        route_target: null, models: ['org/model', 'org/target'],
+        members: [
+          { model: 'org/model', alias: null, merge_group: 'Workspace', routed_to: 'org/target' },
+          { model: 'org/target', alias: null, merge_group: 'Workspace', routed_to: null },
+        ],
+        stats: {
+          input: 2400, input_miss: 1900, cached: 600, measured_cached: 600,
+          estimated_cached: 0, output: 1150, requests: 17, gen_tokens: 1150,
+          gen_time_s: 30,
+        },
+        speed: null,
+        total_cost: 1.5, cost_estimated: false,
+      }],
+      routing_rules: { 'org/model': 'org/target' },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/api/token-stats/hourly') || String(input).includes('/api/token-stats/daily')) return json([])
+      return json(routed)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workspace' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('textbox', { name: 'Merge group' })).toHaveValue('')
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await screen.findByText('Updated usage display for org/model.')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/alias', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ model: 'org/model', alias: null }),
+    }))
+    expect(fetchMock.mock.calls.every(([path]) => !String(path).includes('/api/token-stats/rules'))).toBe(true)
+  })
+
+  it('sends an explicit clear when a configured merge group is removed', async () => {
+    const grouped = { ...summary, merge_groups: { 'org/model': 'Legacy' } }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/api/token-stats/hourly') || String(input).includes('/api/token-stats/daily')) return json([])
+      return json(grouped)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('textbox', { name: 'Merge group' })).toHaveValue('Legacy')
+    await user.clear(screen.getByRole('textbox', { name: 'Merge group' }))
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/alias', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ model: 'org/model', alias: 'Workload', merge_group: null }),
+    })))
+  })
+
   it('surfaces routing rule validation errors inside the display dialog', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

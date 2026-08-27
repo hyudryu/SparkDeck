@@ -172,6 +172,9 @@ export function ModelsPage() {
   const [pinned, setPinned] = useState<string[]>(readPinned)
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
+  const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
+  const [extraFlags, setExtraFlags] = useState('')
+  const [gpuMemoryUtil, setGpuMemoryUtil] = useState('')
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
@@ -240,14 +243,22 @@ export function ModelsPage() {
     setBusy('create')
     setFormError(undefined)
     setActionNotice(undefined)
+    const settings = { ...form.settings, extra_args: form.managed ? shellSplit(extraFlags) : [] }
+    const utilization = Number(gpuMemoryUtil)
+    if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
+      settings.gpu_memory_utilization = utilization
+    }
     try {
-      const deployment = await api.deployments.create(form)
+      const deployment = await api.deployments.create({ ...form, settings })
       const selected = deployment.selected_nodes?.map((node) => node.id === 'local' ? localLabel : node.name).join(', ')
         || selectedNodeLabel(nodes.data ?? [], deployment.node_ids ?? form.node_ids ?? ['local'], localLabel)
       setActionNotice(`Added ${deployment.alias} on ${selected}.`)
       setCreating(false)
       runtimeTouched.current = false
       contextLengthTouched.current = false
+      setLaunchArgsOpen(false)
+      setExtraFlags('')
+      setGpuMemoryUtil('')
       setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
       resource.reload()
     } catch (reason) {
@@ -718,6 +729,14 @@ export function ModelsPage() {
                   <label className="field"><span>Tensor parallel size</span><input type="number" min="1" value={form.settings.tensor_parallel_size} onChange={(event) => setForm({ ...form, settings: { ...form.settings, tensor_parallel_size: Number(event.target.value) } })} /></label>
                 )}
               </div>
+              {form.managed && <>
+                <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
+                {launchArgsOpen && <div className="args-editor">
+                  {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
+                  <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
+                  <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
+                </div>}
+              </>}
               <div className="modal-actions"><Button type="button" onClick={() => setCreating(false)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy === 'create' || (form.managed && !selectionReady)}>{busy === 'create' ? 'Adding…' : <><Server size={16} /> Add to {form.node_ids?.length ?? 1} {(form.node_ids?.length ?? 1) === 1 ? 'node' : 'nodes'}</>}</Button></div>
             </form>
           </section>

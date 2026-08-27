@@ -58,6 +58,7 @@ export interface DeploymentSettings {
   gpu_split?: string
   quantization?: string
   dtype?: string
+  gpu_memory_utilization?: number
   port?: number
   extra_args?: string[]
 }

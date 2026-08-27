@@ -228,6 +228,17 @@ class VirtualNAS:
     def list_transfers(self) -> dict[str, Any]:
         return {"items": [dict(job) for job in self.jobs]}
 
+    def free_bytes(self) -> int | None:
+        """Free space on the filesystem hosting the model cache hub.
+
+        Measured at the hub path rather than "/" because the cache commonly
+        lives on its own mount; None means the reading is unavailable.
+        """
+        try:
+            return _local_free_bytes(self._hub())
+        except (OSError, RuntimeError):
+            return None
+
     def inventory(self) -> list[dict[str, Any]]:
         hub = self._hub()
         if not hub.is_dir():

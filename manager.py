@@ -1311,6 +1311,15 @@ class Manager:
             "instructions": instructions,
         }
 
+    @staticmethod
+    def _byte_count(value: Any) -> int | None:
+        """Normalize a byte-count reading; missing telemetry stays None, not 0."""
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return None
+        return result if result >= 0 else None
+
     async def model_cache_inventory(self) -> list[dict]:
         """Return safe Hugging Face cache sizes even when transfers are off.
 
@@ -1322,32 +1331,39 @@ class Manager:
 
         async def inventory_for(node: dict) -> dict:
             models: list[dict] = []
+            cache_free: int | None = None
             online = bool(node.get("online"))
             if online:
                 try:
                     if node.get("id") == LOCAL_NODE_ID:
                         models = await asyncio.to_thread(self.virtual_nas.inventory)
+                        cache_free = self._byte_count(
+                            await asyncio.to_thread(self.virtual_nas.free_bytes)
+                        )
                     else:
                         payload = await self.node_registry.request(
                             node["id"], "GET", "/api/agent/virtual-nas/inventory",
                             timeout=30,
                         )
                         models = list((payload or {}).get("models") or [])
+                        cache_free = self._byte_count((payload or {}).get("free_size"))
                 except Exception:
                     online = False
+            disk = node.get("disk") or {}
+            # The model cache can live on a different mount than the agent's
+            # root filesystem, so cache-mount free space (reported alongside
+            # the inventory) is preferred over the generic disk reading.
+            raw_free = disk.get("free")
+            if raw_free is None:
+                raw_free = disk.get("free_bytes")
+            raw_total = disk.get("total")
+            if raw_total is None:
+                raw_total = disk.get("total_bytes")
             return {
                 "id": node.get("id"), "name": node.get("name"),
                 "online": online,
-                "total_size": max(0, int(
-                    (node.get("disk") or {}).get("total")
-                    or (node.get("disk") or {}).get("total_bytes")
-                    or 0
-                )),
-                "free_size": max(0, int(
-                    (node.get("disk") or {}).get("free")
-                    or (node.get("disk") or {}).get("free_bytes")
-                    or 0
-                )),
+                "total_size": self._byte_count(raw_total),
+                "free_size": cache_free if cache_free is not None else self._byte_count(raw_free),
                 "models": models,
             }
 

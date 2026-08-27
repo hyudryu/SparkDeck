@@ -44,7 +44,9 @@ _SAFE_CONFIGURATION_KEYS = {
     "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
-_LOCAL_ROUTING_KEYS = {"deployment_mode", "node_ids", "manager_deployment_id"}
+_LOCAL_ROUTING_KEYS = {
+    "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
+}
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -552,6 +554,8 @@ class SparkDeckService:
         request_count = _bounded_benchmark_integer(body.get("request_count"), "request_count")
         if request_count < concurrency:
             raise ValueError("request_count must be at least the measured concurrency")
+        if request_count % concurrency:
+            raise ValueError("request_count must be divisible by the measured concurrency")
         prompt_tokens = _bounded_benchmark_integer(body.get("prompt_tokens"), "prompt_tokens", allow_zero=True)
         generation_tokens = _bounded_benchmark_integer(body.get("generation_tokens"), "generation_tokens", allow_zero=True)
         prompt_seconds = _positive_finite(body.get("prompt_seconds"), "prompt_seconds")
@@ -577,8 +581,15 @@ class SparkDeckService:
             (deployment.get("model") or {}).get("repository") or "local-model"
         ).strip()
         upload_model_id = _public_model_id(raw_model_id)
+        if (
+            upload_model_id != "local-model"
+            and deployment.get("kind") == DeploymentKind.MANAGED.value
+            and settings.get("model_source") != "public_repository"
+        ):
+            upload_model_id = "local-model"
         local_model_id = _local_benchmark_model_id(
             raw_model_id, deployment.get("id") or deployment_id,
+            upload_model_id=upload_model_id,
         )
         point = {
             "id": str(uuid.uuid4()),
@@ -678,6 +689,17 @@ class SparkDeckService:
         launch_controls = self.manager._deployment_launch_controls(launch_settings)
         settings = dict((deployment or {}).get("settings") or {})
         settings["manager_deployment_id"] = manager_deployment.get("id")
+        model_source = str(
+            manager_deployment.get("model_source")
+            or launch_settings.get("model_source")
+            or settings.get("model_source")
+            or "unknown"
+        )
+        settings["model_source"] = (
+            model_source
+            if model_source in {"local", "public_repository", "unknown"}
+            else "unknown"
+        )
         context_window = launch_controls.get("context_window") or launch_settings.get("sg_context_length")
         if context_window is not None:
             for key in ("max_model_len", "context_length", "context_size"):
@@ -1057,6 +1079,7 @@ class SparkDeckService:
                     "deployment_mode": mode,
                     "node_ids": requested_node_ids,
                     "manager_deployment_id": manager_id,
+                    "model_source": cluster.get("model_source") or "unknown",
                 })
                 port = cluster.get("api_port")
                 if not manager_id or not deployment.container_name or not port:
@@ -1094,6 +1117,10 @@ class SparkDeckService:
                     },
                 )
                 deployment.container_name = launched.get("name")
+                deployment.settings = self._local_configuration({
+                    **settings,
+                    "model_source": launched.get("model_source") or "unknown",
+                })
                 port = launched.get("port")
                 if not deployment.container_name or not port:
                     raise RuntimeError("runtime launched without a discoverable container endpoint")
@@ -1891,9 +1918,11 @@ def _public_model_id(value: str) -> str:
     return text
 
 
-def _local_benchmark_model_id(value: str, deployment_id: str | None) -> str:
+def _local_benchmark_model_id(
+    value: str, deployment_id: str | None, *, upload_model_id: str | None = None,
+) -> str:
     """Return a local grouping key without exposing private model identifiers."""
-    public_model_id = _public_model_id(value)
+    public_model_id = upload_model_id or _public_model_id(value)
     if public_model_id != "local-model":
         return public_model_id
     identity = json.dumps(

@@ -268,6 +268,64 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted["pairing_code"], manager.agent_credentials.data["pairing_code"])
         await http.aclose()
 
+    async def test_join_serializes_against_new_worker_registration(self):
+        join_started = asyncio.Event()
+        release_join = asyncio.Event()
+        first_identity = True
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal first_identity
+            if request.method == "GET":
+                if first_identity:
+                    first_identity = False
+                    join_started.set()
+                    await release_join.wait()
+                return httpx.Response(200, json={
+                    "role": "controller",
+                    "node": {
+                        "id": "destination-id",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                })
+            return httpx.Response(200, json={
+                "ok": True,
+                "role": "controller",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "forward_token": "forward-secret",
+                "cluster": {"nodes": []},
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        join_task = asyncio.create_task(service.join({
+            "controller_url": "http://127.0.0.1:9000",
+            "join_code": "654321",
+            "advertise_url": "http://127.0.0.1:9001",
+        }, "http://127.0.0.1:7878"))
+        try:
+            await asyncio.wait_for(join_started.wait(), timeout=1)
+            registration = asyncio.create_task(service.register({
+                "join_code": manager.agent_credentials.current_cluster_join_code(),
+                "pairing_code": "123456",
+                "advertise_url": "http://127.0.0.1:9002",
+                "name": "Late worker",
+            }, "http://127.0.0.1:7878", "late-worker"))
+            await asyncio.sleep(0)
+            self.assertFalse(registration.done())
+
+            release_join.set()
+            joined = await join_task
+            self.assertEqual(joined["role"], "worker")
+            with self.assertRaisesRegex(ValueError, "only a controller"):
+                await registration
+            manager.pair_node.assert_not_awaited()
+        finally:
+            release_join.set()
+            if not join_task.done():
+                join_task.cancel()
+            await http.aclose()
+
     async def test_join_pins_hostname_before_sending_join_and_pairing_codes(self):
         requests = []
         resolutions = []
@@ -680,6 +738,28 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         manager.adopt_controller_role.assert_called_once()
         await http.aclose()
 
+    async def test_force_forgotten_worker_can_leave_reachable_controller(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"detail": "worker is not registered"})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://127.0.0.1:9000",
+            "forward_token": "forgotten-token",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        old_token = manager.agent_credentials.data["agent_token"]
+
+        left = await service.leave("http://127.0.0.1:7878")
+
+        self.assertEqual(left["role"], "controller")
+        self.assertIsNone(service.assignment.load())
+        self.assertFalse(manager.agent_credentials.accepts_token(old_token))
+        manager.adopt_controller_role.assert_called_once()
+        await http.aclose()
+
     async def test_leave_tries_pinned_addresses_without_re_resolving_token(self):
         requests = []
         resolutions = []
@@ -820,6 +900,21 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
             })
         with self.assertRaises(PermissionError):
             service.unregister({FORWARD_HOP_HEADER: "2"})
+
+    def test_controller_reports_force_forgotten_worker_as_unregistered(self):
+        manager = FakeManager(self.root)
+        manager.node_registry.get.return_value = None
+        service = OnboardingService(manager, self.root)
+
+        with self.assertRaisesRegex(ValueError, "worker is not registered"):
+            service.unregister({
+                FORWARD_HOP_HEADER: "1",
+                FORWARD_NODE_HEADER: "forgotten-worker",
+                FORWARD_TOKEN_HEADER: "stale-token",
+            })
+
+        manager.node_registry.accepts_forward_token.assert_not_called()
+        manager.remove_cluster_node.assert_not_called()
 
     async def test_join_registration_is_rate_limited(self):
         manager = FakeManager(self.root)
@@ -1006,6 +1101,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_forwardable_path("/api/agent/status"))
         self.assertFalse(is_forwardable_path("/api/v1/onboarding"))
         self.assertFalse(is_forwardable_path("/api/v1/onboarding/register"))
+        self.assertFalse(is_forwardable_path("/api/v1/onboarding/unregister"))
         self.assertTrue(is_forwardable_path("/api/state"))
         self.assertTrue(is_forwardable_path("/v1/chat/completions"))
         self.assertTrue(is_forwardable_path("/mcp"))

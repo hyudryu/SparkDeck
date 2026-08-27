@@ -1431,9 +1431,23 @@ class Manager:
             return False
         self._assert_cluster_node_removable(node_id)
         if not force:
-            await self.node_registry.request(
-                node_id, "POST", "/api/agent/onboarding/detach", timeout=10,
-            )
+            try:
+                await self.node_registry.request(
+                    node_id, "POST", "/api/agent/onboarding/detach", timeout=10,
+                )
+            except RuntimeError as exc:
+                cause = exc.__cause__
+                protocol_version = node.get("protocol_version")
+                if not (
+                    protocol_version == AGENT_PROTOCOL_VERSION
+                    and isinstance(cause, httpx.HTTPStatusError)
+                    and cause.response.status_code == 404
+                ):
+                    raise
+                # Protocol v1 predates authenticated detach but remains the
+                # advertised compatible version. Preserve the legacy removal
+                # behavior when that one capability is absent; a later local
+                # Leave cluster clears the worker's stale assignment.
         return self.node_registry.remove(node_id)
 
     # ---------- clustered deployments ----------

@@ -103,26 +103,59 @@ class _RetryingDockerClient:
     Docker's ``from_env`` constructor negotiates an API version immediately,
     so constructing the process-wide manager used to prevent controller-only
     installations from starting at all. Keep the normal eager client when it
-    works, but use this small proxy after a connection failure. Every access
-    retries until Docker becomes available, then caches the working client.
+    works, but use this small proxy after a connection failure. Failed attempts
+    are cached briefly and only one caller may negotiate at a time, so aggregate
+    state polling cannot fill the thread pool while a daemon is hung. A later
+    access retries and permanently caches the first working client.
     """
 
-    def __init__(self):
+    RETRY_INTERVAL_SECONDS = 5.0
+
+    def __init__(self, initial_error=None, *, retry_interval=None, clock=None):
         self._client = None
         self._lock = threading.Lock()
+        self._clock = clock or time.monotonic
+        self._retry_interval = (
+            self.RETRY_INTERVAL_SECONDS
+            if retry_interval is None
+            else max(0.0, float(retry_interval))
+        )
+        self._last_error = str(initial_error) if initial_error is not None else ""
+        self._retry_after = (
+            self._clock() + self._retry_interval
+            if initial_error is not None
+            else 0.0
+        )
+
+    def _unavailable(self, detail: str | None = None):
+        message = detail or self._last_error or "reconnect is already in progress"
+        return docker.errors.DockerException(f"Docker is unavailable: {message}")
 
     def _connect(self):
         if self._client is not None:
             return self._client
-        with self._lock:
+        if self._clock() < self._retry_after:
+            raise self._unavailable()
+        # Do not wait behind a Docker SDK negotiation. Those can block for the
+        # transport timeout when the daemon is present but unresponsive, and
+        # each waiting inventory poll would otherwise consume another thread.
+        if not self._lock.acquire(blocking=False):
+            raise self._unavailable("reconnect is already in progress")
+        try:
             if self._client is None:
+                if self._clock() < self._retry_after:
+                    raise self._unavailable()
                 try:
                     self._client = docker.from_env()
                 except docker.errors.DockerException as exc:
-                    raise docker.errors.DockerException(
-                        f"Docker is unavailable: {exc}"
-                    ) from exc
-        return self._client
+                    self._last_error = str(exc)
+                    self._retry_after = self._clock() + self._retry_interval
+                    raise self._unavailable() from exc
+                self._last_error = ""
+                self._retry_after = 0.0
+            return self._client
+        finally:
+            self._lock.release()
 
     def __getattr__(self, name: str):
         return getattr(self._connect(), name)
@@ -477,7 +510,7 @@ class Manager:
                 "Docker is unavailable; starting in controller-only mode: %s",
                 exc,
             )
-            self.client = _RetryingDockerClient()
+            self.client = _RetryingDockerClient(initial_error=exc)
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.lock = asyncio.Lock()
@@ -7301,10 +7334,7 @@ class Manager:
                     out.append(summary)
             out.sort(key=lambda x: (x["status"] != "running", x["name"]))
             return out
-        try:
-            containers = await asyncio.to_thread(_run)
-        except docker.errors.DockerException:
-            return []
+        containers = await asyncio.to_thread(_run)
         # Attach setup phase (health/log-derived) in parallel.
         if containers:
             phases = await asyncio.gather(
@@ -8088,10 +8118,7 @@ class Manager:
                 })
             out.sort(key=lambda x: (not x["is_vllm"], x["tags"][0] if x["tags"] else ""))
             return out
-        try:
-            self._images_cache = await asyncio.to_thread(_do)
-        except docker.errors.DockerException:
-            return []
+        self._images_cache = await asyncio.to_thread(_do)
         self._images_ts = now
         return self._images_cache
 
@@ -11136,11 +11163,26 @@ class Manager:
 
     # ---------- aggregate state ----------
     async def get_state(self) -> dict:
-        containers, images, stats = await asyncio.gather(
+        containers_result, images_result, stats_result = await asyncio.gather(
             self.list_containers(),
             self.list_images(),
             self.get_stats(),
+            return_exceptions=True,
         )
+        for result in (containers_result, images_result):
+            if isinstance(result, BaseException) and not isinstance(
+                result, docker.errors.DockerException
+            ):
+                raise result
+        if isinstance(stats_result, BaseException):
+            raise stats_result
+        containers_unavailable = isinstance(
+            containers_result, docker.errors.DockerException
+        )
+        images_unavailable = isinstance(images_result, docker.errors.DockerException)
+        containers = [] if containers_unavailable else containers_result
+        images = [] if images_unavailable else images_result
+        stats = stats_result
         nodes = await self.cluster_nodes(stats)
         containers_by_node: dict[str, dict[str, dict]] = {
             LOCAL_NODE_ID: {c.get("name"): c for c in containers},
@@ -11156,6 +11198,7 @@ class Manager:
         for saved in self.deployments:
             deployment = {**saved, "members": []}
             member_states = []
+            member_inventory_unknown = False
             runtime_flags = []
             primary_container = None
             for original in saved.get("members", []):
@@ -11181,13 +11224,23 @@ class Manager:
                         })
                     if primary_container is None or member.get("rank") == 0:
                         primary_container = container
+                elif (
+                    containers_unavailable
+                    and member.get("node_id") == LOCAL_NODE_ID
+                ):
+                    member["status"] = "unknown"
+                    member["status_message"] = "Docker is unavailable"
+                    member_inventory_unknown = True
                 elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
                 member["node_status"] = node.get("status", "unknown")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
-                if any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
+                if member_inventory_unknown:
+                    deployment["status"] = "unknown"
+                    deployment["status_message"] = "Docker is unavailable"
+                elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"
@@ -11252,6 +11305,7 @@ class Manager:
         return {
             "containers": containers,
             "images": images,
+            "docker_ready": not (containers_unavailable or images_unavailable),
             "stats": stats,
             "settings": self.public_settings(),
             "token_usage_sync": dict(self._token_usage_sync_status),

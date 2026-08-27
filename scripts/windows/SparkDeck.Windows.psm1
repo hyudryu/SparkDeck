@@ -242,6 +242,95 @@ function Get-SparkDeckBootstrapPython {
     throw "Python 3.11 or newer was not found. Install Python, including the py launcher, and try again."
 }
 
+function Test-SparkDeckPythonSupported {
+    param([Parameter(Mandatory = $true)][string]$PythonPath)
+
+    if (-not [IO.File]::Exists($PythonPath)) {
+        return $false
+    }
+    $versionCheck = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+    try {
+        $probe = Invoke-SparkDeckNativeCapture -FilePath $PythonPath -Arguments @("-c", $versionCheck)
+        return ($probe.ExitCode -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Remove-SparkDeckManagedVenvDirectory {
+    param($Paths, [Parameter(Mandatory = $true)][string]$Directory)
+
+    $candidate = [IO.Path]::GetFullPath($Directory).TrimEnd('\', '/')
+    $expectedVenv = [IO.Path]::GetFullPath($Paths.Venv).TrimEnd('\', '/')
+    $candidateParent = [IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($candidate)).TrimEnd('\', '/')
+    $expectedParent = [IO.Path]::GetFullPath($Paths.Root).TrimEnd('\', '/')
+    $candidateName = [IO.Path]::GetFileName($candidate)
+    $isManagedBackup = (
+        [string]::Equals($candidateParent, $expectedParent, [StringComparison]::OrdinalIgnoreCase) -and
+        $candidateName.StartsWith(".venv.replaced-", [StringComparison]::OrdinalIgnoreCase)
+    )
+    if (-not [string]::Equals($candidate, $expectedVenv, [StringComparison]::OrdinalIgnoreCase) -and -not $isManagedBackup) {
+        throw ("refusing to remove an unmanaged virtual environment directory: {0}" -f $candidate)
+    }
+    if ([IO.Directory]::Exists($candidate)) {
+        [IO.Directory]::Delete($candidate, $true)
+    }
+}
+
+function Initialize-SparkDeckPythonEnvironment {
+    param($Paths)
+
+    if (Test-SparkDeckPythonSupported -PythonPath $Paths.VenvPython) {
+        return
+    }
+
+    $existingVenv = [IO.Directory]::Exists($Paths.Venv)
+    try {
+        # Resolve a supported system interpreter before moving the existing
+        # environment, so a missing Python installation leaves it untouched.
+        $bootstrap = Get-SparkDeckBootstrapPython
+    }
+    catch {
+        if ($existingVenv) {
+            throw ("SparkDeck's existing .venv does not use Python 3.11 or newer, and a supported system Python was not found. Install Python 3.11 or newer and try again. The existing .venv was left unchanged. {0}" -f $_.Exception.Message)
+        }
+        throw
+    }
+
+    $backup = $null
+    if ($existingVenv) {
+        $backup = Join-Path $Paths.Root (".venv.replaced-{0}" -f [Guid]::NewGuid().ToString("N"))
+        Write-Host "Replacing SparkDeck's unsupported Python environment..."
+        Move-Item -LiteralPath $Paths.Venv -Destination $backup
+    }
+    else {
+        Write-Host "Creating SparkDeck Python environment..."
+    }
+
+    try {
+        $arguments = @($bootstrap.PrefixArguments) + @("-m", "venv", $Paths.Venv)
+        Invoke-SparkDeckCheckedCommand -FilePath $bootstrap.FilePath -Arguments $arguments -WorkingDirectory $Paths.Root
+        if (-not (Test-SparkDeckPythonSupported -PythonPath $Paths.VenvPython)) {
+            throw "the newly created virtual environment does not provide Python 3.11 or newer"
+        }
+    }
+    catch {
+        if ([IO.Directory]::Exists($Paths.Venv)) {
+            Remove-SparkDeckManagedVenvDirectory -Paths $Paths -Directory $Paths.Venv
+        }
+        if ($null -ne $backup -and [IO.Directory]::Exists($backup)) {
+            Move-Item -LiteralPath $backup -Destination $Paths.Venv
+            throw ("Could not replace SparkDeck's unsupported .venv; the original environment was restored. {0}" -f $_.Exception.Message)
+        }
+        throw
+    }
+
+    if ($null -ne $backup) {
+        Remove-SparkDeckManagedVenvDirectory -Paths $Paths -Directory $backup
+    }
+}
+
 function Invoke-SparkDeckCheckedCommand {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -307,12 +396,7 @@ function Initialize-SparkDeckEnvironment {
     if (-not [IO.File]::Exists($Paths.Server)) {
         throw ("server.py was not found under {0}" -f $Paths.Root)
     }
-    if (-not [IO.File]::Exists($Paths.VenvPython)) {
-        Write-Host "Creating SparkDeck Python environment..."
-        $bootstrap = Get-SparkDeckBootstrapPython
-        $arguments = @($bootstrap.PrefixArguments) + @("-m", "venv", $Paths.Venv)
-        Invoke-SparkDeckCheckedCommand -FilePath $bootstrap.FilePath -Arguments $arguments -WorkingDirectory $Paths.Root
-    }
+    Initialize-SparkDeckPythonEnvironment $Paths
 
     $requirementsHash = (Get-FileHash -LiteralPath $Paths.Requirements -Algorithm SHA256).Hash.ToLowerInvariant()
     $installedHash = if ([IO.File]::Exists($Paths.RequirementsStamp)) {
@@ -418,7 +502,25 @@ function Start-SparkDeck {
             -RedirectStandardError $paths.StderrLog `
             -WindowStyle Hidden `
             -PassThru
-        Write-SparkDeckPidRecord $paths $process
+        try {
+            Write-SparkDeckPidRecord $paths $process
+        }
+        catch {
+            # This is the exact Process instance returned above. Do not use a
+            # PID lookup here because the PID record was never persisted and a
+            # later lookup could target a reused PID.
+            try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+                $process.WaitForExit()
+            }
+            catch {
+                # Preserve the PID-record exception that made startup unsafe.
+            }
+            throw
+        }
 
         $timeout = 60
         if (-not [string]::IsNullOrWhiteSpace($env:SPARKDECK_START_TIMEOUT_SECONDS)) {

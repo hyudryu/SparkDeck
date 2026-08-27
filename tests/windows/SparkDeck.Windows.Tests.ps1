@@ -124,5 +124,111 @@ Describe "SparkDeck Windows launcher" {
                 $Uri -eq "http://127.0.0.1:7878/healthz"
             }
         }
+
+        It "replaces an unsupported virtual environment while preserving application data" {
+            $root = Join-Path $TestDrive "old python repo"
+            $oldScripts = Join-Path $root ".venv\Scripts"
+            $data = Join-Path $root "data"
+            New-Item -ItemType Directory -Path $oldScripts -Force | Out-Null
+            New-Item -ItemType Directory -Path $data -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $oldScripts "python.exe") -Value "old"
+            Set-Content -LiteralPath (Join-Path $root ".venv\old-marker.txt") -Value "old environment"
+            Set-Content -LiteralPath (Join-Path $data "keep.txt") -Value "persistent data"
+            $paths = Get-SparkDeckPaths $root
+            $script:versionProbe = 0
+
+            Mock Invoke-SparkDeckNativeCapture {
+                $script:versionProbe++
+                [pscustomobject]@{
+                    ExitCode = if ($script:versionProbe -eq 1) { 1 } else { 0 }
+                    Stdout = ""
+                    Stderr = ""
+                }
+            }
+            Mock Get-SparkDeckBootstrapPython {
+                [pscustomobject]@{ FilePath = "C:\Python312\python.exe"; PrefixArguments = @() }
+            }
+            Mock Invoke-SparkDeckCheckedCommand {
+                New-Item -ItemType Directory -Path (Split-Path $paths.VenvPython -Parent) -Force | Out-Null
+                Set-Content -LiteralPath $paths.VenvPython -Value "new"
+                Set-Content -LiteralPath (Join-Path $paths.Venv "new-marker.txt") -Value "new environment"
+            }
+
+            Initialize-SparkDeckPythonEnvironment $paths
+
+            (Test-Path -LiteralPath (Join-Path $paths.Venv "old-marker.txt")) | Should Be $false
+            (Test-Path -LiteralPath (Join-Path $paths.Venv "new-marker.txt")) | Should Be $true
+            (Get-Content -LiteralPath (Join-Path $data "keep.txt") -Raw).Trim() | Should Be "persistent data"
+            @(Get-ChildItem -LiteralPath $root -Directory -Filter ".venv.replaced-*").Count | Should Be 0
+            Assert-MockCalled Invoke-SparkDeckCheckedCommand -Times 1 -Exactly
+        }
+
+        It "leaves an unsupported virtual environment unchanged when no supported Python is installed" {
+            $root = Join-Path $TestDrive "missing system python"
+            New-Item -ItemType Directory -Path (Join-Path $root ".venv\Scripts") -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $root ".venv\Scripts\python.exe") -Value "old"
+            Set-Content -LiteralPath (Join-Path $root ".venv\keep.txt") -Value "keep"
+            $paths = Get-SparkDeckPaths $root
+
+            Mock Test-SparkDeckPythonSupported { $false }
+            Mock Get-SparkDeckBootstrapPython { throw "Python 3.11 or newer was not found" }
+
+            { Initialize-SparkDeckPythonEnvironment $paths } | Should Throw "left unchanged"
+            (Get-Content -LiteralPath (Join-Path $paths.Venv "keep.txt") -Raw).Trim() | Should Be "keep"
+        }
+
+        It "restores an unsupported virtual environment when replacement fails" {
+            $root = Join-Path $TestDrive "failed venv replacement"
+            New-Item -ItemType Directory -Path (Join-Path $root ".venv\Scripts") -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $root ".venv\Scripts\python.exe") -Value "old"
+            Set-Content -LiteralPath (Join-Path $root ".venv\keep.txt") -Value "keep"
+            $paths = Get-SparkDeckPaths $root
+
+            Mock Test-SparkDeckPythonSupported { $false }
+            Mock Get-SparkDeckBootstrapPython {
+                [pscustomobject]@{ FilePath = "C:\Python312\python.exe"; PrefixArguments = @() }
+            }
+            Mock Invoke-SparkDeckCheckedCommand {
+                New-Item -ItemType Directory -Path $paths.Venv -Force | Out-Null
+                throw "venv creation failed"
+            }
+
+            { Initialize-SparkDeckPythonEnvironment $paths } | Should Throw "original environment was restored"
+            (Get-Content -LiteralPath (Join-Path $paths.Venv "keep.txt") -Raw).Trim() | Should Be "keep"
+            @(Get-ChildItem -LiteralPath $root -Directory -Filter ".venv.replaced-*").Count | Should Be 0
+        }
+
+        It "terminates and waits for the exact new process when the PID record cannot be written" {
+            $root = Join-Path $TestDrive "pid write failure"
+            $paths = Get-SparkDeckPaths $root
+            $newProcess = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+                "-NoProfile", "-Command", "Start-Sleep -Seconds 60"
+            ) -WindowStyle Hidden -PassThru
+            try {
+                Mock Get-SparkDeckPaths { $paths }
+                Mock Invoke-WithSparkDeckLock { & $ScriptBlock }
+                Mock Get-SparkDeckPidRecord { $null }
+                Mock Test-SparkDeckProcessIdentity { $false }
+                Mock Test-SparkDeckPortOpen { $false }
+                Mock Initialize-SparkDeckEnvironment {}
+                Mock Write-SparkDeckDockerWarning {}
+                Mock Rotate-SparkDeckLogs {}
+                Mock Start-Process { $newProcess }
+                Mock Write-SparkDeckPidRecord { throw "pid record failed" }
+
+                { Start-SparkDeck } | Should Throw "pid record failed"
+                $newProcess.Refresh()
+                $newProcess.HasExited | Should Be $true
+                Assert-MockCalled Start-Process -Times 1 -Exactly
+                Assert-MockCalled Write-SparkDeckPidRecord -Times 1 -Exactly
+            }
+            finally {
+                $newProcess.Refresh()
+                if (-not $newProcess.HasExited) {
+                    $newProcess.Kill()
+                    $newProcess.WaitForExit()
+                }
+            }
+        }
     }
 }

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from urllib.parse import urlsplit
 from collections import deque
@@ -2282,11 +2283,69 @@ async def disk_manager_page():
 app.mount("", mcp_http_app, name="mcp")
 
 
+_SHUTDOWN_REQUEST_PATTERN = re.compile(r"[1-9][0-9]*")
+
+
+def _shutdown_request_process_ids() -> frozenset[int]:
+    """Return process IDs that identify this server invocation.
+
+    On Windows, a virtualenv ``python.exe`` redirector remains as the process
+    recorded by ``Start-Process`` while the base interpreter runs this module
+    as its child. Accept that redirector PID only for this specific venv case;
+    other platforms and non-venv launches accept the server PID alone.
+    """
+    process_ids = {os.getpid()}
+    if os.name == "nt" and sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        parent_pid = os.getppid()
+        if parent_pid > 0:
+            process_ids.add(parent_pid)
+    return frozenset(process_ids)
+
+
+def _discard_shutdown_request(shutdown_file: Path) -> None:
+    """Remove a request left behind by an earlier server invocation."""
+    try:
+        shutdown_file.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Could not remove stale shutdown request %s: %s",
+            shutdown_file,
+            exc,
+        )
+
+
+def _consume_shutdown_request(
+    shutdown_file: Path,
+    process_ids: frozenset[int],
+) -> bool:
+    """Consume and validate a launcher request for this server invocation."""
+    try:
+        requested_pid = shutdown_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # The launcher may still be replacing/writing the file. Retry on the
+        # next watcher tick rather than losing a valid stop request.
+        return False
+
+    valid = bool(_SHUTDOWN_REQUEST_PATTERN.fullmatch(requested_pid))
+    matches = valid and int(requested_pid) in process_ids
+    _discard_shutdown_request(shutdown_file)
+    return matches
+
+
 async def _serve_application() -> None:
     """Serve one application instance and honor the Windows launcher stop file."""
     import uvicorn
 
     shutdown_file = ROOT / "data" / "run" / "shutdown.request"
+    # A prior launcher/machine interruption can leave this persistent marker
+    # behind. Clear it before serving; any subsequent request must name this
+    # invocation so a foreground or Linux start cannot consume stale state.
+    _discard_shutdown_request(shutdown_file)
+    shutdown_process_ids = _shutdown_request_process_ids()
     instance = uvicorn.Server(uvicorn.Config(
         # Passing the application object avoids importing this module a second
         # time and constructing duplicate managers/background resources.
@@ -2299,8 +2358,7 @@ async def _serve_application() -> None:
 
     async def watch_launcher_shutdown() -> None:
         while not instance.should_exit:
-            if shutdown_file.exists():
-                shutdown_file.unlink(missing_ok=True)
+            if _consume_shutdown_request(shutdown_file, shutdown_process_ids):
                 instance.should_exit = True
                 return
             await asyncio.sleep(0.25)

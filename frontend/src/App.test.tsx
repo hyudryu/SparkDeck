@@ -54,6 +54,80 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Switch' })).not.toHaveAttribute('aria-disabled')
   })
 
+  it('shows this node name next to Dashboard in the navigation', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: 'gx10-node-1', port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    // The exact accessible-name spacing across the two spans is a jsdom
+    // computation quirk, so assert on the chip inside the Dashboard link.
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(dashboard).toHaveAttribute('href', '/')
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+    // Other destinations stay untouched by the node name.
+    expect(screen.getByRole('link', { name: 'Explore' })).toHaveAttribute('href', '/explore')
+  })
+
+  it('names the chip after the entry node even when a joined worker forwards the controller name', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'gx10-worker-2', port: 7878, access_urls: ['http://100.64.0.11:7878'] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      // A joined worker forwards /api/v1/settings to the controller, so any
+      // node name in that response identifies the controller, not the node
+      // serving the browser.
+      if (path.includes('/api/v1/settings')) {
+        return new Response(JSON.stringify({ cluster_node_name: 'gx10-controller' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-worker-2')).toBeInTheDocument()
+    expect(within(dashboard).queryByText('gx10-controller')).not.toBeInTheDocument()
+  })
+
+  it('refreshes the sidebar node name when the entry node is renamed', async () => {
+    let nodeName = 'gx10-node-1'
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'controller',
+          node: { id: 'gx10-node-1', name: nodeName, port: 7878, access_urls: ['http://100.64.0.1:7878'] },
+          controller_reachable: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    const dashboard = await screen.findByRole('link', { name: /Dashboard/ })
+    expect(within(dashboard).getByText('gx10-node-1')).toBeInTheDocument()
+
+    nodeName = 'renamed-gx10'
+    window.dispatchEvent(new Event('sparkdeck:node-name-changed'))
+    await waitFor(() => expect(within(screen.getByRole('link', { name: /Dashboard/ })).getByText('renamed-gx10')).toBeInTheDocument())
+  })
+
   it('ignores an older aborted presence failure after a newer refresh succeeds', async () => {
     const presenceRequests: Array<{
       signal?: AbortSignal
@@ -222,6 +296,42 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('deletes a saved recipe without removing deployments or cached weights', async () => {
+    const user = userEvent.setup()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    localStorage.setItem('sparkdeck:pinned-recipes', JSON.stringify(['recipe-1']))
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/recipes/recipe-1') && init?.method === 'DELETE') {
+        return new Response(null, { status: 204 })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(screen.getByRole('button', { name: 'Delete recipe Saved cluster' }))
+
+    expect(confirm).toHaveBeenCalledWith('Delete recipe Saved cluster? Existing deployments and cached model weights will not be removed.')
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-1', expect.objectContaining({ method: 'DELETE' }),
+    ))
+    expect(screen.queryByText('Saved cluster')).not.toBeInTheDocument()
+    expect(screen.getByText('Running model')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Deleted recipe Saved cluster. Existing deployments and cached model weights were left unchanged.')
+    expect(localStorage.getItem('sparkdeck:pinned-recipes')).toBe('[]')
+  })
+
   it('shows exact replicated disk usage and deploys legacy saved configurations', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3

@@ -28,7 +28,13 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 FORWARD_NODE_HEADER = "x-sparkdeck-forward-node"
 FORWARD_HOP_HEADER = "x-sparkdeck-forward-hop"
 FORWARD_TOKEN_HEADER = "x-sparkdeck-forward-token"
-FORWARD_HEADERS = {FORWARD_NODE_HEADER, FORWARD_HOP_HEADER, FORWARD_TOKEN_HEADER}
+FORWARD_SCHEME_HEADER = "x-sparkdeck-forward-scheme"
+FORWARD_HEADERS = {
+    FORWARD_NODE_HEADER,
+    FORWARD_HOP_HEADER,
+    FORWARD_TOKEN_HEADER,
+    FORWARD_SCHEME_HEADER,
+}
 JOIN_CODE_TTL_SECONDS = 600.0
 JOIN_RATE_LIMIT = 5
 JOIN_RATE_WINDOW_SECONDS = 60.0
@@ -724,8 +730,11 @@ class OnboardingService:
         hop = str(headers.get(FORWARD_HOP_HEADER) or "")
         node_id = str(headers.get(FORWARD_NODE_HEADER) or "")
         token = str(headers.get(FORWARD_TOKEN_HEADER) or "")
+        scheme = str(headers.get(FORWARD_SCHEME_HEADER) or "")
         if hop != "1":
             return False, "forward hop must be exactly 1"
+        if scheme and scheme not in {"http", "https"}:
+            return False, "forward scheme must be http or https"
         if not self.manager.node_registry.accepts_forward_token(node_id, token):
             return False, "invalid worker forwarding credential"
         return True, ""
@@ -758,6 +767,7 @@ async def forward_management_request(
         FORWARD_NODE_HEADER: assignment["node_id"],
         FORWARD_HOP_HEADER: "1",
         FORWARD_TOKEN_HEADER: assignment["forward_token"],
+        FORWARD_SCHEME_HEADER: request.url.scheme,
     })
     try:
         body = await request.body()
@@ -815,7 +825,7 @@ async def forward_management_request(
         key: value for key, value in upstream.headers.items()
         if key.casefold() in {
             "content-type", "content-encoding", "cache-control",
-            "content-disposition", "vary",
+            "content-disposition", "vary", "set-cookie",
         }
     }
     return StreamingResponse(

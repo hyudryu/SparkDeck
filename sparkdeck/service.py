@@ -1382,12 +1382,32 @@ class SparkDeckService:
                       for member in members),
                     return_exceptions=True,
                 )
-                sections = []
-                for member, result in zip(members, results):
+
+                def member_section(member: dict[str, Any], result: Any) -> str:
                     label = f"rank {member.get('rank')} · node {member.get('node_id')}"
                     logs = result.get("logs") if isinstance(result, dict) else None
-                    body = logs if isinstance(logs, str) and logs else f"logs unavailable: {result}"
-                    sections.append(f"===== {label} ({member.get('container_name')}) =====\n{body}")
+                    if isinstance(logs, str) and logs:
+                        body = logs
+                    else:
+                        # Ranks still queued/creating — and older agents that
+                        # reply 404 until Docker creates the container — have
+                        # no logs yet; the coordinator's launch status is the
+                        # useful signal there.
+                        phase = member.get("phase") or {}
+                        message = phase.get("message") or (
+                            "Waiting for the node agent to begin launch"
+                            if member.get("status") in {"queued", "creating"}
+                            else "No output has been reported yet"
+                        )
+                        body = f"=== Coordinator launch status ===\n{message}"
+                        if isinstance(result, Exception):
+                            body += f"\n\nAgent log request: {result}"
+                    return f"===== {label} ({member.get('container_name')}) =====\n{body}"
+
+                sections = [
+                    member_section(member, result)
+                    for member, result in zip(members, results)
+                ]
                 return {"logs": "\n\n".join(sections)}
 
         container = deployment.get("container_name")
@@ -1623,10 +1643,11 @@ class SparkDeckService:
         started = time.monotonic()
         settings = deployment.get("settings") or {}
         manager_id = settings.get("manager_deployment_id")
-        hardware, hardware_verified = await self._managed_hardware_snapshot(deployment)
+        route_observation: dict[str, Any] = {}
         result = (
             await self.manager.proxy_cluster_inference(
                 manager_id, model, upstream_body, endpoint, cancel,
+                route_observation=route_observation,
             )
             if manager_id
             else (
@@ -1645,11 +1666,21 @@ class SparkDeckService:
         )
         revision = deployment["model"].get("revision")
         if hasattr(result, "__aiter__"):
+            async def serving_hardware():
+                return await self._managed_hardware_snapshot(
+                    deployment, route_observation.get("member"),
+                    require_serving_member=bool(manager_id),
+                )
+
             return self._observe_stream(
                 result, deployment["id"], model, deployment["runtime"], settings,
                 started, revision=revision, response_model=deployment["alias"],
-                hardware=hardware, hardware_verified=hardware_verified,
+                hardware_resolver=serving_hardware,
             )
+        hardware, hardware_verified = await self._managed_hardware_snapshot(
+            deployment, route_observation.get("member"),
+            require_serving_member=bool(manager_id),
+        )
         self._record_response(
             deployment["id"], model, deployment["runtime"], settings, started,
             result, revision=revision, hardware=hardware,
@@ -1751,7 +1782,8 @@ class SparkDeckService:
                               started: float, revision: str | None = None,
                               response_model: str | None = None,
                               hardware: dict[str, Any] | None = None,
-                              hardware_verified: bool = True) -> AsyncIterator[str]:
+                              hardware_verified: bool = True,
+                              hardware_resolver: Any = None) -> AsyncIterator[str]:
         first_token_at = None
         usage = None
         async for chunk in stream:
@@ -1766,6 +1798,8 @@ class SparkDeckService:
                     first_token_at = time.monotonic()
             yield text.encode("utf-8") if isinstance(chunk, bytes) else text
         if usage:
+            if hardware_resolver is not None:
+                hardware, hardware_verified = await hardware_resolver()
             self._record_usage(
                 deployment_id, model, runtime, settings, started, usage,
                 first_token_at, revision=revision, hardware=hardware,
@@ -1896,7 +1930,8 @@ class SparkDeckService:
         return configuration
 
     async def _managed_hardware_snapshot(
-        self, deployment: dict[str, Any]
+        self, deployment: dict[str, Any], serving_member: dict[str, Any] | None = None,
+        *, require_serving_member: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         """Resolve benchmark hardware from the cluster member that serves requests."""
         if deployment.get("kind") != DeploymentKind.MANAGED.value:
@@ -1905,8 +1940,11 @@ class SparkDeckService:
         if not manager_id:
             return self._hardware_snapshot(), True
         try:
-            _, primary = self.manager._cluster_primary_member(manager_id)
-            node_id = primary.get("node_id")
+            if serving_member is None:
+                if require_serving_member:
+                    return self._unknown_hardware_snapshot(), False
+                _, serving_member = self.manager._cluster_primary_member(manager_id)
+            node_id = serving_member.get("node_id")
             if node_id == "local":
                 return self._hardware_snapshot(), True
             if not node_id:

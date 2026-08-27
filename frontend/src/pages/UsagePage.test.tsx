@@ -116,7 +116,7 @@ describe('UsagePage', () => {
     render(<UsagePage />)
 
     await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
-    await user.click(screen.getByRole('button', { name: 'Edit alias for org/model' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
     const alias = screen.getByRole('textbox', { name: 'Display alias' })
     await user.clear(alias)
     await user.type(alias, 'Local coder')
@@ -131,6 +131,156 @@ describe('UsagePage', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
     await user.click(screen.getByRole('button', { name: 'Reset lifetime' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
+  })
+
+  it('edits and removes usage routing rules from the display dialog', async () => {
+    const rules: Record<string, string> = { 'org/model': 'org/target' }
+    const routed = {
+      ...summary,
+      models: { 'org/model': summary.models['org/model'], 'org/target': { input: 900, cached: 100, output: 400, requests: 5 } },
+      groups: [{
+        key: 'model:org/target', label: 'org/target', merge_group: null,
+        route_target: 'org/target', models: ['org/model', 'org/target'],
+        members: [
+          { model: 'org/model', alias: null, merge_group: null, routed_to: 'org/target' },
+          { model: 'org/target', alias: null, merge_group: null, routed_to: null },
+        ],
+        stats: {
+          input: 2400, input_miss: 1900, cached: 600, measured_cached: 600,
+          estimated_cached: 0, output: 1150, requests: 17, gen_tokens: 1150,
+          gen_time_s: 30,
+        },
+        speed: null,
+        total_cost: 1.5, cost_estimated: false,
+      }],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'PUT' && path === '/api/token-stats/rules') {
+        const body = JSON.parse(String(init?.body)) as { source: string; destination: string }
+        rules[body.source] = body.destination
+        return json({ ok: true })
+      }
+      if (init?.method === 'DELETE' && path.startsWith('/api/token-stats/rules/')) {
+        delete rules[decodeURIComponent(path.replace('/api/token-stats/rules/', ''))]
+        return json({ ok: true })
+      }
+      if (init?.method) return json({ ok: true })
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json({ ...routed, routing_rules: rules })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for org/target' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('combobox', { name: 'Route usage to' })).toHaveValue('org/target')
+    const options = [...document.querySelectorAll('#usage-route-destinations option')].map((option) => option.getAttribute('value'))
+    expect(options).toContain('org/target')
+    expect(options).not.toContain('org/model')
+
+    await user.clear(screen.getByRole('combobox', { name: 'Route usage to' }))
+    await user.type(screen.getByRole('combobox', { name: 'Route usage to' }), 'org/other')
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ source: 'org/model', destination: 'org/other' }),
+    })))
+    await screen.findByText('Updated usage display for org/model.')
+
+    await user.click(await screen.findByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('combobox', { name: 'Route usage to' })).toHaveValue('org/other')
+    await user.clear(screen.getByRole('combobox', { name: 'Route usage to' }))
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
+  })
+
+  it('keeps a route-only save from overwriting the source merge group', async () => {
+    const routed = {
+      ...summary,
+      models: { 'org/model': summary.models['org/model'], 'org/target': { input: 900, cached: 100, output: 400, requests: 5 } },
+      merge_groups: {},
+      groups: [{
+        key: 'group:Workspace', label: 'Workspace', merge_group: 'Workspace',
+        route_target: null, models: ['org/model', 'org/target'],
+        members: [
+          { model: 'org/model', alias: null, merge_group: 'Workspace', routed_to: 'org/target' },
+          { model: 'org/target', alias: null, merge_group: 'Workspace', routed_to: null },
+        ],
+        stats: {
+          input: 2400, input_miss: 1900, cached: 600, measured_cached: 600,
+          estimated_cached: 0, output: 1150, requests: 17, gen_tokens: 1150,
+          gen_time_s: 30,
+        },
+        speed: null,
+        total_cost: 1.5, cost_estimated: false,
+      }],
+      routing_rules: { 'org/model': 'org/target' },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/api/token-stats/hourly') || String(input).includes('/api/token-stats/daily')) return json([])
+      return json(routed)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workspace' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('textbox', { name: 'Merge group' })).toHaveValue('')
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await screen.findByText('Updated usage display for org/model.')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/alias', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ model: 'org/model', alias: null }),
+    }))
+    expect(fetchMock.mock.calls.every(([path]) => !String(path).includes('/api/token-stats/rules'))).toBe(true)
+  })
+
+  it('sends an explicit clear when a configured merge group is removed', async () => {
+    const grouped = { ...summary, merge_groups: { 'org/model': 'Legacy' } }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/api/token-stats/hourly') || String(input).includes('/api/token-stats/daily')) return json([])
+      return json(grouped)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    expect(screen.getByRole('textbox', { name: 'Merge group' })).toHaveValue('Legacy')
+    await user.clear(screen.getByRole('textbox', { name: 'Merge group' }))
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/alias', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ model: 'org/model', alias: 'Workload', merge_group: null }),
+    })))
+  })
+
+  it('surfaces routing rule validation errors inside the display dialog', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'PUT' && path === '/api/token-stats/rules') return json({ detail: 'routing rules cannot contain a cycle' }, 400)
+      if (init?.method) return json({ ok: true })
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    await user.click(screen.getByRole('button', { name: 'Edit usage display for org/model' }))
+    await user.type(screen.getByRole('combobox', { name: 'Route usage to' }), 'org/other')
+    await user.click(screen.getByRole('button', { name: 'Save usage display' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('routing rules cannot contain a cycle')
+    expect(screen.getByRole('dialog', { name: 'Edit usage model' })).toBeInTheDocument()
   })
 
   it('surfaces historical analysis failures independently with a retry', async () => {

@@ -162,6 +162,122 @@ describe('ClusterPage', () => {
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
   })
 
+  it('announces a local node rename so the sidebar node chip refreshes', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/local') && init?.method === 'PATCH') return new Response(JSON.stringify({ ...clusterNodes.items[0], name: 'Halo Controller', name_sync: 'local' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const renamedEvents = vi.fn()
+    window.addEventListener('sparkdeck:node-name-changed', renamedEvents)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio controller' }))
+    const input = screen.getByRole('textbox', { name: 'New name for Studio controller' })
+    await user.clear(input)
+    await user.type(input, 'Halo Controller')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Renamed Studio controller to Halo Controller.')).toHaveAttribute('role', 'status')
+    expect(renamedEvents).toHaveBeenCalledTimes(1)
+    window.removeEventListener('sparkdeck:node-name-changed', renamedEvents)
+  })
+
+  it('announces renaming the current entry worker so the sidebar node chip refreshes', async () => {
+    const workerStatus = {
+      role: 'worker',
+      node: { id: 'spark-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] },
+      controller_url: 'https://controller.tailnet.ts.net',
+      controller_reachable: true,
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/spark-2') && init?.method === 'PATCH') return new Response(JSON.stringify({ ...clusterNodes.items[1], name: 'Render Spark', name_sync: 'synchronized' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(workerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const renamedEvents = vi.fn()
+    window.addEventListener('sparkdeck:node-name-changed', renamedEvents)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    // Opened through the worker, the inventory marks the controller as
+    // node.local; spark-2 is still this UI's entry node.
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio Spark' }))
+    const input = screen.getByRole('textbox', { name: 'New name for Studio Spark' })
+    await user.clear(input)
+    await user.type(input, 'Render Spark')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Renamed Studio Spark to Render Spark.')).toHaveAttribute('role', 'status')
+    expect(renamedEvents).toHaveBeenCalledTimes(1)
+    window.removeEventListener('sparkdeck:node-name-changed', renamedEvents)
+  })
+
+  it('keeps the sidebar quiet while the rename has not reached the entry worker', async () => {
+    const workerStatus = {
+      role: 'worker',
+      node: { id: 'spark-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] },
+      controller_url: 'https://controller.tailnet.ts.net',
+      controller_reachable: true,
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/spark-2') && init?.method === 'PATCH') return new Response(JSON.stringify({ ...clusterNodes.items[1], name: 'Render Spark', name_sync: 'pending' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(workerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const renamedEvents = vi.fn()
+    window.addEventListener('sparkdeck:node-name-changed', renamedEvents)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio Spark' }))
+    const input = screen.getByRole('textbox', { name: 'New name for Studio Spark' })
+    await user.clear(input)
+    await user.type(input, 'Render Spark')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Renamed Studio Spark to Render Spark.')).toHaveAttribute('role', 'status')
+    expect(renamedEvents).not.toHaveBeenCalled()
+    window.removeEventListener('sparkdeck:node-name-changed', renamedEvents)
+  })
+
+  it('does not announce renaming the controller from a worker entry', async () => {
+    const workerStatus = {
+      role: 'worker',
+      node: { id: 'spark-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] },
+      controller_url: 'https://controller.tailnet.ts.net',
+      controller_reachable: true,
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/local') && init?.method === 'PATCH') return new Response(JSON.stringify({ ...clusterNodes.items[0], name: 'Halo Controller', name_sync: 'synchronized' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(workerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const renamedEvents = vi.fn()
+    window.addEventListener('sparkdeck:node-name-changed', renamedEvents)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Edit name for Studio controller' }))
+    const input = screen.getByRole('textbox', { name: 'New name for Studio controller' })
+    await user.clear(input)
+    await user.type(input, 'Halo Controller')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Renamed Studio controller to Halo Controller.')).toHaveAttribute('role', 'status')
+    expect(renamedEvents).not.toHaveBeenCalled()
+    window.removeEventListener('sparkdeck:node-name-changed', renamedEvents)
+  })
+
   it('removes an edited worker and force-forgets an offline node with a warning', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

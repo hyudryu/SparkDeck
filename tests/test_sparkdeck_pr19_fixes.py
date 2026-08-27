@@ -155,6 +155,37 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             ("cluster-1-r1-model", "logs", 150),
         ])
 
+    async def test_deployment_logs_fall_back_to_coordinator_status(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "starting",
+            "members": [
+                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
+                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1,
+                 "status": "queued", "phase": {"message": "pulling runtime image"}},
+            ],
+        }]
+
+        async def member_action(member, action, log_tail=300):
+            if member["node_id"] == "local":
+                return {"logs": "docker logs here"}
+            raise RuntimeError("agent returned 404")
+
+        self.manager._member_action = member_action
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
+
+        result = await self.service.deployment_logs("container:cluster-1-r0-model", 100)
+
+        self.assertIn("docker logs here", result["logs"])
+        # A rank without logs yet reports the coordinator's launch status
+        # instead of a bare transport error.
+        self.assertIn("=== Coordinator launch status ===", result["logs"])
+        self.assertIn("pulling runtime image", result["logs"])
+        self.assertIn("Agent log request: agent returned 404", result["logs"])
+        self.assertNotIn("logs unavailable", result["logs"])
+
     async def test_deployment_logs_read_single_container(self):
         self.manager.list_containers.return_value = [{
             "name": "legacy-model", "model": "org/model", "engine": "vllm",

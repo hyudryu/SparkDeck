@@ -171,6 +171,13 @@ class SparkDeckStore:
                 (container_name, deployment_id),
             )
 
+    def update_alias(self, deployment_id: str, alias: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET alias = ? WHERE id = ?",
+                (alias, deployment_id),
+            )
+
     def update_runtime_location(self, deployment_id: str, container_name: str,
                                 base_url: str) -> None:
         with self._lock, self._connection:

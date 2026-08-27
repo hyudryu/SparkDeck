@@ -1,8 +1,8 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import { Bookmark, HardDrive, Play, Plus, Server, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { Bookmark, Check, HardDrive, Pencil, Play, Plus, Server, Settings2, Trash2, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { CreateDeploymentInput, Deployment, RuntimeKind, SavedConfiguration } from '../api/types'
+import type { CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -21,6 +21,112 @@ const initialForm: CreateDeploymentInput = {
 
 const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
 
+const PIN_STORAGE_KEY = 'sparkdeck:pinned-recipes'
+const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
+
+type SortMode = 'recent' | 'name-asc' | 'name-desc'
+
+// Flags the structured argument editor manages; everything else in a saved
+// configuration's extra args is shown verbatim in the "Other flags" field.
+const CONTROLLED_FLAGS = new Set([
+  '--max-model-len', '--max-model-length', '--max-num-seqs', '--kv-cache-dtype',
+  '--context-length', '--max-running-requests', '--max-cudagraph-capture-size',
+  '--max-num-batched-tokens', '--speculative-config', '--default-chat-template-kwargs',
+])
+
+const shellQuote = (arg: string) => (/[\s"']/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
+
+// Shell-aware whitespace splitter: respects single/double quotes, strips them.
+function shellSplit(input: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let quote: string | null = null
+  let inWord = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      else cur += ch
+      inWord = true
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      inWord = true
+    } else if (/\s/.test(ch)) {
+      if (inWord) { out.push(cur); cur = ''; inWord = false }
+    } else if (ch === '\\' && i + 1 < input.length) {
+      cur += input[i + 1]
+      i++
+      inWord = true
+    } else {
+      cur += ch
+      inWord = true
+    }
+  }
+  if (inWord) out.push(cur)
+  return out
+}
+
+// Extra args minus the flags the structured editor controls, shell-quoted for display.
+function remainingArgs(args: string[]): string {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    const flag = token.split('=')[0]
+    if (CONTROLLED_FLAGS.has(flag)) {
+      if (!token.includes('=') && i + 1 < args.length && !args[i + 1].startsWith('-')) i++
+      continue
+    }
+    out.push(token)
+  }
+  return out.map(shellQuote).join(' ')
+}
+
+const companyOf = (recipe: SavedConfiguration) => {
+  const first = (recipe.model || recipe.name || '').split('/')[0]?.trim()
+  return first || 'Other'
+}
+
+type ArgsForm = Record<string, string>
+
+type ArgsEditorState = {
+  open: boolean
+  loading: boolean
+  saving: boolean
+  saved: boolean
+  error?: string
+  form: ArgsForm
+}
+
+const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
+  const controls = detail.launch_controls ?? {}
+  return {
+    context_window: controls.context_window?.toString() ?? '',
+    max_concurrency: controls.max_concurrency?.toString() ?? '',
+    kv_cache_dtype: controls.kv_cache_dtype ?? '',
+    thinking_mode: controls.thinking_mode ?? 'default',
+    dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens?.toString() ?? '',
+    max_cudagraph_capture_size: controls.max_cudagraph_capture_size?.toString() ?? '',
+    max_num_batched_tokens: controls.max_num_batched_tokens?.toString() ?? '',
+    gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
+    gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
+    remaining_flags: remainingArgs(detail.extra_args ?? []),
+  }
+}
+
+const readPinned = (): string[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PIN_STORAGE_KEY) ?? '[]')
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+const readSortMode = (): SortMode => {
+  const value = localStorage.getItem(SORT_STORAGE_KEY)
+  return value === 'name-asc' || value === 'name-desc' ? value : 'recent'
+}
+
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const resource = useResource((signal) => api.deployments.list(signal))
@@ -36,6 +142,10 @@ export function ModelsPage() {
   const [actionNotice, setActionNotice] = useState<string>()
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
   const [recipeError, setRecipeError] = useState<string>()
+  const [sortMode, setSortMode] = useState<SortMode>(readSortMode)
+  const [pinned, setPinned] = useState<string[]>(readPinned)
+  const [renaming, setRenaming] = useState<{ id: string; value: string }>()
+  const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
 
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
@@ -104,6 +214,136 @@ export function ModelsPage() {
     }
   }
 
+  const saveRename = async () => {
+    if (!renaming) return
+    const alias = renaming.value.trim()
+    if (!alias) return
+    setBusy(renaming.id)
+    setActionError(undefined)
+    try {
+      const updated = await api.deployments.rename(renaming.id, alias)
+      setRenaming(undefined)
+      setActionNotice(`Renamed deployment to ${updated.alias}.`)
+      resource.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not rename deployment')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const changeSortMode = (mode: SortMode) => {
+    setSortMode(mode)
+    localStorage.setItem(SORT_STORAGE_KEY, mode)
+  }
+
+  const togglePin = (recipeId: string) => {
+    setPinned((current) => {
+      const next = current.includes(recipeId)
+        ? current.filter((id) => id !== recipeId)
+        : [...current, recipeId]
+      localStorage.setItem(PIN_STORAGE_KEY, JSON.stringify(next))
+      return next
+    })
+  }
+
+  const sortedDeployments = useMemo(() => {
+    const items = [...(resource.data ?? [])]
+    if (sortMode === 'name-asc' || sortMode === 'name-desc') {
+      items.sort((a, b) => a.alias.localeCompare(b.alias, undefined, { sensitivity: 'base' }))
+      if (sortMode === 'name-desc') items.reverse()
+    } else {
+      // Stable sort: deployments without a timestamp keep their existing order.
+      items.sort((a, b) => (Date.parse(b.created_at ?? '') || 0) - (Date.parse(a.created_at ?? '') || 0))
+    }
+    return items
+  }, [resource.data, sortMode])
+
+  const recipeGroups = useMemo(() => {
+    const groups = new Map<string, SavedConfiguration[]>()
+    for (const recipe of recipes.data ?? []) {
+      const company = companyOf(recipe)
+      groups.set(company, [...(groups.get(company) ?? []), recipe])
+    }
+    const pinnedSet = new Set(pinned)
+    return [...groups.entries()]
+      .sort(([a], [b]) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+      .map(([company, items]): [string, SavedConfiguration[]] => [company, [...items].sort((a, b) => {
+        const pinDelta = Number(pinnedSet.has(b.id)) - Number(pinnedSet.has(a.id))
+        if (pinDelta) return pinDelta
+        return (a.name || a.model).localeCompare(b.name || b.model, undefined, { sensitivity: 'base' })
+      })])
+  }, [recipes.data, pinned])
+
+  const setArgsEditor = (recipeId: string, next: Partial<ArgsEditorState>) => {
+    setArgsEditors((current) => {
+      const previous: ArgsEditorState = current[recipeId] ?? {
+        open: false, loading: false, saving: false, saved: false, form: {},
+      }
+      return { ...current, [recipeId]: { ...previous, ...next } }
+    })
+  }
+
+  const toggleArgsEditor = async (recipe: SavedConfiguration) => {
+    const current = argsEditors[recipe.id]
+    if (current?.open) {
+      setArgsEditor(recipe.id, { open: false })
+      return
+    }
+    if (current && Object.keys(current.form).length) {
+      setArgsEditor(recipe.id, { open: true })
+      return
+    }
+    setArgsEditor(recipe.id, { open: true, loading: true, error: undefined })
+    try {
+      const detail = await api.recipes.get(recipe.id)
+      setArgsEditor(recipe.id, { loading: false, form: seedArgsForm(detail) })
+    } catch (reason) {
+      setArgsEditor(recipe.id, {
+        loading: false,
+        error: reason instanceof Error ? reason.message : 'Could not load arguments',
+      })
+    }
+  }
+
+  const saveArgs = async (recipe: SavedConfiguration) => {
+    const editor = argsEditors[recipe.id]
+    if (!editor) return
+    const numeric = (value: string) => {
+      const trimmed = (value ?? '').trim()
+      if (!trimmed) return null
+      const parsed = Number(trimmed)
+      return Number.isFinite(parsed) ? parsed : null
+    }
+    const editorForm = editor.form
+    const payload: RecipeUpdateInput = {
+      extra_args: shellSplit(editorForm.remaining_flags ?? ''),
+      launch_controls: {
+        context_window: numeric(editorForm.context_window),
+        max_concurrency: numeric(editorForm.max_concurrency),
+        kv_cache_dtype: editorForm.kv_cache_dtype?.trim() || null,
+        thinking_mode: editorForm.thinking_mode || 'default',
+        dspark_num_speculative_tokens: numeric(editorForm.dspark_num_speculative_tokens),
+        max_cudagraph_capture_size: numeric(editorForm.max_cudagraph_capture_size),
+        max_num_batched_tokens: numeric(editorForm.max_num_batched_tokens),
+      },
+      gpu_memory_utilization: numeric(editorForm.gpu_memory_utilization),
+      gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
+    }
+    setArgsEditor(recipe.id, { saving: true, error: undefined, saved: false })
+    try {
+      await api.recipes.update(recipe.id, payload)
+      setArgsEditor(recipe.id, { saving: false, saved: true })
+      setTimeout(() => setArgsEditor(recipe.id, { saved: false }), 2500)
+      recipes.reload()
+    } catch (reason) {
+      setArgsEditor(recipe.id, {
+        saving: false,
+        error: reason instanceof Error ? reason.message : 'Could not save arguments',
+      })
+    }
+  }
+
   const nodesWithWeights = (recipe: SavedConfiguration) => {
     if (isLocalModelPath(recipe.model)) {
       return new Set(localNodeId ? [localNodeId] : [])
@@ -152,15 +392,27 @@ export function ModelsPage() {
     const locations = (modelCache.data?.nodes ?? []).flatMap((node) =>
       node.models
         .filter((model) => model.model_id === deployment.model_id)
-        .map((model) => ({ ...model, nodeName: node.name })),
+        .map((model) => ({ ...model, nodeId: node.id, nodeName: node.name })),
     )
     if (!locations.length) return 'Disk size unavailable'
     const total = locations.reduce((sum, location) => sum + location.size_bytes, 0)
-    if (locations.length === 1) return `${formatBytes(total)} on ${locations[0].nodeName}`
-    const perCopy = locations.every((location) => location.size_bytes === locations[0].size_bytes)
-      ? `${formatBytes(locations[0].size_bytes)} each · `
-      : ''
-    return `${perCopy}${formatBytes(total)} total on ${locations.length} nodes`
+    let base: string
+    if (locations.length === 1) {
+      base = `${formatBytes(total)} on ${locations[0].nodeName}`
+    } else {
+      const perCopy = locations.every((location) => location.size_bytes === locations[0].size_bytes)
+        ? `${formatBytes(locations[0].size_bytes)} each · `
+        : ''
+      base = `${perCopy}${formatBytes(total)} total on ${locations.length} nodes`
+    }
+    // Multi-node deployments: call out selected nodes whose weights were not
+    // found in the cache inventory instead of silently omitting them.
+    const cachedIds = new Set(locations.map((location) => location.nodeId))
+    const expectedIds = deployment.selected_nodes?.map((node) => node.id) ?? deployment.node_ids ?? []
+    const missing = expectedIds
+      .filter((id) => !cachedIds.has(id))
+      .map((id) => id === 'local' ? localLabel : (nodes.data?.find((node) => node.id === id)?.name ?? id))
+    return missing.length ? `${base} · not cached on ${missing.join(', ')}` : base
   }
 
   const updateRuntime = (runtime: RuntimeKind) => {
@@ -193,57 +445,137 @@ export function ModelsPage() {
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
-      {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">
-        <div className="section-heading"><div><h2 id="saved-configurations-title">Saved cluster configurations</h2><p>Existing saved recipes are preserved and deploy through SparkDeck.</p></div></div>
-        <div className="saved-configuration-grid">
-          {recipes.data.map((recipe) => {
-            const targets = (recipe.node_ids?.length ? recipe.node_ids : ['local']).map((id) => nodes.data?.find((node) => node.id === id))
-            const targetNames = targets.map((node, index) => node?.name ?? recipe.node_ids?.[index] ?? 'This device')
-            const unavailable = targets.some((node) => !node || !isNodeSelectable(node))
-            const disabled = recipe.supported === false
-            return <Panel className="saved-configuration-card" key={recipe.id}>
-              <div className="saved-configuration-heading"><span className="panel-icon"><Bookmark size={17} /></span><div><h3>{recipe.name || recipe.model}</h3><p>{recipe.model}</p></div></div>
-              <dl>
-                <div><dt>Runtime</dt><dd><RuntimeMark runtime={recipe.engine || 'vllm'} /></dd></div>
-                <div><dt>Layout</dt><dd>{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} · ` : ''}{recipe.deployment_mode || 'single'} · {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'}</dd></div>
-                <div><dt>Targets</dt><dd>{targetNames.join(', ')}</dd></div>
-                <div><dt>Arguments</dt><dd>{recipe.extra_args_count ?? 0} saved</dd></div>
-              </dl>
-              {(recipe.error || unavailable) && <p className="saved-configuration-warning">{recipe.error || 'One or more saved nodes are missing, offline, or not ready.'}</p>}
-              <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => openRecipeDeployment(recipe)}><Play size={15} /> Choose nodes &amp; deploy</Button>
-            </Panel>
-          })}
-        </div>
-      </section>}
       {!resource.loading && !resource.error && resource.data?.length === 0 && (
         <EmptyState title="No model servers yet" description="Launch a managed runtime or connect an existing OpenAI-compatible endpoint." action={<Button variant="primary" onClick={openCreator}>Add your first model</Button>} />
       )}
       {resource.data && resource.data.length > 0 && (
-        <Panel className="table-panel">
-          <div className="responsive-table deployments-table" role="table" aria-label="Model deployments">
-            <div className="table-row table-header" role="row">
-              <span role="columnheader">Model</span><span role="columnheader">Runtime</span><span role="columnheader">Configuration</span><span role="columnheader">Target</span><span role="columnheader">Status</span><span role="columnheader">Actions</span>
-            </div>
-            {resource.data.map((deployment) => (
-              <div className="table-row" role="row" key={deployment.id} tabIndex={0}>
-                <div role="cell" data-label="Model"><strong>{deployment.alias}</strong><small>{deployment.model_id}</small><small className="model-disk-usage"><HardDrive size={12} /> {modelStorage(deployment)}</small></div>
-                <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
-                <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
-                <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
-                <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
-                <div role="cell" data-label="Actions" className="row-actions">
-                  {deployment.managed && (deployment.status === 'running'
-                    ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
-                    : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
-                  <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
-                    if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')
-                  }}><Trash2 size={17} /></Button>
-                </div>
-              </div>
-            ))}
+        <section className="deployments" aria-labelledby="deployments-title">
+          <div className="section-heading">
+            <div><h2 id="deployments-title">Deployments</h2></div>
+            <label className="sort-field"><span>Sort</span>
+              <select value={sortMode} onChange={(event) => changeSortMode(event.target.value as SortMode)} aria-label="Sort deployments">
+                <option value="recent">Most recent</option>
+                <option value="name-asc">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+              </select>
+            </label>
           </div>
-        </Panel>
+          <Panel className="table-panel">
+            <div className="responsive-table deployments-table" role="table" aria-label="Model deployments">
+              <div className="table-row table-header" role="row">
+                <span role="columnheader">Model</span><span role="columnheader">Runtime</span><span role="columnheader">Configuration</span><span role="columnheader">Target</span><span role="columnheader">Status</span><span role="columnheader">Actions</span>
+              </div>
+              {sortedDeployments.map((deployment) => (
+                <div className="table-row" role="row" key={deployment.id} tabIndex={0}>
+                  <div role="cell" data-label="Model">
+                    {renaming?.id === deployment.id ? (
+                      <span className="rename-row">
+                        <input
+                          className="rename-input"
+                          autoFocus
+                          value={renaming.value}
+                          aria-label={`New name for ${deployment.alias}`}
+                          onChange={(event) => setRenaming({ id: deployment.id, value: event.target.value })}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') void saveRename()
+                            if (event.key === 'Escape') setRenaming(undefined)
+                          }}
+                        />
+                        <Button variant="tertiary" disabled={busy === deployment.id} aria-label="Save name" onClick={() => void saveRename()}><Check size={15} /></Button>
+                        <Button variant="tertiary" aria-label="Cancel rename" onClick={() => setRenaming(undefined)}><X size={15} /></Button>
+                      </span>
+                    ) : (
+                      <strong>{deployment.alias}</strong>
+                    )}
+                    <small>{deployment.model_id}</small>
+                    <small className="model-disk-usage"><HardDrive size={12} /> {modelStorage(deployment)}</small>
+                  </div>
+                  <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
+                  <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
+                  <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
+                  <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
+                  <div role="cell" data-label="Actions" className="row-actions">
+                    {deployment.managed && (deployment.status === 'running'
+                      ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'start')}>Start</Button>)}
+                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
+                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
+                      if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')
+                    }}><Trash2 size={17} /></Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+        </section>
       )}
+      {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">
+        <div className="section-heading"><div><h2 id="saved-configurations-title">Saved cluster configurations</h2><p>Existing saved recipes are preserved and deploy through SparkDeck.</p></div></div>
+        {recipeGroups.map(([company, items]) => (
+          <div className="saved-configuration-group" key={company}>
+            <h3 className="saved-configuration-group-title">{company} <span className="saved-configuration-group-count">{items.length}</span></h3>
+            <div className="saved-configuration-grid">
+              {items.map((recipe) => {
+                const targets = (recipe.node_ids?.length ? recipe.node_ids : ['local']).map((id) => nodes.data?.find((node) => node.id === id))
+                const targetNames = targets.map((node, index) => node?.name ?? recipe.node_ids?.[index] ?? 'This device')
+                const unavailable = targets.some((node) => !node || !isNodeSelectable(node))
+                const disabled = recipe.supported === false
+                const isPinned = pinned.includes(recipe.id)
+                const editor = argsEditors[recipe.id]
+                const isVllm = (recipe.engine || 'vllm') !== 'sglang'
+                return <Panel className="saved-configuration-card" key={recipe.id}>
+                  <div className="saved-configuration-heading">
+                    <button
+                      type="button"
+                      className={`icon-button pin-button${isPinned ? ' pinned' : ''}`}
+                      aria-label={`${isPinned ? 'Unpin' : 'Pin'} ${recipe.name || recipe.model}`}
+                      aria-pressed={isPinned}
+                      onClick={() => togglePin(recipe.id)}
+                    ><Bookmark size={17} fill={isPinned ? 'currentColor' : 'none'} /></button>
+                    <div><h3>{recipe.name || recipe.model}</h3><p>{recipe.model}</p></div>
+                  </div>
+                  <dl>
+                    <div><dt>Runtime</dt><dd><RuntimeMark runtime={recipe.engine || 'vllm'} /></dd></div>
+                    <div><dt>Layout</dt><dd>{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} · ` : ''}{recipe.deployment_mode || 'single'} · {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'}</dd></div>
+                    <div><dt>Targets</dt><dd>{targetNames.join(', ')}</dd></div>
+                    <div><dt>Arguments</dt><dd>{recipe.extra_args_count ?? 0} saved</dd></div>
+                  </dl>
+                  {(recipe.error || unavailable) && <p className="saved-configuration-warning">{recipe.error || 'One or more saved nodes are missing, offline, or not ready.'}</p>}
+                  <div className="saved-configuration-actions">
+                    <Button variant="primary" disabled={disabled || busy === `recipe:${recipe.id}`} onClick={() => openRecipeDeployment(recipe)}><Play size={15} /> Choose nodes &amp; deploy</Button>
+                    <Button variant="tertiary" aria-expanded={editor?.open ?? false} onClick={() => void toggleArgsEditor(recipe)}><Settings2 size={15} /> Arguments</Button>
+                  </div>
+                  {editor?.open && <div className="args-editor">
+                    {editor.loading && <p className="field-note">Loading arguments…</p>}
+                    {editor.error && <p className="form-error" role="alert">{editor.error}</p>}
+                    {!editor.loading && Object.keys(editor.form).length > 0 && <>
+                      <div className="field-grid">
+                        <label className="field"><span>Context window</span><input type="number" min="1" value={editor.form.context_window} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, context_window: event.target.value } })} /></label>
+                        <label className="field"><span>Max concurrency</span><input type="number" min="1" value={editor.form.max_concurrency} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_concurrency: event.target.value } })} /></label>
+                        <label className="field"><span>KV cache dtype</span><input value={editor.form.kv_cache_dtype} placeholder="auto" onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, kv_cache_dtype: event.target.value } })} /></label>
+                        <label className="field"><span>Thinking</span><select value={editor.form.thinking_mode} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, thinking_mode: event.target.value } })}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
+                        {isVllm && <>
+                          <label className="field"><span>Speculative tokens</span><input type="number" min="1" value={editor.form.dspark_num_speculative_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, dspark_num_speculative_tokens: event.target.value } })} /></label>
+                          <label className="field"><span>Cudagraph capture size</span><input type="number" min="1" value={editor.form.max_cudagraph_capture_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_cudagraph_capture_size: event.target.value } })} /></label>
+                          <label className="field"><span>Batched tokens</span><input type="number" min="1" value={editor.form.max_num_batched_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_num_batched_tokens: event.target.value } })} /></label>
+                        </>}
+                        <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" value={editor.form.gpu_memory_utilization} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_utilization: event.target.value } })} /></label>
+                        <label className="field"><span>Reserve GB</span><input type="number" min="1" value={editor.form.gpu_memory_gb} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_gb: event.target.value } })} /></label>
+                      </div>
+                      <label className="field"><span>Other flags</span><textarea rows={3} value={editor.form.remaining_flags} spellCheck={false} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, remaining_flags: event.target.value } })} /></label>
+                      <p className="field-note">Blank fields remove the flag. Structured fields above override matching flags in &quot;Other flags&quot;.</p>
+                      <div className="args-editor-actions">
+                        <Button variant="primary" disabled={editor.saving} onClick={() => void saveArgs(recipe)}>{editor.saving ? 'Saving…' : 'Save settings'}</Button>
+                        {editor.saved && <span className="inline-success" role="status">Saved.</span>}
+                      </div>
+                    </>}
+                  </div>}
+                </Panel>
+              })}
+            </div>
+          </div>
+        ))}
+      </section>}
 
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment

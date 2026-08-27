@@ -330,7 +330,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
         blobs.mkdir()
         return snapshot, blobs
 
-    def test_inventory_rejects_partial_transformer_snapshot(self):
+    def test_inventory_marks_partial_transformer_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             nas, hub = self._nas(Path(directory))
             snapshot, blobs = self._snapshot(hub)
@@ -339,7 +339,10 @@ class VirtualNASInventoryTests(unittest.TestCase):
             (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"one")
             (blobs / "unrelated-complete-blob").write_bytes(b"not a shard")
 
-            self.assertEqual(nas.inventory(), [])
+            models = nas.inventory()
+            self.assertEqual(len(models), 1)
+            self.assertTrue(models[0]["partial"])
+            self.assertEqual(models[0]["revisions"], [])
 
     def test_free_bytes_measures_the_hub_filesystem(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -374,7 +377,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
             self.assertEqual(models[0]["model_id"], "org/model")
             self.assertEqual(models[0]["revisions"], ["revision-1"])
 
-    def test_inventory_rejects_missing_runtime_requirements(self):
+    def test_inventory_marks_missing_runtime_requirements_partial(self):
         cases = {
             "configuration": {"tokenizer.json", "model.safetensors"},
             "tokenizer": {"config.json", "model.safetensors"},
@@ -386,9 +389,9 @@ class VirtualNASInventoryTests(unittest.TestCase):
                 for filename in filenames:
                     (snapshot / filename).write_bytes(b"content")
 
-                self.assertEqual(nas.inventory(), [])
+                self.assertTrue(nas.inventory()[0]["partial"])
 
-    def test_inventory_rejects_weight_index_with_missing_file(self):
+    def test_inventory_marks_weight_index_with_missing_file_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             nas, hub = self._nas(Path(directory))
             snapshot, _ = self._snapshot(hub)
@@ -401,7 +404,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(nas.inventory(), [])
+            self.assertTrue(nas.inventory()[0]["partial"])
 
     def test_inventory_advertises_only_complete_revision_and_matching_ref(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -421,7 +424,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
             self.assertEqual(models[0]["revisions"], ["complete", "main"])
 
     @unittest.skipIf(os.name == "nt", "creating cache symlinks requires Windows privileges")
-    def test_inventory_rejects_snapshot_with_dangling_blob_link(self):
+    def test_inventory_marks_snapshot_with_dangling_blob_link_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             nas, hub = self._nas(Path(directory))
             snapshot, blobs = self._snapshot(hub)
@@ -433,7 +436,7 @@ class VirtualNASInventoryTests(unittest.TestCase):
             (snapshot / "tokenizer.json").symlink_to(tokenizer_blob)
             (snapshot / "model.safetensors").symlink_to(blobs / "missing-weight")
 
-            self.assertEqual(nas.inventory(), [])
+            self.assertTrue(nas.inventory()[0]["partial"])
 
 
 if __name__ == "__main__":

@@ -423,7 +423,7 @@ export function ModelsPage() {
       return new Set(localNodeId ? [localNodeId] : [])
     }
     return new Set((modelCache.data?.nodes ?? [])
-      .filter((node) => node.models.some((model) => model.model_id === recipe.model
+      .filter((node) => node.models.some((model) => !model.partial && model.model_id === recipe.model
         && model.revisions?.includes(recipe.model_revision ?? 'main')))
       .map((node) => node.id))
   }
@@ -465,7 +465,7 @@ export function ModelsPage() {
   const modelStorage = (deployment: Deployment) => {
     const locations = (modelCache.data?.nodes ?? []).flatMap((node) =>
       node.models
-        .filter((model) => model.model_id === deployment.model_id)
+        .filter((model) => !model.partial && model.model_id === deployment.model_id)
         .map((model) => ({ ...model, nodeId: node.id, nodeName: node.name })),
     )
     if (!locations.length) return 'Disk size unavailable'

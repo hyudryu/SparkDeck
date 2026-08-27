@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
-import { ArrowRight, Database, GripVertical, HardDrive, RefreshCw, Trash2, UploadCloud } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Database, GripVertical, HardDrive, RefreshCw, Trash2, UploadCloud } from 'lucide-react'
 import { api } from '../api/client'
 import type { StorageModel, StorageNode, StorageTransferJob } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -40,25 +40,28 @@ export function StoragePage() {
 
   const nodes = useMemo(() => resource.data?.nodes ?? [], [resource.data?.nodes])
   const sourceNode = nodes.find((node) => node.id === sourceNodeId)
-  const sourceModels = sourceNode?.models ?? []
+  const sourceModels = sourceNode?.models.filter((model) => !model.partial) ?? []
   const inventory = useMemo(() => {
-    const models = new Map<string, { model: StorageModel; nodes: Set<string> }>()
+    const models = new Map<string, { model: StorageModel; nodes: Map<string, StorageModel> }>()
     nodes.forEach((node) => node.models.forEach((model) => {
       const current = models.get(model.model_id)
-      if (current) current.nodes.add(node.id)
-      else models.set(model.model_id, { model, nodes: new Set([node.id]) })
+      if (current) {
+        current.nodes.set(node.id, model)
+        if (current.model.partial && !model.partial) current.model = model
+      } else models.set(model.model_id, { model, nodes: new Map([[node.id, model]]) })
     }))
     return [...models.values()]
   }, [nodes])
 
   useEffect(() => {
     if (!nodes.length) return
-    const selected = nodes.find((node) => node.id === sourceNodeId && node.online && node.models.length)
-      ?? nodes.find((node) => node.online && node.models.length)
+    const selected = nodes.find((node) => node.id === sourceNodeId && node.online && node.models.some((model) => !model.partial))
+      ?? nodes.find((node) => node.online && node.models.some((model) => !model.partial))
+    const completeModels = selected?.models.filter((model) => !model.partial) ?? []
     const nextSourceId = selected?.id ?? ''
-    const nextModelId = selected?.models.some((model) => model.model_id === modelId)
+    const nextModelId = completeModels.some((model) => model.model_id === modelId)
       ? modelId
-      : selected?.models[0]?.model_id ?? ''
+      : completeModels[0]?.model_id ?? ''
     setSourceNodeId(nextSourceId)
     setModelId(nextModelId)
     setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && nodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
@@ -117,6 +120,7 @@ export function StoragePage() {
   }
 
   const startDrag = (event: DragEvent, model: StorageModel, node: StorageNode) => {
+    if (model.partial) return
     const payload = { modelId: model.model_id, sourceNodeId: node.id, sourceNodeName: node.name }
     draggedModelRef.current = payload
     setDraggedModel(payload)
@@ -232,8 +236,8 @@ export function StoragePage() {
               {node.models.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
                 {node.models.map((model) => <li
                   key={`${node.id}:${model.model_id}`}
-                  draggable={node.online}
-                  aria-label={`Transfer ${model.model_id} from ${node.name}`}
+                  draggable={node.online && !model.partial}
+                  aria-label={model.partial ? `Partial cache ${model.model_id} on ${node.name}` : `Transfer ${model.model_id} from ${node.name}`}
                   onDragStart={(event) => startDrag(event, model, node)}
                   onDragEnd={() => {
                     draggedModelRef.current = undefined
@@ -241,8 +245,8 @@ export function StoragePage() {
                     setDropTargetId(undefined)
                   }}
                 >
-                  <GripVertical size={15} aria-hidden="true" />
-                  <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}</small></div>
+                  {model.partial ? <AlertTriangle className="storage-partial-icon" size={15} aria-label="Partial cache" /> : <GripVertical size={15} aria-hidden="true" />}
+                  <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                   <Button
                     variant="tertiary"
                     aria-label={`Delete ${model.model_id} from ${node.name}`}
@@ -263,9 +267,12 @@ export function StoragePage() {
               <label className="field"><span>Source node</span><select value={sourceNodeId} onChange={(event) => {
                 const next = nodes.find((node) => node.id === event.target.value)
                 setSourceNodeId(event.target.value)
-                setModelId(next?.models[0]?.model_id ?? '')
+                setModelId(next?.models.find((model) => !model.partial)?.model_id ?? '')
                 setTargetNodeIds((current) => current.filter((id) => id !== event.target.value))
-              }}><option value="">Select a source</option>{nodes.map((node) => <option key={node.id} value={node.id} disabled={!node.online || node.models.length === 0}>{node.name}{!node.online ? ' (offline)' : node.models.length === 0 ? ' (empty)' : ''}</option>)}</select></label>
+              }}><option value="">Select a source</option>{nodes.map((node) => {
+                const completeCount = node.models.filter((model) => !model.partial).length
+                return <option key={node.id} value={node.id} disabled={!node.online || completeCount === 0}>{node.name}{!node.online ? ' (offline)' : completeCount === 0 ? ' (no complete models)' : ''}</option>
+              })}</select></label>
               <label className="field"><span>Model weights</span><select value={modelId} onChange={(event) => {
                 const nextModelId = event.target.value
                 setModelId(nextModelId)
@@ -289,10 +296,13 @@ export function StoragePage() {
           <div className="responsive-table storage-model-table" role="table" aria-label="Model storage inventory">
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Size</span><span role="columnheader">Files</span><span role="columnheader">Node availability</span></div>
             {inventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
-              <div role="cell" data-label="Model"><strong>{model.model_id}</strong><small>{model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
+              <div role="cell" data-label="Model"><strong>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
               <div role="cell" data-label="Size">{formatBytes(model.size_bytes)}</div>
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
-              <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => <span key={node.id} className={locations.has(node.id) ? 'available' : ''}><span aria-hidden="true">{locations.has(node.id) ? '✓' : '—'}</span> {node.name}</span>)}</div>
+              <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => {
+                const location = locations.get(node.id)
+                return <span key={node.id} className={location?.partial ? 'partial' : location ? 'available' : ''}><span aria-hidden="true">{location?.partial ? '!' : location ? '✓' : '—'}</span> {node.name}</span>
+              })}</div>
             </div>)}
           </div>
         </Panel>}

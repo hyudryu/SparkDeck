@@ -251,7 +251,7 @@ _STORAGE_PRIVATE_KEYS = {
 }
 _STORAGE_INSTRUCTIONS = [
     "Pair SparkDeck nodes over a cluster-private network such as Tailscale.",
-    "Only complete Hugging Face cache weights are shown and transferable.",
+    "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
     "Choose an online source and one or more online targets with enough free space.",
 ]
 
@@ -1682,7 +1682,8 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             node.get("id")
             for node in inventory
             if any(
-                model.get("model_id") == recipe.get("model")
+                not model.get("partial")
+                and model.get("model_id") == recipe.get("model")
                 and cached_revision in (model.get("revisions") or [])
                 for model in node.get("models") or []
             )

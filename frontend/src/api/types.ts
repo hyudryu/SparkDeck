@@ -219,9 +219,15 @@ export interface CommunityPairResponse {
   cluster?: CommunityClusterSync
 }
 
+export interface CommunityAuthConfig {
+  idp_endpoint: string
+  client_id: string
+}
+
 export interface SyncStatus {
   sharing_enabled: boolean
   account_paired: boolean
+  upload_configured: boolean
   pending_count: number
   synced_count: number
   failed_count: number

@@ -8,9 +8,13 @@ import { COMMUNITY_ACCESS_HINT, useCommunityAccess } from '../hooks/useCommunity
 
 export function BenchmarksPage() {
   const samples = useResource((signal) => api.benchmarks.list(signal))
-  const aggregates = useResource((signal) => api.benchmarks.aggregates(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const communityAccess = useCommunityAccess()
+  const aggregates = useResource(
+    (signal) => api.benchmarks.aggregates(signal),
+    [communityAccess.enabled],
+    communityAccess.enabled,
+  )
   const [syncBusy, setSyncBusy] = useState(false)
   const [reviewingConsent, setReviewingConsent] = useState(false)
   const aggregateResponse = aggregates.data
@@ -53,7 +57,7 @@ export function BenchmarksPage() {
           {sync.loading && <p className="muted">Checking sync status…</p>}
           {sync.error && <p className="inline-error">{sync.error}</p>}
           {sync.data && <>
-            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? 'Sharing enabled' : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
+            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired && sync.data.upload_configured ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? (sync.data.upload_configured ? 'Sharing enabled' : 'Queued locally') : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
             <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
           </>}
         </Panel>

@@ -194,7 +194,9 @@ function CommunitySignInForm() {
         : mode === 'reset-request' ? submitResetRequest
           : submitResetConfirm
   const onEnter = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Enter' && !busy) submit()
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    if (!busy) submit()
   }
 
   return (

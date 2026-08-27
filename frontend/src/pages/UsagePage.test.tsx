@@ -44,6 +44,33 @@ describe('UsagePage', () => {
     expect(calendar.months.every((month, index) => index === 0 || month.column > calendar.months[index - 1].column)).toBe(true)
   })
 
+  it('shows the token scale legend and a hover tooltip on heatmap cells', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly')) return json([])
+      if (path.includes('/api/token-stats/daily')) return json([
+        { date: '2026-08-26', input: 1800, cached: 500, output: 650, requests: 6, models: { 'org/model': { input: 1800, cached: 500, output: 650, requests: 6 } } },
+      ])
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    const { container } = render(<UsagePage />)
+
+    expect(await screen.findByRole('img', { name: 'Daily token activity for the last year' })).toBeInTheDocument()
+    const scale = screen.getByText('Less').closest('.usage-heatmap-scale')
+    expect(scale).toHaveTextContent('More')
+    expect(scale?.querySelectorAll('.usage-heatmap-cell')).toHaveLength(5)
+    const activeCell = container.querySelector('.usage-heatmap-cell.level-4')
+    expect(activeCell).not.toBeNull()
+    await user.hover(activeCell as HTMLElement)
+    const tooltip = container.querySelector('.usage-heatmap-tooltip')
+    expect(tooltip).toHaveTextContent('2,450 tokens')
+    expect(tooltip).toHaveTextContent('Aug 26, 2026')
+    await user.unhover(activeCell as HTMLElement)
+    expect(container.querySelector('.usage-heatmap-tooltip')).toBeNull()
+  })
+
   it('restores lifetime model accounting and persisted hourly analysis', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)

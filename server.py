@@ -1595,6 +1595,8 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "community_api_url": "",
+    "default_runtime": "vllm",
+    "default_context_length": 8192,
 }
 
 
@@ -1624,9 +1626,23 @@ async def v1_update_settings(req: Request):
             raise HTTPException(400, "community_api_url must be a valid URL") from e
         if parsed.scheme not in ("http", "https") or not parsed.host:
             raise HTTPException(400, "community_api_url must be an http or https URL")
+    default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
+    if default_runtime not in ("vllm", "llama.cpp", "sglang"):
+        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, or sglang")
+    raw_context_length = body.get(
+        "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
+    )
+    try:
+        default_context_length = int(raw_context_length)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, "default_context_length must be an integer") from e
+    if not 256 <= default_context_length <= 10_000_000:
+        raise HTTPException(400, "default_context_length must be between 256 and 10000000")
     values = {
         "theme": theme,
         "community_api_url": community_api_url,
+        "default_runtime": default_runtime,
+        "default_context_length": default_context_length,
     }
     credential = body.get("hf_token")
     if credential is not None:

@@ -567,7 +567,7 @@ export function ModelsPage() {
         </section>
       )}
       {recipes.data && recipes.data.length > 0 && <section className="saved-configurations" aria-labelledby="saved-configurations-title">
-        <div className="section-heading"><div><h2 id="saved-configurations-title">Saved cluster configurations</h2><p>Existing saved recipes are preserved and deploy through SparkDeck.</p></div></div>
+        <div className="section-heading"><div><h2 id="saved-configurations-title">Recipes</h2><p>Saved launch configurations — choose nodes and launch one as a deployment.</p></div></div>
         {recipeGroups.map(([company, items]) => (
           <div className="saved-configuration-group" key={company}>
             <h3 className="saved-configuration-group-title">{company} <span className="saved-configuration-group-count">{items.length}</span></h3>
@@ -648,7 +648,7 @@ export function ModelsPage() {
         const recipeBusy = busy === `recipe:${recipe.id}`
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
-            <div className="modal-heading"><div><p className="eyebrow">Saved cluster configuration</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
+            <div className="modal-heading"><div><p className="eyebrow">Recipe</p><h2 id="deploy-saved-configuration-title">Deploy {recipe.name || recipe.model}</h2></div><button className="icon-button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Nodes without the complete model weights are disabled.</p>
             {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
             {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}

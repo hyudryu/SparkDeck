@@ -253,7 +253,7 @@ describe('model deployments', () => {
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
 
     expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Saved cluster configurations' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Recipes' })).toBeInTheDocument()
     expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Choose nodes & deploy' }))
     const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved cluster' })

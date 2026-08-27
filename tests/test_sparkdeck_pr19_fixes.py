@@ -66,6 +66,107 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.stop_container.assert_awaited_once_with("legacy-model")
         self.manager.remove_container.assert_awaited_once_with("legacy-model")
 
+    async def test_cluster_member_container_actions_target_whole_cluster(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "ready",
+            "members": [
+                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
+                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1},
+            ],
+        }]
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
+
+        cards = await self.service.deployments()
+        stopped = await self.service.deployment_action(cards[0]["id"], "stop")
+
+        self.assertEqual(cards[0]["id"], "container:cluster-1-r0-model")
+        # The card reports the whole cluster's state, not just the local rank.
+        self.assertEqual(cards[0]["status"], "running")
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "stop")
+        self.manager.stop_container.assert_not_awaited()
+        self.assertEqual(stopped["status"], "stopped")
+
+    async def test_stopped_cluster_member_card_reports_cluster_status(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped",
+            "members": [{"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0}],
+        }]
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "exited", "port": 8000,
+        }]
+
+        cards = await self.service.deployments()
+
+        self.assertEqual(cards[0]["status"], "stopped")
+
+    async def test_cluster_member_remove_targets_whole_cluster(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "running",
+            "members": [
+                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
+                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1},
+            ],
+        }]
+        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
+
+        removed = await self.service.delete_deployment("container:cluster-1-r0-model")
+
+        self.assertEqual(removed, {"ok": True, "id": "container:cluster-1-r0-model"})
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "remove")
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_deployment_logs_include_every_cluster_rank(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "running",
+            "members": [
+                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
+                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1},
+            ],
+        }]
+        tails = []
+
+        async def member_action(member, action, log_tail=300):
+            tails.append((member["container_name"], action, log_tail))
+            return {"logs": f"logs from {member['container_name']}"}
+
+        self.manager._member_action = member_action
+        self.manager.list_containers.return_value = [{
+            "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
+
+        result = await self.service.deployment_logs("container:cluster-1-r0-model", 150)
+
+        self.assertIn("rank 0 · node local", result["logs"])
+        self.assertIn("logs from cluster-1-r0-model", result["logs"])
+        self.assertIn("rank 1 · node node-2", result["logs"])
+        self.assertIn("logs from cluster-1-r1-model", result["logs"])
+        self.assertEqual(sorted(tails), [
+            ("cluster-1-r0-model", "logs", 150),
+            ("cluster-1-r1-model", "logs", 150),
+        ])
+
+    async def test_deployment_logs_read_single_container(self):
+        self.manager.list_containers.return_value = [{
+            "name": "legacy-model", "model": "org/model", "engine": "vllm",
+            "managed": True, "status": "running", "port": 8000,
+        }]
+        self.manager.get_cluster_member_logs = AsyncMock(return_value="single log line")
+
+        result = await self.service.deployment_logs("container:legacy-model")
+
+        self.assertEqual(result, {"logs": "single log line"})
+        self.manager.get_cluster_member_logs.assert_awaited_once_with("legacy-model", 300)
+
     async def test_concurrent_duplicate_alias_launches_only_one_container(self):
         async def launch(*_args, **_kwargs):
             await asyncio.sleep(0.01)

@@ -213,6 +213,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .modal { width: min(620px, 100%); max-height: calc(100dvh - 40px); overflow: auto; padding: 22px; background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 14px; box-shadow: 0 24px 70px rgba(0, 0, 0, .25); }
 .modal-heading { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 20px; }.modal-description { margin: -8px 0 18px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }.modal form { display: grid; gap: 16px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 5px; }
 .legal-modal { width: min(780px, 100%); }.legal-content { display: grid; gap: 20px; color: var(--text-secondary); font-size: 13px; line-height: 1.65; }.legal-content section { display: grid; gap: 7px; }.legal-content h3 { margin: 0; color: var(--text-primary); font-size: 14px; }.legal-content ul { display: grid; gap: 3px; margin: 0; padding-left: 22px; }.legal-content a { color: var(--accent); }.legal-effective { color: var(--text-tertiary); font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.modal-wide { width: min(960px, 100%); }
+.deployment-log-view { margin-top: 4px; }
+.deployment-log-view pre { margin: 0; padding: 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.deployment-log-status { display: block; padding: 3px 12px; color: #89898f; }
 
 .chat-page { min-height: 100dvh; display: grid; grid-template-rows: auto auto minmax(280px, 1fr) auto; }
 .chat-page .page-header { margin-bottom: 20px; }

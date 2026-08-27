@@ -992,13 +992,14 @@ class Manager:
         summaries = []
         for node in nodes:
             state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
+            # Presence is intentionally local and lightweight. Connectivity is
+            # unknown until routeros_cluster_overview authenticates to the switch.
             summaries.append({
                 "node_id": node.get("id"),
                 "node_name": node.get("name"),
                 "online": bool(node.get("online")),
                 "detected": bool(state.get("detected")),
                 "configured": bool(state.get("configured")),
-                "connected": bool(state.get("configured") and node.get("online")),
             })
         return {
             "detected": any(item["detected"] for item in summaries),

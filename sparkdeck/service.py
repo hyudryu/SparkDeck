@@ -1028,6 +1028,37 @@ class SparkDeckService:
             # diagnostic record if even local SQLite adoption fails.
             pass
 
+    def _persisted_revision(self, launch_settings: Any) -> str | None:
+        """Revision pinned in the persisted launch args, if any."""
+        contract_fn = getattr(self.manager, "recipe_deployment_contract", None)
+        if not contract_fn:
+            return None
+        try:
+            contract = contract_fn(launch_settings or {})
+        except Exception:
+            return None
+        if not isinstance(contract, dict):
+            return None
+        value = contract.get("model_revision")
+        return str(value).strip() if isinstance(value, str) and value.strip() else None
+
+    def _owning_cluster_deployment(self, container_name: str | None) -> dict[str, Any] | None:
+        """Return the managed cluster deployment a container is a rank of."""
+        if not container_name:
+            return None
+        return next(
+            (
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id")
+                and any(
+                    isinstance(member, dict)
+                    and member.get("container_name") == container_name
+                    for member in (item.get("members") or [])
+                )
+            ),
+            None,
+        )
+
     def _layout_contract(self, launch_settings: Any) -> dict[str, Any]:
         """Best-effort persisted layout for a cluster deployment.
 
@@ -1052,14 +1083,28 @@ class SparkDeckService:
             result["required_node_count"] = count
         return result
 
-    async def _validate_weights_cached(self, deployment: dict[str, Any], node_ids: list[str]) -> None:
-        """Mirror the recipe deploy gate: every chosen node needs the weights."""
+    async def _validate_start_selection(
+        self, deployment: dict[str, Any], node_ids: list[str],
+        launch_settings: dict[str, Any] | None,
+    ) -> None:
+        """Mirror the recipe deploy gate for an explicit start selection."""
         repository = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
-        if not repository or (resolve_local and resolve_local(repository)):
+        is_local_path = bool(repository and resolve_local and resolve_local(repository))
+        if is_local_path and any(item != "local" for item in node_ids):
+            raise ValueError(
+                "controller-local model paths can only run on the controller node"
+            )
+        if is_local_path or not repository:
             return
+        # A recipe-launched cluster pins its revision in the persisted launch
+        # args, not in the deployment identity — prefer that when present.
+        revision = (
+            (deployment.get("model") or {}).get("revision")
+            or self._persisted_revision(launch_settings)
+            or "main"
+        )
         inventory = await self.manager.model_cache_inventory()
-        cached_revision = (deployment.get("model") or {}).get("revision") or "main"
         nodes_with_weights = {
             node.get("id")
             for node in inventory if isinstance(node, dict)
@@ -1067,7 +1112,7 @@ class SparkDeckService:
             if isinstance(model, dict)
             and not model.get("partial")
             and model.get("model_id") == repository
-            and cached_revision in (model.get("revisions") or [])
+            and revision in (model.get("revisions") or [])
         }
         missing = [node_id for node_id in node_ids if node_id not in nodes_with_weights]
         if missing:
@@ -1093,13 +1138,30 @@ class SparkDeckService:
             raise LookupError("deployment not found")
         if deployment["kind"] != DeploymentKind.MANAGED.value:
             raise ValueError("external endpoints cannot be started or stopped by SparkDeck")
+        container = deployment.get("container_name")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        owner = self._owning_cluster_deployment(container)
+        linked = next(
+            (
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ),
+            None,
+        ) if manager_id else None
+        launch_settings = (owner or linked or {}).get("launch_settings")
+        if node_ids and action == "start":
+            if not manager_id and not owner and any(item != "local" for item in node_ids):
+                # A standalone container runs on the node that holds it; only
+                # cluster deployments can be relocated by a start selection.
+                raise ValueError(
+                    "node selection is only available for cluster deployments; "
+                    "this deployment starts on its existing node"
+                )
+            # The picker constrains choices in the UI, but an API client can
+            # bypass it and the cache can change after the inventory loads —
+            # revalidate before relaunching.
+            await self._validate_start_selection(deployment, node_ids, launch_settings)
         if manager_id:
-            if node_ids and action == "start":
-                # The picker constrains choices in the UI, but an API client
-                # can bypass it and the cache can change after the inventory
-                # loads — revalidate before relaunching.
-                await self._validate_weights_cached(deployment, node_ids)
             if node_ids is None:
                 result = await self.manager.deployment_action(manager_id, action)
             else:
@@ -1123,7 +1185,18 @@ class SparkDeckService:
             current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
             return current
-        container = deployment.get("container_name")
+        if owner:
+            # A discovered card can be one rank of a manager-only cluster.
+            # Acting on the single rank leaves the remaining ranks running,
+            # and the cluster health monitor restarts the whole deployment —
+            # the action must address the cluster instead.
+            if action == "start" and node_ids:
+                result = await self.manager.deployment_action(owner["id"], action, node_ids)
+            else:
+                result = await self.manager.deployment_action(owner["id"], action)
+            if not result.get("ok"):
+                raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
+            return {**deployment, "status": "running" if action == "start" else "stopped"}
         if not container:
             raise LookupError("managed container not found")
         if discovered is None:
@@ -1137,23 +1210,6 @@ class SparkDeckService:
                 raise LookupError("managed container is unavailable") from exc
             if current is None:
                 raise LookupError("managed container not found")
-        owner = self._owning_cluster_deployment(container)
-        if owner:
-            # A discovered card can be one rank of a managed cluster. Acting
-            # on the single rank leaves the remaining ranks running, and the
-            # cluster health monitor restarts the whole deployment — so the
-            # action must address the cluster instead.
-            result = await self.manager.deployment_action(owner["id"], action)
-            if not result.get("ok"):
-                raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
-            return {**deployment, "status": "running" if action == "start" else "stopped"}
-        if node_ids and any(item != "local" for item in node_ids):
-            # A standalone container runs on the node that holds it; only
-            # cluster deployments can be relocated by a start selection.
-            raise ValueError(
-                "node selection is only available for cluster deployments; "
-                "this deployment starts on its existing node"
-            )
         if action == "start":
             await self.manager.start_container(container)
         elif action == "stop":

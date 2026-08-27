@@ -767,7 +767,8 @@ class FanApp:
         self.max_speed_active = bool(max_speed)
         self.current_temp = temp
         self.current_duty_byte = int(duty)
-        assert self.link is not None
+        if self.link is None:
+            raise RuntimeError("fan serial link is not connected")
         self.link.set_duty(int(duty))
         self._update_status_label()
         self.plot.add_sample(temp, byte_to_pct(duty), self.display_rpm)

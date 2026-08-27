@@ -11,7 +11,22 @@ import time
 import urllib.request
 from pathlib import Path
 
-from .updater import CAPABILITY, TRUSTED_ORIGINS
+from .updater import CAPABILITY, TRUSTED_ORIGINS, UPDATE_STATE_FILENAME
+
+
+def validate_state_path(state_path: Path, root: Path) -> Path:
+    """Restrict writes to the service-owned state file in the checkout's data dir.
+
+    The helper receives --state from the process that spawned it, so the path
+    is untrusted input at this trust boundary.
+    """
+    data_dir = (root / "data").resolve()
+    resolved = state_path.resolve()
+    if resolved.parent != data_dir or resolved.name != UPDATE_STATE_FILENAME:
+        raise RuntimeError(
+            "Update state path must be the service state file inside the checkout data directory"
+        )
+    return resolved
 
 
 def write_state(path: Path, **changes) -> None:
@@ -114,6 +129,8 @@ def wait_for_revision(revision: str, timeout: int = 90) -> bool:
 
 
 def apply(root: Path, state_path: Path, tag: str, revision: str) -> None:
+    root = root.resolve()
+    state_path = validate_state_path(state_path, root)
     time.sleep(1.0)  # Let the accepting HTTP response leave the process first.
     stage_dir: Path | None = None
     frontend_swap: Path | None = None

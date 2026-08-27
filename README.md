@@ -18,7 +18,7 @@ _A four-node SparkDeck dashboard in dark mode. Every value shown in this README 
 
 ### Know what performance to expect before pulling a model
 
-The **Community Run Models** catalog shows what other SparkDeck users have measured, so I can get a directional inference tok/s estimate before spending time downloading and deploying a model. Evidence is matched by exact model ID and context window; it is an estimate, not a GB10-specific guarantee, because runtime, quantization, hardware, parallelism, and other settings still matter.
+The **Community Run Models** catalog gives me a directional inference tok/s estimate before spending time downloading and deploying a model. Today those estimates are aggregated from the measurements my own cluster records; measurements from other SparkDeck users appear only when SparkDeck is pointed at a separately configured community aggregates service, since hosted community sync is not available in this release. Evidence is matched by exact model ID and context window; it is an estimate, not a GB10-specific guarantee, because runtime, quantization, hardware, parallelism, and other settings still matter.
 
 ![Community Run Models with illustrative throughput and cluster-fit evidence](docs/screenshots/readme/community-performance-dark.png)
 

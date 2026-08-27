@@ -372,8 +372,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .brand-row, .nav-link, .theme-toggle, .collapse-button { justify-content: center; padding-inline: 0; }
   .collapse-button { display: none; }
   .page { padding-inline: 20px; }
-  .deployments-table .table-row { grid-template-columns: minmax(150px, 1.3fr) 90px minmax(110px, 1fr) minmax(100px, .8fr) 90px; }
-  .deployments-table .table-row > :nth-child(6) { display: none; }
+  .deployments-table .table-row { grid-template-columns: minmax(150px, 1.3fr) 90px minmax(110px, 1fr) 90px 110px; }
+  /* Drop the configuration column at this width; the actions column stays
+     reachable so the deployment log viewer is not cut off on tablets. */
+  .deployments-table .table-row > :nth-child(3) { display: none; }
   .benchmark-table .table-row { grid-template-columns: minmax(160px, 1.5fr) 100px 90px 90px 50px; }
   .benchmark-table .table-row > :nth-child(5) { display: none; }
 }

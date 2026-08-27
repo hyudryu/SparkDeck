@@ -789,18 +789,30 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["hardware_class"], "dgx-spark")
         self.assertNotIn("device_class", snapshot)
 
-    async def test_remote_primary_benchmark_uses_serving_node_hardware(self):
+    async def test_replicated_failover_benchmark_uses_serving_node_hardware(self):
         self.manager._cluster_primary_member = lambda _: (
             {"id": "manager-deployment"},
             {"node_id": "worker-1", "container_name": "rank-0"},
         )
-        self.manager.node_registry = SimpleNamespace(request=AsyncMock(return_value={
-            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
-        }))
-        self.manager.proxy_cluster_inference = AsyncMock(return_value={
-            "usage": {"prompt_tokens": 24, "completion_tokens": 20},
-            "timings": {"predicted_per_second": 80.0},
-        })
+        async def stats(node_id, *args, **kwargs):
+            return {"gpus": [{
+                "name": "NVIDIA RTX 5090" if node_id == "worker-2" else "NVIDIA GB10",
+                "mem_total_mib": 32768 if node_id == "worker-2" else 128000,
+            }]}
+
+        self.manager.node_registry = SimpleNamespace(request=AsyncMock(side_effect=stats))
+
+        async def proxy(*args, route_observation=None, **kwargs):
+            # Rank 0 failed before committing output; rank 1 served the request.
+            route_observation["member"] = {
+                "node_id": "worker-2", "container_name": "rank-1",
+            }
+            return {
+                "usage": {"prompt_tokens": 24, "completion_tokens": 20},
+                "timings": {"predicted_per_second": 80.0},
+            }
+
+        self.manager.proxy_cluster_inference = AsyncMock(side_effect=proxy)
         deployment = {
             "id": "dep-remote", "alias": "remote-model", "kind": "managed",
             "runtime": "vllm", "model": {"repository": "org/model"},
@@ -816,11 +828,55 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         items, _ = self.service.store.benchmarks()
-        self.assertEqual(items[0]["hardware"]["hardware_class"], "dgx-spark")
-        self.assertEqual(items[0]["hardware"]["gpus"][0]["model"], "NVIDIA GB10")
+        self.assertEqual(items[0]["hardware"]["hardware_class"], "local")
+        self.assertEqual(
+            items[0]["hardware"]["gpus"][0]["model"], "NVIDIA RTX 5090",
+        )
         self.assertTrue(items[0]["eligible_for_community"])
         self.manager.node_registry.request.assert_awaited_once_with(
-            "worker-1", "GET", "/api/agent/stats", timeout=5,
+            "worker-2", "GET", "/api/agent/stats", timeout=5,
+        )
+
+    async def test_stream_hardware_lookup_waits_for_serving_member(self):
+        self.manager.node_registry = SimpleNamespace(request=AsyncMock(return_value={
+            "gpus": [{"name": "NVIDIA RTX 5090", "mem_total_mib": 32768}],
+        }))
+
+        async def proxy(*args, route_observation=None, **kwargs):
+            async def stream():
+                route_observation["member"] = {
+                    "node_id": "worker-2", "container_name": "rank-1",
+                }
+                yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield 'data: {"choices":[],"usage":{"prompt_tokens":24,"completion_tokens":20}}\n\n'
+                yield "data: [DONE]\n\n"
+
+            return stream()
+
+        self.manager.proxy_cluster_inference = AsyncMock(side_effect=proxy)
+        deployment = {
+            "id": "dep-stream", "alias": "stream-model", "kind": "managed",
+            "runtime": "vllm", "model": {"repository": "org/model"},
+            "settings": {
+                "manager_deployment_id": "manager-deployment",
+                "context_length": 4096,
+            },
+        }
+
+        stream = await self.service._proxy_managed(
+            deployment, {"model": "stream-model", "stream": True},
+            "chat/completions", None,
+        )
+        self.manager.node_registry.request.assert_not_awaited()
+        _ = [chunk async for chunk in stream]
+
+        items, _ = self.service.store.benchmarks()
+        self.assertEqual(
+            items[0]["hardware"]["gpus"][0]["model"], "NVIDIA RTX 5090",
+        )
+        self.assertTrue(items[0]["eligible_for_community"])
+        self.manager.node_registry.request.assert_awaited_once_with(
+            "worker-2", "GET", "/api/agent/stats", timeout=5,
         )
 
     async def test_managed_llama_uses_local_hardware_but_external_stays_unknown(self):

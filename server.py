@@ -757,7 +757,13 @@ async def agent_inference(endpoint: str, req: Request):
     except ClientAbort:
         return Response(status_code=499)
     except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        raise HTTPException(404, {
+            "type": "replica_unavailable", "message": str(exc),
+        }) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, {
+            "type": "upstream_error", "message": exc.response.text[:500],
+        }) from exc
     finally:
         if not stream:
             watcher.cancel()
@@ -1807,6 +1813,10 @@ async def v1_settings():
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
+    # cluster_node_name is deliberately absent: this response is forwarded to
+    # the controller on joined workers, so it would name the controller rather
+    # than the node serving the browser. Clients read the unforwarded
+    # /api/v1/onboarding status, which every node answers for itself.
     return values
 
 
@@ -2146,9 +2156,24 @@ async def v1_create_deployment(req: Request):
 
 
 @app.post("/api/v1/deployments/{deployment_id}/{action}")
-async def v1_deployment_action(deployment_id: str, action: str):
+async def v1_deployment_action(deployment_id: str, action: str, req: Request):
     try:
-        return await sparkdeck.deployment_action(deployment_id, action)
+        raw = await req.body()
+        body = json.loads(raw) if raw else {}
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+        node_ids = body.get("node_ids")
+        if node_ids is not None:
+            if (
+                not isinstance(node_ids, list)
+                or not node_ids
+                or any(not isinstance(item, str) or not item.strip() for item in node_ids)
+            ):
+                raise ValueError("node_ids must contain non-empty node IDs")
+            node_ids = [item.strip() for item in node_ids]
+        return await sparkdeck.deployment_action(deployment_id, action, node_ids)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "request body must be valid JSON")
     except LookupError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:

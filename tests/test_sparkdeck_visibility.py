@@ -59,6 +59,56 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nodes[3]["total_size"], 300)
 
 
+class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_with_node_selection_relaunches_on_chosen_nodes(self):
+        manager = Manager.__new__(Manager)
+        manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "members": [{"node_id": "local", "container_name": "old-r0", "rank": 0}],
+            "launch_settings": {
+                "model": "org/model", "node_ids": ["local"],
+                "deployment_mode": "sharded", "engine": "vllm",
+                "extra_args": ["--tensor-parallel-size", "2"],
+            },
+        }]
+        manager._member_action = AsyncMock(return_value={"ok": True})
+        manager.create_deployment = AsyncMock(return_value={
+            "id": "cluster-2", "members": [], "node_ids": ["a", "b"], "api_port": 8000,
+        })
+        manager._save_deployments = Mock()
+
+        result = await manager.deployment_action("cluster-1", "start", node_ids=["a", "b"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result.get("deployment", {}).get("id"), "cluster-2")
+        # The old rank container is removed and the saved launch settings are
+        # relaunched with the explicitly chosen nodes.
+        manager._member_action.assert_awaited_once()
+        body = manager.create_deployment.await_args.args[0]
+        self.assertEqual(body["node_ids"], ["a", "b"])
+        self.assertEqual(body["model"], "org/model")
+        self.assertNotIn("cluster-1", [item.get("id") for item in manager.deployments])
+
+    async def test_start_without_node_selection_keeps_existing_ranks(self):
+        manager = Manager.__new__(Manager)
+        manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "members": [{"node_id": "local", "container_name": "old-r0", "rank": 0}],
+            "launch_settings": {"model": "org/model", "node_ids": ["local"]},
+        }]
+        manager._member_action = AsyncMock(return_value={"ok": True})
+        manager.create_deployment = AsyncMock()
+        manager._save_deployments = Mock()
+
+        result = await manager.deployment_action("cluster-1", "start")
+
+        self.assertTrue(result["ok"])
+        manager._member_action.assert_awaited_once_with(
+            {"node_id": "local", "container_name": "old-r0", "rank": 0}, "start",
+        )
+        manager.create_deployment.assert_not_awaited()
+
+
 class DailyUsageSeriesTests(unittest.TestCase):
     def test_daily_usage_preserves_per_model_series(self):
         manager = Manager.__new__(Manager)
@@ -164,6 +214,30 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.aclose()
         self.assignment_patch.stop()
+
+    async def test_deployment_start_route_forwards_node_selection(self):
+        with patch.object(server.sparkdeck, "deployment_action", AsyncMock(return_value={"ok": True})) as action:
+            without_body = await self.client.post("/api/v1/deployments/dep-1/start")
+            with_nodes = await self.client.post(
+                "/api/v1/deployments/dep-1/start",
+                json={"node_ids": ["local", "node-2"]},
+            )
+            with_invalid = await self.client.post(
+                "/api/v1/deployments/dep-1/start",
+                json={"node_ids": []},
+            )
+            invalid_utf8 = await self.client.post(
+                "/api/v1/deployments/dep-1/start",
+                content=b"\xff\xfe{}",
+                headers={"content-type": "application/json"},
+            )
+
+        self.assertEqual(without_body.status_code, 200)
+        self.assertEqual(with_nodes.status_code, 200)
+        self.assertEqual(with_invalid.status_code, 400)
+        self.assertEqual(invalid_utf8.status_code, 400)
+        action.assert_any_await("dep-1", "start", None)
+        action.assert_any_await("dep-1", "start", ["local", "node-2"])
 
     async def test_legacy_recipe_defaults_are_visible_and_launch_through_sparkdeck(self):
         recipe = {

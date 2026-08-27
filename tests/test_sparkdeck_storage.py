@@ -189,7 +189,10 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_setting("device_pairing", {"status": "paired"})
         self.store.retry_outbox()
         rows = self.store.outbox_batch()
-        self.assertEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertEqual(set(rows[0]), {
+            "model_id", "context_window_size", "inference_tokens_per_second",
+        })
+        self.assertLessEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
         self.assertEqual(rows, [{
             "model_id": "org/model",
             "context_window_size": 4096,
@@ -231,7 +234,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_community_consent(True)
         uploads = self.store.outbox_batch()
         self.assertEqual(len(uploads), 2)
-        self.assertTrue(all(set(item) == COMMUNITY_UPLOAD_FIELDS for item in uploads))
+        self.assertTrue(all(set(item) <= COMMUNITY_UPLOAD_FIELDS for item in uploads))
 
     def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
         sample = BenchmarkSample(
@@ -252,7 +255,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         upload = self.store.outbox_batch()
 
         self.assertEqual(local[0]["hardware"], {"hardware_class": "dgx-spark"})
-        self.assertEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
+        self.assertLessEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
         self.assertNotIn("hardware", upload[0])
 
     def test_context_and_speed_are_required_at_the_upload_boundary(self):
@@ -287,6 +290,57 @@ class SparkDeckStoreTests(unittest.TestCase):
             "exact_match_dimensions": ["model_id", "context_window_size"],
             "metric": "inference_tokens_per_second",
         })
+
+    def test_coordinated_series_groups_exact_dimensions_without_filling_gaps(self):
+        base = {
+            "id": "run-1", "created_at": "2026-08-27T00:00:00+00:00",
+            "deployment_id": "dep-1", "model_id": "org/model",
+            "context_window_size": 4096, "concurrency": 1,
+            "tensor_parallel_size": 2, "prompt_tokens_per_second": 1000.0,
+            "generation_tokens_per_second": 80.0, "request_count": 4,
+        }
+        self.store.add_benchmark_series_point(base)
+        self.store.add_benchmark_series_point({
+            **base, "id": "run-2", "prompt_tokens_per_second": 1200.0,
+            "generation_tokens_per_second": 100.0,
+        })
+        self.store.add_benchmark_series_point({
+            **base, "id": "run-c5", "concurrency": 5,
+            "prompt_tokens_per_second": 900.0,
+            "generation_tokens_per_second": 150.0,
+        })
+
+        summaries = self.store.benchmark_model_summaries()
+        detail = self.store.benchmark_model_detail("org/model")
+
+        self.assertEqual(summaries[0]["run_count"], 3)
+        self.assertEqual(summaries[0]["context_windows"], [4096])
+        self.assertEqual(summaries[0]["tensor_parallel_sizes"], [2])
+        self.assertEqual([point["concurrency"] for point in detail["points"]], [1, 5])
+        self.assertEqual(detail["points"][0]["prompt_tokens_per_second"], 1100.0)
+        self.assertEqual(detail["points"][0]["sample_count"], 2)
+
+    def test_upload_includes_only_optional_benchmark_dimensions_when_recorded(self):
+        sample = BenchmarkSample(
+            id="series-upload", created_at="2026-08-27T00:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={
+                "context_length": 16384, "benchmark_concurrency": 5,
+                "tensor_parallel_size": 2, "private": "drop-me",
+            },
+            input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
+            generation_tokens_per_second=50, prompt_tokens_per_second=100,
+            cold_start=False, eligible_for_community=True,
+        )
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        self.store.add_benchmark(sample, queue=True)
+
+        self.assertEqual(self.store.outbox_batch(), [{
+            "model_id": "org/model", "context_window_size": 16384,
+            "inference_tokens_per_second": 50.0,
+            "concurrency": 5, "tensor_parallel_size": 2,
+        }])
 
     def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
         sample = BenchmarkSample(

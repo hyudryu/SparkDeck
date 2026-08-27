@@ -68,6 +68,54 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
 
+    async def test_coordinated_run_records_real_concurrency_and_strict_upload_dimensions(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-series", alias="series", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            settings={"context_length": 16384, "tensor_parallel_size": 2},
+            base_url_set=True,
+        ), "http://127.0.0.1:8000")
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+
+        point = await self.service.record_benchmark_series_point({
+            "deployment_id": "dep-series", "concurrency": 5,
+            "request_count": 10, "prompt_tokens": 1000,
+            "generation_tokens": 500, "wall_seconds": 2.0,
+        })
+
+        self.assertEqual(point["context_window_size"], 16384)
+        self.assertEqual(point["tensor_parallel_size"], 2)
+        self.assertEqual(point["prompt_tokens_per_second"], 500.0)
+        self.assertEqual(point["generation_tokens_per_second"], 250.0)
+        self.assertEqual(self.service.store.benchmark_model_detail("org/model")["points"][0]["concurrency"], 5)
+        self.assertEqual(self.service.store.outbox_batch(), [{
+            "model_id": "org/model", "context_window_size": 16384,
+            "inference_tokens_per_second": 250.0,
+            "concurrency": 5, "tensor_parallel_size": 2,
+        }])
+
+    async def test_coordinated_run_rejects_unmeasured_concurrency(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-series", alias="series", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            settings={"context_length": 4096}, base_url_set=True,
+        ), "http://127.0.0.1:8000")
+
+        with self.assertRaisesRegex(ValueError, "one of 1, 2, 5, or 10"):
+            await self.service.record_benchmark_series_point({
+                "deployment_id": "dep-series", "concurrency": 3,
+                "request_count": 2, "prompt_tokens": 100,
+                "generation_tokens": 50, "wall_seconds": 1,
+            })
+
+        with self.assertRaisesRegex(ValueError, "at least the measured concurrency"):
+            await self.service.record_benchmark_series_point({
+                "deployment_id": "dep-series", "concurrency": 10,
+                "request_count": 5, "prompt_tokens": 100,
+                "generation_tokens": 50, "wall_seconds": 1,
+            })
+
     async def test_upload_worker_drains_exact_privacy_payload_with_idempotency(self):
         requests = []
 

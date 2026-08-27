@@ -366,6 +366,29 @@ export interface SavedConfiguration {
   launch?: { phase?: string; image?: string }
 }
 
+export interface LaunchControls {
+  context_window?: number | null
+  max_concurrency?: number | null
+  kv_cache_dtype?: string | null
+  thinking_mode?: string | null
+  dspark_num_speculative_tokens?: number | null
+  max_cudagraph_capture_size?: number | null
+  max_num_batched_tokens?: number | null
+}
+
+export interface SavedConfigurationDetail extends SavedConfiguration {
+  extra_args: string[]
+  launch_controls: LaunchControls
+}
+
+export interface RecipeUpdateInput {
+  name?: string
+  extra_args?: string[]
+  launch_controls?: LaunchControls
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
+}
+
 export interface CreateStorageTransferInput {
   model_id: string
   source_node_id: string

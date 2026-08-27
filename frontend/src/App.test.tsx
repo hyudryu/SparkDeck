@@ -407,4 +407,153 @@ describe('model deployments', () => {
     await user.selectOptions(runtime, 'sglang')
     expect(contextLength).toHaveValue(32768)
   })
+
+  it('groups saved configurations by company and pins cards within a group', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/recipes') ? { items: [
+        {
+          id: 'recipe-qwen', name: 'Qwen config', model: 'Qwen/Qwen3-32B', engine: 'vllm',
+          deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+          pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+        },
+        {
+          id: 'recipe-ds', name: 'DS config', model: 'deepseek-ai/DeepSeek-V4', engine: 'vllm',
+          deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+          pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+        },
+      ] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('heading', { name: 'deepseek-ai 1' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Qwen 1' })).toBeInTheDocument()
+
+    const pin = screen.getByRole('button', { name: 'Pin DS config' })
+    expect(pin).toHaveAttribute('aria-pressed', 'false')
+    await user.click(pin)
+    expect(screen.getByRole('button', { name: 'Unpin DS config' })).toHaveAttribute('aria-pressed', 'true')
+    expect(JSON.parse(localStorage.getItem('sparkdeck:pinned-recipes') ?? '[]')).toContain('recipe-ds')
+  })
+
+  it('sorts deployments by recency or name and renames them inline', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'PATCH' && path.includes('/api/v1/deployments/dep-1')) {
+        return new Response(JSON.stringify({
+          id: 'dep-1', alias: 'Renamed', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'running', settings: {},
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [
+        {
+          id: 'dep-1', alias: 'Zulu', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/zulu' }, status: 'running', settings: {},
+          created_at: '2026-08-25T00:00:00+00:00',
+        },
+        {
+          id: 'dep-2', alias: 'Alpha', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/alpha' }, status: 'stopped', settings: {},
+          created_at: '2026-08-20T00:00:00+00:00',
+        },
+      ] } : path.includes('/api/v1/recipes') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    // Default: most recently deployed first.
+    let rows = await screen.findAllByRole('row')
+    expect(within(rows[1]).getByText('Zulu')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('Alpha')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Sort deployments' }), 'name-asc')
+    rows = screen.getAllByRole('row')
+    expect(within(rows[1]).getByText('Alpha')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('Zulu')).toBeInTheDocument()
+    expect(localStorage.getItem('sparkdeck:models-sort')).toBe('name-asc')
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Sort deployments' }), 'name-desc')
+    rows = screen.getAllByRole('row')
+    expect(within(rows[1]).getByText('Zulu')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Rename Zulu' }))
+    const input = screen.getByRole('textbox', { name: 'New name for Zulu' })
+    await user.clear(input)
+    await user.type(input, 'Renamed')
+    await user.click(screen.getByRole('button', { name: 'Save name' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-1',
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ alias: 'Renamed' }) }),
+    ))
+    expect(await screen.findByText('Renamed deployment to Renamed.')).toBeInTheDocument()
+  })
+
+  it('edits saved configuration arguments and saves them as launch controls', async () => {
+    const user = userEvent.setup()
+    const detail = {
+      id: 'recipe-args', name: 'Args config', model: 'org/model', engine: 'vllm',
+      deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+      pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 3,
+      extra_args: ['--max-model-len', '32768', '--enable-prefix-caching'],
+      launch_controls: {
+        context_window: 32768, max_concurrency: null, kv_cache_dtype: null,
+        thinking_mode: 'default', dspark_num_speculative_tokens: null,
+        max_cudagraph_capture_size: null, max_num_batched_tokens: null,
+      },
+      gpu_memory_utilization: 0.9, gpu_memory_gb: null,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/recipes/recipe-args' && init?.method === 'PUT') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes/recipe-args') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-args', name: 'Args config', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 3,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Arguments' }))
+    const contextWindow = await screen.findByRole('spinbutton', { name: 'Context window' })
+    expect(contextWindow).toHaveValue(32768)
+    expect(screen.getByRole('textbox', { name: 'Other flags' })).toHaveValue('--enable-prefix-caching')
+    expect(screen.getByRole('spinbutton', { name: 'GPU memory util' })).toHaveValue(0.9)
+
+    await user.clear(contextWindow)
+    await user.type(contextWindow, '65536')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-args',
+      expect.objectContaining({ method: 'PUT' }),
+    ))
+    const putCall = fetchMock.mock.calls.find(([input, init]) => String(input) === '/api/v1/recipes/recipe-args' && init?.method === 'PUT')
+    const payload = JSON.parse(String(putCall?.[1]?.body))
+    expect(payload.extra_args).toEqual(['--enable-prefix-caching'])
+    expect(payload.launch_controls.context_window).toBe(65536)
+    expect(payload.gpu_memory_utilization).toBe(0.9)
+    expect(await screen.findByText('Saved.')).toBeInTheDocument()
+  })
 })

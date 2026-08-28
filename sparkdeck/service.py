@@ -294,6 +294,7 @@ class SparkDeckService:
         )
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
+        self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
@@ -304,6 +305,11 @@ class SparkDeckService:
         self._community_active_observations: dict[str, dict[str, Any]] = {}
 
     async def close(self) -> None:
+        tasks = list(self._deployment_launch_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.store.close()
 
     async def set_community_consent(
@@ -816,6 +822,9 @@ class SparkDeckService:
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
+            stored.update(_deployment_launch_progress(cluster))
+            if cluster.get("error"):
+                stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
@@ -849,7 +858,11 @@ class SparkDeckService:
                 continue
             stored = by_container.get(container.get("name"))
             if stored:
-                stored["status"] = _managed_container_status(container)
+                # A local rank is not the whole clustered deployment. Preserve
+                # Manager's aggregate state while another rank is still
+                # pulling, starting, or failing.
+                if not stored.get("settings", {}).get("manager_deployment_id"):
+                    stored["status"] = _managed_container_status(container)
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -872,11 +885,18 @@ class SparkDeckService:
                 and deployment.get("id") not in seen
                 and not str(deployment.get("id") or "").startswith("container:")
             ):
-                deployment["status"] = "missing"
-                deployment["last_error"] = (
-                    "Docker is unavailable" if docker_unavailable
-                    else "Managed container is missing"
-                )
+                if deployment.get("id") in self._deployment_launches:
+                    deployment.update({
+                        "status": "starting",
+                        "launch_phase": "queued",
+                        "launch_message": "Preparing deployment launch",
+                    })
+                else:
+                    deployment["status"] = "missing"
+                    deployment["last_error"] = (
+                        "Docker is unavailable" if docker_unavailable
+                        else "Managed container is missing"
+                    )
         async def probe_external(deployment: dict[str, Any]) -> None:
             if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
                 return
@@ -1121,7 +1141,9 @@ class SparkDeckService:
             )
         return str(resolved)
 
-    async def create_deployment(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def create_deployment(
+        self, body: dict[str, Any], *, background: bool = False,
+    ) -> dict[str, Any]:
         model = str(body.get("model") or "").strip()
         alias = str(body.get("alias") or model).strip()
         if not model:
@@ -1235,6 +1257,11 @@ class SparkDeckService:
                         launch_body["extra_args"] += [
                             "--quantization", str(settings["quantization"]),
                         ]
+                if background:
+                    return await self._begin_cluster_deployment(
+                        deployment, settings, mode, requested_node_ids,
+                        selected, launch_body,
+                    )
                 try:
                     cluster = await self.manager.create_deployment(launch_body)
                 except Exception:
@@ -1330,6 +1357,100 @@ class SparkDeckService:
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment_id, None)
+
+    def _link_cluster_record(
+        self, deployment: Deployment, settings: dict[str, Any], mode: str,
+        node_ids: list[str], cluster: dict[str, Any],
+    ) -> None:
+        """Persist the public record's route to a durable Manager launch."""
+        members = cluster.get("members") or []
+        primary = members[0] if members else {}
+        deployment.container_name = primary.get("container_name")
+        deployment.settings = self._local_configuration({
+            **settings,
+            "deployment_mode": mode,
+            "node_ids": node_ids,
+            "manager_deployment_id": cluster.get("id"),
+            "model_source": cluster.get("model_source") or "unknown",
+        })
+        port = cluster.get("api_port")
+        self.store.update_managed_routing(
+            deployment.id,
+            deployment.settings,
+            deployment.container_name,
+            f"http://127.0.0.1:{int(port)}" if port else None,
+        )
+
+    async def _begin_cluster_deployment(
+        self, deployment: Deployment, settings: dict[str, Any], mode: str,
+        node_ids: list[str], selected: list[dict[str, Any]],
+        launch_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a public card, then continue the slow launch in background."""
+        launch_complete = asyncio.Event()
+        self.store.add_deployment(deployment, None, None)
+        self._deployment_launches[deployment.id] = launch_complete
+        persisted = asyncio.get_running_loop().create_future()
+
+        def consume_persisted_error(future: asyncio.Future) -> None:
+            if not future.cancelled():
+                future.exception()
+
+        persisted.add_done_callback(consume_persisted_error)
+
+        async def launch() -> None:
+            try:
+                cluster = await self.manager.create_deployment(
+                    launch_body, launch_persisted=persisted,
+                )
+                self._link_cluster_record(
+                    deployment, settings, mode, node_ids, cluster,
+                )
+            except BaseException:
+                # Manager persists node-specific launch failures. Once linked,
+                # retaining the SQLite row makes that diagnostic durable and
+                # visible in Deployments. A preflight failure is handled by
+                # the foreground waiter below before any response is returned.
+                linked = any(
+                    item.get("sparkdeck_record_id") == deployment.id
+                    for item in getattr(self.manager, "deployments", [])
+                    if isinstance(item, dict)
+                )
+                if not linked:
+                    self.store.delete_deployment(deployment.id)
+            finally:
+                launch_complete.set()
+                self._deployment_launches.pop(deployment.id, None)
+                self._deployment_launch_tasks.pop(deployment.id, None)
+
+        task = asyncio.create_task(
+            launch(), name=f"sparkdeck-deploy-{deployment.id}",
+        )
+        self._deployment_launch_tasks[deployment.id] = task
+        try:
+            cluster = await asyncio.shield(persisted)
+        except asyncio.CancelledError:
+            # The accepted operation belongs to the service, not the client
+            # connection. Keep the public row and retained launch task alive.
+            raise
+        except BaseException:
+            await task
+            raise
+
+        self._link_cluster_record(
+            deployment, settings, mode, node_ids, cluster,
+        )
+        result = self.store.deployment(deployment.id) or deployment.to_dict()
+        result.update({
+            "status": "starting",
+            "port": cluster.get("api_port"),
+            "node_ids": node_ids,
+            "selected_nodes": [
+                self.manager.public_target_node(node) for node in selected
+            ],
+            **_deployment_launch_progress(cluster),
+        })
+        return result
 
     async def _recover_failed_cluster_launch(
         self, deployment: Deployment, settings: dict[str, Any],
@@ -1593,6 +1714,11 @@ class SparkDeckService:
             deployment_id, asyncio.Lock(),
         )
         async with lock:
+            launch_task = self._deployment_launch_tasks.get(deployment_id)
+            if launch_task is not None and not launch_task.done():
+                raise RuntimeError(
+                    "deployment launch is still in progress; wait for container creation"
+                )
             return await self._deployment_action_locked(
                 deployment_id, action, node_ids,
             )
@@ -2694,6 +2820,86 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy", "degraded"):
         return "error"
     return "unknown"
+
+
+def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
+    """Flatten honest per-member launch state for deployment list cards."""
+    if deployment.get("status") == "error" or deployment.get("error"):
+        return {
+            "launch_phase": "error",
+            "launch_message": str(
+                deployment.get("error") or "Deployment launch failed"
+            ),
+        }
+    members = [
+        member for member in (deployment.get("members") or [])
+        if isinstance(member, dict)
+    ]
+    # Report the least-advanced active rank. Rank order is only a tie-breaker:
+    # a queued worker must win over a rank-0 image pull, and an image pull must
+    # win over another rank that has already started loading model weights.
+    phase_order = {
+        "queued": 0,
+        "recovering": 0,
+        "preparing": 1,
+        "checking_image": 2,
+        "pulling_image": 3,
+        "creating": 4,
+        "creating_container": 4,
+        "created": 5,
+        "starting": 5,
+        "running": 5,
+        "downloading": 6,
+        "loading": 7,
+        "initializing": 8,
+        "ready": 9,
+    }
+    terminal_order = {
+        "error": 0, "dead": 1, "unreachable": 2,
+        "missing": 3, "unknown": 4,
+    }
+
+    def member_order(member: dict[str, Any]) -> tuple[int, int, int]:
+        phase = member.get("phase")
+        raw_phase = phase.get("phase") if isinstance(phase, dict) else phase
+        phase_name = str(
+            raw_phase or member.get("status") or "starting"
+        ).casefold()
+        rank = int(member.get("rank") or 0)
+        if phase_name in terminal_order:
+            # Another rank may still be actively pulling/creating/loading.
+            # Keep reporting that work until no active phase remains; only
+            # then surface terminal inventory state ahead of already-ready ranks.
+            return 1, terminal_order[phase_name], rank
+        if phase_name == "ready":
+            return 2, phase_order[phase_name], rank
+        return 0, phase_order.get(phase_name, phase_order["starting"]), rank
+
+    members.sort(key=member_order)
+    for member in members:
+        raw_phase = member.get("phase")
+        phase = raw_phase if isinstance(raw_phase, dict) else {}
+        phase_name = str(
+            phase.get("phase") or raw_phase or member.get("status") or ""
+        ).strip()
+        message = str(phase.get("message") or "").strip()
+        if not message and member.get("error"):
+            message = str(member["error"])
+        if phase_name or message:
+            public_phase = (
+                "error" if phase_name.casefold() in terminal_order else phase_name
+            )
+            return {
+                "launch_phase": public_phase or "starting",
+                "launch_message": (
+                    message or phase_name.replace("_", " ").title()
+                ),
+            }
+    status = str(deployment.get("status") or "starting").strip()
+    return {
+        "launch_phase": status,
+        "launch_message": "Preparing deployment launch",
+    }
 
 
 def _managed_container_status(container: dict[str, Any]) -> str:

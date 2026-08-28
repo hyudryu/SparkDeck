@@ -1707,7 +1707,8 @@ class Manager:
                     and (
                         job.get("download_attempted_at") is not None
                         or (
-                            job.get("status") == "failed"
+                            job.get("legacy_download_attempt_tracking")
+                            and job.get("status") == "failed"
                             and job.get("started_at") is not None
                         )
                     )

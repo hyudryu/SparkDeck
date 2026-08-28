@@ -738,6 +738,7 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(revision ? { revision } : {}),
       },
+      NO_REQUEST_TIMEOUT,
     ),
     preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',

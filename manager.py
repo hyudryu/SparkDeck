@@ -40,6 +40,7 @@ from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+    VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
     VirtualNAS,
     cached_download_bytes,
     download_required_free_bytes,
@@ -1072,6 +1073,7 @@ class Manager:
                 CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+                VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
             ],
             "update_protocol": 1,
             "app_revision": getattr(self, "app_revision", None),
@@ -1892,6 +1894,60 @@ class Manager:
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
+    async def node_supports_selective_downloads(self, node_id: str) -> bool:
+        if node_id == LOCAL_NODE_ID:
+            return True
+        node = self.node_registry.get(node_id)
+        if node is None:
+            return False
+        return VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY in (node.get("capabilities") or [])
+
+    async def node_has_model_files(
+        self, node_id: str, model_id: str, revision: str, filenames: list[str],
+    ) -> bool:
+        """Report whether one node's cache already holds every selected file."""
+        model_id = validate_model_id(model_id)
+        if node_id == LOCAL_NODE_ID:
+            result = await asyncio.to_thread(
+                self.virtual_nas.has_model_files,
+                model_id, revision, filenames,
+            )
+            return bool(result["complete"])
+        result = await self.node_registry.request(
+            node_id, "POST",
+            f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/files/check",
+            json_body={"revision": revision, "files": list(filenames)},
+            timeout=60,
+        )
+        return bool((result or {}).get("complete"))
+
+    async def node_download_model_files(
+        self, node_id: str, model_id: str, revision: str, filenames: list[str],
+        requested_revision: str | None = None,
+    ) -> dict:
+        """Seed an exact file subset into one node's cache and await it."""
+        model_id = validate_model_id(model_id)
+        if not await self.node_supports_selective_downloads(node_id):
+            raise RuntimeError(
+                f"node '{node_id}' does not support selective model file downloads; "
+                "update its SparkDeck agent"
+            )
+        if node_id == LOCAL_NODE_ID:
+            return await self.virtual_nas.download_model_files_checked(
+                model_id, revision, filenames,
+                requested_revision=requested_revision,
+            )
+        return await self.node_registry.request(
+            node_id, "POST",
+            f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
+            json_body={
+                "revision": revision,
+                "requested_revision": requested_revision or revision,
+                "files": list(filenames),
+            },
+            timeout=24 * 60 * 60,
+        )
+
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
         resolved_download: dict | None = None,
@@ -2148,11 +2204,19 @@ class Manager:
     async def recipe_model_preparation_preflight(
         self, model_id: str, revision: str | None, node_ids: list[str],
         resolved_download: dict | None = None,
+        download_node_id: str | None = None,
     ) -> dict:
         """Plan one selected-set preparation without mutating cluster state."""
         selected_ids = list(dict.fromkeys(str(value).strip() for value in node_ids if str(value).strip()))
         if not selected_ids:
             raise ValueError("node_ids must contain at least one node")
+        requested_seed = (
+            str(download_node_id).strip() if download_node_id else None
+        )
+        if requested_seed and requested_seed not in selected_ids:
+            raise ValueError(
+                "download_node_id must be one of the selected nodes"
+            )
         preflight = await self.virtual_nas_transfer_preflight(
             model_id, revision, resolved_download,
         )
@@ -2281,7 +2345,13 @@ class Manager:
         # other revisions and blobs that are absent from the Hub estimate for
         # this revision. Use a cache-empty seed whenever fan-out is needed so
         # target sizing remains tied to the requested snapshot size.
-        candidate_ids = empty_candidate_ids or selected_ids
+        if requested_seed:
+            # An explicitly designated seed is authoritative: consider only
+            # that node so the plan either honors the choice or reports why
+            # it cannot, instead of silently downloading somewhere else.
+            candidate_ids = [requested_seed]
+        else:
+            candidate_ids = empty_candidate_ids or selected_ids
         for candidate_id in candidate_ids:
             download_ids = [
                 candidate_id,
@@ -2400,11 +2470,15 @@ class Manager:
 
     async def queue_recipe_model_preparation(
         self, model_id: str, revision: str | None, node_ids: list[str],
+        download_node_id: str | None = None,
     ) -> dict:
         """Revalidate and persist the selected-set preparation atomically."""
         normalized_nodes = [str(value).strip() for value in node_ids]
         if len(set(normalized_nodes)) != len(normalized_nodes):
             raise ValueError("node_ids must not contain duplicates")
+        requested_seed = (
+            str(download_node_id).strip() if download_node_id else None
+        )
         normalized_revision = validate_revision(revision)
         lock = getattr(self, "_recipe_preparation_lock", None)
         if lock is None:
@@ -2454,6 +2528,7 @@ class Manager:
             )
             plan = await self.recipe_model_preparation_preflight(
                 model_id, normalized_revision, normalized_nodes, resolution,
+                download_node_id=requested_seed,
             )
             if not plan.get("eligible"):
                 raise RuntimeError(str(plan.get("reason") or "selected nodes are not eligible"))

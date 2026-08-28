@@ -1,7 +1,8 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { activityHeatmapCalendar, UsagePage } from './UsagePage'
+import type { UsageGroup } from '../api/types'
+import { activityHeatmapCalendar, modelShareItems, UsagePage } from './UsagePage'
 
 const summary = {
   models: {
@@ -36,6 +37,35 @@ afterEach(() => {
 })
 
 describe('UsagePage', () => {
+  it('shows the top seven model shares and combines the remainder as Others', () => {
+    const rows = Array.from({ length: 9 }, (_, index) => {
+      const rank = index + 1
+      const value = (10 - rank) * 100
+      return {
+        key: `model:model-${rank}`,
+        label: `Model ${rank}`,
+        merge_group: null,
+        route_target: `model-${rank}`,
+        models: [`model-${rank}`],
+        members: [],
+        stats: { input: value, input_miss: value, cached: 0, measured_cached: 0, estimated_cached: 0, output: 0, requests: 1, gen_tokens: 0, gen_time_s: 0 },
+        total_cost: 0,
+        cost_estimated: false,
+      }
+    }) satisfies UsageGroup[]
+
+    expect(modelShareItems([...rows].reverse())).toEqual([
+      { key: 'model:model-1', label: 'Model 1', value: 900 },
+      { key: 'model:model-2', label: 'Model 2', value: 800 },
+      { key: 'model:model-3', label: 'Model 3', value: 700 },
+      { key: 'model:model-4', label: 'Model 4', value: 600 },
+      { key: 'model:model-5', label: 'Model 5', value: 500 },
+      { key: 'model:model-6', label: 'Model 6', value: 400 },
+      { key: 'model:model-7', label: 'Model 7', value: 300 },
+      { key: 'others', label: 'Others', value: 300 },
+    ])
+  })
+
   it('derives heatmap month labels and positions from the rendered dates', () => {
     const calendar = activityHeatmapCalendar([], new Date('2026-01-15T12:00:00Z'))
 
@@ -194,6 +224,62 @@ describe('UsagePage', () => {
     await user.clear(screen.getByRole('combobox', { name: 'Route usage to' }))
     await user.click(screen.getByRole('button', { name: 'Save usage display' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
+  })
+
+  it('adds, updates, and removes rules from the visible routing manager', async () => {
+    const rules: Record<string, string> = { 'org/legacy': 'org/target' }
+    const routedSummary = {
+      ...summary,
+      models: {
+        'org/model': summary.models['org/model'],
+        'org/target': { input: 900, cached: 100, output: 400, requests: 5 },
+        'org/legacy': { input: 300, cached: 0, output: 100, requests: 2 },
+      },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'PUT' && path === '/api/token-stats/rules') {
+        const body = JSON.parse(String(init.body)) as { source: string; destination: string }
+        rules[body.source] = body.destination
+        return json({ ok: true })
+      }
+      if (init?.method === 'DELETE' && path.startsWith('/api/token-stats/rules/')) {
+        delete rules[decodeURIComponent(path.replace('/api/token-stats/rules/', ''))]
+        return json({ ok: true })
+      }
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json({ ...routedSummary, routing_rules: { ...rules } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    const form = await screen.findByRole('form', { name: 'Add model routing rule' })
+    expect(form).toBeInTheDocument()
+    expect(screen.getByLabelText('Current model routing rules')).toHaveTextContent('org/legacy')
+    expect(screen.getByLabelText('Current model routing rules')).toHaveTextContent('org/target')
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Source model' }), 'org/model')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Destination model' }), 'org/target')
+    await user.click(screen.getByRole('button', { name: 'Add rule' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ source: 'org/model', destination: 'org/target' }),
+    })))
+    expect(await screen.findByRole('button', { name: 'Remove routing rule for org/model' })).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Source model' }), 'org/legacy')
+    expect(screen.getByRole('button', { name: 'Update rule' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Destination model' }), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Update rule' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ source: 'org/legacy', destination: 'org/model' }),
+    })))
+
+    await user.click(screen.getByRole('button', { name: 'Remove routing rule for org/legacy' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/rules/org%2Flegacy', expect.objectContaining({ method: 'DELETE' })))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Remove routing rule for org/legacy' })).not.toBeInTheDocument())
   })
 
   it('keeps a route-only save from overwriting the source merge group', async () => {

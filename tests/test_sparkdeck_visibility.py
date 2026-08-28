@@ -288,6 +288,7 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", state.text)
         self.assertEqual(state.json()["recipes"][0]["extra_args"], ["--dtype", "auto"])
         self.assertEqual(launched.status_code, 201)
+        self.assertEqual(create.await_args.kwargs, {"background": True})
         self.assertEqual(
             create.await_args.args[0]["settings"]["extra_args"],
             ["--dtype", "auto"],

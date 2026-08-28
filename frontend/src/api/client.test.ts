@@ -115,7 +115,9 @@ describe('API client adapters', () => {
         runtime: 'llama.cpp',
         kind: 'managed',
         model: { repository: 'org/model', quantization: 'Q4_K_M' },
-        status: 'running',
+        status: 'starting',
+        launch_phase: 'pulling_image',
+        launch_message: 'Downloading Docker image',
         settings: { context_length: 4096, parallel_slots: 2 },
       }],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
@@ -126,6 +128,9 @@ describe('API client adapters', () => {
         model_id: 'org/model',
         runtime: 'llama.cpp',
         managed: true,
+        status: 'starting',
+        launch_phase: 'pulling_image',
+        launch_message: 'Downloading Docker image',
         settings: expect.objectContaining({ quantization: 'Q4_K_M', parallel_slots: 2 }),
       }),
     ])

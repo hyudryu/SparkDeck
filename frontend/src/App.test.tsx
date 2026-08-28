@@ -494,7 +494,7 @@ describe('model deployments', () => {
       '/api/v1/recipes/recipe-1/deploy',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['local', 'node-2'] }) }),
     ))
-    expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
+    expect(await screen.findByText('Started deployment Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
   it('confirms one selected-set preparation and rejects insufficient targets', async () => {
@@ -805,6 +805,62 @@ describe('model deployments', () => {
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('launch failed')
     expect(within(dialog).getByRole('button', { name: 'Close dialog' })).toBeEnabled()
     expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeEnabled()
+  })
+
+  it('moves an accepted recipe launch into Deployments and refreshes its live phase', async () => {
+    const user = userEvent.setup()
+    let deploymentListCalls = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [{ node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-live/deploy')) {
+        return new Response(JSON.stringify({
+          id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'launching', settings: {},
+          node_ids: ['local'], launch_phase: 'queued', launch_message: 'Launch accepted',
+        }), { status: 202, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        return new Response(JSON.stringify({ items: deploymentListCalls === 1 ? [] : [{
+          id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {},
+          node_ids: ['local'], launch_phase: 'pulling_image', launch_message: 'Downloading Docker image',
+        }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-live', name: 'Live recipe', model: 'org/model', engine: 'sglang',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Deploy Live recipe' })).getByRole('button', { name: 'Deploy on 1 node' }))
+
+    expect(screen.queryByRole('dialog', { name: 'Deploy Live recipe' })).not.toBeInTheDocument()
+    const deploymentRow = screen.getByRole('link', { name: 'Live recipe' }).closest('[role="row"]') as HTMLElement
+    expect(within(deploymentRow).getByText('launching')).toBeInTheDocument()
+    expect(within(deploymentRow).getByText('Queued')).toBeInTheDocument()
+    expect(within(deploymentRow).getByText('Launch accepted')).toBeInTheDocument()
+    expect(within(deploymentRow).getByRole('button', { name: 'Stop' })).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('Started deployment Live recipe on This device.')
+
+    expect(await within(deploymentRow).findByText('Downloading Docker image', {}, { timeout: 3500 })).toBeInTheDocument()
+    expect(within(deploymentRow).getByText('Pulling Image')).toBeInTheDocument()
+    expect(within(deploymentRow).getByRole('button', { name: 'Stop' })).toBeDisabled()
+    expect(deploymentListCalls).toBeGreaterThanOrEqual(2)
   })
 
   it('deduplicates saved node IDs before filling an exact-count selector', async () => {

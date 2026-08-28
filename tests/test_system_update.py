@@ -450,6 +450,48 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "failed")
         self.assertIn("interrupted", status["error"].lower())
 
+    async def test_start_local_retries_without_a_status_poll_after_helper_dies(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "staging", "target_revision": "b" * 40,
+            "helper_pid": 999999, "boot_id": "old-boot",
+        })
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater._helper_alive", return_value=False), \
+             patch("sparkdeck.updater._spawn_update_helper", return_value=4321), \
+             patch("sparkdeck.updater.platform.system", return_value="Linux"):
+            state = await self.service.start_local("main", "c" * 40)
+
+        self.assertEqual(state["phase"], "accepted")
+        self.assertEqual(state["target_revision"], "c" * 40)
+        self.assertEqual(state["helper_pid"], 4321)
+
+    async def test_start_local_still_rejects_a_verified_live_helper(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321,
+        })
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater._helper_alive", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "already updating"):
+                await self.service.start_local("main", "c" * 40)
+
+        self.service.preflight_local.assert_not_awaited()
+
+    async def test_dead_restarting_helper_recovers_when_new_revision_is_serving(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321,
+        })
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater._helper_alive", return_value=False), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = self.service.agent_status()
+
+        self.assertEqual(status["phase"], "succeeded")
+        self.assertNotIn("error", self.service._read(self.service.agent_path))
+
     async def test_target_checkout_does_not_finish_before_helper_verification(self):
         self.service._write(self.service.agent_path, {
             "phase": "restarting", "target_revision": "b" * 40,

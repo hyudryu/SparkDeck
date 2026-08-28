@@ -70,7 +70,7 @@ The page provides:
 - **Hugging Face** and **Community Run Models** views;
 - model name, author, parameter count, estimated weight size, downloads, and likes;
 - expandable rows for runtime compatibility and deployment actions;
-- **Only what fits**, based on measured per-node cluster memory;
+- **Only what fits**, based on measured aggregate memory across cluster nodes when a sharded deployment can divide model weights among them, with per-node fit used when sharding is unavailable;
 - **Only with community data**, available when Community Features are enabled; and
 - fit colors: green for comfortable fit, orange for tight fit, and red when the weights do not fit.
 

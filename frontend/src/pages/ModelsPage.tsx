@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -40,6 +40,22 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
 }
 
 const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
+
+export function recipePreparationRequiredBytes(
+  option: StorageTransferPreflightTarget | undefined,
+  hasExactSource: boolean,
+) {
+  if (!option) return undefined
+  if (hasExactSource) {
+    return option.has_model_cache && !option.has_required_weights
+      ? option.download_required_free_bytes
+      : option.required_free_bytes
+  }
+  return Math.max(
+    option.download_required_free_bytes ?? 0,
+    option.transfer_after_download_required_free_bytes ?? 0,
+  )
+}
 
 const PIN_STORAGE_KEY = 'sparkdeck:pinned-recipes'
 const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
@@ -685,17 +701,21 @@ export function ModelsPage() {
         reloadModelCache()
         return
       }
-      const sourceNode = plan.action === 'download'
-        ? nodes.data?.find((node) => node.id === plan.download_node_id)
-        : undefined
+      const downloadNodeIds = plan.download_node_ids?.length
+        ? plan.download_node_ids
+        : plan.download_node_id ? [plan.download_node_id] : []
+      const downloadNames = downloadNodeIds.map((id) => (
+        nodes.data?.find((node) => node.id === id)?.name ?? id
+      ))
       const sourceName = plan.action === 'download'
-        ? sourceNode?.name ?? plan.download_node_id
+        ? downloadNames[0]
         : plan.source?.node_name
       const targetNames = plan.transfer_target_node_ids.map((id) => (
         nodes.data?.find((node) => node.id === id)?.name ?? id
       ))
+      const fanoutSource = plan.source?.node_name
       const message = plan.action === 'download'
-        ? `Download ${recipe.model} revision ${revision} (${formatBytes(plan.download?.size_bytes ?? 0)}) from Hugging Face onto ${sourceName}${targetNames.length ? `, then transfer it via Virtual NAS to ${targetNames.join(', ')}` : ''}?`
+        ? `Download ${recipe.model} revision ${revision} (${formatBytes(plan.download?.size_bytes ?? 0)}) from Hugging Face onto ${downloadNames.join(', ')}${targetNames.length ? fanoutSource ? `, then transfer it from ${fanoutSource} via Virtual NAS to ${targetNames.join(', ')}` : `, then transfer it via Virtual NAS to ${targetNames.join(', ')}` : ''}?`
         : `Transfer ${recipe.model} from ${sourceName} via Virtual NAS to ${targetNames.join(', ')}?`
       if (!window.confirm(`${message}\n\nCapacity was verified on each selected node's model-cache volume.`)) return
       setRecipeTransferNotice(undefined)
@@ -719,7 +739,7 @@ export function ModelsPage() {
       })
       setRecipeTransferNotice(
         plan.action === 'download'
-          ? `Hugging Face seed download queued on ${sourceName}. Virtual NAS fan-out will follow automatically.`
+          ? `Hugging Face ${downloadNames.length > 1 ? 'downloads' : 'seed download'} queued on ${downloadNames.join(', ')}.${targetNames.length ? ' Virtual NAS fan-out will follow automatically.' : ''}`
           : `Virtual NAS transfer queued to ${targetNames.join(', ')}.`,
       )
       reloadTransferPreflight()
@@ -1012,7 +1032,7 @@ export function ModelsPage() {
               {transferPreflight.loading && <p role="status">Checking source weights, Hugging Face size, and cache-volume capacity…</p>}
               {transferPreflight.error && <div className="recipe-transfer-error" role="alert"><span>{transferPreflight.error}</span><Button type="button" variant="tertiary" onClick={transferPreflight.reload}>Retry</Button></div>}
               {transferPreflight.data && !transferPreflight.data.enabled && <p>Virtual NAS is disabled. Enable it on the Storage page before transferring weights.</p>}
-              {transferPreflight.data?.enabled && transferPreflight.data.source && <p>A complete copy is available on {transferPreflight.data.source.node_name}; selected missing nodes will receive it through Virtual NAS.</p>}
+              {transferPreflight.data?.enabled && transferPreflight.data.source && <p>A complete copy is available on {transferPreflight.data.source.node_name}; cache-empty nodes will receive it through Virtual NAS, while incomplete caches resume from Hugging Face.</p>}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download && <p>No cluster node has the requested revision. One selected node will download {formatBytes(transferPreflight.data.download.size_bytes)} from Hugging Face, then fan it out to the rest.</p>}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download_error && <p>{transferPreflight.data.download_error}</p>}
               {transferPreflight.data?.enabled && <div className="recipe-transfer-targets">
@@ -1021,9 +1041,9 @@ export function ModelsPage() {
                   const selectable = isNodeSelectable(node)
                   const trackedJob = recipeTransferJobs[recipeJobKey(recipe.id, recipe.model, node.id)]
                   const eligible = Boolean(allowedIds.includes(node.id) && selectable && !trackedJob)
-                  const requiredBytes = transferPreflight.data?.source
-                    ? option?.required_free_bytes
-                    : Math.max(option?.download_required_free_bytes ?? 0, option?.transfer_after_download_required_free_bytes ?? 0)
+                  const requiredBytes = recipePreparationRequiredBytes(
+                    option, Boolean(transferPreflight.data?.source),
+                  )
                   const capacity = option?.free_bytes != null && requiredBytes
                     ? `${formatBytes(option.free_bytes)} free · up to ${formatBytes(requiredBytes)} required`
                     : undefined

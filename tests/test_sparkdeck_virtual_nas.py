@@ -286,6 +286,40 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(job["status"] == "completed" for job in saved))
         await nas.stop()
 
+    async def test_concurrent_queues_cannot_persist_duplicate_targets(self):
+        registry = FakeRegistry()
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, registry, lambda: True,
+        )
+        nas.start = Mock()
+        first_target_check = asyncio.Event()
+        release_target_check = asyncio.Event()
+        original_storage = nas._node_storage
+
+        async def blocked_storage(node_id):
+            if node_id == "worker-a":
+                first_target_check.set()
+                await release_target_check.wait()
+            return await original_storage(node_id)
+
+        nas._node_storage = blocked_storage
+        first = asyncio.create_task(
+            nas.queue_transfer("org/model", "local", ["worker-a"]),
+        )
+        await asyncio.wait_for(first_target_check.wait(), 2)
+        second = asyncio.create_task(
+            nas.queue_transfer("org/model", "local", ["worker-a"]),
+        )
+        await asyncio.sleep(0.05)
+        release_target_check.set()
+
+        results = await asyncio.gather(first, second, return_exceptions=True)
+
+        self.assertEqual(sum(isinstance(item, dict) for item in results), 1)
+        self.assertEqual(sum(isinstance(item, ValueError) for item in results), 1)
+        self.assertEqual(len(nas.jobs), 1)
+        self.assertEqual(nas.jobs[0]["target_node_id"], "worker-a")
+
     async def test_restart_recovers_running_job_to_queue(self):
         path = Path(self.temp.name) / "virtual_nas_transfers.json"
         path.write_text(json.dumps([{
@@ -406,6 +440,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
             await nas.download_model_checked("other/model", "main", "ephemeral")
 
+        nas.estimate_download_size.assert_awaited_once_with(
+            "other/model", "main", "ephemeral", force_refresh=True,
+        )
         nas.download_model.assert_not_called()
 
 

@@ -1658,6 +1658,7 @@ class Manager:
             return {
                 **preflight, "node_ids": selected_ids, "eligible": True,
                 "action": "ready", "download_node_id": None,
+                "download_node_ids": [],
                 "transfer_target_node_ids": [], "reason": None,
             }
 
@@ -1665,13 +1666,35 @@ class Manager:
             selected_sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
             source = selected_sources[0]
             transfer_required = source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            download = preflight.get("download")
+            download_required = (
+                self._byte_count(download.get("required_free_bytes"))
+                if download else None
+            )
+            download_error = preflight.get("download_error")
             blocked_reasons = []
+            download_ids = []
+            transfer_ids = []
             for node_id in missing_ids:
                 option = options[node_id]
                 free_bytes = self._byte_count(option.get("free_bytes"))
                 if option.get("has_model_cache"):
-                    blocked_reasons.append("A cache for this model already exists on the target")
-                elif option.get("active_job_id"):
+                    download_ids.append(node_id)
+                    if option.get("active_job_id"):
+                        blocked_reasons.append("Model preparation is already active")
+                    elif download_error or download_required is None:
+                        blocked_reasons.append(
+                            download_error or "Hugging Face download size is unavailable"
+                        )
+                    elif free_bytes is None:
+                        blocked_reasons.append("Free cache capacity is unavailable")
+                    elif free_bytes < download_required:
+                        blocked_reasons.append(
+                            "Not enough free cache space for the Hugging Face download"
+                        )
+                    continue
+                transfer_ids.append(node_id)
+                if option.get("active_job_id"):
                     blocked_reasons.append("Model preparation is already active")
                 elif free_bytes is None:
                     blocked_reasons.append("Free cache capacity is unavailable")
@@ -1679,9 +1702,12 @@ class Manager:
                     blocked_reasons.append("Not enough free cache space for Virtual NAS staging")
             return {
                 **preflight, "node_ids": selected_ids,
-                "eligible": not blocked_reasons, "action": "transfer",
-                "source": source, "download_node_id": None,
-                "transfer_target_node_ids": missing_ids,
+                "eligible": not blocked_reasons,
+                "action": "download" if download_ids else "transfer",
+                "source": source,
+                "download_node_id": download_ids[0] if download_ids else None,
+                "download_node_ids": download_ids,
+                "transfer_target_node_ids": transfer_ids,
                 "reason": blocked_reasons[0] if blocked_reasons else None,
             }
 
@@ -1704,6 +1730,7 @@ class Manager:
             return {
                 **preflight, "node_ids": selected_ids, "eligible": False,
                 "action": "download", "download_node_id": None,
+                "download_node_ids": [],
                 "transfer_target_node_ids": missing_ids,
                 "reason": download_error or "Hugging Face download size is unavailable",
             }
@@ -1714,26 +1741,41 @@ class Manager:
         )
         candidate_reasons: list[str] = []
         chosen = None
-        for candidate_id in selected_ids:
-            candidate = options[candidate_id]
-            free_bytes = self._byte_count(candidate.get("free_bytes"))
-            if candidate.get("active_job_id"):
-                candidate_reasons.append(candidate.get("reason") or "Model preparation is already active")
-                continue
-            if free_bytes is None:
-                candidate_reasons.append("Free cache capacity is unavailable")
-                continue
-            if free_bytes < download_required:
-                candidate_reasons.append("Not enough free cache space for the Hugging Face download")
-                continue
-            other_ids = [node_id for node_id in missing_ids if node_id != candidate_id]
+        chosen_download_ids: list[str] = []
+        chosen_transfer_ids: list[str] = []
+        candidate_ids = sorted(
+            selected_ids,
+            key=lambda node_id: (
+                not options[node_id].get("has_model_cache"),
+                selected_ids.index(node_id),
+            ),
+        )
+        for candidate_id in candidate_ids:
+            download_ids = [
+                candidate_id,
+                *(
+                    node_id for node_id in missing_ids
+                    if node_id != candidate_id
+                    and options[node_id].get("has_model_cache")
+                ),
+            ]
+            transfer_ids = [
+                node_id for node_id in missing_ids if node_id not in download_ids
+            ]
             blocked = []
-            for target_id in other_ids:
+            for download_id in download_ids:
+                target = options[download_id]
+                target_free = self._byte_count(target.get("free_bytes"))
+                if target.get("active_job_id"):
+                    blocked.append("Model preparation is already active")
+                elif target_free is None:
+                    blocked.append("Free cache capacity is unavailable")
+                elif target_free < download_required:
+                    blocked.append("Not enough free cache space for the Hugging Face download")
+            for target_id in transfer_ids:
                 target = options[target_id]
                 target_free = self._byte_count(target.get("free_bytes"))
-                if target.get("has_model_cache"):
-                    blocked.append("A cache for this model already exists on a transfer target")
-                elif target.get("active_job_id"):
+                if target.get("active_job_id"):
                     blocked.append("Model preparation is already active")
                 elif target_free is None:
                     blocked.append("Free cache capacity is unavailable")
@@ -1741,15 +1783,16 @@ class Manager:
                     blocked.append("Not enough free cache space for Virtual NAS staging")
             if not blocked:
                 chosen = candidate_id
+                chosen_download_ids = download_ids
+                chosen_transfer_ids = transfer_ids
                 break
             candidate_reasons.extend(blocked)
         return {
             **preflight, "download": download, "download_error": download_error,
             "node_ids": selected_ids, "eligible": chosen is not None,
             "action": "download", "download_node_id": chosen,
-            "transfer_target_node_ids": [
-                node_id for node_id in missing_ids if node_id != chosen
-            ],
+            "download_node_ids": chosen_download_ids,
+            "transfer_target_node_ids": chosen_transfer_ids,
             "reason": None if chosen else (
                 candidate_reasons[0] if candidate_reasons
                 else "No selected node can seed the Hugging Face download"
@@ -1806,6 +1849,10 @@ class Manager:
                     plan["model_id"], plan["revision"], plan["download_node_id"],
                     plan["transfer_target_node_ids"], plan["download"]["size_bytes"],
                     workflow_id, plan["node_ids"],
+                    additional_download_node_ids=(
+                        plan.get("download_node_ids") or []
+                    )[1:],
+                    source_node_id=(plan.get("source") or {}).get("node_id"),
                 )
                 result["jobs"] = [
                     self._public_virtual_nas_job(job) for job in result["jobs"]

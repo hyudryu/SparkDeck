@@ -505,6 +505,7 @@ export interface RecipePreparationPlan extends StorageTransferPreflight {
   eligible: boolean
   action: 'ready' | 'transfer' | 'download'
   download_node_id?: string | null
+  download_node_ids?: string[]
   transfer_target_node_ids: string[]
   reason?: string | null
 }

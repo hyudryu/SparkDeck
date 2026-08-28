@@ -17,7 +17,7 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote
 
 
@@ -166,6 +166,7 @@ class VirtualNAS:
         self._download_locks: dict[str, threading.Lock] = {}
         self._download_locks_guard = threading.Lock()
         self._download_size_cache: dict[tuple[str, str], tuple[float, int]] = {}
+        self._queue_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -173,6 +174,14 @@ class VirtualNAS:
 
     def _hub(self) -> Path:
         return Path(self._hub_path_provider()).expanduser().resolve()
+
+    async def _await_uncancelable(self, operation: Awaitable[Any]) -> Any:
+        """Finish work that cannot be safely stopped after it has begun."""
+        task = asyncio.ensure_future(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            return await task
 
     def _model_path(self, model_id: str) -> Path:
         hub = self._hub()
@@ -256,13 +265,14 @@ class VirtualNAS:
     async def estimate_download_size(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
+        *, force_refresh: bool = False,
     ) -> int:
         """Return the exact Hub file total or fail closed when it is unknown."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
         cache_key = (model_id, revision)
         cached = self._download_size_cache.get(cache_key)
-        if cached and time.monotonic() - cached[0] < 300:
+        if not force_refresh and cached and time.monotonic() - cached[0] < 300:
             return cached[1]
         token = str(
             explicit_token if explicit_token is not None else self._token_provider() or ""
@@ -314,7 +324,7 @@ class VirtualNAS:
         ), None)
         if existing is None:
             expected_bytes = await self.estimate_download_size(
-                model_id, revision, explicit_token,
+                model_id, revision, explicit_token, force_refresh=True,
             )
             free_bytes = await asyncio.to_thread(self.free_bytes)
             required = expected_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
@@ -325,8 +335,10 @@ class VirtualNAS:
                     f"download node has insufficient free cache space "
                     f"({free_bytes} bytes available; {required} bytes required)"
                 )
-        return await asyncio.to_thread(
-            self.download_model, model_id, revision, explicit_token,
+        return await self._await_uncancelable(
+            asyncio.to_thread(
+                self.download_model, model_id, revision, explicit_token,
+            ),
         )
 
     def download_model(
@@ -608,6 +620,18 @@ class VirtualNAS:
         workflow_id: str | None = None,
         workflow_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        async with self._queue_lock:
+            return await self._queue_transfer(
+                model_id, source_node_id, target_node_ids, revision,
+                workflow_id, workflow_node_ids,
+            )
+
+    async def _queue_transfer(
+        self, model_id: str, source_node_id: str,
+        target_node_ids: list[str], revision: str | None = None,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
@@ -648,13 +672,13 @@ class VirtualNAS:
             duplicate = next((
                 job for job in self.jobs
                 if job["model_id"] == model_id
-                and job["source_node_id"] == source_node_id
                 and job["target_node_id"] == target
                 and job["status"] in _ACTIVE_TRANSFER_STATES
             ), None)
             if duplicate:
                 raise ValueError(
-                    f"an active transfer for '{model_id}' to node '{target}' already exists"
+                    f"an active model preparation for '{model_id}' to node "
+                    f"'{target}' already exists"
                 )
             storage = await self._node_storage(target)
             target_storage[target] = storage
@@ -714,8 +738,30 @@ class VirtualNAS:
         expected_bytes: int,
         workflow_id: str | None = None,
         workflow_node_ids: list[str] | None = None,
+        additional_download_node_ids: list[str] | None = None,
+        source_node_id: str | None = None,
     ) -> dict[str, Any]:
-        """Persist a resumable Hub download followed by dependent transfers."""
+        async with self._queue_lock:
+            return await self._queue_download_and_transfer(
+                model_id, revision, download_node_id,
+                transfer_target_node_ids, expected_bytes, workflow_id,
+                workflow_node_ids, additional_download_node_ids,
+                source_node_id,
+            )
+
+    async def _queue_download_and_transfer(
+        self,
+        model_id: str,
+        revision: str,
+        download_node_id: str,
+        transfer_target_node_ids: list[str],
+        expected_bytes: int,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+        additional_download_node_ids: list[str] | None = None,
+        source_node_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist resumable Hub downloads and any dependent NAS fan-out."""
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
@@ -724,13 +770,27 @@ class VirtualNAS:
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
         download_node_id = str(download_node_id or LOCAL_NODE_ID)
+        download_nodes = list(dict.fromkeys([
+            download_node_id,
+            *(str(value) for value in (additional_download_node_ids or []) if value),
+        ]))
         targets = list(dict.fromkeys(
             str(value) for value in transfer_target_node_ids if value
         ))
-        if download_node_id in targets:
-            raise ValueError("download node cannot also be a transfer target")
+        overlap = sorted(set(download_nodes) & set(targets))
+        if overlap:
+            raise ValueError(
+                "download nodes cannot also be transfer targets: "
+                + ", ".join(overlap)
+            )
+        transfer_source = str(source_node_id) if source_node_id else download_node_id
+        if transfer_source in targets:
+            raise ValueError("source node cannot also be a transfer target")
 
-        await self._validate_online_node(download_node_id)
+        for node_id in download_nodes:
+            await self._validate_online_node(node_id)
+        if targets and transfer_source not in download_nodes:
+            await self._validate_online_node(transfer_source)
         for target in targets:
             await self._validate_online_node(target)
 
@@ -740,7 +800,7 @@ class VirtualNAS:
             if job.get("model_id") == model_id
             and job.get("status") in _ACTIVE_TRANSFER_STATES
         }
-        requested_targets = {download_node_id, *targets}
+        requested_targets = {*download_nodes, *targets}
         duplicate_targets = sorted(active_targets & requested_targets)
         if duplicate_targets:
             raise ValueError(
@@ -748,20 +808,35 @@ class VirtualNAS:
                 + ", ".join(duplicate_targets)
             )
 
-        download_storage = await self._node_storage(download_node_id)
-        download_free = _optional_nonnegative_int(download_storage.get("free_size"))
         download_required = expected_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
-        if download_free is None:
-            raise RuntimeError(
-                f"download node '{download_node_id}' did not report free cache capacity"
-            )
-        if download_free < download_required:
-            raise RuntimeError(
-                f"download node '{download_node_id}' has insufficient free cache space "
-                f"({download_free} bytes available; {download_required} bytes required)"
-            )
+        for node_id in download_nodes:
+            download_storage = await self._node_storage(node_id)
+            download_free = _optional_nonnegative_int(download_storage.get("free_size"))
+            if download_free is None:
+                raise RuntimeError(
+                    f"download node '{node_id}' did not report free cache capacity"
+                )
+            if download_free < download_required:
+                raise RuntimeError(
+                    f"download node '{node_id}' has insufficient free cache space "
+                    f"({download_free} bytes available; {download_required} bytes required)"
+                )
 
-        transfer_required = expected_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        transfer_bytes = expected_bytes
+        if targets and transfer_source not in download_nodes:
+            source_storage = await self._node_storage(transfer_source)
+            source_model = next((
+                item for item in source_storage["models"]
+                if item.get("model_id") == model_id
+                and not item.get("partial")
+                and revision in (item.get("revisions") or [])
+            ), None)
+            if source_model is None:
+                raise LookupError("cached source model revision not found")
+            transfer_bytes = _nonnegative_int(source_model.get("size_bytes"))
+            if transfer_bytes <= 0:
+                raise RuntimeError("source node did not report a usable cached model size")
+        transfer_required = transfer_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
         for target in targets:
             storage = await self._node_storage(target)
             if any(item.get("model_id") == model_id for item in storage["models"]):
@@ -780,25 +855,28 @@ class VirtualNAS:
                 )
 
         created = time.time()
-        download_job = {
+        jobs = [{
             "id": str(uuid.uuid4()), "kind": "download", "model_id": model_id,
-            "source_node_id": "huggingface", "target_node_id": download_node_id,
+            "source_node_id": "huggingface", "target_node_id": node_id,
             "revision": revision, "depends_on_job_id": None,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
             "status": "queued", "bytes_total": expected_bytes,
             "bytes_transferred": 0, "created_at": created,
             "started_at": None, "completed_at": None, "error": None,
-        }
-        jobs = [download_job]
+        } for node_id in download_nodes]
+        primary_download_job = jobs[0]
         for target in targets:
             jobs.append({
                 "id": str(uuid.uuid4()), "kind": "transfer", "model_id": model_id,
-                "source_node_id": download_node_id, "target_node_id": target,
-                "revision": revision, "depends_on_job_id": download_job["id"],
+                "source_node_id": transfer_source, "target_node_id": target,
+                "revision": revision,
+                "depends_on_job_id": (
+                    None if source_node_id else primary_download_job["id"]
+                ),
                 "workflow_id": workflow_id,
                 "workflow_node_ids": list(workflow_node_ids or []),
-                "status": "queued", "bytes_total": expected_bytes,
+                "status": "queued", "bytes_total": transfer_bytes,
                 "bytes_transferred": 0, "created_at": created,
                 "started_at": None, "completed_at": None, "error": None,
             })
@@ -951,8 +1029,18 @@ class VirtualNAS:
                 and job.get("revision") in (item.get("revisions") or [])
             ), None)
             if already_complete is None:
+                current_size = await self.estimate_download_size(
+                    job["model_id"], job.get("revision") or "main", token,
+                    force_refresh=True,
+                )
+                job["bytes_total"] = current_size
+                self._save()
+                # Re-read the authoritative cache filesystem after the Hub
+                # metadata call so both operands of the capacity gate are
+                # current when the download actually begins.
+                storage = await self._node_storage(job["target_node_id"])
                 free_bytes = _optional_nonnegative_int(storage.get("free_size"))
-                required = job["bytes_total"] * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+                required = current_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
                 if free_bytes is None:
                     raise RuntimeError("download node did not report free cache capacity")
                 if free_bytes < required:
@@ -961,12 +1049,12 @@ class VirtualNAS:
                         f"({free_bytes} bytes available; {required} bytes required)"
                     )
             if job["target_node_id"] == LOCAL_NODE_ID:
-                result = await asyncio.to_thread(
-                    self.download_model, job["model_id"], job.get("revision") or "main",
-                    token,
+                operation = asyncio.to_thread(
+                    self.download_model, job["model_id"],
+                    job.get("revision") or "main", token,
                 )
             else:
-                result = await self.node_registry.request(
+                operation = self.node_registry.request(
                     job["target_node_id"], "POST",
                     self._model_agent_path(job["model_id"], "download"),
                     json_body={
@@ -975,6 +1063,10 @@ class VirtualNAS:
                     },
                     timeout=24 * 60 * 60,
                 )
+            # Neither a local snapshot_download worker nor a remote agent's
+            # snapshot worker can be safely canceled once it begins. Retain
+            # ownership until it finishes so stop/restart cannot duplicate it.
+            result = await self._await_uncancelable(operation)
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             size_bytes = _nonnegative_int((result or {}).get("size_bytes"))

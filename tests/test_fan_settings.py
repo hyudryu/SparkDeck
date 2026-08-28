@@ -146,6 +146,39 @@ class FanSettingsTests(unittest.TestCase):
             self.assertEqual(state["active_settings"], CURVE)
             self.assertEqual(state["mode"], "curve")
 
+            stale_mtime = time.time() - manager_module.FAN_STATE_MAX_AGE_SECONDS - 1
+            os.utime(state_path, (stale_mtime, stale_mtime))
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": directory}):
+                self.assertIsNone(instance._read_fan_state())
+
+    def test_state_sanitizer_rejects_stale_future_and_malformed_files(self) -> None:
+        now = 10_000.0
+        state = {
+            "rpm": 1800,
+            "duty_byte": 128,
+            "duty_pct": 50.2,
+            "temp": 71.5,
+            "mode": "curve",
+            "active_settings": CURVE,
+            "status": "connected",
+            "max_speed": False,
+            "ts": now,
+        }
+
+        self.assertIsNotNone(Manager._sanitize_fan_state(state, now=now))
+        self.assertIsNone(Manager._sanitize_fan_state({
+            **state, "ts": now - manager_module.FAN_STATE_MAX_AGE_SECONDS - 0.1,
+        }, now=now))
+        self.assertIsNone(Manager._sanitize_fan_state({
+            **state, "ts": now + manager_module.FAN_STATE_MAX_FUTURE_SKEW_SECONDS + 0.1,
+        }, now=now))
+        self.assertIsNone(Manager._sanitize_fan_state({
+            **state, "duty_pct": "100",
+        }, now=now))
+        self.assertIsNone(Manager._sanitize_fan_state({
+            **state, "active_settings": {**CURVE, "script": "unsafe"},
+        }, now=now))
+
     def test_cluster_temperature_uses_hottest_fresh_cpu_or_gpu(self) -> None:
         now = 1_000.0
         result = Manager._cluster_temperature_override([
@@ -195,6 +228,9 @@ class FanSettingsTests(unittest.TestCase):
             instance = Manager.__new__(Manager)
             instance._fan_control_lock = threading.Lock()
             instance._fan_control_path = lambda: path
+            instance._read_fan_state = lambda: {
+                "mode": "curve", "active_settings": CURVE,
+            }
             override = {
                 "temperature_c": 75.0,
                 "expires_at": time.time() + 10,
@@ -211,6 +247,95 @@ class FanSettingsTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()), {
                 "temperature_override": override,
             })
+
+
+class FanControlClusterTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def live_fan(now: float | None = None) -> dict:
+        return {
+            "rpm": 1800,
+            "duty_byte": 128,
+            "duty_pct": 50.2,
+            "temp": 71.5,
+            "mode": "curve",
+            "active_settings": CURVE,
+            "status": "connected",
+            "max_speed": False,
+            "ts": time.time() if now is None else now,
+        }
+
+    @staticmethod
+    def settings() -> dict:
+        return {
+            "mode": "curve",
+            "settings": {
+                mode: {key: value for key, value in values.items()}
+                for mode, values in manager_module.FAN_MODE_DEFAULTS.items()
+            },
+        }
+
+    async def test_cluster_overview_only_returns_revalidated_capable_nodes(self) -> None:
+        instance = Manager.__new__(Manager)
+        local_fan = self.live_fan()
+        remote_fan = self.live_fan()
+        stale_fan = self.live_fan(time.time() - 60)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[
+            {"id": "local", "name": "Controller", "online": True,
+             "stats": {"fan": local_fan}},
+            {"id": "worker-1", "name": "Rack", "online": True,
+             "stats": {"fan": remote_fan}},
+            {"id": "stale", "name": "Old", "online": True,
+             "stats": {"fan": stale_fan}},
+            {"id": "plain", "name": "No fan", "online": True,
+             "stats": {"fan": None}},
+        ])
+        instance.local_fan_control_overview = mock.Mock(return_value={
+            "fan": local_fan, "settings": self.settings(),
+        })
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(return_value={
+            "fan": remote_fan, "settings": self.settings(),
+        })
+
+        result = await instance.fan_control_cluster_overview()
+
+        self.assertTrue(result["available"])
+        self.assertEqual(
+            [node["node_id"] for node in result["nodes"]],
+            ["local", "worker-1"],
+        )
+        self.assertIn("curve", result["nodes"][1]["settings"]["settings"])
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "GET", "/api/agent/fan-control",
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_remote_max_speed_uses_authenticated_agent_contract(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1", "name": "Rack", "online": True,
+            "stats": {"fan": self.live_fan()},
+        }])
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(return_value={"enabled": True})
+
+        result = await instance.set_node_fan_max_speed("worker-1", True)
+
+        self.assertEqual(result, {"node_id": "worker-1", "enabled": True})
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "PATCH", "/api/agent/fan-control/max-speed",
+            json_body={"enabled": True},
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_max_speed_rejects_non_boolean_before_routing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "enabled must be a boolean"):
+            await instance.set_node_fan_max_speed("local", 1)
+
+        instance.cluster_nodes.assert_not_awaited()
 
 
 if __name__ == "__main__":

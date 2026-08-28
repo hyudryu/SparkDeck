@@ -35,6 +35,7 @@ describe('SparkDeck application shell', () => {
     }
     expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('aria-disabled', 'true')
     expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('title', 'Switch is not detected')
+    expect(screen.queryByRole('link', { name: 'Fan Control' })).not.toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: 'System overview' })).toBeInTheDocument()
   })
@@ -52,6 +53,21 @@ describe('SparkDeck application shell', () => {
 
     await waitFor(() => expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('href', '/switch'))
     expect(screen.getByRole('link', { name: 'Switch' })).not.toHaveAttribute('aria-disabled')
+  })
+
+  it('only shows Fan Control for a non-empty available FanController overview', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input).includes('/api/v1/fan-control')) {
+        return new Response(JSON.stringify({ available: true, nodes: [{ node_id: 'fan-node' }] }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Fan Control' })).toHaveAttribute('href', '/fan-control'))
   })
 
   it('shows this node name next to Dashboard in the navigation', async () => {

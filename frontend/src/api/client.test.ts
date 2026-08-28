@@ -35,6 +35,44 @@ describe('API client adapters', () => {
     await result
   })
 
+  it('keeps the timeout active while reading a JSON response body', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      json: () => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      }),
+    }) as Response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = expect(api.deployments.list()).rejects.toMatchObject({ status: 408 })
+    await vi.advanceTimersByTimeAsync(30_000)
+    await result
+  })
+
+  it('forwards caller cancellation while reading a JSON response body', async () => {
+    const caller = new AbortController()
+    let readingBody = false
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'Content-Type': 'application/json' }),
+      json: () => new Promise((_resolve, reject) => {
+        readingBody = true
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      }),
+    }) as Response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = api.nodes.list(caller.signal)
+    await vi.waitFor(() => expect(readingBody).toBe(true))
+    caller.abort()
+
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
   it('does not time out a long-running deployment launch', async () => {
     vi.useFakeTimers()
     let finishRequest: ((response: Response) => void) | undefined
@@ -73,6 +111,25 @@ describe('API client adapters', () => {
       ok: true, image: 'vllm/vllm-openai:v1', node_ids: ['local'], results: [],
     }), { status: 201, headers: { 'Content-Type': 'application/json' } }))
     await expect(result).resolves.toEqual(expect.objectContaining({ ok: true, node_ids: ['local'] }))
+  })
+
+  it('does not time out a long-running non-streaming chat completion', async () => {
+    vi.useFakeTimers()
+    let finishRequest: ((response: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => new Promise((resolve) => {
+      finishRequest = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = api.chat('slow-model', [{ role: 'user', content: 'Think carefully.' }])
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    finishRequest?.(new Response(JSON.stringify({
+      id: 'chat-1', model: 'slow-model',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Done.' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await expect(result).resolves.toEqual(expect.objectContaining({ id: 'chat-1' }))
   })
 
   it('updates a node fan override with an encoded ID and boolean body', async () => {

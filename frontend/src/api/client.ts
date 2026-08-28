@@ -37,6 +37,7 @@ import type {
   StorageTransferResult,
   RecipePreparationPlan,
   RecipePreparationResult,
+  SavedDeploymentUpdateInput,
   ModelCacheState,
   SavedConfiguration,
   SavedConfigurationDetail,
@@ -395,7 +396,12 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
-    settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    settings: {
+      ...item.settings,
+      port: item.port,
+      quantization: item.model.quantization,
+      artifact: item.settings?.artifact || item.model.artifact,
+    },
     deployment_mode: item.deployment_mode,
     required_node_count: item.required_node_count,
     node_ids: item.node_ids,
@@ -472,7 +478,7 @@ export const api = {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}`, { signal })
       return deploymentDetailFromWire(data)
     },
-    update: async (id: string, input: DeploymentUpdateInput) => {
+    update: async (id: string, input: DeploymentUpdateInput | SavedDeploymentUpdateInput) => {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}/settings`, {
         method: 'PUT',
         body: JSON.stringify(input),
@@ -491,12 +497,23 @@ export const api = {
           api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
-          node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
-          deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
+          // Saved deployments record node preferences for every managed
+          // runtime (Llama server included); launch honours or overrides them.
+          node_ids: input.managed ? input.node_ids : undefined,
+          deployment_mode: input.managed ? input.deployment_mode : undefined,
         }),
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
+    preparePreflight: (id: string, nodeIds: string[], signal?: AbortSignal) => request<RecipePreparationPlan>(
+      `/api/v1/deployments/${encodeURIComponent(id)}/prepare/preflight`,
+      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }), signal },
+    ),
+    prepare: (id: string, nodeIds: string[]) => request<RecipePreparationResult>(
+      `/api/v1/deployments/${encodeURIComponent(id)}/prepare`,
+      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
+      NO_REQUEST_TIMEOUT,
+    ),
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(

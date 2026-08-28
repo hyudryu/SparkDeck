@@ -1000,6 +1000,10 @@ async def agent_create_container(req: Request):
             sg_image=body.get("sg_image"),
             cluster_member=body.get("cluster_member"),
             hf_token=body.get("hf_token"),
+            llama_artifact=body.get("llama_artifact"),
+            llama_context_length=body.get("llama_context_length"),
+            llama_parallel_slots=body.get("llama_parallel_slots"),
+            llama_gpu_layers=body.get("llama_gpu_layers"),
         )
     except Exception as exc:
         detail = str(exc)
@@ -2040,7 +2044,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             "node_ids": selected_node_ids,
             "deployment_mode": contract["deployment_mode"],
             "recipe_id": recipe_id,
-        }, background=True)
+        }, launch=True, background=True)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
@@ -2473,6 +2477,66 @@ async def v1_create_deployment(req: Request):
         return await sparkdeck.create_deployment(await req.json())
     except (ValueError, json.JSONDecodeError) as e:
         raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# The prepare routes must be declared before the generic /{action} route so
+# FastAPI does not capture "prepare" as an action name.
+@app.post("/api/v1/deployments/{deployment_id}/prepare/preflight")
+async def v1_deployment_prepare_preflight(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    node_ids = body.get("node_ids")
+    if (
+        not isinstance(node_ids, list)
+        or not node_ids
+        or any(not isinstance(item, str) or not item.strip() for item in node_ids)
+    ):
+        raise HTTPException(400, "node_ids must contain non-empty node IDs")
+    try:
+        return await sparkdeck.deployment_preparation_preflight(
+            deployment_id, [item.strip() for item in node_ids],
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/v1/deployments/{deployment_id}/prepare")
+async def v1_deployment_prepare(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    node_ids = body.get("node_ids")
+    if (
+        not isinstance(node_ids, list)
+        or not node_ids
+        or any(not isinstance(item, str) or not item.strip() for item in node_ids)
+    ):
+        raise HTTPException(400, "node_ids must contain non-empty node IDs")
+    try:
+        return await sparkdeck.deployment_prepare(
+            deployment_id, [item.strip() for item in node_ids],
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 

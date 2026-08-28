@@ -455,10 +455,10 @@ describe('API client adapters', () => {
     }))
   })
 
-  it('keeps llama.cpp local in the UI without sending cluster target fields', async () => {
+  it('saves node preferences for llama.cpp deployments like the other runtimes', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       id: 'dep-llama', alias: 'local-gguf', runtime: 'llama.cpp', kind: 'managed',
-      model: { repository: 'models/local.gguf' }, status: 'registered', settings: {},
+      model: { repository: 'models/local.gguf' }, status: 'saved', settings: {},
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
 
@@ -468,9 +468,10 @@ describe('API client adapters', () => {
     })
 
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>
-    expect(body).not.toHaveProperty('node_ids')
-    expect(body).not.toHaveProperty('selected_nodes')
-    expect(body).not.toHaveProperty('deployment_mode')
+    expect(body).toEqual(expect.objectContaining({
+      node_ids: ['local'],
+      deployment_mode: 'single',
+    }))
   })
 
   it('sends selected node IDs when pulling an image', async () => {

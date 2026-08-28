@@ -51,6 +51,9 @@ _SAFE_CONFIGURATION_KEYS = {
 }
 _LOCAL_ROUTING_KEYS = {
     "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
+    # Saved deployments relaunch from the persisted record, so their extra
+    # argv must survive persistence alongside the routing keys above.
+    "extra_args",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -939,12 +942,26 @@ class SparkDeckService:
                         "launch_phase": "queued",
                         "launch_message": "Preparing deployment launch",
                     })
-                else:
-                    deployment["status"] = "missing"
-                    deployment["last_error"] = (
-                        "Docker is unavailable" if docker_unavailable
-                        else "Managed container is missing"
-                    )
+                    continue
+                settings = deployment.get("settings") or {}
+                never_launched = (
+                    not deployment.get("container_name")
+                    and not settings.get("manager_deployment_id")
+                    and not settings.get("model_source")
+                    and deployment.get("desired_state") == "stopped"
+                )
+                if never_launched:
+                    # A saved deployment is a launch bookmark; it owns no
+                    # containers until its first explicit start.
+                    deployment["status"] = "saved"
+                    deployment["node_ids"] = list(settings.get("node_ids") or [])
+                    deployment["deployment_mode"] = settings.get("deployment_mode")
+                    continue
+                deployment["status"] = "missing"
+                deployment["last_error"] = (
+                    "Docker is unavailable" if docker_unavailable
+                    else "Managed container is missing"
+                )
         await asyncio.gather(
             *(self._probe_external_endpoint(item) for item in registered)
         )
@@ -1026,6 +1043,15 @@ class SparkDeckService:
             and isinstance(manager_deployment.get("launch_settings"), dict)
             else None
         )
+        # A saved deployment is a launch bookmark: it owns a record with the
+        # model, settings, and node preferences but no launched runtime yet.
+        saved_only = bool(
+            stored is not None
+            and stored.get("kind") == DeploymentKind.MANAGED.value
+            and not manager_id
+            and manager_deployment is None
+            and not (stored.get("settings") or {}).get("model_source")
+        )
         # Discovered containers have no saved launch settings, but their
         # parsed command is still shown read-only so the deployment page
         # reflects the flags the container actually runs with.
@@ -1049,15 +1075,24 @@ class SparkDeckService:
                 self.manager, engine, discovered_settings, extra_args,
             )
         else:
+            saved_settings = (stored or {}).get("settings") or {}
+            saved_extra_args = (
+                [str(item) for item in saved_settings.get("extra_args") or []]
+                if saved_only else []
+            )
             extra_args = self.manager._without_sensitive_cli_credentials(
-                (launch_settings or {}).get("extra_args") or []
+                (launch_settings or {}).get("extra_args") or saved_extra_args
             )
             launch_controls = (
                 self.manager._deployment_launch_controls({
                     **launch_settings,
                     "extra_args": extra_args,
                 })
-                if launch_settings is not None else {}
+                if launch_settings is not None
+                else self.manager._deployment_launch_controls({
+                    "engine": str(public.get("runtime") or "vllm"),
+                    "extra_args": extra_args,
+                }) if saved_only else {}
             )
 
         raw_status = str(
@@ -1072,6 +1107,7 @@ class SparkDeckService:
                 )
             )
         )
+        saved_only = bool(saved_only)
         editable = bool(
             stored is not None
             and manager_id
@@ -1079,7 +1115,7 @@ class SparkDeckService:
             and launch_settings is not None
             and str(public.get("runtime") or "") in {"vllm", "sglang"}
             and (raw_status == "stopped" or repairable_error)
-        )
+        ) or saved_only
         if editable:
             edit_reason = None
         elif stored is None or str(deployment_id).startswith("container:"):
@@ -1148,15 +1184,6 @@ class SparkDeckService:
         self, deployment_id: str, changes: dict[str, Any],
     ) -> dict[str, Any]:
         """Update a stopped manager-backed deployment by its public record ID."""
-        allowed = {
-            "extra_args", "launch_controls",
-            "gpu_memory_utilization", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction",
-        }
-        unknown = sorted(set(changes) - allowed)
-        if unknown:
-            raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
-
         # Listing first performs the normal manager/store reconciliation, so a
         # settings save cannot target a manager deployment ID that was replaced
         # by an earlier relaunch.
@@ -1168,9 +1195,16 @@ class SparkDeckService:
             "manager_deployment_id"
         )
         if not manager_id:
-            raise ValueError(
-                "deployment does not have editable saved launch settings"
-            )
+            return await self._update_saved_deployment(stored, changes)
+
+        allowed = {
+            "extra_args", "launch_controls",
+            "gpu_memory_utilization", "gpu_memory_gb",
+            "sg_tp_size", "sg_mem_fraction",
+        }
+        unknown = sorted(set(changes) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
 
         updated = self.manager.update_deployment_settings(manager_id, changes)
         launch_settings = updated.get("launch_settings") or {}
@@ -1199,11 +1233,95 @@ class SparkDeckService:
         )
         return await self.deployment_detail(deployment_id)
 
-    async def _prepare_public_gguf_artifact(
-        self, repository: str, artifact: str, revision: str,
-        quantization: str | None,
-    ) -> str:
-        """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
+    async def _update_saved_deployment(
+        self, stored: dict[str, Any], changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Edit a saved deployment bookmark before its first launch."""
+        allowed = {
+            "context_length", "tensor_parallel_size", "parallel_slots",
+            "gpu_layers", "quantization", "artifact", "extra_args",
+            "gpu_memory_utilization", "node_ids", "deployment_mode",
+        }
+        unknown = sorted(set(changes) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+        settings = dict(stored.get("settings") or {})
+        numeric_fields = (
+            "context_length", "tensor_parallel_size", "parallel_slots",
+            "gpu_layers", "gpu_memory_utilization",
+        )
+        for field in numeric_fields:
+            if field not in changes:
+                continue
+            value = changes.get(field)
+            if value is None or (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+            ):
+                settings[field] = value
+                continue
+            try:
+                settings[field] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field} must be a number") from exc
+        if "quantization" in changes:
+            settings["quantization"] = canonical_quantization(
+                changes.get("quantization")
+            )
+        if "artifact" in changes:
+            artifact = _optional_string(changes.get("artifact"))
+            if artifact and str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value:
+                self._validate_public_gguf_artifact(
+                    str((stored.get("model") or {}).get("repository") or ""),
+                    artifact, settings.get("quantization"),
+                )
+            settings["artifact"] = artifact
+        if "extra_args" in changes:
+            extra_args = changes.get("extra_args")
+            if not isinstance(extra_args, list) or any(
+                not isinstance(item, str) for item in extra_args
+            ):
+                raise ValueError("extra_args must be an array of strings")
+            settings["extra_args"] = extra_args
+        if "node_ids" in changes:
+            node_ids = changes.get("node_ids")
+            if node_ids is not None:
+                if (
+                    not isinstance(node_ids, list) or not node_ids
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in node_ids)
+                ):
+                    raise ValueError("node_ids must contain non-empty node IDs")
+                node_ids = list(dict.fromkeys(item.strip() for item in node_ids))
+                await self.manager.selected_cluster_nodes(node_ids)
+                if settings.get("deployment_mode") == "single" and len(node_ids) != 1:
+                    raise ValueError("single deployment requires exactly one node")
+            settings["node_ids"] = node_ids
+        if "deployment_mode" in changes:
+            mode = changes.get("deployment_mode")
+            if mode is not None and mode not in {"single", "replicated", "sharded"}:
+                raise ValueError(
+                    "deployment_mode must be single, sharded, or replicated"
+                )
+            settings["deployment_mode"] = mode
+        self.store.update_managed_routing(
+            stored["id"],
+            self._local_configuration(settings),
+            stored.get("container_name"),
+            stored.get("_base_url"),
+        )
+        model = dict(stored.get("model") or {})
+        if "quantization" in changes:
+            model["quantization"] = settings.get("quantization")
+        if "artifact" in changes:
+            model["artifact"] = settings.get("artifact")
+        if model != (stored.get("model") or {}):
+            self.store.update_deployment_model(stored["id"], model)
+        return await self.deployment_detail(stored["id"])
+
+    def _validate_public_gguf_artifact(
+        self, repository: str, artifact: str, quantization: str | None,
+    ) -> PurePosixPath:
+        """Validate one repo-relative GGUF reference without touching the cache."""
         if _public_model_id(repository) != repository:
             raise ValueError(
                 "repo-relative GGUF artifacts require a public Hugging Face repository"
@@ -1212,32 +1330,70 @@ class SparkDeckService:
         if (
             relative.is_absolute() or not relative.parts
             or any(part in {"", ".", ".."} for part in relative.parts)
-            or "\\" in artifact or relative.suffix.casefold() != ".gguf"
+            or "\\" in artifact
+            or re.match(r"^[A-Za-z]:", artifact)
+            or relative.suffix.casefold() != ".gguf"
         ):
             raise ValueError("artifact must be a safe repo-relative .gguf filename")
         inferred = quantization_from_text(artifact)
         if quantization and inferred and quantization != inferred:
             raise ValueError("artifact quantization does not match the selected quantization")
+        return relative
 
+    @staticmethod
+    def _expand_gguf_shard_files(relative: PurePosixPath) -> list[str]:
+        """Expand one shard reference into its complete ordered shard set."""
+        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name)
+        if not shard:
+            return [relative.as_posix()]
+        shard_count = int(shard.group("count"))
+        return [
+            str(relative.with_name(
+                f"{shard.group('stem')}-{index:05d}"
+                f"{shard.group('separator')}{shard_count:05d}"
+                f"{shard.group('suffix')}"
+            ))
+            for index in range(1, shard_count + 1)
+        ]
+
+    async def _resolved_model_revision(
+        self, repository: str, revision: str | None,
+    ) -> str:
+        """Resolve one public repository reference to an immutable commit SHA."""
         virtual_nas = getattr(self.manager, "virtual_nas", None)
         if virtual_nas is None:
             raise RuntimeError("model preparation is unavailable")
-        resolution = await virtual_nas.resolve_download_revision(repository, revision)
+        resolution = await virtual_nas.resolve_download_revision(
+            repository, revision or "main",
+        )
         resolved_revision = str(resolution.get("resolved_revision") or "")
         if not re.fullmatch(r"[0-9a-f]{40}", resolved_revision):
             raise RuntimeError("model preparation did not resolve an immutable revision")
-        selected_files = [relative.as_posix()]
-        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name)
-        if shard:
-            shard_count = int(shard.group("count"))
-            selected_files = [
-                str(relative.with_name(
-                    f"{shard.group('stem')}-{index:05d}"
-                    f"{shard.group('separator')}{shard_count:05d}"
-                    f"{shard.group('suffix')}"
-                ))
-                for index in range(1, shard_count + 1)
-            ]
+        return resolved_revision
+
+    def _hub_relative_llama_artifact(
+        self, repository: str, artifact: str, resolved_revision: str,
+    ) -> str:
+        """Return the cache-relative snapshot path for one GGUF artifact.
+
+        Llama.cpp cluster members resolve this reference against each node's
+        own Hugging Face cache, so one persisted value addresses every node.
+        """
+        relative = self._validate_public_gguf_artifact(repository, artifact, None)
+        encoded = "models--" + repository.replace("/", "--")
+        first_file = self._expand_gguf_shard_files(relative)[0]
+        return f"{encoded}/snapshots/{resolved_revision}/{first_file}"
+
+    async def _prepare_public_gguf_artifact(
+        self, repository: str, artifact: str, revision: str,
+        quantization: str | None,
+    ) -> str:
+        """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
+        relative = self._validate_public_gguf_artifact(repository, artifact, quantization)
+
+        resolved_revision = await self._resolved_model_revision(repository, revision)
+        selected_files = self._expand_gguf_shard_files(relative)
+        virtual_nas = self.manager.virtual_nas
         await virtual_nas.download_model_files_checked(
             repository, resolved_revision, selected_files,
             requested_revision=revision,
@@ -1266,7 +1422,7 @@ class SparkDeckService:
             candidate,
             "model preparation completed without the selected GGUF artifact",
         )
-        if shard:
+        if _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name):
             for selected_file in selected_files:
                 selected_relative = PurePosixPath(selected_file)
                 logical_shard = snapshot_root.joinpath(*selected_relative.parts)
@@ -1280,7 +1436,8 @@ class SparkDeckService:
         return str(candidate)
 
     async def create_deployment(
-        self, body: dict[str, Any], *, background: bool = False,
+        self, body: dict[str, Any], *, launch: bool = False,
+        background: bool = False,
     ) -> dict[str, Any]:
         model = str(body.get("model") or "").strip()
         alias = str(body.get("alias") or model).strip()
@@ -1308,6 +1465,7 @@ class SparkDeckService:
         async with self._deployment_create_lock:
             if self.store.deployment(alias):
                 raise ValueError(f"deployment alias '{alias}' is already in use")
+            artifact_is_local = False
             if (
                 runtime is RuntimeKind.LLAMA_CPP
                 and kind is DeploymentKind.MANAGED
@@ -1322,14 +1480,19 @@ class SparkDeckService:
                         raise ValueError(
                             "llama.cpp managed deployments require an existing local GGUF artifact"
                         )
+                    artifact_is_local = True
                     settings["model_source"] = "local"
                 else:
-                    artifact = await self._prepare_public_gguf_artifact(
-                        model, artifact,
-                        _optional_string(body.get("revision")) or "main",
-                        quantization,
-                    )
-                    settings["model_source"] = "public_repository"
+                    # A saved deployment only records the reference; the GGUF
+                    # is resolved (and downloaded if needed) at launch time.
+                    self._validate_public_gguf_artifact(model, artifact, quantization)
+                    if launch:
+                        artifact = await self._prepare_public_gguf_artifact(
+                            model, artifact,
+                            _optional_string(body.get("revision")) or "main",
+                            quantization,
+                        )
+                        settings["model_source"] = "public_repository"
                 settings["artifact"] = artifact
                 if quantization:
                     settings["quantization"] = quantization
@@ -1354,9 +1517,12 @@ class SparkDeckService:
                 return (self.store.deployment(deployment_id) or deployment.to_dict())
 
             if requested_node_ids is not None:
-                if runtime is RuntimeKind.LLAMA_CPP:
+                if runtime is RuntimeKind.LLAMA_CPP and (
+                    artifact_is_local
+                    or (not artifact and _public_model_id(model) == "local-model")
+                ):
                     raise ValueError(
-                        "explicit node selection currently supports managed vLLM and SGLang deployments"
+                        "local GGUF artifacts can only be saved for the controller node"
                     )
                 selected = await self.manager.selected_cluster_nodes(requested_node_ids)
                 mode = deployment_mode or (
@@ -1364,55 +1530,36 @@ class SparkDeckService:
                 )
                 if mode == "single" and len(requested_node_ids) != 1:
                     raise ValueError("single deployment requires exactly one node")
-                extra_args = list(settings.get("extra_args") or [])
-                if runtime is RuntimeKind.VLLM:
-                    for key, flag in (
-                        ("tensor_parallel_size", "--tensor-parallel-size"),
-                        ("pipeline_parallel_size", "--pipeline-parallel-size"),
-                        ("quantization", "--quantization"),
-                        ("dtype", "--dtype"),
-                    ):
-                        if settings.get(key) is not None:
-                            extra_args += [flag, str(settings[key])]
-                    context_length = settings.get("max_model_len") or settings.get("context_length")
-                    if context_length is not None:
-                        extra_args += ["--max-model-len", str(context_length)]
-                if identity.revision:
-                    extra_args += ["--revision", identity.revision]
-                launch_body = {
-                    **settings,
-                    "model": model,
-                    "deployment_name": alias,
-                    "engine": runtime.value,
-                    "deployment_mode": mode,
-                    "node_ids": requested_node_ids,
-                    "extra_args": extra_args,
-                    "managed_by": "sparkdeck",
-                    "sparkdeck_record_id": deployment_id,
-                    "recipe_id": body.get("recipe_id"),
-                }
-                if runtime is RuntimeKind.SGLANG:
-                    launch_body.update({
-                        "sg_tp_size": settings.get("tensor_parallel_size"),
-                        "sg_context_length": settings.get("context_length"),
-                        "sg_max_running_requests": settings.get("max_running_requests"),
-                        "sg_mem_fraction": settings.get("mem_fraction_static"),
+                if mode == "sharded" and runtime is RuntimeKind.LLAMA_CPP:
+                    raise ValueError(
+                        "llama.cpp deployments support single and replicated layouts, not sharded"
+                    )
+                if not launch:
+                    # A saved deployment is a launch bookmark: persist the
+                    # runtime, model, settings, and node preferences without
+                    # mutating Docker or the cluster. Launch happens through
+                    # the explicit start action.
+                    deployment.desired_state = "stopped"
+                    deployment.settings = self._local_configuration({
+                        **settings,
+                        "deployment_mode": mode,
+                        "node_ids": requested_node_ids,
                     })
-                    if (
-                        settings.get("data_parallel_size") is not None
-                        and not any(
-                            str(arg) == "--dp-size"
-                            or str(arg).startswith("--dp-size=")
-                            for arg in launch_body["extra_args"]
-                        )
-                    ):
-                        launch_body["extra_args"] += [
-                            "--dp-size", str(settings["data_parallel_size"]),
-                        ]
-                    if settings.get("quantization") is not None:
-                        launch_body["extra_args"] += [
-                            "--quantization", str(settings["quantization"]),
-                        ]
+                    self.store.add_deployment(deployment, None, None)
+                    result = self.store.deployment(deployment_id) or deployment.to_dict()
+                    result.update({
+                        "status": "saved",
+                        "node_ids": requested_node_ids,
+                        "deployment_mode": mode,
+                        "selected_nodes": [
+                            self.manager.public_target_node(node) for node in selected
+                        ],
+                    })
+                    return result
+                launch_body = self._cluster_launch_body(
+                    runtime, model, alias, deployment_id, identity, settings,
+                    requested_node_ids, mode, llama_artifact=None,
+                )
                 if background:
                     return await self._begin_cluster_deployment(
                         deployment, settings, mode, requested_node_ids,
@@ -1458,6 +1605,16 @@ class SparkDeckService:
                         self.manager.public_target_node(node) for node in selected
                     ],
                 })
+                return result
+
+            if not launch:
+                # Controller-local bookmark without saved node preferences.
+                # Everything about the record stays editable until the start
+                # action launches it.
+                deployment.desired_state = "stopped"
+                self.store.add_deployment(deployment, None, None)
+                result = self.store.deployment(deployment_id) or deployment.to_dict()
+                result.update({"status": "saved"})
                 return result
 
             adapter = self.registry.get(runtime)
@@ -1517,6 +1674,253 @@ class SparkDeckService:
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment_id, None)
+
+    def _cluster_launch_body(
+        self, runtime: RuntimeKind, model: str, alias: str, deployment_id: str,
+        identity: ModelIdentity, settings: dict[str, Any],
+        node_ids: list[str], mode: str, llama_artifact: str | None,
+        recipe_id: Any = None,
+    ) -> dict[str, Any]:
+        """Translate saved launch settings into a Manager cluster launch."""
+        extra_args = list(settings.get("extra_args") or [])
+        if runtime is RuntimeKind.VLLM:
+            for key, flag in (
+                ("tensor_parallel_size", "--tensor-parallel-size"),
+                ("pipeline_parallel_size", "--pipeline-parallel-size"),
+                ("quantization", "--quantization"),
+                ("dtype", "--dtype"),
+            ):
+                if settings.get(key) is not None:
+                    extra_args += [flag, str(settings[key])]
+            context_length = settings.get("max_model_len") or settings.get("context_length")
+            if context_length is not None:
+                extra_args += ["--max-model-len", str(context_length)]
+        if identity.revision and runtime is not RuntimeKind.LLAMA_CPP:
+            # Llama.cpp pins its revision inside the cache-relative artifact
+            # reference; an unknown --revision flag would break llama-server.
+            extra_args += ["--revision", identity.revision]
+        launch_body = {
+            **settings,
+            "model": model,
+            "deployment_name": alias,
+            "engine": runtime.value,
+            "deployment_mode": mode,
+            "node_ids": node_ids,
+            "extra_args": extra_args,
+            "managed_by": "sparkdeck",
+            "sparkdeck_record_id": deployment_id,
+            "recipe_id": recipe_id,
+        }
+        if runtime is RuntimeKind.SGLANG:
+            launch_body.update({
+                "sg_tp_size": settings.get("tensor_parallel_size"),
+                "sg_context_length": settings.get("context_length"),
+                "sg_max_running_requests": settings.get("max_running_requests"),
+                "sg_mem_fraction": settings.get("mem_fraction_static"),
+            })
+            if (
+                settings.get("data_parallel_size") is not None
+                and not any(
+                    str(arg) == "--dp-size"
+                    or str(arg).startswith("--dp-size=")
+                    for arg in launch_body["extra_args"]
+                )
+            ):
+                launch_body["extra_args"] += [
+                    "--dp-size", str(settings["data_parallel_size"]),
+                ]
+            if settings.get("quantization") is not None:
+                launch_body["extra_args"] += [
+                    "--quantization", str(settings["quantization"]),
+                ]
+        if runtime is RuntimeKind.LLAMA_CPP:
+            launch_body.update({
+                "llama_artifact": llama_artifact,
+                "llama_context_length": settings.get("context_length"),
+                "llama_parallel_slots": settings.get("parallel_slots"),
+                "llama_gpu_layers": settings.get("gpu_layers"),
+            })
+        return launch_body
+
+    def _saved_deployment_controller_only(
+        self, runtime: RuntimeKind, model: str, artifact: str | None,
+    ) -> bool:
+        """True when the saved model can only ever run on the controller."""
+        if runtime is not RuntimeKind.LLAMA_CPP:
+            return False
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if resolve_local and resolve_local(model):
+            return True
+        if artifact and not PurePosixPath(artifact).is_absolute():
+            return False
+        return bool(artifact) or _public_model_id(model) == "local-model"
+
+    async def _launch_saved_deployment(
+        self, deployment: dict[str, Any], node_ids: list[str] | None,
+    ) -> dict[str, Any]:
+        """Launch a saved deployment bookmark for the first time."""
+        model = str((deployment.get("model") or {}).get("repository") or "")
+        stored_model = deployment.get("model") or {}
+        record = Deployment(
+            id=deployment["id"],
+            alias=deployment["alias"],
+            runtime=RuntimeKind(str(deployment["runtime"])),
+            kind=DeploymentKind(str(deployment["kind"])),
+            model=ModelIdentity(
+                repository=model,
+                revision=_optional_string(stored_model.get("revision")),
+                artifact=_optional_string(stored_model.get("artifact")),
+                quantization=_optional_string(stored_model.get("quantization")),
+            ),
+            settings=dict(deployment.get("settings") or {}),
+        )
+        settings = record.settings
+        artifact = str(record.model.artifact or settings.get("artifact") or "")
+        if self._saved_deployment_controller_only(record.runtime, model, artifact):
+            if any(item != "local" for item in node_ids or []):
+                raise ValueError(
+                    "controller-local model artifacts can only run on the controller node"
+                )
+            return await self._launch_controller_llama_deployment(
+                record, settings, model, artifact,
+            )
+        if (
+            record.runtime is RuntimeKind.LLAMA_CPP
+            and not node_ids and not settings.get("node_ids")
+        ):
+            # No node preferences were saved: keep the llama.cpp bookmark
+            # controller-local, matching deployments saved before node
+            # preferences existed. Its GGUF is prepared on the controller.
+            return await self._launch_controller_llama_deployment(
+                record, settings, model, artifact,
+            )
+        return await self._launch_cluster_record(
+            record, settings, model, artifact, node_ids,
+        )
+
+    async def _launch_controller_llama_deployment(
+        self, record: Deployment, settings: dict[str, Any],
+        model: str, artifact: str,
+    ) -> dict[str, Any]:
+        """Run a controller-local llama.cpp bookmark as a standalone container."""
+        deployment_id = record.id
+        adapter = self.registry.get(record.runtime)
+        launch_settings = dict(settings)
+        if artifact and not PurePosixPath(artifact).is_absolute():
+            # Resolve (downloading if needed) the public GGUF on the controller.
+            launch_settings["artifact"] = await self._prepare_public_gguf_artifact(
+                model, artifact,
+                record.model.revision or "main",
+                record.model.quantization,
+            )
+        elif not artifact:
+            raise ValueError("llama.cpp deployments require a GGUF artifact")
+        cleanup_name = safe_container_name(record.alias, deployment_id)
+        record.container_name = cleanup_name
+        launch_complete = asyncio.Event()
+        self._deployment_launches[deployment_id] = launch_complete
+        try:
+            launched = await launch_managed_container(
+                self.manager, adapter, deployment_id, record.alias, model,
+                {
+                    **launch_settings,
+                    "artifact": launch_settings.get("artifact") or artifact,
+                    "revision": record.model.revision,
+                },
+            )
+            record.container_name = launched.get("name")
+            record.settings = self._local_configuration({
+                **settings,
+                "artifact": launch_settings.get("artifact") or artifact,
+                "model_source": (
+                    settings.get("model_source")
+                    or launched.get("model_source")
+                    or "unknown"
+                ),
+            })
+            port = launched.get("port")
+            if not record.container_name or not port:
+                raise RuntimeError(
+                    "runtime launched without a discoverable container endpoint"
+                )
+            self.store.update_managed_routing(
+                record.id, record.settings, record.container_name,
+                f"http://127.0.0.1:{int(port)}",
+            )
+        except Exception:
+            try:
+                await self.manager.remove_container(cleanup_name)
+            except Exception as cleanup_error:
+                if not _is_missing_container_error(cleanup_error):
+                    raise
+            raise
+        finally:
+            launch_complete.set()
+            self._deployment_launches.pop(deployment_id, None)
+        self.store.update_desired_state(deployment_id, "running")
+        current = self.store.deployment(deployment_id) or record.to_dict()
+        current.update({
+            "status": launched.get("status", "running"), "port": int(port),
+        })
+        return current
+
+    async def _launch_cluster_record(
+        self, record: Deployment, settings: dict[str, Any],
+        model: str, artifact: str, node_ids: list[str] | None,
+    ) -> dict[str, Any]:
+        """Launch a saved deployment as a Manager cluster on the given nodes."""
+        saved_nodes = [
+            str(item).strip() for item in settings.get("node_ids") or []
+            if str(item).strip()
+        ]
+        selected_ids = list(node_ids) if node_ids else (saved_nodes or ["local"])
+        selected_ids = list(dict.fromkeys(selected_ids))
+        selected = await self.manager.selected_cluster_nodes(selected_ids)
+        mode = str(settings.get("deployment_mode") or "").strip() or (
+            "replicated" if len(selected_ids) > 1 else "single"
+        )
+        if mode == "single" and len(selected_ids) != 1:
+            raise ValueError("single deployment requires exactly one node")
+        if mode == "sharded" and record.runtime is RuntimeKind.LLAMA_CPP:
+            raise ValueError(
+                "llama.cpp deployments support single and replicated layouts, not sharded"
+            )
+        deployment_dict = record.to_dict()
+        deployment_dict["settings"] = settings
+        await self._validate_start_selection(deployment_dict, selected_ids, None)
+        llama_artifact = None
+        if record.runtime is RuntimeKind.LLAMA_CPP:
+            if not artifact:
+                raise ValueError("llama.cpp deployments require a GGUF artifact")
+            resolved_revision = await self._resolved_model_revision(
+                model, record.model.revision or "main",
+            )
+            llama_artifact = self._hub_relative_llama_artifact(
+                model, artifact, resolved_revision,
+            )
+        launch_body = self._cluster_launch_body(
+            record.runtime, model, record.alias, record.id, record.model,
+            settings, selected_ids, mode, llama_artifact=llama_artifact,
+        )
+        try:
+            cluster = await self.manager.create_deployment(launch_body)
+        except Exception:
+            await self._recover_failed_cluster_launch(
+                record, settings, mode, selected_ids,
+            )
+            raise
+        self._link_cluster_record(record, settings, mode, selected_ids, cluster)
+        self.store.update_desired_state(record.id, "running")
+        current = self.store.deployment(record.id) or record.to_dict()
+        current.update({
+            "status": _deployment_status(cluster.get("status")),
+            "port": cluster.get("api_port"),
+            "node_ids": selected_ids,
+            "selected_nodes": [
+                self.manager.public_target_node(node) for node in selected
+            ],
+        })
+        return current
 
     def _link_cluster_record(
         self, deployment: Deployment, settings: dict[str, Any], mode: str,
@@ -1653,9 +2057,18 @@ class SparkDeckService:
                 None,
             )
         except Exception:
-            # Preserve the original launch error. Manager still retains its
-            # diagnostic record if even local SQLite adoption fails.
-            pass
+            # A saved deployment already owns its SQLite row; adopt the failed
+            # Manager record into it so the diagnostic stays reachable.
+            try:
+                self.store.update_managed_routing(
+                    deployment.id, deployment.settings,
+                    deployment.container_name,
+                    f"http://127.0.0.1:{int(port)}" if port else None,
+                )
+            except Exception:
+                # Preserve the original launch error. Manager still retains
+                # its diagnostic record if even local SQLite adoption fails.
+                pass
 
     def _persisted_revision(self, launch_settings: Any) -> str | None:
         """Revision pinned in the persisted launch args, if any."""
@@ -1746,11 +2159,17 @@ class SparkDeckService:
         repository = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         is_local_path = bool(repository and resolve_local and resolve_local(repository))
-        # llama.cpp restarts an existing controller-owned GGUF container. Its
-        # repository field may be a file path, which Manager's directory-only
-        # HF path resolver intentionally does not recognize.
+        # llama.cpp GGUFs that live in a node's Hugging Face cache run on any
+        # prepared node; only artifacts at absolute controller-local paths are
+        # pinned to the controller.
+        artifact = str(
+            (deployment.get("model") or {}).get("artifact")
+            or (deployment.get("settings") or {}).get("artifact")
+            or ""
+        )
         controller_artifact = (
             deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
+            and (not artifact or PurePosixPath(artifact).is_absolute())
         )
         if (is_local_path or controller_artifact) and any(
             item != "local" for item in node_ids
@@ -1913,6 +2332,14 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
+        if (
+            action == "start" and discovered is None
+            and not manager_id and not owner and not container
+        ):
+            # A saved deployment (launch bookmark) has never been launched:
+            # the start action performs the first launch using the recorded
+            # runtime, model, settings, and node preferences.
+            return await self._launch_saved_deployment(deployment, node_ids)
         relaunch_mode: str | None = None
         if additional_node_ids and action == "start":
             # "Launch on additional nodes" grows the running node set instead
@@ -2045,6 +2472,47 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    def _preparable_deployment_model(
+        self, deployment_id: str,
+    ) -> tuple[dict[str, Any], str, str]:
+        """Resolve one managed deployment to its (record, model, revision)."""
+        deployment = self.store.deployment(deployment_id, include_private=True)
+        if deployment is None:
+            raise LookupError("deployment not found")
+        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+            raise ValueError("external endpoints do not use cached model weights")
+        model = str((deployment.get("model") or {}).get("repository") or "")
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if resolve_local and resolve_local(model):
+            raise ValueError(
+                "local model paths are not distributed through Virtual NAS"
+            )
+        if not model:
+            raise ValueError("deployment does not reference a Hugging Face model")
+        revision = (
+            _optional_string((deployment.get("model") or {}).get("revision"))
+            or "main"
+        )
+        return deployment, model, revision
+
+    async def deployment_preparation_preflight(
+        self, deployment_id: str, node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Plan per-node weight preparation for a saved deployment."""
+        _, model, revision = self._preparable_deployment_model(deployment_id)
+        return await self.manager.recipe_model_preparation_preflight(
+            model, revision, node_ids,
+        )
+
+    async def deployment_prepare(
+        self, deployment_id: str, node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Queue Virtual NAS weight preparation for a saved deployment."""
+        _, model, revision = self._preparable_deployment_model(deployment_id)
+        return await self.manager.queue_recipe_model_preparation(
+            model, revision, node_ids,
+        )
 
     async def deployment_logs(self, deployment_id: str, tail: Any = 300) -> dict[str, Any]:
         """Return recent container logs for a deployment, all ranks included."""

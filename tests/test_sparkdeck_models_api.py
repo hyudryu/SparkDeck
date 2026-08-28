@@ -348,5 +348,122 @@ class RecipeLaunchSettingsTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    def _stub_discovered(self, card, container):
+        return (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck,
+                "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+        )
+
+    async def test_discovered_vllm_detail_surfaces_container_flags(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {
+            "name": "vllm-dspark", "image": "example/dspark:latest",
+            "load_settings": {
+                "engine": "vllm", "editable": True,
+                "extra_args": [
+                    "--tensor-parallel-size", "2",
+                    "--speculative-config",
+                    '{"method":"mtp","num_speculative_tokens":4}',
+                    "--enable-prefix-caching",
+                ],
+                "context_window": 65536, "max_concurrency": 8,
+                "kv_cache_dtype": "fp8", "thinking_mode": "default",
+                "gpu_memory_utilization": 0.85, "tensor_parallel_size": 2,
+            },
+        }
+        patches = self._stub_discovered(card, container)
+        with patches[0], patches[1]:
+            response = await self.client.get("/api/v1/deployments/container:vllm-dspark")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["editable"])
+        self.assertIn("read-only", body["edit_reason"])
+        self.assertEqual(body["launch_controls"]["context_window"], 65536)
+        self.assertEqual(body["launch_controls"]["max_concurrency"], 8)
+        self.assertEqual(body["launch_controls"]["kv_cache_dtype"], "fp8")
+        self.assertEqual(
+            body["launch_controls"]["dspark_num_speculative_tokens"], 4,
+        )
+        self.assertEqual(body["gpu_memory_utilization"], 0.85)
+        self.assertIsNone(body["sg_mem_fraction"])
+        self.assertEqual(body["image"], "example/dspark:latest")
+        self.assertIn("--enable-prefix-caching", body["extra_args"])
+        self.assertIn("--tensor-parallel-size", body["extra_args"])
+        self.assertNotIn("--max-model-len", body["extra_args"])
+
+    async def test_discovered_sglang_detail_maps_sglang_scalars(self):
+        card = {
+            "id": "container:qwen3.8-27b-sglang", "alias": "qwen",
+            "runtime": "sglang", "kind": "external",
+            "model": {"repository": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "qwen3.8-27b-sglang", "image": "lmsysorg/sglang:latest",
+            "load_settings": {
+                "engine": "sglang", "editable": True,
+                "extra_args": ["--enable-metrics"],
+                "context_window": 262144, "max_concurrency": 10,
+                "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
+                "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1,
+            },
+        }
+        patches = self._stub_discovered(card, container)
+        with patches[0], patches[1]:
+            response = await self.client.get(
+                "/api/v1/deployments/container:qwen3.8-27b-sglang",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["launch_controls"]["context_window"], 262144)
+        self.assertEqual(body["launch_controls"]["max_concurrency"], 10)
+        self.assertEqual(body["launch_controls"]["kv_cache_dtype"], "fp8_e4m3")
+        self.assertEqual(body["sg_mem_fraction"], 0.9)
+        self.assertEqual(body["sg_tp_size"], 1)
+        self.assertIsNone(body["gpu_memory_utilization"])
+        self.assertEqual(body["extra_args"], ["--enable-metrics"])
+
+    async def test_discovered_detail_falls_back_when_container_is_gone(self):
+        card = {
+            "id": "container:vanished", "alias": "vanished", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        patches = (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck,
+                "_resolve_discovered_container",
+                AsyncMock(side_effect=LookupError("managed container not found")),
+            ),
+        )
+        with patches[0], patches[1]:
+            response = await self.client.get("/api/v1/deployments/container:vanished")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["extra_args"], [])
+        self.assertEqual(body["launch_controls"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

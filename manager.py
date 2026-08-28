@@ -2698,6 +2698,33 @@ class Manager:
             None,
         )
 
+    def _container_deployment(self, container: dict) -> dict | None:
+        """Return the durable deployment that owns a container, if any."""
+        deployment_id = container.get("deployment_id")
+        if deployment_id:
+            deployment = self._deployment(str(deployment_id))
+            if deployment:
+                return deployment
+        container_name = container.get("name")
+        if not container_name:
+            return None
+        return next(
+            (
+                deployment
+                for deployment in getattr(self, "deployments", [])
+                if any(
+                    isinstance(member, dict)
+                    and member.get("container_name") == container_name
+                    for member in (deployment.get("members") or [])
+                )
+            ),
+            None,
+        )
+
+    def _container_is_durably_stopped(self, container: dict) -> bool:
+        deployment = self._container_deployment(container)
+        return bool(deployment and deployment.get("desired_state") == "stopped")
+
     @staticmethod
     def _pricing_value(value: Any, field: str) -> float | None:
         if value in (None, ""):
@@ -3103,7 +3130,7 @@ class Manager:
             value = values[index]
             key = value.split("=", 1)[0].lower().replace("_", "-")
             name = key.removeprefix("--")
-            sensitive = (
+            sensitive = value.startswith("--") and (
                 key in {item.replace("_", "-") for item in SENSITIVE_CREDENTIAL_CLI_OPTIONS}
                 or name.endswith("-token")
                 or name.endswith("-password")
@@ -11216,6 +11243,8 @@ class Manager:
                     "deployment is stopped; start it before sending inference requests"
                 )
         containers = await self.list_containers()
+        stopped_match = False
+        runnable_match = False
         # Look for a running container with this model
         for c in containers:
             if container_name and c.get("name") != container_name:
@@ -11225,11 +11254,21 @@ class Manager:
                 and c.get("deployment_id") != deployment_id
             ):
                 continue
-            if model in self._container_model_ids(c) and c["status"] == "running":
+            if model not in self._container_model_ids(c):
+                continue
+            if self._container_is_durably_stopped(c):
+                stopped_match = True
+                continue
+            runnable_match = True
+            if c["status"] == "running":
                 ready = await self._check_ready(c)
                 if ready:
                     self._mark_active(c["name"])
                     return c
+        if stopped_match and not runnable_match:
+            raise LookupError(
+                "deployment is stopped; start it before sending inference requests"
+            )
         # Try ensure_loaded to start/swap the container
         try:
             return await self.ensure_loaded(
@@ -11261,6 +11300,7 @@ class Manager:
             if (
                 model in self._container_model_ids(container)
                 and container.get("status") == "running"
+                and not self._container_is_durably_stopped(container)
             ):
                 return bool(await self._check_ready(container))
         return False
@@ -12564,6 +12604,8 @@ class Manager:
                 ):
                     continue
                 if not c.get("managed") or model not in self._container_model_ids(c):
+                    continue
+                if self._container_is_durably_stopped(c):
                     continue
                 # Prefer a running candidate if there are duplicates.
                 if target is None or c["status"] == "running":

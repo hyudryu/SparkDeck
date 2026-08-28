@@ -3339,6 +3339,26 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         instance.list_containers.assert_not_awaited()
         instance.ensure_loaded.assert_not_awaited()
 
+    async def test_repository_target_cannot_wake_stopped_deployment(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1", "desired_state": "stopped",
+            "members": [{"container_name": "rank-0"}],
+        }]
+        instance._capacity_redeploying_models = set()
+        instance.list_containers = mock.AsyncMock(return_value=[{
+            "name": "rank-0", "model": "example/Model", "status": "running",
+            "managed": True, "deployment_id": "deployment-1",
+        }])
+        instance._check_ready = mock.AsyncMock()
+        instance.ensure_loaded = mock.AsyncMock()
+
+        with self.assertRaisesRegex(LookupError, "deployment is stopped"):
+            await instance._resolve_vllm_target("example/Model")
+
+        instance._check_ready.assert_not_awaited()
+        instance.ensure_loaded.assert_not_awaited()
+
     async def test_inference_health_does_not_wake_stopped_container(self) -> None:
         instance = Manager.__new__(Manager)
         instance.deployments = []

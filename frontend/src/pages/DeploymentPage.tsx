@@ -12,17 +12,33 @@ function splitFlags(input: string): string[] {
   const values: string[] = []
   let value = ''
   let quote: string | undefined
-  let escaped = false
   let inWord = false
-  for (const character of input) {
-    if (escaped) { value += character; escaped = false; inWord = true; continue }
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index]
     if (quote) {
       if (character === quote) quote = undefined
-      else if (quote === '"' && character === '\\') escaped = true
+      else if (quote === '"' && character === '\\') {
+        const next = input[index + 1]
+        if (next === '\n') index += 1
+        else if (next === '$' || next === '`' || next === '"' || next === '\\') {
+          value += next
+          index += 1
+          inWord = true
+        } else {
+          value += character
+          inWord = true
+        }
+      }
       else value += character
       continue
     }
-    if (character === '\\') { escaped = true; inWord = true; continue }
+    if (character === '\\') {
+      const next = input[index + 1]
+      if (next === undefined) value += character
+      else { value += next; index += 1 }
+      inWord = true
+      continue
+    }
     if (character === '"' || character === "'") { quote = character; inWord = true; continue }
     if (/\s/.test(character)) {
       if (inWord) { values.push(value); value = ''; inWord = false }
@@ -32,7 +48,6 @@ function splitFlags(input: string): string[] {
     inWord = true
   }
   if (quote) throw new Error('Flags contain an unmatched quote')
-  if (escaped) { value += '\\'; inWord = true }
   if (inWord) values.push(value)
   return values
 }

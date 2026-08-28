@@ -1909,6 +1909,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             release.set()
             await task
+            self.assertTrue(all(
+                member["phase"]["phase"] == "starting"
+                for member in instance.deployments[0]["members"]
+            ))
 
     async def test_cluster_logs_show_progress_before_container_exists(self) -> None:
         instance = Manager.__new__(Manager)
@@ -3157,6 +3161,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
             instance.deployments = [interrupted]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
             instance._member_action = mock.AsyncMock(
                 side_effect=ValueError("cluster member not found"),
             )
@@ -3201,6 +3208,21 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "extra_args": [],
                 },
             }]
+            first_probe = asyncio.Event()
+            probes = 0
+
+            async def selected_nodes(_node_ids):
+                nonlocal probes
+                probes += 1
+                if probes == 1:
+                    first_probe.set()
+                    raise ValueError("cluster node(s) are offline: Controller")
+                return [{"id": "local", "online": True, "docker_ready": True}]
+
+            instance.selected_cluster_nodes = mock.AsyncMock(
+                side_effect=selected_nodes,
+            )
+            instance._deployment_resume_wakeup = asyncio.Event()
             instance._member_action = mock.AsyncMock(
                 side_effect=ValueError("cluster member not found"),
             )
@@ -3246,6 +3268,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             await instance.start()
             resume_task = instance.deployment_resume_task
+            await asyncio.wait_for(first_probe.wait(), 1)
+            self.assertEqual(instance.deployments[0]["status"], "recovering")
+            self.assertFalse(resume_task.done())
+            instance._deployment_resume_wakeup.set()
             await asyncio.wait_for(resumed.wait(), 1)
             await instance.stop()
 
@@ -3257,7 +3283,98 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 instance.deployments[0]["sparkdeck_record_id"], "public-1",
             )
+            self.assertEqual(probes, 2)
             instance.http.aclose.assert_awaited_once_with()
+
+    async def test_resume_retries_transient_failed_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            base_settings = {
+                "model": "org/model", "engine": "vllm",
+                "deployment_mode": "single", "node_ids": ["local"],
+                "extra_args": [],
+            }
+            instance.deployments = [{
+                "id": "old", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": dict(base_settings),
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
+            instance._member_action = mock.AsyncMock(
+                side_effect=ValueError("cluster member not found"),
+            )
+            instance._deployment_resume_wakeup = asyncio.Event()
+            first_failed = asyncio.Event()
+            attempts = 0
+
+            async def relaunch(body):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    replacement = {
+                        "id": "failed-replacement", "status": "error",
+                        "desired_state": "running", "node_ids": ["local"],
+                        "members": [{
+                            "node_id": "local", "container_name": "failed-r0",
+                            "rank": 0, "status": "error",
+                        }],
+                        "launch_settings": dict(base_settings),
+                        "automation_run_id": body["automation_run_id"],
+                    }
+                    instance.deployments.append(replacement)
+                    instance._save_deployments()
+                    first_failed.set()
+                    raise RuntimeError("Controller connection unavailable")
+                final = {"id": "final", "status": "starting"}
+                instance.deployments.append(final)
+                instance._save_deployments()
+                return final
+
+            instance.create_deployment = mock.AsyncMock(side_effect=relaunch)
+            resume = asyncio.create_task(instance._resume_interrupted_deployments())
+            await asyncio.wait_for(first_failed.wait(), 1)
+            await asyncio.sleep(0)
+            recovering = instance._deployment("failed-replacement")
+            self.assertEqual(recovering["status"], "recovering")
+            self.assertIsNone(recovering["error"])
+            instance._deployment_resume_wakeup.set()
+            await asyncio.wait_for(resume, 1)
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(
+                [item["id"] for item in instance.deployments], ["final"],
+            )
+
+    async def test_resume_keeps_terminal_validation_failure_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "invalid", "status": "recovering",
+                "desired_state": "running", "node_ids": ["missing-node"],
+                "members": [],
+                "launch_settings": {
+                    "model": "org/model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["missing-node"],
+                    "extra_args": [],
+                },
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(
+                side_effect=ValueError("unknown cluster node(s): missing-node"),
+            )
+            instance._wait_for_interrupted_launch_retry = mock.AsyncMock()
+
+            await instance._resume_interrupted_deployments()
+
+            self.assertEqual(instance.deployments[0]["status"], "error")
+            self.assertIn("unknown cluster node", instance.deployments[0]["error"])
+            instance._wait_for_interrupted_launch_retry.assert_not_awaited()
 
     async def test_relaunch_fixed_port_collision_preserves_old_rank(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

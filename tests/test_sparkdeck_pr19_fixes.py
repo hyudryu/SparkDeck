@@ -8,7 +8,7 @@ import httpx
 
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.runtimes import LlamaCppAdapter, SglangAdapter, launch_managed_container
-from sparkdeck.service import SparkDeckService
+from sparkdeck.service import SparkDeckService, _deployment_launch_progress
 
 
 # server.py constructs its process-wide Manager at import time. The HTTP route
@@ -49,6 +49,57 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result[0]["status"], "missing")
         self.assertEqual(result[0]["last_error"], "Docker is unavailable")
+
+    def test_cluster_progress_uses_least_advanced_active_member(self):
+        deployment = {
+            "status": "starting",
+            "members": [
+                {
+                    "rank": 0,
+                    "phase": {
+                        "phase": "pulling_image", "message": "Pulling image",
+                    },
+                },
+                {
+                    "rank": 1,
+                    "phase": {"phase": "queued", "message": "Waiting"},
+                },
+            ],
+        }
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_phase"], "queued",
+        )
+
+        deployment["members"] = [
+            {
+                "rank": 0,
+                "phase": {
+                    "phase": "unreachable", "message": "Node unreachable",
+                },
+            },
+            {
+                "rank": 1,
+                "phase": {
+                    "phase": "pulling_image", "message": "Pulling image",
+                },
+            },
+        ]
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_phase"],
+            "pulling_image",
+        )
+
+        deployment["members"][1]["phase"] = {
+            "phase": "ready", "message": "Ready",
+        }
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_phase"],
+            "error",
+        )
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_message"],
+            "Node unreachable",
+        )
 
     async def test_discovered_legacy_managed_container_is_actionable(self):
         self.manager.list_containers.return_value = [{

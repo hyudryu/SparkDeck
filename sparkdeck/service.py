@@ -2465,12 +2465,45 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
         member for member in (deployment.get("members") or [])
         if isinstance(member, dict)
     ]
-    # Report unfinished work before ready ranks so replicated/sharded launches
-    # do not appear complete while another node is still pulling or loading.
-    def member_order(member: dict[str, Any]) -> tuple[bool, int]:
+    # Report the least-advanced active rank. Rank order is only a tie-breaker:
+    # a queued worker must win over a rank-0 image pull, and an image pull must
+    # win over another rank that has already started loading model weights.
+    phase_order = {
+        "queued": 0,
+        "recovering": 0,
+        "preparing": 1,
+        "checking_image": 2,
+        "pulling_image": 3,
+        "creating": 4,
+        "creating_container": 4,
+        "created": 5,
+        "starting": 5,
+        "running": 5,
+        "downloading": 6,
+        "loading": 7,
+        "initializing": 8,
+        "ready": 9,
+    }
+    terminal_order = {
+        "error": 0, "dead": 1, "unreachable": 2,
+        "missing": 3, "unknown": 4,
+    }
+
+    def member_order(member: dict[str, Any]) -> tuple[int, int, int]:
         phase = member.get("phase")
-        phase_name = phase.get("phase") if isinstance(phase, dict) else phase
-        return phase_name == "ready", int(member.get("rank") or 0)
+        raw_phase = phase.get("phase") if isinstance(phase, dict) else phase
+        phase_name = str(
+            raw_phase or member.get("status") or "starting"
+        ).casefold()
+        rank = int(member.get("rank") or 0)
+        if phase_name in terminal_order:
+            # Another rank may still be actively pulling/creating/loading.
+            # Keep reporting that work until no active phase remains; only
+            # then surface terminal inventory state ahead of already-ready ranks.
+            return 1, terminal_order[phase_name], rank
+        if phase_name == "ready":
+            return 2, phase_order[phase_name], rank
+        return 0, phase_order.get(phase_name, phase_order["starting"]), rank
 
     members.sort(key=member_order)
     for member in members:
@@ -2483,8 +2516,11 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
         if not message and member.get("error"):
             message = str(member["error"])
         if phase_name or message:
+            public_phase = (
+                "error" if phase_name.casefold() in terminal_order else phase_name
+            )
             return {
-                "launch_phase": phase_name or "starting",
+                "launch_phase": public_phase or "starting",
                 "launch_message": (
                     message or phase_name.replace("_", " ").title()
                 ),

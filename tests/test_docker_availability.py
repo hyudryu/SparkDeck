@@ -212,6 +212,64 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(deployment["members"][0]["status"], "missing")
         self.assertFalse(state["docker_ready"])
 
+    async def test_state_replaces_stale_queued_phase_after_member_creation(self):
+        manager = self.manager_without_docker()
+        manager.deployments = [{
+            "id": "deployment-1", "name": "Interrupted", "model": "org/model",
+            "engine": "vllm", "mode": "replicated", "status": "starting",
+            "desired_state": "running", "node_ids": ["local", "remote-1"],
+            "members": [
+                {
+                    "node_id": "local", "node_name": "Controller", "rank": 0,
+                    "container_name": "missing-local", "status": "starting",
+                    "phase": {"phase": "queued", "message": "Stale queue phase"},
+                },
+                {
+                    "node_id": "remote-1", "node_name": "Worker", "rank": 1,
+                    "container_name": "missing-remote", "status": "starting",
+                    "phase": {"phase": "queued", "message": "Stale queue phase"},
+                },
+            ],
+            "launch_settings": {
+                "model": "org/model", "engine": "vllm",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "remote-1"], "extra_args": [],
+            },
+        }]
+        manager.list_containers = AsyncMock(return_value=[])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {
+                "id": "local", "name": "Controller", "local": True,
+                "online": True, "docker_ready": True, "containers": [],
+            },
+            {
+                "id": "remote-1", "name": "Worker", "online": False,
+                "docker_ready": False, "containers": [],
+            },
+        ])
+
+        state = await manager.get_state()
+
+        members = state["deployments"][0]["members"]
+        self.assertEqual(members[0]["status"], "missing")
+        self.assertEqual(members[0]["phase"]["phase"], "missing")
+        self.assertEqual(members[1]["status"], "unreachable")
+        self.assertEqual(members[1]["phase"]["phase"], "unreachable")
+        self.assertNotIn("queued", str(members))
+
+        manager.deployments[0]["status"] = "recovering"
+        manager.deployments[0]["status_message"] = (
+            "Waiting for selected nodes to reconnect"
+        )
+        recovering_state = await manager.get_state()
+        recovering = recovering_state["deployments"][0]
+        self.assertEqual(recovering["status"], "recovering")
+        self.assertEqual(
+            recovering["members"][1]["phase"]["phase"], "recovering",
+        )
+
     async def test_liveness_api_does_not_query_docker_or_cluster_state(self):
         transport = httpx.ASGITransport(app=server.app)
         async with httpx.AsyncClient(

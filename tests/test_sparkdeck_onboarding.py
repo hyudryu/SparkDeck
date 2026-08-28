@@ -792,6 +792,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_leave_unregisters_then_revokes_before_clearing_assignment(self):
         requests = []
         observed = {}
+        revoke_consent = AsyncMock()
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
@@ -801,7 +802,9 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         manager = FakeManager(self.root, http)
-        service = OnboardingService(manager, self.root)
+        service = OnboardingService(
+            manager, self.root, revoke_community_consent=revoke_consent,
+        )
         service.assignment.save({
             "controller_url": "http://127.0.0.1:9000",
             "forward_token": "secret",
@@ -816,6 +819,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assert_status_shape(left, "controller")
         self.assertIn("join_code", left)
         self.assertIsNone(service.assignment.load())
+        revoke_consent.assert_awaited_once_with()
         manager.adopt_controller_role.assert_called_once()
         self.assertFalse(manager.agent_credentials.accepts_token(old_token))
         self.assertNotEqual(manager.agent_credentials.data["pairing_code"], old_pairing)
@@ -832,7 +836,16 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authenticated_detach_revokes_credentials_and_makes_worker_controller(self):
         manager = FakeManager(self.root)
-        service = OnboardingService(manager, self.root)
+        consent_observation = {}
+
+        async def revoke_consent():
+            consent_observation["assignment_present"] = (
+                service.assignment.load() is not None
+            )
+
+        service = OnboardingService(
+            manager, self.root, revoke_community_consent=revoke_consent,
+        )
         service.assignment.save({
             "controller_url": "http://127.0.0.1:9000",
             "forward_token": "secret",
@@ -844,6 +857,7 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(detached, {"ok": True, "role": "controller", "revoked": True})
         self.assertIsNone(service.assignment.load())
+        self.assertEqual(consent_observation, {"assignment_present": True})
         self.assertFalse(manager.agent_credentials.accepts_token(old_token))
         manager.adopt_controller_role.assert_called_once()
         await manager.http.aclose()

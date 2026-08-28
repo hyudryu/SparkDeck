@@ -346,6 +346,8 @@ interface WireDeployment {
   model_revision?: string
   created_at?: string
   desired_state?: 'running' | 'stopped'
+  launch_phase?: string
+  launch_message?: string
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -393,6 +395,8 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
     desired_state: item.desired_state,
+    launch_phase: item.launch_phase,
+    launch_message: item.launch_message,
   }
 }
 
@@ -439,11 +443,12 @@ export const api = {
         `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 100 })}`,
         { signal },
       ),
-    model: (id: string, signal?: AbortSignal) =>
+    details: (id: string, signal?: AbortSignal) =>
       request<{ model: CatalogResponse['items'][number]; aggregates: BenchmarkAggregate[] }>(
         `/api/v1/catalog/models/${encodeURIComponent(id)}`,
         { signal },
       ),
+    model: (id: string, signal?: AbortSignal) => api.catalog.details(id, signal),
   },
   deployments: {
     list: async (signal?: AbortSignal) => {
@@ -730,6 +735,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
+    finishDownload: (nodeId: string, modelId: string, revision?: string) => request<StorageTransferResult>(
+      `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}/download`,
+      {
+        method: 'POST',
+        body: JSON.stringify(revision ? { revision } : {}),
+      },
+      NO_REQUEST_TIMEOUT,
+    ),
     preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',
       body: JSON.stringify({ node_ids: nodeIds }),

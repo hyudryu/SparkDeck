@@ -856,6 +856,13 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "status": "failed", "started_at": 4,
             "download_attempted_at": 4.5,
             "legacy_download_attempt_tracking": False, "created_at": 5,
+        }, {
+            "id": "older-pinned-download", "kind": "download",
+            "model_id": "org/model", "target_node_id": "worker-a",
+            "requested_revision": "older", "revision": RESOLVED_REVISION,
+            "status": "failed", "started_at": 2,
+            "download_attempted_at": 2.5,
+            "legacy_download_attempt_tracking": False, "created_at": 3,
         }]}
         manager.virtual_nas.resolve_download_revision = AsyncMock()
         manager.virtual_nas_transfer_preflight = AsyncMock()

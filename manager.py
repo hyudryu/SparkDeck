@@ -1726,14 +1726,15 @@ class Manager:
                 key=lambda job: float(job.get("created_at") or 0),
                 reverse=True,
             )
-            for job in previous_downloads:
+            if previous_downloads:
+                job = previous_downloads[0]
                 try:
                     candidate_requested_revision = validate_revision(
                         job.get("requested_revision") or job.get("revision")
                     )
                     resolved_revision = str(job.get("revision") or "").strip()
                     if not IMMUTABLE_HF_REVISION.fullmatch(resolved_revision):
-                        continue
+                        raise ValueError("stored download revision is not immutable")
                     recovered_size = self._byte_count(job.get("bytes_total"))
                     if not recovered_size:
                         recovered_size = await self.virtual_nas.estimate_download_size(
@@ -1749,9 +1750,10 @@ class Manager:
                         ),
                     }
                     requested_revision = candidate_requested_revision
-                except ValueError:
-                    continue
-                break
+                except ValueError as exc:
+                    raise LookupError(
+                        "partial download revision cannot be recovered safely"
+                    ) from exc
             if previous_downloads and recovered_resolution is None:
                 raise LookupError(
                     "partial download revision cannot be recovered safely"

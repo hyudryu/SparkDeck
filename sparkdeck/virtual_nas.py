@@ -1306,6 +1306,14 @@ class VirtualNAS:
                 if item.get("model_id") == job["model_id"]
                 and self._has_revision(
                     item, job.get("revision") or "main",
+                    job.get("requested_revision") or job.get("revision") or "main",
+                )
+            ), None)
+            immutable_complete = next((
+                item for item in storage["models"]
+                if item.get("model_id") == job["model_id"]
+                and self._has_revision(
+                    item, job.get("revision") or "main",
                     job.get("revision") or "main",
                 )
             ), None)
@@ -1314,7 +1322,7 @@ class VirtualNAS:
                 if item.get("model_id") == job["model_id"]
             ), None)
             if job.get("require_partial_cache") and not (
-                already_complete is not None
+                immutable_complete is not None
                 or (
                     cached_model
                     and (cached_model.get("partial") or cached_model.get("has_partial_download"))
@@ -1341,10 +1349,18 @@ class VirtualNAS:
                     if item.get("model_id") == job["model_id"]
                     and self._has_revision(
                         item, job.get("revision") or "main",
+                        job.get("requested_revision") or job.get("revision") or "main",
+                    )
+                ), None)
+                immutable_complete = next((
+                    item for item in storage["models"]
+                    if item.get("model_id") == job["model_id"]
+                    and self._has_revision(
+                        item, job.get("revision") or "main",
                         job.get("revision") or "main",
                     )
                 ), None)
-                if already_complete is None:
+                if already_complete is None and immutable_complete is None:
                     if job.get("require_partial_cache") and not (
                         cached_model and (
                             cached_model.get("partial")

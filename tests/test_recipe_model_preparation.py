@@ -704,9 +704,12 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 registry.request.await_args.kwargs["json_body"],
             )
 
-    async def test_finish_job_accepts_revision_completed_while_queued(self):
+    async def test_finish_job_preserves_alias_for_revision_completed_while_queued(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = Registry()
+            registry.request.return_value = {
+                "ok": True, "size_bytes": MODEL_BYTES,
+            }
             nas = VirtualNAS(
                 Path(directory), lambda: Path(directory) / "hub", registry,
                 lambda: True,
@@ -724,14 +727,18 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 }],
                 "free_size": AMPLE_BYTES,
             })
-            nas.estimate_download_size = AsyncMock()
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
 
             await nas._run_download(job)
 
             self.assertEqual(job["status"], "completed")
             self.assertEqual(job["bytes_transferred"], MODEL_BYTES)
-            nas.estimate_download_size.assert_not_awaited()
-            registry.request.assert_not_awaited()
+            nas.estimate_download_size.assert_awaited_once()
+            registry.request.assert_awaited_once()
+            self.assertEqual(
+                registry.request.await_args.kwargs["json_body"]["requested_revision"],
+                REVISION,
+            )
 
     async def test_finish_job_rechecks_partial_cache_after_metadata_refresh(self):
         with tempfile.TemporaryDirectory() as directory:

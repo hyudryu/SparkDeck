@@ -221,6 +221,76 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 resolved,
             )
 
+    async def test_selective_download_uses_selected_capacity_and_stays_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            resolved = "b" * 40
+            selected_name = "MODEL-00001-OF-00001.GGUF"
+            selected_size = 8
+            repository_size = selected_size + 500_000_000
+            repository = hub / "models--org--model"
+            snapshot = repository / "snapshots" / resolved
+
+            def download_file_into_cache(**kwargs):
+                (repository / "blobs").mkdir(parents=True, exist_ok=True)
+                snapshot.mkdir(parents=True, exist_ok=True)
+                self.assertEqual(kwargs["filename"], selected_name)
+                (snapshot / selected_name).write_bytes(b"12345678")
+                return str(snapshot / selected_name)
+
+            def download_full_snapshot(**kwargs):
+                (snapshot / "README.md").write_text("full", encoding="utf-8")
+                return str(snapshot)
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[
+                    Mock(rfilename=selected_name, size=selected_size),
+                    Mock(rfilename="README.md", size=repository_size - selected_size),
+                ],
+            )
+            hf_hub_download = Mock(side_effect=download_file_into_cache)
+            snapshot_download = Mock(side_effect=download_full_snapshot)
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+                snapshot_download=snapshot_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            selected_required = (
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            )
+            nas.free_bytes = Mock(return_value=selected_required)
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                result = await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["size_bytes"], selected_size)
+                self.assertTrue(
+                    (snapshot / ".sparkdeck-selective.incomplete").is_file()
+                )
+                self.assertTrue(nas.inventory()[0]["partial"])
+                self.assertEqual(hf_hub_download.call_count, 1)
+                self.assertEqual(
+                    hf_hub_download.call_args.kwargs["filename"], selected_name,
+                )
+
+                full = nas.download_model("org/model", resolved)
+
+            self.assertTrue(full["ok"])
+            self.assertEqual(snapshot_download.call_count, 1)
+            self.assertEqual(hf_hub_download.call_count, 1)
+            self.assertFalse(
+                (snapshot / ".sparkdeck-selective.incomplete").exists()
+            )
+            self.assertFalse(nas.inventory()[0]["partial"])
+
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

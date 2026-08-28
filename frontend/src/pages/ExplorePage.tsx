@@ -36,7 +36,7 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
   const capacities = nodes.map(nodeMemoryBytes).filter((value): value is number => value !== undefined)
   if (capacities.length === 0) return { capacity: 0, measuredNodes: 0 }
   return {
-    capacity: Math.max(...capacities),
+    capacity: capacities.reduce((sum, capacity) => sum + capacity, 0),
     measuredNodes: capacities.length,
   }
 }
@@ -63,12 +63,14 @@ function bestCommunityEstimate(items: BenchmarkAggregate[]) {
 function ModelRow({
   model,
   capacity,
+  measuredNodes,
   expanded,
   communityEnabled,
   onToggle,
 }: {
   model: DisplayCatalogModel
   capacity: number
+  measuredNodes: number
   expanded: boolean
   communityEnabled: boolean
   onToggle: () => void
@@ -99,7 +101,7 @@ function ModelRow({
         <div>
           <span className="detail-label">Cluster fit</span>
           <strong className={`fit-${tone}`}>{fitLabel(tone)} · {model.weight_size_bytes ? formatBytes(model.weight_size_bytes) : 'Weight size unavailable'}</strong>
-          <p>{capacity > 0 ? `${formatBytes(capacity)} on the largest measured node. ` : 'Cluster memory telemetry is unavailable. '}Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights; context and KV cache can increase runtime memory.</p>
+          <p>{capacity > 0 ? `${formatBytes(capacity)} aggregate memory across ${measuredNodes} measured ${measuredNodes === 1 ? 'node' : 'nodes'}. ` : 'Cluster memory telemetry is unavailable. '}Fit assumes a sharded deployment that can divide model weights across those nodes; replicated deployments still require the full model weights on every replica, and context and KV cache can increase runtime memory.</p>
         </div>
         <div>
           <span className="detail-label">Compatibility</span>
@@ -250,7 +252,7 @@ export function ExplorePage() {
           <button className="button button-primary" type="submit">Search</button>
         </form>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? `${formatBytes(memory.capacity)} aggregate memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
           <label title={communityEnabled ? undefined : accessHint}><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={!communityEnabled || tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
@@ -275,7 +277,7 @@ export function ExplorePage() {
       )}
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span><span>Downloads</span><span>Likes</span><span /></div>
-        {displayedModels.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} expanded={expandedIds.has(model.id)} communityEnabled={communityEnabled} onToggle={() => toggleExpanded(model.id)} />)}
+        {displayedModels.map((model) => <ModelRow key={model.id} model={model} capacity={memory.capacity} measuredNodes={memory.measuredNodes} expanded={expandedIds.has(model.id)} communityEnabled={communityEnabled} onToggle={() => toggleExpanded(model.id)} />)}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}
     </div>

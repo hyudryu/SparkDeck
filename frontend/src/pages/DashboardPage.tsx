@@ -114,9 +114,10 @@ export function DashboardPage() {
   const accessHint = communityAccessHint(communityAccess.signedIn)
 
   useEffect(() => {
-    const timer = window.setInterval(resource.reload, 10_000)
-    return () => window.clearInterval(timer)
-  }, [resource.reload])
+    if (resource.loading) return
+    const timer = window.setTimeout(resource.reload, 10_000)
+    return () => window.clearTimeout(timer)
+  }, [resource.loading, resource.reload])
 
   const stats = resource.data?.stats
   const activeRequests = Object.entries(stats?.active_requests ?? {})

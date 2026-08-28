@@ -6,6 +6,18 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('updates a node fan override with an encoded ID and boolean body', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ node_id: 'node/1', enabled: true }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.fanControl.setMaxSpeed('node/1', true)).resolves.toEqual({ node_id: 'node/1', enabled: true })
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/fan-control/nodes/node%2F1/max-speed', expect.objectContaining({
+      method: 'PATCH', body: JSON.stringify({ enabled: true }),
+    }))
+  })
+
   it('restores sanitized community state from the node session', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       status: 'signed-in', email: 'user@example.com', token_invalid: false,

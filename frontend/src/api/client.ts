@@ -46,6 +46,8 @@ import type {
   RouterOSNodeOverview,
   RouterOSOverview,
   RouterOSPresence,
+  FanControlOverview,
+  FanMaxSpeedResult,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -332,6 +334,13 @@ export const api = {
     updateFanSettings: (nodeId: string, settings: Record<string, unknown>) => request<RouterOSNodeOverview>(
       `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/fan-settings`,
       { method: 'PATCH', body: JSON.stringify(settings) },
+    ),
+  },
+  fanControl: {
+    get: (signal?: AbortSignal) => request<FanControlOverview>('/api/v1/fan-control', { signal }),
+    setMaxSpeed: (nodeId: string, enabled: boolean) => request<FanMaxSpeedResult>(
+      `/api/v1/fan-control/nodes/${encodeURIComponent(nodeId)}/max-speed`,
+      { method: 'PATCH', body: JSON.stringify({ enabled }) },
     ),
   },
   onboarding: {

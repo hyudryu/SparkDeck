@@ -288,6 +288,9 @@ VLLM_MAX_CONCURRENCY_RE = re.compile(
 FAN_CLUSTER_SYNC_INTERVAL_SECONDS = 2.0
 FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS = 12.0
 FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
+FAN_STATE_MAX_AGE_SECONDS = 30.0
+FAN_STATE_MAX_FUTURE_SKEW_SECONDS = 5.0
+FAN_CONTROL_AGENT_TIMEOUT_SECONDS = 5.0
 
 # Remote controller calls must cover each worker-side RouterOS request phase
 # plus agent transport/serialization overhead. An overview has three phases
@@ -1322,6 +1325,106 @@ class Manager:
             node["id"], "PATCH", "/api/agent/routeros/fan-settings",
             json_body=body, timeout=ROUTEROS_FAN_UPDATE_TIMEOUT_SECONDS,
         )
+
+    @classmethod
+    def _sanitize_fan_settings_snapshot(
+        cls, snapshot: Any, current_mode: str,
+    ) -> dict | None:
+        if not isinstance(snapshot, dict) or snapshot.get("mode") != current_mode:
+            return None
+        raw_settings = snapshot.get("settings")
+        if not isinstance(raw_settings, dict):
+            return None
+        try:
+            settings = {
+                mode: cls._validate_fan_settings(mode, raw_settings.get(mode))
+                for mode in FAN_MODE_DEFAULTS
+            }
+        except ValueError:
+            return None
+        return {"mode": current_mode, "settings": settings}
+
+    def local_fan_control_overview(self) -> dict:
+        """Return a live local FanController state plus safe settings panes."""
+        fan = self._read_fan_state()
+        if fan is None:
+            raise FanSettingsConflict("FanController state is unavailable")
+        settings = self._sanitize_fan_settings_snapshot(
+            self.get_fan_settings(), str(fan["mode"]),
+        )
+        if settings is None:
+            raise ValueError("FanController settings are invalid")
+        return {"fan": fan, "settings": settings}
+
+    async def fan_control_cluster_overview(self) -> dict:
+        """Return only cluster nodes with a revalidated live FanController."""
+        nodes = await self.cluster_nodes()
+
+        async def load(node: dict) -> dict | None:
+            node_id = str(node.get("id") or "")
+            if not node_id or not node.get("online"):
+                return None
+            advertised_fan = self._sanitize_fan_state(
+                (node.get("stats") or {}).get("fan"),
+            )
+            if advertised_fan is None:
+                return None
+            try:
+                if node_id == LOCAL_NODE_ID:
+                    result = self.local_fan_control_overview()
+                else:
+                    result = await self.node_registry.request(
+                        node_id, "GET", "/api/agent/fan-control",
+                        timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+                    )
+            except Exception:
+                return None
+            if not isinstance(result, dict):
+                return None
+            fan = self._sanitize_fan_state(result.get("fan"))
+            if fan is None:
+                return None
+            settings = self._sanitize_fan_settings_snapshot(
+                result.get("settings"), str(fan["mode"]),
+            )
+            if settings is None:
+                return None
+            return {
+                "node_id": node_id,
+                "node_name": str(node.get("name") or node_id),
+                "local": node_id == LOCAL_NODE_ID,
+                "fan": fan,
+                "settings": settings,
+            }
+
+        results = await asyncio.gather(*(load(node) for node in nodes))
+        capable = [result for result in results if result is not None]
+        return {"available": bool(capable), "nodes": capable}
+
+    async def set_node_fan_max_speed(self, node_id: str, enabled: Any) -> dict:
+        """Set a live node's max-speed override through its local agent."""
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        normalized = str(node_id or "").strip()
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        node = available.get(normalized)
+        if node is None:
+            raise ValueError("cluster node not found")
+        if not node.get("online"):
+            raise RuntimeError(f"{node.get('name', normalized)} is offline")
+        if self._sanitize_fan_state((node.get("stats") or {}).get("fan")) is None:
+            raise FanSettingsConflict("FanController state is unavailable")
+        if normalized == LOCAL_NODE_ID:
+            result = self.set_fan_max_speed(enabled)
+        else:
+            result = await self.node_registry.request(
+                normalized, "PATCH", "/api/agent/fan-control/max-speed",
+                json_body={"enabled": enabled},
+                timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+            )
+        if not isinstance(result, dict) or result.get("enabled") is not enabled:
+            raise RuntimeError("FanController did not accept the requested mode")
+        return {"node_id": normalized, "enabled": enabled}
 
     async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
         """Durably rename a local or paired node without exposing credentials.
@@ -5101,7 +5204,7 @@ class Manager:
         """Read the external Noctua fan state published by FanController.
 
         Returns None when the daemon is not running or the state file is stale
-        (>30 s old), otherwise {rpm, duty_byte, duty_pct, temp, mode, status, ts}.
+        (>30 s old), malformed, or implausibly future-dated.
         """
         try:
             state_root = Path(
@@ -5111,27 +5214,91 @@ class Manager:
             path = state_root / "fancontroller" / "state.json"
             if not path.exists():
                 return None
-            data = json.loads(path.read_text(encoding="utf-8"))
-            ts = data.get("ts")
-            if ts is None or time.time() - float(ts) > 30:
+            current_time = time.time()
+            modified_at = path.stat().st_mtime
+            if (current_time - modified_at > FAN_STATE_MAX_AGE_SECONDS
+                    or modified_at - current_time > FAN_STATE_MAX_FUTURE_SKEW_SECONDS):
                 return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return self._sanitize_fan_state(data, now=current_time)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sanitize_fan_state(data: Any, now: float | None = None) -> dict | None:
+        """Return the small public FanController state contract when live.
+
+        A state file is only a capability signal while FanController is
+        actively refreshing it. Strict type/range checks keep a leftover or
+        unrelated JSON file from causing the Fan Control UI to appear.
+        """
+        if not isinstance(data, dict):
+            return None
+        current_time = time.time() if now is None else float(now)
+
+        def number(
+            key: str, low: float, high: float, *, integer: bool = False,
+            nullable: bool = False,
+        ) -> int | float | None:
+            value = data.get(key)
+            if nullable and value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"invalid {key}")
+            converted = float(value)
+            if not math.isfinite(converted) or converted < low or converted > high:
+                raise ValueError(f"invalid {key}")
+            if integer:
+                if not converted.is_integer():
+                    raise ValueError(f"invalid {key}")
+                return int(converted)
+            return converted
+
+        try:
+            ts = number("ts", 0, current_time + FAN_STATE_MAX_FUTURE_SKEW_SECONDS)
+            if ts is None or current_time - ts > FAN_STATE_MAX_AGE_SECONDS:
+                return None
+            mode = data.get("mode")
+            active_settings = Manager._validate_fan_settings(
+                mode, data.get("active_settings"),
+            )
+            status = data.get("status")
+            max_speed = data.get("max_speed")
+            override_active = data.get("temperature_override_active", False)
+            if not isinstance(status, str) or len(status) > 500:
+                return None
+            if not isinstance(max_speed, bool) or not isinstance(override_active, bool):
+                return None
+
+            override: dict[str, Any] = {}
+            raw_override = data.get("temperature_override", {})
+            if isinstance(raw_override, dict):
+                for key in ("source", "sensor", "node_id", "node_name"):
+                    value = raw_override.get(key)
+                    if isinstance(value, str) and len(value) <= 200:
+                        override[key] = value
+                for key in ("temperature_c", "observed_at", "expires_at"):
+                    value = raw_override.get(key)
+                    if (not isinstance(value, bool)
+                            and isinstance(value, (int, float))
+                            and math.isfinite(float(value))):
+                        override[key] = float(value)
+
             return {
-                "rpm": data.get("rpm"),
-                "duty_byte": data.get("duty_byte"),
-                "duty_pct": data.get("duty_pct"),
-                "temp": data.get("temp"),
-                "local_temp": data.get("local_temp"),
-                "temperature_override": data.get("temperature_override", {}),
-                "temperature_override_active": data.get(
-                    "temperature_override_active", False,
-                ),
-                "mode": data.get("mode"),
-                "active_settings": data.get("active_settings", {}),
-                "status": data.get("status"),
-                "max_speed": data.get("max_speed", False),
+                "rpm": number("rpm", 0, 1_000_000, integer=True),
+                "duty_byte": number("duty_byte", 0, 255, integer=True),
+                "duty_pct": number("duty_pct", 0, 100),
+                "temp": number("temp", -40, 150, nullable=True),
+                "local_temp": number("local_temp", -40, 150, nullable=True),
+                "temperature_override": override,
+                "temperature_override_active": override_active,
+                "mode": mode,
+                "active_settings": active_settings,
+                "status": status,
+                "max_speed": max_speed,
                 "ts": ts,
             }
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     def _fan_control_path(self) -> Path:
@@ -5400,10 +5567,11 @@ class Manager:
             current = self._read_fan_config()
             settings: dict[str, dict] = {}
             for mode, defaults in FAN_MODE_DEFAULTS.items():
-                settings[mode] = {
+                pane = {
                     key: current.get(key, default)
                     for key, default in defaults.items()
                 }
+                settings[mode] = self._validate_fan_settings(mode, pane)
             return {"mode": state.get("mode"), "settings": settings}
 
     @staticmethod
@@ -5537,14 +5705,15 @@ class Manager:
 
     def set_fan_max_speed(self, enabled: bool) -> dict:
         """Write/clear max speed without discarding cluster temperature."""
-        try:
-            if enabled:
-                self._update_fan_control({"max_speed": True})
-            else:
-                self._update_fan_control(remove=("max_speed",))
-            return {"enabled": enabled}
-        except Exception as e:
-            return {"error": str(e)}
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        if self._read_fan_state() is None:
+            raise FanSettingsConflict("FanController state is unavailable")
+        if enabled:
+            self._update_fan_control({"max_speed": True})
+        else:
+            self._update_fan_control(remove=("max_speed",))
+        return {"enabled": enabled}
 
     # ---------- settings ----------
     def _load_settings(self) -> dict:

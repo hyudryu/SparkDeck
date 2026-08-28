@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/switch', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
+const routes = ['/', '/dashboard', '/explore', '/models', '/cluster', '/switch', '/fan-control', '/chat', '/compare', '/benchmarks', '/usage', '/images', '/storage', '/settings', '/logs']
 const benchmarkCurves = [
   { context: 4096, prompt: [5980, 6120, 5100, 4950], generation: [95, 155, 168, 140] },
   { context: 8192, prompt: [5600, 5850, 5300, 5050], generation: [100, 162, 148, 110] },
@@ -15,7 +15,15 @@ test.beforeEach(async ({ page }) => {
   await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
     const path = new URL(route.request().url()).pathname
     let body: unknown = {}
-    if (path.endsWith('/routeros/presence')) body = { detected: false, nodes: [{ node_id: 'local', node_name: 'This device', detected: false, configured: false, connected: false }] }
+    if (path.endsWith('/fan-control')) body = {
+      available: true,
+      nodes: [{
+        node_id: 'local', node_name: 'This device', local: true,
+        fan: { rpm: 4120, duty_byte: 128, duty_pct: 50, temp: 61, local_temp: 58, mode: 'curve', active_settings: { curve_points: [[30, 20], [55, 50], [80, 100]], curve_min_temp: 30, curve_max_temp: 80, min_floor_pct: 20 }, status: 'running', max_speed: false, ts: 1787860800 },
+        settings: { mode: 'curve', settings: { curve: { curve_points: [[30, 20], [55, 50], [80, 100]], curve_min_temp: 30, curve_max_temp: 80, min_floor_pct: 20 }, pid: { setpoint: 60, kp: 2, ki: .2, kd: .1, min_floor_pct: 20 }, hysteresis: { hyst_on_temp: 65, hyst_off_temp: 50 }, manual: { manual_duty_pct: 40 } } },
+      }],
+    }
+    else if (path.endsWith('/routeros/presence')) body = { detected: false, nodes: [{ node_id: 'local', node_name: 'This device', detected: false, configured: false, connected: false }] }
     else if (path.endsWith('/routeros')) body = { detected: false, nodes: [{ node_id: 'local', node_name: 'This device', detected: false, configured: false, connected: false, discovery: [], health: [], interfaces: [] }] }
     else if (path.includes('/catalog/models')) body = { items: [], total: 0, next_cursor: null }
     else if (path === '/api/token-stats') body = {
@@ -88,6 +96,17 @@ test('keeps every primary route within the viewport', async ({ page }) => {
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     expect(overflow, `${route} has horizontal overflow`).toBeLessThanOrEqual(1)
   }
+})
+
+test('renders FanController telemetry and a touch-friendly override', async ({ page }) => {
+  await page.goto('/fan-control')
+  await expect(page.getByRole('heading', { name: 'Fan Control' })).toBeVisible()
+  await expect(page.getByRole('img', { name: 'Fan curve for This device' })).toBeVisible()
+  const override = page.getByRole('switch', { name: 'Fan speed override' })
+  await expect(override).not.toBeChecked()
+  const toggle = override.locator('xpath=..')
+  const box = await toggle.boundingBox()
+  expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
 })
 
 test('renders lifetime and analysis usage without horizontal overflow', async ({ page }) => {

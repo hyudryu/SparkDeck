@@ -569,6 +569,35 @@ async def agent_stats(req: Request):
     return await manager.get_stats()
 
 
+@app.get("/api/agent/fan-control")
+async def agent_fan_control(req: Request):
+    _require_agent(req)
+    try:
+        return manager.local_fan_control_overview()
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/api/agent/fan-control/max-speed")
+async def agent_set_fan_max_speed(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"enabled"}:
+            raise ValueError("request body must contain only enabled")
+        if not isinstance(body["enabled"], bool):
+            raise ValueError("enabled must be a boolean")
+        return manager.set_fan_max_speed(body["enabled"])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not update FanController: {exc}") from exc
+
+
 @app.get("/api/agent/routeros")
 async def agent_routeros(req: Request):
     _require_agent(req)
@@ -1196,8 +1225,19 @@ async def get_fan_max_speed():
 
 @app.post("/api/fan/max-speed")
 async def set_fan_max_speed(req: Request):
-    body = await req.json()
-    return manager.set_fan_max_speed(bool(body.get("enabled", False)))
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"enabled"}:
+            raise ValueError("request body must contain only enabled")
+        if not isinstance(body["enabled"], bool):
+            raise ValueError("enabled must be a boolean")
+        return manager.set_fan_max_speed(body["enabled"])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not update FanController: {exc}") from exc
 
 
 @app.get("/api/fan/settings")
@@ -1927,6 +1967,29 @@ def _require_same_origin_or_forwarded(req: Request, action: str = "system update
     parsed = urlsplit(origin)
     if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != req.headers.get("host", "").casefold():
         raise HTTPException(403, f"{action} require a same-origin request")
+
+
+@app.get("/api/v1/fan-control")
+async def fan_control_overview():
+    return await manager.fan_control_cluster_overview()
+
+
+@app.patch("/api/v1/fan-control/nodes/{node_id}/max-speed")
+async def update_fan_control_max_speed(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "FanController changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"enabled"}:
+            raise ValueError("request body must contain only enabled")
+        if not isinstance(body["enabled"], bool):
+            raise ValueError("enabled must be a boolean")
+        return await manager.set_node_fan_max_speed(node_id, body["enabled"])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/api/v1/routeros/presence")

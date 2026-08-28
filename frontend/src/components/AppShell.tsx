@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ClipboardList,
   Cpu,
+  Fan,
   GitCompareArrows,
   HardDrive,
   Images,
@@ -29,6 +30,7 @@ const navigation = [
   { to: '/models', label: 'Models', icon: Cpu },
   { to: '/cluster', label: 'Cluster', icon: Network },
   { to: '/switch', label: 'Switch', icon: Cable },
+  { to: '/fan-control', label: 'Fan Control', icon: Fan },
   { to: '/chat', label: 'Chat', icon: MessageSquareText },
   { to: '/compare', label: 'Compare', icon: GitCompareArrows },
   { to: '/benchmarks', label: 'Benchmarks', icon: ClipboardList },
@@ -52,6 +54,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [themeSyncing, setThemeSyncing] = useState(false)
   const [themeStatus, setThemeStatus] = useState('')
   const [switchDetected, setSwitchDetected] = useState(false)
+  const [fanControlAvailable, setFanControlAvailable] = useState(false)
   const [nodeName, setNodeName] = useState('')
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
@@ -98,6 +101,36 @@ export function AppShell({ children }: { children: ReactNode }) {
       latestRequest += 1
       controller?.abort()
       window.removeEventListener('sparkdeck:node-name-changed', refreshSettings)
+    }
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    let controller: AbortController | undefined
+    let latestRequest = 0
+    const refreshPresence = () => {
+      controller?.abort()
+      const requestController = new AbortController()
+      const requestId = ++latestRequest
+      controller = requestController
+      const isFresh = () => !disposed && requestId === latestRequest && !requestController.signal.aborted
+      api.fanControl.get(requestController.signal)
+        .then((overview) => {
+          if (isFresh()) setFanControlAvailable(Boolean(overview.available && overview.nodes.length > 0))
+        })
+        .catch(() => {
+          if (isFresh()) setFanControlAvailable(false)
+        })
+    }
+    refreshPresence()
+    const interval = window.setInterval(refreshPresence, 15_000)
+    window.addEventListener('sparkdeck:fan-control-presence-changed', refreshPresence)
+    return () => {
+      disposed = true
+      latestRequest += 1
+      controller?.abort()
+      window.clearInterval(interval)
+      window.removeEventListener('sparkdeck:fan-control-presence-changed', refreshPresence)
     }
   }, [])
 
@@ -206,6 +239,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         <nav className="nav-list">
           {navigation.map(({ to, label, icon: Icon, end }, index) => {
+            if (to === '/fan-control' && !fanControlAvailable) return null
             if (to === '/switch' && !switchDetected) {
               return <span
                 key={to}

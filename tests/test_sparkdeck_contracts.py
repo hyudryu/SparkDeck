@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -170,6 +171,47 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created["model"]["repository"], "org/model")
         self.assertEqual(created["model"]["quantization"], "FP16")
         self.assertEqual(created["model"]["artifact"], str(artifact.resolve()))
+
+    @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
+    async def test_prepared_gguf_preserves_logical_snapshot_symlink_name(self):
+        revision = "b" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        first_blob = model_root / "blobs" / "first-content-hash"
+        second_blob = model_root / "blobs" / "second-content-hash"
+        first_blob.parent.mkdir(parents=True)
+        first_blob.write_bytes(b"first")
+        second_blob.write_bytes(b"second")
+        artifact = (
+            model_root / "snapshots" / revision
+            / "model-00001-of-00002.gguf"
+        )
+        second_artifact = artifact.with_name("model-00002-of-00002.gguf")
+        artifact.parent.mkdir(parents=True)
+        artifact.symlink_to(Path("../../blobs/first-content-hash"))
+        second_artifact.symlink_to(Path("../../blobs/second-content-hash"))
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+
+        prepared = await self.service._prepare_public_gguf_artifact(
+            "org/model", "model-00001-of-00002.gguf", "main", None,
+        )
+
+        self.assertEqual(prepared, str(artifact))
+        self.assertTrue(Path(prepared).is_symlink())
+
+        outside = Path(self.temp.name) / "outside-shard"
+        outside.write_bytes(b"outside")
+        second_artifact.unlink()
+        second_artifact.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "complete selected GGUF shard set"):
+            await self.service._prepare_public_gguf_artifact(
+                "org/model", "model-00001-of-00002.gguf", "main", None,
+            )
 
     async def test_managed_ownership_is_durable_before_container_launch(self):
         async def fail_launch(*args):

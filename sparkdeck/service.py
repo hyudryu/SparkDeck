@@ -58,6 +58,10 @@ _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
+_PUBLIC_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
 
 
 def _discovered_launch_controls(
@@ -1225,19 +1229,44 @@ class SparkDeckService:
             repository, resolved_revision, requested_revision=revision,
         )
         model_root = virtual_nas._model_path(repository).resolve()
-        candidate = model_root / "snapshots" / resolved_revision
+        snapshot_root = model_root / "snapshots" / resolved_revision
+        candidate = snapshot_root
         for part in relative.parts:
             candidate = candidate / part
-        resolved = candidate.resolve()
-        try:
-            resolved.relative_to(model_root)
-        except ValueError as exc:
-            raise RuntimeError("prepared GGUF artifact escapes the model cache") from exc
-        if not resolved.is_file():
-            raise RuntimeError(
-                "model preparation completed without the selected GGUF artifact"
-            )
-        return str(resolved)
+
+        def validate_artifact_path(logical_path: Path, missing_message: str) -> None:
+            try:
+                resolved_path = logical_path.resolve(strict=True)
+                allowed_root = (
+                    (model_root / "blobs").resolve(strict=True)
+                    if logical_path.is_symlink()
+                    else snapshot_root.resolve(strict=True)
+                )
+                resolved_path.relative_to(allowed_root)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(missing_message) from exc
+            if not logical_path.is_file():
+                raise RuntimeError(missing_message)
+
+        validate_artifact_path(
+            candidate,
+            "model preparation completed without the selected GGUF artifact",
+        )
+        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(candidate.name)
+        if shard:
+            shard_count = int(shard.group("count"))
+            for index in range(1, shard_count + 1):
+                logical_shard = candidate.with_name(
+                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
+                )
+                validate_artifact_path(
+                    logical_shard,
+                    "model preparation completed without the complete selected GGUF shard set",
+                )
+        # Preserve the logical snapshot filename. Hugging Face cache entries
+        # are normally symlinks into blobs/, whose content-addressed targets
+        # have no .gguf suffix and do not retain multi-shard names.
+        return str(candidate)
 
     async def create_deployment(
         self, body: dict[str, Any], *, background: bool = False,

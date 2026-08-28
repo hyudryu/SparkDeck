@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -76,6 +77,40 @@ class RuntimeAdapterTests(unittest.TestCase):
                 LlamaCppAdapter().launch_spec(
                     "org/model", {"artifact": str(artifact)},
                 )
+
+    @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
+    def test_llama_server_mounts_hub_symlink_shards_under_logical_names(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            blobs = root / "blobs"
+            snapshot = root / "snapshots" / "revision"
+            blobs.mkdir()
+            snapshot.mkdir(parents=True)
+            first_blob = blobs / "first-content-hash"
+            second_blob = blobs / "second-content-hash"
+            first_blob.write_bytes(b"first")
+            second_blob.write_bytes(b"second")
+            first = snapshot / "model-00001-of-00002.gguf"
+            second = snapshot / "model-00002-of-00002.gguf"
+            first.symlink_to(Path("../../blobs/first-content-hash"))
+            second.symlink_to(Path("../../blobs/second-content-hash"))
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/model-00001-of-00002.gguf",
+        )
+        self.assertEqual(spec.volumes, {
+            str(first_blob.resolve()): {
+                "bind": "/models/model-00001-of-00002.gguf", "mode": "ro",
+            },
+            str(second_blob.resolve()): {
+                "bind": "/models/model-00002-of-00002.gguf", "mode": "ro",
+            },
+        })
 
     def test_sglang_uses_runtime_native_parallel_flags(self):
         command = SglangAdapter().launch_spec("org/model", {

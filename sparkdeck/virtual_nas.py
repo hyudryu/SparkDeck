@@ -24,6 +24,7 @@ from urllib.parse import quote
 LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
@@ -42,6 +43,7 @@ _TOKENIZER_FILES = {
 # filesystem allocation rounding rather than admitting at an exact 2x edge.
 TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
+_SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
 
 
 def partial_download_size_bytes(
@@ -532,6 +534,190 @@ class VirtualNAS:
             ),
         )
 
+    async def download_model_files_checked(
+        self, model_id: str, revision: str, filenames: list[str],
+        explicit_token: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Download an exact subset of one immutable Hub revision.
+
+        Selective snapshots remain explicitly partial so the normal model
+        preparation path cannot mistake one GGUF quantization for a complete
+        repository and skip a later unrestricted download.
+        """
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        if not _is_commit_sha(revision):
+            raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        token = str(
+            explicit_token if explicit_token is not None else self._token_provider() or ""
+        ).strip()
+
+        def inspect() -> tuple[dict[str, int], list[str], dict[str, str]]:
+            try:
+                from huggingface_hub import HfApi
+            except ImportError as exc:
+                raise RuntimeError(
+                    "huggingface-hub is required to download model weights"
+                ) from exc
+            try:
+                info = HfApi(token=token or None).model_info(
+                    model_id, revision=revision, files_metadata=True,
+                )
+                resolved_value = getattr(info, "sha", None)
+                if (
+                    not isinstance(resolved_value, str)
+                    or resolved_value.strip().lower() != revision.lower()
+                ):
+                    raise RuntimeError(
+                        "Hugging Face did not report the requested immutable revision"
+                    )
+                repository_files: list[str] = []
+                sizes: dict[str, int] = {}
+                blob_keys: dict[str, str] = {}
+                for sibling in list(getattr(info, "siblings", None) or []):
+                    filename = getattr(sibling, "rfilename", None)
+                    if not isinstance(filename, str):
+                        continue
+                    repository_files.append(filename)
+                    if filename not in selected:
+                        continue
+                    size = getattr(sibling, "size", None)
+                    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                        raise RuntimeError(
+                            "Hugging Face did not report complete selected file sizes"
+                        )
+                    sizes[filename] = size
+                    lfs = getattr(sibling, "lfs", None)
+                    if lfs is not None:
+                        cache_key = getattr(lfs, "sha256", None)
+                        if (
+                            isinstance(cache_key, str)
+                            and re.fullmatch(r"[0-9a-fA-F]{64}", cache_key)
+                        ):
+                            blob_keys[filename] = cache_key.lower()
+                    else:
+                        cache_key = getattr(sibling, "blob_id", None)
+                        if (
+                            isinstance(cache_key, str)
+                            and _HUB_BLOB_KEY.fullmatch(cache_key)
+                        ):
+                            blob_keys[filename] = cache_key.lower()
+                missing = [filename for filename in selected if filename not in sizes]
+                if missing:
+                    raise RuntimeError(
+                        "Hugging Face did not report every selected repository file"
+                    )
+                return sizes, repository_files, blob_keys
+            except Exception as exc:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(
+                    "could not inspect Hugging Face model; verify repository access, revision, credentials, and network"
+                ) from exc
+
+        sizes, repository_files, blob_keys = await asyncio.to_thread(inspect)
+
+        def download_selected() -> dict[str, Any]:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError as exc:
+                raise RuntimeError(
+                    "huggingface-hub is required to download model weights"
+                ) from exc
+            with self._download_locks_guard:
+                download_lock = self._download_locks.setdefault(model_id, threading.Lock())
+            with download_lock:
+                repository = self._model_path(model_id)
+                snapshot = repository / "snapshots" / revision
+                repository_complete = bool(repository_files) and all(
+                    _safe_cached_snapshot_file(repository, revision, filename) is not None
+                    for filename in repository_files
+                )
+                missing = [
+                    filename for filename in selected
+                    if _safe_cached_snapshot_file(repository, revision, filename) is None
+                ]
+                if missing:
+                    expected_bytes = sum(sizes[filename] for filename in missing)
+                    cached_bytes = sum(
+                        _safe_incomplete_blob_bytes(
+                            repository, blob_keys.get(filename), sizes[filename],
+                        )
+                        for filename in missing
+                    )
+                    free_bytes = self.free_bytes()
+                    required = download_required_free_bytes(
+                        expected_bytes, cached_bytes,
+                    )
+                    if free_bytes is None:
+                        raise RuntimeError(
+                            "download node did not report free cache capacity"
+                        )
+                    if free_bytes < required:
+                        raise RuntimeError(
+                            f"download node has insufficient free cache space "
+                            f"({free_bytes} bytes available; {required} bytes required)"
+                        )
+                marker = snapshot / _SELECTIVE_SNAPSHOT_MARKER
+                if repository_complete:
+                    marker.unlink(missing_ok=True)
+                else:
+                    _ensure_safe_snapshot_directory(repository, revision)
+                    if marker.is_symlink() or (
+                        marker.exists() and not marker.is_file()
+                    ):
+                        raise RuntimeError(
+                            "Hugging Face selective snapshot marker is not safe"
+                        )
+                    marker.write_text("selective\n", encoding="utf-8")
+                if missing:
+                    try:
+                        for filename in missing:
+                            hf_hub_download(
+                                repo_id=model_id,
+                                filename=filename,
+                                revision=revision,
+                                cache_dir=str(self._hub()),
+                                token=token or None,
+                            )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Hugging Face download failed; verify repository access, revision, credentials, and network"
+                        ) from exc
+                if any(
+                    _safe_cached_snapshot_file(repository, revision, filename) is None
+                    for filename in selected
+                ):
+                    raise RuntimeError(
+                        "download finished without every selected repository file"
+                    )
+                if repository_files and all(
+                    _safe_cached_snapshot_file(repository, revision, filename) is not None
+                    for filename in repository_files
+                ):
+                    marker.unlink(missing_ok=True)
+                self._write_revision_ref(
+                    model_id, requested_revision, revision,
+                )
+                return {
+                    "ok": True,
+                    "model_id": model_id,
+                    "revision": revision,
+                    "size_bytes": sum(sizes.values()),
+                    "files": selected,
+                }
+
+        return await self._await_uncancelable(
+            asyncio.to_thread(download_selected),
+        )
+
     def download_model(
         self, model_id: str, revision: str = "main", explicit_token: str | None = None,
         requested_revision: str | None = None,
@@ -570,6 +756,10 @@ class VirtualNAS:
                     cache_dir=str(self._hub()),
                     token=token or None,
                 )
+                (
+                    self._model_path(model_id) / "snapshots" / revision
+                    / _SELECTIVE_SNAPSHOT_MARKER
+                ).unlink(missing_ok=True)
                 self._write_revision_ref(
                     model_id, requested_revision, revision,
                 )
@@ -618,6 +808,9 @@ class VirtualNAS:
                 continue
             snapshot_revisions = _complete_snapshot_revisions(repository)
             partial = not bool(snapshot_revisions)
+            incomplete_revisions = _safe_incomplete_snapshot_revisions(
+                repository, set(snapshot_revisions),
+            )
             size_bytes = 0
             incomplete_size_bytes = 0
             file_count = 0
@@ -633,18 +826,25 @@ class VirtualNAS:
                     except OSError:
                         continue
                     size_bytes += stat.st_size
-                    if name.endswith(".incomplete"):
+                    if (
+                        name.endswith(".incomplete")
+                        and name != _SELECTIVE_SNAPSHOT_MARKER
+                    ):
                         incomplete_size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
-                repository, set(snapshot_revisions),
+                repository, set(snapshot_revisions), incomplete_revisions,
             )
-            if len(incomplete_revision_bytes) == 1:
-                only_revision = next(iter(incomplete_revision_bytes))
-                incomplete_revision_bytes[only_revision] += incomplete_size_bytes
+            if len(incomplete_revisions) == 1:
+                only_revision = next(iter(incomplete_revisions))
+                incomplete_revision_bytes[only_revision] = (
+                    incomplete_revision_bytes.get(only_revision, 0)
+                    + incomplete_size_bytes
+                )
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
+            partial_revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
                 for ref in refs_root.rglob("*"):
@@ -656,20 +856,34 @@ class VirtualNAS:
                             ref_name = ref.relative_to(refs_root).as_posix()
                             revisions.add(ref_name)
                             revision_refs[ref_name] = target
+                        elif target in incomplete_revisions:
+                            ref_name = ref.relative_to(refs_root).as_posix()
+                            partial_revision_refs[ref_name] = target
                     except (OSError, UnicodeError, ValueError):
                         continue
+            partial_revision = None
+            if len(incomplete_revisions) == 1:
+                incomplete_revision = next(iter(incomplete_revisions))
+                aliases = sorted(
+                    name for name, target in partial_revision_refs.items()
+                    if target == incomplete_revision
+                )
+                partial_revision = aliases[0] if aliases else incomplete_revision
             models.append({
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
                 "partial": partial,
                 "has_partial_download": (
-                    partial or bool(incomplete_revision_bytes)
+                    partial or bool(incomplete_revisions)
                 ),
                 "partial_size_bytes": (
                     size_bytes if partial else sum(incomplete_revision_bytes.values())
                 ),
                 "partial_revision_size_bytes": incomplete_revision_bytes,
+                "partial_revisions": sorted(incomplete_revisions),
+                "partial_revision_refs": partial_revision_refs,
+                "revision": partial_revision,
                 "revisions": sorted(revisions),
                 "revision_refs": revision_refs,
                 "last_modified": (
@@ -1670,6 +1884,79 @@ def _local_free_bytes(path: Path) -> int:
         raise RuntimeError("local node free disk capacity is unavailable") from exc
 
 
+def _validate_repo_relative_file(filename: str) -> str:
+    value = str(filename or "")
+    relative = PurePosixPath(value)
+    if (
+        len(value) > 1024
+        or relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or "\\" in value
+    ):
+        raise ValueError("repository file must be a safe relative path")
+    return relative.as_posix()
+
+
+def _ensure_safe_snapshot_directory(repository: Path, revision: str) -> Path:
+    if repository.exists() and (not repository.is_dir() or repository.is_symlink()):
+        raise RuntimeError("Hugging Face cache repository is not safe")
+    repository.mkdir(parents=True, exist_ok=True)
+    snapshots = repository / "snapshots"
+    if snapshots.exists() and (not snapshots.is_dir() or snapshots.is_symlink()):
+        raise RuntimeError("Hugging Face snapshots directory is not safe")
+    snapshots.mkdir(exist_ok=True)
+    snapshot = snapshots / revision
+    if snapshot.exists() and (not snapshot.is_dir() or snapshot.is_symlink()):
+        raise RuntimeError("Hugging Face snapshot directory is not safe")
+    snapshot.mkdir(exist_ok=True)
+    return snapshot
+
+
+def _safe_cached_snapshot_file(
+    repository: Path, revision: str, filename: str,
+) -> Path | None:
+    try:
+        relative = PurePosixPath(_validate_repo_relative_file(filename))
+        snapshot = repository / "snapshots" / revision
+        candidate = snapshot.joinpath(*relative.parts)
+        resolved = candidate.resolve(strict=True)
+        allowed = (
+            (repository / "blobs").resolve(strict=True)
+            if candidate.is_symlink()
+            else snapshot.resolve(strict=True)
+        )
+        resolved.relative_to(allowed)
+        if not candidate.is_file():
+            return None
+        return candidate
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _safe_incomplete_blob_bytes(
+    repository: Path, cache_key: str | None, expected_bytes: int,
+) -> int:
+    """Return resumable bytes for one exact Hub sibling, failing closed."""
+    if not isinstance(cache_key, str) or not _HUB_BLOB_KEY.fullmatch(cache_key):
+        return 0
+    try:
+        if not repository.is_dir() or repository.is_symlink():
+            return 0
+        blobs = repository / "blobs"
+        if not blobs.is_dir() or blobs.is_symlink():
+            return 0
+        blob_root = blobs.resolve(strict=True)
+        candidate = blobs / f"{cache_key.lower()}.incomplete"
+        if candidate.is_symlink() or not candidate.is_file():
+            return 0
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(blob_root)
+        return min(_nonnegative_int(expected_bytes), candidate.stat().st_size)
+    except (OSError, RuntimeError, ValueError):
+        return 0
+
+
 def _is_complete_repository(repository: Path) -> bool:
     return bool(_complete_snapshot_revisions(repository))
 
@@ -1698,8 +1985,61 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return set()
 
 
+def _safe_incomplete_snapshot_revisions(
+    repository: Path, complete_revisions: set[str],
+) -> set[str]:
+    """Return incomplete snapshot directories whose contents stay cache-local."""
+    try:
+        snapshots = repository / "snapshots"
+        blobs = repository / "blobs"
+        if (
+            not snapshots.is_dir() or snapshots.is_symlink()
+            or not blobs.is_dir() or blobs.is_symlink()
+        ):
+            return set()
+        blob_root = blobs.resolve(strict=True)
+        incomplete = set()
+        for snapshot in snapshots.iterdir():
+            if (
+                snapshot.name in complete_revisions
+                or not _is_commit_sha(snapshot.name)
+                or not snapshot.is_dir() or snapshot.is_symlink()
+            ):
+                continue
+            try:
+                safe = True
+                has_evidence = False
+                for item in snapshot.rglob("*"):
+                    if item.is_symlink():
+                        if item.name == _SELECTIVE_SNAPSHOT_MARKER or not item.is_file():
+                            safe = False
+                            break
+                        resolved = item.resolve(strict=True)
+                        if not resolved.is_relative_to(blob_root) or not resolved.is_file():
+                            safe = False
+                            break
+                        has_evidence = True
+                    elif item.is_dir():
+                        continue
+                    elif not item.is_file():
+                        safe = False
+                        break
+                    elif item.name == _SELECTIVE_SNAPSHOT_MARKER:
+                        has_evidence = True
+                    elif not item.name.endswith((".incomplete", ".lock")):
+                        has_evidence = True
+                if safe and has_evidence:
+                    incomplete.add(snapshot.name)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return incomplete
+    except OSError:
+        return set()
+
+
 def _incomplete_snapshot_reusable_bytes(
     repository: Path, complete_revisions: set[str],
+    incomplete_revisions: set[str],
 ) -> dict[str, int]:
     """Count unique completed blobs referenced only by incomplete snapshots."""
     try:
@@ -1726,12 +2066,8 @@ def _incomplete_snapshot_reusable_bytes(
                 if resolved.is_relative_to(blob_root) and resolved.is_file():
                     complete_blobs.add(resolved)
         reusable_by_revision: dict[str, set[Path]] = {}
-        for snapshot in snapshots.iterdir():
-            if (
-                snapshot.name in complete_revisions
-                or not snapshot.is_dir() or snapshot.is_symlink()
-            ):
-                continue
+        for revision in incomplete_revisions:
+            snapshot = snapshots / revision
             reusable = reusable_by_revision.setdefault(snapshot.name, set())
             for item in snapshot.rglob("*"):
                 if item.name.endswith((".incomplete", ".lock")):

@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -45,6 +46,105 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_llama_server_rejects_repository_without_gguf_artifact(self):
         with self.assertRaisesRegex(ValueError, "existing local GGUF artifact"):
             LlamaCppAdapter().launch_spec("org/model", {})
+
+    def test_llama_server_mounts_only_complete_shard_files(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "model-Q4_K_M-00001-of-00002.gguf"
+            second = root / "model-Q4_K_M-00002-of-00002.gguf"
+            first.touch()
+            second.touch()
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/model-Q4_K_M-00001-of-00002.gguf",
+        )
+        self.assertEqual(
+            spec.volumes,
+            {
+                str(first.resolve()): {
+                    "bind": "/models/model-Q4_K_M-00001-of-00002.gguf",
+                    "mode": "ro",
+                },
+                str(second.resolve()): {
+                    "bind": "/models/model-Q4_K_M-00002-of-00002.gguf",
+                    "mode": "ro",
+                },
+            },
+        )
+
+    def test_llama_server_preserves_actual_shard_filename_casing(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "Model-00001-of-00002.GGUF"
+            second = root / "Model-00002-of-00002.GGUF"
+            first.touch()
+            second.touch()
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/Model-00001-of-00002.GGUF",
+        )
+        self.assertEqual(spec.volumes, {
+            str(first.resolve()): {
+                "bind": "/models/Model-00001-of-00002.GGUF", "mode": "ro",
+            },
+            str(second.resolve()): {
+                "bind": "/models/Model-00002-of-00002.GGUF", "mode": "ro",
+            },
+        })
+
+    def test_llama_server_rejects_incomplete_shard_set(self):
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "model-Q4_K_M-00001-of-00002.gguf"
+            artifact.touch()
+
+            with self.assertRaisesRegex(ValueError, "every GGUF shard"):
+                LlamaCppAdapter().launch_spec(
+                    "org/model", {"artifact": str(artifact)},
+                )
+
+    @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
+    def test_llama_server_mounts_hub_symlink_shards_under_logical_names(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            blobs = root / "blobs"
+            snapshot = root / "snapshots" / "revision"
+            blobs.mkdir()
+            snapshot.mkdir(parents=True)
+            first_blob = blobs / "first-content-hash"
+            second_blob = blobs / "second-content-hash"
+            first_blob.write_bytes(b"first")
+            second_blob.write_bytes(b"second")
+            first = snapshot / "model-00001-of-00002.gguf"
+            second = snapshot / "model-00002-of-00002.gguf"
+            first.symlink_to(Path("../../blobs/first-content-hash"))
+            second.symlink_to(Path("../../blobs/second-content-hash"))
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/model-00001-of-00002.gguf",
+        )
+        self.assertEqual(spec.volumes, {
+            str(first_blob.resolve()): {
+                "bind": "/models/model-00001-of-00002.gguf", "mode": "ro",
+            },
+            str(second_blob.resolve()): {
+                "bind": "/models/model-00002-of-00002.gguf", "mode": "ro",
+            },
+        })
 
     def test_sglang_uses_runtime_native_parallel_flags(self):
         command = SglangAdapter().launch_spec("org/model", {

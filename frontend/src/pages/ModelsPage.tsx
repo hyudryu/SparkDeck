@@ -361,16 +361,18 @@ export function ModelsPage() {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
     const sharded = searchParams.get('layout') === 'sharded'
+    const requestedRuntimeValue = searchParams.get('runtime')?.trim()
+    const requestedRuntime = isRuntimeKind(requestedRuntimeValue) ? requestedRuntimeValue : undefined
     const quantization = searchParams.get('quantization')?.trim()
     const artifact = searchParams.get('artifact')?.trim()
     const ggufArtifact = Boolean(artifact?.toLocaleLowerCase().endsWith('.gguf'))
     catalogShardedLayout.current = sharded
-    if (ggufArtifact) runtimeTouched.current = true
+    if (ggufArtifact || requestedRuntime) runtimeTouched.current = true
     setForm((current) => ({
       ...current,
       model_id: modelId,
       alias: current.alias || modelId.split('/').at(-1) || modelId,
-      runtime: ggufArtifact ? 'llama.cpp' : current.runtime,
+      runtime: ggufArtifact ? 'llama.cpp' : requestedRuntime ?? current.runtime,
       deployment_mode: ggufArtifact ? 'single' : sharded ? 'sharded' : current.deployment_mode,
       settings: ggufArtifact
         ? {
@@ -1056,7 +1058,7 @@ export function ModelsPage() {
       <PageHeader
         eyebrow="Local runtimes"
         title="Models"
-        description="Manage model servers across vLLM, llama.cpp, and SGLang from one place."
+        description="Manage model servers across vLLM, SGLang, and Llama server from one place."
         actions={<Button variant="primary" onClick={openCreator}><Plus size={16} /> Add model</Button>}
       />
       {resource.loading && <LoadingState label="Loading deployments" />}
@@ -1423,7 +1425,7 @@ export function ModelsPage() {
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="llama.cpp">llama.cpp</option><option value="sglang">SGLang</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>
@@ -1445,7 +1447,7 @@ export function ModelsPage() {
                 localLabel={localLabel}
                 primaryId={form.deployment_mode === 'sharded' ? localNodeId : (form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
               />}
-              {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
+              {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">Llama server deployments use the local node because GGUF artifacts are local to this device.</p>}
               {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Replicated (full weights per node)</option><option value="sharded" disabled={!shardedAvailable}>Sharded (split one model across nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The controller is required as the primary node, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {

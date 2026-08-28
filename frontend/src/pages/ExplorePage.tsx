@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Check, ChevronDown, ChevronRight, Download, ExternalLink, Heart, Search } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
@@ -14,9 +14,17 @@ type DisplayCatalogModel = CatalogModel & {
   communityEvidenceSource?: 'community' | 'local'
   communityVariantKey?: string
 }
+type GgufArtifactOption = {
+  key: string
+  filename: string
+  quantization: string
+  weightSize?: number | null
+}
 
 const MIB = 1024 ** 2
 const COMMUNITY_PAGE_SIZE = 50
+const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
+const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 
 function formatParameters(value?: number | null) {
   if (!Number.isFinite(value) || Number(value) <= 0) return '—'
@@ -39,7 +47,12 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
   const measured = nodes
     .map((node) => ({ node, capacity: nodeMemoryBytes(node) }))
     .filter((item): item is { node: NodeInventoryItem; capacity: number } => item.capacity !== undefined)
-  if (measured.length === 0) return { capacity: 0, measuredNodes: 0, aggregate: false }
+  if (measured.length === 0) {
+    return { capacity: 0, localCapacity: 0, measuredNodes: 0, aggregate: false }
+  }
+  const localCapacity = measured.find(({ node }) => node.local === true)?.capacity
+    ?? measured.find(({ node }) => node.id === 'local')?.capacity
+    ?? 0
   const aggregate = measured.length > 1 && measured.some(({ node }) => node.local === true || node.id === 'local')
   return {
     capacity: aggregate
@@ -47,6 +60,7 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
       : Math.max(...measured.map((item) => item.capacity)),
     measuredNodes: measured.length,
     aggregate,
+    localCapacity,
   }
 }
 
@@ -77,53 +91,176 @@ function communityVariantKey(item: BenchmarkAggregate) {
   return `${item.model_id}::${aggregateQuantization(item)}::${item.prompt_tokens_bucket}`
 }
 
-function deployHref(model: DisplayCatalogModel, quantizations: NonNullable<CatalogModel['quantizations']>, sharded: boolean, communityMode: boolean) {
-  const params = new URLSearchParams({ model: model.id })
-  const quantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
-  if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
-  const variant = quantization
-    ? quantizations.find((item) => item.name.toLocaleLowerCase() === quantization.toLocaleLowerCase())
+function ggufArtifactOptions(quantizations: NonNullable<CatalogModel['quantizations']>): GgufArtifactOption[] {
+  return quantizations.flatMap((variant) => {
+    const artifacts = variant.artifacts?.length
+      ? variant.artifacts
+      : variant.files.some((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))
+        ? [{
+          filename: variant.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))!.filename,
+          files: variant.files,
+          weight_size_bytes: variant.weight_size_bytes,
+        }]
+        : []
+    return artifacts.map((artifact) => ({
+      key: `${variant.name}\u0000${artifact.filename}`,
+      filename: artifact.filename,
+      quantization: variant.name,
+      weightSize: artifact.weight_size_bytes,
+    }))
+  })
+}
+
+function mergeRuntimeCompatibility(
+  searchCompatibility: NonNullable<CatalogModel['runtime_compatibility']>,
+  detailCompatibility: NonNullable<CatalogModel['runtime_compatibility']>,
+) {
+  const merged = new Map(detailCompatibility.map((item) => [item.runtime, item]))
+  for (const item of searchCompatibility) {
+    const existing = merged.get(item.runtime)
+    merged.set(item.runtime, existing
+      ? { ...existing, ...item, supported: existing.supported || item.supported }
+      : item)
+  }
+  return [...merged.values()]
+}
+
+function requiresControllerCapacity(model: DisplayCatalogModel) {
+  const compatibility = model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const hasNonLlamaRuntime = compatibility.some((item) => item.runtime !== 'llama.cpp' && item.supported)
+  const hasLlamaRuntime = compatibility.some((item) => item.runtime === 'llama.cpp' && item.supported)
+  const hasGgufArtifact = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS).length > 0
+  return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
+}
+
+function preferredGgufArtifact(
+  artifactOptions: GgufArtifactOption[],
+  communityQuantization?: string,
+) {
+  return artifactOptions.find((item) => (
+    communityQuantization
+    && item.quantization.toLocaleLowerCase() === communityQuantization.toLocaleLowerCase()
+  )) ?? artifactOptions[0]
+}
+
+function defaultGgufWeightSize(model: DisplayCatalogModel, communityMode: boolean) {
+  const artifactOptions = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)
+  const communityQuantization = communityMode && model.community
+    ? aggregateQuantization(model.community)
     : undefined
-  const artifact = variant?.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))?.filename
-  if (artifact) params.set('artifact', artifact)
-  else if (sharded) params.set('layout', 'sharded')
+  const defaultArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
+  return defaultArtifact?.weightSize ?? model.weight_size_bytes ?? model.community?.weight_size_bytes
+}
+
+function deployHref(
+  model: DisplayCatalogModel,
+  runtime: RuntimeKind,
+  artifact: GgufArtifactOption | undefined,
+  sharded: boolean,
+  communityMode: boolean,
+) {
+  const params = new URLSearchParams({ model: model.id, runtime })
+  const quantization = runtime === 'llama.cpp'
+    ? artifact?.quantization
+    : communityMode && model.community ? aggregateQuantization(model.community) : undefined
+  if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
+  if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
+  else if (runtime !== 'llama.cpp' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
 function ModelRow({
   model,
   capacity,
+  localCapacity,
   measuredNodes,
   aggregate,
   expanded,
   communityEnabled,
   communityMode,
+  requestedRuntime,
   onToggle,
 }: {
   model: DisplayCatalogModel
   capacity: number
+  localCapacity: number
   measuredNodes: number
   aggregate: boolean
   expanded: boolean
   communityEnabled: boolean
   communityMode: boolean
+  requestedRuntime: RuntimeKind | ''
   onToggle: () => void
 }) {
   const rowKey = model.communityVariantKey ?? model.id
   const panelId = `model-details-${rowKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
   const modelName = model.name ?? model.id.split('/').at(-1) ?? model.id
-  const supportedRuntimes = (model.runtime_compatibility ?? []).filter((item) => item.supported)
   const details = useResource(
     (signal) => api.catalog.details(model.id, signal),
     [model.id],
     expanded,
   )
-  const quantizations = details.data?.model?.quantizations ?? model.quantizations ?? []
+  const detailedModel = details.data?.model
+  const compatibility = useMemo(() => mergeRuntimeCompatibility(
+    model.runtime_compatibility ?? EMPTY_COMPATIBILITY,
+    detailedModel?.runtime_compatibility ?? EMPTY_COMPATIBILITY,
+  ), [detailedModel?.runtime_compatibility, model.runtime_compatibility])
+  const supportedRuntimes = useMemo(
+    () => compatibility.filter((item) => item.supported),
+    [compatibility],
+  )
+  const compatibilityByRuntime = useMemo(
+    () => new Map(compatibility.map((item) => [item.runtime, item.supported])),
+    [compatibility],
+  )
+  const quantizations = detailedModel?.quantizations ?? model.quantizations ?? EMPTY_QUANTIZATIONS
+  const artifactOptions = useMemo(() => ggufArtifactOptions(quantizations), [quantizations])
+  const initiallySupported = (candidate: RuntimeKind) => compatibilityByRuntime.get(candidate) !== false
+  const initialRuntime = requestedRuntime && initiallySupported(requestedRuntime)
+    ? requestedRuntime
+    : supportedRuntimes.length === 1
+      ? supportedRuntimes[0].runtime
+      : initiallySupported('vllm') ? 'vllm' : initiallySupported('sglang') ? 'sglang' : 'llama.cpp'
+  const [deploymentRuntime, setDeploymentRuntime] = useState<RuntimeKind>(initialRuntime)
+  const communityQuantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
+  const preferredArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
+  const [artifactKey, setArtifactKey] = useState(preferredArtifact?.key ?? '')
+  const selectedArtifact = artifactOptions.find((item) => item.key === artifactKey) ?? preferredArtifact
+  const llamaSupported = compatibilityByRuntime.get('llama.cpp') !== false && artifactOptions.length > 0
+  const deploymentReady = deploymentRuntime !== 'llama.cpp' || Boolean(selectedArtifact)
+  const previousRequestedRuntime = useRef(requestedRuntime)
+
+  useEffect(() => {
+    const requestedRuntimeChanged = previousRequestedRuntime.current !== requestedRuntime
+    previousRequestedRuntime.current = requestedRuntime
+    setDeploymentRuntime((current) => {
+      if (requestedRuntimeChanged && requestedRuntime && compatibilityByRuntime.get(requestedRuntime) !== false) {
+        return requestedRuntime
+      }
+      return compatibilityByRuntime.get(current) === false
+        ? supportedRuntimes[0]?.runtime ?? 'vllm'
+        : current
+    })
+  }, [compatibilityByRuntime, requestedRuntime, supportedRuntimes])
+
+  useEffect(() => {
+    if (!artifactOptions.some((item) => item.key === artifactKey)) {
+      setArtifactKey(preferredArtifact?.key ?? '')
+    }
+  }, [artifactKey, artifactOptions, preferredArtifact?.key])
   const rowLabel = communityMode && model.community
     ? `${model.id} (${aggregateQuantization(model.community)}, ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket)`
     : model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
+  const fitWeightSize = deploymentRuntime === 'llama.cpp'
+    ? selectedArtifact?.weightSize ?? weightSize
+    : weightSize
+  const fitCapacity = deploymentRuntime === 'llama.cpp' ? localCapacity : capacity
+  const fitAggregate = deploymentRuntime !== 'llama.cpp' && aggregate
+  const fitMeasuredNodes = deploymentRuntime === 'llama.cpp'
+    ? localCapacity > 0 ? 1 : 0
+    : measuredNodes
 
   return <article className={`catalog-model-row${expanded ? ' expanded' : ''}`}>
     <button
@@ -136,7 +273,7 @@ function ModelRow({
     >
       <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket` : ''}</small></span>
       <span className="catalog-model-stat"><small>Parameters</small><strong>{formatParameters(parameterCount)}</strong></span>
-      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(weightSize, capacity)}`}><small>Weights</small><strong>{weightSize ? formatBytes(weightSize) : '—'}</strong><em>{fitLabel(fitTone(weightSize, capacity))}</em></span>
+      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(fitWeightSize, fitCapacity)}`}><small>Weights</small><strong>{fitWeightSize ? formatBytes(fitWeightSize) : '—'}</strong><em>{fitLabel(fitTone(fitWeightSize, fitCapacity))}</em></span>
       {communityMode
         ? <>
           <span className="catalog-model-stat"><small>Output speed</small><strong>{formatRate(model.community?.inference_tokens_per_second)}</strong></span>
@@ -151,13 +288,15 @@ function ModelRow({
     {expanded && <div className="catalog-model-details" id={panelId}>
       <div className="catalog-model-detail-grid">
         <div>
-          <span className="detail-label">Cluster fit</span>
-          <strong className={`fit-${fitTone(weightSize, capacity)}`}>{fitLabel(fitTone(weightSize, capacity))} · {weightSize ? formatBytes(weightSize) : 'Weight size unavailable'}</strong>
-          <p>{capacity > 0
-            ? aggregate
+          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : 'Cluster fit'}</span>
+          <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}</strong>
+          <p>{fitCapacity > 0
+            ? deploymentRuntime === 'llama.cpp'
+              ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
+              : fitAggregate
               ? `${formatBytes(capacity)} aggregate memory across ${measuredNodes} measured nodes. Fit assumes a sharded deployment that can divide model weights across those nodes; replicated deployments still require the full model weights on every replica. `
-              : `${formatBytes(capacity)} on the largest of ${measuredNodes} measured ${measuredNodes === 1 ? 'node' : 'nodes'}. Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights. `
-            : 'Cluster memory telemetry is unavailable. '}Context and KV cache can increase runtime memory.</p>
+              : `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights. `
+            : deploymentRuntime === 'llama.cpp' ? 'Controller memory telemetry is unavailable. ' : 'Cluster memory telemetry is unavailable. '}Context and KV cache can increase runtime memory.</p>
         </div>
         <div>
           <span className="detail-label">Compatibility</span>
@@ -183,7 +322,17 @@ function ModelRow({
       </div>}
       <div className="catalog-model-actions">
         <a className="button" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Hugging Face</a>
-        <Link className="button button-primary" aria-label={`Deploy ${model.id}`} to={deployHref(model, quantizations, aggregate, communityMode)}>Deploy</Link>
+        <label className="catalog-deployment-type"><span>Deployment type</span><select aria-label={`Deployment type for ${model.id}`} value={deploymentRuntime} onChange={(event) => setDeploymentRuntime(event.target.value as RuntimeKind)}>
+          <option value="vllm" disabled={compatibilityByRuntime.get('vllm') === false}>vLLM</option>
+          <option value="sglang" disabled={compatibilityByRuntime.get('sglang') === false}>SGLang</option>
+          <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
+        </select></label>
+        {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
+          {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
+        </select></label>}
+        {deploymentReady
+          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${deploymentRuntime === 'llama.cpp' ? 'Llama server' : deploymentRuntime === 'vllm' ? 'vLLM' : 'SGLang'}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>
+          : <button className="button button-primary" type="button" disabled title={details.loading ? 'Loading GGUF artifacts' : 'No deployable GGUF artifact was found'}>Deploy</button>}
       </div>
     </div>}
   </article>
@@ -198,9 +347,10 @@ export function ExplorePage() {
   const [communityOnly, setCommunityOnly] = useState(false)
   const [communityLimit, setCommunityLimit] = useState(COMMUNITY_PAGE_SIZE)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
+  const activeRuntime = tab === 'hugging-face' ? runtime : ''
   const catalog = useResource(
-    (signal) => api.catalog.search(query, runtime || undefined, undefined, signal),
-    [query, runtime],
+    (signal) => api.catalog.search(query, activeRuntime || undefined, undefined, signal),
+    [activeRuntime, query],
   )
   const nodes = useResource((signal) => api.nodes.list(signal))
   const communityAccess = useCommunityAccess()
@@ -221,6 +371,7 @@ export function ExplorePage() {
   }, [aggregates.data?.items, communityOnly, fitsOnly, query, tab])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
+  const catalogFitCapacity = activeRuntime === 'llama.cpp' ? memory.localCapacity : memory.capacity
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate[]>()
@@ -268,14 +419,24 @@ export function ExplorePage() {
       ))
     }
     if (communityOnly || tab === 'community') visible = visible.filter((model) => Boolean(model.community))
-    if (fitsOnly) visible = visible.filter((model) => ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, memory.capacity)))
+    if (fitsOnly) visible = visible.filter((model) => {
+      const usesControllerCapacity = activeRuntime === 'llama.cpp'
+        || (activeRuntime === '' && requiresControllerCapacity(model))
+      const applicableCapacity = usesControllerCapacity
+        ? memory.localCapacity
+        : memory.capacity
+      const applicableWeightSize = usesControllerCapacity
+        ? defaultGgufWeightSize(model, tab === 'community')
+        : model.weight_size_bytes
+      return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity))
+    })
     if (fitsOnly) {
       visible = [...visible].sort((left, right) => Number(right.weight_size_bytes ?? 0) - Number(left.weight_size_bytes ?? 0))
     } else if (tab === 'community') {
       visible = [...visible].sort((left, right) => Number(right.community?.sample_count ?? 0) - Number(left.community?.sample_count ?? 0))
     }
     return visible
-  }, [aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory.capacity, query, tab])
+  }, [activeRuntime, aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory, query, tab])
   const displayedModels = tab === 'community' ? models.slice(0, communityLimit) : models
   const remainingCommunityModels = tab === 'community' ? models.length - displayedModels.length : 0
 
@@ -322,14 +483,14 @@ export function ExplorePage() {
             <select value={runtime} onChange={(event) => setRuntime(event.target.value as RuntimeKind | '')}>
               <option value="">All runtimes</option>
               <option value="vllm">vLLM</option>
-              <option value="llama.cpp">llama.cpp</option>
+              <option value="llama.cpp">Llama server</option>
               <option value="sglang">SGLang</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>
         </form>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={memory.capacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{memory.capacity > 0 ? memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? activeRuntime === 'llama.cpp' ? `${formatBytes(catalogFitCapacity)} controller memory for Llama server` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : activeRuntime === 'llama.cpp' ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           <label title={communityEnabled ? undefined : accessHint}><input type="checkbox" checked={communityOnly || tab === 'community'} disabled={!communityEnabled || tab === 'community'} onChange={(event) => setCommunityOnly(event.target.checked)} /><span><strong>Only with community data</strong><small>Benchmark samples shared by SparkDeck users</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
@@ -356,7 +517,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Unique clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = model.communityVariantKey ?? model.id
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} onToggle={() => toggleExpanded(rowKey)} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

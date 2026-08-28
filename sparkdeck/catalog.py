@@ -90,6 +90,7 @@ class HuggingFaceCatalog:
                     *(("expand[]", field) for field in (
                         "author", "downloads", "likes", "tags", "safetensors",
                         "gguf", "pipeline_tag", "gated", "private", "lastModified",
+                        "siblings",
                     )),
                 ],
                 headers={"Authorization": f"Bearer {token}"} if token else {},
@@ -99,11 +100,15 @@ class HuggingFaceCatalog:
             raw_items = response.json()
             if not isinstance(raw_items, list):
                 raise ValueError("Hugging Face returned an invalid model list")
-            items = [
-                public for item in raw_items
-                if isinstance(item, dict) and not item.get("private")
-                if (public := self._public_item(item)).get("id")
-            ]
+            items = []
+            for item in raw_items:
+                if not isinstance(item, dict) or item.get("private"):
+                    continue
+                public = self._public_item(item)
+                if not public.get("id"):
+                    continue
+                public["quantizations"] = _gguf_quantizations(item.get("siblings"))
+                items.append(public)
             self._cache[key] = (time.monotonic(), items)
             return items
 
@@ -235,8 +240,20 @@ class HuggingFaceCatalog:
         repository = str(item.get("id") or item.get("modelId") or "").strip()
         tags = [str(tag)[:100] for tag in item.get("tags", []) if isinstance(tag, str)][:100]
         folded_tags = {tag.casefold() for tag in tags}
+        siblings = item.get("siblings")
+        has_gguf_sibling = isinstance(siblings, list) and any(
+            isinstance(sibling, dict)
+            and str(sibling.get("rfilename") or sibling.get("path") or "")
+            .casefold().endswith(".gguf")
+            for sibling in siblings
+        )
         formats = []
-        if "gguf" in folded_tags:
+        gguf_metadata = item.get("gguf")
+        if (
+            "gguf" in folded_tags
+            or (isinstance(gguf_metadata, dict) and bool(gguf_metadata))
+            or has_gguf_sibling
+        ):
             formats.append("gguf")
         transformer_model = bool(folded_tags & {"transformers", "safetensors"})
         runtime_compatibility = [
@@ -352,9 +369,7 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
             or "/mtp-" in folded_filename
         ):
             continue
-        quantization = quantization_from_text(filename)
-        if not quantization:
-            continue
+        quantization = quantization_from_text(filename) or "unknown"
         size = _positive_int(sibling.get("size"))
         lfs = sibling.get("lfs")
         if size is None and isinstance(lfs, dict):
@@ -394,6 +409,8 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
                 or group["shard_indexes"]
                 == set(range(1, group["shard_count"] + 1))
             )
+            if not verified:
+                continue
             artifacts.append({
                 "filename": group["files"][0]["filename"],
                 "files": group["files"],
@@ -403,6 +420,8 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
                 ),
                 "sharded": group["shard_count"] > 1,
             })
+        if not artifacts:
+            continue
         artifacts.sort(key=lambda item: (
             item["weight_size_bytes"] is None,
             item["weight_size_bytes"] or math.inf,

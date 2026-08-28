@@ -58,6 +58,11 @@ _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
+_PUBLIC_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
+    r"(?P<count>\d{5})(?P<suffix>\.gguf)$",
+    re.IGNORECASE,
+)
 
 
 def _discovered_launch_controls(
@@ -1221,23 +1226,58 @@ class SparkDeckService:
         resolved_revision = str(resolution.get("resolved_revision") or "")
         if not re.fullmatch(r"[0-9a-f]{40}", resolved_revision):
             raise RuntimeError("model preparation did not resolve an immutable revision")
-        await virtual_nas.download_model_checked(
-            repository, resolved_revision, requested_revision=revision,
+        selected_files = [relative.as_posix()]
+        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name)
+        if shard:
+            shard_count = int(shard.group("count"))
+            selected_files = [
+                str(relative.with_name(
+                    f"{shard.group('stem')}-{index:05d}"
+                    f"{shard.group('separator')}{shard_count:05d}"
+                    f"{shard.group('suffix')}"
+                ))
+                for index in range(1, shard_count + 1)
+            ]
+        await virtual_nas.download_model_files_checked(
+            repository, resolved_revision, selected_files,
+            requested_revision=revision,
         )
         model_root = virtual_nas._model_path(repository).resolve()
-        candidate = model_root / "snapshots" / resolved_revision
+        snapshot_root = model_root / "snapshots" / resolved_revision
+        candidate = snapshot_root
         for part in relative.parts:
             candidate = candidate / part
-        resolved = candidate.resolve()
-        try:
-            resolved.relative_to(model_root)
-        except ValueError as exc:
-            raise RuntimeError("prepared GGUF artifact escapes the model cache") from exc
-        if not resolved.is_file():
-            raise RuntimeError(
-                "model preparation completed without the selected GGUF artifact"
-            )
-        return str(resolved)
+
+        def validate_artifact_path(logical_path: Path, missing_message: str) -> None:
+            try:
+                resolved_path = logical_path.resolve(strict=True)
+                allowed_root = (
+                    (model_root / "blobs").resolve(strict=True)
+                    if logical_path.is_symlink()
+                    else snapshot_root.resolve(strict=True)
+                )
+                resolved_path.relative_to(allowed_root)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(missing_message) from exc
+            if not logical_path.is_file():
+                raise RuntimeError(missing_message)
+
+        validate_artifact_path(
+            candidate,
+            "model preparation completed without the selected GGUF artifact",
+        )
+        if shard:
+            for selected_file in selected_files:
+                selected_relative = PurePosixPath(selected_file)
+                logical_shard = snapshot_root.joinpath(*selected_relative.parts)
+                validate_artifact_path(
+                    logical_shard,
+                    "model preparation completed without the complete selected GGUF shard set",
+                )
+        # Preserve the logical snapshot filename. Hugging Face cache entries
+        # are normally symlinks into blobs/, whose content-addressed targets
+        # have no .gguf suffix and do not retain multi-shard names.
+        return str(candidate)
 
     async def create_deployment(
         self, body: dict[str, Any], *, background: bool = False,
@@ -1251,40 +1291,58 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        # Runtime provenance is derived from the resolved launch input below;
+        # callers cannot promote a local model to public benchmark evidence.
+        settings.pop("model_source", None)
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")
         )
-        if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED and artifact:
-            artifact_path = Path(artifact).expanduser()
-            if not artifact_path.is_file():
-                artifact = await self._prepare_public_gguf_artifact(
-                    model, artifact, _optional_string(body.get("revision")) or "main",
-                    quantization,
-                )
-            settings["artifact"] = artifact
-            if quantization:
-                settings["quantization"] = quantization
         requested_node_ids = _requested_node_ids(body)
         deployment_mode = str(body.get("deployment_mode") or "").strip() or None
         if requested_node_ids is not None and kind is DeploymentKind.EXTERNAL:
             raise ValueError("node_ids are only supported for managed deployments")
         deployment_id = str(uuid.uuid4())
-        identity = ModelIdentity(
-            repository=model, revision=_optional_string(body.get("revision")),
-            artifact=artifact,
-            quantization=quantization,
-        )
-        deployment = Deployment(
-            id=deployment_id, alias=alias, runtime=runtime, kind=kind,
-            model=identity, settings=self._local_configuration(settings),
-            base_url_set=bool(body.get("base_url")),
-        )
         # A launch can take minutes, but serializing creation is intentional:
         # alias uniqueness must be established before Docker is mutated.
         async with self._deployment_create_lock:
             if self.store.deployment(alias):
                 raise ValueError(f"deployment alias '{alias}' is already in use")
+            if (
+                runtime is RuntimeKind.LLAMA_CPP
+                and kind is DeploymentKind.MANAGED
+                and artifact
+            ):
+                # Classify the caller's raw artifact. A repo-relative Hub path
+                # such as ~/quantized/model.gguf must not become controller-
+                # local merely because the same path exists under its home.
+                artifact_path = Path(artifact)
+                if artifact_path.is_absolute():
+                    if not artifact_path.is_file():
+                        raise ValueError(
+                            "llama.cpp managed deployments require an existing local GGUF artifact"
+                        )
+                    settings["model_source"] = "local"
+                else:
+                    artifact = await self._prepare_public_gguf_artifact(
+                        model, artifact,
+                        _optional_string(body.get("revision")) or "main",
+                        quantization,
+                    )
+                    settings["model_source"] = "public_repository"
+                settings["artifact"] = artifact
+                if quantization:
+                    settings["quantization"] = quantization
+            identity = ModelIdentity(
+                repository=model, revision=_optional_string(body.get("revision")),
+                artifact=artifact,
+                quantization=quantization,
+            )
+            deployment = Deployment(
+                id=deployment_id, alias=alias, runtime=runtime, kind=kind,
+                model=identity, settings=self._local_configuration(settings),
+                base_url_set=bool(body.get("base_url")),
+            )
             if kind is DeploymentKind.EXTERNAL:
                 base_url = self._validate_base_url(body.get("base_url"))
                 credential_ref = self._store_credential(deployment_id, body.get("api_key"))
@@ -1425,7 +1483,11 @@ class SparkDeckService:
                     deployment.container_name = launched.get("name")
                     deployment.settings = self._local_configuration({
                         **settings,
-                        "model_source": launched.get("model_source") or "unknown",
+                        "model_source": (
+                            settings.get("model_source")
+                            or launched.get("model_source")
+                            or "unknown"
+                        ),
                     })
                     port = launched.get("port")
                     if not deployment.container_name or not port:

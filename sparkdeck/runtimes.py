@@ -19,6 +19,10 @@ SPARKDECK_LABEL = "io.sparkdeck.managed"
 SPARKDECK_MODEL_LABEL = "io.sparkdeck.model"
 SPARKDECK_RUNTIME_LABEL = "io.sparkdeck.runtime"
 SPARKDECK_DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
+_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -87,14 +91,57 @@ class LlamaCppAdapter(RuntimeAdapter):
 
     def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
         artifact = str(settings.get("artifact") or model).strip()
-        artifact_path = Path(artifact).expanduser()
+        artifact_path = Path(artifact).expanduser().absolute()
         if artifact_path.suffix.casefold() != ".gguf" or not artifact_path.is_file():
             raise ValueError(
                 "llama.cpp managed deployments require an existing local GGUF artifact"
             )
-        resolved = str(artifact_path.resolve())
-        volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
-        artifact = "/models/model.gguf"
+        shard = _GGUF_SHARD_PATTERN.match(artifact_path.name)
+        if shard:
+            shard_count = int(shard.group("count"))
+            shards_by_index: dict[int, list[Path]] = {}
+            for candidate in artifact_path.parent.iterdir():
+                candidate_shard = _GGUF_SHARD_PATTERN.match(candidate.name)
+                if (
+                    candidate_shard
+                    and candidate_shard.group("stem").casefold()
+                    == shard.group("stem").casefold()
+                    and int(candidate_shard.group("count")) == shard_count
+                    and candidate.is_file()
+                ):
+                    index = int(candidate_shard.group("index"))
+                    shards_by_index.setdefault(index, []).append(candidate)
+            if any(
+                len(shards_by_index.get(index, [])) != 1
+                for index in range(1, shard_count + 1)
+            ):
+                raise ValueError(
+                    "llama.cpp managed deployment requires every GGUF shard"
+                )
+            shard_paths = [
+                shards_by_index[index][0]
+                for index in range(1, shard_count + 1)
+            ]
+            artifact_path = shard_paths[0]
+            resolved_shards = [path.resolve(strict=True) for path in shard_paths]
+            if len(set(resolved_shards)) != len(resolved_shards):
+                raise ValueError(
+                    "llama.cpp managed deployment requires distinct GGUF shards"
+                )
+            volumes = {
+                str(source): {
+                    "bind": f"/models/{logical.name}", "mode": "ro",
+                }
+                for logical, source in zip(shard_paths, resolved_shards, strict=True)
+            }
+            artifact = f"/models/{artifact_path.name}"
+        else:
+            volumes = {
+                str(artifact_path.resolve()): {
+                    "bind": "/models/model.gguf", "mode": "ro",
+                }
+            }
+            artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]
         context_size = settings.get("context_size") or settings.get("context_length")
         if context_size:

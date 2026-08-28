@@ -221,12 +221,192 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 resolved,
             )
 
+    async def test_selective_download_uses_selected_capacity_and_stays_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            resolved = "b" * 40
+            selected_name = "MODEL-00001-OF-00001.GGUF"
+            selected_size = 8
+            repository_size = selected_size + 500_000_000
+            repository = hub / "models--org--model"
+            snapshot = repository / "snapshots" / resolved
+
+            def download_file_into_cache(**kwargs):
+                (repository / "blobs").mkdir(parents=True, exist_ok=True)
+                snapshot.mkdir(parents=True, exist_ok=True)
+                self.assertEqual(kwargs["filename"], selected_name)
+                (snapshot / selected_name).write_bytes(b"12345678")
+                return str(snapshot / selected_name)
+
+            def download_full_snapshot(**kwargs):
+                (snapshot / "README.md").write_text("full", encoding="utf-8")
+                return str(snapshot)
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[
+                    Mock(rfilename=selected_name, size=selected_size),
+                    Mock(rfilename="README.md", size=repository_size - selected_size),
+                ],
+            )
+            hf_hub_download = Mock(side_effect=download_file_into_cache)
+            snapshot_download = Mock(side_effect=download_full_snapshot)
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+                snapshot_download=snapshot_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            selected_required = (
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            )
+            nas.free_bytes = Mock(return_value=selected_required)
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                result = await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                    requested_revision="release-gguf",
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["size_bytes"], selected_size)
+                self.assertTrue(
+                    (snapshot / ".sparkdeck-selective.incomplete").is_file()
+                )
+                partial_model = nas.inventory()[0]
+                self.assertTrue(partial_model["partial"])
+                self.assertEqual(partial_model["revision"], "release-gguf")
+                self.assertEqual(partial_model["revision_refs"], {})
+                self.assertEqual(
+                    partial_model["partial_revision_refs"],
+                    {"release-gguf": resolved},
+                )
+                self.assertEqual(hf_hub_download.call_count, 1)
+                self.assertEqual(
+                    hf_hub_download.call_args.kwargs["filename"], selected_name,
+                )
+
+                full = nas.download_model("org/model", resolved)
+
+            self.assertTrue(full["ok"])
+            self.assertEqual(snapshot_download.call_count, 1)
+            self.assertEqual(hf_hub_download.call_count, 1)
+            self.assertFalse(
+                (snapshot / ".sparkdeck-selective.incomplete").exists()
+            )
+            completed_model = nas.inventory()[0]
+            self.assertFalse(completed_model["partial"])
+            self.assertEqual(
+                completed_model["revision_refs"], {"release-gguf": resolved},
+            )
+
+    async def test_selective_download_credits_only_selected_resumable_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            resolved = "b" * 40
+            selected_name = "model.gguf"
+            selected_size = 8
+            selected_sha = "1" * 64
+            incomplete = blobs / f"{selected_sha}.incomplete"
+            incomplete.write_bytes(b"123")
+            snapshot = repository / "snapshots" / resolved
+
+            def download_file_into_cache(**kwargs):
+                incomplete.unlink()
+                snapshot.mkdir(parents=True, exist_ok=True)
+                (snapshot / selected_name).write_bytes(b"12345678")
+                return str(snapshot / selected_name)
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[Mock(
+                    rfilename=selected_name,
+                    size=selected_size,
+                    lfs=Mock(sha256=selected_sha),
+                    blob_id="2" * 40,
+                )],
+            )
+            hf_hub_download = Mock(side_effect=download_file_into_cache)
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            nas.free_bytes = Mock(return_value=(
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+            ))
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                result = await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                )
+
+            self.assertTrue(result["ok"])
+            hf_hub_download.assert_called_once()
+
+    async def test_selective_download_does_not_credit_unrelated_resumable_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            resolved = "b" * 40
+            selected_name = "model.gguf"
+            selected_size = 8
+            selected_blob_id = "1" * 40
+            (blobs / f"{'2' * 40}.incomplete").write_bytes(b"123")
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[Mock(
+                    rfilename=selected_name,
+                    size=selected_size,
+                    lfs=None,
+                    blob_id=selected_blob_id,
+                )],
+            )
+            hf_hub_download = Mock()
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            nas.free_bytes = Mock(return_value=(
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+            ))
+
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}),
+                self.assertRaisesRegex(RuntimeError, "insufficient free cache space"),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                )
+
+            hf_hub_download.assert_not_called()
+
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
             (complete / "blobs" / "next.incomplete").write_bytes(b"partial")
-            next_snapshot = complete / "snapshots" / "revision-2"
+            next_revision = "b" * 40
+            older_revision = "c" * 40
+            empty_revision = "d" * 40
+            lock_only_revision = "e" * 40
+            next_snapshot = complete / "snapshots" / next_revision
             next_snapshot.mkdir()
             completed_blob = complete / "blobs" / "next-complete"
             completed_blob.write_bytes(b"completed")
@@ -234,7 +414,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 (next_snapshot / "config.json").symlink_to(completed_blob)
             except OSError:
                 (next_snapshot / "config.json").write_bytes(b"completed")
-            older_snapshot = complete / "snapshots" / "revision-3"
+            older_snapshot = complete / "snapshots" / older_revision
             older_snapshot.mkdir()
             older_blob = complete / "blobs" / "older-complete"
             older_blob.write_bytes(b"older")
@@ -245,8 +425,16 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             (complete / "refs").mkdir()
             (complete / "refs" / "main").write_text("revision-1")
             (complete / "refs" / "stale").write_text("missing-revision")
-            (complete / "snapshots" / "empty-revision").mkdir()
-            (complete / "refs" / "empty").write_text("empty-revision")
+            (complete / "snapshots" / empty_revision).mkdir()
+            (complete / "refs" / "empty").write_text(empty_revision)
+            lock_only = complete / "snapshots" / lock_only_revision
+            lock_only.mkdir()
+            (lock_only / "download.lock").write_text("locked", encoding="utf-8")
+            (complete / "refs" / "locked").write_text(lock_only_revision)
+            non_commit = complete / "snapshots" / "release-partial"
+            non_commit.mkdir()
+            (non_commit / "config.json").write_text("{}", encoding="utf-8")
+            (complete / "refs" / "non-commit").write_text("release-partial")
             (hub / "models--partial--repo" / "snapshots").mkdir(parents=True)
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: False)
 
@@ -265,14 +453,67 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 len(b"completed") + len(b"older"),
             )
             self.assertEqual(models[0]["partial_revision_size_bytes"], {
-                "revision-2": len(b"completed"),
-                "revision-3": len(b"older"),
+                next_revision: len(b"completed"),
+                older_revision: len(b"older"),
             })
+            self.assertEqual(
+                models[0]["partial_revisions"],
+                [next_revision, older_revision],
+            )
+            self.assertNotIn("empty", models[0]["partial_revision_refs"])
+            self.assertNotIn("locked", models[0]["partial_revision_refs"])
+            self.assertNotIn("non-commit", models[0]["partial_revision_refs"])
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
+
+    async def test_partial_revision_survives_when_its_blob_is_shared_with_complete_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            shared_blob = blobs / "shared-content-hash"
+            shared_blob.write_bytes(b"shared-weights")
+            complete_revision = "c" * 40
+            partial_revision = "d" * 40
+            complete = repository / "snapshots" / complete_revision
+            partial = repository / "snapshots" / partial_revision
+            complete.mkdir(parents=True)
+            partial.mkdir(parents=True)
+            complete.joinpath("model.gguf").symlink_to(
+                Path("../../blobs/shared-content-hash")
+            )
+            partial.joinpath("model-00001-of-00002.gguf").symlink_to(
+                Path("../../blobs/shared-content-hash")
+            )
+            partial.joinpath(".sparkdeck-selective.incomplete").write_text(
+                "selective cache marker", encoding="utf-8",
+            )
+            refs = repository / "refs"
+            refs.mkdir()
+            refs.joinpath("release-shared").write_text(
+                partial_revision, encoding="utf-8",
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertFalse(model["partial"])
+            self.assertTrue(model["has_partial_download"])
+            self.assertEqual(model["partial_revisions"], [partial_revision])
+            self.assertEqual(
+                model["partial_revision_size_bytes"], {partial_revision: 0},
+            )
+            self.assertEqual(
+                model["partial_revision_refs"],
+                {"release-shared": partial_revision},
+            )
+            self.assertEqual(model["revision"], "release-shared")
 
     async def test_inventory_accepts_complete_windows_snapshot_without_blob_links(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -895,6 +1136,68 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             manager.virtual_nas.queue_download_and_transfer.await_count, 1,
+        )
+
+    async def test_manager_finishes_selective_cache_at_its_pinned_non_main_revision(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": []}
+        manager.virtual_nas.resolve_download_revision = AsyncMock()
+        manager.virtual_nas.estimate_download_size = AsyncMock(return_value=100)
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["download-1"],
+            "jobs": [{
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "local",
+                "status": "queued", "bytes_total": 100, "bytes_transferred": 0,
+                "created_at": 1,
+            }],
+        })
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "cache_free_size": 10**9,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 8,
+                "partial": True, "has_partial_download": True,
+                "revision": "release-gguf",
+                "partial_revision_refs": {"release-gguf": RESOLVED_REVISION},
+                "partial_revisions": [RESOLVED_REVISION],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 0},
+            }],
+        }])
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 100},
+            "targets": [{
+                "node_id": "local", "has_partial_model_cache": True,
+                "download_eligible": True,
+            }],
+        })
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "local",
+        )
+
+        self.assertEqual(result["job_ids"], ["download-1"])
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+        manager.virtual_nas.estimate_download_size.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION,
+        )
+        pinned_resolution = {
+            "requested_revision": "release-gguf",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 100,
+            "resume_node_id": "local",
+            "download_cache_baseline_bytes": None,
+        }
+        manager.virtual_nas_transfer_preflight.assert_awaited_once_with(
+            "org/model", "release-gguf", pinned_resolution,
+        )
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "local", [], 100,
+            requested_revision="release-gguf", require_partial_cache=True,
+            download_cache_baseline_bytes=None,
         )
 
     async def test_resume_preflight_credits_only_bytes_after_attempt_baseline(self):

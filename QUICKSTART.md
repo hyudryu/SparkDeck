@@ -125,7 +125,7 @@ Direct HTTP is still encrypted between Tailscale peers by Tailscale's WireGuard 
 3. Change the current node's name to something recognizable, such as `Spark 1`.
 4. In **Add a node from this controller**, copy Spark 1's private access URL and the current one-time pairing code.
 
-![Cluster onboarding with illustrative dummy data](docs/screenshots/readme/cluster-management-dark.png)
+![Cluster Management with illustrative dummy data](docs/screenshots/readme/cluster-management-dark.png)
 
 The pairing code is temporary. Generate or copy a fresh code immediately before joining Spark 2.
 

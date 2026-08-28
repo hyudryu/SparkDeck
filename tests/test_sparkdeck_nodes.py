@@ -365,7 +365,9 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["deployment_mode"], "replicated")
         self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
         self.assertEqual(stored["settings"]["context_length"], 8192)
-        self.assertNotIn("image", stored["settings"])
+        # Saved launch inputs must survive persistence so a bookmark relaunch
+        # uses the same image instead of a silent default.
+        self.assertEqual(stored["settings"]["image"], "private/image")
 
         self.manager.deployments = [self.manager.create_deployment.return_value]
         listed = (await self.service.deployments())[0]

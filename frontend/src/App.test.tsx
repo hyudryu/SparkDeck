@@ -1656,6 +1656,48 @@ describe('model deployments', () => {
     expect(await screen.findByText('Starting Saved model on This device.')).toBeInTheDocument()
   })
 
+  it('keeps viable nodes launchable when an unrelated node lacks cache space', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-mixed/prepare/preflight' && (init?.method ?? 'GET') === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main',
+          source: null, sources: [],
+          download: { size_bytes: 5_000_000_000, required_free_bytes: 10_000_000_000 },
+          targets: [
+            { node_id: 'local', node_name: 'Spark One', eligible: true, has_required_weights: false, has_model_cache: false, free_bytes: 900, download_eligible: true },
+            { node_id: 'node-2', node_name: 'Spark Two', eligible: false, has_required_weights: false, has_model_cache: false, free_bytes: 100, download_eligible: false, download_reason: 'Not enough free cache space for the Hugging Face download' },
+          ],
+          node_ids: ['local', 'node-2'], eligible: true, action: 'download',
+          download_node_id: 'local', download_node_ids: ['local'],
+          transfer_target_node_ids: [], reason: null,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-mixed', alias: 'Mixed nodes', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'saved', settings: {}, node_ids: ['local'],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Mixed nodes' })
+    await waitFor(() => expect(
+      within(dialog).getByRole('radio', { name: /Spark Two/ }),
+    ).toBeDisabled())
+    // Spark One can receive the weights, so the launch stays available even
+    // though Spark Two is blocked by its own cache capacity.
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('button', { name: /launch on 1 node/i })).toBeEnabled()
+  })
+
   it('blocks a saved deployment launch when no node has enough free cache space', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {
@@ -1666,7 +1708,7 @@ describe('model deployments', () => {
           source: null, sources: [],
           download: { size_bytes: 5_000_000_000, required_free_bytes: 10_000_000_000 },
           targets: [
-            { node_id: 'local', node_name: 'Spark One', eligible: false, has_required_weights: false, has_model_cache: false, free_bytes: 100, download_eligible: true, reason: 'Not enough free cache space for the Hugging Face download' },
+            { node_id: 'local', node_name: 'Spark One', eligible: false, has_required_weights: false, has_model_cache: false, free_bytes: 100, download_eligible: false, download_reason: 'Not enough free cache space for the Hugging Face download', transfer_after_download_eligible: false, transfer_after_download_reason: 'Not enough free cache space for Virtual NAS staging' },
           ],
           node_ids: ['local'], eligible: false, action: 'download',
           download_node_id: null, download_node_ids: [],

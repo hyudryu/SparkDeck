@@ -268,6 +268,7 @@ CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
 # counter baseline exists, any single-rank increment is detected immediately.
 CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
+INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 
 # vLLM prints its allocated KV capacity after engine initialization. Poll only
 # deployments that have not produced a usable capacity report yet; once found,
@@ -366,6 +367,10 @@ class StreamNudge(Exception):
 
 class ClusterReplicaUnavailable(RuntimeError):
     """A replica-local availability failure that may be failed over."""
+
+
+class _InterruptedLaunchDeferred(RuntimeError):
+    """Startup relaunch is waiting for one or more selected nodes."""
 
 
 _STREAM_READY = object()
@@ -637,6 +642,7 @@ class Manager:
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
         self.deployment_resume_task: asyncio.Task | None = None
+        self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
         # A controller restart can attach to an older deployment whose vLLM
@@ -4354,9 +4360,17 @@ class Manager:
             if isinstance(result, Exception):
                 spec["status"] = "error"
                 spec["error"] = str(result)
+                spec["phase"] = {
+                    "phase": "error",
+                    "message": f"Launch failed: {result}",
+                }
                 errors.append(f"{spec['node_name']}: {result}")
             else:
                 spec["status"] = result.get("status", "starting")
+                spec["phase"] = result.get("phase") or {
+                    "phase": "starting",
+                    "message": "Container created; starting the model server",
+                }
                 spec["container_id"] = result.get("id")
                 spec["port"] = result.get("port") or spec.get("port")
                 model_source = str(result.get("model_source") or "unknown")
@@ -4602,24 +4616,62 @@ class Manager:
 
     async def _resume_interrupted_deployments(self) -> None:
         """Relaunch accepted work whose request died before containers existed."""
-        candidates = [
-            deployment for deployment in list(self.deployments)
-            if isinstance(deployment, dict)
-            and deployment.get("status") in {"launching", "recovering"}
-            and deployment.get("desired_state") != "stopped"
-            and isinstance(deployment.get("launch_settings"), dict)
-        ]
-        for deployment in candidates:
-            try:
-                await self._resume_interrupted_deployment(deployment["id"])
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                current = self._deployment(deployment.get("id"))
-                if current is not None:
-                    current["status"] = "error"
-                    current["error"] = f"Could not resume interrupted launch: {exc}"
-                    self._save_deployments()
+        while True:
+            candidates = [
+                deployment for deployment in list(self.deployments)
+                if isinstance(deployment, dict)
+                and deployment.get("status") in {"launching", "recovering"}
+                and deployment.get("desired_state") != "stopped"
+                and isinstance(deployment.get("launch_settings"), dict)
+            ]
+            if not candidates:
+                return
+            retry_required = False
+            for deployment in candidates:
+                try:
+                    await self._resume_interrupted_deployment(deployment["id"])
+                except asyncio.CancelledError:
+                    raise
+                except _InterruptedLaunchDeferred as exc:
+                    current = self._deployment(deployment.get("id"))
+                    if current is not None:
+                        current["status"] = "recovering"
+                        current["error"] = None
+                        current["status_message"] = str(exc)
+                        self._save_deployments()
+                    retry_required = True
+                except Exception as exc:
+                    current = self._deployment(deployment.get("id"))
+                    if current is not None:
+                        current["status"] = "error"
+                        current["error"] = (
+                            f"Could not resume interrupted launch: {exc}"
+                        )
+                        self._save_deployments()
+            if not retry_required:
+                return
+            await self._wait_for_interrupted_launch_retry()
+
+    async def _wait_for_interrupted_launch_retry(self) -> None:
+        wakeup = getattr(self, "_deployment_resume_wakeup", None)
+        if wakeup is None:
+            wakeup = self._deployment_resume_wakeup = asyncio.Event()
+        try:
+            await asyncio.wait_for(
+                wakeup.wait(), timeout=INTERRUPTED_LAUNCH_RETRY_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        finally:
+            wakeup.clear()
+
+    @staticmethod
+    def _interrupted_launch_reconnect_error(exc: BaseException) -> bool:
+        message = str(exc).casefold()
+        return any(marker in message for marker in (
+            "offline", "unavailable", "unreachable", "connection",
+            "could not connect", "timed out", "timeout",
+        ))
 
     async def _resume_interrupted_deployment(self, deployment_id: str) -> None:
         deployment = self._deployment(deployment_id)
@@ -4650,13 +4702,28 @@ class Manager:
         deployment["status"] = "recovering"
         deployment["status_message"] = "Resuming interrupted deployment launch"
         self._save_deployments()
+        try:
+            await self.selected_cluster_nodes(
+                list(deployment.get("node_ids") or [LOCAL_NODE_ID])
+            )
+        except Exception as exc:
+            if self._interrupted_launch_reconnect_error(exc):
+                raise _InterruptedLaunchDeferred(
+                    f"Waiting for selected nodes to reconnect: {exc}"
+                ) from exc
+            raise
         removed = await asyncio.gather(*(
             self._member_action(member, "remove")
             for member in deployment.get("members") or []
         ), return_exceptions=True)
         remove_errors = self._member_action_errors(removed, "remove")
         if remove_errors:
-            raise RuntimeError("; ".join(remove_errors))
+            error = RuntimeError("; ".join(remove_errors))
+            if self._interrupted_launch_reconnect_error(error):
+                raise _InterruptedLaunchDeferred(
+                    f"Waiting for selected nodes to reconnect: {error}"
+                ) from error
+            raise error
 
         # Remove the stale reservation only after its old member names have
         # been cleaned up. create_deployment then atomically accepts a fresh
@@ -4669,17 +4736,37 @@ class Manager:
             await self.create_deployment(launch_body)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            replacement_exists = any(
-                isinstance(item, dict)
-                and item.get("automation_run_id") == resume_token
-                for item in self.deployments
+        except Exception as exc:
+            replacement = next(
+                (
+                    item for item in self.deployments
+                    if isinstance(item, dict)
+                    and item.get("automation_run_id") == resume_token
+                ),
+                None,
             )
-            if not replacement_exists:
-                deployment["status"] = "error"
-                deployment["error"] = "Interrupted deployment relaunch was rejected"
+            reconnecting = self._interrupted_launch_reconnect_error(exc)
+            if replacement is not None and reconnecting:
+                replacement["status"] = "recovering"
+                replacement["error"] = None
+                replacement["status_message"] = (
+                    f"Waiting for selected nodes to reconnect: {exc}"
+                )
+                self._save_deployments()
+                raise _InterruptedLaunchDeferred(
+                    replacement["status_message"]
+                ) from exc
+            if replacement is None:
+                deployment["status"] = "recovering" if reconnecting else "error"
+                deployment["error"] = None if reconnecting else (
+                    "Interrupted deployment relaunch was rejected"
+                )
                 self.deployments.append(deployment)
                 self._save_deployments()
+                if reconnecting:
+                    raise _InterruptedLaunchDeferred(
+                        f"Waiting for selected nodes to reconnect: {exc}"
+                    ) from exc
             raise
 
     def _cluster_health_issue(self, deployment: dict, nodes: list[dict]) -> str | None:
@@ -13159,6 +13246,21 @@ class Manager:
                 )
                 if not node.get("online"):
                     member["status"] = "unreachable"
+                    if saved.get("status") == "recovering":
+                        member["phase"] = {
+                            "phase": "recovering",
+                            "message": saved.get("status_message") or (
+                                "Waiting for selected nodes to reconnect"
+                            ),
+                        }
+                    else:
+                        member["phase"] = {
+                            "phase": "unreachable",
+                            "message": (
+                                f"{member.get('node_name') or member.get('node_id')} "
+                                "is unreachable"
+                            ),
+                        }
                 elif container:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")
@@ -13180,9 +13282,17 @@ class Manager:
                 ):
                     member["status"] = "unknown"
                     member["status_message"] = "Docker is unavailable"
+                    member["phase"] = {
+                        "phase": "unknown",
+                        "message": "Docker is unavailable",
+                    }
                     member_inventory_unknown = True
                 elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
+                    member["phase"] = {
+                        "phase": "missing",
+                        "message": "Managed container is missing",
+                    }
                 member["node_status"] = node.get("status", "unknown")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
@@ -13190,6 +13300,14 @@ class Manager:
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif saved.get("status") == "recovering" and any(
+                    s in {"unreachable", "missing", "dead", "error"}
+                    for s in member_states
+                ):
+                    # Startup recovery owns this deployment and will retry when
+                    # its selected nodes reconnect. Keep the public deployment
+                    # active while its member phase carries the honest wait.
+                    deployment["status"] = "recovering"
                 elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):

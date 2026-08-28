@@ -1291,40 +1291,55 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        # Runtime provenance is derived from the resolved launch input below;
+        # callers cannot promote a local model to public benchmark evidence.
+        settings.pop("model_source", None)
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")
         )
-        if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED and artifact:
-            artifact_path = Path(artifact).expanduser()
-            if not artifact_path.is_file():
-                artifact = await self._prepare_public_gguf_artifact(
-                    model, artifact, _optional_string(body.get("revision")) or "main",
-                    quantization,
-                )
-            settings["artifact"] = artifact
-            if quantization:
-                settings["quantization"] = quantization
         requested_node_ids = _requested_node_ids(body)
         deployment_mode = str(body.get("deployment_mode") or "").strip() or None
         if requested_node_ids is not None and kind is DeploymentKind.EXTERNAL:
             raise ValueError("node_ids are only supported for managed deployments")
         deployment_id = str(uuid.uuid4())
-        identity = ModelIdentity(
-            repository=model, revision=_optional_string(body.get("revision")),
-            artifact=artifact,
-            quantization=quantization,
-        )
-        deployment = Deployment(
-            id=deployment_id, alias=alias, runtime=runtime, kind=kind,
-            model=identity, settings=self._local_configuration(settings),
-            base_url_set=bool(body.get("base_url")),
-        )
         # A launch can take minutes, but serializing creation is intentional:
         # alias uniqueness must be established before Docker is mutated.
         async with self._deployment_create_lock:
             if self.store.deployment(alias):
                 raise ValueError(f"deployment alias '{alias}' is already in use")
+            if (
+                runtime is RuntimeKind.LLAMA_CPP
+                and kind is DeploymentKind.MANAGED
+                and artifact
+            ):
+                artifact_path = Path(artifact).expanduser()
+                if artifact_path.is_absolute():
+                    if not artifact_path.is_file():
+                        raise ValueError(
+                            "llama.cpp managed deployments require an existing local GGUF artifact"
+                        )
+                    settings["model_source"] = "local"
+                else:
+                    artifact = await self._prepare_public_gguf_artifact(
+                        model, artifact,
+                        _optional_string(body.get("revision")) or "main",
+                        quantization,
+                    )
+                    settings["model_source"] = "public_repository"
+                settings["artifact"] = artifact
+                if quantization:
+                    settings["quantization"] = quantization
+            identity = ModelIdentity(
+                repository=model, revision=_optional_string(body.get("revision")),
+                artifact=artifact,
+                quantization=quantization,
+            )
+            deployment = Deployment(
+                id=deployment_id, alias=alias, runtime=runtime, kind=kind,
+                model=identity, settings=self._local_configuration(settings),
+                base_url_set=bool(body.get("base_url")),
+            )
             if kind is DeploymentKind.EXTERNAL:
                 base_url = self._validate_base_url(body.get("base_url"))
                 credential_ref = self._store_credential(deployment_id, body.get("api_key"))
@@ -1465,7 +1480,11 @@ class SparkDeckService:
                     deployment.container_name = launched.get("name")
                     deployment.settings = self._local_configuration({
                         **settings,
-                        "model_source": launched.get("model_source") or "unknown",
+                        "model_source": (
+                            settings.get("model_source")
+                            or launched.get("model_source")
+                            or "unknown"
+                        ),
                     })
                     port = launched.get("port")
                     if not deployment.container_name or not port:

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -63,7 +63,278 @@ describe('ExplorePage model rows', () => {
     expect(within(estimate).getByText('31.3 tok/s')).toBeInTheDocument()
     expect(within(estimate).getByText(/1,000-token prompt-length bucket/)).toBeInTheDocument()
     expect(within(estimate).getByText(/estimate, not a guarantee/)).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')
+    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
+  })
+
+  it('offers an unquantized Hugging Face GGUF with controller-local fit and an overridable runtime filter', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({
+        items: [{
+          id: 'org/model-GGUF', name: 'model-GGUF', downloads: 100, likes: 5,
+          weight_size_bytes: 12 * gib,
+          runtime_compatibility: [
+            { runtime: 'vllm', supported: true },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+          local_deployment_ids: ['existing-vllm'],
+        }],
+        total: 1,
+      })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'org/model-GGUF', name: 'model-GGUF',
+        runtime_compatibility: [
+          { runtime: 'vllm', supported: false },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'unknown', files: [{ filename: 'model.gguf', size_bytes: 6 * gib }],
+          artifacts: [{
+            filename: 'model.gguf',
+            files: [{ filename: 'model.gguf', size_bytes: 6 * gib }],
+            weight_size_bytes: 6 * gib,
+            sharded: false,
+          }],
+        }],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    const row = await screen.findByRole('button', { name: 'Expand org/model-GGUF' })
+    expect(within(row).getByText('12 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'vllm')
+    await user.click(screen.getByRole('button', { name: 'Expand org/model-GGUF' }))
+
+    const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
+    expect(deploymentType).toHaveValue('vllm')
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    await screen.findByText('model.gguf')
+    expect(within(deploymentType).getByRole('option', { name: 'vLLM' })).toBeEnabled()
+    await user.selectOptions(deploymentType, 'llama.cpp')
+    expect(deploymentType).toHaveValue('llama.cpp')
+    const selectedRow = screen.getByRole('button', { name: 'Collapse org/model-GGUF' })
+    expect(within(selectedRow).getByText('6.0 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
+    expect(screen.getByText(/Tight fit · 6\.0 GB/)).toBeInTheDocument()
+    expect(screen.getByText(/Llama server deployments run on the controller/)).toHaveTextContent('8.0 GB on the controller node')
+    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('unknown\u0000model.gguf')
+    expect(screen.getByRole('link', { name: 'Deploy org/model-GGUF' })).toHaveAttribute(
+      'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&artifact=model.gguf',
+    )
+  })
+
+  it('preserves a compatible row runtime selection when model details arrive', async () => {
+    const user = userEvent.setup()
+    let resolveDetails: ((response: Response) => void) | undefined
+    const pendingDetails = new Promise<Response>((resolve) => { resolveDetails = resolve })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({ items: [{
+        id: 'org/async-details', name: 'async-details', weight_size_bytes: 8 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: true },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+          files: [{ filename: 'search.gguf', size_bytes: 8 * gib }],
+          artifacts: [{
+            filename: 'search.gguf', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'search.gguf', size_bytes: 8 * gib }],
+          }],
+        }],
+      }], total: 1 })
+      if (path.includes('/api/v1/catalog/models/')) return pendingDetails
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [{
+        id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true,
+        stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] },
+      }] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/async-details' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'vllm')
+    await user.click(screen.getByRole('button', { name: 'Expand org/async-details' }))
+    expect(screen.getByText(/Loading available quantizations/)).toBeInTheDocument()
+    const deploymentType = screen.getByRole('combobox', { name: 'Deployment type for org/async-details' })
+    await user.selectOptions(deploymentType, 'llama.cpp')
+    expect(deploymentType).toHaveValue('llama.cpp')
+
+    await act(async () => resolveDetails?.(json({ model: {
+      id: 'org/async-details', name: 'async-details', runtime_compatibility: [
+        { runtime: 'vllm', supported: true },
+        { runtime: 'llama.cpp', supported: true },
+        { runtime: 'sglang', supported: false },
+      ],
+      quantizations: [{
+        name: 'Q5_K_M', weight_size_bytes: 9 * gib,
+        files: [{ filename: 'detail-only.gguf', size_bytes: 9 * gib }],
+        artifacts: [{
+          filename: 'detail-only.gguf', weight_size_bytes: 9 * gib,
+          files: [{ filename: 'detail-only.gguf', size_bytes: 9 * gib }],
+        }],
+      }],
+    }, aggregates: [] })))
+
+    expect(await screen.findByText('detail-only.gguf')).toBeInTheDocument()
+    expect(deploymentType).toHaveValue('llama.cpp')
+  })
+
+  it('uses controller capacity for Llama-only models when filtering all runtimes by fit', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [
+        {
+          id: 'org/llama-too-large', name: 'llama-too-large', weight_size_bytes: 12 * gib,
+          downloads: 30, likes: 3, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+        },
+        {
+          id: 'org/llama-small', name: 'llama-small', weight_size_bytes: 6 * gib,
+          downloads: 20, likes: 2, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+        },
+        {
+          id: 'org/vllm-model', name: 'vllm-model', weight_size_bytes: 12 * gib,
+          downloads: 10, likes: 1, runtime_compatibility: [
+            { runtime: 'vllm', supported: true },
+            { runtime: 'llama.cpp', supported: false },
+            { runtime: 'sglang', supported: true },
+          ],
+        },
+      ], total: 3 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/llama-too-large' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    expect(screen.queryByRole('button', { name: 'Expand org/llama-too-large' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Expand org/llama-small' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Expand org/vllm-model' })).toBeInTheDocument()
+  })
+
+  it('filters Llama models by their default GGUF artifact size instead of model-level weights', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [
+        {
+          id: 'org/small-artifact', name: 'small-artifact', weight_size_bytes: 30 * gib,
+          downloads: 20, likes: 2, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+          quantizations: [{
+            name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'small-q4_k_m.gguf', size_bytes: 8 * gib }],
+            artifacts: [{
+              filename: 'small-q4_k_m.gguf', weight_size_bytes: 8 * gib,
+              files: [{ filename: 'small-q4_k_m.gguf', size_bytes: 8 * gib }],
+            }],
+          }],
+        },
+        {
+          id: 'org/large-artifact', name: 'large-artifact', weight_size_bytes: 8 * gib,
+          downloads: 10, likes: 1, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+          quantizations: [{
+            name: 'F16', weight_size_bytes: 30 * gib,
+            files: [{ filename: 'large-f16.gguf', size_bytes: 30 * gib }],
+            artifacts: [{
+              filename: 'large-f16.gguf', weight_size_bytes: 30 * gib,
+              files: [{ filename: 'large-f16.gguf', size_bytes: 30 * gib }],
+            }],
+          }],
+        },
+      ], total: 2 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 64 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/small-artifact' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+    expect(await screen.findByText('16 GB controller memory for Llama server')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    expect(screen.getByRole('button', { name: 'Expand org/small-artifact' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Expand org/large-artifact' })).not.toBeInTheDocument()
+  })
+
+  it('allows an active fit filter to be cleared after switching to Llama without controller telemetry', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/mixed-runtime', name: 'mixed-runtime', weight_size_bytes: 8 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: true },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+          files: [{ filename: 'mixed-q4_k_m.gguf', size_bytes: 8 * gib }],
+          artifacts: [{
+            filename: 'mixed-q4_k_m.gguf', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'mixed-q4_k_m.gguf', size_bytes: 8 * gib }],
+          }],
+        }],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: false, selectable: false, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/mixed-runtime' })).toBeInTheDocument()
+    const fits = screen.getByRole('checkbox', { name: /Only what fits/ })
+    await user.click(fits)
+    expect(fits).toBeChecked()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+
+    expect(await screen.findByText('Controller memory unavailable')).toBeInTheDocument()
+    expect(fits).toBeChecked()
+    expect(fits).toBeEnabled()
+    expect(await screen.findByText('No models found')).toBeInTheDocument()
+
+    await user.click(fits)
+    expect(fits).not.toBeChecked()
+    expect(await screen.findByRole('button', { name: 'Expand org/mixed-runtime' })).toBeInTheDocument()
   })
 
   it('color codes cluster fit and filters fitting models largest first', async () => {
@@ -101,7 +372,7 @@ describe('ExplorePage model rows', () => {
     expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
     expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
     expect(screen.getByRole('link', { name: 'Deploy zai-org/GLM-5.3-Flash' })).toHaveAttribute(
-      'href', '/models?model=zai-org%2FGLM-5.3-Flash&layout=sharded',
+      'href', '/models?model=zai-org%2FGLM-5.3-Flash&runtime=vllm&layout=sharded',
     )
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
@@ -143,7 +414,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
     await user.click(expand)
     expect(screen.getByRole('link', { name: 'Deploy org/worker-pool-only' })).toHaveAttribute(
-      'href', '/models?model=org%2Fworker-pool-only',
+      'href', '/models?model=org%2Fworker-pool-only&runtime=vllm',
     )
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
@@ -173,6 +444,116 @@ describe('ExplorePage model rows', () => {
     await user.click(screen.getByRole('button', { name: 'Expand community/model (unknown, 1,000-token prompt bucket)' }))
     expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
+  })
+
+  it('does not carry a hidden Hugging Face Llama fit filter into the community tab', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/community-mixed', name: 'community-mixed', weight_size_bytes: 12 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: true },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', weight_size_bytes: 12 * gib,
+          files: [{ filename: 'community-mixed-q4_k_m.gguf', size_bytes: 12 * gib }],
+          artifacts: [{
+            filename: 'community-mixed-q4_k_m.gguf', weight_size_bytes: 12 * gib,
+            files: [{ filename: 'community-mixed-q4_k_m.gguf', size_bytes: 12 * gib }],
+          }],
+        }],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({
+        items: [{
+          model_id: 'org/community-mixed', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
+          inference_tokens_per_second: 20, sample_count: 10, unique_cluster_count: 2,
+          weight_size_bytes: 12 * gib,
+        }],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/community-mixed' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+    expect(await screen.findByText('No models found')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Community Run Models' }))
+
+    expect(await screen.findByText('24 GB aggregate sharded memory across 2 measured nodes')).toBeInTheDocument()
+    expect(await screen.findByRole('button', {
+      name: 'Expand org/community-mixed (Q4_K_M, 1,000-token prompt bucket)',
+    })).toBeInTheDocument()
+  })
+
+  it('filters community Llama variants using the GGUF artifact matching their quantization', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/community-llama', name: 'community-llama', weight_size_bytes: 20 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: false },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [
+          {
+            name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'community-q4_k_m.gguf', size_bytes: 8 * gib }],
+            artifacts: [{
+              filename: 'community-q4_k_m.gguf', weight_size_bytes: 8 * gib,
+              files: [{ filename: 'community-q4_k_m.gguf', size_bytes: 8 * gib }],
+            }],
+          },
+          {
+            name: 'Q8_0', weight_size_bytes: 20 * gib,
+            files: [{ filename: 'community-q8_0.gguf', size_bytes: 20 * gib }],
+            artifacts: [{
+              filename: 'community-q8_0.gguf', weight_size_bytes: 20 * gib,
+              files: [{ filename: 'community-q8_0.gguf', size_bytes: 20 * gib }],
+            }],
+          },
+        ],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 64 * 1024 }] } },
+      ] })
+      return json({
+        items: [
+          { model_id: 'org/community-llama', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, unique_cluster_count: 2 },
+          { model_id: 'org/community-llama', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 10, unique_cluster_count: 2 },
+        ],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
+    expect(await screen.findByRole('button', {
+      name: 'Expand org/community-llama (Q4_K_M, 1,000-token prompt bucket)',
+    })).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Expand org/community-llama (Q8_0, 1,000-token prompt bucket)',
+    })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    expect(screen.getByRole('button', {
+      name: 'Expand org/community-llama (Q4_K_M, 1,000-token prompt bucket)',
+    })).toBeInTheDocument()
+    expect(screen.queryByRole('button', {
+      name: 'Expand org/community-llama (Q8_0, 1,000-token prompt bucket)',
+    })).not.toBeInTheDocument()
   })
 
   it('pages large community result sets instead of rendering every model at once', async () => {
@@ -250,13 +631,18 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
     expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
     expect(within(nvfp4.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
-      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=NVFP4',
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=vllm&quantization=NVFP4',
     )
 
     await user.click(gguf)
-    expect(await within(gguf.closest('article')!).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    const ggufRow = gguf.closest('article')!
+    expect(await within(ggufRow).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    const deploymentType = within(ggufRow).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    await user.selectOptions(deploymentType, 'llama.cpp')
+    expect(within(ggufRow).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')
     expect(within(gguf.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
-      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
     )
   })
 

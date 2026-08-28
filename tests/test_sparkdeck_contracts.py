@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -143,33 +144,213 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         virtual_nas.resolve_download_revision = AsyncMock(return_value={
             "resolved_revision": revision,
         })
-        virtual_nas.download_model_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
         launch = AsyncMock(return_value={
             "name": "sparkdeck-gguf", "port": 8080, "status": "running",
-            "model_source": "public_repository",
+            "model_source": "unknown",
         })
 
         with patch("sparkdeck.service.launch_managed_container", launch):
             created = await self.service.create_deployment({
                 "model": "org/model", "alias": "prepared-gguf",
-                "runtime": "llama.cpp", "revision": "main",
+                "runtime": "llama.cpp", "revision": "release-gguf",
                 "quantization": "f16",
                 "settings": {"artifact": "FP16/model-F16.gguf"},
             })
 
         virtual_nas.resolve_download_revision.assert_awaited_once_with(
-            "org/model", "main",
+            "org/model", "release-gguf",
         )
-        virtual_nas.download_model_checked.assert_awaited_once_with(
-            "org/model", revision, requested_revision="main",
+        virtual_nas.download_model_files_checked.assert_awaited_once_with(
+            "org/model", revision, ["FP16/model-F16.gguf"],
+            requested_revision="release-gguf",
         )
         launch_settings = launch.await_args.args[5]
         self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
+        self.assertEqual(launch_settings["model_source"], "public_repository")
         self.assertEqual(created["model"]["repository"], "org/model")
         self.assertEqual(created["model"]["quantization"], "FP16")
         self.assertEqual(created["model"]["artifact"], str(artifact.resolve()))
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+        stored = self.service.store.deployment(created["id"], include_private=True)
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+
+    async def test_repo_relative_gguf_ignores_coincidental_cwd_file(self):
+        prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
+        ambient_cwd = Path(self.temp.name) / "ambient-cwd"
+        ambient_cwd.mkdir()
+        ambient_cwd.joinpath("model.gguf").write_bytes(b"unrelated")
+        prepare = AsyncMock(return_value=prepared)
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-coincidental", "port": 8080, "status": "running",
+        })
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(ambient_cwd)
+            with (
+                patch.object(
+                    self.service, "_prepare_public_gguf_artifact", prepare,
+                ),
+                patch("sparkdeck.service.launch_managed_container", launch),
+            ):
+                created = await self.service.create_deployment({
+                    "model": "org/model", "alias": "coincidental",
+                    "runtime": "llama.cpp", "revision": "release-1",
+                    "settings": {"artifact": "model.gguf"},
+                })
+        finally:
+            os.chdir(original_cwd)
+
+        prepare.assert_awaited_once_with(
+            "org/model", "model.gguf", "release-1", None,
+        )
+        self.assertEqual(created["model"]["artifact"], prepared)
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+
+    async def test_repo_relative_tilde_gguf_is_not_expanded_to_controller_home(self):
+        prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
+        coincidental_home_artifact = Path(self.temp.name) / "home" / "model.gguf"
+        coincidental_home_artifact.parent.mkdir()
+        coincidental_home_artifact.write_bytes(b"unrelated")
+        prepare = AsyncMock(return_value=prepared)
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-tilde", "port": 8080, "status": "running",
+        })
+
+        with (
+            patch.object(Path, "expanduser", return_value=coincidental_home_artifact),
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            patch("sparkdeck.service.launch_managed_container", launch),
+        ):
+            created = await self.service.create_deployment({
+                "model": "org/model", "alias": "tilde-repository-path",
+                "runtime": "llama.cpp", "revision": "release-1",
+                "settings": {"artifact": "~/model.gguf"},
+            })
+
+        prepare.assert_awaited_once_with(
+            "org/model", "~/model.gguf", "release-1", None,
+        )
+        self.assertEqual(created["model"]["artifact"], prepared)
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+
+    async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
+        self.service.store.add_deployment(Deployment(
+            id="existing", alias="duplicate", runtime=RuntimeKind.LLAMA_CPP,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/existing"),
+        ))
+        prepare = AsyncMock()
+
+        with (
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            self.assertRaisesRegex(ValueError, "alias 'duplicate' is already in use"),
+        ):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "duplicate",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": "model.gguf"},
+            })
+
+        prepare.assert_not_awaited()
+
+    async def test_absolute_local_gguf_remains_local(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+        prepare = AsyncMock()
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-local", "port": 8080, "status": "running",
+            "model_source": "unknown",
+        })
+
+        with (
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            patch("sparkdeck.service.launch_managed_container", launch),
+        ):
+            created = await self.service.create_deployment({
+                "model": "local/model", "alias": "local-gguf",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": str(artifact)},
+            })
+
+        prepare.assert_not_awaited()
+        self.assertEqual(created["settings"]["model_source"], "local")
+
+    @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
+    async def test_prepared_gguf_preserves_logical_snapshot_symlink_name(self):
+        revision = "b" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        first_blob = model_root / "blobs" / "first-content-hash"
+        second_blob = model_root / "blobs" / "second-content-hash"
+        first_blob.parent.mkdir(parents=True)
+        first_blob.write_bytes(b"first")
+        second_blob.write_bytes(b"second")
+        artifact = (
+            model_root / "snapshots" / revision
+            / "model-00001-of-00002.gguf"
+        )
+        second_artifact = artifact.with_name("model-00002-of-00002.gguf")
+        artifact.parent.mkdir(parents=True)
+        artifact.symlink_to(Path("../../blobs/first-content-hash"))
+        second_artifact.symlink_to(Path("../../blobs/second-content-hash"))
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+
+        prepared = await self.service._prepare_public_gguf_artifact(
+            "org/model", "model-00001-of-00002.gguf", "main", None,
+        )
+
+        self.assertEqual(prepared, str(artifact))
+        self.assertTrue(Path(prepared).is_symlink())
+
+        outside = Path(self.temp.name) / "outside-shard"
+        outside.write_bytes(b"outside")
+        second_artifact.unlink()
+        second_artifact.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "complete selected GGUF shard set"):
+            await self.service._prepare_public_gguf_artifact(
+                "org/model", "model-00001-of-00002.gguf", "main", None,
+            )
+
+    async def test_prepared_gguf_preserves_uppercase_shard_filename_casing(self):
+        revision = "c" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        snapshot = model_root / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        first = snapshot / "MODEL-00001-OF-00002.GGUF"
+        second = snapshot / "MODEL-00002-OF-00002.GGUF"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+
+        prepared = await self.service._prepare_public_gguf_artifact(
+            "org/model", "MODEL-00001-OF-00002.GGUF", "main", None,
+        )
+
+        self.assertEqual(prepared, str(first))
+        virtual_nas.download_model_files_checked.assert_awaited_once_with(
+            "org/model", revision,
+            ["MODEL-00001-OF-00002.GGUF", "MODEL-00002-OF-00002.GGUF"],
+            requested_revision="main",
+        )
 
     async def test_managed_ownership_is_durable_before_container_launch(self):
         async def fail_launch(*args):

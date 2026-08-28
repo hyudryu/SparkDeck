@@ -48,7 +48,7 @@ export function Status({ status, children }: { status: string; children?: ReactN
 export function RuntimeMark({ runtime }: { runtime: string }) {
   const labels: Record<string, string> = {
     vllm: 'vLLM',
-    'llama.cpp': 'llama.cpp',
+    'llama.cpp': 'Llama server',
     sglang: 'SGLang',
   }
   return <span className="runtime-mark">{labels[runtime] ?? runtime}</span>

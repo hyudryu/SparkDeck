@@ -25,6 +25,7 @@ LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
+VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -640,6 +641,9 @@ class VirtualNAS:
                         incomplete_size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
+            incomplete_snapshot_bytes = _incomplete_snapshot_reusable_bytes(
+                repository, set(snapshot_revisions),
+            )
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
@@ -664,7 +668,9 @@ class VirtualNAS:
                     partial or incomplete_snapshot or incomplete_size_bytes > 0
                 ),
                 "partial_size_bytes": (
-                    size_bytes if partial else incomplete_size_bytes
+                    size_bytes if partial else (
+                        incomplete_size_bytes + incomplete_snapshot_bytes
+                    )
                 ),
                 "revisions": sorted(revisions),
                 "revision_refs": revision_refs,
@@ -1300,7 +1306,7 @@ class VirtualNAS:
                 if item.get("model_id") == job["model_id"]
                 and self._has_revision(
                     item, job.get("revision") or "main",
-                    job.get("requested_revision") or job.get("revision") or "main",
+                    job.get("revision") or "main",
                 )
             ), None)
             cached_model = next((
@@ -1308,8 +1314,11 @@ class VirtualNAS:
                 if item.get("model_id") == job["model_id"]
             ), None)
             if job.get("require_partial_cache") and not (
-                cached_model
-                and (cached_model.get("partial") or cached_model.get("has_partial_download"))
+                already_complete is not None
+                or (
+                    cached_model
+                    and (cached_model.get("partial") or cached_model.get("has_partial_download"))
+                )
             ):
                 raise LookupError("partial model cache no longer exists")
             if already_complete is None:
@@ -1327,19 +1336,44 @@ class VirtualNAS:
                     item for item in storage["models"]
                     if item.get("model_id") == job["model_id"]
                 ), None)
-                free_bytes = _optional_nonnegative_int(storage.get("free_size"))
-                required = download_required_free_bytes(
-                    current_size, cached_download_bytes(
-                        cached_model, job.get("download_cache_baseline_bytes"),
-                    ),
-                )
-                if free_bytes is None:
-                    raise RuntimeError("download node did not report free cache capacity")
-                if free_bytes < required:
-                    raise RuntimeError(
-                        f"download node has insufficient free cache space "
-                        f"({free_bytes} bytes available; {required} bytes required)"
+                already_complete = next((
+                    item for item in storage["models"]
+                    if item.get("model_id") == job["model_id"]
+                    and self._has_revision(
+                        item, job.get("revision") or "main",
+                        job.get("revision") or "main",
                     )
+                ), None)
+                if already_complete is None:
+                    if job.get("require_partial_cache") and not (
+                        cached_model and (
+                            cached_model.get("partial")
+                            or cached_model.get("has_partial_download")
+                        )
+                    ):
+                        raise LookupError("partial model cache no longer exists")
+                    free_bytes = _optional_nonnegative_int(storage.get("free_size"))
+                    required = download_required_free_bytes(
+                        current_size, cached_download_bytes(
+                            cached_model, job.get("download_cache_baseline_bytes"),
+                        ),
+                    )
+                    if free_bytes is None:
+                        raise RuntimeError("download node did not report free cache capacity")
+                    if free_bytes < required:
+                        raise RuntimeError(
+                            f"download node has insufficient free cache space "
+                            f"({free_bytes} bytes available; {required} bytes required)"
+                        )
+            if already_complete is not None:
+                completed_size = _nonnegative_int(job.get("bytes_total"))
+                job.update({
+                    "status": "completed",
+                    "bytes_transferred": completed_size,
+                    "completed_at": time.time(), "error": None,
+                })
+                self._save()
+                return
             if job["target_node_id"] == LOCAL_NODE_ID:
                 operation = asyncio.to_thread(
                     self.download_model, job["model_id"],
@@ -1347,21 +1381,25 @@ class VirtualNAS:
                     job.get("requested_revision") or job.get("revision") or "main",
                 )
             else:
-                await self._validate_download_node(job["target_node_id"])
+                download_status = await self._validate_download_node(job["target_node_id"])
+                download_body = {
+                    "revision": job.get("revision") or "main",
+                    "requested_revision": (
+                        job.get("requested_revision")
+                        or job.get("revision") or "main"
+                    ),
+                    "hf_token": token,
+                }
+                if VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY in (
+                    download_status.get("capabilities") or []
+                ):
+                    download_body["download_cache_baseline_bytes"] = job.get(
+                        "download_cache_baseline_bytes"
+                    )
                 operation = self.node_registry.request(
                     job["target_node_id"], "POST",
                     self._model_agent_path(job["model_id"], "download"),
-                    json_body={
-                        "revision": job.get("revision") or "main",
-                        "requested_revision": (
-                            job.get("requested_revision")
-                            or job.get("revision") or "main"
-                        ),
-                        "download_cache_baseline_bytes": job.get(
-                            "download_cache_baseline_bytes"
-                        ),
-                        "hf_token": token,
-                    },
+                    json_body=download_body,
                     timeout=24 * 60 * 60,
                 )
             job["download_attempted_at"] = time.time()
@@ -1632,6 +1670,57 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return complete
     except OSError:
         return set()
+
+
+def _incomplete_snapshot_reusable_bytes(
+    repository: Path, complete_revisions: set[str],
+) -> int:
+    """Count unique completed blobs referenced only by incomplete snapshots."""
+    try:
+        snapshots = repository / "snapshots"
+        blobs = repository / "blobs"
+        if (
+            not snapshots.is_dir() or snapshots.is_symlink()
+            or not blobs.is_dir() or blobs.is_symlink()
+        ):
+            return 0
+        blob_root = blobs.resolve(strict=True)
+        complete_blobs: set[Path] = set()
+        for revision in complete_revisions:
+            snapshot = snapshots / revision
+            if not snapshot.is_dir() or snapshot.is_symlink():
+                continue
+            for item in snapshot.rglob("*"):
+                if not item.is_symlink() or not item.is_file():
+                    continue
+                resolved = item.resolve(strict=True)
+                if resolved.is_relative_to(blob_root) and resolved.is_file():
+                    complete_blobs.add(resolved)
+        reusable: set[Path] = set()
+        for snapshot in snapshots.iterdir():
+            if (
+                snapshot.name in complete_revisions
+                or not snapshot.is_dir() or snapshot.is_symlink()
+            ):
+                continue
+            for item in snapshot.rglob("*"):
+                if item.name.endswith((".incomplete", ".lock")):
+                    continue
+                if item.is_symlink():
+                    if not item.is_file():
+                        continue
+                    resolved = item.resolve(strict=True)
+                    if (
+                        resolved.is_relative_to(blob_root)
+                        and resolved.is_file()
+                        and resolved not in complete_blobs
+                    ):
+                        reusable.add(resolved)
+                elif item.is_file():
+                    reusable.add(item)
+        return sum(item.stat().st_size for item in reusable)
+    except (OSError, RuntimeError, ValueError):
+        return 0
 
 
 def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:

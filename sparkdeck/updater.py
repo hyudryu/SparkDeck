@@ -429,6 +429,11 @@ class UpdateService:
         task_live = self._task is not None and not self._task.done()
         if state.get("active") and not task_live:
             if state.get("phase") == "updating_controller" and revision == state.get("target_revision"):
+                for node in state.get("nodes", []):
+                    if node.get("local"):
+                        node.update(phase="succeeded", current_revision=revision)
+                        node.pop("error", None)
+                        break
                 state.update(active=False, phase="succeeded", message="Cluster update completed")
             elif state.get("phase") == "updating_controller" and _helper_alive(self._read(self.agent_path)):
                 pass

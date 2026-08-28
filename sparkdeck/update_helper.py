@@ -200,18 +200,32 @@ def restart_service(root: Path) -> None:
         launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
         if not launcher.is_file():
             raise RuntimeError("The bundled Windows launcher was not found")
-        run(
-            root,
-            "powershell.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(launcher),
-            "restart",
+        # The launcher starts the replacement SparkDeck process before it
+        # exits. Capturing this command's pipes lets that long-lived child
+        # inherit their handles, so subprocess.run() waits forever for EOF
+        # even after PowerShell exits. A restart is a handoff, not a command
+        # whose output the updater needs to collect.
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher),
+                "restart",
+            ],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=180,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        if result.returncode:
+            raise RuntimeError("The bundled Windows launcher could not restart SparkDeck")
         return
     raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
 

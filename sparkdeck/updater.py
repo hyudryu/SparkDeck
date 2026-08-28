@@ -34,6 +34,9 @@ CAPABILITY = "cluster_update_main_v1"
 CONFIRMATION = "update-entire-cluster"
 UPDATE_STATE_FILENAME = "system-update-agent.json"
 FAILED_NODE_PHASES = {"failed", "rolled_back", "recovery_required"}
+RUNTIME_REVISION_BLOCKER = (
+    "Running SparkDeck revision could not be verified; restart SparkDeck before updating"
+)
 
 _WINDOWS_HELPER_BOOTSTRAP = r"""
 import json
@@ -183,6 +186,132 @@ def _windows_process_started(pid: int) -> int | None:
         kernel32.CloseHandle(handle)
 
 
+def _terminate_exact_windows_process(pid: int, expected_started_at: int) -> bool:
+    """Terminate one Windows process through the handle used to verify it."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # QUERY_LIMITED_INFORMATION | SYNCHRONIZE | TERMINATE. Keep one handle
+    # from identity check through termination so PID reuse cannot redirect it.
+    handle = kernel32.OpenProcess(0x101001, False, pid)
+    if not handle:
+        return False
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return False
+        started = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        if started != expected_started_at or not kernel32.TerminateProcess(handle, 1):
+            return False
+        return kernel32.WaitForSingleObject(handle, 5000) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_update_helper_children(parent_pid: int, target_revision: str) -> list[tuple[int, int]] | None:
+    """Find direct Python redirector children that run the legacy helper."""
+    command = (
+        f"$parentId={parent_pid}; $target='{target_revision}'; "
+        "$items=@(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$parentId\" | "
+        "Where-Object { $_.CommandLine -like '*sparkdeck.update_helper*' -and "
+        "$_.CommandLine -like \"*$target*\" } | ForEach-Object { "
+        "[pscustomobject]@{ pid=[int]$_.ProcessId; "
+        "started_at=[long]$_.CreationDate.ToUniversalTime().ToFileTimeUtc() } }); "
+        "ConvertTo-Json -Compress -InputObject $items"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", command],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode:
+            return None
+        payload = json.loads(result.stdout or "[]")
+        if not isinstance(payload, list):
+            return None
+        children = []
+        for item in payload:
+            if not isinstance(item, dict):
+                return None
+            pid = item.get("pid")
+            started_at = item.get("started_at")
+            if not isinstance(pid, int) or pid <= 0 or not isinstance(started_at, int):
+                return None
+            children.append((pid, started_at))
+        return children
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _terminate_replaced_windows_helper(state: dict) -> bool:
+    """Retire the verified legacy helper without killing the new server."""
+    if platform.system() != "Windows":
+        return False
+    pid = state.get("helper_pid")
+    expected = state.get("helper_started_at")
+    target = state.get("target_revision")
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or pid == os.getpid()
+        or not isinstance(expected, int)
+        or not isinstance(target, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", target)
+    ):
+        return False
+    # Windows venv launchers may leave the real interpreter as an immediate
+    # child. Retire that verified helper child first, then its launcher. Do not
+    # use taskkill /T: the healthy replacement server can also be a descendant
+    # of the restart command and must remain running.
+    children = _windows_update_helper_children(pid, target)
+    if children is None:
+        return False
+    for child_pid, discovered_started in children:
+        # CIM timestamps have microsecond precision while GetProcessTimes uses
+        # 100ns ticks. Require the same timestamp to that known precision, then
+        # terminate through a handle verified against the exact native value.
+        exact_started = _windows_process_started(child_pid)
+        if (
+            child_pid == os.getpid()
+            or exact_started is None
+            or abs(exact_started - discovered_started) >= 10
+            or not _terminate_exact_windows_process(child_pid, exact_started)
+        ):
+            return False
+    return _terminate_exact_windows_process(pid, expected)
+
+
 def _helper_alive(state: dict) -> bool:
     pid = state.get("helper_pid")
     if not isinstance(pid, int) or pid <= 0:
@@ -285,6 +414,10 @@ class UpdateService:
     def __init__(self, manager: Any, root: Path, data_dir: Path):
         self.manager = manager
         self.root = Path(root).resolve()
+        # Pin the revision loaded by this process. Git HEAD changes before the
+        # updater restarts the service, so reading it dynamically would let the
+        # old process falsely claim that it is already serving the new code.
+        self.runtime_revision = current_revision(self.root)
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.cluster_path = self.data_dir / "system-update.json"
@@ -359,12 +492,25 @@ class UpdateService:
     def _reconciled_agent_state(self, revision: str | None = None) -> dict:
         state = self._read(self.agent_path)
         if state.get("phase") in {"accepted", "staging", "restarting"}:
-            if not _helper_alive(state):
-                installed_after_restart = bool(
-                    state.get("phase") == "restarting"
-                    and revision
-                    and state.get("target_revision") == revision
-                )
+            installed_after_restart = bool(
+                state.get("phase") == "restarting"
+                and revision
+                and state.get("target_revision") == revision
+            )
+            # A newly started target process is authoritative even when an
+            # older helper remains alive. This also recovers nodes affected by
+            # the Windows restart pipe leak fixed in update_helper.py.
+            helper_alive = _helper_alive(state)
+            if (
+                installed_after_restart
+                and helper_alive
+                and platform.system() == "Windows"
+                and not _terminate_replaced_windows_helper(state)
+            ):
+                state["message"] = "Update is serving the target; waiting for the previous helper to exit"
+                self._write(self.agent_path, state)
+                return state
+            if installed_after_restart or not helper_alive:
                 state["phase"] = "succeeded" if installed_after_restart else "failed"
                 state["message"] = (
                     "Update installed and verified after restart"
@@ -379,8 +525,11 @@ class UpdateService:
         return state
 
     def agent_status(self) -> dict:
-        revision = current_revision(self.root)
+        revision = self.runtime_revision
         state = self._reconciled_agent_state(revision)
+        blockers = local_blockers(self.root)
+        if not revision:
+            blockers.insert(0, RUNTIME_REVISION_BLOCKER)
         return {
             "capability": CAPABILITY,
             "current_revision": revision,
@@ -389,7 +538,7 @@ class UpdateService:
             "target_revision": state.get("target_revision"),
             "message": state.get("message"),
             "error": state.get("error"),
-            "blockers": local_blockers(self.root),
+            "blockers": blockers,
         }
 
     async def published_releases(self, *, force: bool = False) -> tuple[list[dict], str | None]:
@@ -487,9 +636,9 @@ class UpdateService:
         return result
 
     async def overview(self) -> dict:
-        revision = current_revision(self.root)
+        revision = self.runtime_revision
         state = self._read(self.cluster_path)
-        agent_state = self._read(self.agent_path)
+        agent_state = self._reconciled_agent_state(revision)
         task_live = self._task is not None and not self._task.done()
         target_revision = state.get("target_revision")
         controller_verified = bool(
@@ -565,6 +714,8 @@ class UpdateService:
         # Windows service preflight launches a bundled status command that can
         # probe this process. Keep synchronous checks off the event loop.
         blockers = await asyncio.to_thread(local_blockers, self.root)
+        if not revision:
+            blockers.insert(0, RUNTIME_REVISION_BLOCKER)
         for node in nodes:
             node_blockers: list[str] = []
             if not node.get("enabled", True):
@@ -791,7 +942,9 @@ class UpdateService:
         async with self._agent_lock:
             if not branch or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
                 raise ValueError("A valid update target and immutable commit are required")
-            installed_revision = current_revision(self.root)
+            installed_revision = self.runtime_revision
+            if not installed_revision:
+                raise RuntimeError(RUNTIME_REVISION_BLOCKER)
             state = self._reconciled_agent_state(installed_revision)
             if state.get("phase") in {"accepted", "staging", "restarting"}:
                 raise RuntimeError("This node is already updating")

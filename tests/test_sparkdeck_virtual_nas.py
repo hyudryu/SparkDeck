@@ -308,7 +308,11 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
             (complete / "blobs" / "next.incomplete").write_bytes(b"partial")
-            next_snapshot = complete / "snapshots" / "revision-2"
+            next_revision = "b" * 40
+            older_revision = "c" * 40
+            empty_revision = "d" * 40
+            lock_only_revision = "e" * 40
+            next_snapshot = complete / "snapshots" / next_revision
             next_snapshot.mkdir()
             completed_blob = complete / "blobs" / "next-complete"
             completed_blob.write_bytes(b"completed")
@@ -316,7 +320,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 (next_snapshot / "config.json").symlink_to(completed_blob)
             except OSError:
                 (next_snapshot / "config.json").write_bytes(b"completed")
-            older_snapshot = complete / "snapshots" / "revision-3"
+            older_snapshot = complete / "snapshots" / older_revision
             older_snapshot.mkdir()
             older_blob = complete / "blobs" / "older-complete"
             older_blob.write_bytes(b"older")
@@ -327,8 +331,16 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             (complete / "refs").mkdir()
             (complete / "refs" / "main").write_text("revision-1")
             (complete / "refs" / "stale").write_text("missing-revision")
-            (complete / "snapshots" / "empty-revision").mkdir()
-            (complete / "refs" / "empty").write_text("empty-revision")
+            (complete / "snapshots" / empty_revision).mkdir()
+            (complete / "refs" / "empty").write_text(empty_revision)
+            lock_only = complete / "snapshots" / lock_only_revision
+            lock_only.mkdir()
+            (lock_only / "download.lock").write_text("locked", encoding="utf-8")
+            (complete / "refs" / "locked").write_text(lock_only_revision)
+            non_commit = complete / "snapshots" / "release-partial"
+            non_commit.mkdir()
+            (non_commit / "config.json").write_text("{}", encoding="utf-8")
+            (complete / "refs" / "non-commit").write_text("release-partial")
             (hub / "models--partial--repo" / "snapshots").mkdir(parents=True)
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: False)
 
@@ -347,14 +359,67 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 len(b"partial") + len(b"completed") + len(b"older"),
             )
             self.assertEqual(models[0]["partial_revision_size_bytes"], {
-                "revision-2": len(b"completed"),
-                "revision-3": len(b"older"),
+                next_revision: len(b"completed"),
+                older_revision: len(b"older"),
             })
+            self.assertEqual(
+                models[0]["partial_revisions"],
+                [next_revision, older_revision],
+            )
+            self.assertNotIn("empty", models[0]["partial_revision_refs"])
+            self.assertNotIn("locked", models[0]["partial_revision_refs"])
+            self.assertNotIn("non-commit", models[0]["partial_revision_refs"])
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
+
+    async def test_partial_revision_survives_when_its_blob_is_shared_with_complete_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            shared_blob = blobs / "shared-content-hash"
+            shared_blob.write_bytes(b"shared-weights")
+            complete_revision = "c" * 40
+            partial_revision = "d" * 40
+            complete = repository / "snapshots" / complete_revision
+            partial = repository / "snapshots" / partial_revision
+            complete.mkdir(parents=True)
+            partial.mkdir(parents=True)
+            complete.joinpath("model.gguf").symlink_to(
+                Path("../../blobs/shared-content-hash")
+            )
+            partial.joinpath("model-00001-of-00002.gguf").symlink_to(
+                Path("../../blobs/shared-content-hash")
+            )
+            partial.joinpath(".sparkdeck-selective.incomplete").write_text(
+                "selective cache marker", encoding="utf-8",
+            )
+            refs = repository / "refs"
+            refs.mkdir()
+            refs.joinpath("release-shared").write_text(
+                partial_revision, encoding="utf-8",
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertFalse(model["partial"])
+            self.assertTrue(model["has_partial_download"])
+            self.assertEqual(model["partial_revisions"], [partial_revision])
+            self.assertEqual(
+                model["partial_revision_size_bytes"], {partial_revision: 0},
+            )
+            self.assertEqual(
+                model["partial_revision_refs"],
+                {"release-shared": partial_revision},
+            )
+            self.assertEqual(model["revision"], "release-shared")
 
     def test_inventory_requires_matching_index_for_complete_transformer_shards(self):
         cases = (
@@ -927,7 +992,8 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "partial": True, "has_partial_download": True,
                 "revision": "release-gguf",
                 "partial_revision_refs": {"release-gguf": RESOLVED_REVISION},
-                "partial_revision_size_bytes": {RESOLVED_REVISION: 8},
+                "partial_revisions": [RESOLVED_REVISION],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 0},
             }],
         }])
         manager.virtual_nas_transfer_preflight = AsyncMock(return_value={

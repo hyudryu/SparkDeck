@@ -1785,6 +1785,20 @@ class Manager:
                 partial_sizes = partial_model.get("partial_revision_size_bytes")
                 if not isinstance(partial_sizes, dict):
                     partial_sizes = {}
+                reported_partial_revisions = partial_model.get("partial_revisions")
+                if not isinstance(reported_partial_revisions, (list, tuple, set)):
+                    reported_partial_revisions = []
+                partial_revisions = {
+                    str(value) for value in reported_partial_revisions
+                    if IMMUTABLE_HF_REVISION.fullmatch(str(value))
+                }
+                partial_revisions.update(
+                    str(value) for value, size in partial_sizes.items()
+                    if (
+                        IMMUTABLE_HF_REVISION.fullmatch(str(value))
+                        and self._byte_count(size) is not None
+                    )
+                )
                 candidate_resolved = (
                     partial_refs.get(candidate_requested)
                     if candidate_requested else None
@@ -1793,14 +1807,14 @@ class Manager:
                     candidate_resolved is None
                     and candidate_requested
                     and IMMUTABLE_HF_REVISION.fullmatch(candidate_requested)
-                    and candidate_requested in partial_sizes
+                    and candidate_requested in partial_revisions
                 ):
                     candidate_resolved = candidate_requested
                 if (
                     candidate_requested
                     and isinstance(candidate_resolved, str)
                     and IMMUTABLE_HF_REVISION.fullmatch(candidate_resolved)
-                    and self._byte_count(partial_sizes.get(candidate_resolved))
+                    and candidate_resolved in partial_revisions
                 ):
                     recovered_resolution = {
                         "requested_revision": candidate_requested,

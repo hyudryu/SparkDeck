@@ -28,7 +28,7 @@ The **Community Run Models** catalog gives me a directional inference tok/s esti
 
 ![Community Run Models with illustrative throughput and cluster-fit evidence](docs/screenshots/readme/community-performance-dark.png)
 
-_Community throughput evidence and per-node fit. Illustrative demo data; estimates are evidence, not guarantees._
+_Community throughput evidence and aggregate sharded cluster fit. Illustrative demo data; estimates are evidence, not guarantees._
 
 ### Manage the whole GB10 cluster from one controller
 

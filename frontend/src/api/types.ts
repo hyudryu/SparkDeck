@@ -197,6 +197,75 @@ export interface RouterOSConnectionInput {
   verify_tls: boolean
 }
 
+export type FanControlMode = 'curve' | 'pid' | 'hysteresis' | 'manual'
+
+export interface FanCurveSettings {
+  curve_points: number[][]
+  curve_min_temp: number
+  curve_max_temp: number
+  min_floor_pct: number
+}
+
+export interface FanPidSettings {
+  setpoint: number
+  kp: number
+  ki: number
+  kd: number
+  min_floor_pct: number
+}
+
+export interface FanHysteresisSettings {
+  hyst_on_temp: number
+  hyst_off_temp: number
+}
+
+export interface FanManualSettings {
+  manual_duty_pct: number
+}
+
+export interface FanControlSettings {
+  mode: FanControlMode
+  settings: {
+    curve: FanCurveSettings
+    pid: FanPidSettings
+    hysteresis: FanHysteresisSettings
+    manual: FanManualSettings
+  }
+}
+
+export interface FanControlState {
+  rpm?: number | null
+  duty_byte?: number | null
+  duty_pct?: number | null
+  temp?: number | null
+  local_temp?: number | null
+  temperature_override?: Record<string, unknown> | null
+  temperature_override_active?: boolean
+  mode: FanControlMode
+  active_settings?: Record<string, unknown>
+  status?: string | null
+  max_speed: boolean
+  ts: number
+}
+
+export interface FanControlNode {
+  node_id: string
+  node_name: string
+  local: boolean
+  fan: FanControlState
+  settings: FanControlSettings
+}
+
+export interface FanControlOverview {
+  available: boolean
+  nodes: FanControlNode[]
+}
+
+export interface FanMaxSpeedResult {
+  node_id: string
+  enabled: boolean
+}
+
 export interface RenameNodeInput {
   name: string
 }

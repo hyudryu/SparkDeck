@@ -48,6 +48,11 @@ const isLocalArtifact = (artifact?: string) => Boolean(
   artifact && (/^\//.test(artifact) || artifact.startsWith('~') || /^[A-Za-z]:[\\/]/.test(artifact)),
 )
 
+const isControllerArtifact = (deployment: Deployment) => (
+  isLocalModelPath(deployment.model_id)
+  || (deployment.runtime === 'llama.cpp' && isLocalArtifact(deployment.settings.artifact))
+)
+
 // "Target nodes" alone is ambiguous: a selection can mean one model split
 // across the nodes (tensor parallelism) or one complete model per node
 // (parallel instances). Every picker states which one it means.
@@ -303,7 +308,12 @@ export function ModelsPage() {
       return api.deployments.preparePreflight(startSelection.deployment.id, selectableIds, signal)
     },
     [startSelection?.deployment.id],
-    Boolean(startSelection && startSelection.deployment.status === 'saved' && nodes.data?.length),
+    Boolean(
+      startSelection
+      && startSelection.deployment.status === 'saved'
+      && !isControllerArtifact(startSelection.deployment)
+      && nodes.data?.length,
+    ),
   )
   const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
   const [additionalError, setAdditionalError] = useState<string>()
@@ -729,9 +739,10 @@ export function ModelsPage() {
     setStartError(undefined)
     setStartNotice(undefined)
     try {
-      if (deployment.status === 'saved') {
+      if (deployment.status === 'saved' && !isControllerArtifact(deployment)) {
         // First launch of a saved deployment: route missing weights to the
-        // selected nodes through Virtual NAS before starting.
+        // selected nodes through Virtual NAS before starting. Controller-local
+        // artifacts never go through preparation; the node holds them already.
         const plan = await api.deployments.preparePreflight(deployment.id, nodeIds)
         if (!plan.eligible) {
           throw new Error(plan.reason || 'The selected nodes cannot be prepared for launch')
@@ -775,11 +786,6 @@ export function ModelsPage() {
   // The backend derives the persisted layout contract (replicated saved-node
   // count, TP×PP for sharded, single otherwise); unknown layouts start on one.
   const deploymentRequiredNodes = (deployment: Deployment) => deployment.required_node_count ?? 1
-
-  const isControllerArtifact = (deployment: Deployment) => (
-    isLocalModelPath(deployment.model_id)
-    || (deployment.runtime === 'llama.cpp' && isLocalArtifact(deployment.settings.artifact))
-  )
 
   const deploymentWeightedNodes = (deployment: Deployment) => {
     if (isControllerArtifact(deployment)) {

@@ -9996,20 +9996,6 @@ class Manager:
             name, "preparing", "Preparing Llama server launch",
             model=model, cluster_member=cluster_member,
         )
-        model_path, _shards = self._resolve_llama_artifact(
-            model, llama_artifact, image,
-        )
-        command = [
-            "--host", "0.0.0.0", "--port", str(_LLAMA_SERVE_PORT),
-            "--model", model_path,
-        ]
-        if llama_context_length:
-            command += ["--ctx-size", str(int(llama_context_length))]
-        if llama_parallel_slots:
-            command += ["--parallel", str(int(llama_parallel_slots))]
-        if llama_gpu_layers is not None:
-            command += ["--n-gpu-layers", str(int(llama_gpu_layers))]
-        command.extend(str(item) for item in extra_args or [])
 
         def _create():
             try:
@@ -10026,6 +10012,23 @@ class Manager:
                 )
                 print(f"[llama] pulling missing image: {image}")
                 self.client.images.pull(image)
+            # Resolve the in-container model path only after the image is
+            # present: a custom image declaring HF_HOME mounts the cache
+            # somewhere else, so the pull decides where --model must point.
+            model_path, _shards = self._resolve_llama_artifact(
+                model, llama_artifact, image,
+            )
+            command = [
+                "--host", "0.0.0.0", "--port", str(_LLAMA_SERVE_PORT),
+                "--model", model_path,
+            ]
+            if llama_context_length:
+                command += ["--ctx-size", str(int(llama_context_length))]
+            if llama_parallel_slots:
+                command += ["--parallel", str(int(llama_parallel_slots))]
+            if llama_gpu_layers is not None:
+                command += ["--n-gpu-layers", str(int(llama_gpu_layers))]
+            command.extend(str(item) for item in extra_args or [])
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",
                 model=model, cluster_member=cluster_member,

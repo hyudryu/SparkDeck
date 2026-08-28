@@ -139,6 +139,64 @@ describe('StoragePage', () => {
     ])
   })
 
+  it('keeps in-progress downloads above the descending model order', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              { model_id: 'org/alpha', size_bytes: 100, partial: true },
+              { model_id: 'org/zeta', size_bytes: 300 },
+              { model_id: 'org/model', size_bytes: 200 },
+              { model_id: 'org/aardvark', size_bytes: 50, partial: true },
+              { model_id: 'org/beta', size_bytes: 150 },
+            ],
+          }
+        : node),
+      jobs: [
+        {
+          id: 'download-alpha', kind: 'download', model_id: 'org/alpha',
+          source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'running',
+          bytes_total: 100, bytes_transferred: 50, created_at: '2026-08-27T12:00:00Z',
+        },
+        {
+          id: 'transfer-aardvark', kind: 'transfer', model_id: 'org/aardvark',
+          source_node_id: 'node-b', source_node_name: 'Backup Spark',
+          target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'running',
+          bytes_total: 50, bytes_transferred: 25, created_at: '2026-08-27T12:01:00Z',
+        },
+        {
+          id: 'download-beta', kind: 'download', model_id: 'org/beta',
+          source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'completed',
+          bytes_total: 150, bytes_transferred: 150, created_at: '2026-08-27T11:00:00Z',
+        },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
+    expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
+      'org/alpha', 'org/zeta', 'org/model', 'org/beta', 'org/aardvark',
+    ])
+
+    const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
+    await waitFor(() => expect(
+      within(modelSelect).getAllByRole('option').map((option) => option.textContent),
+    ).toEqual(['Select a model', 'org/zeta', 'org/model', 'org/beta']))
+
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    expect([...inventory.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
+      'org/alpha', 'org/zeta', 'org/offline-model', 'org/model', 'org/beta', 'org/aardvark',
+    ])
+    expect(storage.nodes[0].models.map((model) => model.model_id)).toEqual([
+      'org/alpha', 'org/zeta', 'org/model', 'org/aardvark', 'org/beta',
+    ])
+  })
+
   it('queues a transfer from the keyboard and touch-friendly form', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

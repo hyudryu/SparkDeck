@@ -824,10 +824,19 @@ async def forward_management_request(
     response_headers = {
         key: value for key, value in upstream.headers.items()
         if key.casefold() in {
-            "content-type", "content-encoding", "cache-control",
+            "content-type", "content-length", "content-encoding", "cache-control",
             "content-disposition", "vary", "set-cookie",
         }
     }
+    media_type = (
+        upstream.headers.get("content-type", "")
+        .partition(";")[0].strip().casefold()
+    )
+    if media_type == "application/json" or media_type.endswith("+json"):
+        # Management JSON is mutable cluster state. The upstream length keeps
+        # finite responses framed without buffering them or changing genuine
+        # streaming routes into in-memory responses.
+        response_headers.setdefault("cache-control", "no-store")
     return StreamingResponse(
         content(), status_code=upstream.status_code, headers=response_headers,
     )

@@ -1213,6 +1213,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
                 207, stream=Body(),
                 headers={
                     "content-type": "application/problem+json",
+                    "content-length": "16",
                     "set-cookie": (
                         "sparkdeck_community_session=opaque; HttpOnly; "
                         "SameSite=strict"
@@ -1245,6 +1246,8 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 207)
         self.assertEqual(response.headers["content-type"], "application/problem+json")
+        self.assertEqual(response.headers["content-length"], "16")
+        self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertIn(
             "sparkdeck_community_session=opaque",
             response.headers["set-cookie"],

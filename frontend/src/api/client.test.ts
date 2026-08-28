@@ -6,6 +6,19 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('does not reuse mutable API responses from the browser cache', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.nodes.list()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes', expect.objectContaining({
+      cache: 'no-store',
+    }))
+  })
+
   it('updates a node fan override with an encoded ID and boolean body', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ node_id: 'node/1', enabled: true }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

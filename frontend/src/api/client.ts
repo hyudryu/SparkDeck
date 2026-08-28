@@ -443,11 +443,12 @@ export const api = {
         `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 100 })}`,
         { signal },
       ),
-    model: (id: string, signal?: AbortSignal) =>
+    details: (id: string, signal?: AbortSignal) =>
       request<{ model: CatalogResponse['items'][number]; aggregates: BenchmarkAggregate[] }>(
         `/api/v1/catalog/models/${encodeURIComponent(id)}`,
         { signal },
       ),
+    model: (id: string, signal?: AbortSignal) => api.catalog.details(id, signal),
   },
   deployments: {
     list: async (signal?: AbortSignal) => {

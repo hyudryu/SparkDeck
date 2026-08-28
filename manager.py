@@ -2453,7 +2453,9 @@ class Manager:
         ), return_exceptions=True)
         return _community_pairing_fanout(nodes, results)
 
-    async def push_community_consent(self, enabled: bool) -> dict:
+    async def push_community_consent(
+        self, enabled: bool, telemetry_cluster_id: str | None = None,
+    ) -> dict:
         """Best-effort fan-out of consent to every joined peer.
 
         Disabled nodes still own their local upload workers, so privacy state
@@ -2463,7 +2465,13 @@ class Manager:
         results = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "PUT", "/api/agent/community-consent",
-                json_body={"enabled": enabled},
+                json_body={
+                    "enabled": enabled,
+                    **(
+                        {"telemetry_cluster_id": telemetry_cluster_id}
+                        if telemetry_cluster_id else {}
+                    ),
+                },
                 timeout=20,
                 allow_disabled=True,
             )

@@ -140,6 +140,29 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(item["quantizations"][0]["files"]), 2)
         await http.aclose()
 
+    async def test_details_keeps_gguf_without_quantization_marker(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [{"rfilename": "model.gguf", "size": 10}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        self.assertEqual(item["quantizations"], [{
+            "name": "unknown",
+            "files": [{"filename": "model.gguf", "size_bytes": 10}],
+            "weight_size_bytes": 10,
+            "artifacts": [{
+                "filename": "model.gguf",
+                "files": [{"filename": "model.gguf", "size_bytes": 10}],
+                "weight_size_bytes": 10,
+                "sharded": False,
+            }],
+        }])
+        await http.aclose()
+
     async def test_details_rejects_non_repository_ids_without_network(self):
         calls = 0
 

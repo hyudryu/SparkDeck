@@ -91,38 +91,50 @@ class LlamaCppAdapter(RuntimeAdapter):
 
     def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
         artifact = str(settings.get("artifact") or model).strip()
-        artifact_path = Path(artifact).expanduser()
+        artifact_path = Path(artifact).expanduser().absolute()
         if artifact_path.suffix.casefold() != ".gguf" or not artifact_path.is_file():
             raise ValueError(
                 "llama.cpp managed deployments require an existing local GGUF artifact"
             )
-        artifact_path = artifact_path.resolve()
         shard = _GGUF_SHARD_PATTERN.match(artifact_path.name)
         if shard:
             shard_count = int(shard.group("count"))
-            missing = [
+            shard_paths = [
                 artifact_path.with_name(
                     f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
                 )
                 for index in range(1, shard_count + 1)
-                if not artifact_path.with_name(
-                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
-                ).is_file()
             ]
+            missing = [path for path in shard_paths if not path.is_file()]
             if missing:
                 raise ValueError(
                     "llama.cpp managed deployment requires every GGUF shard"
                 )
-            artifact_path = artifact_path.with_name(
-                f"{shard.group('stem')}-00001-of-{shard_count:05d}.gguf"
-            )
-            volumes = {
-                str(artifact_path.parent): {"bind": "/models", "mode": "ro"}
-            }
+            artifact_path = shard_paths[0]
+            if any(path.is_symlink() for path in shard_paths):
+                resolved_shards = [path.resolve(strict=True) for path in shard_paths]
+                if len(set(resolved_shards)) != len(resolved_shards):
+                    raise ValueError(
+                        "llama.cpp managed deployment requires distinct GGUF shards"
+                    )
+                volumes = {
+                    str(source): {
+                        "bind": f"/models/{logical.name}", "mode": "ro",
+                    }
+                    for logical, source in zip(shard_paths, resolved_shards, strict=True)
+                }
+            else:
+                volumes = {
+                    str(artifact_path.parent.resolve()): {
+                        "bind": "/models", "mode": "ro",
+                    }
+                }
             artifact = f"/models/{artifact_path.name}"
         else:
             volumes = {
-                str(artifact_path): {"bind": "/models/model.gguf", "mode": "ro"}
+                str(artifact_path.resolve()): {
+                    "bind": "/models/model.gguf", "mode": "ro",
+                }
             }
             artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]

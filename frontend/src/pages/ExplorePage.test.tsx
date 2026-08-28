@@ -66,15 +66,16 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
   })
 
-  it('offers a verified Hugging Face GGUF as a Llama server deployment', async () => {
+  it('offers an unquantized Hugging Face GGUF with controller-local fit and an overridable runtime filter', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models?')) return json({
         items: [{
           id: 'org/model-GGUF', name: 'model-GGUF', downloads: 100, likes: 5,
+          weight_size_bytes: 12 * gib,
           runtime_compatibility: [
-            { runtime: 'vllm', supported: false },
+            { runtime: 'vllm', supported: true },
             { runtime: 'llama.cpp', supported: true },
             { runtime: 'sglang', supported: false },
           ],
@@ -84,33 +85,44 @@ describe('ExplorePage model rows', () => {
       if (path.includes('/api/v1/catalog/models/')) return json({ model: {
         id: 'org/model-GGUF', name: 'model-GGUF',
         runtime_compatibility: [
-          { runtime: 'vllm', supported: false },
+          { runtime: 'vllm', supported: true },
           { runtime: 'llama.cpp', supported: true },
           { runtime: 'sglang', supported: false },
         ],
         quantizations: [{
-          name: 'Q4_K_M', files: [{ filename: 'model-Q4_K_M.gguf', size_bytes: 12 * gib }],
+          name: 'unknown', files: [{ filename: 'model.gguf', size_bytes: 12 * gib }],
           artifacts: [{
-            filename: 'model-Q4_K_M.gguf',
-            files: [{ filename: 'model-Q4_K_M.gguf', size_bytes: 12 * gib }],
+            filename: 'model.gguf',
+            files: [{ filename: 'model.gguf', size_bytes: 12 * gib }],
             weight_size_bytes: 12 * gib,
             sharded: false,
           }],
         }],
       }, aggregates: [] })
-      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
       return json({ items: [], availability: 'not_configured', evidence_policy: {} })
     }))
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Expand org/model-GGUF' }))
+    const row = await screen.findByRole('button', { name: 'Expand org/model-GGUF' })
+    expect(within(row).getByText('12 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'vllm')
+    await user.click(screen.getByRole('button', { name: 'Expand org/model-GGUF' }))
 
     const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
-    expect(deploymentType).toHaveValue('llama.cpp')
+    expect(deploymentType).toHaveValue('vllm')
     expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
-    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('Q4_K_M\u0000model-Q4_K_M.gguf')
+    await user.selectOptions(deploymentType, 'llama.cpp')
+    expect(deploymentType).toHaveValue('llama.cpp')
+    const selectedRow = screen.getByRole('button', { name: 'Collapse org/model-GGUF' })
+    expect(within(selectedRow).getByText('12 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText(/Llama server deployments run on the controller/)).toHaveTextContent('8.0 GB on the controller node')
+    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('unknown\u0000model.gguf')
     expect(screen.getByRole('link', { name: 'Deploy org/model-GGUF' })).toHaveAttribute(
-      'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&quantization=Q4_K_M&artifact=model-Q4_K_M.gguf',
+      'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&artifact=model.gguf',
     )
   })
 

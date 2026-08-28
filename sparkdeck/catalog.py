@@ -364,9 +364,7 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
             or "/mtp-" in folded_filename
         ):
             continue
-        quantization = quantization_from_text(filename)
-        if not quantization:
-            continue
+        quantization = quantization_from_text(filename) or "unknown"
         size = _positive_int(sibling.get("size"))
         lfs = sibling.get("lfs")
         if size is None and isinstance(lfs, dict):

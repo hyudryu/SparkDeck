@@ -727,10 +727,10 @@ async def agent_inference_health(req: Request):
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
     try:
-        container = await manager._resolve_vllm_target(
+        ready = await manager.inference_target_health(
             model, container_name=container_name, deployment_id=deployment_id,
         )
-        return {"ready": await manager._check_ready(container), "model": model}
+        return {"ready": ready, "model": model}
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -934,13 +934,13 @@ async def agent_create_container(req: Request):
 @app.post("/api/agent/containers/{name}/start")
 async def agent_start_container(name: str, req: Request):
     await _require_managed_agent_container(name, req)
-    return await manager.start_container(name)
+    return await manager.start_container(name, explicit=True)
 
 
 @app.post("/api/agent/containers/{name}/stop")
-async def agent_stop_container(name: str, req: Request):
+async def agent_stop_container(name: str, req: Request, explicit: bool = False):
     await _require_managed_agent_container(name, req)
-    return await manager.stop_container(name)
+    return await manager.stop_container(name, explicit=explicit)
 
 
 @app.delete("/api/agent/containers/{name}")
@@ -1279,7 +1279,7 @@ async def create_container(req: Request):
 @app.post("/api/containers/{name}/start")
 async def start_container(name: str):
     try:
-        return await manager.start_container(name)
+        return await manager.start_container(name, explicit=True)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1287,7 +1287,7 @@ async def start_container(name: str):
 @app.post("/api/containers/{name}/stop")
 async def stop_container(name: str):
     try:
-        return await manager.stop_container(name)
+        return await manager.stop_container(name, explicit=True)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1599,6 +1599,44 @@ async def catalog_models(q: str = "", runtime: str | None = None, limit: int = 2
 @app.get("/api/v1/deployments")
 async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
+
+
+@app.get("/api/v1/deployments/{deployment_id}")
+async def v1_deployment_detail(deployment_id: str):
+    try:
+        return await sparkdeck.deployment_detail(deployment_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/v1/deployments/{deployment_id}/settings")
+async def v1_update_deployment_settings(deployment_id: str, req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "extra_args", "launch_controls",
+        "gpu_memory_utilization", "gpu_memory_gb",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        return await sparkdeck.update_deployment_settings(deployment_id, body)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        message = str(exc)
+        status = 409 if (
+            "stop the cluster" in message.lower()
+            or "editable saved launch settings" in message.lower()
+        ) else 400
+        raise HTTPException(status, message) from exc
 
 
 @app.get("/api/v1/deployments/{deployment_id}/logs")

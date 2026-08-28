@@ -140,6 +140,76 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 404)
 
+    async def test_deployment_detail_returns_curated_editable_settings(self):
+        detail = {
+            "id": "dep-1", "alias": "Model", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {}, "editable": True,
+            "edit_reason": None, "desired_state": "stopped",
+            "extra_args": ["--enable-prefix-caching"],
+            "launch_controls": {"context_window": 32768},
+            "gpu_memory_utilization": 0.9, "gpu_memory_gb": None,
+            "image": "example/vllm:test",
+        }
+        get_detail = AsyncMock(return_value=detail)
+        with patch.object(server.sparkdeck, "deployment_detail", get_detail):
+            response = await self.client.get("/api/v1/deployments/dep-1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), detail)
+        get_detail.assert_awaited_once_with("dep-1")
+
+    async def test_deployment_detail_maps_missing_deployment(self):
+        get_detail = AsyncMock(side_effect=LookupError("deployment not found"))
+        with patch.object(server.sparkdeck, "deployment_detail", get_detail):
+            response = await self.client.get("/api/v1/deployments/missing")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "deployment not found")
+
+    async def test_update_deployment_settings_uses_exact_public_contract(self):
+        changes = {
+            "extra_args": ["--enable-prefix-caching"],
+            "launch_controls": {"context_window": 65536},
+            "gpu_memory_utilization": 0.9,
+            "gpu_memory_gb": None,
+        }
+        updated = AsyncMock(return_value={
+            "id": "dep-1", "editable": True, "extra_args": changes["extra_args"],
+        })
+        with patch.object(server.sparkdeck, "update_deployment_settings", updated):
+            response = await self.client.put(
+                "/api/v1/deployments/dep-1/settings", json=changes,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        updated.assert_awaited_once_with("dep-1", changes)
+
+        response = await self.client.put(
+            "/api/v1/deployments/dep-1/settings",
+            json={"desired_state": "running"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported field", response.json()["detail"])
+
+    async def test_update_deployment_settings_maps_missing_and_running_state(self):
+        update = AsyncMock(side_effect=LookupError("deployment not found"))
+        with patch.object(server.sparkdeck, "update_deployment_settings", update):
+            missing = await self.client.put(
+                "/api/v1/deployments/missing/settings", json={"extra_args": []},
+            )
+
+        update.side_effect = ValueError(
+            "stop the cluster before changing its launch settings"
+        )
+        with patch.object(server.sparkdeck, "update_deployment_settings", update):
+            running = await self.client.put(
+                "/api/v1/deployments/dep-1/settings", json={"extra_args": []},
+            )
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(running.status_code, 409)
+
 
 class DeploymentRenameStoreTests(unittest.TestCase):
     def test_update_alias_persists_new_name(self):

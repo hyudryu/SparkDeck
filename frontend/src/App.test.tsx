@@ -327,7 +327,7 @@ describe('model deployments', () => {
       '/api/v1/recipes/recipe-1', expect.objectContaining({ method: 'DELETE' }),
     ))
     expect(screen.queryByText('Saved cluster')).not.toBeInTheDocument()
-    expect(screen.getByText('Running model')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Running model' })).toHaveAttribute('href', '/models/dep-1')
     expect(screen.getByRole('status')).toHaveTextContent('Deleted recipe Saved cluster. Existing deployments and cached model weights were left unchanged.')
     expect(localStorage.getItem('sparkdeck:pinned-recipes')).toBe('[]')
   })

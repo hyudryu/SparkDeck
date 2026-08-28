@@ -40,6 +40,7 @@ class Deployment:
     container_name: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     base_url_set: bool = False
+    desired_state: str = "running"
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

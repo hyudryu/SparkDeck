@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
@@ -869,7 +869,7 @@ export function ModelsPage() {
                         <Button variant="tertiary" aria-label="Cancel rename" onClick={() => setRenaming(undefined)}><X size={15} /></Button>
                       </span>
                     ) : (
-                      <strong>{deployment.alias}</strong>
+                      <strong><Link to={`/models/${encodeURIComponent(deployment.id)}`}>{deployment.alias}</Link></strong>
                     )}
                     <small>{deployment.model_id}</small>
                     <small className="model-disk-usage"><HardDrive size={12} /> {modelStorage(deployment)}</small>

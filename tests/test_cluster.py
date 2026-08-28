@@ -3260,6 +3260,131 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(instance.deployments[0]["status"], "degraded")
 
+    async def test_manual_stop_persists_intent_before_stopping_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment()
+            instance.deployments = [deployment]
+            stop_started = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def member_action(_member, action):
+                self.assertEqual(action, "stop")
+                stop_started.set()
+                await release_stop.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            stopping = asyncio.create_task(
+                instance.deployment_action("deployment-1", "stop")
+            )
+            await asyncio.wait_for(stop_started.wait(), 1)
+
+            self.assertEqual(deployment["desired_state"], "stopped")
+            saved = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(saved[0]["desired_state"], "stopped")
+            release_stop.set()
+            await stopping
+
+    async def test_failed_manual_stop_remains_explicitly_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment()
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(
+                side_effect=RuntimeError("Docker did not stop")
+            )
+
+            result = await instance.deployment_action("deployment-1", "stop")
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(deployment["desired_state"], "stopped")
+            self.assertEqual(deployment["status"], "error")
+
+    async def test_stopped_deployment_cannot_be_woken_by_inference(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1",
+            "desired_state": "stopped",
+            "members": [{
+                "rank": 0, "node_id": "local", "container_name": "rank-0",
+            }],
+        }]
+        instance._proxy_cluster_member = mock.AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "deployment is stopped"):
+            await instance.proxy_cluster_inference(
+                "deployment-1", "example/Model", {"stream": False},
+                "chat/completions",
+            )
+
+        instance._proxy_cluster_member.assert_not_awaited()
+
+    async def test_stopped_target_resolver_never_calls_ensure_loaded(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1", "desired_state": "stopped",
+        }]
+        instance._capacity_redeploying_models = set()
+        instance.list_containers = mock.AsyncMock()
+        instance.ensure_loaded = mock.AsyncMock()
+
+        with self.assertRaisesRegex(LookupError, "deployment is stopped"):
+            await instance._resolve_vllm_target(
+                "example/Model", deployment_id="deployment-1",
+            )
+
+        instance.list_containers.assert_not_awaited()
+        instance.ensure_loaded.assert_not_awaited()
+
+    async def test_inference_health_does_not_wake_stopped_container(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = []
+        instance.list_containers = mock.AsyncMock(return_value=[{
+            "name": "rank-0", "model": "example/Model", "status": "exited",
+        }])
+        instance._check_ready = mock.AsyncMock()
+        instance.ensure_loaded = mock.AsyncMock()
+
+        ready = await instance.inference_target_health(
+            "example/Model", container_name="rank-0",
+        )
+
+        self.assertFalse(ready)
+        instance._check_ready.assert_not_awaited()
+        instance.ensure_loaded.assert_not_awaited()
+
+    async def test_inflight_agent_request_cannot_restart_explicitly_stopped_container(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._explicitly_stopped_containers = {"rank-0"}
+        instance.client = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "deployment is stopped"):
+            await instance.start_container("rank-0")
+
+        instance.client.containers.get.assert_not_called()
+
+    async def test_explicit_remote_stop_marks_agent_race_guard(self) -> None:
+        instance = Manager.__new__(Manager)
+        member = {
+            "rank": 0, "node_id": "worker", "container_name": "rank-0",
+        }
+        instance.deployments = [{
+            "id": "deployment-1", "desired_state": "stopped",
+            "members": [member],
+        }]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(return_value={"ok": True})
+
+        await instance._member_action(member, "stop")
+
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker", "POST", "/api/agent/containers/rank-0/stop?explicit=true",
+            timeout=120,
+        )
+
     def test_node_in_use_by_deployment_cannot_be_removed(self) -> None:
         instance = Manager.__new__(Manager)
         instance.deployments = [{

@@ -1072,8 +1072,9 @@ class UpdateHelperTests(unittest.TestCase):
             )
 
     @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
-    @patch("sparkdeck.update_helper.run")
-    def test_windows_restart_uses_bundled_launcher(self, command_run, _system):
+    @patch("sparkdeck.update_helper.subprocess.run")
+    def test_windows_restart_uses_bundled_launcher_without_pipe_capture(self, process_run, _system):
+        process_run.return_value = Mock(returncode=0)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
@@ -1082,17 +1083,23 @@ class UpdateHelperTests(unittest.TestCase):
 
             restart_service(root)
 
-        command_run.assert_called_once_with(
-            root,
-            "powershell.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(launcher),
-            "restart",
+        process_run.assert_called_once_with(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher),
+                "restart",
+            ],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=180,
+            check=False,
         )
 
     @patch("sparkdeck.update_helper.platform.system", return_value="Linux")

@@ -72,7 +72,7 @@ export function NodeSelector({
           {nodes.map((node) => {
             const allowed = !allowedIds || allowedIds.includes(node.id)
             const ready = isNodeSelectable(node) && allowed
-            const status = !allowed ? unavailableReasons?.[node.id] ?? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? 'Docker unavailable' : node.selectable === false ? 'Unavailable' : 'Ready'
+            const status = !allowed ? unavailableReasons?.[node.id] ?? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? node.status_message ?? 'Docker unavailable' : node.selectable === false ? node.status_message ?? 'Unavailable' : 'Ready'
             const required = requiredIds.includes(node.id)
             const displayName = nodeLabel(node, node.id, localLabel)
             const primary = primaryId === node.id

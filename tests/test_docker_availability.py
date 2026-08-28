@@ -79,6 +79,21 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             "Docker must be configured to use Linux containers",
         )
 
+    async def test_agent_status_explains_service_user_docker_permissions(self):
+        manager = self.manager_without_docker()
+        manager.client._retry_after = 0
+        with patch(
+            "manager.docker.from_env",
+            side_effect=docker.errors.DockerException(
+                "PermissionError(13, 'Permission denied')"
+            ),
+        ):
+            manager.get_disk = AsyncMock(return_value={})
+            status = await manager.agent_status(stats={})
+
+        self.assertFalse(status["docker_ready"])
+        self.assertIn("service user cannot access Docker", status["status_message"])
+
     async def test_linux_container_daemon_is_ready(self):
         manager = self.manager_without_docker()
         client = Mock()

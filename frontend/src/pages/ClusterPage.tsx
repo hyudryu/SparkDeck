@@ -3,6 +3,7 @@ import { Check, Clipboard, Edit3, Eye, EyeOff, Link2, Network, RefreshCw, Server
 import { api } from '../api/client'
 import type { JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 
 const emptyJoin: JoinClusterInput = { controller_url: '', join_code: '', advertise_url: '', name: '' }
@@ -19,6 +20,7 @@ function nodeRole(node: NodeInventoryItem, onboarding: OnboardingStatus) {
 }
 
 export function ClusterPage() {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const resource = useResource((signal) => api.onboarding.get(signal))
   const nodes = useResource((signal) => api.nodes.list(signal))
   const [joining, setJoining] = useState(false)
@@ -77,7 +79,12 @@ export function ClusterPage() {
   }
 
   const leave = async () => {
-    if (!window.confirm('Leave this cluster and make this node its own controller?')) return
+    if (!await confirm({
+      title: 'Leave this cluster?',
+      message: 'This node will become its own standalone controller.',
+      confirmLabel: 'Leave cluster',
+      danger: true,
+    })) return
     setBusy(true)
     setError(undefined)
     setNotice(undefined)
@@ -152,7 +159,12 @@ export function ClusterPage() {
     const warning = force
       ? `Forget offline node ${node.name}? SparkDeck cannot notify it, so it may still show the old cluster until you use Leave cluster or join it again. Cached weights stay on that machine.`
       : `Remove ${node.name} from this cluster? SparkDeck will disconnect only this machine and make it a standalone controller. Cached weights stay on that machine.`
-    if (!window.confirm(warning)) return
+    if (!await confirm({
+      title: force ? `Forget ${node.name}?` : `Remove ${node.name}?`,
+      message: warning,
+      confirmLabel: force ? 'Forget node' : 'Remove node',
+      danger: true,
+    })) return
 
     setRemovingNodeId(node.id)
     setNodeError(undefined)
@@ -289,6 +301,7 @@ export function ClusterPage() {
           <Button type="button" variant="danger" disabled={busy} onClick={() => void leave()}><Unlink size={16} /> {busy ? 'Leaving…' : 'Leave cluster'}</Button>
         </Panel>}
       </>}
+      {confirmationDialog}
     </div>
   )
 }

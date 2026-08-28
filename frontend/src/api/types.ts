@@ -786,3 +786,97 @@ export interface UsageAnalysis {
   hourly: HourlyUsagePoint[]
   daily: DailyUsagePoint[]
 }
+
+export interface BenchyStatus {
+  installed: boolean
+  version?: string | null
+  launch_mode?: 'path' | 'python_module' | null
+  path_on_host: boolean
+  active_run_id?: string | null
+}
+
+export interface BenchyServedModel {
+  id: string
+  label: string
+  runtime?: string
+  deployment_id?: string | null
+  model: string
+  quantization?: string | null
+  base_url: string
+}
+
+export interface BenchyRunConfig {
+  model_id: string
+  prompt_sizes: number[]
+  response_sizes: number[]
+  concurrency_levels: number[]
+  context_depths: number[]
+  runs: number
+  warmup_runs: number
+  exact_tg: boolean
+}
+
+export interface BenchyRunProgress {
+  requests_done: number
+  requests_failed: number
+  current?: {
+    prompt_size?: number
+    response_size?: number
+    context_depth?: number
+    concurrency?: number
+  } | null
+}
+
+export type BenchyRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface BenchyResultRow {
+  prompt_size?: number
+  response_size?: number
+  context_depth?: number
+  concurrency?: number
+  is_context_prefill_phase?: boolean
+  pp_tokens_per_second?: number | null
+  pp_tokens_per_second_std?: number | null
+  pp_tokens_per_second_request?: number | null
+  pp_tokens_per_second_request_std?: number | null
+  tg_tokens_per_second?: number | null
+  tg_tokens_per_second_std?: number | null
+  tg_tokens_per_second_request?: number | null
+  tg_tokens_per_second_request_std?: number | null
+  peak_tg_tokens_per_second?: number | null
+  peak_tg_tokens_per_second_request?: number | null
+  ttfr_ms?: number | null
+  est_ppt_ms?: number | null
+  e2e_ttft_ms?: number | null
+}
+
+export interface BenchyRunSummary {
+  id: string
+  status: BenchyRunStatus
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  duration_seconds?: number | null
+  model: string
+  model_id: string
+  quantization?: string | null
+  runtime?: string | null
+  base_url?: string
+  deployment_id?: string | null
+  config: BenchyRunConfig
+  benchy_version?: string | null
+  error?: string | null
+  result_count?: number
+  progress?: BenchyRunProgress
+}
+
+export interface BenchyRunDetail extends BenchyRunSummary {
+  results: BenchyResultRow[]
+  csv_filename?: string | null
+  report?: {
+    benchy_version?: string | null
+    latency_mode?: string | null
+    latency_ms?: number | null
+    prefix_caching_enabled?: boolean | null
+  } | null
+}

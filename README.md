@@ -83,6 +83,17 @@ SparkDeck is under active development. The management API is not hardened for di
 - An NVIDIA GPU and supported container GPU access for GPU-backed runtimes
 - A Hugging Face account for gated models
 
+On Linux, run `docker info` as the same unprivileged account that will run
+SparkDeck. If it reports a Docker socket permission error, add that account to
+the Docker group and start a fresh login session before installing SparkDeck:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+Do not start `run.sh` with `sudo`; doing so creates root-owned settings and a
+second process identity that the bundled user service cannot safely update.
+
 ### Linux
 
 Create a virtual environment, install the dependencies, and start the application:
@@ -244,6 +255,12 @@ cp sparkdeck.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now sparkdeck.service
 ```
+
+Run exactly one SparkDeck service per node. Before enabling the user service,
+stop any foreground `./run.sh` process and disable an older system-wide
+`vllm-controller.service` if one exists. Never launch SparkDeck or its restart
+script with `sudo`; updates intentionally verify and restart the user service
+that owns the checkout and settings.
 
 SparkDeck automatically discovers Node installations managed by NVM, Volta,
 asdf, and fnm even though systemd does not load an interactive shell. For a

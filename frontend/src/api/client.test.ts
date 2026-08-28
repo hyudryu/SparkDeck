@@ -3,6 +3,7 @@ import { api } from './client'
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('API client adapters', () => {
@@ -17,6 +18,21 @@ describe('API client adapters', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes', expect.objectContaining({
       cache: 'no-store',
     }))
+  })
+
+  it('turns an indefinitely pending API call into a retryable timeout error', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = expect(api.deployments.list()).rejects.toMatchObject({
+      status: 408,
+      message: 'The request timed out. Check the node connection and retry.',
+    })
+    await vi.advanceTimersByTimeAsync(30_000)
+    await result
   })
 
   it('updates a node fan override with an encoded ID and boolean body', async () => {

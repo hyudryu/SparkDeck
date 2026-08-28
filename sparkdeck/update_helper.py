@@ -200,18 +200,27 @@ def restart_service(root: Path) -> None:
         launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
         if not launcher.is_file():
             raise RuntimeError("The bundled Windows launcher was not found")
-        run(
-            root,
-            "powershell.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(launcher),
-            "restart",
+        # Do not use PIPE-backed capture here. The newly launched background
+        # server can inherit the PowerShell process's standard handles, which
+        # keeps subprocess.communicate() waiting for EOF after PowerShell has
+        # exited and leaves the update helper permanently "restarting".
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-File", str(launcher),
+                "restart",
+            ],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=180,
+            check=False,
         )
+        if result.returncode:
+            raise RuntimeError(
+                f"The bundled Windows launcher failed with exit code {result.returncode}"
+            )
         return
     raise RuntimeError("Self-update supports only the bundled Linux and Windows launchers")
 

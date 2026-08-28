@@ -4,6 +4,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
 import { formatBytes } from '../utils/format'
@@ -178,6 +179,7 @@ type RecipeTrackedJob = {
 const recipeJobKey = (recipeId: string, modelId: string, targetId: string) => `${recipeId}\u0000${modelId}\u0000${targetId}`
 
 export function ModelsPage() {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const [searchParams, setSearchParams] = useSearchParams()
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
   const resource = useResource((signal) => api.deployments.list(signal))
@@ -589,7 +591,12 @@ export function ModelsPage() {
 
   const deleteRecipe = async (recipe: SavedConfiguration) => {
     const label = recipe.name || recipe.model
-    if (!window.confirm(`Delete recipe ${label}? Existing deployments and cached model weights will not be removed.`)) return
+    if (!await confirm({
+      title: `Delete recipe ${label}?`,
+      message: 'Existing deployments and cached model weights will not be removed.',
+      confirmLabel: 'Delete recipe',
+      danger: true,
+    })) return
     const busyKey = `recipe-delete:${recipe.id}`
     setBusy(busyKey)
     setActionError(undefined)
@@ -776,7 +783,11 @@ export function ModelsPage() {
       const message = plan.action === 'download'
         ? `Download ${recipe.model} revision ${revision} (${formatBytes(plan.download?.size_bytes ?? 0)}) from Hugging Face onto ${downloadNames.join(', ')}${targetNames.length ? fanoutSource ? `, then transfer it from ${fanoutSource} via Virtual NAS to ${targetNames.join(', ')}` : `, then transfer it via Virtual NAS to ${targetNames.join(', ')}` : ''}?`
         : `Transfer ${recipe.model} from ${sourceName} via Virtual NAS to ${targetNames.join(', ')}?`
-      if (!window.confirm(`${message}\n\nCapacity was verified on each selected node's model-cache volume.`)) return
+      if (!await confirm({
+        title: 'Prepare model weights?',
+        message: `${message}\n\nCapacity was verified on each selected node's model-cache volume.`,
+        confirmLabel: 'Start preparation',
+      })) return
       setRecipeTransferNotice(undefined)
       const result = await api.storage.prepareRecipe(recipe.id, nodeIds)
       if (!result.jobs.length) {
@@ -948,9 +959,15 @@ export function ModelsPage() {
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
-                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => {
-                      if (window.confirm(`Remove ${deployment.alias} from SparkDeck?`)) void act(deployment, 'remove')
-                    }}><Trash2 size={17} /></Button>
+                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => void confirm({
+                      title: `Remove ${deployment.alias}?`,
+                      message: 'SparkDeck will remove this deployment and tear down its managed runtime.',
+                      confirmLabel: 'Remove deployment',
+                      danger: true,
+                    }).then((accepted) => {
+                      if (accepted) return act(deployment, 'remove')
+                      return undefined
+                    })}><Trash2 size={17} /></Button>
                   </div>
                 </div>
               ))}
@@ -1250,6 +1267,7 @@ export function ModelsPage() {
           </section>
         </div>
       )}
+      {confirmationDialog}
     </div>
   )
 }

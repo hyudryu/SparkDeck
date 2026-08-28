@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { UsageGroup } from '../api/types'
@@ -141,7 +141,6 @@ describe('UsagePage', () => {
       return json(summary)
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const user = userEvent.setup()
     render(<UsagePage />)
 
@@ -158,8 +157,10 @@ describe('UsagePage', () => {
     })))
 
     await user.click(screen.getByRole('button', { name: 'Erase' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Erase usage for org/model?' })).getByRole('button', { name: 'Erase usage' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
     await user.click(screen.getByRole('button', { name: 'Reset lifetime' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Reset all usage counters?' })).getByRole('button', { name: 'Reset counters' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
   })
 

@@ -62,17 +62,42 @@ export class ApiError extends Error {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 30_000
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-      ...init?.headers,
-    },
-  })
+  const controller = new AbortController()
+  const callerSignal = init?.signal
+  let timedOut = false
+  const forwardAbort = () => controller.abort(callerSignal?.reason)
+  if (callerSignal?.aborted) forwardAbort()
+  else callerSignal?.addEventListener('abort', forwardAbort, { once: true })
+  const timeout = globalThis.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
+
+  let response: Response
+  try {
+    response = await fetch(path, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...init?.headers,
+      },
+    })
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiError('The request timed out. Check the node connection and retry.', 408)
+    }
+    throw error
+  } finally {
+    globalThis.clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', forwardAbort)
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`
     let body: { detail?: unknown; message?: string } | undefined

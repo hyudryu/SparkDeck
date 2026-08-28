@@ -7,6 +7,7 @@ import { useAuth } from '../auth/AuthContext'
 import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { LegalDialog } from '../components/LegalDialog'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
@@ -26,6 +27,7 @@ function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
 }
 
 function SoftwareUpdatePanel() {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const resource = useResource((signal) => api.updates.overview(signal))
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState<string>()
@@ -43,7 +45,11 @@ function SoftwareUpdatePanel() {
     const eligibleCount = resource.data?.nodes?.filter((node) => node.current_revision !== targetRevision && node.blockers.length === 0).length ?? 0
     const unavailableCount = resource.data?.nodes?.filter((node) => node.current_revision !== targetRevision && node.blockers.length > 0).length ?? 0
     const skipped = unavailableCount > 0 ? ` ${unavailableCount} unavailable node${unavailableCount === 1 ? '' : 's'} will be skipped and reported.` : ''
-    if (!window.confirm(`Update ${eligibleCount} eligible cluster node${eligibleCount === 1 ? '' : 's'} to origin/main at ${shortRevision(targetRevision)}?${skipped} Workers restart one at a time and the eligible controller restarts last.`)) return
+    if (!await confirm({
+      title: 'Update the cluster?',
+      message: `Update ${eligibleCount} eligible cluster node${eligibleCount === 1 ? '' : 's'} to origin/main at ${shortRevision(targetRevision)}?${skipped} Workers restart one at a time and the eligible controller restarts last.`,
+      confirmLabel: 'Start update',
+    })) return
     setStarting(true)
     setActionError(undefined)
     try {
@@ -62,7 +68,7 @@ function SoftwareUpdatePanel() {
   const targetRevision = data?.target?.revision
   const upToDate = Boolean(data?.up_to_date)
   return (
-    <Panel className="settings-section software-update-section">
+    <><Panel className="settings-section software-update-section">
       <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every eligible cluster node to the latest commit on the main branch. Nodes that cannot update are reported and skipped.</p></div></div>
       <div className="settings-fields">
         {resource.loading && !data && <LoadingState label="Checking for updates" />}
@@ -81,7 +87,7 @@ function SoftwareUpdatePanel() {
           {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => { const status = nodeUpdateStatus(node, targetRevision); return <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={status.color}>{status.label}</Status></div> })}</div>}
         </>}
       </div>
-    </Panel>
+    </Panel>{confirmationDialog}</>
   )
 }
 
@@ -325,6 +331,7 @@ function CommunitySignOutDialog({
 }
 
 export function SettingsPage() {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const resource = useResource((signal) => api.settings.get(signal))
   const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const auth = useAuth()
@@ -408,7 +415,12 @@ export function SettingsPage() {
   }
 
   const clearHuggingFaceKey = async () => {
-    if (!window.confirm('Remove the saved Hugging Face API key for the entire cluster?')) return
+    if (!await confirm({
+      title: 'Remove the Hugging Face API key?',
+      message: 'This removes the saved Hugging Face API key for the entire cluster.',
+      confirmLabel: 'Remove key',
+      danger: true,
+    })) return
     setSaving(true)
     setSaved(false)
     setError(undefined)
@@ -531,6 +543,7 @@ export function SettingsPage() {
         <section><h3>Suspension, termination, and changes</h3><p>You may sign out and turn off telemetry at any time. Access may be suspended when reasonably necessary to protect users, the service, or benchmark integrity, or to address misuse. Material changes will be identified by a new effective date and reasonable notice where required.</p></section>
         <section><h3>Contact</h3><p>Questions about these Terms may be submitted through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. Applicable California and United States law applies without limiting mandatory consumer protections in your place of residence.</p></section>
       </LegalDialog>}
+      {confirmationDialog}
     </div>
   )
 }

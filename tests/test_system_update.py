@@ -83,6 +83,10 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.manager = FakeManager()
         self.service = UpdateService(self.manager, self.root, self.root / "data")
+        # The Windows test host's temp directory is nested under a separate
+        # user-level Git repository. Give the fixture an explicit process
+        # revision instead of inheriting that unrelated repository's HEAD.
+        self.service.runtime_revision = "a" * 40
 
     async def asyncTearDown(self):
         self.temp.cleanup()
@@ -94,6 +98,23 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
             overview = await self.service.overview()
         self.assertFalse(overview["can_update"])
         self.assertIn("Could not check origin/main", overview["blockers"][0])
+
+    async def test_missing_startup_revision_blocks_updates_without_dynamic_fallback(self):
+        self.service.runtime_revision = None
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = self.service.agent_status()
+            overview = await self.service.overview()
+            with self.assertRaisesRegex(RuntimeError, "revision could not be verified"):
+                await self.service.start_local("main", "b" * 40)
+
+        self.assertIsNone(status["current_revision"])
+        self.assertIn("revision could not be verified", status["blockers"][0])
+        self.assertFalse(overview["can_update"])
+        self.assertIsNone(overview["current_revision"])
+        self.service.preflight_local.assert_not_awaited()
 
     async def test_overview_resolves_immutable_main_target(self):
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
@@ -480,12 +501,14 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.preflight_local.assert_not_awaited()
 
     async def test_dead_restarting_helper_recovers_when_new_revision_is_serving(self):
+        self.service.runtime_revision = "b" * 40
         self.service._write(self.service.agent_path, {
             "phase": "restarting", "target_revision": "b" * 40,
             "helper_pid": 4321,
         })
-        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
-             patch("sparkdeck.updater._helper_alive", return_value=False), \
+        with patch("sparkdeck.updater._helper_alive", return_value=True), \
+             patch("sparkdeck.updater._terminate_replaced_windows_helper", return_value=True), \
+             patch("sparkdeck.updater.platform.system", return_value="Windows"), \
              patch("sparkdeck.updater.local_blockers", return_value=[]):
             status = self.service.agent_status()
 
@@ -493,6 +516,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("error", self.service._read(self.service.agent_path))
 
     async def test_target_checkout_does_not_finish_before_helper_verification(self):
+        self.service.runtime_revision = "a" * 40
         self.service._write(self.service.agent_path, {
             "phase": "restarting", "target_revision": "b" * 40,
             "helper_pid": 4321,
@@ -503,6 +527,22 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
             status = self.service.agent_status()
 
         self.assertEqual(status["phase"], "restarting")
+        self.assertEqual(status["current_revision"], "a" * 40)
+
+    async def test_target_runtime_waits_if_legacy_helper_cannot_be_retired(self):
+        self.service.runtime_revision = "b" * 40
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321, "helper_started_at": 123,
+        })
+        with patch("sparkdeck.updater._helper_alive", return_value=True), \
+             patch("sparkdeck.updater._terminate_replaced_windows_helper", return_value=False), \
+             patch("sparkdeck.updater.platform.system", return_value="Windows"), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = self.service.agent_status()
+
+        self.assertEqual(status["phase"], "restarting")
+        self.assertIn("waiting for the previous helper", status["message"])
 
     async def test_interrupted_controller_job_is_unblocked(self):
         self.service._write(self.service.cluster_path, {
@@ -518,6 +558,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview["job"]["phase"], "failed")
 
     async def test_controller_restart_preserves_worker_failure_as_partial(self):
+        self.service.runtime_revision = "b" * 40
         self.service._write(self.service.cluster_path, {
             "id": "stale", "active": True, "phase": "updating_controller",
             "target_revision": "b" * 40,
@@ -546,6 +587,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview["job"]["nodes"][1]["phase"], "succeeded")
 
     async def test_restarted_controller_reconciles_local_node_success(self):
+        self.service.runtime_revision = "b" * 40
         self.service._write(self.service.cluster_path, {
             "id": "stale", "active": True, "phase": "updating_controller",
             "target_revision": "b" * 40,
@@ -578,6 +620,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("error", local)
 
     async def test_completed_controller_job_self_heals_stale_local_node(self):
+        self.service.runtime_revision = "b" * 40
         self.service._write(self.service.cluster_path, {
             "id": "completed", "active": False, "phase": "succeeded",
             "target_revision": "b" * 40,
@@ -601,6 +644,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service._read(self.service.cluster_path), overview["job"])
 
     async def test_controller_checkout_waits_for_helper_success_before_finishing(self):
+        self.service.runtime_revision = "a" * 40
         self.service._write(self.service.cluster_path, {
             "id": "active", "active": True, "phase": "updating_controller",
             "target_revision": "b" * 40,
@@ -623,6 +667,31 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview["job"]["phase"], "updating_controller")
         self.assertEqual(overview["job"]["nodes"][0]["phase"], "updating")
 
+    async def test_restarted_target_controller_finishes_with_old_helper_alive(self):
+        self.service.runtime_revision = "b" * 40
+        self.service._write(self.service.cluster_path, {
+            "id": "active", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [{
+                "id": "local", "name": "Controller", "local": True,
+                "phase": "updating", "current_revision": "a" * 40,
+            }],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater._helper_alive", return_value=True), \
+             patch("sparkdeck.updater._terminate_replaced_windows_helper", return_value=True), \
+             patch("sparkdeck.updater.platform.system", return_value="Windows"), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        self.assertFalse(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "succeeded")
+        self.assertEqual(overview["job"]["nodes"][0]["phase"], "succeeded")
+
     async def test_windows_start_records_verified_helper_identity(self):
         self.service.preflight_local = AsyncMock(return_value={"ok": True})
         with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
@@ -636,6 +705,31 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpdateHelperProcessTests(unittest.TestCase):
+    @patch("sparkdeck.updater._terminate_exact_windows_process")
+    @patch("sparkdeck.updater._windows_process_started", return_value=227)
+    @patch("sparkdeck.updater._windows_update_helper_children")
+    @patch("sparkdeck.updater.platform.system", return_value="Windows")
+    def test_replaced_windows_helper_retires_redirector_child_then_launcher(
+        self, _system, helper_children, _native_started, terminate_process,
+    ):
+        from sparkdeck.updater import _terminate_replaced_windows_helper
+
+        helper_children.return_value = [(76120, 222)]
+        terminate_process.return_value = True
+
+        stopped = _terminate_replaced_windows_helper({
+            "helper_pid": 90276,
+            "helper_started_at": 111,
+            "target_revision": "b" * 40,
+        })
+
+        self.assertTrue(stopped)
+        helper_children.assert_called_once_with(90276, "b" * 40)
+        self.assertEqual(
+            terminate_process.call_args_list,
+            [call(76120, 227), call(90276, 111)],
+        )
+
     @patch("sparkdeck.updater.os.kill")
     @patch("sparkdeck.updater._windows_process_started", return_value=123456)
     @patch("sparkdeck.updater.platform.system", return_value="Windows")
@@ -1073,8 +1167,8 @@ class UpdateHelperTests(unittest.TestCase):
 
     @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
     @patch("sparkdeck.update_helper.subprocess.run")
-    def test_windows_restart_uses_bundled_launcher_without_pipe_capture(self, process_run, _system):
-        process_run.return_value = Mock(returncode=0)
+    def test_windows_restart_uses_bundled_launcher(self, command_run, _system):
+        command_run.return_value = Mock(returncode=0)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
@@ -1083,7 +1177,7 @@ class UpdateHelperTests(unittest.TestCase):
 
             restart_service(root)
 
-        process_run.assert_called_once_with(
+        command_run.assert_called_once_with(
             [
                 "powershell.exe",
                 "-NoLogo",
@@ -1100,7 +1194,20 @@ class UpdateHelperTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
             timeout=180,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
+    @patch("sparkdeck.update_helper.subprocess.run", return_value=Mock(returncode=1))
+    def test_windows_restart_reports_launcher_failure(self, _command_run, _system):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("# launcher", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "could not restart SparkDeck"):
+                restart_service(root)
 
     @patch("sparkdeck.update_helper.platform.system", return_value="Linux")
     @patch("sparkdeck.update_helper.run")

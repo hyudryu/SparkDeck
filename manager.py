@@ -558,6 +558,9 @@ def _community_consent_fanout(nodes: list[dict], results: list) -> dict:
 class Manager:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
+        # Report the code loaded by this process, not a checkout HEAD that an
+        # update helper may already have moved underneath it.
+        self.app_revision = current_revision(Path(__file__).parent)
         self.data_dir.mkdir(exist_ok=True)
         self.settings_path = self.data_dir / "settings.json"
         self.settings = self._load_settings()
@@ -1047,7 +1050,7 @@ class Manager:
             "protocol_version": AGENT_PROTOCOL_VERSION,
             "capabilities": [CAPABILITY, VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
             "update_protocol": 1,
-            "app_revision": current_revision(Path(__file__).parent),
+            "app_revision": getattr(self, "app_revision", None),
             "status": "online" if docker_ready else "degraded",
             "online": True,
             "status_message": docker_status_message,

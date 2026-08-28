@@ -61,6 +61,24 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["status_message"], "Docker is unavailable")
         self.assertFalse(status["docker_ready"])
 
+    async def test_agent_status_reports_the_revision_pinned_at_manager_startup(self):
+        manager = self.manager_without_docker()
+        manager.app_revision = "a" * 40
+        manager.get_disk = AsyncMock(return_value={})
+        unavailable = docker.errors.DockerException("daemon is not running")
+
+        with patch("manager.current_revision", return_value="b" * 40), \
+             patch("manager.docker.from_env", side_effect=unavailable):
+            status = await manager.agent_status(stats={})
+
+        self.assertEqual(status["app_revision"], "a" * 40)
+
+    async def test_agent_info_reports_the_revision_pinned_at_server_startup(self):
+        with patch.object(server.updater, "runtime_revision", "a" * 40):
+            info = await server.agent_info()
+
+        self.assertEqual(info["app_revision"], "a" * 40)
+
     async def test_agent_status_rejects_windows_container_daemon(self):
         manager = self.manager_without_docker()
         client = Mock()

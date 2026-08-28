@@ -170,6 +170,18 @@ Describe "SparkDeck Windows launcher" {
             }
         }
 
+        It "checks updater process ownership without recursively probing API health" {
+            Mock Get-SparkDeckPaths { [pscustomobject]@{ Root = "C:\SparkDeck" } }
+            Mock Get-SparkDeckPidRecord { [pscustomobject]@{ pid = 1234 } }
+            Mock Test-SparkDeckProcessIdentity { $true }
+            Mock Test-SparkDeckHealth { throw "process-status must not probe the API" }
+
+            (Invoke-SparkDeckCommand -Command "process-status") | Should Be 0
+
+            Assert-MockCalled Test-SparkDeckProcessIdentity -Times 1 -Exactly
+            Assert-MockCalled Test-SparkDeckHealth -Times 0 -Exactly
+        }
+
         It "replaces an unsupported virtual environment while preserving application data" {
             $root = Join-Path $TestDrive "old python repo"
             $oldScripts = Join-Path $root ".venv\Scripts"

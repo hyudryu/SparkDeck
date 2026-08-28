@@ -11,6 +11,9 @@ import type {
   ContainerImage,
   CreateDeploymentInput,
   Deployment,
+  DeploymentDetail,
+  DeploymentLaunchControls,
+  DeploymentUpdateInput,
   DashboardData,
   SystemStats,
   AdmissionStats,
@@ -123,6 +126,18 @@ interface WireDeployment {
   required_node_count?: number
   model_revision?: string
   created_at?: string
+  desired_state?: 'running' | 'stopped'
+}
+
+interface WireDeploymentDetail extends WireDeployment {
+  editable: boolean
+  edit_reason?: string | null
+  desired_state: 'running' | 'stopped'
+  extra_args: string[]
+  launch_controls: DeploymentLaunchControls
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
+  image?: string | null
 }
 
 interface WireBenchmark {
@@ -158,6 +173,21 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
+    desired_state: item.desired_state,
+  }
+}
+
+function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail {
+  return {
+    ...deploymentFromWire(item),
+    editable: item.editable,
+    edit_reason: item.edit_reason,
+    desired_state: item.desired_state,
+    extra_args: item.extra_args ?? [],
+    launch_controls: item.launch_controls ?? {},
+    gpu_memory_utilization: item.gpu_memory_utilization,
+    gpu_memory_gb: item.gpu_memory_gb,
+    image: item.image ?? undefined,
   }
 }
 
@@ -200,6 +230,17 @@ export const api = {
     list: async (signal?: AbortSignal) => {
       const data = await request<{ items: WireDeployment[] }>('/api/v1/deployments', { signal })
       return data.items.map(deploymentFromWire)
+    },
+    get: async (id: string, signal?: AbortSignal) => {
+      const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}`, { signal })
+      return deploymentDetailFromWire(data)
+    },
+    update: async (id: string, input: DeploymentUpdateInput) => {
+      const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}/settings`, {
+        method: 'PUT',
+        body: JSON.stringify(input),
+      })
+      return deploymentDetailFromWire(data)
     },
     create: async (input: CreateDeploymentInput) => {
       const data = await request<WireDeployment>('/api/v1/deployments', {

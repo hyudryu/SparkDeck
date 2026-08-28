@@ -101,6 +101,13 @@ DEFAULT_SETTINGS = {
 
 logger = logging.getLogger(__name__)
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
+SENSITIVE_CREDENTIAL_CLI_OPTIONS = HF_CREDENTIAL_CLI_OPTIONS | {
+    "--api-key", "--api_key", "--token", "--auth-token", "--auth_token",
+    "--access-token", "--access_token", "--bearer-token", "--bearer_token",
+    "--password", "--secret", "--client-secret", "--client_secret",
+    "--credential", "--credentials", "--authorization",
+    "--huggingface-token", "--huggingface_token",
+}
 IMMUTABLE_HF_REVISION = re.compile(r"^[0-9a-f]{40}$")
 PERSISTED_RECIPE_ARGS_ERROR = (
     "unsupported persisted extra_args: expected an array of strings"
@@ -559,6 +566,11 @@ class Manager:
         # fills the otherwise silent gap between the launch request and the
         # container being created.
         self.cluster_member_launches: dict[str, dict] = {}
+        # Short-lived race guard for explicit Stop. Durable intent lives in
+        # the controller deployment records; this set prevents an inference
+        # request already in flight on a worker from waking the just-stopped
+        # container before that request observes controller state.
+        self._explicitly_stopped_containers: set[str] = set()
         self.unsloth_settings_path = self.data_dir / "unsloth_models.json"
         self.unsloth_settings: dict[str, dict] = self._load_unsloth_settings()
         # Saved SparkRun targets are references understood by the SparkRun CLI
@@ -2339,6 +2351,10 @@ class Manager:
             if not isinstance(value, list):
                 return []
             for deployment in value:
+                deployment.setdefault(
+                    "desired_state",
+                    "stopped" if deployment.get("status") == "stopped" else "running",
+                )
                 engine = str(deployment.get("engine") or "vllm")
                 if engine not in {"vllm", "sglang"}:
                     deployment["status"] = "error"
@@ -2422,7 +2438,7 @@ class Manager:
                 continue
             else:
                 original = list(raw_args)
-            sanitized = self._without_hf_cli_credentials(original)
+            sanitized = self._without_sensitive_cli_credentials(original)
             if sanitized != original:
                 settings["extra_args"] = sanitized
                 deployment["settings_dirty"] = True
@@ -2675,7 +2691,11 @@ class Manager:
 
     def _deployment(self, deployment_id: str) -> dict | None:
         return next(
-            (d for d in self.deployments if d.get("id") == deployment_id), None
+            (
+                d for d in getattr(self, "deployments", [])
+                if d.get("id") == deployment_id
+            ),
+            None,
         )
 
     @staticmethod
@@ -2872,7 +2892,7 @@ class Manager:
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""
         if "extra_args" in body:
-            self._reject_hf_cli_credentials(body.get("extra_args"))
+            self._reject_sensitive_cli_credentials(body.get("extra_args"))
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -3069,23 +3089,52 @@ class Manager:
 
     @classmethod
     def _without_hf_cli_credentials(cls, args: list[Any]) -> list[str]:
+        """Compatibility alias for callers that need a public-safe argv."""
+        return cls._without_sensitive_cli_credentials(args)
+
+    @classmethod
+    def _without_sensitive_cli_credentials(cls, args: list[Any]) -> list[str]:
         if not isinstance(args, list):
             return []
-        return cls._without_cli_options(
-            [str(value) for value in (args or [])], HF_CREDENTIAL_CLI_OPTIONS,
-        )
+        values = [str(value) for value in (args or [])]
+        result: list[str] = []
+        index = 0
+        while index < len(values):
+            value = values[index]
+            key = value.split("=", 1)[0].lower().replace("_", "-")
+            name = key.removeprefix("--")
+            sensitive = (
+                key in {item.replace("_", "-") for item in SENSITIVE_CREDENTIAL_CLI_OPTIONS}
+                or name.endswith("-token")
+                or name.endswith("-password")
+                or name.endswith("-secret")
+                or name.endswith("-credential")
+                or name.endswith("-credentials")
+                or "api-key" in name
+            )
+            if sensitive:
+                index += 1 if "=" in value else 2
+                continue
+            result.append(value)
+            index += 1
+        return result
 
     @classmethod
     def _reject_hf_cli_credentials(cls, args: list[Any] | None) -> None:
+        """Compatibility alias for the broader credential-argv policy."""
+        cls._reject_sensitive_cli_credentials(args)
+
+    @classmethod
+    def _reject_sensitive_cli_credentials(cls, args: list[Any] | None) -> None:
         if args is not None and (
             not isinstance(args, list)
             or any(not isinstance(value, str) for value in args)
         ):
             raise ValueError("extra_args must be an array of strings")
         original = [str(value) for value in (args or [])]
-        if cls._without_hf_cli_credentials(original) != original:
+        if cls._without_sensitive_cli_credentials(original) != original:
             raise ValueError(
-                "configure Hugging Face credentials in Settings, not launch arguments"
+                "configure credentials in Settings, not launch arguments"
             )
 
     @staticmethod
@@ -3606,6 +3655,8 @@ class Manager:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise LookupError("cluster deployment not found")
+        if deployment.get("desired_state") == "stopped":
+            raise RuntimeError("deployment is stopped; start it before sending inference requests")
         candidates = self._cluster_route_order(deployment)
         if not candidates:
             raise LookupError("cluster deployment has no inference member")
@@ -3656,6 +3707,9 @@ class Manager:
         still fail over until the first real SSE event is forwarded.
         """
         deployment_id = str(deployment.get("id") or "")
+        current = self._deployment(deployment_id)
+        if current and current.get("desired_state") == "stopped":
+            raise RuntimeError("deployment is stopped; start it before sending inference requests")
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)
         stream_owns_member = False
@@ -3945,6 +3999,7 @@ class Manager:
             "mode": mode,
             "node_ids": node_ids,
             "status": "launching",
+            "desired_state": "running",
             "members": [],
             "created_at": time.time(),
             "recipe_id": body.get("recipe_id"),
@@ -4121,11 +4176,25 @@ class Manager:
     ) -> Any:
         node_id = member["node_id"]
         name = member["container_name"]
+        owner = next(
+            (
+                deployment for deployment in getattr(self, "deployments", [])
+                if any(
+                    candidate.get("container_name") == name
+                    for candidate in deployment.get("members", [])
+                )
+            ),
+            None,
+        )
+        explicit_stop = bool(
+            action == "stop" and owner
+            and owner.get("desired_state") == "stopped"
+        )
         if node_id == LOCAL_NODE_ID:
             if action == "start":
-                return await self.start_container(name)
+                return await self.start_container(name, explicit=True)
             if action == "stop":
-                return await self.stop_container(name)
+                return await self.stop_container(name, explicit=explicit_stop)
             if action == "remove":
                 return await self.remove_cluster_member(name)
             if action == "logs":
@@ -4136,6 +4205,8 @@ class Manager:
             if action == "logs"
             else ("" if action == "remove" else f"/{action}")
         )
+        if explicit_stop:
+            suffix += "?explicit=true"
         return await self.node_registry.request(
             node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
         )
@@ -4204,6 +4275,13 @@ class Manager:
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
 
+        # Persist user intent before touching any member. Inference and health
+        # paths consult this independently from observed container state, so a
+        # request racing an explicit Stop cannot resurrect the deployment.
+        if action == "stop":
+            deployment["desired_state"] = "stopped"
+            self._save_deployments()
+
         # Containers cannot move between nodes: an explicit node selection (or
         # any argv-affecting setting change) means removing the old ranks and
         # relaunching the deployment through the fully validated path.
@@ -4221,6 +4299,8 @@ class Manager:
             await self._preflight_deployment_launch(
                 launch_body, exclude_deployment_id=deployment_id,
             )
+            deployment["desired_state"] = "running"
+            self._save_deployments()
 
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
@@ -4262,6 +4342,10 @@ class Manager:
                 "replaced_deployment_id": deployment_id,
             }
 
+        if action == "start":
+            deployment["desired_state"] = "running"
+            self._save_deployments()
+
         results = await asyncio.gather(
             *[self._member_action(m, action) for m in deployment.get("members", [])],
             return_exceptions=True,
@@ -4301,7 +4385,10 @@ class Manager:
         members = deployment.get("members") or []
         if len(members) < 2:
             return None
-        if deployment.get("status") in {"stopped", "error", "launching"}:
+        if (
+            deployment.get("desired_state") == "stopped"
+            or deployment.get("status") in {"stopped", "error", "launching"}
+        ):
             return None
 
         node_by_id = {node.get("id"): node for node in nodes}
@@ -4384,7 +4471,11 @@ class Manager:
         """Stop every rank, then start every rank as one atomic generation."""
         async with self._cluster_action_lock():
             deployment = self._deployment(deployment_id)
-            if not deployment or deployment.get("status") in {"stopped", "error", "launching"}:
+            if (
+                not deployment
+                or deployment.get("desired_state") == "stopped"
+                or deployment.get("status") in {"stopped", "error", "launching"}
+            ):
                 return
             members = list(deployment.get("members") or [])
             if len(members) < 2:
@@ -4446,6 +4537,7 @@ class Manager:
         candidates = [
             deployment for deployment in list(self.deployments)
             if len(deployment.get("members") or []) >= 2
+            and deployment.get("desired_state") != "stopped"
             and deployment.get("status") not in {"stopped", "error", "launching"}
         ]
         if not candidates:
@@ -4682,6 +4774,7 @@ class Manager:
             deployment for deployment in list(self.deployments)
             if deployment.get("engine") == "vllm"
             and deployment.get("members")
+            and deployment.get("desired_state") != "stopped"
             and deployment.get("status") not in {
                 "stopped", "error", "launching", "recovering",
                 "capacity_redeploying",
@@ -9127,7 +9220,14 @@ class Manager:
                 )
                 raise RuntimeError(safe_error) from exc
 
-    async def start_container(self, name: str) -> dict:
+    async def start_container(self, name: str, *, explicit: bool = False) -> dict:
+        stopped = getattr(self, "_explicitly_stopped_containers", set())
+        if name in stopped and not explicit:
+            raise RuntimeError(
+                "deployment is stopped; start it before sending inference requests"
+            )
+        if explicit:
+            stopped.discard(name)
         # VRAM-aware: evict only if the GPU is full.
         # Estimate VRAM from the container's model label.
         try:
@@ -9393,7 +9493,12 @@ class Manager:
         except docker.errors.NotFound:
             return False
 
-    async def stop_container(self, name: str) -> dict:
+    async def stop_container(self, name: str, *, explicit: bool = False) -> dict:
+        if explicit:
+            stopped = getattr(self, "_explicitly_stopped_containers", None)
+            if stopped is None:
+                stopped = self._explicitly_stopped_containers = set()
+            stopped.add(name)
         def _do():
             container = self.client.containers.get(name)
             # Prevent Docker's restart policy from resurrecting a model that
@@ -9429,6 +9534,7 @@ class Manager:
                     raise
                 ledger.release(name)
         await asyncio.to_thread(_do)
+        getattr(self, "_explicitly_stopped_containers", set()).discard(name)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
         aliases = getattr(self, "container_aliases", {})
         if name in aliases:
@@ -11103,6 +11209,12 @@ class Manager:
         # replacement generation has at least been created.
         while model in getattr(self, "_capacity_redeploying_models", set()):
             await asyncio.sleep(0.25)
+        if deployment_id:
+            deployment = self._deployment(deployment_id)
+            if deployment and deployment.get("desired_state") == "stopped":
+                raise LookupError(
+                    "deployment is stopped; start it before sending inference requests"
+                )
         containers = await self.list_containers()
         # Look for a running container with this model
         for c in containers:
@@ -11128,6 +11240,30 @@ class Manager:
             raise LookupError(f"No managed container found for model '{model}'")
         except TimeoutError:
             raise TimeoutError(f"Timeout waiting for model '{model}' to become ready")
+
+    async def inference_target_health(
+        self, model: str, *, container_name: str | None = None,
+        deployment_id: str | None = None,
+    ) -> bool:
+        """Observe an exact inference target without waking a stopped model."""
+        if deployment_id:
+            deployment = self._deployment(deployment_id)
+            if deployment and deployment.get("desired_state") == "stopped":
+                return False
+        for container in await self.list_containers():
+            if container_name and container.get("name") != container_name:
+                continue
+            if (
+                deployment_id and container.get("deployment_id")
+                and container.get("deployment_id") != deployment_id
+            ):
+                continue
+            if (
+                model in self._container_model_ids(container)
+                and container.get("status") == "running"
+            ):
+                return bool(await self._check_ready(container))
+        return False
 
     def _vllm_stream(self, url: str, body: dict, key: str,
                      cancel: asyncio.Event | None = None,

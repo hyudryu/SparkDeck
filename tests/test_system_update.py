@@ -105,6 +105,28 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(overview["up_to_date"])
         self.assertFalse(overview["can_update"])
 
+    async def test_overview_allows_eligible_nodes_when_another_node_is_blocked(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        self.manager.cluster_nodes.return_value = [
+            {
+                "id": "local", "name": "Controller", "local": True,
+                "online": True, "enabled": True, "capabilities": [CAPABILITY],
+                "app_revision": "a" * 40,
+            },
+            {
+                "id": "worker", "name": "Worker", "local": False,
+                "online": True, "enabled": True, "capabilities": [CAPABILITY],
+                "app_revision": "a" * 40,
+            },
+        ]
+        with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=["Launcher unavailable"]):
+            overview = await self.service.overview()
+
+        self.assertTrue(overview["can_update"])
+        self.assertIn("Controller: Launcher unavailable", overview["blockers"])
+        self.assertEqual(overview["nodes"][1]["blockers"], [])
+
     async def test_release_resolves_to_immutable_commit(self):
         self.manager.http.get.side_effect = [
             response(200, [{"tag_name": "v1.2.3", "name": "Release 1.2.3", "html_url": "https://github.com/hyudryu/SparkDeck/releases/tag/v1.2.3", "draft": False}]),
@@ -156,7 +178,7 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(release["tag"], "v1.0.0")
         self.assertEqual(release["revision"], "c" * 40)
 
-    async def test_worker_failure_stops_before_controller(self):
+    async def test_worker_preflight_failure_does_not_stop_controller(self):
         state = {
             "id": "job", "active": True, "phase": "preflight", "target_branch": "main",
             "target_revision": "b" * 40,
@@ -169,8 +191,72 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.preflight_local = AsyncMock(return_value={"ok": True})
         self.service.start_local = AsyncMock()
         await self.service._run_cluster(state)
-        self.assertEqual(state["phase"], "failed")
+        self.assertEqual(state["phase"], "updating_controller")
+        self.assertEqual(state["nodes"][0]["phase"], "failed")
+        self.assertIn("worker unavailable", state["nodes"][0]["error"])
+        self.service.start_local.assert_awaited_once_with("main", "b" * 40)
+
+    async def test_blocked_controller_does_not_stop_eligible_worker(self):
+        state = {
+            "id": "job", "active": True, "phase": "preflight", "target_branch": "main",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {
+                    "id": "worker", "name": "Worker", "local": False,
+                    "phase": "pending", "blockers": [],
+                },
+                {
+                    "id": "local", "name": "Controller", "local": True,
+                    "phase": "pending", "blockers": ["Launcher unavailable"],
+                },
+            ],
+        }
+        self.manager.node_registry.request.side_effect = [
+            {"capability": CAPABILITY, "blockers": []},
+            {"phase": "accepted"},
+            {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        self.service.preflight_local = AsyncMock()
+        self.service.start_local = AsyncMock()
+
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()):
+            await self.service._run_cluster(state)
+
+        self.assertFalse(state["active"])
+        self.assertEqual(state["phase"], "partial")
+        self.assertEqual(state["nodes"][0]["phase"], "succeeded")
+        self.assertEqual(state["nodes"][1]["phase"], "failed")
+        self.assertIn("Launcher unavailable", state["nodes"][1]["error"])
+        self.service.preflight_local.assert_not_awaited()
         self.service.start_local.assert_not_awaited()
+
+    async def test_worker_runtime_failure_does_not_stop_later_nodes(self):
+        state = {
+            "id": "job", "active": True, "phase": "preflight", "target_branch": "main",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {"id": "bad", "name": "Bad worker", "local": False, "phase": "pending"},
+                {"id": "good", "name": "Good worker", "local": False, "phase": "pending"},
+                {"id": "local", "name": "Controller", "local": True, "phase": "pending"},
+            ],
+        }
+        self.manager.node_registry.request.side_effect = [
+            {"capability": CAPABILITY, "blockers": []},
+            {"capability": CAPABILITY, "blockers": []},
+            RuntimeError("update request failed"),
+            {"phase": "accepted"},
+            {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        self.service.start_local = AsyncMock()
+
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()):
+            await self.service._run_cluster(state)
+
+        self.assertEqual(state["nodes"][0]["phase"], "failed")
+        self.assertEqual(state["nodes"][1]["phase"], "succeeded")
+        self.assertEqual(state["phase"], "updating_controller")
+        self.service.start_local.assert_awaited_once()
 
     async def test_worker_requests_use_main_branch_and_immutable_revision(self):
         state = {
@@ -286,6 +372,18 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "failed")
         self.assertIn("interrupted", status["error"].lower())
 
+    async def test_target_checkout_does_not_finish_before_helper_verification(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321,
+        })
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater._helper_alive", return_value=True), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = self.service.agent_status()
+
+        self.assertEqual(status["phase"], "restarting")
+
     async def test_interrupted_controller_job_is_unblocked(self):
         self.service._write(self.service.cluster_path, {
             "id": "stale", "active": True, "phase": "preflight",
@@ -298,6 +396,57 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
             overview = await self.service.overview()
         self.assertFalse(overview["job"]["active"])
         self.assertEqual(overview["job"]["phase"], "failed")
+
+    async def test_controller_restart_preserves_worker_failure_as_partial(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "stale", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {
+                    "id": "worker", "name": "Worker", "local": False,
+                    "phase": "failed", "error": "Docker unavailable",
+                },
+                {
+                    "id": "local", "name": "Controller", "local": True,
+                    "phase": "updating",
+                },
+            ],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "succeeded", "target_revision": "b" * 40,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        self.assertFalse(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "partial")
+        self.assertEqual(overview["job"]["nodes"][0]["error"], "Docker unavailable")
+        self.assertEqual(overview["job"]["nodes"][1]["phase"], "succeeded")
+
+    async def test_controller_checkout_waits_for_helper_success_before_finishing(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "active", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [{
+                "id": "local", "name": "Controller", "local": True,
+                "phase": "updating",
+            }],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 4321,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater._helper_alive", return_value=True), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        self.assertTrue(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "updating_controller")
+        self.assertEqual(overview["job"]["nodes"][0]["phase"], "updating")
 
     async def test_windows_start_records_verified_helper_identity(self):
         self.service.preflight_local = AsyncMock(return_value={"ok": True})
@@ -352,7 +501,7 @@ class UpdateHelperProcessTests(unittest.TestCase):
 class LocalUpdatePreflightTests(unittest.TestCase):
     @patch("sparkdeck.updater.platform.system", return_value="Windows")
     @patch("sparkdeck.updater._run")
-    def test_windows_preflight_uses_bundled_launcher_status(self, command_run, _system):
+    def test_windows_preflight_uses_bundled_launcher_process_status(self, command_run, _system):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
@@ -371,7 +520,7 @@ class LocalUpdatePreflightTests(unittest.TestCase):
             "Bypass",
             "-File",
             str(launcher),
-            "status",
+            "process-status",
         ))
         self.assertEqual(command_run.call_args_list[-1].kwargs, {"timeout": 30})
 

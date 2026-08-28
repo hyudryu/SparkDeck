@@ -82,6 +82,35 @@ export interface Deployment {
   updated_at?: string
   node_ids?: string[]
   selected_nodes?: NodeSummary[]
+  desired_state?: 'running' | 'stopped'
+}
+
+export interface DeploymentLaunchControls {
+  context_window?: number | null
+  max_concurrency?: number | null
+  kv_cache_dtype?: string | null
+  thinking_mode?: string | null
+  dspark_num_speculative_tokens?: number | null
+  max_cudagraph_capture_size?: number | null
+  max_num_batched_tokens?: number | null
+}
+
+export interface DeploymentDetail extends Deployment {
+  editable: boolean
+  edit_reason?: string | null
+  desired_state: 'running' | 'stopped'
+  extra_args: string[]
+  launch_controls: DeploymentLaunchControls
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
+  image?: string
+}
+
+export interface DeploymentUpdateInput {
+  extra_args: string[]
+  launch_controls: DeploymentLaunchControls
+  gpu_memory_utilization?: number | null
+  gpu_memory_gb?: number | null
 }
 
 export interface CreateDeploymentInput {

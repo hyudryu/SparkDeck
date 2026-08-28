@@ -684,6 +684,29 @@ class AgentInferenceErrorTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.detail["type"], "replica_unavailable",
         )
 
+    async def test_agent_health_is_observational_and_never_resolves_or_starts(self):
+        import server
+
+        request = self.Request()
+        request.json = AsyncMock(return_value={
+            "model": "org/model",
+            "_sparkdeck_container_name": "rank-0",
+            "_sparkdeck_deployment_id": "deployment-1",
+        })
+        health = AsyncMock(return_value=False)
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager, "inference_target_health", health),
+            patch.object(server.manager, "_resolve_vllm_target", AsyncMock()) as resolve,
+        ):
+            result = await server.agent_inference_health(request)
+
+        self.assertEqual(result, {"ready": False, "model": "org/model"})
+        health.assert_awaited_once_with(
+            "org/model", container_name="rank-0", deployment_id="deployment-1",
+        )
+        resolve.assert_not_awaited()
+
 
 class ReplicaHealthTests(unittest.IsolatedAsyncioTestCase):
     async def test_replicated_health_ready_when_any_replica_ready(self):

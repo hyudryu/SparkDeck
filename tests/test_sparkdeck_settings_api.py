@@ -220,6 +220,18 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "credentials in Settings"):
             instance._reject_hf_cli_credentials(["--hf-token", "hf_new_secret"])
 
+    def test_legacy_stopped_deployment_remains_stopped_after_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments_path.write_text(json.dumps([{
+                "id": "legacy-stopped", "status": "stopped",
+            }]), encoding="utf-8")
+
+            loaded = instance._load_deployments()
+
+            self.assertEqual(loaded[0]["desired_state"], "stopped")
+
     def test_malformed_recipe_args_are_isolated_and_durable_during_startup(self):
         class StartupContinued(Exception):
             pass

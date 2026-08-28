@@ -24,6 +24,26 @@ class FakeManager:
 
 
 class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicitly_stopped_registered_deployment_cannot_auto_wake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="stopped", alias="sleeping-model", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                container_name="sleeping-container", desired_state="stopped",
+            ))
+
+            with self.assertRaisesRegex(RuntimeError, "deployment is stopped"):
+                await service.proxy(
+                    {"model": "sleeping-model", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+
+            manager._vllm_chat.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_registered_alias_passes_exact_container_and_deployment_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()

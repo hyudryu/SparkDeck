@@ -162,6 +162,10 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
 
         await self.service.deployment_action("record-1", "stop")
         self.manager.deployment_action.assert_awaited_once_with("new-manager", "stop")
+        self.assertEqual(
+            self.service.store.deployment("record-1")["desired_state"],
+            "stopped",
+        )
 
     async def test_settings_dirty_start_result_immediately_reconciles_replacement(self):
         self.manager.deployment_action.return_value = {
@@ -184,6 +188,38 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stored["container_name"], "replacement-rank")
         self.assertEqual(stored["_base_url"], "http://127.0.0.1:8020")
+        self.assertEqual(stored["desired_state"], "running")
+
+    async def test_concurrent_start_then_stop_finishes_durably_stopped(self):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def action(_deployment_id, action):
+            if action == "start":
+                start_entered.set()
+                await release_start.wait()
+            return {"ok": True, "errors": []}
+
+        self.manager.deployment_action.side_effect = action
+        start = asyncio.create_task(
+            self.service.deployment_action("record-1", "start")
+        )
+        await start_entered.wait()
+        stop = asyncio.create_task(
+            self.service.deployment_action("record-1", "stop")
+        )
+        await asyncio.sleep(0)
+        release_start.set()
+        await asyncio.gather(start, stop)
+
+        self.assertEqual(
+            self.service.store.deployment("record-1")["desired_state"],
+            "stopped",
+        )
+        self.assertEqual(
+            [call.args[1] for call in self.manager.deployment_action.await_args_list],
+            ["start", "stop"],
+        )
 
     async def test_remote_first_replica_does_not_duplicate_later_local_member(self):
         self.service.store.update_container("record-1", "remote-rank-0")
@@ -215,6 +251,129 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listed[0]["id"], "record-1")
         self.assertEqual(listed[0]["status"], "running")
         self.assertFalse(any(item["id"] == "container:local-rank-1" for item in listed))
+
+
+class DeploymentSettingsContractTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.manager = Manager.__new__(Manager)
+        self.manager.http = httpx.AsyncClient()
+        self.manager.deployments_path = root / "manager-deployments.json"
+        self.manager.deployments = [{
+            "id": "manager-1",
+            "sparkdeck_record_id": "record-1",
+            "name": "Editable model",
+            "model": "org/model",
+            "engine": "vllm",
+            "mode": "single",
+            "node_ids": ["local"],
+            "status": "stopped",
+            "desired_state": "stopped",
+            "api_port": 8000,
+            "members": [],
+            "launch_settings": {
+                "deployment_name": "Editable model",
+                "model": "org/model",
+                "engine": "vllm",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "extra_args": [
+                    "--hf-token", "do-not-expose",
+                    "--api-key", "also-do-not-expose",
+                    "--max-model-len", "32768",
+                    "--enable-prefix-caching",
+                ],
+                "gpu_memory_utilization": 0.9,
+                "gpu_memory_gb": 12,
+                "image": "example/vllm:test",
+            },
+        }]
+        self.manager.get_state = AsyncMock(
+            side_effect=lambda: {"deployments": self.manager.deployments},
+        )
+        self.manager.cluster_nodes = AsyncMock(return_value=[
+            cluster_node("local", local=True),
+        ])
+        self.manager.list_containers = AsyncMock(return_value=[])
+        self.service = SparkDeckService(self.manager, root)
+        self.service.store.add_deployment(Deployment(
+            id="record-1", alias="Editable model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "manager-1"},
+            desired_state="stopped",
+        ), "http://127.0.0.1:8000")
+
+    async def asyncTearDown(self):
+        await self.service.close()
+        await self.manager.http.aclose()
+        self.temp.cleanup()
+
+    async def test_detail_resolves_public_record_and_redacts_launch_credentials(self):
+        detail = await self.service.deployment_detail("record-1")
+
+        self.assertEqual(detail["id"], "record-1")
+        self.assertTrue(detail["editable"])
+        self.assertEqual(detail["desired_state"], "stopped")
+        self.assertEqual(detail["launch_controls"]["context_window"], 32768)
+        self.assertEqual(detail["extra_args"], [
+            "--max-model-len", "32768", "--enable-prefix-caching",
+        ])
+        self.assertEqual(detail["gpu_memory_utilization"], 0.9)
+        self.assertEqual(detail["gpu_memory_gb"], 12)
+        self.assertEqual(detail["image"], "example/vllm:test")
+        self.assertNotIn("do-not-expose", str(detail))
+        self.assertNotIn("also-do-not-expose", str(detail))
+        self.assertNotIn("launch_settings", detail)
+        self.assertNotIn("manager_deployment_id", str(detail))
+
+    async def test_update_maps_record_to_manager_and_refreshes_public_settings(self):
+        detail = await self.service.update_deployment_settings("record-1", {
+            "extra_args": ["--enable-prefix-caching"],
+            "launch_controls": {"context_window": 65536},
+            "gpu_memory_utilization": 0.8,
+            "gpu_memory_gb": None,
+        })
+
+        manager_deployment = self.manager.deployments[0]
+        self.assertTrue(manager_deployment["settings_dirty"])
+        self.assertEqual(
+            self.manager._cli_option(
+                manager_deployment["launch_settings"]["extra_args"],
+                {"--max-model-len"}, int,
+            ),
+            65536,
+        )
+        stored = self.service.store.deployment("record-1")
+        self.assertEqual(
+            stored["settings"]["manager_deployment_id"], "manager-1",
+        )
+        self.assertEqual(stored["settings"]["context_length"], 65536)
+        self.assertEqual(detail["launch_controls"]["context_window"], 65536)
+        self.assertEqual(detail["gpu_memory_utilization"], 0.8)
+
+    async def test_update_rejects_credential_bearing_runtime_flags(self):
+        with self.assertRaisesRegex(ValueError, "credentials in Settings"):
+            await self.service.update_deployment_settings("record-1", {
+                "extra_args": ["--api-key", "never-persist-this"],
+            })
+
+        self.assertNotIn(
+            "never-persist-this", str(self.manager.deployments[0]),
+        )
+
+    async def test_manager_stopped_state_repairs_store_and_blocks_proxy(self):
+        self.service.store.update_desired_state("record-1", "running")
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(listed[0]["desired_state"], "stopped")
+        stored = self.service.store.deployment("record-1", include_private=True)
+        self.assertEqual(stored["desired_state"], "stopped")
+        with self.assertRaisesRegex(RuntimeError, "deployment is stopped"):
+            await self.service._proxy_registered(
+                stored, {"model": "Editable model"}, "chat/completions", None,
+            )
 
 
 class WorkerSchedulerTests(unittest.IsolatedAsyncioTestCase):

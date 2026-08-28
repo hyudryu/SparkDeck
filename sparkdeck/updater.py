@@ -440,15 +440,23 @@ class UpdateService:
     async def overview(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.cluster_path)
+        agent_state = self._read(self.agent_path)
         task_live = self._task is not None and not self._task.done()
+        target_revision = state.get("target_revision")
+        controller_verified = bool(
+            revision
+            and revision == target_revision
+            and agent_state.get("phase") == "succeeded"
+            and agent_state.get("target_revision") == target_revision
+        )
         completed_job_reconciled = False
-        if state.get("phase") == "succeeded" and revision and revision == state.get("target_revision"):
+        if state.get("phase") == "succeeded" and controller_verified:
             completed_job_reconciled = self._reconcile_local_node_success(state, revision)
         if state.get("active") and not task_live:
-            if state.get("phase") == "updating_controller" and revision and revision == state.get("target_revision"):
+            if state.get("phase") == "updating_controller" and controller_verified:
                 self._reconcile_local_node_success(state, revision)
                 state.update(active=False, phase="succeeded", message="Cluster update completed")
-            elif state.get("phase") == "updating_controller" and _helper_alive(self._read(self.agent_path)):
+            elif state.get("phase") == "updating_controller" and _helper_alive(agent_state):
                 pass
             else:
                 changed = any(

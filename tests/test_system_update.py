@@ -338,6 +338,9 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         })
+        self.service._write(self.service.agent_path, {
+            "phase": "succeeded", "target_revision": "b" * 40,
+        })
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
 
         with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
@@ -361,6 +364,9 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
                 "phase": "updating", "current_revision": "a" * 40,
             }],
         })
+        self.service._write(self.service.agent_path, {
+            "phase": "succeeded", "target_revision": "b" * 40,
+        })
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
 
         with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
@@ -371,6 +377,30 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local["phase"], "succeeded")
         self.assertEqual(local["current_revision"], "b" * 40)
         self.assertEqual(self.service._read(self.service.cluster_path), overview["job"])
+
+    async def test_controller_checkout_does_not_finish_job_before_helper_verification(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "active", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [{
+                "id": "local", "name": "Controller", "local": True,
+                "phase": "updating", "current_revision": "a" * 40,
+            }],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 1234,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._helper_alive", return_value=True):
+            overview = await self.service.overview()
+
+        self.assertTrue(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "updating_controller")
+        self.assertEqual(overview["job"]["nodes"][0]["phase"], "updating")
 
     async def test_windows_start_records_verified_helper_identity(self):
         self.service.preflight_local = AsyncMock(return_value={"ok": True})

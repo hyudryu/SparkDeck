@@ -99,4 +99,17 @@ describe('deployment object page', () => {
       '--regex', '\\d+', '--windows-path', 'C:\\models\\foo',
     ])
   })
+
+  it('does not save or start when Run encounters invalid form values', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const utilization = await screen.findByLabelText('GPU memory utilization')
+    fireEvent.change(utilization, { target: { value: '2' } })
+    expect(utilization).toBeInvalid()
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+
+    const mutationCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    expect(mutationCalls).toEqual([])
+  })
 })

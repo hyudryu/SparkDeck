@@ -66,11 +66,15 @@ type SortMode = 'recent' | 'name-asc' | 'name-desc'
 const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting'])
 const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
-const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped'])
+const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
 
 const deploymentNeedsPoll = (deployment: Deployment) => (
   ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
   || Boolean(deployment.launch_phase && !FINISHED_LAUNCH_PHASES.has(deployment.launch_phase))
+)
+
+const showLaunchDetails = (deployment: Deployment) => !(
+  deployment.status === 'stopped' && deployment.launch_phase === 'exited'
 )
 
 const formatLaunchPhase = (phase: string) => phase
@@ -987,8 +991,8 @@ export function ModelsPage() {
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
                   <div role="cell" data-label="Status" className="deployment-status-cell" aria-live="polite">
                     <Status status={deployment.status} />
-                    {deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
-                    {deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
+                    {showLaunchDetails(deployment) && deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
+                    {showLaunchDetails(deployment) && deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)

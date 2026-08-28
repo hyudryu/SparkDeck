@@ -377,6 +377,34 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('treats an exited clustered deployment as stopped rather than active launch progress', async () => {
+    const timeout = vi.spyOn(window, 'setTimeout')
+    let deploymentListCalls = 0
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-exited', alias: 'Stopped cluster', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
+        launch_phase: 'exited', launch_message: 'Container exited',
+        settings: {}, node_ids: ['local'],
+      }] } : path.includes('/api/v1/nodes') ? { items: [{
+        id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true,
+      }] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : { items: [] }
+      if (path.includes('/api/v1/deployments')) deploymentListCalls += 1
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    const row = (await screen.findByRole('link', { name: 'Stopped cluster' })).closest('[role="row"]') as HTMLElement
+    expect(within(row).getByText('stopped')).toBeInTheDocument()
+    expect(within(row).queryByText('Exited')).not.toBeInTheDocument()
+    expect(within(row).queryByText('Container exited')).not.toBeInTheDocument()
+    expect(within(row).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(deploymentListCalls).toBe(1)
+    expect(timeout).not.toHaveBeenCalledWith(expect.any(Function), 2000)
+  })
+
   it('offers Start when stopped intent outlives a still-running container', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

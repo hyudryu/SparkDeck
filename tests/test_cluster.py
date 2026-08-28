@@ -3250,6 +3250,60 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             persisted = json.loads(instance.deployments_path.read_text())
             self.assertEqual(persisted[0]["id"], "new-manager-id")
 
+    async def test_explicit_stop_serializes_before_interrupted_launch_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._deployment_action_lock = asyncio.Lock()
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "recovering", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "recovering-r0",
+                    "rank": 0,
+                }],
+                "launch_settings": {
+                    "model": "org/model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }
+            instance.deployments = [deployment]
+            stop_entered = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def member_action(_member, action, **_kwargs):
+                self.assertEqual(action, "stop")
+                stop_entered.set()
+                await release_stop.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            instance.selected_cluster_nodes = mock.AsyncMock()
+            instance.create_deployment = mock.AsyncMock()
+
+            stop_task = asyncio.create_task(
+                instance.deployment_action("recovering", "stop")
+            )
+            await asyncio.wait_for(stop_entered.wait(), 1)
+            resume_task = asyncio.create_task(
+                instance._resume_interrupted_deployment("recovering")
+            )
+            await asyncio.sleep(0)
+
+            self.assertFalse(resume_task.done())
+            instance.selected_cluster_nodes.assert_not_awaited()
+            release_stop.set()
+            stop_result, _ = await asyncio.wait_for(
+                asyncio.gather(stop_task, resume_task), 1,
+            )
+
+            self.assertTrue(stop_result["ok"])
+            self.assertEqual(deployment["desired_state"], "stopped")
+            self.assertEqual(deployment["status"], "stopped")
+            instance.selected_cluster_nodes.assert_not_awaited()
+            instance.create_deployment.assert_not_awaited()
+
     async def test_start_resumes_recovering_launch_and_stop_consumes_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

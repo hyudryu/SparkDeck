@@ -4733,6 +4733,15 @@ class Manager:
         ))
 
     async def _resume_interrupted_deployment(self, deployment_id: str) -> None:
+        # Startup recovery removes stale members and replaces their durable
+        # record. Serialize that whole transaction with explicit lifecycle
+        # actions so a completed Stop can never be followed by this relaunch.
+        async with self._cluster_action_lock():
+            await self._resume_interrupted_deployment_locked(deployment_id)
+
+    async def _resume_interrupted_deployment_locked(
+        self, deployment_id: str,
+    ) -> None:
         deployment = self._deployment(deployment_id)
         if (
             deployment is None

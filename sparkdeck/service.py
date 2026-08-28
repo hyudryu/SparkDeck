@@ -2627,7 +2627,11 @@ def _chunk_has_output(chunk: dict[str, Any]) -> bool:
         if not isinstance(choice, dict):
             continue
         delta = choice.get("delta") or {}
-        if isinstance(delta, dict) and (delta.get("content") or delta.get("reasoning_content")):
+        if isinstance(delta, dict) and (
+            delta.get("content")
+            or delta.get("reasoning_content")
+            or delta.get("reasoning")
+        ):
             return True
         if choice.get("text"):
             return True

@@ -24,6 +24,15 @@ AGENT_PROTOCOL_VERSION = 1
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
 
 
+class NodeAgentResponseError(RuntimeError):
+    """A non-success response returned by an authenticated cluster agent."""
+
+    def __init__(self, node_name: str, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"{node_name} agent error: HTTP {status_code}: {detail}")
+
+
 def normalize_agent_url(value: str) -> str:
     url = (value or "").strip().rstrip("/")
     parsed = urlparse(url)
@@ -402,9 +411,8 @@ class NodeRegistry:
             raise last_error
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
-            raise RuntimeError(
-                f"{node.get('name', node_id)} agent error: "
-                f"HTTP {exc.response.status_code}: {detail}"
+            raise NodeAgentResponseError(
+                str(node.get("name", node_id)), exc.response.status_code, detail,
             ) from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(
@@ -483,7 +491,10 @@ class NodeRegistry:
                 if not compatible:
                     issues.append("agent protocol version mismatch")
                 if not status.get("docker_ready"):
-                    issues.append("Docker is unavailable")
+                    issues.append(
+                        str(status.get("status_message") or "").strip()
+                        or "Docker is unavailable"
+                    )
                 authoritative_name = str(public.get("name") or "").strip()
                 if (
                     authoritative_name

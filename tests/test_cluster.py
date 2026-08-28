@@ -15,6 +15,7 @@ from cluster import (
     AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
     AgentCredentials,
+    NodeAgentResponseError,
     NodeRegistry,
     normalize_agent_url,
 )
@@ -101,6 +102,42 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_request_preserves_agent_response_status(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"detail": "fan mode changed; refresh and try again"},
+                request=request,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(Path(directory), client, "controller")
+            registry.nodes = [{
+                "id": "remote-1",
+                "name": "Spark 2",
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+                "enabled": True,
+            }]
+            registry._connection_targets = mock.AsyncMock(return_value=[(
+                httpx.URL("https://100.100.20.30:7878/api/agent/fan-control/settings"),
+                {"Host": "worker.tail.example:7878"},
+                {"sni_hostname": "worker.tail.example"},
+            )])
+            try:
+                with self.assertRaises(NodeAgentResponseError) as raised:
+                    await registry.request(
+                        "remote-1", "PATCH", "/api/agent/fan-control/settings",
+                        json_body={"mode": "curve"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("fan mode changed", raised.exception.detail)
+        self.assertIn("Spark 2 agent error: HTTP 409", str(raised.exception))
+
     async def test_authenticated_consent_can_reach_a_disabled_joined_worker(self) -> None:
         requests = []
 
@@ -417,6 +454,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 "node_id": "remote-1",
                 "protocol_version": 1,
                 "docker_ready": docker_ready,
+                "status_message": None if docker_ready else (
+                    "SparkDeck's service user cannot access Docker. Add this "
+                    "user to the docker group, then restart the user session."
+                ),
                 "fabric_ready": True,
                 "interfaces": [],
                 "stats": {},
@@ -440,7 +481,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 degraded = await registry.probe(node, force=True)
                 self.assertEqual(degraded["status"], "degraded")
                 self.assertTrue(degraded["online"])
-                self.assertIn("Docker", degraded["status_message"])
+                self.assertIn(
+                    "service user cannot access Docker",
+                    degraded["status_message"],
+                )
             finally:
                 await client.aclose()
 
@@ -1076,6 +1120,21 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(settings["max_retries"], 7)
         self.assertEqual(settings["hf_cache"], str(Path.home() / ".cache" / "huggingface"))
+
+    def test_root_service_hf_cache_default_is_migrated_to_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "hf_cache": "/root/.cache/huggingface",
+                "max_retries": 7,
+            }))
+
+            settings = instance._load_settings()
+
+        self.assertEqual(
+            settings["hf_cache"], str(Path.home() / ".cache" / "huggingface")
+        )
 
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

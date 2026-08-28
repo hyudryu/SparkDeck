@@ -202,7 +202,6 @@ describe('settings page', () => {
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const user = userEvent.setup()
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
@@ -210,8 +209,9 @@ describe('settings page', () => {
     const appearance = await screen.findByRole('combobox', { name: 'Appearance' })
     await user.selectOptions(appearance, 'dark')
     await user.click(await screen.findByRole('button', { name: 'Remove saved key' }))
-
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/entire cluster/i))
+    const confirmation = await screen.findByRole('dialog', { name: 'Remove the Hugging Face API key?' })
+    expect(confirmation).toHaveTextContent(/entire cluster/i)
+    await user.click(within(confirmation).getByRole('button', { name: 'Remove key' }))
     await screen.findByText('Not configured')
     expect(appearance).toHaveValue('dark')
     expect(screen.getByRole('button', { name: 'Save settings' })).toBeEnabled()
@@ -235,7 +235,6 @@ describe('settings page', () => {
       return new Response(JSON.stringify({ theme: 'system', default_runtime: 'vllm', default_context_length: 8192 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const user = userEvent.setup()
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
@@ -243,8 +242,9 @@ describe('settings page', () => {
     expect(screen.queryByRole('combobox', { name: 'Release version' })).not.toBeInTheDocument()
     expect(screen.queryByText(/downgrade|roll back|rollback/i)).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Update to main' }))
-
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/origin\/main at bbbbbbbb.*controller restarts last/i))
+    const confirmation = await screen.findByRole('dialog', { name: 'Update the cluster?' })
+    expect(confirmation).toHaveTextContent(/origin\/main at bbbbbbbb.*controller restarts last/i)
+    await user.click(within(confirmation).getByRole('button', { name: 'Start update' }))
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/system-update', expect.objectContaining({
       method: 'POST', body: JSON.stringify({ confirm: 'update-entire-cluster', revision: 'b'.repeat(40) }),
     }))

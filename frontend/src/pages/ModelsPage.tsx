@@ -3,7 +3,7 @@ import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Pl
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
-import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
+import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -226,6 +226,8 @@ export function ModelsPage() {
   const [logError, setLogError] = useState<string>()
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [startError, setStartError] = useState<string>()
+  const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
+  const [additionalError, setAdditionalError] = useState<string>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -530,6 +532,45 @@ export function ModelsPage() {
     }
     setStartError(undefined)
     setStartSelection({ deployment, nodeIds })
+  }
+
+  const deploymentRunningNodeNames = (deployment: Deployment) => {
+    const ids = deployment.node_ids ?? deployment.selected_nodes?.map((node) => node.id) ?? []
+    return ids.map((id) => id === 'local'
+      ? localLabel
+      : (nodes.data?.find((node) => node.id === id)?.name ?? id))
+  }
+
+  // Growing the replica set only applies to cluster layouts: controller-local
+  // artifacts cannot leave the controller and sharded layouts have a fixed
+  // tensor-parallel node count.
+  const supportsAdditionalNodes = (deployment: Deployment) => (
+    !isControllerArtifact(deployment) && deployment.deployment_mode !== 'sharded'
+  )
+
+  const openAdditionalPicker = (deployment: Deployment) => {
+    const currentIds = deployment.node_ids ?? deployment.selected_nodes?.map((node) => node.id) ?? []
+    setAdditionalError(undefined)
+    setAdditionalLaunch({ deployment, currentIds, additionalIds: [] })
+  }
+
+  const confirmAdditionalLaunch = async () => {
+    if (!additionalLaunch) return
+    const { deployment, additionalIds } = additionalLaunch
+    setBusy(deployment.id)
+    setAdditionalError(undefined)
+    try {
+      await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
+      setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
+      setAdditionalLaunch(undefined)
+      resource.reload()
+    } catch (reason) {
+      // Render inside the dialog: the page-level alert sits behind the
+      // modal backdrop where the user cannot see it.
+      setAdditionalError(reason instanceof Error ? reason.message : 'Could not launch on additional nodes')
+    } finally {
+      setBusy(undefined)
+    }
   }
 
   const saveRename = async () => {
@@ -952,10 +993,20 @@ export function ModelsPage() {
                   <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                   <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
-                  <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
+                  <div role="cell" data-label="Status">{(deployment.status === 'running' || deployment.status === 'starting') && deploymentRunningNodeNames(deployment).length > 0
+                    ? <Tooltip label={<><strong>{deployment.status === 'starting' ? 'Starting on' : 'Running on'}</strong><span>{deploymentRunningNodeNames(deployment).join(', ')}</span></>}><Status status={deployment.status} /></Tooltip>
+                    : <Status status={deployment.status} />}</div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.desired_state !== 'stopped' && (deployment.status === 'running' || deployment.status === 'starting')
-                      ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
+                      ? (supportsAdditionalNodes(deployment)
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id}
+                            onMainAction={() => void act(deployment, 'stop')}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
+                          />
+                        : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
@@ -1190,6 +1241,42 @@ export function ModelsPage() {
             {allowedIds.length < required && <p className="field-note">Model weights are cached on only {allowedIds.length} of {required} required {required === 1 ? 'node' : 'nodes'}. Copy the weights in Storage first.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
+      {additionalLaunch && (() => {
+        const { deployment, currentIds, additionalIds } = additionalLaunch
+        const weighted = deploymentWeightedNodes(deployment)
+        const eligible = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id) && isNodeSelectable(node))
+        const allowedIds = [...currentIds, ...eligible.map((node) => node.id)]
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached']))
+        const additionalBusy = busy === deployment.id
+        const ready = additionalIds.length > 0 && !nodes.loading && !nodes.error
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !additionalBusy && setAdditionalLaunch(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="additional-nodes-title">
+            <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">Currently running on {selectedNodeLabel(nodes.data ?? [], currentIds, localLabel)}. Choose the nodes that should also run {deployment.model_id}; the running nodes stay selected. SparkDeck relaunches the deployment, so existing replicas restart briefly.</p>
+            {additionalError && <p className="form-error" role="alert">{additionalError}</p>}
+            {modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={[...currentIds, ...additionalIds]}
+              onChange={(next) => setAdditionalLaunch({ deployment, currentIds, additionalIds: next.filter((id) => !currentIds.includes(id)) })}
+              loading={nodes.loading || modelCache.loading}
+              error={nodes.error}
+              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              multiple
+              disabled={additionalBusy}
+              requiredIds={currentIds}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={currentIds[0]}
+              legend="Additional nodes"
+              help={`Only nodes with ${deployment.model_id} already cached can join. The running nodes above cannot be removed here.`}
+            />
+            <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

@@ -1,5 +1,6 @@
-import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
-import { AlertCircle, Inbox, LoaderCircle, RefreshCw } from 'lucide-react'
+import { useRef, useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from 'react'
+import { AlertCircle, ChevronDown, Inbox, LoaderCircle, RefreshCw } from 'lucide-react'
+import { createPortal } from 'react-dom'
 
 export function PageHeader({
   eyebrow,
@@ -100,6 +101,105 @@ export function EmptyState({
 
 export function Panel({ className = '', ...props }: HTMLAttributes<HTMLElement>) {
   return <section className={`panel ${className}`.trim()} {...props} />
+}
+
+// Hover/focus tooltip rendered through a portal with fixed positioning so
+// table overflow clipping and stacking contexts cannot hide it.
+export function Tooltip({ label, children }: { label: ReactNode; children: ReactNode }) {
+  const [position, setPosition] = useState<{ x: number; y: number }>()
+  const show = (target: HTMLElement) => {
+    const rect = target.getBoundingClientRect()
+    setPosition({ x: rect.left + rect.width / 2, y: rect.top })
+  }
+  return (
+    <span
+      tabIndex={0}
+      onMouseEnter={(event) => show(event.currentTarget)}
+      onMouseLeave={() => setPosition(undefined)}
+      onFocus={(event) => show(event.currentTarget)}
+      onBlur={() => setPosition(undefined)}
+    >
+      {children}
+      {position && createPortal(
+        <div className="tooltip" role="tooltip" style={{ left: position.x, top: position.y }}>{label}</div>,
+        document.body,
+      )}
+    </span>
+  )
+}
+
+export interface SplitButtonItem {
+  key: string
+  label: ReactNode
+  disabled?: boolean
+  onSelect: () => void
+}
+
+// Primary action with a side caret that opens a small action menu, similar to
+// GitHub's merge button. The menu renders through a portal anchored to the
+// caret so enclosing panels with overflow: hidden cannot clip it.
+export function SplitButton({
+  label,
+  onMainAction,
+  items,
+  disabled = false,
+  mainAriaLabel,
+  toggleAriaLabel,
+}: {
+  label: ReactNode
+  onMainAction: () => void
+  items: SplitButtonItem[]
+  disabled?: boolean
+  mainAriaLabel?: string
+  toggleAriaLabel: string
+}) {
+  const toggleRef = useRef<HTMLButtonElement>(null)
+  const [anchor, setAnchor] = useState<{ top: number; right: number }>()
+  const toggleMenu = () => {
+    if (anchor) {
+      setAnchor(undefined)
+      return
+    }
+    const rect = toggleRef.current?.getBoundingClientRect()
+    if (rect) setAnchor({ top: rect.bottom + 4, right: window.innerWidth - rect.right })
+  }
+  const select = (item: SplitButtonItem) => {
+    setAnchor(undefined)
+    item.onSelect()
+  }
+  return (
+    <span className="split-button">
+      <Button variant="tertiary" disabled={disabled} aria-label={mainAriaLabel} onClick={onMainAction}>{label}</Button>
+      <button
+        ref={toggleRef}
+        type="button"
+        className="button button-tertiary split-button-toggle"
+        aria-label={toggleAriaLabel}
+        aria-haspopup="menu"
+        aria-expanded={anchor !== undefined}
+        disabled={disabled}
+        onClick={toggleMenu}
+      ><ChevronDown size={14} /></button>
+      {anchor && createPortal(
+        <>
+          <div className="menu-backdrop" onMouseDown={() => setAnchor(undefined)} />
+          <div className="menu" role="menu" aria-label={toggleAriaLabel} style={{ top: anchor.top, right: anchor.right }}>
+            {items.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="menuitem"
+                disabled={item.disabled}
+                onClick={() => select(item)}
+                onKeyDown={(event) => event.key === 'Escape' && setAnchor(undefined)}
+              >{item.label}</button>
+            ))}
+          </div>
+        </>,
+        document.body,
+      )}
+    </span>
+  )
 }
 
 export function formatNumber(value?: number) {

@@ -176,7 +176,7 @@ export function ClusterPage() {
 
   return (
     <div className="page cluster-page">
-      <PageHeader eyebrow="DGX Spark cluster" title="Cluster onboarding" description="Connect SparkDeck nodes over Tailscale, then manage model pulls and deployments from one controller." />
+      <PageHeader eyebrow="DGX Spark cluster" title="Cluster Management" description="Connect SparkDeck nodes over Tailscale, then manage model pulls and deployments from one controller." />
       {resource.loading && <LoadingState label="Loading cluster status" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {error && <p className="form-error" role="alert">{error}</p>}
@@ -239,7 +239,7 @@ export function ClusterPage() {
             <ol className="setup-steps">
               {(status.instructions?.length ? status.instructions : [
                 'Connect both systems to the same Tailscale tailnet.',
-                'Open Cluster onboarding on the node you want to join.',
+                'Open Cluster Management on the node you want to join.',
                 'Enter this controller URL and the one-time pairing code.',
               ]).map((instruction, index) => <li key={instruction}><span>{index + 1}</span><p>{instruction}</p></li>)}
             </ol>

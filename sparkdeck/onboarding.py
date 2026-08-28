@@ -251,7 +251,7 @@ class OnboardingService:
     def _instructions() -> list[str]:
         return [
             "Connect the joining system and this entry node to the same Tailscale tailnet.",
-            "Open Cluster onboarding on the system you want to join.",
+            "Open Cluster Management on the system you want to join.",
             "Enter one of this node's access URLs and the one-time pairing code.",
             "Repeat this for every machine; joining one node never imports its former cluster members.",
         ]

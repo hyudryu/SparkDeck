@@ -65,6 +65,12 @@ type SortMode = 'recent' | 'name-asc' | 'name-desc'
 const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting'])
 const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
+const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped'])
+
+const deploymentNeedsPoll = (deployment: Deployment) => (
+  ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
+  || Boolean(deployment.launch_phase && !FINISHED_LAUNCH_PHASES.has(deployment.launch_phase))
+)
 
 const formatLaunchPhase = (phase: string) => phase
   .replaceAll('_', ' ')
@@ -188,7 +194,15 @@ const recipeJobKey = (recipeId: string, modelId: string, targetId: string) => `$
 export function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
-  const resource = useResource((signal) => api.deployments.list(signal))
+  const acceptedDeployments = useRef(new Map<string, Deployment>())
+  const resource = useResource(async (signal) => {
+    const deployments = await api.deployments.list(signal)
+    const accepted = acceptedDeployments.current
+    if (!accepted.size) return deployments
+    const loadedIds = new Set(deployments.map((deployment) => deployment.id))
+    loadedIds.forEach((id) => accepted.delete(id))
+    return [...accepted.values(), ...deployments]
+  })
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
   const appSettings = useResource((signal) => api.settings.get(signal))
@@ -243,7 +257,7 @@ export function ModelsPage() {
   const reloadDeployments = resource.reload
 
   useEffect(() => {
-    if (resource.loading || !resource.data?.some((deployment) => ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status))) return
+    if (resource.loading || !resource.data?.some(deploymentNeedsPoll)) return
     const timer = window.setTimeout(reloadDeployments, 2000)
     return () => window.clearTimeout(timer)
   }, [resource.data, resource.loading, reloadDeployments])
@@ -836,6 +850,7 @@ export function ModelsPage() {
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
       setRecipeDeployment(undefined)
+      acceptedDeployments.current.set(deployment.id, deployment)
       resource.setData((current) => [
         deployment,
         ...(current ?? []).filter((item) => item.id !== deployment.id),

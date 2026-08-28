@@ -16,12 +16,17 @@ with patch("docker.from_env", return_value=Mock()):
 
 class NodeRenameApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.assignment = patch.object(
+            server.onboarding.assignment, "load", return_value=None,
+        )
+        self.assignment.start()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server.app), base_url="http://test",
         )
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.assignment.stop()
 
     async def test_versioned_patch_delegates_and_returns_public_node(self):
         rename = AsyncMock(return_value={
@@ -49,6 +54,31 @@ class NodeRenameApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 404)
+
+    async def test_versioned_patch_updates_dashboard_visibility(self):
+        visibility = AsyncMock(return_value={
+            "id": "remote-1", "hidden_from_dashboard": True,
+        })
+        with patch.object(
+            server.manager, "set_cluster_node_dashboard_hidden", visibility,
+        ):
+            response = await self.client.patch(
+                "/api/v1/nodes/remote-1",
+                json={"hidden_from_dashboard": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["hidden_from_dashboard"])
+        visibility.assert_awaited_once_with("remote-1", True)
+
+    async def test_versioned_patch_rejects_mixed_node_updates(self):
+        response = await self.client.patch(
+            "/api/v1/nodes/remote-1",
+            json={"name": "Worker", "hidden_from_dashboard": True},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("only name or hidden_from_dashboard", response.text)
 
     async def test_agent_patch_requires_auth_and_updates_only_local_node(self):
         rename = AsyncMock(return_value={"id": "local", "name": "Worker"})

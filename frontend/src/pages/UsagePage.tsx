@@ -1,5 +1,5 @@
 import { useMemo, useState, type CSSProperties, type FormEvent } from 'react'
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, RotateCcw, Trash2, X } from 'lucide-react'
+import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, RotateCcw, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
@@ -9,6 +9,7 @@ type SortKey = 'model' | 'input' | 'cached' | 'output' | 'requests' | 'speed' | 
 type RangeDays = 7 | 30
 
 const chartColors = ['#4a9eff', '#48c774', '#8c6bff', '#ff626a', '#ff9238', '#4cc9c0', '#d66efd', '#e4c34e']
+const modelShareLimit = 7
 
 function isoDate(value: Date) { return value.toISOString().slice(0, 10) }
 function daysAgo(days: number) {
@@ -108,8 +109,19 @@ function TrendChart({ points, range }: { points: DailyUsagePoint[]; range: Range
   </svg><div className="usage-chart-axis"><span>{new Date(`${dates[0]}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span><span>{new Date(`${dates.at(-1)}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></div></div>
 }
 
+export function modelShareItems(rows: UsageGroup[]) {
+  const ranked = rows
+    .map((row) => ({ key: row.key, label: row.label, value: inputMisses(row) + Number(row.stats.cached || 0) + Number(row.stats.output || 0) }))
+    .filter((item) => item.value > 0)
+    .sort((left, right) => right.value - left.value || left.label.localeCompare(right.label, undefined, { numeric: true, sensitivity: 'base' }) || left.key.localeCompare(right.key))
+  const values = ranked.slice(0, modelShareLimit)
+  const others = ranked.slice(modelShareLimit).reduce((sum, item) => sum + item.value, 0)
+  if (others > 0) values.push({ key: 'others', label: 'Others', value: others })
+  return values
+}
+
 function ModelShare({ rows }: { rows: UsageGroup[] }) {
-  const values = rows.map((row) => ({ row, value: inputMisses(row) + Number(row.stats.cached || 0) + Number(row.stats.output || 0) })).filter((item) => item.value > 0)
+  const values = modelShareItems(rows)
   const total = values.reduce((sum, item) => sum + item.value, 0)
   const stops = values.map((item, index) => {
     const start = values.slice(0, index).reduce((sum, previous) => sum + previous.value, 0) / total * 100
@@ -117,7 +129,7 @@ function ModelShare({ rows }: { rows: UsageGroup[] }) {
     return `${chartColors[index % chartColors.length]} ${start}% ${end}%`
   })
   if (!values.length) return <EmptyState title="No model usage" description="Model share appears after token usage is recorded." />
-  return <div className="usage-share"><div className="usage-donut" style={{ '--usage-donut': `conic-gradient(${stops.join(',')})` } as CSSProperties}><strong>{formatTokens(total)}</strong><span>tokens</span></div><div className="usage-share-list">{values.map((item, index) => <div key={item.row.key}><i style={{ background: chartColors[index % chartColors.length] }} /><span><strong>{item.row.label}</strong><small>{formatTokens(item.value)} tokens</small></span><b>{Math.round(item.value / total * 100)}%</b></div>)}</div></div>
+  return <div className="usage-share"><div className="usage-donut" style={{ '--usage-donut': `conic-gradient(${stops.join(',')})` } as CSSProperties}><strong>{formatTokens(total)}</strong><span>tokens</span></div><div className="usage-share-list">{values.map((item, index) => <div key={item.key}><i style={{ background: chartColors[index % chartColors.length] }} /><span><strong>{item.label}</strong><small>{formatTokens(item.value)} tokens</small></span><b>{Math.round(item.value / total * 100)}%</b></div>)}</div></div>
 }
 
 export function UsagePage() {
@@ -127,7 +139,8 @@ export function UsagePage() {
   const [sortKey, setSortKey] = useState<SortKey>('output'); const [sortAscending, setSortAscending] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set()); const [editing, setEditing] = useState<UsageMember>()
   const [alias, setAlias] = useState(''); const [mergeGroup, setMergeGroup] = useState(''); const [routeTo, setRouteTo] = useState(''); const [busy, setBusy] = useState<string>()
-  const [actionError, setActionError] = useState<string>(); const [notice, setNotice] = useState<string>()
+  const [routeSource, setRouteSource] = useState(''); const [routeDestination, setRouteDestination] = useState('')
+  const [actionError, setActionError] = useState<string>(); const [routeError, setRouteError] = useState<string>(); const [notice, setNotice] = useState<string>()
   const rows = useMemo(() => [...(summary.data?.groups ?? [])].sort((left, right) => { const a = sortValue(left, sortKey); const b = sortValue(right, sortKey); const result = typeof a === 'string' ? a.localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' }) : Number(a) - Number(b); return (result || left.key.localeCompare(right.key)) * (sortAscending ? 1 : -1) }), [sortAscending, sortKey, summary.data?.groups])
   const totals = useMemo(() => rows.reduce((value, row) => ({ input: value.input + inputMisses(row), cached: value.cached + Number(row.stats.cached || 0), output: value.output + Number(row.stats.output || 0), requests: value.requests + Number(row.stats.requests || 0), cost: value.cost + Number(row.total_cost || 0) }), { input: 0, cached: 0, output: 0, requests: 0, cost: 0 }), [rows])
   const daily = analysis.data?.daily ?? []; const streaks = usageStreaks(daily); const peak = Math.max(0, ...daily.map((point) => totalTokens(point)))
@@ -151,7 +164,27 @@ export function UsagePage() {
     } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not update the usage display') } finally { setBusy(undefined) }
   }
   const erase = async (model: string) => { if (!window.confirm(`Erase all lifetime and hourly usage for ${model}? This cannot be undone.`)) return; setBusy(`erase:${model}`); setActionError(undefined); try { await api.usage.erase(model); setNotice(`Erased usage for ${model}.`); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not erase model usage') } finally { setBusy(undefined) } }
-  const routeOptions = editing ? [...new Set([...Object.keys(summary.data?.models ?? {}), ...Object.values(summary.data?.routing_rules ?? {}), ...(summary.data?.groups ?? []).map((group) => group.route_target).filter((target): target is string => Boolean(target))])].filter((model) => model !== editing.model).sort() : []
+  const routeModels = [...new Set([...Object.keys(summary.data?.models ?? {}), ...Object.keys(summary.data?.routing_rules ?? {}), ...Object.values(summary.data?.routing_rules ?? {}), ...(summary.data?.groups ?? []).map((group) => group.route_target).filter((target): target is string => Boolean(target))])].sort()
+  const routingRules = Object.entries(summary.data?.routing_rules ?? {}).sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
+  const routeOptions = editing ? routeModels.filter((model) => model !== editing.model) : []
+  const saveRoute = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!routeSource || !routeDestination || routeSource === routeDestination) return
+    setBusy('route:add'); setActionError(undefined); setRouteError(undefined)
+    try {
+      await api.usage.setRoute(routeSource, routeDestination)
+      setNotice(`Routed ${routeSource} usage to ${routeDestination}.`); setRouteSource(''); setRouteDestination(''); summary.reload()
+    } catch (reason) { setRouteError(reason instanceof Error ? reason.message : 'Could not save the routing rule') } finally { setBusy(undefined) }
+  }
+  const removeRoute = async (source: string) => {
+    setBusy(`route:${source}`); setActionError(undefined); setRouteError(undefined)
+    try {
+      await api.usage.deleteRoute(source)
+      setNotice(`Removed the routing rule for ${source}.`)
+      if (routeSource === source) setRouteDestination('')
+      summary.reload()
+    } catch (reason) { setRouteError(reason instanceof Error ? reason.message : 'Could not remove the routing rule') } finally { setBusy(undefined) }
+  }
 
   return <div className="page usage-page"><PageHeader eyebrow="Cluster inference accounting" title="Usage stats" description="Combined token activity and model share from every paired SparkDeck node." actions={<><Button onClick={reload}><RefreshCw size={15} /> Refresh</Button><Button variant="danger" disabled={busy === 'reset'} onClick={() => void reset()}><RotateCcw size={15} /> Reset lifetime</Button></>} />
     {actionError && !editing && <p className="inline-error" role="alert">{actionError}</p>}{notice && <p className="inline-success" role="status">{notice}</p>}
@@ -162,6 +195,11 @@ export function UsagePage() {
       <div className="usage-time-heading"><h2>Time range</h2><div className="segmented-control" aria-label="Usage time range"><button aria-pressed={range === 7} onClick={() => setRange(7)}>Last 7 days</button><button aria-pressed={range === 30} onClick={() => setRange(30)}>Last 30 days</button></div></div>
       <Panel className="usage-trend-panel"><div className="usage-panel-heading"><div><h2>Daily token trend</h2><p>Input and output tokens by model</p></div></div><TrendChart points={daily} range={range} /></Panel>
       <Panel className="usage-share-panel"><div className="usage-panel-heading"><div><h2>Model usage</h2><p>Lifetime token share by model or alias</p></div></div><ModelShare rows={rows} /></Panel>
+      <Panel className="usage-routing-panel" aria-labelledby="usage-routing-title"><div className="usage-panel-heading"><div><h2 id="usage-routing-title">Model routing rules</h2><p>Combine one model's accounting into another without changing the underlying counters.</p></div></div>
+        <form className="usage-routing-form" aria-label="Add model routing rule" onSubmit={(event) => void saveRoute(event)}><label className="field"><span>Source model</span><select value={routeSource} disabled={busy?.startsWith('route:')} onChange={(event) => { const source = event.target.value; setRouteSource(source); setRouteDestination(summary.data?.routing_rules?.[source] ?? ''); setRouteError(undefined) }}><option value="">Select a model</option>{routeModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label className="field"><span>Destination model</span><select value={routeDestination} onChange={(event) => { setRouteDestination(event.target.value); setRouteError(undefined) }} disabled={!routeSource || busy?.startsWith('route:')}><option value="">Select a model</option>{routeModels.filter((model) => model !== routeSource).map((model) => <option key={model} value={model}>{model}</option>)}</select></label><Button type="submit" variant="primary" disabled={!routeSource || !routeDestination || routeSource === routeDestination || busy?.startsWith('route:')}>{summary.data?.routing_rules?.[routeSource] ? 'Update rule' : 'Add rule'}</Button></form>
+        {routeError && <p className="inline-error usage-routing-error" role="alert">{routeError}</p>}
+        {routingRules.length ? <ul className="usage-routing-list" aria-label="Current model routing rules">{routingRules.map(([source, destination]) => <li key={source} aria-label={`${source} routes to ${destination}`}><code>{source}</code><ArrowRight size={14} aria-hidden="true" /><code>{destination}</code><Button type="button" variant="tertiary" aria-label={`Remove routing rule for ${source}`} disabled={busy?.startsWith('route:')} onClick={() => void removeRoute(source)}><Trash2 size={14} /> Remove</Button></li>)}</ul> : <p className="usage-routing-empty">No routing rules yet. Add one to combine a source model into a destination model.</p>}
+      </Panel>
       <div className="section-heading"><div><h2>Detailed accounting</h2><p>Aliases, merge groups, and routing rules affect display only; raw counters remain intact.</p></div></div>
       {!rows.length ? <EmptyState title="No token usage recorded" description="Run a model through any paired SparkDeck node to begin collecting cluster lifetime counters." /> : <Panel className="table-panel usage-table-panel"><div className="responsive-table usage-table" role="table" aria-label="Lifetime model usage"><div className="table-row table-header" role="row">{([['model', 'Model / alias'], ['input', 'Input miss'], ['cached', 'Cache hit'], ['output', 'Output'], ['requests', 'Requests'], ['speed', 'Avg speed'], ['cost', 'Cost']] as Array<[SortKey, string]>).map(([key, label]) => <button role="columnheader" key={key} onClick={() => setSort(key)} aria-sort={sortKey === key ? (sortAscending ? 'ascending' : 'descending') : 'none'}>{label}<span aria-hidden="true">{sortKey === key ? (sortAscending ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}</span></button>)}<span role="columnheader">Details</span></div>
         {rows.map((row) => { const open = expanded.has(row.key); return <div className="usage-row-group" key={row.key}><div className="table-row" role="row"><div role="cell" data-label="Model / alias"><strong>{row.label}</strong><small>{row.merge_group ? `${row.models.length} merged models` : row.route_target ?? row.models[0]}</small></div><div role="cell" data-label="Input miss"><strong>{row.stats.estimated_cached ? '~' : ''}{formatTokens(inputMisses(row))}</strong></div><div role="cell" data-label="Cache hit"><strong>{row.stats.estimated_cached ? '~' : ''}{formatTokens(row.stats.cached)}</strong><small>{row.stats.estimated_cached ? `${formatTokens(row.stats.measured_cached)} measured` : 'Measured reuse'}</small></div><div role="cell" data-label="Output"><strong>{formatTokens(row.stats.output)}</strong><small>{formatDuration(row.stats.gen_time_s)} decode</small></div><div role="cell" data-label="Requests">{formatTokens(row.stats.requests)}</div><div role="cell" data-label="Avg speed"><strong>{row.speed?.tok_s == null ? '--' : `${row.speed.tok_s.toFixed(1)} tok/s`}</strong><small>{row.speed?.legacy ? 'Legacy lifetime average' : row.speed?.tokens ? `Last ${formatTokens(row.speed.tokens)} output` : 'No speed samples'}</small></div><div role="cell" data-label="Cost"><strong>{formatCost(row.total_cost)}</strong><small>{row.cost_estimated ? 'Includes cache estimate' : 'Recorded pricing'}</small></div><div role="cell" data-label="Details" className="row-actions"><Button variant="tertiary" aria-expanded={open} aria-label={`${open ? 'Hide' : 'Show'} details for ${row.label}`} onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next })}>{open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</Button></div></div>

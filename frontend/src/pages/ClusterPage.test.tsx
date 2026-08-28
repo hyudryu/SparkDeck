@@ -141,6 +141,36 @@ describe('ClusterPage', () => {
     expect(screen.getByText('Render Spark', { selector: '.cluster-summary strong' })).toBeInTheDocument()
   })
 
+  it('hides and restores a node on the dashboard without removing it', async () => {
+    let hidden = false
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/nodes/spark-2') && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as { hidden_from_dashboard: boolean }
+        hidden = body.hidden_from_dashboard
+        return new Response(JSON.stringify({ id: 'spark-2', hidden_from_dashboard: hidden }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Hide Studio Spark from dashboard' }))
+
+    expect(await screen.findByText('Studio Spark is hidden from the dashboard.')).toHaveAttribute('role', 'status')
+    expect(screen.getByText('spark-2')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Show Studio Spark on dashboard' })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes/spark-2', expect.objectContaining({
+      method: 'PATCH', body: JSON.stringify({ hidden_from_dashboard: true }),
+    }))
+
+    await user.click(screen.getByRole('button', { name: 'Show Studio Spark on dashboard' }))
+    expect(await screen.findByText('Studio Spark will appear on the dashboard.')).toHaveAttribute('role', 'status')
+    expect(hidden).toBe(false)
+  })
+
   it('keeps editing available and announces a rename error', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

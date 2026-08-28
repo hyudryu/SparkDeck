@@ -18,12 +18,11 @@ function shortRevision(value?: string) {
 function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
   const error = node.error || node.blockers?.join('; ')
   if (error) return { color: 'error', label: error }
-  const latest = node.phase === 'up_to_date'
-    || Boolean(targetRevision && node.current_revision?.toLowerCase() === targetRevision.toLowerCase())
+  const latest = Boolean(targetRevision && node.current_revision?.toLowerCase() === targetRevision.toLowerCase())
   if (latest) return { color: 'running', label: 'Latest' }
   if (node.phase === 'succeeded') return { color: 'running', label: 'Succeeded' }
   if (node.online === false) return { color: 'stopped', label: 'Offline' }
-  return { color: 'starting', label: node.phase || 'Ready' }
+  return { color: 'starting', label: node.phase === 'up_to_date' ? 'Ready' : node.phase || 'Ready' }
 }
 
 function SoftwareUpdatePanel() {

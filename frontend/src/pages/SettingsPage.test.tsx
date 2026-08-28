@@ -306,6 +306,35 @@ describe('settings page', () => {
     expect(within(oldNode!).getByText('Ready')).toBeInTheDocument()
     expect(oldNode!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
+
+  it('does not trust an up-to-date phase saved for an older target', async () => {
+    const current = 'b'.repeat(40)
+    const old = 'a'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: current,
+        target: { branch: 'main', revision: current, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
+        up_to_date: false,
+        can_update: true, blockers: [],
+        nodes: [],
+        job: {
+          id: 'old-job', active: false, phase: 'partial', target_branch: 'main', target_revision: old,
+          nodes: [{ id: 'stale', name: 'Stale job node', local: false, online: true, current_revision: old, blockers: [], phase: 'up_to_date' }],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', default_runtime: 'vllm', default_context_length: 8192,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const node = (await screen.findByText('Stale job node')).closest<HTMLElement>('.update-node')
+    expect(node).not.toBeNull()
+    expect(within(node!).queryByText('Latest')).not.toBeInTheDocument()
+    expect(within(node!).getByText('Ready')).toBeInTheDocument()
+    expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
+  })
 })
 
 describe('community features sign-in', () => {

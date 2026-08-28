@@ -448,7 +448,10 @@ class UpdateService:
         main_target, main_error = await self.resolve_main()
         nodes = await self.manager.cluster_nodes()
         public_nodes = []
-        blockers = local_blockers(self.root)
+        # Windows service preflight launches the bundled status command, which
+        # probes this process's /healthz route. Keep that synchronous process
+        # and HTTP check off the event loop so the route can answer it.
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         for node in nodes:
             node_blockers: list[str] = []
             if not node.get("enabled", True):
@@ -588,7 +591,7 @@ class UpdateService:
     async def preflight_local(self, branch: str, revision: str) -> dict:
         if branch != MAIN_BRANCH:
             raise ValueError("The active update target is origin/main")
-        blockers = local_blockers(self.root)
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
         remote_ref = f"refs/remotes/origin/{MAIN_BRANCH}"
@@ -617,7 +620,7 @@ class UpdateService:
         release, error = await self.resolve_release(tag, force=True)
         if error or not release or release["revision"] != revision.lower():
             raise ValueError("Update target is not an official published GitHub release")
-        blockers = local_blockers(self.root)
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
         _run(self.root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}", timeout=60)

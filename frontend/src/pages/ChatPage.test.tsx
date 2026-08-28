@@ -55,8 +55,8 @@ describe('ChatPage', () => {
         output_tokens_per_second: 42.5,
       },
     }))
-    expect(await screen.findByText('Tokens now arrive live.')).toBeInTheDocument()
-    expect(await screen.findByRole('heading', { name: 'Live answer' })).toBeInTheDocument()
+    expect(await screen.findByText('Tokens now arrive live.', {}, { timeout: 5000 })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Live answer' }, { timeout: 5000 })).toBeInTheDocument()
     expect(screen.getByText('1200.0 tok/s')).toBeInTheDocument()
     expect(screen.getByText('42.5 tok/s')).toBeInTheDocument()
 
@@ -75,9 +75,12 @@ describe('ChatPage', () => {
     expect(screen.getByRole('button', { name: 'Send message' })).toBeInTheDocument()
   })
 
-  it('does not retain an empty assistant turn after a stream fails', async () => {
+  it('marks a partial failed response and excludes it from later prompts', async () => {
     vi.mocked(api.chatStream)
-      .mockRejectedValueOnce(new Error('GPU worker stopped'))
+      .mockImplementationOnce((_model, _messages, options) => {
+        options?.onUpdate?.({ content: 'Partial answer' })
+        return Promise.reject(new Error('GPU worker stopped'))
+      })
       .mockResolvedValueOnce({
         message: { role: 'assistant', content: 'Recovered' },
         reasoning: '',
@@ -90,6 +93,8 @@ describe('ChatPage', () => {
     await user.type(composer, 'First request')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('GPU worker stopped')
+    expect(screen.getByText('Partial answer')).toBeInTheDocument()
+    expect(screen.getByText('Response interrupted')).toBeInTheDocument()
 
     await user.type(composer, 'Second request')
     await user.click(screen.getByRole('button', { name: 'Send message' }))

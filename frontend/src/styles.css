@@ -246,6 +246,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .message-content code { padding: 2px 5px; background: var(--bg-subtle); border-radius: 5px; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .message-content pre code { padding: 0; background: transparent; }
 .message-content a { color: var(--accent); text-underline-offset: 2px; }
+.markdown-image-blocked { display: inline-flex; padding: 4px 8px; color: var(--text-secondary); background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 6px; font-size: 11px; }
 .message-content table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .message-content th, .message-content td { padding: 7px 10px; border: 1px solid var(--border-subtle); text-align: left; }
 .thinking { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); }
@@ -255,6 +256,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .reasoning-block > div { max-height: 240px; margin-top: 8px; padding: 4px 0 4px 13px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--border-strong); font-size: 12px; line-height: 1.65; }
 .message-content.is-streaming::after { content: ''; display: inline-block; width: 2px; height: 1em; margin-left: 3px; vertical-align: -.12em; background: currentColor; animation: cursor-blink .8s steps(1) infinite; }
 .generation-stopped { margin-top: 9px; color: var(--text-tertiary); font-size: 11px; }
+.generation-failed { margin-top: 9px; color: var(--danger); font-size: 11px; }
 .response-metrics { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 15px; }
 .response-metrics > div { display: flex; gap: 5px; padding: 4px 8px; color: var(--text-tertiary); background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 999px; font-size: 10px; }
 .response-metrics dt::after { content: ':'; }.response-metrics dd { color: var(--text-secondary); font-variant-numeric: tabular-nums; font-weight: 600; }

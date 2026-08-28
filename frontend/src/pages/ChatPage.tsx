@@ -16,6 +16,7 @@ interface ConversationMessage extends ChatMessage {
   metrics?: ChatResponseMetrics
   streaming?: boolean
   stopped?: boolean
+  failed?: boolean
 }
 
 function formatRate(value: number | undefined, streaming?: boolean) {
@@ -82,7 +83,7 @@ export function ChatPage() {
     }
     const history = [...messages, userMessage]
     const requestMessages: ChatMessage[] = history
-      .filter((message) => message.role !== 'assistant' || message.content.trim())
+      .filter((message) => message.role !== 'assistant' || (message.content.trim() && !message.failed))
       .map(({ role, content: messageContent }) => ({ role, content: messageContent }))
     const controller = new AbortController()
     abortRef.current = controller
@@ -114,7 +115,7 @@ export function ChatPage() {
       setMessages((current) => current.flatMap((message) => {
         if (message.id !== assistantId) return [message]
         if (!stopped && !message.content && !message.reasoning) return []
-        return [{ ...message, streaming: false, stopped }]
+        return [{ ...message, streaming: false, stopped, failed: !stopped }]
       }))
       if (!stopped) setError(reason instanceof Error ? reason.message : 'The model did not respond')
     } finally {
@@ -170,6 +171,7 @@ export function ChatPage() {
                 message.streaming && !message.reasoning ? <p className="thinking"><span className="thinking-dot" /> Thinking…</p> : null
               )}
               {message.stopped && <p className="generation-stopped">Response stopped</p>}
+              {message.failed && <p className="generation-failed">Response interrupted</p>}
               <ResponseMetrics metrics={message.metrics} streaming={message.streaming} />
             </div>
           </article>

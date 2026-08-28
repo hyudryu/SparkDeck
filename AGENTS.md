@@ -43,21 +43,23 @@ After the PR is opened, wait for Codex to review it:
   in the worktree, commit, push, and continue waiting.
 - Repeat this loop until there are no unresolved Codex comments.
 
-## 4. Merge Only After the 👍 Approval
+## 4. Stop at the 👍 Approval — the User Merges
 
-The waiting ends only when the PR's **main post** (the issue body) has a
+The waiting ends when the PR's **main post** (the issue body) has a
 thumbs-up (`+1`) reaction. Check with:
 
 ```bash
 gh api repos/{owner}/{repo}/issues/<pr-number>/reactions
 ```
 
-Merge **only** when both are true:
+When both are true:
 
 1. No unresolved Codex review comments remain.
 2. The PR body has a `+1` (👍) reaction.
 
-Then merge and clean up:
+**Stop there and hand off to the user.** Do NOT merge the PR yourself —
+report that the PR is approved and ready, and let the user review and merge
+it. The user performs the merge and the worktree/branch cleanup:
 
 ```bash
 gh pr merge <pr-number> --merge
@@ -67,7 +69,8 @@ git branch -d <branch>
 
 ## Safety Rules
 
-- Never merge before the 👍 reaction appears on the PR body.
+- Never merge a PR yourself — once the 👍 reaction appears on the PR body and
+  no Codex comments are outstanding, hand off to the user for approval/merge.
 - Never push or commit directly to `main`.
 - Keep each change minimal and scoped to the request — no unrelated refactors.
 - Run the relevant tests before opening the PR.

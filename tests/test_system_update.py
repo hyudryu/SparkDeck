@@ -831,7 +831,7 @@ class UpdateHelperTests(unittest.TestCase):
             npm=Path("C:/Node/npm.cmd"), node=Path("C:/Node/node.exe"),
             version="22.12.0", path_entries=(Path("C:/Node"),),
         )
-        self.assertEqual(npm_executable(), "C:\\Node\\npm.cmd")
+        self.assertEqual(npm_executable(), str(Path("C:/Node/npm.cmd")))
 
     def test_update_passes_toolchain_path_to_both_npm_commands(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -573,3 +573,25 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* ---------- Benchy (llama-benchy runner) ---------- */
+.benchy-tool-row { display: flex; align-items: flex-start; gap: 12px; }
+.benchy-tool-icon { display: grid; place-items: center; width: 36px; height: 36px; color: var(--accent); background: var(--accent-soft); border-radius: 10px; }
+.benchy-tool-info { min-width: 0; flex: 1; }
+.benchy-tool-info h2 { margin: 0 0 2px; font-size: 14px; }
+.benchy-tool-info p { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.benchy-tool-panel .button { align-self: center; }
+.benchy-run-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.benchy-checkbox { display: flex; align-items: center; gap: 8px; min-height: 40px; }
+.benchy-checkbox input { width: 16px; height: 16px; accent-color: var(--accent); }
+.benchy-active-panel { border-color: var(--accent); }
+.benchy-active-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.benchy-active-shape { margin: 10px 0 2px; font-weight: 600; }
+.benchy-run-row { cursor: pointer; }
+.benchy-run-row:hover { background: var(--bg-subtle); }
+.benchy-run-row-selected { box-shadow: inset 3px 0 0 var(--accent); }
+.benchy-run-actions-cell { display: flex; align-items: center; gap: 6px; }
+.benchy-detail { display: grid; gap: 12px; margin-top: 4px; }
+.benchy-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.benchy-detail-head h3 { margin: 0; font-size: 15px; }
+.benchy-detail-head p { margin: 2px 0 0; font-size: 12px; }

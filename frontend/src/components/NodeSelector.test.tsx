@@ -62,4 +62,14 @@ describe('NodeSelector', () => {
     expect(screen.getByRole('checkbox', { name: /Studio Spark.*Primary/ })).toBeChecked()
     expect(screen.getByText('Targets:').parentElement).toHaveTextContent('Targets: Studio Spark, Controller · Primary: Studio Spark')
   })
+
+  it('explains why a running node is disabled', () => {
+    render(<NodeSelector nodes={[{
+      id: 'spark-4', name: 'Spark Four', online: true, docker_ready: false, selectable: false,
+      status_message: "SparkDeck's service user cannot access Docker. Add this user to the docker group, then restart the user session.",
+    }]} selectedIds={[]} onChange={() => undefined} />)
+
+    expect(screen.getByRole('checkbox', { name: /Spark Four/ })).toBeDisabled()
+    expect(screen.getByText(/service user cannot access Docker/)).toBeInTheDocument()
+  })
 })

@@ -76,6 +76,9 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.get(path)
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("sparkdeck-spa", response.text)
+                self.assertEqual(
+                    response.headers["cache-control"], "no-store, max-age=0"
+                )
 
     async def test_spa_routes_do_not_shadow_reserved_surfaces(self) -> None:
         expectations = {

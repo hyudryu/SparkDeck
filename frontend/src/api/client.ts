@@ -62,40 +62,80 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-      ...init?.headers,
-    },
-  })
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`
-    let body: { detail?: unknown; message?: string } | undefined
-    try {
-      body = (await response.json()) as { detail?: unknown; message?: string }
-      if (typeof body.detail === 'string') message = body.detail
-      else if (body.message) message = body.message
-    } catch {
-      // The status text is still useful for non-JSON failures.
+const REQUEST_TIMEOUT_MS = 30_000
+// Long-running mutations and non-streaming inference already have
+// backend-owned limits. Keep their browser connection alive so the server can
+// return the authoritative result instead of inviting a duplicate retry after
+// 30 seconds while the original state change is still completing.
+const NO_REQUEST_TIMEOUT: null = null
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController()
+  const callerSignal = init?.signal
+  let timedOut = false
+  const forwardAbort = () => controller.abort(callerSignal?.reason)
+  if (callerSignal?.aborted) forwardAbort()
+  else callerSignal?.addEventListener('abort', forwardAbort, { once: true })
+  const timeout = timeoutMs === null ? undefined : globalThis.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+
+  try {
+    const response = await fetch(path, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...init?.headers,
+      },
+    })
+    if (!response.ok) {
+      let message = `${response.status} ${response.statusText}`
+      let body: { detail?: unknown; message?: string } | undefined
+      try {
+        body = (await response.json()) as { detail?: unknown; message?: string }
+        if (typeof body.detail === 'string') message = body.detail
+        else if (body.message) message = body.message
+      } catch (error) {
+        // Abort still needs to propagate while the response body is being read.
+        if (controller.signal.aborted) throw error
+        // The status text is still useful for non-JSON failures.
+      }
+      throw new ApiError(message, response.status, body)
     }
-    throw new ApiError(message, response.status, body)
+    if (response.status === 204) return undefined as T
+    if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T
+    return await response.json() as T
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiError('The request timed out. Check the node connection and retry.', 408)
+    }
+    throw error
+  } finally {
+    if (timeout !== undefined) globalThis.clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', forwardAbort)
   }
-  if (response.status === 204) return undefined as T
-  if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T
-  return response.json() as Promise<T>
 }
 
-async function requestWithFallback<T>(primary: string, fallback: string, init?: RequestInit) {
+async function requestWithFallback<T>(
+  primary: string,
+  fallback: string,
+  init?: RequestInit,
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+) {
   try {
-    return await request<T>(primary, init)
+    return await request<T>(primary, init, timeoutMs)
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 404) throw error
-    return request<T>(fallback, init)
+    return request<T>(fallback, init, timeoutMs)
   }
 }
 
@@ -260,18 +300,22 @@ export const api = {
           node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
           deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
         }),
-      })
+      }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
       if (action === 'remove') {
-        return request<void>(`/api/v1/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        return request<void>(
+          `/api/v1/deployments/${encodeURIComponent(id)}`,
+          { method: 'DELETE' },
+          NO_REQUEST_TIMEOUT,
+        )
       }
       const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
         body,
-      })
+      }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {
@@ -305,6 +349,7 @@ export const api = {
     deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
+      NO_REQUEST_TIMEOUT,
     ).then(deploymentFromWire),
   },
   nodes: {
@@ -339,6 +384,7 @@ export const api = {
     updateFanSettings: (nodeId: string, settings: Record<string, unknown>) => request<RouterOSNodeOverview>(
       `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/fan-settings`,
       { method: 'PATCH', body: JSON.stringify(settings) },
+      NO_REQUEST_TIMEOUT,
     ),
   },
   fanControl: {
@@ -364,7 +410,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ model, messages, stream: false }),
       signal,
-    }),
+    }, NO_REQUEST_TIMEOUT),
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {
       const data = await request<{ items: WireBenchmark[] }>('/api/v1/benchmarks?limit=100&offset=0', { signal })
@@ -470,11 +516,16 @@ export const api = {
       const result = await requestWithFallback<ImagePullResult>('/api/v1/images/pull', '/api/images/pull', {
         method: 'POST',
         body: JSON.stringify({ image, node_ids: nodeIds }),
-      })
+      }, NO_REQUEST_TIMEOUT)
       return result ?? { ok: true, image, node_ids: nodeIds ?? ['local'], results: [] }
     },
     remove: (id: string) =>
-      requestWithFallback<void>(`/api/v1/images/${encodeURIComponent(id)}`, `/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      requestWithFallback<void>(
+        `/api/v1/images/${encodeURIComponent(id)}`,
+        `/api/images/${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+        NO_REQUEST_TIMEOUT,
+      ),
   },
   storage: {
     get: (signal?: AbortSignal) => request<StorageState>('/api/v1/storage', { signal }),
@@ -505,6 +556,7 @@ export const api = {
     removeModel: (nodeId: string, modelId: string) => request<void>(
       `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}`,
       { method: 'DELETE' },
+      NO_REQUEST_TIMEOUT,
     ),
   },
   modelCache: {

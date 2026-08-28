@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ClusterPage } from './ClusterPage'
@@ -318,14 +318,14 @@ describe('ClusterPage', () => {
       return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const user = userEvent.setup()
     render(<ClusterPage />)
 
     await user.click(await screen.findByRole('button', { name: 'Edit name for Studio Spark' }))
     await user.click(screen.getByRole('button', { name: 'Forget node' }))
-
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/cannot notify it.*Leave cluster.*Cached weights stay/is))
+    const confirmation = await screen.findByRole('dialog', { name: 'Forget Studio Spark?' })
+    expect(confirmation).toHaveTextContent(/cannot notify it.*Leave cluster.*Cached weights stay/is)
+    await user.click(within(confirmation).getByRole('button', { name: 'Forget node' }))
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/nodes/spark-2?force=true', expect.objectContaining({ method: 'DELETE' }))
     expect(await screen.findByText(/Forgot offline node Studio Spark/)).toHaveAttribute('role', 'status')
     expect(screen.queryByText('spark-2')).not.toBeInTheDocument()

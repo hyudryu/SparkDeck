@@ -497,6 +497,42 @@ describe('model deployments', () => {
     expect(await screen.findByText('Deployed saved configuration Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
+  it('shows recipe nodes while the model-cache inventory is still loading', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/model-cache')) return new Promise<Response>(() => undefined)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: true,
+        model_id: 'org/model',
+        revision: 'main',
+        source: { node_id: 'local', node_name: 'Spark One', size_bytes: 20 },
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(screen.getByRole('button', { name: 'Choose nodes & deploy' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved cluster' })
+    expect(within(dialog).queryByText('Loading available nodes…')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
+    expect(await within(dialog).findByRole('button', { name: 'Deploy on 1 node' })).toBeEnabled()
+  })
+
   it('confirms one selected-set preparation and rejects insufficient targets', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3

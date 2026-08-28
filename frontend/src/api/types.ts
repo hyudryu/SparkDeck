@@ -571,6 +571,8 @@ export interface StorageModel {
   model_id: string
   size_bytes: number
   partial?: boolean
+  has_partial_download?: boolean
+  partial_size_bytes?: number
   last_modified?: string
   revision?: string
   revisions?: string[]

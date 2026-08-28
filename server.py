@@ -710,9 +710,11 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         body = await req.json()
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
+            "download_cache_baseline_bytes",
         }:
             raise ValueError(
-                "request may contain only revision, requested_revision, and hf_token"
+                "request may contain only revision, requested_revision, hf_token, "
+                "and download_cache_baseline_bytes"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
@@ -723,10 +725,18 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             raise ValueError("hf_token must be a string")
         if requested_revision is not None and not isinstance(requested_revision, str):
             raise ValueError("requested_revision must be a string")
-        result = await manager.virtual_nas.download_model_checked(
+        baseline = body.get("download_cache_baseline_bytes")
+        if baseline is not None and (
+            isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
+        ):
+            raise ValueError("download_cache_baseline_bytes must be a non-negative integer")
+        download_args = [
             model_id, revision or "main", token if token is not None else "",
             requested_revision or revision or "main",
-        )
+        ]
+        if baseline is not None:
+            download_args.append(baseline)
+        result = await manager.virtual_nas.download_model_checked(*download_args)
         return _public_storage_payload(result)
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
@@ -2335,6 +2345,31 @@ async def v1_storage_delete_model(node_id: str, model_id: str):
             await manager.delete_virtual_nas_model(node_id.strip(), model_id)
         )
     except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/storage/nodes/{node_id}/models/{model_id:path}/download",
+    status_code=202,
+)
+async def v1_storage_finish_model_download(node_id: str, model_id: str, req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) - {"revision"}:
+            raise ValueError("request may contain only revision")
+        revision = body.get("revision")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        return _public_storage_payload(
+            await manager.queue_virtual_nas_download(
+                model_id.strip(), node_id.strip(), revision,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
         raise _storage_error(exc) from exc
 
 

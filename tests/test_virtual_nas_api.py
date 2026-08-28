@@ -244,6 +244,24 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 409)
 
+    async def test_finish_partial_download_contract_queues_selected_node(self):
+        queue = AsyncMock(return_value={
+            "job_ids": ["download-1"],
+            "jobs": [{"id": "download-1", "status": "queued", "token": "hidden"}],
+        })
+        with (
+            patch.object(server.manager, "virtual_nas_enabled", return_value=True),
+            patch.object(server.manager, "queue_virtual_nas_download", queue),
+        ):
+            response = await self.client.post(
+                "/api/v1/storage/nodes/worker-1/models/org/model/download",
+                json={"revision": "main"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        queue.assert_awaited_once_with("org/model", "worker-1", "main")
+        self.assertNotIn("token", response.text)
+
     async def test_agent_storage_routes_require_a_paired_node_token(self):
         with patch.object(
             server.manager.agent_credentials, "authorize_controller", return_value=False,
@@ -283,12 +301,13 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
                     "revision": resolved,
                     "requested_revision": "main",
                     "hf_token": "ephemeral",
+                    "download_cache_baseline_bytes": 7,
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         checked.assert_awaited_once_with(
-            "org/model", resolved, "ephemeral", "main",
+            "org/model", resolved, "ephemeral", "main", 7,
         )
         self.assertNotIn("ephemeral", response.text)
 

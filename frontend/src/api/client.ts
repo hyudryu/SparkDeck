@@ -18,7 +18,6 @@ import type {
   DeploymentDetail,
   DeploymentLaunchControls,
   DeploymentUpdateInput,
-  DashboardData,
   SystemStats,
   AdmissionStats,
   LogEntry,
@@ -78,6 +77,7 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
+const DASHBOARD_CORE_TIMEOUT_MS = 10_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
 // return the authoritative result instead of inviting a duplicate retry after
@@ -434,17 +434,21 @@ function queryString(values: Record<string, string | number | undefined>) {
 
 export const api = {
   dashboard: {
-    load: async (signal?: AbortSignal): Promise<DashboardData> => {
-      const nodeInventory = api.nodes.list(signal).catch(() => [])
-      const [stats, admission, deployments, sync, nodes] = await Promise.all([
-        request<SystemStats>('/api/stats', { signal }),
-        request<Record<string, AdmissionStats>>('/api/inference-queue', { signal }),
-        api.deployments.list(signal),
-        api.benchmarks.syncStatus(signal),
-        nodeInventory,
-      ])
-      return { stats, admission, deployments, sync, nodes }
-    },
+    stats: (signal?: AbortSignal) => request<SystemStats>(
+      '/api/stats', { signal }, DASHBOARD_CORE_TIMEOUT_MS,
+    ),
+    admission: (signal?: AbortSignal) => request<Record<string, AdmissionStats>>(
+      '/api/inference-queue', { signal }, DASHBOARD_CORE_TIMEOUT_MS,
+    ),
+    deployments: (signal?: AbortSignal): Promise<Deployment[]> => (
+      api.deployments.list(signal)
+    ),
+    sync: (signal?: AbortSignal): Promise<SyncStatus> => (
+      api.benchmarks.syncStatus(signal)
+    ),
+    nodes: (signal?: AbortSignal): Promise<NodeInventoryItem[]> => (
+      api.nodes.list(signal)
+    ),
   },
   catalog: {
     search: (query = '', runtime?: string, cursor?: string, signal?: AbortSignal) =>

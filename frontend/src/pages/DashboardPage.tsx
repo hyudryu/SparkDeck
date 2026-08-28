@@ -63,7 +63,12 @@ function finiteNumber(value: unknown): number | undefined {
 export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStats?: SystemStats) {
   const visibleOnline = nodes.filter((node) => node.hidden_from_dashboard !== true && node.online)
   const telemetry = nodes.length
-    ? visibleOnline.flatMap((node) => node.stats ? [{ id: node.id, stats: node.stats }] : [])
+    ? visibleOnline.flatMap((node) => {
+      const nodeStats = fallbackStats && (node.local || node.id === 'local')
+        ? fallbackStats
+        : node.stats
+      return nodeStats ? [{ id: node.id, stats: nodeStats }] : []
+    })
     : fallbackStats ? [{ id: 'entry-node', stats: fallbackStats }] : []
   let cpuTotal = 0; let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let allCpuCountsKnown = true
   let ramUsed = 0; let ramTotal = 0; let ramNodes = 0
@@ -109,26 +114,46 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
 }
 
 export function DashboardPage() {
-  const resource = useResource((signal) => api.dashboard.load(signal))
+  const statsResource = useDashboardResource((signal) => api.dashboard.stats(signal))
+  const admissionResource = useDashboardResource((signal) => api.dashboard.admission(signal))
+  const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal))
+  const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal))
+  const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal))
   const communityAccess = useCommunityAccess()
   const accessHint = communityAccessHint(communityAccess.signedIn)
 
-  useEffect(() => {
-    if (resource.loading) return
-    const timer = window.setTimeout(resource.reload, 10_000)
-    return () => window.clearTimeout(timer)
-  }, [resource.loading, resource.reload])
-
-  const stats = resource.data?.stats
+  const stats = statsResource.data
+  const admission = admissionResource.data
+  const deployments = deploymentsResource.data ?? []
+  const sync = syncResource.data
   const activeRequests = Object.entries(stats?.active_requests ?? {})
   const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
-  const queuedRequests = Object.values(resource.data?.admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
-  const runningDeployments = resource.data?.deployments.filter((item) => item.status === 'running') ?? []
+  const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
+  const runningDeployments = deployments.filter((item) => item.status === 'running')
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
-  const allClusterNodes = resource.data?.nodes ?? []
+  const allClusterNodes = nodesResource.data ?? []
   const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
   const hiddenNodeCount = allClusterNodes.length - clusterNodes.length
   const pooled = clusterResourceSnapshot(allClusterNodes, stats)
+  const loading = [statsResource, admissionResource, deploymentsResource, syncResource, nodesResource]
+    .some((item) => item.loading)
+  const queueSummary = admission
+    ? `${queuedRequests} queued${admissionResource.error ? ' · refresh paused' : ''}`
+    : admissionResource.error ? 'queue unavailable' : 'queue loading'
+  const inferenceStatus = runningSessions > 0
+    ? 'running'
+    : stats && admission ? (queuedRequests > 0 ? 'waiting' : 'stopped') : 'waiting'
+  const inferenceStatusLabel = runningSessions > 0
+    ? 'Processing'
+    : stats && admission ? (queuedRequests > 0 ? 'Waiting' : 'Idle')
+      : statsResource.error || admissionResource.error ? 'Unavailable' : 'Loading'
+  const reload = () => {
+    statsResource.reload()
+    admissionResource.reload()
+    deploymentsResource.reload()
+    syncResource.reload()
+    nodesResource.reload()
+  }
 
   return (
     <div className="page dashboard-page">
@@ -138,18 +163,17 @@ export function DashboardPage() {
         description="Live pooled resource health and per-machine telemetry for the SparkDeck cluster."
         actions={
           <div className="dashboard-refresh">
-            <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Waiting for telemetry'}</span>
-            <Button onClick={resource.reload} disabled={resource.loading}><RefreshCw size={15} /> Refresh</Button>
+            <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : statsResource.loading ? 'Loading local telemetry' : 'Telemetry unavailable'}</span>
+            <Button onClick={reload} disabled={loading}><RefreshCw size={15} /> Refresh</Button>
           </div>
         }
       />
 
-      {resource.loading && !resource.data && <LoadingState label="Loading system overview" />}
-      {resource.error && !resource.data && <ErrorState message={resource.error} onRetry={resource.reload} />}
-      {resource.error && resource.data && <p className="dashboard-stale" role="status">Live refresh paused: {resource.error}</p>}
+      {statsResource.loading && !stats && <LoadingState label="Loading local telemetry" />}
+      {statsResource.error && !stats && <ErrorState message={statsResource.error} onRetry={statsResource.reload} />}
+      {statsResource.error && stats && <p className="dashboard-stale" role="status">Local telemetry refresh paused: {statsResource.error}</p>}
 
-      {resource.data && (
-        <>
+      <>
           <section className="metric-grid" aria-label="System overview">
             <Panel className="metric-panel">
               <div className="metric-label"><Cpu size={16} /><span>Pooled CPU</span></div>
@@ -171,17 +195,19 @@ export function DashboardPage() {
             </Panel>
             <Panel className="metric-panel">
               <div className="metric-label"><Activity size={16} /><span>Inference</span></div>
-              <strong>{runningSessions}</strong>
-              <p className="metric-context">active {runningSessions === 1 ? 'session' : 'sessions'} · {queuedRequests} queued</p>
-              <div className="metric-status"><Status status={runningSessions > 0 ? 'running' : queuedRequests > 0 ? 'waiting' : 'stopped'}>{runningSessions > 0 ? 'Processing' : queuedRequests > 0 ? 'Waiting' : 'Idle'}</Status></div>
+              <strong>{stats ? runningSessions : '—'}</strong>
+              <p className="metric-context">{stats ? `active ${runningSessions === 1 ? 'session' : 'sessions'} · ${queueSummary}` : statsResource.error ? 'Inference telemetry unavailable' : 'Loading inference telemetry'}</p>
+              <div className="metric-status"><Status status={inferenceStatus}>{inferenceStatusLabel}</Status></div>
             </Panel>
           </section>
 
           <section className="cluster-health" aria-labelledby="cluster-health-title">
-            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{clusterNodes.filter((node) => node.online).length} of {clusterNodes.length} visible nodes online · pooled above, telemetry per machine{hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
+            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{nodesResource.loading && !nodesResource.data ? 'Loading cluster inventory' : `${clusterNodes.filter((node) => node.online).length} of ${clusterNodes.length} visible nodes online · pooled above, telemetry per machine${hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}`}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
+            {nodesResource.error && nodesResource.data && <p className="dashboard-stale" role="status">Cluster inventory refresh paused: {nodesResource.error}</p>}
             <div className="cluster-health-grid">
-              {!clusterNodes.length && hiddenNodeCount > 0 && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
-              {!clusterNodes.length && hiddenNodeCount === 0 && <EmptyState title="Cluster inventory unavailable" description="Refresh to retry loading per-machine telemetry." />}
+              {nodesResource.loading && !nodesResource.data && <LoadingState label="Loading cluster nodes" />}
+              {!nodesResource.loading && !clusterNodes.length && hiddenNodeCount > 0 && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
+              {!nodesResource.loading && !clusterNodes.length && hiddenNodeCount === 0 && <EmptyState title="Cluster inventory unavailable" description="Refresh to retry loading per-machine telemetry." />}
               {clusterNodes.map((node) => {
                 const nodeStats = node.stats
                 const nodeGpu = nodeStats?.gpus?.find((item) => !item.error)
@@ -203,10 +229,15 @@ export function DashboardPage() {
           <div className="dashboard-grid">
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{runningDeployments.length} of {resource.data.deployments.length} deployments online</p></div></div>
+                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${runningDeployments.length} of ${deployments.length} deployments online`}</p></div></div>
                 <Link className="text-link" to="/models">Manage</Link>
               </div>
-              {runningDeployments.length === 0 ? (
+              {deploymentsResource.error && deploymentsResource.data && <p className="dashboard-stale" role="status">Deployment refresh paused: {deploymentsResource.error}</p>}
+              {deploymentsResource.loading && !deploymentsResource.data ? (
+                <LoadingState label="Loading deployments" />
+              ) : deploymentsResource.error && !deploymentsResource.data ? (
+                <EmptyState title="Deployment status unavailable" description="Refresh to retry loading model status." />
+              ) : runningDeployments.length === 0 ? (
                 <EmptyState title="No models running" description="Start a deployment to make it available for chat and comparison." action={<Link className="button button-primary" to="/models">Open models</Link>} />
               ) : (
                 <div className="dashboard-list">
@@ -223,18 +254,23 @@ export function DashboardPage() {
 
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{runningSessions} active · {queuedRequests} queued requests</p></div></div>
+                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{stats ? `${runningSessions} active` : 'Active sessions loading'} · {queueSummary}</p></div></div>
                 <Link className="text-link" to="/chat">Open chat</Link>
               </div>
-              {activeRequests.length === 0 ? (
-                <EmptyState title="No active inference" description="Current sessions and queue pressure will appear here." />
-              ) : (
+              {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
+              {activeRequests.length > 0 ? (
                 <div className="dashboard-list">
                   {activeRequests.map(([model, request]) => <SessionRow key={model} model={model} request={request} />)}
                 </div>
+              ) : statsResource.error && !stats ? (
+                <EmptyState title="Active session status unavailable" description="Refresh to retry loading current inference sessions." />
+              ) : !stats ? (
+                <LoadingState label="Loading active sessions" />
+              ) : (
+                <EmptyState title="No active inference" description="Current sessions and queue pressure will appear here." />
               )}
               {queuedRequests > 0 && (
-                <div className="queue-note"><Gauge size={15} /><span><strong>{queuedRequests} queued</strong> · oldest wait {displayValue(Math.max(...Object.values(resource.data.admission).map((item) => item.oldest_wait_seconds ?? 0)), 's', 1)}</span></div>
+                <div className="queue-note"><Gauge size={15} /><span><strong>{queuedRequests} queued</strong> · oldest wait {displayValue(Math.max(...Object.values(admission ?? {}).map((item) => item.oldest_wait_seconds ?? 0)), 's', 1)}</span></div>
               )}
             </Panel>
           </div>
@@ -242,16 +278,25 @@ export function DashboardPage() {
           <Panel className="community-strip" title={communityAccess.enabled ? undefined : accessHint}>
             <span className="panel-icon"><Cloud size={17} /></span>
             <div><h2>Community benchmark sync</h2><p>Share aggregation-safe performance measurements without prompts or responses.</p></div>
-            <Status status={resource.data.sync.sharing_enabled ? (resource.data.sync.account_paired ? 'running' : 'waiting') : 'stopped'}>
-              {resource.data.sync.sharing_enabled ? (resource.data.sync.account_paired ? 'Connected' : 'Waiting for account') : 'Sharing off'}
+            <Status status={sync ? (sync.sharing_enabled ? (sync.account_paired ? 'running' : 'waiting') : 'stopped') : 'waiting'}>
+              {sync ? (sync.sharing_enabled ? (sync.account_paired ? 'Connected' : 'Waiting for account') : 'Sharing off') : syncResource.error ? 'Unavailable' : 'Loading'}
             </Status>
-            <span className="community-counts">{resource.data.sync.pending_count} pending · {resource.data.sync.synced_count} synced</span>
+            <span className="community-counts">{sync ? `${sync.pending_count} pending · ${sync.synced_count} synced${syncResource.error ? ' · refresh paused' : ''}` : 'Sync status pending'}</span>
             <Link className="text-link" to={communityAccess.enabled || communityAccess.signedIn ? '/benchmarks' : '/settings'}>{communityAccess.enabled ? 'View benchmarks' : communityAccess.signedIn ? 'Review sharing' : 'Open community settings'}</Link>
           </Panel>
-        </>
-      )}
+      </>
     </div>
   )
+}
+
+function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>) {
+  const resource = useResource(loader)
+  useEffect(() => {
+    if (resource.loading) return
+    const timer = window.setTimeout(resource.reload, 10_000)
+    return () => window.clearTimeout(timer)
+  }, [resource.loading, resource.reload])
+  return resource
 }
 
 function SessionRow({ model, request }: { model: string; request: ActiveRequestStats }) {

@@ -264,9 +264,9 @@ describe('StoragePage', () => {
     expect(partial).toHaveTextContent('Partial')
     expect(partial).toHaveAttribute('draggable', 'false')
     const mixed = screen.getByLabelText('Transfer org/mixed-model from Studio Spark')
-    expect(mixed).toHaveTextContent('Incomplete download')
+    expect(mixed).not.toHaveTextContent('Incomplete download')
     expect(mixed).toHaveAttribute('draggable', 'true')
-    expect(screen.getByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).not.toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'org/mixed-model' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
     let dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
@@ -326,20 +326,21 @@ describe('StoragePage', () => {
       '/api/v1/storage/transfers/job-1',
       expect.objectContaining({ method: 'DELETE' }),
     ))
-    expect(screen.getByRole('progressbar', { name: 'Transfer org/other progress' })).toHaveValue(40)
+    expect(screen.getByRole('progressbar', { name: 'Transfer org/other progress' })).toHaveAttribute('aria-valuenow', '40')
   })
 
   it('shows active downloads and transfers on their target NAS cards', async () => {
+    const gib = 1024 ** 3
     const storage: StorageState = {
       ...enabledStorage,
       nodes: enabledStorage.nodes.map((node) => node.id === 'node-b'
-        ? { ...node, models: [{ model_id: 'org/download', size_bytes: 25, partial: true }] }
+        ? { ...node, models: [{ model_id: 'org/download', size_bytes: 97.5 * gib, partial: true }] }
         : node),
       jobs: [
         {
           id: 'download-1', model_id: 'org/download', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
           target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
-          bytes_total: 1000, bytes_transferred: 0, progress: 0, created_at: '2026-08-26T12:00:00Z',
+          bytes_total: 100 * gib, bytes_transferred: 97.5 * gib, progress: 0.975, created_at: '2026-08-26T12:00:00Z',
         },
         {
           id: 'transfer-1', model_id: 'org/copy', source_node_id: 'node-a', source_node_name: 'Studio Spark',
@@ -353,11 +354,13 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
     const download = within(nodePanel).getByLabelText('Downloading from Hugging Face org/download on Backup Spark')
-    expect(within(download).getByRole('progressbar', { name: 'Downloading from Hugging Face org/download progress' })).not.toHaveAttribute('value')
-    expect(within(download).getByText('In progress')).toBeInTheDocument()
+    const downloadProgress = within(download).getByRole('progressbar', { name: 'Downloading from Hugging Face org/download progress' })
+    expect(downloadProgress).toHaveAttribute('aria-valuenow', '97.5')
+    expect(downloadProgress.firstElementChild).toHaveStyle({ transform: 'scaleX(0.975)' })
+    expect(within(download).getByText(/^97\.5%/)).toBeInTheDocument()
     expect(within(nodePanel).getAllByText('org/download')).toHaveLength(1)
     expect(within(nodePanel).queryByText('No model weights reported')).not.toBeInTheDocument()
-    expect(within(nodePanel).getByRole('progressbar', { name: 'Transferring from Studio Spark org/copy progress' })).toHaveValue(40)
+    expect(within(nodePanel).getByRole('progressbar', { name: 'Transferring from Studio Spark org/copy progress' })).toHaveAttribute('aria-valuenow', '40')
     expect(within(nodePanel).getByRole('button', { name: 'Cancel org/copy transfer' })).toBeInTheDocument()
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })

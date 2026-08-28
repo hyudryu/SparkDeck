@@ -1598,9 +1598,38 @@ class Manager:
                 "instructions": instructions,
             }
         nodes = await self.model_cache_inventory()
+        models_by_node = {
+            str(node.get("id")): {
+                str(model.get("model_id")): model
+                for model in node.get("models") or []
+            }
+            for node in nodes
+        }
+        jobs = []
+        for job in self.virtual_nas.list_transfers()["items"]:
+            snapshot = dict(job)
+            if (
+                job.get("kind") == "download"
+                and job.get("status") in {"queued", "running"}
+            ):
+                model = models_by_node.get(
+                    str(job.get("target_node_id")), {}
+                ).get(str(job.get("model_id")))
+                if model is not None:
+                    total = max(0, int(job.get("bytes_total") or 0))
+                    live_bytes = cached_download_bytes(
+                        model,
+                        job.get("download_cache_baseline_bytes"),
+                        job.get("revision") or "main",
+                    )
+                    snapshot["bytes_transferred"] = max(
+                        max(0, int(job.get("bytes_transferred") or 0)),
+                        min(total, live_bytes),
+                    )
+            jobs.append(self._public_virtual_nas_job(snapshot))
         return {
             "enabled": True, "nodes": nodes,
-            "jobs": self.virtual_nas_transfers()["items"],
+            "jobs": jobs,
             "instructions": instructions,
         }
 

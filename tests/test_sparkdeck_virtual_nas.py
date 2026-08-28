@@ -356,7 +356,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(models[0]["has_partial_download"])
             self.assertEqual(
                 models[0]["partial_size_bytes"],
-                len(b"partial") + len(b"completed") + len(b"older"),
+                len(b"completed") + len(b"older"),
             )
             self.assertEqual(models[0]["partial_revision_size_bytes"], {
                 next_revision: len(b"completed"),
@@ -420,6 +420,41 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 {"release-shared": partial_revision},
             )
             self.assertEqual(model["revision"], "release-shared")
+
+    async def test_inventory_accepts_complete_windows_snapshot_without_blob_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = (
+                hub / "models--org--windows-model" / "snapshots" / "revision-1"
+            )
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (snapshot / "model.safetensors").write_bytes(b"complete weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["has_partial_download"])
+            self.assertEqual(model["revisions"], ["revision-1"])
+
+    async def test_complete_model_ignores_unassigned_incomplete_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            (repository / "blobs" / "orphan.incomplete").write_bytes(b"stale")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["has_partial_download"])
+            self.assertEqual(model["partial_size_bytes"], 0)
 
     def test_inventory_requires_matching_index_for_complete_transformer_shards(self):
         cases = (
@@ -739,6 +774,44 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
 
+    async def test_remote_download_reuses_fresh_probe_instead_of_forcing_a_second_probe(self):
+        registry = FakeRegistry()
+        force_values = []
+
+        async def transient_probe(node, force=False):
+            force_values.append(force)
+            if force:
+                return {**node, "online": False}
+            return {
+                **node, "online": True,
+                "capabilities": [
+                    VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                    VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+                ],
+            }
+
+        registry.probe = transient_probe
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, registry, lambda: True,
+        )
+        nas.start = Mock()
+        nas._node_storage = AsyncMock(return_value={
+            "models": [{
+                "model_id": "org/model", "size_bytes": 97,
+                "partial": True, "revisions": [],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
+            }],
+            "free_size": 10 * 1024 * 1024 * 1024,
+        })
+
+        result = await nas.queue_download_and_transfer(
+            "org/model", RESOLVED_REVISION, "worker-a", [], 100,
+            requested_revision="main", require_partial_cache=True,
+        )
+
+        self.assertEqual(force_values, [False])
+        self.assertEqual(result["jobs"][0]["bytes_transferred"], 97)
+
     async def test_finish_download_never_starts_without_the_partial_cache(self):
         nas = VirtualNAS(
             Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
@@ -779,6 +852,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                         download_cache_baseline_bytes=100,
                     )
                     self.assertEqual(len(result["jobs"]), 1)
+                    self.assertEqual(
+                        result["jobs"][0]["bytes_transferred"], cached,
+                    )
                 else:
                     with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
                         await nas.queue_download_and_transfer(
@@ -1246,6 +1322,37 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["nodes"][0]["total_size"], 1000)
         self.assertEqual(result["nodes"][0]["free_size"], 600)
+
+    async def test_public_inventory_reports_live_overall_download_progress(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {
+            "virtual_nas_enabled": True, "cluster_node_name": "Coordinator",
+        }
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [{
+            "id": "download-1", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "worker-a",
+            "revision": RESOLVED_REVISION, "status": "running",
+            "bytes_total": 1000, "bytes_transferred": 970,
+            "download_cache_baseline_bytes": 1000, "created_at": 1,
+        }]}
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "worker-a", "name": "Worker A",
+        }
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker A", "online": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 1975,
+                "partial": False, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 975},
+            }],
+        }])
+
+        result = await manager.virtual_nas_inventory()
+
+        self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
+        self.assertEqual(result["jobs"][0]["progress"], 0.975)
 
 
 if __name__ == "__main__":

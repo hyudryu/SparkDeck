@@ -22,7 +22,7 @@ function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
   if (latest) return { color: 'running', label: 'Latest' }
   if (node.phase === 'succeeded') return { color: 'running', label: 'Succeeded' }
   if (node.online === false) return { color: 'stopped', label: 'Offline' }
-  return { color: 'starting', label: node.phase === 'up_to_date' ? 'Ready' : node.phase || 'Ready' }
+  return { color: 'starting', label: node.phase === 'ready' ? 'Queued' : node.phase === 'up_to_date' ? 'Ready' : node.phase || 'Ready' }
 }
 
 function SoftwareUpdatePanel() {

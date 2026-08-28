@@ -39,7 +39,7 @@ from sparkdeck.onboarding import (
     forward_management_request,
     is_forwardable_path,
 )
-from sparkdeck.updater import CONFIRMATION, UpdateService, current_revision
+from sparkdeck.updater import CONFIRMATION, UpdateService
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
@@ -473,7 +473,7 @@ async def agent_info():
         "name": manager.settings.get("cluster_node_name"),
         "protocol_version": AGENT_PROTOCOL_VERSION,
         "pairing_required": True,
-        "app_revision": current_revision(ROOT),
+        "app_revision": updater.runtime_revision,
     }
 
 

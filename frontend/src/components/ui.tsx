@@ -106,22 +106,38 @@ export function Panel({ className = '', ...props }: HTMLAttributes<HTMLElement>)
 // Hover/focus tooltip rendered through a portal with fixed positioning so
 // table overflow clipping and stacking contexts cannot hide it.
 export function Tooltip({ label, children }: { label: ReactNode; children: ReactNode }) {
-  const [position, setPosition] = useState<{ x: number; y: number }>()
+  const [anchor, setAnchor] = useState<{ x: number; y: number; below: boolean }>()
   const show = (target: HTMLElement) => {
     const rect = target.getBoundingClientRect()
-    setPosition({ x: rect.left + rect.width / 2, y: rect.top })
+    // Near the top edge there is no room above the badge, so flip below when
+    // that side has more space; horizontally clamp the centered tooltip
+    // inside the viewport.
+    const below = rect.top < 72 && window.innerHeight - rect.bottom > rect.top
+    const halfWidth = Math.min(170, window.innerWidth * 0.45)
+    setAnchor({
+      x: Math.min(
+        Math.max(rect.left + rect.width / 2, halfWidth + 8),
+        window.innerWidth - halfWidth - 8,
+      ),
+      y: below ? rect.bottom : rect.top,
+      below,
+    })
   }
   return (
     <span
       tabIndex={0}
       onMouseEnter={(event) => show(event.currentTarget)}
-      onMouseLeave={() => setPosition(undefined)}
+      onMouseLeave={() => setAnchor(undefined)}
       onFocus={(event) => show(event.currentTarget)}
-      onBlur={() => setPosition(undefined)}
+      onBlur={() => setAnchor(undefined)}
     >
       {children}
-      {position && createPortal(
-        <div className="tooltip" role="tooltip" style={{ left: position.x, top: position.y }}>{label}</div>,
+      {anchor && createPortal(
+        <div
+          className={`tooltip${anchor.below ? ' tooltip-below' : ''}`}
+          role="tooltip"
+          style={{ left: anchor.x, top: anchor.y }}
+        >{label}</div>,
         document.body,
       )}
     </span>

@@ -26,6 +26,10 @@ RUN_TERMINAL_STATES = ("completed", "failed", "cancelled")
 MAX_RUN_SECONDS = 4 * 60 * 60
 MAX_LIST_ITEMS = 8
 _MAX_POSITIVE = 2_000_000
+# The controller's own OpenAI-compatible endpoint (same convention as the MCP
+# client and onboarding service in server.py). Keyed deployments benchmark
+# through it so their stored credential never appears on a command line.
+CONTROLLER_LOCAL_BASE_URL = "http://127.0.0.1:7878"
 
 
 class BenchyError(ValueError):
@@ -98,9 +102,13 @@ class BenchyService:
             try:
                 stdout, _ = await asyncio.wait_for(process.communicate(), timeout=900)
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+                await _stop_process(process)
                 raise BenchyError("llama-benchy installation timed out")
+            except asyncio.CancelledError:
+                # Shutdown must not leave pip mutating the shared environment
+                # after the replacement server has started.
+                await _stop_process(process)
+                raise
         if process.returncode != 0:
             raise BenchyError(_output_tail(stdout))
         return await self.detect(refresh=True)
@@ -137,10 +145,11 @@ class BenchyService:
         """Models currently served, with the endpoint llama-benchy should hit."""
         models: list[dict[str, Any]] = []
         seen: set[str] = set()
-        llama = await self._native_llama_target()
-        if llama:
-            models.append(llama)
-            seen.add(llama["id"])
+        containers = await self._containers_by_name()
+        # Registered deployments come first: normal inference gives the stored
+        # record precedence when an alias collides with the native llama model
+        # id, and Benchy must benchmark the same target the proxy would route
+        # that id to.
         try:
             served = await self.sparkdeck.models()
         except Exception:
@@ -149,13 +158,26 @@ class BenchyService:
             model_id = str(entry.get("id") or "")
             if not model_id or model_id in seen:
                 continue
-            deployment_id = entry.get("deployment_id")
-            target = self._deployment_target(entry, deployment_id)
+            target = self._build_target(entry, containers)
             if target is None:
                 continue
             models.append(target)
             seen.add(model_id)
+        native = await self._native_llama_target()
+        if native and native["id"] not in seen:
+            models.append(native)
         return models
+
+    async def _containers_by_name(self) -> dict[str, dict[str, Any]]:
+        try:
+            containers = await self.manager.list_containers()
+        except Exception:
+            return {}
+        return {
+            container.get("name"): container
+            for container in containers
+            if isinstance(container, dict) and container.get("name")
+        }
 
     async def _native_llama_target(self) -> dict[str, Any] | None:
         manager = self.manager
@@ -177,14 +199,41 @@ class BenchyService:
             "base_url": f"http://{host}:{int(port)}",
         }
 
-    def _deployment_target(
-        self, entry: dict[str, Any], deployment_id: str | None,
+    def _build_target(
+        self, entry: dict[str, Any],
+        containers_by_name: dict[str, dict[str, Any]],
     ) -> dict[str, Any] | None:
-        if not deployment_id:
+        deployment_id = entry.get("deployment_id")
+        stored = (
+            self.sparkdeck.store.deployment(deployment_id, include_private=True)
+            if deployment_id else None
+        )
+        if stored is not None:
+            return self._stored_target(entry, stored, containers_by_name)
+        # Discovered legacy containers are genuinely served but absent from
+        # SQLite; their published port is on the controller host.
+        container_name = entry.get("container_name")
+        port = entry.get("port")
+        if not container_name or not port:
             return None
-        stored = self.sparkdeck.store.deployment(deployment_id, include_private=True)
-        if stored is None:
-            return None
+        identity = entry.get("model") or {}
+        return {
+            "id": entry["id"],
+            "label": entry.get("id"),
+            "runtime": entry.get("runtime"),
+            "deployment_id": deployment_id,
+            "model": self._served_model_id(
+                containers_by_name, container_name,
+                identity.get("repository") or entry["id"],
+            ),
+            "quantization": identity.get("quantization"),
+            "base_url": f"http://127.0.0.1:{int(port)}",
+        }
+
+    def _stored_target(
+        self, entry: dict[str, Any], stored: dict[str, Any],
+        containers_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
         base_url = str(stored.get("_base_url") or "").rstrip("/")
         if stored.get("kind") == "managed":
             port = entry.get("port") or stored.get("port")
@@ -192,23 +241,58 @@ class BenchyService:
                 base_url = f"http://127.0.0.1:{int(port)}"
         if not base_url:
             return None
-        # Keyed deployments need the stored credential or every benchmark
-        # request would fail authentication, unlike the proxied inference path.
-        # Underscore-prefixed: stripped from the public /models response.
-        api_key = self.sparkdeck._get_credential(
-            deployment_id, stored.get("_credential_ref")
-        )
+        if not self._managed_primary_is_local(stored):
+            # A remote primary exposes api_port in the worker's host namespace
+            # (see Manager._used_host_ports): the controller cannot reach it,
+            # and a local port squatter would benchmark the wrong service.
+            return None
         identity = entry.get("model") or {}
-        return {
+        model = self._served_model_id(
+            containers_by_name, entry.get("container_name") or stored.get("container_name"),
+            identity.get("repository") or entry["id"],
+        )
+        target = {
             "id": entry["id"],
             "label": entry.get("id"),
             "runtime": entry.get("runtime"),
-            "deployment_id": deployment_id,
-            "model": identity.get("repository") or entry["id"],
+            "deployment_id": entry.get("deployment_id"),
+            "model": model,
             "quantization": identity.get("quantization"),
             "base_url": base_url,
-            "_api_key": api_key,
         }
+        # llama-benchy only accepts credentials as a --api-key argv flag, which
+        # would expose the stored secret via /proc/<pid>/cmdline for the whole
+        # run. Keyed deployments therefore benchmark through the controller's
+        # authenticated proxy, which resolves the key server-side from the
+        # deployment alias and needs no auth for local callers.
+        if self.sparkdeck._get_credential(
+            target["deployment_id"], stored.get("_credential_ref")
+        ):
+            target["base_url"] = CONTROLLER_LOCAL_BASE_URL
+            target["model"] = entry["id"]
+        return target
+
+    def _served_model_id(
+        self, containers_by_name: dict[str, dict[str, Any]],
+        container_name: str | None, requested: str,
+    ) -> str:
+        """Remap to the id the runtime actually serves, like the proxy path."""
+        container = containers_by_name.get(container_name or "")
+        if container is None:
+            return requested
+        return self.manager._upstream_model_id(container, requested)
+
+    def _managed_primary_is_local(self, stored: dict[str, Any]) -> bool:
+        manager_id = (stored.get("settings") or {}).get("manager_deployment_id")
+        if not manager_id:
+            # Legacy containers without a cluster record run in the
+            # controller's own Docker, so their port is reachable locally.
+            return True
+        try:
+            _, member = self.manager._cluster_primary_member(manager_id)
+        except Exception:
+            return False
+        return (member or {}).get("node_id") == "local"
 
     # ---------- run lifecycle ----------
 
@@ -260,11 +344,15 @@ class BenchyService:
             "csv_filename": None,
             "report": None,
         }
+        # Persist before registering: if the state write fails (full or
+        # read-only volume), the run must not linger as a registered
+        # "running" record that blocks every future start.
+        try:
+            self._save_state(run)
+        except OSError as exc:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise BenchyError(f"could not record benchmark state: {exc}") from exc
         self.runs[run_id] = run
-        self._save_state(run)
-        # The credential must reach the subprocess but never the persisted or
-        # API-visible state (underscore keys are stripped from both).
-        run["_api_key"] = target.get("_api_key")
         argv = self._build_argv(run, target, run_dir, detection)
         run["_argv"] = argv
         run["_run_dir"] = str(run_dir)
@@ -290,9 +378,6 @@ class BenchyService:
             "--save-result", str(run_dir / "report.json"),
             "--emit-progress", str(run_dir / "progress.jsonl"),
         ]
-        api_key = run.get("_api_key")
-        if api_key:
-            argv += ["--api-key", api_key]
         if config.get("exact_tg"):
             argv.append("--exact-tg")
         return argv
@@ -372,7 +457,7 @@ class BenchyService:
                         f"{_log_tail(run_dir / 'output.log')}"
                     )
             run.pop("_run_dir", None)
-            self._save_state(run)
+            self._save_state_quietly(run)
         except asyncio.CancelledError:
             # Shutdown cancels this monitor; the subprocess must not survive it
             # and keep pushing benchmark traffic after the replacement service
@@ -383,13 +468,21 @@ class BenchyService:
             run["status"] = "failed"
             run["error"] = "benchmark interrupted by SparkDeck shutdown"
             run["finished_at"] = _utcnow()
-            self._save_state(run)
+            self._save_state_quietly(run)
             raise
         except Exception as exc:  # defensive: monitoring must never crash the server
             run["status"] = "failed"
             run["error"] = str(exc)
             run["finished_at"] = _utcnow()
+            self._save_state_quietly(run)
+
+    def _save_state_quietly(self, run: dict[str, Any]) -> None:
+        """Persist terminal state; a disk failure must not crash the monitor
+        (the in-memory record already reflects the terminal state)."""
+        try:
             self._save_state(run)
+        except OSError:
+            pass
 
     def _consume_progress(
         self, run: dict[str, Any], progress_path: Path, offset: int,
@@ -434,10 +527,10 @@ class BenchyService:
         run["_cancel_requested"] = True
         process = self._processes.get(run_id)
         if process and process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
+            # Escalate to kill and reap within a bounded interval so a hung
+            # llama-benchy cannot hold the single active-run slot until the
+            # four-hour deadline.
+            await _stop_process(process)
         return self.public_run(run)
 
     def delete_run(self, run_id: str) -> None:

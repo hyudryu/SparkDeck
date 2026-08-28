@@ -84,17 +84,31 @@ def _installed():
 
 
 class FakeManager:
-    def __init__(self, llama_running=False):
+    def __init__(self, llama_running=False, containers=None, primary_node_id=None):
         self.settings = {"llama_server_host": "127.0.0.1"}
         self._llama_model = "unsloth/Qwen3-4B-GGUF" if llama_running else None
         self._llama_port = 8080 if llama_running else 0
         self._running = llama_running
+        self.list_containers = AsyncMock(return_value=containers or [])
+        self._primary_node_id = primary_node_id
 
     def _llama_running(self):
         return self._running
 
     def _unsloth_variant(self, model):
         return "Q4_K_M" if model.upper().endswith("GGUF") else ""
+
+    @staticmethod
+    def _upstream_model_id(container, requested_model):
+        served = container.get("served_models") or []
+        if requested_model in served:
+            return requested_model
+        return served[0] if served else requested_model
+
+    def _cluster_primary_member(self, deployment_id):
+        if self._primary_node_id is None:
+            raise LookupError("cluster deployment not found")
+        return {"id": deployment_id}, {"node_id": self._primary_node_id}
 
 
 class FakeSparkdeck:
@@ -283,7 +297,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0]["model"], "org/model")
         self.assertEqual(models[0]["quantization"], "FP8")
 
-    async def test_keyed_deployment_resolves_credential_internally(self):
+    async def test_keyed_deployment_benchmarks_through_controller_proxy(self):
         sparkdeck = FakeSparkdeck(stored={
             "id": "dep-1", "kind": "external",
             "_base_url": "http://10.0.0.9:8000", "_credential_ref": "cred-1",
@@ -294,7 +308,82 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["_api_key"], "secret-key")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:7878")
+        # The proxy resolves the alias to the upstream model server-side.
+        self.assertEqual(models[0]["model"], "org/model")
+
+    async def test_unkeyed_deployment_keeps_direct_endpoint(self):
+        sparkdeck = FakeSparkdeck(stored={
+            "id": "dep-1", "kind": "external", "_base_url": "http://10.0.0.9:8000",
+        })
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "org/model", "runtime": "vllm", "deployment_id": "dep-1",
+            "model": {"repository": "org/model", "quantization": None},
+        }]})
+        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        models = await service.served_models()
+        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
+
+    async def test_managed_deployment_uses_served_model_id(self):
+        sparkdeck = FakeSparkdeck(stored={
+            "id": "dep-2", "kind": "managed", "_base_url": None,
+        })
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "alias", "runtime": "vllm", "deployment_id": "dep-2",
+            "port": 8123, "container_name": "c1",
+            "model": {"repository": "org/model", "quantization": None},
+        }]})
+        manager = FakeManager(containers=[
+            {"name": "c1", "served_models": ["served-model-name"]},
+        ])
+        service = BenchyService(manager, sparkdeck, Path("data-unused"))
+        models = await service.served_models()
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(models[0]["model"], "served-model-name")
+
+    async def test_remote_managed_deployment_is_excluded(self):
+        sparkdeck = FakeSparkdeck(stored={
+            "id": "dep-2", "kind": "managed", "_base_url": None,
+            "settings": {"manager_deployment_id": "md-1"},
+        })
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "alias", "runtime": "vllm", "deployment_id": "dep-2",
+            "port": 8123, "container_name": "c1",
+            "model": {"repository": "org/model", "quantization": None},
+        }]})
+        remote = BenchyService(FakeManager(primary_node_id="node-2"), sparkdeck, Path("data-unused"))
+        self.assertEqual(await remote.served_models(), [])
+        local = BenchyService(FakeManager(primary_node_id="local"), sparkdeck, Path("data-unused"))
+        self.assertEqual(len(await local.served_models()), 1)
+
+    async def test_discovered_container_is_benchmarkable(self):
+        sparkdeck = FakeSparkdeck(stored=None)
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "container:legacy-vllm", "runtime": "vllm",
+            "deployment_id": "container:legacy-vllm", "port": 8222,
+            "container_name": "legacy-vllm",
+            "model": {"repository": "org/legacy", "quantization": None},
+        }]})
+        manager = FakeManager(containers=[
+            {"name": "legacy-vllm", "served_models": ["legacy-served"]},
+        ])
+        service = BenchyService(manager, sparkdeck, Path("data-unused"))
+        models = await service.served_models()
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8222")
+        self.assertEqual(models[0]["model"], "legacy-served")
+
+    async def test_registered_deployment_wins_over_native_llama_alias(self):
+        sparkdeck = FakeSparkdeck(stored={
+            "id": "dep-1", "kind": "external", "_base_url": "http://10.0.0.9:8000",
+        })
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "unsloth/Qwen3-4B-GGUF", "runtime": "vllm", "deployment_id": "dep-1",
+            "model": {"repository": "unsloth/Qwen3-4B-GGUF", "quantization": None},
+        }]})
+        service = BenchyService(FakeManager(llama_running=True), sparkdeck, Path("data-unused"))
+        models = await service.served_models()
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
 
     async def test_managed_deployment_uses_local_port(self):
         sparkdeck = FakeSparkdeck(stored={"id": "dep-2", "kind": "managed", "_base_url": None})
@@ -474,44 +563,54 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         persisted = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(persisted["status"], "failed")
 
-    async def test_api_key_reaches_argv_but_not_persisted_state(self):
+    async def test_install_cancellation_terminates_pip(self):
+        class HangingPipProcess:
+            def __init__(self):
+                self.returncode = None
+                self._done = asyncio.Event()
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+                self._done.set()
+
+            def kill(self):
+                self.returncode = -9
+                self._done.set()
+
+            async def wait(self):
+                await self._done.wait()
+                return self.returncode
+
+            async def communicate(self):
+                await self._done.wait()
+                return b"", None
+
+        pip_process = HangingPipProcess()
+        with patch("sparkdeck.benchy.asyncio.create_subprocess_exec",
+                   AsyncMock(return_value=pip_process)):
+            service = BenchyService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
+            task = asyncio.create_task(service.install())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(pip_process.terminated, "pip must not survive cancellation")
+        self.assertIsNotNone(pip_process.returncode)
+
+    async def test_start_run_rolls_back_when_state_persist_fails(self):
         service = self._service()
-        keyed_target = {**_target(), "_api_key": "secret-key"}
-
-        async def fake_spawn(run):
-            run.pop("_argv")
-            run_dir = Path(run["_run_dir"])
-            (run_dir / "report.json").write_text(
-                json.dumps(_report_payload()), encoding="utf-8")
-            process = FakeFinishedProcess(returncode=0)
-            service._processes[run["id"]] = process
-            return process
-
         with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
-                patch.object(service, "served_models", AsyncMock(return_value=[keyed_target])), \
-                patch.object(service, "_spawn", AsyncMock(side_effect=fake_spawn)):
-            started = await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
-            await _wait_terminal(service, started["id"])
-
-        run = service.get_run(started["id"])
-        self.assertEqual(run["status"], "completed")
-        # The key never reaches the API-visible run, the history list, or disk.
-        self.assertNotIn("secret-key", str(run))
-        self.assertNotIn("secret-key", str(service.list_runs()))
-        state = (service.runs_dir / started["id"] / "state.json").read_text(encoding="utf-8")
-        self.assertNotIn("secret-key", state)
-        service.delete_run(started["id"])
-
-    def test_build_argv_includes_api_key_only_when_present(self):
-        service = self._service()
-        detection = _installed()
-        target = _target()
-        run = {"config": service._validate_config({"model_id": target["id"]})}
-        argv = service._build_argv(run, target, Path("unused"), detection)
-        self.assertNotIn("--api-key", argv)
-        run["_api_key"] = "secret-key"
-        argv = service._build_argv(run, target, Path("unused"), detection)
-        self.assertEqual(argv[argv.index("--api-key") + 1], "secret-key")
+                patch.object(service, "served_models", AsyncMock(return_value=[_target()])), \
+                patch.object(service, "_save_state", Mock(side_effect=OSError("disk full"))):
+            with self.assertRaises(BenchyError) as caught:
+                await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
+        self.assertIn("could not record benchmark state", str(caught.exception))
+        self.assertEqual(service.runs, {})
+        self.assertIsNone(service.active_run())
+        # No half-created run directory survives the rollback.
+        self.assertEqual(list(service.runs_dir.iterdir()), [])
 
     async def test_delete_failure_keeps_run_recorded(self):
         service = self._service()

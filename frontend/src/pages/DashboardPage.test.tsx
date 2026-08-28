@@ -108,6 +108,36 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('Hidden node')).not.toBeInTheDocument()
   })
 
+  it('renders core telemetry without waiting for secondary dashboard requests', async () => {
+    const pending = new Promise<Response>(() => undefined)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({
+        cpu_pct: 42, cpu_logical_count: 8,
+        mem: { used: 8 * 1024 ** 3, total: 16 * 1024 ** 3 },
+        gpus: [], active_requests: {}, ts: 1_777_000_000,
+      })
+      if (
+        path.includes('/api/inference-queue')
+        || path.includes('/api/v1/deployments')
+        || path.includes('/api/v1/community/sync')
+        || path.includes('/api/v1/nodes')
+      ) return pending
+      return json({ enabled: false })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Pooled CPU')).toBeInTheDocument()
+    expect(screen.getByText('42.0%')).toBeInTheDocument()
+    expect(screen.queryByText('Loading system overview')).not.toBeInTheDocument()
+    expect(screen.getByText('Loading cluster nodes')).toBeInTheDocument()
+    expect(screen.getAllByText('Loading deployments')).toHaveLength(2)
+    expect(screen.getByText('No active inference')).toBeInTheDocument()
+    expect(screen.getAllByText(/queue loading/)).toHaveLength(2)
+    expect(screen.queryByText('Idle')).not.toBeInTheDocument()
+  })
+
   it('does not abort a slow initial load when the refresh interval elapses', async () => {
     vi.useFakeTimers()
     let finishNodeInventory: ((response: Response) => void) | undefined
@@ -135,7 +165,7 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Pooled CPU')).toBeInTheDocument()
   })
 
-  it('lets a stuck initial request reach the client timeout', async () => {
+  it('surfaces a stuck core telemetry request after the short dashboard timeout', async () => {
     vi.useFakeTimers()
     let statsSignal: AbortSignal | undefined
     let statsCalls = 0
@@ -158,13 +188,93 @@ describe('DashboardPage', () => {
 
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999) })
     expect(statsCalls).toBe(1)
     expect(statsSignal?.aborted).toBe(false)
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     expect(screen.getByText('The request timed out. Check the node connection and retry.')).toBeInTheDocument()
     expect(screen.queryByText('Loading system overview')).not.toBeInTheDocument()
+  })
+
+  it('marks retained section data stale when an independent refresh fails', async () => {
+    vi.useFakeTimers()
+    const attempts = new Map<string, number>()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      const tracked = [
+        '/api/stats', '/api/inference-queue', '/api/v1/deployments',
+        '/api/v1/community/sync', '/api/v1/nodes',
+      ].find((item) => path.includes(item))
+      if (!tracked) return json({ enabled: false })
+      const attempt = (attempts.get(tracked) ?? 0) + 1
+      attempts.set(tracked, attempt)
+      if (attempt > 1) return new Response(JSON.stringify({ detail: 'refresh failed' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (tracked === '/api/stats') return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+      if (tracked === '/api/inference-queue') return json({ model: { running: 0, queued: 2 } })
+      if (tracked === '/api/v1/deployments') return json({ items: [] })
+      if (tracked === '/api/v1/community/sync') return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    await act(async () => { await Promise.resolve() })
+    expect(screen.getByText('Sharing off')).toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+
+    expect(screen.getByText(/Local telemetry refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getByText(/Cluster inventory refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getByText(/Deployment refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getByText(/Queue refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getAllByText(/2 queued · refresh paused/)).toHaveLength(2)
+    expect(screen.getByText(/0 pending · 0 synced · refresh paused/)).toBeInTheDocument()
+  })
+
+  it('keeps live session details visible when initial queue loading fails', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({
+        cpu_pct: 25, mem: {}, gpus: [],
+        active_requests: { 'live-model': { connections: 1, output_tok_s: 12 } },
+      })
+      if (path.includes('/api/inference-queue')) return new Response(
+        JSON.stringify({ detail: 'queue unavailable' }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } },
+      )
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('Processing')).toBeInTheDocument()
+    expect(screen.getByText(/Queue status unavailable: queue unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText('Active session status unavailable')).not.toBeInTheDocument()
+  })
+
+  it('prefers fresh local stats over retained local node telemetry', () => {
+    const snapshot = clusterResourceSnapshot([{
+      id: 'local', name: 'This node', local: true, online: true,
+      stats: {
+        cpu_pct: 10, cpu_logical_count: 8,
+        mem: { used: 2, total: 10 },
+        gpus: [{ index: 0, util: 10 }],
+      },
+    }], {
+      cpu_pct: 80, cpu_logical_count: 8,
+      mem: { used: 8, total: 10 },
+      gpus: [{ index: 0, util: 70 }],
+    })
+
+    expect(snapshot.cpuPct).toBe(80)
+    expect(snapshot.ramUsed).toBe(8)
+    expect(snapshot.gpuPct).toBe(70)
   })
 
   it('uses equal node weighting when logical CPU counts are incomplete', () => {

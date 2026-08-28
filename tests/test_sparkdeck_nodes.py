@@ -351,7 +351,7 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
             "node_ids": ["local", "remote-1"],
             "revision": "release-2",
             "settings": {"context_length": 8192, "image": "private/image"},
-        })
+        }, launch=True)
 
         launch = self.manager.create_deployment.await_args.args[0]
         self.assertEqual(launch["node_ids"], ["local", "remote-1"])
@@ -384,7 +384,7 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
         created = await self.service.create_deployment({
             "model": "org/model", "alias": "remote-model",
             "runtime": "sglang", "node_id": "remote-1",
-        })
+        }, launch=True)
 
         response = await self.service.proxy({
             "model": "remote-model", "messages": [], "stream": False,
@@ -403,7 +403,7 @@ class SelectedDeploymentTests(unittest.IsolatedAsyncioTestCase):
         await self.service.create_deployment({
             "model": "org/model", "alias": "clustered", "runtime": "vllm",
             "node_ids": ["local", "remote-1"],
-        })
+        }, launch=True)
 
         stopped = await self.service.deployment_action(result_id := result_id_for(self.service, "clustered"), "stop")
         removed = await self.service.delete_deployment(result_id)
@@ -580,7 +580,7 @@ class RemovedOllamaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ollama_container_launch_is_rejected(self):
         manager = Manager.__new__(Manager)
-        with self.assertRaisesRegex(ValueError, "engine must be vllm or sglang"):
+        with self.assertRaisesRegex(ValueError, "engine must be vllm, sglang, or llama.cpp"):
             await manager.create_container("legacy/model", engine="ollama")
 
 

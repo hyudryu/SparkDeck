@@ -53,7 +53,7 @@ class FailedClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
                 await service.create_deployment({
                     "model": "org/model", "alias": "retryable", "runtime": "vllm",
                     "node_ids": ["remote-1"],
-                })
+                }, launch=True)
 
             manager.deployment_action.assert_awaited_once_with(
                 "failed-manager", "remove"
@@ -73,7 +73,7 @@ class FailedClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
                 await service.create_deployment({
                     "model": "org/model", "alias": "adopted", "runtime": "vllm",
                     "node_ids": ["remote-1"],
-                })
+                }, launch=True)
 
             stored = service.store.deployment("adopted")
             self.assertEqual(
@@ -100,7 +100,7 @@ class SelectedSglangSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "model": "org/model", "alias": "sglang-dp", "runtime": "sglang",
                 "node_ids": ["remote-1"],
                 "settings": {"data_parallel_size": 4},
-            })
+            }, launch=True)
 
             launch = manager.create_deployment.await_args.args[0]
             index = launch["extra_args"].index("--dp-size")

@@ -1,5 +1,7 @@
+import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -149,6 +151,57 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(plan["revision"], REVISION)
 
+    async def test_cached_missing_revisions_resume_from_hf_while_empty_nodes_transfer(self):
+        source = {
+            "node_id": "source", "node_name": "Source",
+            "size_bytes": MODEL_BYTES,
+        }
+        manager = planning_manager(preparation_preflight(
+            [
+                target("source", has_required_weights=True, has_model_cache=True),
+                target("partial", has_model_cache=True),
+                target("wrong-revision", has_model_cache=True),
+                target("empty"),
+            ],
+            sources=[source],
+        ))
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION,
+            ["source", "partial", "wrong-revision", "empty"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["action"], "download")
+        self.assertEqual(plan["download_node_id"], "partial")
+        self.assertEqual(
+            plan["download_node_ids"], ["partial", "wrong-revision"],
+        )
+        self.assertEqual(plan["transfer_target_node_ids"], ["empty"])
+        self.assertEqual(plan["source"]["node_id"], "source")
+
+    async def test_no_source_prefers_cached_seed_and_resumes_other_cached_nodes(self):
+        manager = planning_manager(preparation_preflight([
+            target("empty-a"),
+            target("partial", has_model_cache=True),
+            target("wrong-revision", has_model_cache=True),
+            target("empty-b"),
+        ]))
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION,
+            ["empty-a", "partial", "wrong-revision", "empty-b"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["download_node_id"], "partial")
+        self.assertEqual(
+            plan["download_node_ids"], ["partial", "wrong-revision"],
+        )
+        self.assertEqual(
+            plan["transfer_target_node_ids"], ["empty-a", "empty-b"],
+        )
+
     async def test_insufficient_or_unknown_authoritative_capacity_blocks(self):
         required = MODEL_BYTES * 2 + TRANSFER_STAGING_RESERVE_BYTES
         source = {
@@ -278,6 +331,41 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.args[5], ["source", "target"])
         self.assertEqual(result["workflow_id"], call.args[4])
 
+    async def test_mixed_queue_batches_resumable_downloads_and_clean_transfers(self):
+        source = {
+            "node_id": "source", "node_name": "Source",
+            "size_bytes": MODEL_BYTES,
+        }
+        manager = planning_manager(preparation_preflight(
+            [
+                target("source", has_required_weights=True, has_model_cache=True),
+                target("partial", has_model_cache=True),
+                target("wrong-revision", has_model_cache=True),
+                target("empty"),
+            ],
+            sources=[source],
+        ))
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["download-a", "download-b", "transfer"], "jobs": [],
+        })
+
+        result = await manager.queue_recipe_model_preparation(
+            MODEL_ID, REVISION,
+            ["source", "partial", "wrong-revision", "empty"],
+        )
+
+        call = manager.virtual_nas.queue_download_and_transfer.await_args
+        self.assertEqual(call.args[:5], (
+            MODEL_ID, REVISION, "partial", ["empty"], MODEL_BYTES,
+        ))
+        self.assertEqual(
+            call.kwargs["additional_download_node_ids"], ["wrong-revision"],
+        )
+        self.assertEqual(call.kwargs["source_node_id"], "source")
+        self.assertEqual(
+            result["job_ids"], ["download-a", "download-b", "transfer"],
+        )
+
 
 class Registry:
     def __init__(self):
@@ -350,10 +438,11 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             job = queued_job(
                 kind="download", source_node_id="huggingface",
-                target_node_id="seed", bytes_total=MODEL_BYTES,
+                target_node_id="seed", bytes_total=1,
             )
             nas.jobs = [job]
             required = MODEL_BYTES * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
             nas._node_storage = AsyncMock(return_value={
                 "models": [], "free_size": required - 1,
             })
@@ -361,8 +450,101 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             await nas._run_download(job)
 
             self.assertEqual(job["status"], "failed")
+            self.assertEqual(job["bytes_total"], MODEL_BYTES)
             self.assertIn("insufficient free cache space", job["error"])
+            nas.estimate_download_size.assert_awaited_once_with(
+                MODEL_ID, REVISION, "", force_refresh=True,
+            )
             registry.request.assert_not_awaited()
+
+    async def test_stop_waits_for_uncancelable_local_download_without_requeue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = Registry()
+            nas = VirtualNAS(
+                root, lambda: root / "hub", registry, lambda: True,
+            )
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="local", bytes_total=MODEL_BYTES,
+            )
+            nas.jobs = [job]
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": AMPLE_BYTES,
+            })
+            started = threading.Event()
+            release = threading.Event()
+
+            def blocking_download(*_args):
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("test download timed out")
+                return {"ok": True, "size_bytes": MODEL_BYTES}
+
+            nas.download_model = Mock(side_effect=blocking_download)
+            active = asyncio.create_task(nas._run_download(job))
+            nas._active["local"] = active
+            nas._dispatcher = asyncio.create_task(asyncio.Event().wait())
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+
+            stopping = asyncio.create_task(nas.stop())
+            await asyncio.sleep(0.05)
+            self.assertFalse(stopping.done())
+            self.assertEqual(job["status"], "running")
+            release.set()
+            await asyncio.wait_for(stopping, 2)
+
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(nas.download_model.call_count, 1)
+            nas.start()
+            await asyncio.sleep(0.05)
+            self.assertEqual(nas.download_model.call_count, 1)
+            await nas.stop()
+
+    async def test_stop_waits_for_remote_agent_download_without_requeue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = Registry()
+            nas = VirtualNAS(
+                root, lambda: root / "hub", registry, lambda: True,
+            )
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="seed", bytes_total=MODEL_BYTES,
+            )
+            nas.jobs = [job]
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": AMPLE_BYTES,
+            })
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocking_request(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return {"ok": True, "size_bytes": MODEL_BYTES}
+
+            registry.request.side_effect = blocking_request
+            active = asyncio.create_task(nas._run_download(job))
+            nas._active["seed"] = active
+            nas._dispatcher = asyncio.create_task(asyncio.Event().wait())
+            await asyncio.wait_for(started.wait(), 2)
+
+            stopping = asyncio.create_task(nas.stop())
+            await asyncio.sleep(0.05)
+            self.assertFalse(stopping.done())
+            self.assertEqual(job["status"], "running")
+            release.set()
+            await asyncio.wait_for(stopping, 2)
+
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(registry.request.await_count, 1)
+            nas.start()
+            await asyncio.sleep(0.05)
+            self.assertEqual(registry.request.await_count, 1)
+            await nas.stop()
 
     async def test_exact_revision_is_persisted_but_hf_token_is_not(self):
         secret = "hf_recipe_secret_value"
@@ -395,6 +577,74 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ["seed", "target"],
             )
 
+    async def test_mixed_batch_persists_downloads_and_source_transfers_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = Registry()
+            registry.nodes.update({
+                node_id: {"id": node_id, "name": node_id, "enabled": True}
+                for node_id in ("source", "partial", "wrong", "empty")
+            })
+            nas = VirtualNAS(
+                root, lambda: root / "hub", registry, lambda: True,
+            )
+            nas.start = Mock()
+            nas._node_storage = AsyncMock(side_effect=[
+                {"models": [], "free_size": AMPLE_BYTES},
+                {"models": [], "free_size": AMPLE_BYTES},
+                {"models": [{
+                    "model_id": MODEL_ID, "partial": False,
+                    "revisions": [REVISION], "size_bytes": MODEL_BYTES,
+                }], "free_size": AMPLE_BYTES},
+                {"models": [], "free_size": AMPLE_BYTES},
+            ])
+
+            result = await nas.queue_download_and_transfer(
+                MODEL_ID, REVISION, "partial", ["empty"], MODEL_BYTES,
+                "workflow-mixed", ["source", "partial", "wrong", "empty"],
+                additional_download_node_ids=["wrong"],
+                source_node_id="source",
+            )
+
+            self.assertEqual(
+                [job["kind"] for job in result["jobs"]],
+                ["download", "download", "transfer"],
+            )
+            self.assertEqual(
+                [job["target_node_id"] for job in result["jobs"]],
+                ["partial", "wrong", "empty"],
+            )
+            transfer = result["jobs"][-1]
+            self.assertEqual(transfer["source_node_id"], "source")
+            self.assertIsNone(transfer["depends_on_job_id"])
+            persisted = json.loads(nas.path.read_text(encoding="utf-8"))
+            self.assertEqual(len(persisted), 3)
+
+    async def test_download_only_batch_does_not_validate_unused_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = Registry()
+            nas = VirtualNAS(
+                root, lambda: root / "hub", registry, lambda: True,
+            )
+            nas.start = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [{
+                    "model_id": MODEL_ID, "partial": True,
+                    "revisions": [], "size_bytes": 1,
+                }],
+                "free_size": AMPLE_BYTES,
+            })
+
+            result = await nas.queue_download_and_transfer(
+                MODEL_ID, REVISION, "seed", [], MODEL_BYTES,
+                source_node_id="offline-unused-source",
+            )
+
+            self.assertEqual(len(result["jobs"]), 1)
+            self.assertEqual(result["jobs"][0]["kind"], "download")
+            self.assertEqual(result["jobs"][0]["target_node_id"], "seed")
+
     async def test_download_error_redacts_ephemeral_hf_token(self):
         secret = "hf_ephemeral_secret"
         with tempfile.TemporaryDirectory() as directory:
@@ -415,6 +665,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             nas._node_storage = AsyncMock(return_value={
                 "models": [], "free_size": AMPLE_BYTES,
             })
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
 
             await nas._run_download(job)
 

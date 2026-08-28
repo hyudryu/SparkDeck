@@ -1937,15 +1937,31 @@ class Manager:
                 model_id, revision, filenames,
                 requested_revision=requested_revision,
             )
+        # Forward the controller credential (possibly an explicit empty
+        # value) so the agent downloads as the same HF account the
+        # controller used to resolve the revision, instead of falling back
+        # to whatever worker-local token exists.
         return await self.node_registry.request(
             node_id, "POST",
             f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
             json_body={
                 "revision": revision,
                 "requested_revision": requested_revision or revision,
+                "hf_token": self._resolved_hf_token() or "",
                 "files": list(filenames),
             },
             timeout=24 * 60 * 60,
+        )
+
+    async def node_transfer_model_files(
+        self, source_node_id: str, target_node_id: str,
+        model_id: str, revision: str, filenames: list[str],
+        requested_revision: str | None = None,
+    ) -> dict:
+        """Stream a file-scoped snapshot subset between two cluster nodes."""
+        return await self.virtual_nas.transfer_model_files(
+            model_id, revision, filenames,
+            source_node_id, target_node_id, requested_revision,
         )
 
     async def virtual_nas_transfer_preflight(

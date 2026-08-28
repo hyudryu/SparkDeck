@@ -387,6 +387,54 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
   })
 
+  it('does not carry a hidden Hugging Face Llama fit filter into the community tab', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/community-mixed', name: 'community-mixed', weight_size_bytes: 12 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: true },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', weight_size_bytes: 12 * gib,
+          files: [{ filename: 'community-mixed-q4_k_m.gguf', size_bytes: 12 * gib }],
+          artifacts: [{
+            filename: 'community-mixed-q4_k_m.gguf', weight_size_bytes: 12 * gib,
+            files: [{ filename: 'community-mixed-q4_k_m.gguf', size_bytes: 12 * gib }],
+          }],
+        }],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({
+        items: [{
+          model_id: 'org/community-mixed', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
+          inference_tokens_per_second: 20, sample_count: 10, unique_cluster_count: 2,
+          weight_size_bytes: 12 * gib,
+        }],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/community-mixed' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+    expect(await screen.findByText('No models found')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Community Run Models' }))
+
+    expect(await screen.findByText('24 GB aggregate sharded memory across 2 measured nodes')).toBeInTheDocument()
+    expect(await screen.findByRole('button', {
+      name: 'Expand org/community-mixed (Q4_K_M, 1,000-token prompt bucket)',
+    })).toBeInTheDocument()
+  })
+
   it('pages large community result sets instead of rendering every model at once', async () => {
     const user = userEvent.setup()
     const items = Array.from({ length: 120 }, (_, index) => ({

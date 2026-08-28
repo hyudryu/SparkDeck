@@ -303,6 +303,100 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 completed_model["revision_refs"], {"release-gguf": resolved},
             )
 
+    async def test_selective_download_credits_only_selected_resumable_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            resolved = "b" * 40
+            selected_name = "model.gguf"
+            selected_size = 8
+            selected_sha = "1" * 64
+            incomplete = blobs / f"{selected_sha}.incomplete"
+            incomplete.write_bytes(b"123")
+            snapshot = repository / "snapshots" / resolved
+
+            def download_file_into_cache(**kwargs):
+                incomplete.unlink()
+                snapshot.mkdir(parents=True, exist_ok=True)
+                (snapshot / selected_name).write_bytes(b"12345678")
+                return str(snapshot / selected_name)
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[Mock(
+                    rfilename=selected_name,
+                    size=selected_size,
+                    lfs=Mock(sha256=selected_sha),
+                    blob_id="2" * 40,
+                )],
+            )
+            hf_hub_download = Mock(side_effect=download_file_into_cache)
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            nas.free_bytes = Mock(return_value=(
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+            ))
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                result = await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                )
+
+            self.assertTrue(result["ok"])
+            hf_hub_download.assert_called_once()
+
+    async def test_selective_download_does_not_credit_unrelated_resumable_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            resolved = "b" * 40
+            selected_name = "model.gguf"
+            selected_size = 8
+            selected_blob_id = "1" * 40
+            (blobs / f"{'2' * 40}.incomplete").write_bytes(b"123")
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[Mock(
+                    rfilename=selected_name,
+                    size=selected_size,
+                    lfs=None,
+                    blob_id=selected_blob_id,
+                )],
+            )
+            hf_hub_download = Mock()
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=hf_hub_download,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            nas.free_bytes = Mock(return_value=(
+                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+            ))
+
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}),
+                self.assertRaisesRegex(RuntimeError, "insufficient free cache space"),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", resolved, [selected_name],
+                )
+
+            hf_hub_download.assert_not_called()
+
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

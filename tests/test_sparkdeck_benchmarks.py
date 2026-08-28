@@ -15,6 +15,7 @@ from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeK
 from sparkdeck.service import (
     SparkDeckService,
     _COMMUNITY_MAX_RESPONSE_BYTES,
+    _chunk_has_output,
     _read_bounded_community_response,
 )
 
@@ -42,6 +43,13 @@ class FakeManager:
             (item for item in self.deployments if item.get("id") == deployment_id),
             None,
         )
+
+
+class StreamChunkTests(unittest.TestCase):
+    def test_reasoning_alias_marks_the_first_output_token(self):
+        self.assertTrue(_chunk_has_output({
+            "choices": [{"delta": {"reasoning": "Working through it"}}],
+        }))
 
 
 class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):

@@ -8,6 +8,10 @@ import type {
   CatalogResponse,
   ChatCompletionResponse,
   ChatMessage,
+  ChatResponseMetrics,
+  ChatStreamResult,
+  ChatStreamUpdate,
+  ChatUsage,
   ContainerImage,
   CreateDeploymentInput,
   Deployment,
@@ -96,6 +100,172 @@ async function requestWithFallback<T>(primary: string, fallback: string, init?: 
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 404) throw error
     return request<T>(fallback, init)
+  }
+}
+
+export interface ChatStreamOptions {
+  signal?: AbortSignal
+  onUpdate?: (update: ChatStreamUpdate) => void
+}
+
+function positiveNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+async function streamChat(model: string, messages: ChatMessage[], options: ChatStreamOptions = {}): Promise<ChatStreamResult> {
+  const startedAt = performance.now()
+  const response = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true } }),
+    signal: options.signal,
+  })
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const body = await response.json() as { detail?: unknown; message?: string }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.message) message = body.message
+    } catch {
+      // Keep the HTTP status for non-JSON failures.
+    }
+    throw new ApiError(message, response.status)
+  }
+  if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+    throw new Error('The model returned a non-streaming response')
+  }
+  if (!response.body) throw new Error('The model returned an empty response stream')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let eventData: string[] = []
+  let content = ''
+  let reasoning = ''
+  let usage: ChatUsage | undefined
+  let firstTokenAt: number | undefined
+  let nativePromptRate: number | undefined
+  let nativeOutputRate: number | undefined
+  let doneReceived = false
+  let terminalSeen = false
+
+  const metricsAt = (now: number): ChatResponseMetrics => {
+    const ttftMs = firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - startedAt)
+    const promptTokens = positiveNumber(usage?.prompt_tokens)
+    const completionTokens = positiveNumber(usage?.completion_tokens)
+    const rawCachedTokens = usage?.prompt_tokens_details?.cached_tokens
+    const cachedTokens = typeof rawCachedTokens === 'number' && Number.isFinite(rawCachedTokens) && rawCachedTokens >= 0
+      ? rawCachedTokens
+      : undefined
+    const processedPromptTokens = promptTokens === undefined || cachedTokens === undefined
+      ? undefined
+      : Math.max(0, promptTokens - cachedTokens)
+    const generationMs = firstTokenAt === undefined ? undefined : now - firstTokenAt
+    return {
+      prompt_tokens_per_second: nativePromptRate ?? (
+        processedPromptTokens && ttftMs ? processedPromptTokens / (ttftMs / 1000) : undefined
+      ),
+      ttft_ms: ttftMs,
+      output_tokens_per_second: nativeOutputRate ?? (
+        completionTokens !== undefined && completionTokens >= 2 && generationMs !== undefined && generationMs >= 50
+          ? completionTokens / (generationMs / 1000)
+          : undefined
+      ),
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+    }
+  }
+
+  const publish = (update: Omit<ChatStreamUpdate, 'metrics'> = {}) => {
+    options.onUpdate?.({ ...update, metrics: metricsAt(performance.now()) })
+  }
+
+  const consumeData = (data: string) => {
+    if (!data) return
+    if (data === '[DONE]') {
+      doneReceived = true
+      terminalSeen = true
+      return
+    }
+    let payload: Record<string, unknown>
+    try {
+      payload = JSON.parse(data) as Record<string, unknown>
+    } catch {
+      throw new Error('The model returned malformed stream data')
+    }
+    const streamError = payload.error
+    if (streamError) {
+      const message = typeof streamError === 'string'
+        ? streamError
+        : String((streamError as { message?: unknown }).message ?? 'The model stream failed')
+      throw new Error(message)
+    }
+    const choices = Array.isArray(payload.choices) ? payload.choices : []
+    const choice = choices[0] as { delta?: Record<string, unknown>; finish_reason?: unknown } | undefined
+    if (choice?.finish_reason !== undefined && choice.finish_reason !== null) terminalSeen = true
+    const delta = choice?.delta
+    const contentDelta = typeof delta?.content === 'string' ? delta.content : ''
+    const reasoningDelta = typeof delta?.reasoning_content === 'string'
+      ? delta.reasoning_content
+      : typeof delta?.reasoning === 'string' ? delta.reasoning : ''
+    if ((contentDelta || reasoningDelta) && firstTokenAt === undefined) firstTokenAt = performance.now()
+    content += contentDelta
+    reasoning += reasoningDelta
+    if (payload.usage && typeof payload.usage === 'object') usage = payload.usage as ChatUsage
+    const timings = payload.timings && typeof payload.timings === 'object'
+      ? payload.timings as Record<string, unknown>
+      : undefined
+    nativePromptRate = positiveNumber(timings?.prompt_per_second) ?? nativePromptRate
+    nativeOutputRate = positiveNumber(timings?.predicted_per_second) ?? nativeOutputRate
+    if (contentDelta || reasoningDelta || payload.usage || timings) {
+      publish({ content: contentDelta || undefined, reasoning: reasoningDelta || undefined })
+    }
+  }
+
+  const consumeLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
+    if (line === '') {
+      if (eventData.length) consumeData(eventData.join('\n'))
+      eventData = []
+    } else if (line.startsWith('data:')) {
+      eventData.push(line.slice(5).trimStart())
+    }
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      let newline = buffer.indexOf('\n')
+      while (newline >= 0 && !doneReceived) {
+        consumeLine(buffer.slice(0, newline))
+        buffer = buffer.slice(newline + 1)
+        newline = buffer.indexOf('\n')
+      }
+      if (doneReceived) {
+        break
+      }
+      if (done) break
+    }
+    if (!doneReceived) {
+      if (buffer) consumeLine(buffer)
+      if (eventData.length) consumeData(eventData.join('\n'))
+    }
+    if (!terminalSeen) throw new Error('The model response stream ended unexpectedly')
+  } catch (error) {
+    await reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+
+  return {
+    message: { role: 'assistant', content },
+    reasoning,
+    usage,
+    metrics: metricsAt(performance.now()),
   }
 }
 
@@ -365,6 +535,7 @@ export const api = {
       body: JSON.stringify({ model, messages, stream: false }),
       signal,
     }),
+  chatStream: streamChat,
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {
       const data = await request<{ items: WireBenchmark[] }>('/api/v1/benchmarks?limit=100&offset=0', { signal })

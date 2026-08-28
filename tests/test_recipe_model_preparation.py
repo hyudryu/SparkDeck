@@ -184,6 +184,48 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["download_node_id"], "solo")
         self.assertEqual(plan["transfer_target_node_ids"], [])
 
+    async def test_explicit_seed_replaces_the_default_choice(self):
+        manager = planning_manager(preparation_preflight([
+            target("node-b"), target("node-a"),
+        ]))
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION, ["node-b", "node-a"],
+            download_node_id="node-a",
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["download_node_id"], "node-a")
+        self.assertEqual(plan["transfer_target_node_ids"], ["node-b"])
+
+    async def test_explicit_seed_that_cannot_download_blocks_instead_of_falling_back(self):
+        preflight = preparation_preflight([target("node-b"), target("node-a")])
+        preflight["targets"][1]["download_eligible"] = False
+        preflight["targets"][1]["download_reason"] = "Node cannot download from Hugging Face"
+        preflight["download"] = {
+            "size_bytes": MODEL_BYTES,
+            "required_free_bytes": MODEL_BYTES * 2 + 1,
+        }
+        manager = planning_manager(preflight)
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION, ["node-b", "node-a"],
+            download_node_id="node-a",
+        )
+
+        self.assertFalse(plan["eligible"])
+        self.assertIsNone(plan["download_node_id"])
+
+    async def test_seed_outside_the_selected_set_is_rejected(self):
+        manager = planning_manager(preparation_preflight([target("node-b")]))
+
+        with self.assertRaisesRegex(
+            ValueError, "download_node_id must be one of the selected nodes",
+        ):
+            await manager.recipe_model_preparation_preflight(
+                MODEL_ID, REVISION, ["node-b"], download_node_id="elsewhere",
+            )
+
     async def test_selected_exact_revision_source_fans_out_to_missing_nodes(self):
         source = {
             "node_id": "source", "node_name": "Source",

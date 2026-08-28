@@ -491,8 +491,9 @@ export const api = {
           api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
-          node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
+          node_ids: input.managed ? input.node_ids : undefined,
           deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
+          download_node_id: input.managed ? input.download_node_id || undefined : undefined,
         }),
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
@@ -787,13 +788,31 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
+    preparationPreflight: (recipeId: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',
-      body: JSON.stringify({ node_ids: nodeIds }),
+      body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
     }),
-    prepareRecipe: (recipeId: string, nodeIds: string[]) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
+    prepareRecipe: (recipeId: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
       method: 'POST',
-      body: JSON.stringify({ node_ids: nodeIds }),
+      body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
+    }),
+    preparationPreflightModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>('/api/v1/storage/preparations/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        model_id: modelId,
+        revision: revision || undefined,
+        node_ids: nodeIds,
+        download_node_id: downloadNodeId || undefined,
+      }),
+    }),
+    prepareModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>('/api/v1/storage/preparations', {
+      method: 'POST',
+      body: JSON.stringify({
+        model_id: modelId,
+        revision: revision || undefined,
+        node_ids: nodeIds,
+        download_node_id: downloadNodeId || undefined,
+      }),
     }),
     cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
       method: 'DELETE',

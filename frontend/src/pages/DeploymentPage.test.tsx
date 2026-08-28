@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -83,5 +83,20 @@ describe('deployment object page', () => {
     expect(await screen.findByText('Stop this deployment before changing its launch settings.')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('button', { name: 'Run' })).toBeDisabled())
     expect(screen.getByLabelText(/Runtime flags/)).toBeDisabled()
+  })
+
+  it('preserves literal backslashes in double-quoted flags', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const flags = await screen.findByLabelText(/Runtime flags/)
+    fireEvent.change(flags, { target: { value: '--regex "\\d+" --windows-path "C:\\models\\foo"' } })
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+
+    const save = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
+    expect(save).toBeDefined()
+    expect(JSON.parse(String(save?.[1]?.body)).extra_args).toEqual([
+      '--regex', '\\d+', '--windows-path', 'C:\\models\\foo',
+    ])
   })
 })

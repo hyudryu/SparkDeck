@@ -196,6 +196,12 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
+    def test_positional_token_suffix_is_not_treated_as_a_credential(self):
+        args = ["--served-model-name", "my-token", "--dtype", "auto"]
+
+        self.assertEqual(Manager._without_sensitive_cli_credentials(args), args)
+        Manager._reject_sensitive_cli_credentials(args)
+
     def test_legacy_cli_credentials_are_removed_and_new_ones_are_rejected(self):
         instance = Manager.__new__(Manager)
         instance.recipes = [{

@@ -648,7 +648,9 @@ class SparkDeckService:
             if isinstance(member, dict) and member.get("container_name")
         }
         cluster_nodes: dict[str, dict[str, Any]] = {}
-        if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
+        if any(
+            item.get("settings", {}).get("manager_deployment_id") for item in registered
+        ) or cluster_by_container:
             try:
                 cluster_nodes = {
                     node["id"]: node for node in await self.manager.cluster_nodes()
@@ -762,6 +764,19 @@ class SparkDeckService:
                 # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
                 discovered.update(self._layout_contract(owner.get("launch_settings")))
+                owner_node_ids = [
+                    str(item) for item in owner.get("node_ids") or [] if str(item).strip()
+                ]
+                if owner_node_ids:
+                    # Without the cluster node set the card would look like a
+                    # standalone container: the running-node tooltip hides and
+                    # an add-nodes picker cannot tell which nodes already run
+                    # the model.
+                    discovered["node_ids"] = owner_node_ids
+                    discovered["selected_nodes"] = [
+                        self.manager.public_target_node(cluster_nodes[node_id])
+                        for node_id in owner_node_ids if node_id in cluster_nodes
+                    ]
             registered.append(discovered)
         for deployment in registered:
             if (
@@ -1488,6 +1503,14 @@ class SparkDeckService:
                 *(str(item) for item in current_nodes if str(item).strip()),
                 *(str(item).strip() for item in additional_node_ids),
             ]))
+            if all(item in {str(item) for item in current_nodes} for item in merged):
+                # Manager treats any explicit node selection as a relocation:
+                # relaunching with an unchanged set would tear down every
+                # running rank for a semantic no-op.
+                raise ValueError(
+                    "additional_node_ids must include at least one node that "
+                    "is not already running this deployment"
+                )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.

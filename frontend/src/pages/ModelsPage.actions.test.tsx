@@ -149,4 +149,45 @@ describe('models page running actions', () => {
     expect(screen.queryByRole('button', { name: 'More actions for Chat model' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Start' })).toBeInTheDocument()
   })
+
+  it('shows the controller tooltip and no add-nodes action for standalone deployments', async () => {
+    const standalone = {
+      id: 'dep-2', alias: 'Local runner', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'running',
+      settings: {}, desired_state: 'running',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [standalone] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(standalone), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const badge = await screen.findByText('running')
+    fireEvent.mouseOver(badge)
+
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent('Running on')
+    expect(tooltip).toHaveTextContent('This device')
+    // No cluster to grow: the standalone card keeps a plain Stop button.
+    expect(screen.queryByRole('button', { name: 'More actions for Local runner' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+  })
 })

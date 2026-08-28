@@ -172,6 +172,20 @@ class AdditionalNodeLaunchTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_additional_nodes_reject_requests_without_new_nodes(self):
+        manager = self.build_manager()
+        service = self.build_service(manager)
+        try:
+            with self.assertRaisesRegex(ValueError, "at least one node"):
+                await service.deployment_action(
+                    "record-1", "start", additional_node_ids=["worker-1"],
+                )
+
+            manager.deployment_action.assert_not_awaited()
+        finally:
+            await manager.http.aclose()
+            await service.close()
+
     async def test_additional_nodes_reject_standalone_container(self):
         manager = self.build_manager()
         manager.deployments = []
@@ -243,6 +257,62 @@ class ManagerRelaunchModeTests(unittest.IsolatedAsyncioTestCase):
                 [item["id"] for item in manager.deployments],
                 [],
             )
+
+
+class ManagerOnlyClusterCardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manager_only_cluster_card_reports_cluster_node_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager.__new__(Manager)
+            manager.http = httpx.AsyncClient()
+            manager.deployments = [{
+                "id": "manager-1",
+                "name": "Chat model",
+                "model": "org/model",
+                "engine": "vllm",
+                "status": "running",
+                "desired_state": "running",
+                "api_port": 8000,
+                "node_ids": ["worker-1", "worker-2"],
+                "members": [
+                    {"rank": 0, "node_id": "worker-1", "container_name": "rank-0"},
+                    {"rank": 1, "node_id": "worker-2", "container_name": "rank-1"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Chat model",
+                    "model": "org/model",
+                    "engine": "vllm",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["worker-1", "worker-2"],
+                    "extra_args": [],
+                },
+            }]
+            manager.cluster_nodes = AsyncMock(return_value=[
+                cluster_node("local", local=True),
+                cluster_node("worker-1"), cluster_node("worker-2"),
+            ])
+            manager.list_containers = AsyncMock(return_value=[{
+                "name": "rank-0", "model": "org/model", "runtime": "vllm",
+                "managed": True, "status": "running", "port": 8000,
+            }])
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                listed = await service.deployments()
+
+                cards = [item for item in listed if str(item.get("id", "")).startswith("container:")]
+                self.assertEqual(len(cards), 1)
+                card = cards[0]
+                # The card must carry the owning cluster's node set so the UI
+                # can show the running nodes and lock them in an add-nodes
+                # picker instead of treating the card as standalone.
+                self.assertEqual(card["node_ids"], ["worker-1", "worker-2"])
+                self.assertEqual(
+                    [node["id"] for node in card["selected_nodes"]],
+                    ["worker-1", "worker-2"],
+                )
+                self.assertEqual(card["deployment_mode"], "replicated")
+            finally:
+                await manager.http.aclose()
+                await service.close()
 
 
 if __name__ == "__main__":

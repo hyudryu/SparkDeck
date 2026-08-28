@@ -649,16 +649,24 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
     _require_agent(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) - {"revision", "hf_token"}:
-            raise ValueError("request may contain only revision and hf_token")
+        if not isinstance(body, dict) or set(body) - {
+            "revision", "requested_revision", "hf_token",
+        }:
+            raise ValueError(
+                "request may contain only revision, requested_revision, and hf_token"
+            )
         revision = body.get("revision")
+        requested_revision = body.get("requested_revision")
         token = body.get("hf_token")
         if revision is not None and not isinstance(revision, str):
             raise ValueError("revision must be a string")
         if token is not None and not isinstance(token, str):
             raise ValueError("hf_token must be a string")
+        if requested_revision is not None and not isinstance(requested_revision, str):
+            raise ValueError("requested_revision must be a string")
         result = await manager.virtual_nas.download_model_checked(
             model_id, revision or "main", token if token is not None else "",
+            requested_revision or revision or "main",
         )
         return _public_storage_payload(result)
     except json.JSONDecodeError as exc:
@@ -1744,19 +1752,16 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
     if local_model_path:
         nodes_with_weights = {LOCAL_NODE_ID}
     else:
-        inventory = await manager.model_cache_inventory()
-        requested_revision = contract.get("model_revision")
-        cached_revision = requested_revision or "main"
-        nodes_with_weights = {
-            node.get("id")
-            for node in inventory
-            if any(
-                not model.get("partial")
-                and model.get("model_id") == recipe.get("model")
-                and cached_revision in (model.get("revisions") or [])
-                for model in node.get("models") or []
+        try:
+            readiness = await manager.recipe_model_revision_readiness(
+                str(recipe.get("model") or ""),
+                contract.get("model_revision"), selected_node_ids,
             )
-        }
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        nodes_with_weights = set(selected_node_ids) - set(
+            readiness["missing_node_ids"]
+        )
     missing_weights = [
         node_id for node_id in selected_node_ids if node_id not in nodes_with_weights
     ]

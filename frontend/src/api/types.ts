@@ -494,6 +494,7 @@ export interface StorageTransferPreflight {
   enabled: boolean
   model_id: string
   revision: string
+  resolved_revision?: string | null
   source?: { node_id: string; node_name: string; size_bytes: number } | null
   sources?: { node_id: string; node_name: string; size_bytes: number }[]
   download?: { size_bytes: number; required_free_bytes: number } | null

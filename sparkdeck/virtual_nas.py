@@ -23,7 +23,8 @@ from urllib.parse import quote
 
 LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -61,14 +62,34 @@ def validate_model_id(model_id: str) -> str:
 
 def validate_revision(revision: str | None) -> str:
     value = str(revision or "main").strip() or "main"
+    components = value.split("/")
     if (
-        not _REVISION.fullmatch(value)
-        or ".." in value.split("/")
+        len(value) > 200
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(character.isspace() for character in value)
+        or any(character in "~^:?*[\\<>|\"" for character in value)
+        or value == "@"
+        or ".." in value
         or "//" in value
+        or "@{" in value
+        or value.startswith("/")
         or value.endswith("/")
+        or value.endswith(".")
+        or any(
+            component in {"", ".", ".."}
+            or component.startswith(".")
+            or component.endswith(".lock")
+            for component in components
+        )
     ):
         raise ValueError("revision must be a bounded Hugging Face revision")
     return value
+
+
+def _is_commit_sha(revision: str | None) -> bool:
+    return bool(
+        isinstance(revision, str) and _COMMIT_SHA.fullmatch(revision.strip())
+    )
 
 
 def _cache_name(model_id: str) -> str:
@@ -165,7 +186,9 @@ class VirtualNAS:
         self._streaming_models: dict[str, int] = {}
         self._download_locks: dict[str, threading.Lock] = {}
         self._download_locks_guard = threading.Lock()
-        self._download_size_cache: dict[tuple[str, str], tuple[float, int]] = {}
+        self._download_size_cache: dict[
+            tuple[str, str], tuple[float, str, int]
+        ] = {}
         self._queue_lock = asyncio.Lock()
 
     @property
@@ -190,6 +213,63 @@ class VirtualNAS:
             raise ValueError("model cache path escapes the Hugging Face hub")
         return candidate
 
+    @staticmethod
+    def _has_revision(
+        model: dict[str, Any], resolved_revision: str,
+        requested_revision: str | None = None,
+    ) -> bool:
+        if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+            return False
+        if not requested_revision or requested_revision == resolved_revision:
+            return True
+        return (model.get("revision_refs") or {}).get(requested_revision) == resolved_revision
+
+    def _write_revision_ref(
+        self, model_id: str, requested_revision: str, resolved_revision: str,
+    ) -> None:
+        requested_revision = validate_revision(requested_revision)
+        resolved_revision = validate_revision(resolved_revision)
+        if requested_revision == resolved_revision:
+            return
+        repository = self._model_path(model_id)
+        snapshot = repository / "snapshots" / resolved_revision
+        if not snapshot.is_dir() or snapshot.is_symlink():
+            raise RuntimeError("download finished without the resolved snapshot")
+        refs_root = repository / "refs"
+        if refs_root.exists() and (not refs_root.is_dir() or refs_root.is_symlink()):
+            raise RuntimeError("Hugging Face refs directory is not safe")
+        refs_root.mkdir(parents=True, exist_ok=True)
+        parts = PurePosixPath(requested_revision).parts
+        parent = refs_root
+        for component in parts[:-1]:
+            candidate = parent / component
+            if candidate.exists():
+                if not candidate.is_dir() or candidate.is_symlink():
+                    raise RuntimeError("Hugging Face revision ref contains an unsafe directory")
+            else:
+                candidate.mkdir()
+            parent = candidate
+        destination = parent / parts[-1]
+        refs_resolved = refs_root.resolve()
+        try:
+            destination.parent.resolve().relative_to(refs_resolved)
+        except ValueError as exc:
+            raise RuntimeError("Hugging Face revision ref escapes the cache") from exc
+        if destination.exists() and (destination.is_symlink() or not destination.is_file()):
+            raise RuntimeError("Hugging Face revision ref is not a safe file")
+        handle, temporary = tempfile.mkstemp(prefix=".sparkdeck-ref-", dir=destination.parent)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(f"{resolved_revision}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
     def _load_jobs(self) -> list[dict[str, Any]]:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
@@ -205,9 +285,27 @@ class VirtualNAS:
             try:
                 validate_model_id(raw.get("model_id"))
                 revision = validate_revision(raw.get("revision")) if raw.get("revision") else None
+                requested_revision = (
+                    validate_revision(raw.get("requested_revision"))
+                    if raw.get("requested_revision") else revision
+                )
             except ValueError:
                 continue
             status = str(raw.get("status") or "failed")
+            legacy_mutable_workflow = bool(
+                raw.get("workflow_id")
+                and revision
+                and not _is_commit_sha(revision)
+                and status in _ACTIVE_TRANSFER_STATES
+            )
+            if legacy_mutable_workflow:
+                status = "failed"
+                raw["completed_at"] = time.time()
+                raw["error"] = (
+                    "model preparation was created before immutable revision "
+                    "pinning; retry the recipe preparation"
+                )
+                recovered = True
             if status == "running":
                 status = "queued"
                 raw["bytes_transferred"] = 0
@@ -221,6 +319,7 @@ class VirtualNAS:
                 "source_node_id": str(raw.get("source_node_id") or LOCAL_NODE_ID),
                 "target_node_id": str(raw.get("target_node_id") or ""),
                 "revision": revision,
+                "requested_revision": requested_revision,
                 "depends_on_job_id": raw.get("depends_on_job_id"),
                 "workflow_id": raw.get("workflow_id"),
                 "workflow_node_ids": list(raw.get("workflow_node_ids") or []),
@@ -262,23 +361,32 @@ class VirtualNAS:
     def list_transfers(self) -> dict[str, Any]:
         return {"items": [dict(job) for job in self.jobs]}
 
-    async def estimate_download_size(
+    async def resolve_download_revision(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
         *, force_refresh: bool = False,
-    ) -> int:
-        """Return the exact Hub file total or fail closed when it is unknown."""
+    ) -> dict[str, Any]:
+        """Resolve a requested Hub ref once to an immutable commit and size."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
         cache_key = (model_id, revision)
         cached = self._download_size_cache.get(cache_key)
-        if not force_refresh and cached and time.monotonic() - cached[0] < 300:
-            return cached[1]
+        if (
+            _is_commit_sha(revision)
+            and not force_refresh
+            and cached
+            and time.monotonic() - cached[0] < 300
+        ):
+            return {
+                "requested_revision": revision,
+                "resolved_revision": cached[1],
+                "size_bytes": cached[2],
+            }
         token = str(
             explicit_token if explicit_token is not None else self._token_provider() or ""
         ).strip()
 
-        def inspect() -> int:
+        def inspect() -> tuple[str, int]:
             try:
                 from huggingface_hub import HfApi
             except ImportError as exc:
@@ -287,6 +395,12 @@ class VirtualNAS:
                 info = HfApi(token=token or None).model_info(
                     model_id, revision=revision, files_metadata=True,
                 )
+                resolved_value = getattr(info, "sha", None)
+                if not isinstance(resolved_value, str) or not _COMMIT_SHA.fullmatch(
+                    resolved_value.strip()
+                ):
+                    raise RuntimeError("Hugging Face did not report an immutable revision")
+                resolved_revision = resolved_value.strip().lower()
                 siblings = list(getattr(info, "siblings", None) or [])
                 sizes = [getattr(item, "size", None) for item in siblings]
                 if not siblings or any(
@@ -297,7 +411,7 @@ class VirtualNAS:
                 total = sum(sizes)
                 if total <= 0:
                     raise RuntimeError("Hugging Face reported an empty model repository")
-                return total
+                return resolved_revision, total
             except Exception as exc:
                 if isinstance(exc, RuntimeError):
                     raise
@@ -305,22 +419,43 @@ class VirtualNAS:
                     "could not inspect Hugging Face model; verify repository access, revision, credentials, and network"
                 ) from exc
 
-        result = await asyncio.to_thread(inspect)
-        self._download_size_cache[cache_key] = (time.monotonic(), result)
-        return result
+        resolved_revision, size_bytes = await asyncio.to_thread(inspect)
+        if _is_commit_sha(revision):
+            self._download_size_cache[cache_key] = (
+                time.monotonic(), resolved_revision, size_bytes,
+            )
+        return {
+            "requested_revision": revision,
+            "resolved_revision": resolved_revision,
+            "size_bytes": size_bytes,
+        }
+
+    async def estimate_download_size(
+        self, model_id: str, revision: str = "main",
+        explicit_token: str | None = None,
+        *, force_refresh: bool = False,
+    ) -> int:
+        """Return the exact Hub file total or fail closed when it is unknown."""
+        resolved = await self.resolve_download_revision(
+            model_id, revision, explicit_token, force_refresh=force_refresh,
+        )
+        return int(resolved["size_bytes"])
 
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         """Agent-side capacity gate using only this cache filesystem."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
+        if not _is_commit_sha(revision):
+            raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
         existing = next((
             item for item in await asyncio.to_thread(self.inventory)
             if item.get("model_id") == model_id
-            and not item.get("partial")
-            and revision in (item.get("revisions") or [])
+            and self._has_revision(item, revision, requested_revision)
         ), None)
         if existing is None:
             expected_bytes = await self.estimate_download_size(
@@ -338,23 +473,25 @@ class VirtualNAS:
         return await self._await_uncancelable(
             asyncio.to_thread(
                 self.download_model, model_id, revision, explicit_token,
+                requested_revision,
             ),
         )
 
     def download_model(
         self, model_id: str, revision: str = "main", explicit_token: str | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         """Resume a Hub snapshot into this node's configured cache."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
+        requested_revision = validate_revision(requested_revision or revision)
         token = str(
             explicit_token if explicit_token is not None else self._token_provider() or ""
         ).strip()
         existing = next((
             item for item in self.inventory()
             if item.get("model_id") == model_id
-            and not item.get("partial")
-            and revision in (item.get("revisions") or [])
+            and self._has_revision(item, revision, requested_revision)
         ), None)
         if existing is not None:
             return {
@@ -378,6 +515,9 @@ class VirtualNAS:
                     cache_dir=str(self._hub()),
                     token=token or None,
                 )
+                self._write_revision_ref(
+                    model_id, requested_revision, revision,
+                )
         except Exception as exc:
             raise RuntimeError(
                 "Hugging Face download failed; verify repository access, revision, credentials, and network"
@@ -385,8 +525,7 @@ class VirtualNAS:
         model = next((
             item for item in self.inventory()
             if item.get("model_id") == model_id
-            and not item.get("partial")
-            and revision in (item.get("revisions") or [])
+            and self._has_revision(item, revision, requested_revision)
         ), None)
         if model is None:
             raise RuntimeError("download finished without a complete requested revision")
@@ -441,6 +580,7 @@ class VirtualNAS:
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
             revisions = set(snapshot_revisions)
+            revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
                 for ref in refs_root.rglob("*"):
@@ -449,7 +589,9 @@ class VirtualNAS:
                             continue
                         target = ref.read_text(encoding="utf-8").strip()
                         if target in snapshot_revisions:
-                            revisions.add(ref.relative_to(refs_root).as_posix())
+                            ref_name = ref.relative_to(refs_root).as_posix()
+                            revisions.add(ref_name)
+                            revision_refs[ref_name] = target
                     except (OSError, UnicodeError, ValueError):
                         continue
             models.append({
@@ -458,6 +600,7 @@ class VirtualNAS:
                 "file_count": file_count,
                 "partial": partial,
                 "revisions": sorted(revisions),
+                "revision_refs": revision_refs,
                 "last_modified": (
                     datetime.fromtimestamp(last_modified, timezone.utc).isoformat()
                     if last_modified else None
@@ -619,11 +762,12 @@ class VirtualNAS:
         target_node_ids: list[str], revision: str | None = None,
         workflow_id: str | None = None,
         workflow_node_ids: list[str] | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         async with self._queue_lock:
             return await self._queue_transfer(
                 model_id, source_node_id, target_node_ids, revision,
-                workflow_id, workflow_node_ids,
+                workflow_id, workflow_node_ids, requested_revision,
             )
 
     async def _queue_transfer(
@@ -631,11 +775,16 @@ class VirtualNAS:
         target_node_ids: list[str], revision: str | None = None,
         workflow_id: str | None = None,
         workflow_node_ids: list[str] | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision) if revision else None
+        requested_revision = (
+            validate_revision(requested_revision or revision)
+            if revision else None
+        )
         source_node_id = str(source_node_id or LOCAL_NODE_ID)
         targets = list(dict.fromkeys(str(value) for value in target_node_ids if value))
         if not targets:
@@ -652,10 +801,9 @@ class VirtualNAS:
             (
                 item for item in source_inventory
                 if item.get("model_id") == model_id
-                and (
-                    not revision
-                    or revision in (item.get("revisions") or [])
-                )
+                and (not revision or self._has_revision(
+                    item, revision, requested_revision,
+                ))
             ),
             None,
         )
@@ -713,6 +861,7 @@ class VirtualNAS:
                 "id": str(uuid.uuid4()), "kind": "transfer", "model_id": model_id,
                 "source_node_id": source_node_id, "target_node_id": target,
                 "revision": revision,
+                "requested_revision": requested_revision,
                 "depends_on_job_id": None,
                 "workflow_id": workflow_id,
                 "workflow_node_ids": list(workflow_node_ids or []),
@@ -740,13 +889,14 @@ class VirtualNAS:
         workflow_node_ids: list[str] | None = None,
         additional_download_node_ids: list[str] | None = None,
         source_node_id: str | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         async with self._queue_lock:
             return await self._queue_download_and_transfer(
                 model_id, revision, download_node_id,
                 transfer_target_node_ids, expected_bytes, workflow_id,
                 workflow_node_ids, additional_download_node_ids,
-                source_node_id,
+                source_node_id, requested_revision,
             )
 
     async def _queue_download_and_transfer(
@@ -760,12 +910,16 @@ class VirtualNAS:
         workflow_node_ids: list[str] | None = None,
         additional_download_node_ids: list[str] | None = None,
         source_node_id: str | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         """Persist resumable Hub downloads and any dependent NAS fan-out."""
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
+        if not _is_commit_sha(revision):
+            raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
         expected_bytes = _nonnegative_int(expected_bytes)
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
@@ -788,7 +942,7 @@ class VirtualNAS:
             raise ValueError("source node cannot also be a transfer target")
 
         for node_id in download_nodes:
-            await self._validate_online_node(node_id)
+            await self._validate_download_node(node_id)
         if targets and transfer_source not in download_nodes:
             await self._validate_online_node(transfer_source)
         for target in targets:
@@ -828,8 +982,7 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == model_id
-                and not item.get("partial")
-                and revision in (item.get("revisions") or [])
+                and self._has_revision(item, revision, requested_revision)
             ), None)
             if source_model is None:
                 raise LookupError("cached source model revision not found")
@@ -859,6 +1012,7 @@ class VirtualNAS:
             "id": str(uuid.uuid4()), "kind": "download", "model_id": model_id,
             "source_node_id": "huggingface", "target_node_id": node_id,
             "revision": revision, "depends_on_job_id": None,
+            "requested_revision": requested_revision,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
             "status": "queued", "bytes_total": expected_bytes,
@@ -871,6 +1025,7 @@ class VirtualNAS:
                 "id": str(uuid.uuid4()), "kind": "transfer", "model_id": model_id,
                 "source_node_id": transfer_source, "target_node_id": target,
                 "revision": revision,
+                "requested_revision": requested_revision,
                 "depends_on_job_id": (
                     None if source_node_id else primary_download_job["id"]
                 ),
@@ -954,6 +1109,19 @@ class VirtualNAS:
             raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
         return status
 
+    async def _validate_download_node(self, node_id: str) -> dict[str, Any]:
+        status = await self._validate_online_node(node_id)
+        if (
+            node_id != LOCAL_NODE_ID
+            and VIRTUAL_NAS_DOWNLOAD_CAPABILITY
+            not in (status.get("capabilities") or [])
+        ):
+            raise RuntimeError(
+                f"node '{status.get('name', node_id)}' must be updated before "
+                "it can download models from Hugging Face"
+            )
+        return status
+
     async def _node_storage(self, node_id: str) -> dict[str, Any]:
         if node_id == LOCAL_NODE_ID:
             return {
@@ -1025,8 +1193,10 @@ class VirtualNAS:
             already_complete = next((
                 item for item in storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and not item.get("partial")
-                and job.get("revision") in (item.get("revisions") or [])
+                and self._has_revision(
+                    item, job.get("revision") or "main",
+                    job.get("requested_revision") or job.get("revision") or "main",
+                )
             ), None)
             if already_complete is None:
                 current_size = await self.estimate_download_size(
@@ -1052,13 +1222,19 @@ class VirtualNAS:
                 operation = asyncio.to_thread(
                     self.download_model, job["model_id"],
                     job.get("revision") or "main", token,
+                    job.get("requested_revision") or job.get("revision") or "main",
                 )
             else:
+                await self._validate_download_node(job["target_node_id"])
                 operation = self.node_registry.request(
                     job["target_node_id"], "POST",
                     self._model_agent_path(job["model_id"], "download"),
                     json_body={
                         "revision": job.get("revision") or "main",
+                        "requested_revision": (
+                            job.get("requested_revision")
+                            or job.get("revision") or "main"
+                        ),
                         "hf_token": token,
                     },
                     timeout=24 * 60 * 60,
@@ -1116,11 +1292,10 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and not item.get("partial")
-                and (
-                    not job.get("revision")
-                    or job["revision"] in (item.get("revisions") or [])
-                )
+                and (not job.get("revision") or self._has_revision(
+                    item, job["revision"],
+                    job.get("requested_revision") or job["revision"],
+                ))
             ), None)
             if source_model is None:
                 raise RuntimeError("source node does not have the complete requested revision")
@@ -1184,11 +1359,10 @@ class VirtualNAS:
             imported_model = next((
                 item for item in imported_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and not item.get("partial")
-                and (
-                    not job.get("revision")
-                    or job["revision"] in (item.get("revisions") or [])
-                )
+                and (not job.get("revision") or self._has_revision(
+                    item, job["revision"],
+                    job.get("requested_revision") or job["revision"],
+                ))
             ), None)
             if imported_model is None:
                 raise RuntimeError("target did not report the complete requested revision")

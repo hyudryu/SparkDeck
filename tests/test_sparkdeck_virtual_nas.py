@@ -8,7 +8,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from manager import DEFAULT_SETTINGS, Manager
-from sparkdeck.virtual_nas import VirtualNAS, validate_model_id
+from sparkdeck.virtual_nas import (
+    VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+    VirtualNAS,
+    validate_model_id,
+    validate_revision,
+)
+
+
+RESOLVED_REVISION = "a" * 40
 
 
 def create_cached_model(hub: Path, model_id: str = "org/model") -> Path:
@@ -68,6 +76,7 @@ class FakeRegistry:
     async def probe(self, node, force=False):
         return {
             **node, "online": True,
+            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
             "disk": {"free": 10 * 1024 * 1024 * 1024},
         }
 
@@ -135,6 +144,78 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue((hub / "models--org--model").is_dir())
 
+    async def test_mutable_revision_resolution_is_fresh_and_returns_commit_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_sha = "a" * 40
+            second_sha = "b" * 40
+            api = Mock()
+            api.model_info.side_effect = [
+                Mock(sha=first_sha, siblings=[Mock(size=10), Mock(size=20)]),
+                Mock(sha=second_sha, siblings=[Mock(size=10), Mock(size=20)]),
+            ]
+            huggingface_hub = Mock(HfApi=Mock(return_value=api))
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub",
+                FakeRegistry(), lambda: True,
+            )
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                first = await nas.resolve_download_revision("org/model", "main")
+                second = await nas.resolve_download_revision("org/model", "main")
+
+            self.assertEqual(first["resolved_revision"], first_sha)
+            self.assertEqual(second["resolved_revision"], second_sha)
+            self.assertEqual(first["size_bytes"], 30)
+            self.assertEqual(api.model_info.call_count, 2)
+
+    async def test_revision_resolution_rejects_non_commit_hub_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha="main", siblings=[Mock(size=20)],
+            )
+            huggingface_hub = Mock(HfApi=Mock(return_value=api))
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub",
+                FakeRegistry(), lambda: True,
+            )
+
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}),
+                self.assertRaisesRegex(RuntimeError, "immutable revision"),
+            ):
+                await nas.resolve_download_revision("org/model", "main")
+
+    def test_pinned_download_writes_requested_ref_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            resolved = "a" * 40
+
+            def download_into_cache(**kwargs):
+                repository = create_cached_model(hub)
+                original = repository / "snapshots" / "revision-1"
+                original.rename(repository / "snapshots" / resolved)
+                return str(repository / "snapshots" / resolved)
+
+            snapshot_download = Mock(side_effect=download_into_cache)
+            huggingface_hub = Mock(snapshot_download=snapshot_download)
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                result = nas.download_model(
+                    "org/model", resolved, requested_revision="main",
+                )
+
+            model = nas.inventory()[0]
+            self.assertTrue(result["ok"])
+            self.assertEqual(model["revision_refs"], {"main": resolved})
+            self.assertEqual(
+                (hub / "models--org--model" / "refs" / "main").read_text().strip(),
+                resolved,
+            )
+
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
@@ -154,6 +235,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 ["org/model", "partial/repo"],
             )
             self.assertEqual(models[0]["revisions"], ["main", "revision-1"])
+            self.assertEqual(models[0]["revision_refs"], {"main": "revision-1"})
             self.assertFalse(models[0]["partial"])
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
@@ -249,6 +331,18 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     validate_model_id(value)
+
+    def test_revision_validation_accepts_hub_refs_and_rejects_unsafe_git_refs(self):
+        self.assertEqual(validate_revision("v1.0+cuda"), "v1.0+cuda")
+        self.assertEqual(validate_revision("release@candidate"), "release@candidate")
+        for value in (
+            "@", "feature@{one}", "../main", "a//b", "a b", "a\\b",
+            "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "trailing.",
+            "refs/name.lock", "/main", "main/", "line\nbreak",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_revision(value)
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
@@ -438,15 +532,85 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         nas.download_model = Mock()
 
         with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
-            await nas.download_model_checked("other/model", "main", "ephemeral")
+            await nas.download_model_checked(
+                "other/model", RESOLVED_REVISION, "ephemeral", "main",
+            )
 
         nas.estimate_download_size.assert_awaited_once_with(
-            "other/model", "main", "ephemeral", force_refresh=True,
+            "other/model", RESOLVED_REVISION, "ephemeral", force_refresh=True,
         )
         nas.download_model.assert_not_called()
 
+    async def test_remote_download_requires_advertised_agent_capability(self):
+        registry = FakeRegistry()
+
+        async def legacy_probe(node, force=False):
+            return {**node, "online": True, "capabilities": []}
+
+        registry.probe = legacy_probe
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, registry, lambda: True,
+        )
+        nas.start = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "must be updated"):
+            await nas.queue_download_and_transfer(
+                "org/model", RESOLVED_REVISION, "worker-a", [], 100,
+                requested_revision="main",
+            )
+
+        self.assertEqual(nas.jobs, [])
+
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_requested_ref_cannot_seed_pinned_workflow(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "stale", "name": "Stale", "online": True,
+            "cache_free_size": 10**9,
+            "virtual_nas_download_capable": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 20,
+                "partial": False,
+                "revisions": ["main", "a" * 40, "b" * 40],
+                "revision_refs": {"main": "b" * 40},
+            }],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": "a" * 40,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertIsNone(result["source"])
+        self.assertFalse(result["targets"][0]["has_required_weights"])
+
+    async def test_legacy_agent_is_transfer_capable_but_not_download_capable(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "legacy", "name": "Legacy", "online": True,
+            "cache_free_size": 10**9,
+            "virtual_nas_download_capable": False, "models": [],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertFalse(result["targets"][0]["download_eligible"])
+        self.assertIn("updated", result["targets"][0]["download_reason"])
+
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}
@@ -457,7 +621,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "free_size": required, "cache_free_size": required,
                 "models": [{
                     "model_id": "org/model", "size_bytes": 20,
-                    "partial": False, "revisions": ["main"],
+                    "partial": False,
+                    "revisions": ["main", RESOLVED_REVISION],
+                    "revision_refs": {"main": RESOLVED_REVISION},
                 }],
             },
             {
@@ -484,6 +650,11 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager.virtual_nas_transfers = Mock(return_value={"items": []})
         manager.virtual_nas = Mock()
         manager.virtual_nas.estimate_download_size = AsyncMock(return_value=20)
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
 
         result = await manager.virtual_nas_transfer_preflight("org/model", "main")
         targets = {item["node_id"]: item for item in result["targets"]}
@@ -511,7 +682,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "cache_free_size": required,
                 "models": [{
                     "model_id": "org/model", "size_bytes": 20,
-                    "partial": False, "revisions": ["rev-b"],
+                    "partial": False,
+                    "revisions": ["rev-b", RESOLVED_REVISION],
+                    "revision_refs": {"rev-b": RESOLVED_REVISION},
                 }],
             },
             {
@@ -525,6 +698,11 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         }]})
         manager.virtual_nas = Mock()
         manager.virtual_nas.estimate_download_size = AsyncMock(return_value=20)
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "rev-b",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
 
         result = await manager.virtual_nas_transfer_preflight("org/model", "rev-b")
         target = next(item for item in result["targets"] if item["node_id"] == "target")

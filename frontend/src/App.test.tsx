@@ -337,6 +337,15 @@ describe('model deployments', () => {
     const gib = 1024 ** 3
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false },
+          { node_id: 'node-2', node_name: 'Spark Two', has_required_weights: true, eligible: false },
+          { node_id: 'node-3', node_name: 'Spark Three', has_required_weights: false, eligible: false, reason: 'Virtual NAS is disabled' },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return new Response(JSON.stringify({
         id: 'dep-new', alias: 'Saved cluster', runtime: 'vllm', kind: 'managed',
         model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local', 'node-2'],
@@ -373,7 +382,7 @@ describe('model deployments', () => {
     const secondNode = within(dialog).getByRole('checkbox', { name: /Spark Two/ })
     expect(secondNode).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Three/ })).toBeDisabled()
-    expect(dialog).toHaveTextContent('Model weights not cached')
+    expect(dialog).toHaveTextContent('Virtual NAS is disabled')
 
     await user.click(secondNode)
     expect(within(dialog).getByRole('button', { name: 'Prepare selected nodes' })).toBeDisabled()
@@ -586,6 +595,14 @@ describe('model deployments', () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Snapshot only', has_required_weights: false, eligible: false, reason: 'Virtual NAS is disabled' },
+          { node_id: 'node-2', node_name: 'Default branch', has_required_weights: true, eligible: false },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Snapshot only', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['snapshot-a'] }] },
         { id: 'node-2', name: 'Default branch', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main', 'snapshot-b'] }] },
@@ -652,6 +669,11 @@ describe('model deployments', () => {
     const deployResponse = new Promise<Response>((resolve) => { resolveDeploy = resolve })
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [{ node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return deployResponse
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
@@ -689,6 +711,14 @@ describe('model deployments', () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false },
+          { node_id: 'node-2', node_name: 'Spark Two', has_required_weights: true, eligible: false },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-duplicates/deploy')) {
         return new Response(JSON.stringify({
           id: 'dep-replicas', alias: 'Saved replicas', runtime: 'vllm', kind: 'managed',
@@ -728,6 +758,44 @@ describe('model deployments', () => {
         method: 'POST', body: JSON.stringify({ node_ids: ['local', 'node-2'] }),
       }),
     ))
+  })
+
+  it('does not deploy nodes whose main refs resolve to different commits', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: true, model_id: 'org/model', revision: 'main', resolved_revision: 'a'.repeat(40),
+        source: { node_id: 'local', node_name: 'Spark One', size_bytes: 20 },
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        download: { size_bytes: 20, required_free_bytes: 1000 },
+        targets: [
+          { node_id: 'local', node_name: 'Spark One', has_required_weights: true, has_model_cache: true, eligible: false },
+          { node_id: 'node-2', node_name: 'Spark Two', has_required_weights: false, has_model_cache: true, eligible: false, download_eligible: true, free_bytes: 2000 },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main', 'a'.repeat(40)] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main', 'b'.repeat(40)] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'mixed-main', name: 'Mixed main', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'sharded', required_node_count: 2, tensor_parallel_size: 2,
+        pipeline_parallel_size: 1, node_ids: ['local', 'node-2'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Mixed main' })
+
+    expect(within(dialog).queryByRole('button', { name: 'Deploy on 2 nodes' })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Prepare selected nodes' })).toBeEnabled()
   })
 
   it('surfaces saved-configuration failures without hiding deployment state', async () => {

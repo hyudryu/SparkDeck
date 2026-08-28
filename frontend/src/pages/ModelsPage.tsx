@@ -973,8 +973,12 @@ export function ModelsPage() {
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment
         const localPath = isLocalModelPath(recipe.model)
-        const weighted = nodesWithWeights(recipe)
         const preflightTargets = new Map((transferPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
+        const weighted = localPath
+          ? nodesWithWeights(recipe)
+          : new Set((transferPreflight.data?.targets ?? [])
+            .filter((target) => target.has_required_weights)
+            .map((target) => target.node_id))
         const missingNodes = (nodes.data ?? []).filter((node) => !weighted.has(node.id))
         const allowedIds = (nodes.data ?? []).filter((node) => {
           if (weighted.has(node.id)) return true

@@ -9,7 +9,7 @@ import httpx
 
 from manager import Manager
 from sparkdeck.service import SparkDeckService
-from sparkdeck.virtual_nas import VirtualNAS
+from sparkdeck.virtual_nas import VirtualNAS, _is_complete_repository
 
 
 class FakeManager:
@@ -349,6 +349,79 @@ class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 "org/model", revision, ["UD/model-Q8.gguf"],
             )["complete"])
 
+    async def test_subset_of_a_complete_source_marks_the_target_selective(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, _ = self.build_nodes(Path(directory))
+            revision = "c" * 40
+            root = source_hub / "models--org--model"
+            snapshot = root / "snapshots" / revision
+            (snapshot / "UD").mkdir(parents=True)
+            (snapshot / "UD" / "model-Q8.gguf").write_bytes(b"q8-weights")
+            (snapshot / "tokenizer.json").write_text("{}")
+            # No selective marker: the source cache holds a complete snapshot.
+
+            export = source.export_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"], "main",
+            )
+            await target.import_model_files("org/model", export)
+
+            target_root = (
+                Path(directory) / "target" / "hub" / "models--org--model"
+            )
+            marker = (
+                target_root / "snapshots" / revision
+                / ".sparkdeck-selective.incomplete"
+            )
+            self.assertTrue(marker.is_file())
+            self.assertFalse(_is_complete_repository(target_root))
+            self.assertFalse(target.has_model_files(
+                "org/model", revision, ["tokenizer.json"],
+            )["complete"])
+
+    async def test_merge_keeps_a_complete_target_snapshot_unmarked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            self.stub_remote_target(source, target, target_hub)
+            target_root = target_hub / "models--org--model"
+            q4_blob = target_root / "blobs" / "blob-q4"
+            q4_blob.parent.mkdir(parents=True)
+            q4_blob.write_bytes(b"q4-weights")
+            q4_snapshot = target_root / "snapshots" / revision / "Q4"
+            q4_snapshot.mkdir(parents=True)
+            (q4_snapshot / "model-Q4.gguf").write_bytes(b"q4-weights")
+
+            await source.transfer_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+                "local", "local-2", "main",
+            )
+
+            marker = target_root / "snapshots" / revision / ".sparkdeck-selective.incomplete"
+            self.assertFalse(marker.exists())
+            self.assertTrue(_is_complete_repository(target_root))
+
+    async def test_merge_updates_a_stale_revision_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            self.stub_remote_target(source, target, target_hub)
+            target_root = target_hub / "models--org--model"
+            target_root.mkdir(parents=True)
+            stale_ref = target_root / "refs" / "main"
+            stale_ref.parent.mkdir(parents=True)
+            stale_ref.write_text("b" * 40, encoding="utf-8")
+
+            await source.transfer_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+                "local", "local-2", "main",
+            )
+
+            self.assertEqual(
+                stale_ref.read_text(encoding="utf-8").strip(), revision,
+            )
+
     async def test_multi_shard_transfer_carries_every_selected_file(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target, _, _ = self.build_nodes(Path(directory))
@@ -394,6 +467,20 @@ class LlamaCppHomesContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(homes)
         self.assertIsNone(seed)
+
+    async def test_remote_seed_is_rejected_for_the_controller_only_selection(self):
+        with self.assertRaisesRegex(ValueError, "download_node_id must be one of"):
+            self.service._llama_cpp_artifact_homes(
+                None, {"download_node_id": "worker-1"},
+            )
+
+    async def test_controller_seed_without_explicit_nodes_is_accepted(self):
+        homes, seed = self.service._llama_cpp_artifact_homes(
+            None, {"download_node_id": "local"},
+        )
+
+        self.assertIsNone(homes)
+        self.assertEqual(seed, "local")
 
     async def test_homes_keep_controller_order_and_report_the_requested_seed(self):
         homes, seed = self.service._llama_cpp_artifact_homes(

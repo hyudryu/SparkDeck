@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import posixpath
@@ -45,6 +46,7 @@ _TOKENIZER_FILES = {
 TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 _SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
+_SELECTIVE_MARKER_CONTENT = b"selective\n"
 
 
 def partial_download_size_bytes(
@@ -1079,17 +1081,29 @@ class VirtualNAS:
     def _model_files_members(
         self, repository: Path, revision: str, filenames: list[str],
         requested_revision: str,
-    ) -> tuple[list[Path], list[str], int]:
+    ) -> tuple[list[Path], list[str], int, bool]:
         """Collect archive members for one file-scoped snapshot transfer.
 
-        Returns the filesystem paths to archive, their arcnames, and the
-        byte total of the real files (blobs are deduplicated through their
-        snapshot symlinks). Revision ref aliases resolving to the requested
-        revision travel along so the target reports the same alias.
+        Returns the filesystem paths to archive, their arcnames, the byte
+        total of the real files, and whether the target snapshot must carry
+        the selective marker. A file-scoped export is selective unless it
+        ships every file of an already-complete source snapshot, otherwise
+        targets would advertise a partial copy as a complete revision.
         """
-        entries, selective = self._selected_snapshot_entries(
+        entries, marker_present = self._selected_snapshot_entries(
             repository, revision, filenames,
         )
+        snapshot = repository / "snapshots" / revision
+        marker = snapshot / _SELECTIVE_SNAPSHOT_MARKER
+        snapshot_files = {
+            item.relative_to(snapshot).as_posix()
+            for item in snapshot.rglob("*")
+            if (item.is_symlink() or item.is_file())
+            and item != marker
+        }
+        ships_whole_snapshot = snapshot_files == set(filenames)
+        selective = marker_present or not ships_whole_snapshot
+        synthetic_marker = selective and not marker_present
         paths: list[Path] = []
         arcnames: list[str] = []
         total = 0
@@ -1130,14 +1144,19 @@ class VirtualNAS:
                 blob_relative = real.relative_to(repository).as_posix()
                 add(real, f"{root}/{blob_relative}", size=True)
         for filename, entry in entries.items():
+            if entry in archived_reals:
+                # A regular-file entry (degraded symlink layouts) was already
+                # archived under its snapshot path; adding it again would
+                # duplicate the payload in the archive.
+                continue
             add(
                 entry,
                 f"{root}/snapshots/{revision}/{filename}",
                 size=True,
             )
-        if selective:
+        if marker_present:
             add(
-                snapshot / _SELECTIVE_SNAPSHOT_MARKER,
+                marker,
                 f"{root}/snapshots/{revision}/{_SELECTIVE_SNAPSHOT_MARKER}",
                 size=False,
             )
@@ -1156,7 +1175,7 @@ class VirtualNAS:
                         f"{root}/refs/{ref.relative_to(refs_root).as_posix()}",
                         size=True,
                     )
-        return paths, arcnames, total
+        return paths, arcnames, total, synthetic_marker
 
     def export_model_files(
         self, model_id: str, revision: str, filenames: list[str],
@@ -1177,7 +1196,7 @@ class VirtualNAS:
         entries, _ = self._selected_snapshot_entries(
             repository, revision, selected,
         )
-        paths, arcnames, total = self._model_files_members(
+        paths, arcnames, total, synthetic_marker = self._model_files_members(
             repository, revision, selected, requested_revision,
         )
         self._reserve_stream(model_id)
@@ -1202,6 +1221,15 @@ class VirtualNAS:
                         for path, arcname in zip(paths, arcnames):
                             archive.add(
                                 path, arcname=arcname, recursive=False,
+                            )
+                        if synthetic_marker:
+                            info = tarfile.TarInfo(
+                                f"{repository.name}/snapshots/{revision}/"
+                                f"{_SELECTIVE_SNAPSHOT_MARKER}"
+                            )
+                            info.size = len(_SELECTIVE_MARKER_CONTENT)
+                            archive.addfile(
+                                info, io.BytesIO(_SELECTIVE_MARKER_CONTENT),
                             )
                 except BrokenPipeError:
                     pass
@@ -1276,7 +1304,6 @@ class VirtualNAS:
                 await asyncio.to_thread(
                     self._place_or_merge_model_files,
                     archive_path, stage, archive_name,
-                    expected_bytes if expected_bytes is not None else received,
                 )
                 return {
                     "ok": True, "model_id": model_id, "bytes_received": received,
@@ -1289,7 +1316,6 @@ class VirtualNAS:
 
     def _place_or_merge_model_files(
         self, archive_path: Path, stage: Path, archive_name: str,
-        model_bytes: int,
     ) -> None:
         with tarfile.open(archive_path, mode="r:*") as archive:
             members = archive.getmembers()
@@ -1309,27 +1335,66 @@ class VirtualNAS:
             raise ValueError("model archive does not contain a snapshot")
         destination = self._hub() / archive_name
         if not destination.exists():
-            free_bytes = _local_free_bytes(self._hub())
-            if free_bytes < model_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES:
-                raise RuntimeError(
-                    "target cache volume no longer has enough free space for import"
-                )
+            # Capacity was gated before the stream started; the staging copy
+            # is already part of that budget, so placement is a rename. The
+            # archive's own marker state defines snapshot completeness.
             os.replace(extracted, destination)
             return
         self._merge_model_directory(extracted, destination)
         shutil.rmtree(extracted, ignore_errors=True)
 
     def _merge_model_directory(self, extracted: Path, destination: Path) -> None:
-        """Merge one cached repository into an existing one, never deleting."""
+        """Merge one cached repository into an existing one, never deleting.
+
+        Snapshot markers are governed by the destination for pre-existing
+        snapshot directories (they keep their own marker state so an
+        incoming selective subset can never downgrade a complete target
+        snapshot), while snapshot directories newly created by this merge
+        take the archive's marker because they hold only the shipped
+        subset. Revision refs are updated to the incoming alias mapping
+        when it differs.
+        """
+        destination_snapshots = destination / "snapshots"
+        pre_existing = {
+            item.name
+            for item in destination_snapshots.iterdir()
+            if item.is_dir() and not item.is_symlink()
+        } if destination_snapshots.is_dir() else set()
+
         for source_path in sorted(extracted.rglob("*")):
             relative = source_path.relative_to(extracted)
             target_path = destination / relative
+            if (
+                len(relative.parts) >= 3
+                and relative.parts[0] == "snapshots"
+                and relative.parts[2] == _SELECTIVE_SNAPSHOT_MARKER
+                and relative.parts[1] in pre_existing
+            ):
+                # Pre-existing snapshots keep their own marker state so an
+                # incoming selective subset cannot downgrade a complete
+                # target snapshot; newly created snapshots accept the
+                # archive's marker because they hold only a subset.
+                continue
             if source_path.is_dir() and not source_path.is_symlink():
                 target_path.mkdir(parents=True, exist_ok=True)
                 continue
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if not target_path.exists():
                 os.replace(source_path, target_path)
+                continue
+            if relative.parts[0] == "refs" and source_path.is_file():
+                content = source_path.read_text(encoding="utf-8").strip()
+                if (
+                    target_path.is_file()
+                    and target_path.read_text(encoding="utf-8").strip() == content
+                ):
+                    continue
+                if re.fullmatch(r"[0-9a-fA-F]{40}", content):
+                    staging_ref = target_path.with_name(
+                        target_path.name + ".sparkdeck-ref"
+                    )
+                    staging_ref.write_text(content + "\n", encoding="utf-8")
+                    os.replace(staging_ref, target_path)
                 continue
             if source_path.is_symlink() or target_path.is_symlink():
                 if source_path.is_symlink() and target_path.is_symlink() and (
@@ -1347,6 +1412,7 @@ class VirtualNAS:
             raise RuntimeError(
                 "refusing to merge a cached file that differs on the target"
             )
+        shutil.rmtree(extracted, ignore_errors=True)
 
     async def transfer_model_files(
         self, model_id: str, revision: str, filenames: list[str],

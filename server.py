@@ -805,6 +805,7 @@ async def agent_virtual_nas_files_size(
 
 @app.get("/api/agent/virtual-nas/models/{model_id:path}/files/export")
 async def agent_virtual_nas_files_export(
+    req: Request,
     model_id: str,
     revision: str,
     requested_revision: str | None = None,

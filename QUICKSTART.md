@@ -226,6 +226,11 @@ journalctl --user -u sparkdeck.service -f
 
 If the checkout is elsewhere, edit the copied unit before enabling it. Never put tokens directly in the committed service file.
 
+The service discovers Node installations managed by NVM, Volta, asdf, and fnm
+without loading shell startup files. If Node is installed elsewhere, add
+`SPARKDECK_NODE_BIN=/absolute/path/to/node/bin` to
+`~/.config/sparkdeck/sparkdeck.env`, then restart the service.
+
 ## Troubleshooting
 
 ### Spark 2 cannot open Spark 1

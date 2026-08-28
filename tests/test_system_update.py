@@ -11,6 +11,15 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 
+from sparkdeck.node_toolchain import (
+    NODE_ENGINE,
+    NodeToolchain,
+    _supported,
+    frontend_build_environment,
+    main as node_toolchain_main,
+    resolve_node_toolchain,
+)
+
 from sparkdeck.updater import (
     CAPABILITY,
     CONFIRMATION,
@@ -26,6 +35,7 @@ from sparkdeck.update_helper import (
     _prepare_frontend_bundle,
     _publish_frontend_bundle,
     _restore_frontend_bundle,
+    apply as apply_update,
     fetch_update_target,
     install_release_revision,
     install_revision,
@@ -622,9 +632,12 @@ class UpdateHelperProcessTests(unittest.TestCase):
 
 
 class LocalUpdatePreflightTests(unittest.TestCase):
+    @patch("sparkdeck.updater.resolve_node_toolchain")
     @patch("sparkdeck.updater.platform.system", return_value="Windows")
     @patch("sparkdeck.updater._run")
-    def test_windows_preflight_uses_bundled_launcher_process_status(self, command_run, _system):
+    def test_windows_preflight_uses_bundled_launcher_process_status(
+        self, command_run, _system, _toolchain,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "scripts" / "windows" / "sparkdeck.ps1"
@@ -647,9 +660,12 @@ class LocalUpdatePreflightTests(unittest.TestCase):
         ))
         self.assertEqual(command_run.call_args_list[-1].kwargs, {"timeout": 30})
 
+    @patch("sparkdeck.updater.resolve_node_toolchain")
     @patch("sparkdeck.updater.platform.system", return_value="Windows")
     @patch("sparkdeck.updater._run")
-    def test_windows_preflight_requires_bundled_launcher(self, command_run, _system):
+    def test_windows_preflight_requires_bundled_launcher(
+        self, command_run, _system, _toolchain,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             command_run.side_effect = ["https://github.com/hyudryu/SparkDeck.git", ""]
@@ -659,13 +675,217 @@ class LocalUpdatePreflightTests(unittest.TestCase):
         self.assertEqual(len(blockers), 1)
         self.assertIn("bundled Windows launcher", blockers[0])
 
+    @patch("sparkdeck.updater.resolve_node_toolchain")
+    @patch("sparkdeck.updater._service_preflight")
+    @patch("sparkdeck.updater._run")
+    def test_frontend_toolchain_failure_is_a_node_local_blocker(
+        self, command_run, _service, toolchain,
+    ):
+        command_run.side_effect = ["https://github.com/hyudryu/SparkDeck.git", ""]
+        toolchain.side_effect = RuntimeError(
+            "Node.js and npm are not available to the SparkDeck service"
+        )
+
+        blockers = local_blockers(Path("/sparkdeck"))
+
+        self.assertEqual(len(blockers), 1)
+        self.assertIn("Frontend build preflight failed", blockers[0])
+        self.assertIn("not available to the SparkDeck service", blockers[0])
+
+
+class NodeToolchainTests(unittest.TestCase):
+    def test_supported_versions_match_frontend_engine(self):
+        expected = {
+            (20, 18, 9): False,
+            (20, 19, 0): True,
+            (21, 7, 3): False,
+            (22, 11, 0): False,
+            (22, 12, 0): True,
+            (23, 0, 0): True,
+        }
+
+        self.assertEqual(NODE_ENGINE, "^20.19.0 || >=22.12.0")
+        for version, supported in expected.items():
+            with self.subTest(version=version):
+                self.assertEqual(_supported(version), supported)
+
+    @patch("sparkdeck.node_toolchain.subprocess.run")
+    def test_discovers_nvm_install_when_service_path_omits_node(self, process_run):
+        process_run.return_value = Mock(returncode=0, stdout="v22.12.0\n", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            node_bin = home / ".nvm" / "versions" / "node" / "v22.12.0" / "bin"
+            node_bin.mkdir(parents=True)
+            (node_bin / "node").write_text("node", encoding="utf-8")
+            (node_bin / "npm").write_text("npm", encoding="utf-8")
+
+            toolchain = resolve_node_toolchain(
+                {"HOME": str(home), "PATH": "/usr/empty"}, home=home, system="Linux",
+            )
+
+        self.assertEqual(toolchain.npm, node_bin / "npm")
+        self.assertEqual(toolchain.node, node_bin / "node")
+        self.assertEqual(toolchain.version, "22.12.0")
+        self.assertTrue(
+            process_run.call_args.kwargs["env"]["PATH"].startswith(str(node_bin))
+        )
+
+    @patch("sparkdeck.node_toolchain.subprocess.run")
+    def test_explicit_node_bin_takes_precedence(self, process_run):
+        process_run.return_value = Mock(returncode=0, stdout="v20.19.0\n", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            explicit = root / "custom-node" / "bin"
+            explicit.mkdir(parents=True)
+            (explicit / "node").write_text("node", encoding="utf-8")
+            (explicit / "npm").write_text("npm", encoding="utf-8")
+
+            toolchain = resolve_node_toolchain({
+                "HOME": str(root),
+                "PATH": "/usr/empty",
+                "SPARKDECK_NODE_BIN": str(explicit),
+            }, home=root, system="Linux")
+
+        self.assertEqual(toolchain.npm.parent, explicit)
+
+    @patch("sparkdeck.node_toolchain.subprocess.run")
+    def test_skips_unsupported_path_node_for_supported_nvm_install(self, process_run):
+        def version_for(command, **_kwargs):
+            version = "v18.20.0" if "system" in command[0] else "v22.12.0"
+            return Mock(returncode=0, stdout=version, stderr="")
+
+        process_run.side_effect = version_for
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            system_bin = home / "system-bin"
+            nvm_bin = home / ".nvm" / "versions" / "node" / "v22.12.0" / "bin"
+            for node_bin in (system_bin, nvm_bin):
+                node_bin.mkdir(parents=True)
+                (node_bin / "node").write_text("node", encoding="utf-8")
+                (node_bin / "npm").write_text("npm", encoding="utf-8")
+
+            with patch(
+                "sparkdeck.node_toolchain.shutil.which",
+                return_value=str(system_bin / "npm"),
+            ):
+                toolchain = resolve_node_toolchain(
+                    {"HOME": str(home), "PATH": str(system_bin)},
+                    home=home,
+                    system="Linux",
+                )
+
+        self.assertEqual(toolchain.npm, nvm_bin / "npm")
+
+    def test_build_environment_prepends_every_toolchain_path(self):
+        toolchain = NodeToolchain(
+            npm=Path("/home/test/.asdf/shims/npm"),
+            node=Path("/home/test/.asdf/shims/node"),
+            version="22.12.0",
+            path_entries=(Path("/home/test/.asdf/shims"), Path("/home/test/.asdf/bin")),
+        )
+
+        environment = frontend_build_environment(toolchain, {"PATH": "/usr/bin"})
+
+        self.assertEqual(
+            environment["PATH"],
+            os.pathsep.join([
+                str(Path("/home/test/.asdf/shims")),
+                str(Path("/home/test/.asdf/bin")),
+                "/usr/bin",
+            ]),
+        )
+
+    @patch("sparkdeck.node_toolchain.subprocess.run")
+    @patch("sparkdeck.node_toolchain.resolve_node_toolchain")
+    def test_cli_runs_npm_with_the_resolved_environment(self, resolve, process_run):
+        node_bin = Path("/home/test/.nvm/versions/node/v22.12.0/bin")
+        resolve.return_value = NodeToolchain(
+            npm=node_bin / "npm",
+            node=node_bin / "node",
+            version="22.12.0",
+            path_entries=(node_bin,),
+        )
+        process_run.return_value = Mock(returncode=0)
+
+        with patch("sparkdeck.node_toolchain.sys.argv", [
+            "node_toolchain", "--prefix", "frontend", "ci",
+        ]), self.assertRaises(SystemExit) as exited:
+            node_toolchain_main()
+
+        self.assertEqual(exited.exception.code, 0)
+        self.assertEqual(
+            process_run.call_args.args[0],
+            [str(node_bin / "npm"), "--prefix", "frontend", "ci"],
+        )
+        self.assertTrue(
+            process_run.call_args.kwargs["env"]["PATH"].startswith(
+                str(node_bin) + os.pathsep
+            )
+        )
+
 
 class UpdateHelperTests(unittest.TestCase):
-    @patch("sparkdeck.update_helper.shutil.which", return_value="C:\\Node\\npm.cmd")
-    @patch("sparkdeck.update_helper.platform.system", return_value="Windows")
-    def test_windows_npm_resolves_cmd_shim(self, _system, which):
-        self.assertEqual(npm_executable(), "C:\\Node\\npm.cmd")
-        which.assert_called_once_with("npm.cmd")
+    @patch("sparkdeck.update_helper.resolve_node_toolchain")
+    def test_windows_npm_resolves_cmd_shim(self, resolve):
+        resolve.return_value = NodeToolchain(
+            npm=Path("C:/Node/npm.cmd"), node=Path("C:/Node/node.exe"),
+            version="22.12.0", path_entries=(Path("C:/Node"),),
+        )
+        self.assertEqual(npm_executable(), str(Path("C:/Node/npm.cmd")))
+
+    def test_update_passes_toolchain_path_to_both_npm_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            stage = Path(directory) / "stage"
+            state_path = root / "data" / "system-update-agent.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text("{}", encoding="utf-8")
+            (stage / "sparkdeck").mkdir(parents=True)
+            (stage / "frontend").mkdir()
+            (stage / "sparkdeck-update.json").write_text(
+                '{"update_protocol": 1, "data_schema": 1}', encoding="utf-8",
+            )
+            (stage / "sparkdeck" / "updater.py").write_text(
+                CAPABILITY, encoding="utf-8",
+            )
+            (stage / "frontend" / "package-lock.json").write_text(
+                "{}", encoding="utf-8",
+            )
+            node_bin = Path(directory) / "node" / "bin"
+            toolchain = NodeToolchain(
+                npm=node_bin / "npm",
+                node=node_bin / "node",
+                version="22.12.0",
+                path_entries=(node_bin,),
+            )
+
+            def command_result(_root, *args, **_kwargs):
+                if args == ("git", "remote", "get-url", "origin"):
+                    return "https://github.com/hyudryu/SparkDeck.git"
+                if args == ("git", "rev-parse", "HEAD"):
+                    return "a" * 40
+                return ""
+
+            with patch("sparkdeck.update_helper.run", side_effect=command_result) as command_run, \
+                 patch("sparkdeck.update_helper.resolve_node_toolchain", return_value=toolchain), \
+                 patch("sparkdeck.update_helper.fetch_update_target"), \
+                 patch("sparkdeck.update_helper.install_revision"), \
+                 patch("sparkdeck.update_helper._prepare_frontend_bundle", return_value=None), \
+                 patch("sparkdeck.update_helper.restart_service"), \
+                 patch("sparkdeck.update_helper.wait_for_revision", return_value=True), \
+                 patch("sparkdeck.update_helper.tempfile.mkdtemp", return_value=str(stage)), \
+                 patch("sparkdeck.update_helper.time.sleep"):
+                apply_update(root, state_path, MAIN_BRANCH, "b" * 40)
+
+        npm_calls = [
+            command for command in command_run.call_args_list
+            if len(command.args) > 1 and command.args[1] == str(toolchain.npm)
+        ]
+        self.assertEqual(len(npm_calls), 2)
+        for command in npm_calls:
+            self.assertTrue(
+                command.kwargs["env"]["PATH"].startswith(str(node_bin) + os.pathsep)
+            )
 
     @patch("sparkdeck.update_helper.run", return_value="a" * 64)
     @patch("sparkdeck.update_helper.platform.system", return_value="Windows")

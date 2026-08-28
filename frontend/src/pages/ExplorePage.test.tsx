@@ -71,14 +71,18 @@ describe('ExplorePage model rows', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models')) return json({ items: [
-        { id: 'org/easy', name: 'easy', parameter_count: 40_000_000_000, weight_size_bytes: 80 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', context_window_size: 8192, inference_tokens_per_second: 40, sample_count: 10 } },
-        { id: 'org/tight', name: 'tight', parameter_count: 60_000_000_000, weight_size_bytes: 120 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
-        { id: 'org/large', name: 'large', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
+        { id: 'org/easy', name: 'easy', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', context_window_size: 8192, inference_tokens_per_second: 40, sample_count: 10 } },
+        { id: 'zai-org/GLM-5.3-Flash', name: 'GLM-5.3-Flash', parameter_count: 321_300_000_000, weight_size_bytes: 306 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
+        { id: 'org/tight', name: 'tight', parameter_count: 400_000_000_000, weight_size_bytes: 400 * gib, downloads: 15, likes: 1, runtime_compatibility: [] },
+        { id: 'org/large', name: 'large', parameter_count: 600_000_000_000, weight_size_bytes: 600 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
         { id: 'org/unknown', name: 'unknown', downloads: 5, likes: 0, runtime_compatibility: [] },
-      ], total: 4 })
+      ], total: 5 })
       if (path.endsWith('/api/v1/nodes')) return json({ items: [
         { id: 'local', name: 'Spark One', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'node-3', name: 'Spark Three', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'node-4', name: 'Spark Four', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'offline', name: 'Offline', online: false, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 500 * 1024 }] } },
       ] })
       return json({ items: [], availability: 'not_configured', evidence_policy: {} })
     }))
@@ -86,20 +90,23 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     expect(await screen.findByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
-    expect(screen.getByText('80 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
-    expect(screen.getByText('120 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
-    expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
+    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(screen.getByText('306 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(screen.getByText('400 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
+    expect(screen.getByText('600 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText('512 GB aggregate memory across 4 measured nodes')).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Expand org/large' }))
-    expect(screen.getByText(/128 GB on the largest measured node/)).toBeInTheDocument()
-    expect(screen.getByText(/every replica must hold the full model weights/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Expand zai-org/GLM-5.3-Flash' }))
+    const fitDetails = screen.getByText(/Fit assumes a sharded deployment/)
+    expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
+    expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
-    const visibleRows = screen.getAllByRole('button', { name: /^Expand org\// })
+    const visibleRows = screen.getAllByRole('button', { name: /^(Expand|Collapse) (org|zai-org)\// })
     expect(visibleRows.map((row) => row.getAttribute('aria-label'))).toEqual([
       'Expand org/tight',
+      'Collapse zai-org/GLM-5.3-Flash',
       'Expand org/easy',
     ])
     expect(screen.queryByRole('button', { name: 'Expand org/large' })).not.toBeInTheDocument()

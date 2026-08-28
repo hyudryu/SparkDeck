@@ -98,6 +98,35 @@ test('keeps every primary route within the viewport', async ({ page }) => {
   }
 })
 
+test('renders streamed chat reasoning, output, and response metrics', async ({ page }, testInfo) => {
+  await page.route('**/v1/chat/completions', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: [
+        'data: {"choices":[{"delta":{"reasoning_content":"Checking the local runtime and planning the answer."}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"Your response now streams as it is generated."}}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":18},"timings":{"prompt_per_second":1234.5,"predicted_per_second":48.2}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+    })
+  })
+  await page.goto('/chat')
+  await page.getByRole('textbox', { name: 'Message' }).fill('How does streaming work?')
+  await page.getByRole('button', { name: 'Send message' }).click()
+
+  await expect(page.getByText('Your response now streams as it is generated.')).toBeVisible()
+  await expect(page.getByText('Checking the local runtime and planning the answer.')).toBeAttached()
+  const metrics = page.getByRole('group', { name: 'Response performance' })
+  await expect(metrics).toContainText('1234.5 tok/s')
+  await expect(metrics).toContainText('48.2 tok/s')
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+  if (testInfo.project.name === 'desktop-1440') {
+    await page.screenshot({ path: testInfo.outputPath('chat-streaming.png'), fullPage: true })
+  }
+})
+
 test('renders FanController telemetry and a touch-friendly override', async ({ page }) => {
   await page.goto('/fan-control')
   await expect(page.getByRole('heading', { name: 'Fan Control' })).toBeVisible()

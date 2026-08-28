@@ -8,6 +8,13 @@ import { formatBytes } from '../utils/format'
 
 type DraggedModel = { modelId: string; sourceNodeId: string; sourceNodeName: string }
 
+function compareModelIdsDescending(left: StorageModel, right: StorageModel) {
+  return right.model_id.localeCompare(left.model_id, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  })
+}
+
 function formatTimestamp(value?: string | number) {
   if (!value) return 'Not reported'
   const date = new Date(typeof value === 'number' && value < 1_000_000_000_000 ? value * 1000 : value)
@@ -38,7 +45,10 @@ export function StoragePage() {
   const [dropTargetId, setDropTargetId] = useState<string>()
   const draggedModelRef = useRef<DraggedModel | undefined>(undefined)
 
-  const nodes = useMemo(() => resource.data?.nodes ?? [], [resource.data?.nodes])
+  const nodes = useMemo(() => (resource.data?.nodes ?? []).map((node) => ({
+    ...node,
+    models: [...node.models].sort(compareModelIdsDescending),
+  })), [resource.data?.nodes])
   const sourceNode = nodes.find((node) => node.id === sourceNodeId)
   const sourceModels = sourceNode?.models.filter((model) => !model.partial) ?? []
   const inventory = useMemo(() => {
@@ -50,7 +60,9 @@ export function StoragePage() {
         if (current.model.partial && !model.partial) current.model = model
       } else models.set(model.model_id, { model, nodes: new Map([[node.id, model]]) })
     }))
-    return [...models.values()]
+    return [...models.values()].sort((left, right) => (
+      compareModelIdsDescending(left.model, right.model)
+    ))
   }, [nodes])
 
   useEffect(() => {

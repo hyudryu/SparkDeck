@@ -198,6 +198,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate.status_code, 400)
         preflight.assert_awaited_once_with(
             "org/model", "release-1", ["local", "worker-1"],
+            download_node_id=None,
         )
 
     async def test_delete_maps_absent_and_in_use_without_exposing_core_details(self):
@@ -310,6 +311,118 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
             "org/model", resolved, "ephemeral", "main", 7,
         )
         self.assertNotIn("ephemeral", response.text)
+
+    async def test_agent_download_supports_selective_files(self):
+        resolved = "b" * 40
+        checked_files = AsyncMock(return_value={
+            "ok": True, "model_id": "org/model", "revision": resolved,
+            "size_bytes": 12, "files": ["q4/model.gguf"],
+        })
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_files_checked", checked_files),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={
+                    "revision": resolved,
+                    "requested_revision": "main",
+                    "hf_token": "ephemeral",
+                    "files": ["q4/model.gguf"],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        checked_files.assert_awaited_once_with(
+            "org/model", resolved, ["q4/model.gguf"],
+            explicit_token="ephemeral", requested_revision="main",
+        )
+        self.assertNotIn("ephemeral", response.text)
+
+    async def test_agent_files_check_reports_selected_file_presence(self):
+        has_files = Mock(return_value={
+            "model_id": "org/model", "revision": "main",
+            "present_files": ["q4/model.gguf"], "missing_files": [],
+            "complete": True,
+        })
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "has_model_files", has_files),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/files/check",
+                json={"revision": "main", "files": ["q4/model.gguf"]},
+            )
+            invalid = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/files/check",
+                json={"revision": "main", "files": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["complete"])
+        has_files.assert_called_once_with("org/model", "main", ["q4/model.gguf"])
+        self.assertEqual(invalid.status_code, 400)
+
+    async def test_generic_model_preparation_queues_with_a_seed(self):
+        queue = AsyncMock(return_value={"workflow_id": "wf-1", "job_ids": [], "jobs": []})
+        with (
+            patch.object(server.manager, "virtual_nas_enabled", return_value=True),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[])),
+            patch.object(server.manager, "queue_recipe_model_preparation", queue),
+        ):
+            response = await self.client.post(
+                "/api/v1/storage/preparations",
+                json={
+                    "model_id": "org/model", "revision": "main",
+                    "node_ids": ["local", "worker-1"],
+                    "download_node_id": "worker-1",
+                },
+            )
+            missing_seed = await self.client.post(
+                "/api/v1/storage/preparations",
+                json={
+                    "model_id": "org/model", "revision": "main",
+                    "node_ids": ["local", "worker-1"],
+                    "download_node_id": "worker-9",
+                },
+            )
+
+        self.assertEqual(response.status_code, 202)
+        queue.assert_awaited_once_with("org/model", "main", ["local", "worker-1"], "worker-1")
+        self.assertEqual(missing_seed.status_code, 400)
+
+    async def test_recipe_preparation_preflight_forwards_an_explicit_seed(self):
+        recipe = {
+            "id": "recipe-1", "model": "org/model", "engine": "vllm",
+            "node_ids": ["local", "worker-1"],
+        }
+        contract = {
+            "supported": True, "required_node_count": 2,
+            "deployment_mode": "replicated", "model_revision": "release-1",
+        }
+        preflight = AsyncMock(return_value={
+            "enabled": True, "eligible": True, "action": "download",
+            "model_id": "org/model", "revision": "release-1",
+            "node_ids": ["local", "worker-1"], "targets": [],
+            "transfer_target_node_ids": ["worker-1"],
+        })
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(server.manager, "recipe_deployment_contract", return_value=contract),
+            patch.object(server.manager, "_resolve_local_path", return_value=None),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[])),
+            patch.object(server.manager, "recipe_model_preparation_preflight", preflight),
+        ):
+            response = await self.client.post(
+                "/api/v1/recipes/recipe-1/prepare/preflight",
+                json={"node_ids": ["local", "worker-1"], "download_node_id": "worker-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        preflight.assert_awaited_once_with(
+            "org/model", "release-1", ["local", "worker-1"],
+            download_node_id="worker-1",
+        )
 
     async def test_agent_inventory_export_import_and_delete_contracts(self):
         async def export(_model_id):

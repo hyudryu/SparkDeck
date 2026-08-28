@@ -27,6 +27,7 @@ _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
+VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -717,6 +718,37 @@ class VirtualNAS:
         return await self._await_uncancelable(
             asyncio.to_thread(download_selected),
         )
+
+    def has_model_files(
+        self, model_id: str, revision: str, filenames: list[str],
+    ) -> dict[str, Any]:
+        """Report which selected files of one revision are already cached.
+
+        A pure local filesystem check so the controller can decide between
+        transferring an existing copy and seeding a fresh Hub download
+        without touching the network.
+        """
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        repository = self._model_path(model_id)
+        present = [
+            filename for filename in selected
+            if _safe_cached_snapshot_file(repository, revision, filename) is not None
+        ]
+        return {
+            "model_id": model_id,
+            "revision": revision,
+            "present_files": present,
+            "missing_files": [
+                filename for filename in selected if filename not in present
+            ],
+            "complete": not any(filename not in present for filename in selected),
+        }
 
     def download_model(
         self, model_id: str, revision: str = "main", explicit_token: str | None = None,

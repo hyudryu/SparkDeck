@@ -342,6 +342,8 @@ export function SettingsPage() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
   const [signingOut, setSigningOut] = useState(false)
+  const [communitySharingBusy, setCommunitySharingBusy] = useState(false)
+  const [communitySharingError, setCommunitySharingError] = useState<string>()
   const [signOutDialogOpen, setSignOutDialogOpen] = useState(false)
   const [signOutError, setSignOutError] = useState<string>()
   const [legalDialog, setLegalDialog] = useState<'privacy' | 'terms'>()
@@ -373,6 +375,25 @@ export function SettingsPage() {
     setSignOutError(undefined)
     setSignOutDialogOpen(false)
   }, [])
+
+  const setCommunitySharing = async (enabled: boolean) => {
+    if (!communitySync.data || (enabled && auth.status !== 'signed-in')) return
+    setCommunitySharingBusy(true)
+    setCommunitySharingError(undefined)
+    try {
+      const updated = await api.benchmarks.setConsent(enabled)
+      communitySync.setData(updated)
+      if (updated.cluster_errors?.length) {
+        setCommunitySharingError(
+          `Telemetry was ${enabled ? 'enabled' : 'disabled'} on this controller, but not on: ${updated.cluster_errors.join('; ')}. Retry when those nodes are reachable.`,
+        )
+      }
+    } catch (reason) {
+      setCommunitySharingError(reason instanceof Error ? reason.message : 'Could not update telemetry sharing')
+    } finally {
+      setCommunitySharingBusy(false)
+    }
+  }
 
   const signOut = async (password: string) => {
     setSigningOut(true)
@@ -473,15 +494,37 @@ export function SettingsPage() {
           <div className="settings-fields"><div className="credential-state wide-field"><Cable size={17} /><div><strong>Switch connection</strong><span className="muted">Enter a RouterOS REST API URL manually when discovery cannot cross a routed network.</span></div><Link className="button button-secondary" to="/switch">Open switch setup</Link></div></div>
         </Panel>
         <Panel className="settings-section">
-          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Create an account or sign in to access community data. Benchmark sharing remains off until you explicitly enable it.</p></div></div>
+          <div className="settings-heading"><span><Cloud size={18} /></span><div><h2>Community Features</h2><p>Sign in to optionally contribute anonymous model-performance telemetry and view community results.</p></div></div>
           <div className="settings-fields">
-            <p className="muted wide-field">Connected to the SparkDeck community service.</p>
+            <p className="muted wide-field">Telemetry is disabled by default. While disabled, SparkDeck neither collects samples for upload nor requests hosted community telemetry.</p>
             {communitySync.data?.token_invalid && <p className="form-error wide-field" role="alert">Your community session expired on this node — sign in again to resume sharing.</p>}
             {auth.status === 'restoring'
               ? <p className="muted wide-field" role="status">Restoring community session…</p>
               : auth.status === 'signed-in'
                 ? <div className="credential-state"><KeyRound size={17} /><div><strong>{auth.email ?? 'Community account'}</strong><Status status="running">Signed in</Status></div><button ref={signOutButtonRef} className="button button-secondary" type="button" disabled={signingOut} onClick={() => { setSignOutError(undefined); setSignOutDialogOpen(true) }}>Sign out</button></div>
                 : <CommunitySignInForm />}
+            <div className="community-consent-control wide-field">
+              <div>
+                <strong>Community telemetry</strong>
+                <span id="community-telemetry-description" className="muted">Share canonical model name, quantization, C1 output speed, and context size. Prompts and responses never leave your cluster.</span>
+                {communitySync.data && <small>{communitySync.data.pending_count} pending · {communitySync.data.synced_count} synced</small>}
+              </div>
+              <label className="settings-toggle">
+                <span>Off</span>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  aria-label="Community telemetry"
+                  aria-describedby="community-telemetry-description"
+                  checked={Boolean(communitySync.data?.sharing_enabled)}
+                  disabled={communitySharingBusy || communitySync.loading || !communitySync.data || (!communitySync.data.sharing_enabled && auth.status !== 'signed-in')}
+                  onChange={(event) => void setCommunitySharing(event.target.checked)}
+                />
+                <span className="settings-toggle-track" aria-hidden="true"><span /></span>
+                <span>On</span>
+              </label>
+            </div>
+            {communitySharingError && <p className="form-error wide-field" role="alert">{communitySharingError}</p>}
             {auth.status === 'signed-in' && auth.clusterSync && <>
               {auth.clusterSync.conflicts.map((conflict) => (
                 <p className="muted wide-field" role="status" key={conflict.node}>
@@ -523,7 +566,7 @@ export function SettingsPage() {
         <p className="legal-effective">Effective August 27, 2026</p>
         <section><h3>Local-first by default</h3><p>SparkDeck's core app runs on systems you control. It keeps benchmark history, runtime details, settings, and operational records locally on your device or cluster. Local storage is not collection by SparkDeck's hosted Community Features service.</p><p>If you do not create or sign in to a Community Features account, SparkDeck does not send account data or benchmark telemetry to the Community Features service.</p></section>
         <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data. Your browser removes its token copy after pairing, while each paired SparkDeck node privately stores a refresh credential so signed-in status can be shared across your joined cluster without returning that credential to the browser.</p></section>
-        <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly opt in from Benchmarks. When enabled, eligible existing local samples may be queued along with future samples. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>model identifier;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>tensor-parallel (TP) size, when recorded; and</li><li>context-window size.</li></ul><p>Prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
+        <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly enable it under Community Features in Settings. When enabled, eligible existing local samples may be queued along with future samples. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>canonical model identifier;</li><li>model quantization;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>tensor-parallel (TP) size, when recorded; and</li><li>context-window size.</li></ul><p>Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
         <section><h3>How information is used</h3><p>Account information authenticates Community Features. Benchmark telemetry is used to group comparable results, show expected performance for the same model and configuration, detect invalid submissions, and operate the service. Published results may be aggregated with other users' results.</p><p>Telemetry uploads use a node-scoped credential and idempotency identifier. Hosting and network providers may also process ordinary connection metadata such as IP address, request time, and user agent for security and service operation. This metadata is not part of the benchmark JSON.</p></section>
         <section><h3>Your controls and retention</h3><p>You can turn telemetry off at any time. This stops future uploads and removes unsent queued uploads; it does not delete local benchmark history or recall data already received. Account information and received telemetry are retained only while reasonably needed to provide Community Features, protect the service, meet legal obligations, or maintain aggregated benchmark results. You may request access, correction, or deletion through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. Do not include sensitive personal information in a public issue. Backup and aggregated records may persist where legally permitted or where they can no longer reasonably be linked to an account.</p></section>
         <section><h3>Service providers and external links</h3><p>Amazon Cognito provides authentication. GitHub receives information under its own privacy notice if you open or submit a bug report. Services you choose separately, including Hugging Face and Tailscale, operate under their own terms and privacy notices. SparkDeck does not sell personal information or share it for cross-context behavioral advertising.</p></section>

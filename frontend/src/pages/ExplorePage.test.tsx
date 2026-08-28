@@ -8,7 +8,7 @@ const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true
 
 vi.mock('../hooks/useCommunityAccess', () => ({
   communityAccessHint: (signedIn: boolean) => signedIn
-    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    ? 'Enable telemetry under Settings → Community Features to see community data.'
     : 'Sign in under Settings → Community Features to see community data.',
   useCommunityAccess: () => communityAccess,
 }))
@@ -166,11 +166,11 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
 
-    expect(await screen.findByRole('button', { name: 'Expand community/model' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Expand community/model (unknown)' })).toBeInTheDocument()
     expect(screen.queryByText('Hugging Face unavailable')).not.toBeInTheDocument()
     expect(screen.getByText('Based on aggregated benchmark samples—not live session tracking.')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeChecked()
-    await user.click(screen.getByRole('button', { name: 'Expand community/model' }))
+    await user.click(screen.getByRole('button', { name: 'Expand community/model (unknown)' }))
     expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
   })
@@ -201,10 +201,56 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByRole('button', { name: 'Load more community models (20 remaining)' })).toBeInTheDocument()
   })
 
+  it('keeps quantization variants separate and shows community-specific columns and artifacts', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({ items: [{
+        id: 'RadixArk/Qwen3.8-27B', name: 'Qwen3.8-27B', parameter_count: 27_000_000_000,
+        weight_size_bytes: 16 * gib, downloads: 9000, likes: 400, runtime_compatibility: [],
+      }], total: 1 })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'RadixArk/Qwen3.8-27B', name: 'Qwen3.8-27B', runtime_compatibility: [],
+        quantizations: [
+          { name: 'NVFP4', weight_size_bytes: 16 * gib, files: [{ filename: 'model-nvfp4.safetensors', size_bytes: 16 * gib }] },
+          { name: 'Q4_K_M', weight_size_bytes: 15 * gib, files: [{ filename: 'qwen3.8-q4_k_m.gguf', size_bytes: 15 * gib }] },
+        ],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      return json({
+        items: [
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', context_window_size: 8192, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', context_window_size: 8192, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
+        ],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
+
+    const header = document.querySelector('.catalog-model-header')
+    expect(header).toHaveTextContent('Output speed')
+    expect(header).toHaveTextContent('Unique clusters')
+    expect(screen.queryByText('Downloads')).not.toBeInTheDocument()
+    expect(screen.queryByText('Likes')).not.toBeInTheDocument()
+    const nvfp4 = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4)' })
+    const gguf = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (Q4_K_M)' })
+    expect(within(nvfp4).getByText('52.4 tok/s')).toBeInTheDocument()
+    expect(within(nvfp4).getByText('7')).toBeInTheDocument()
+    expect(within(gguf).getByText('31.2 tok/s')).toBeInTheDocument()
+    expect(within(gguf).getByText('4')).toBeInTheDocument()
+
+    await user.click(nvfp4)
+    expect(await screen.findByText('Available quantizations and artifacts')).toBeInTheDocument()
+    expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
+    expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+  })
+
   it('locks community features behind sign-in and telemetry opt-in', async () => {
     Object.assign(communityAccess, { signedIn: false, sharingEnabled: false, enabled: false })
     const user = userEvent.setup()
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models')) return json({
         items: [{
@@ -217,7 +263,8 @@ describe('ExplorePage model rows', () => {
       })
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({ items: [], availability: 'not_configured', evidence_policy: {} })
-    }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
@@ -229,5 +276,24 @@ describe('ExplorePage model rows', () => {
     await user.click(await screen.findByRole('button', { name: 'Expand org/model' }))
 
     expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/api/v1/community/aggregates'))).toBe(false)
+  })
+
+  it('does not request hosted aggregates for a signed-in user who opted out', async () => {
+    Object.assign(communityAccess, { signedIn: true, sharingEnabled: false, enabled: false })
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [], total: 0 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    const tab = await screen.findByRole('tab', { name: 'Community Run Models' })
+    expect(tab).toBeDisabled()
+    expect(tab).toHaveAttribute('title', 'Enable telemetry under Settings → Community Features to see community data.')
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/api/v1/community/aggregates'))).toBe(false)
   })
 })

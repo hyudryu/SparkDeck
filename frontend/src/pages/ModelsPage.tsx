@@ -1033,7 +1033,7 @@ export function ModelsPage() {
               {transferPreflight.error && <div className="recipe-transfer-error" role="alert"><span>{transferPreflight.error}</span><Button type="button" variant="tertiary" onClick={transferPreflight.reload}>Retry</Button></div>}
               {transferPreflight.data && !transferPreflight.data.enabled && <p>Virtual NAS is disabled. Enable it on the Storage page before transferring weights.</p>}
               {transferPreflight.data?.enabled && transferPreflight.data.source && <p>A complete copy is available on {transferPreflight.data.source.node_name}; cache-empty nodes will receive it through Virtual NAS, while incomplete caches resume from Hugging Face.</p>}
-              {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download && <p>No cluster node has the requested revision. One selected node will download {formatBytes(transferPreflight.data.download.size_bytes)} from Hugging Face, then fan it out to the rest.</p>}
+              {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download && <p>No cluster node has the requested revision. Incomplete selected caches will resume from Hugging Face; a cache-empty selected node will seed any Virtual NAS fan-out.</p>}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download_error && <p>{transferPreflight.data.download_error}</p>}
               {transferPreflight.data?.enabled && <div className="recipe-transfer-targets">
                 {missingNodes.filter((node) => nodeIds.includes(node.id)).map((node) => {

@@ -325,6 +325,12 @@ class VirtualNAS:
                 "workflow_node_ids": list(raw.get("workflow_node_ids") or []),
                 "require_partial_cache": bool(raw.get("require_partial_cache")),
                 "download_attempted_at": raw.get("download_attempted_at"),
+                "legacy_download_attempt_tracking": bool(
+                    raw.get(
+                        "legacy_download_attempt_tracking",
+                        "download_attempted_at" not in raw,
+                    )
+                ),
                 "status": status,
                 "bytes_total": _nonnegative_int(raw.get("bytes_total")),
                 "bytes_transferred": _nonnegative_int(raw.get("bytes_transferred")),
@@ -1026,6 +1032,7 @@ class VirtualNAS:
             "requested_revision": requested_revision,
             "require_partial_cache": bool(require_partial_cache),
             "download_attempted_at": None,
+            "legacy_download_attempt_tracking": False,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
             "status": "queued", "bytes_total": expected_bytes,

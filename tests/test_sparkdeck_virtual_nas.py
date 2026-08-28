@@ -635,13 +635,25 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "id": "failed-download", "kind": "download",
                 "model_id": "org/model", "target_node_id": "worker-a",
                 "requested_revision": "release-1", "revision": RESOLVED_REVISION,
-                "status": "failed", "started_at": 4, "created_at": 5,
+                "status": "failed", "started_at": 4,
+                "download_attempted_at": 4.5,
+                "legacy_download_attempt_tracking": False, "created_at": 5,
+            },
+            {
+                "id": "failed-before-attempt", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-2", "revision": "b" * 40,
+                "status": "failed", "started_at": 6,
+                "download_attempted_at": None,
+                "legacy_download_attempt_tracking": False, "created_at": 7,
             },
             {
                 "id": "canceled-before-start", "kind": "download",
                 "model_id": "org/model", "target_node_id": "worker-a",
-                "requested_revision": "release-2", "revision": "b" * 40,
-                "status": "canceled", "started_at": None, "created_at": 6,
+                "requested_revision": "release-3", "revision": "c" * 40,
+                "status": "canceled", "started_at": None,
+                "download_attempted_at": None,
+                "legacy_download_attempt_tracking": False, "created_at": 8,
             },
         ]}
         manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={

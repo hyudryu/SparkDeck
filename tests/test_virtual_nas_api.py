@@ -301,12 +301,13 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
                     "revision": resolved,
                     "requested_revision": "main",
                     "hf_token": "ephemeral",
+                    "download_cache_baseline_bytes": 7,
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         checked.assert_awaited_once_with(
-            "org/model", resolved, "ephemeral", "main",
+            "org/model", resolved, "ephemeral", "main", 7,
         )
         self.assertNotIn("ephemeral", response.text)
 

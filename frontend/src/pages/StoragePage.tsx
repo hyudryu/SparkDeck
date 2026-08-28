@@ -20,8 +20,11 @@ function compareModels(left: StorageModel, right: StorageModel) {
   return right.size_bytes - left.size_bytes || compareModelIdsDescending(left.model_id, right.model_id)
 }
 
-function hasPartialDownload(model: StorageModel) {
-  return Boolean(model.partial || model.has_partial_download)
+function isPartialModel(model: StorageModel) {
+  // A repository can contain a complete usable revision alongside leftovers
+  // from a different interrupted revision. Only a repository with no complete
+  // snapshot should be presented as partial in the generic storage inventory.
+  return model.partial === true
 }
 
 function formatTimestamp(value?: string | number) {
@@ -36,6 +39,23 @@ function jobProgress(job: StorageTransferJob) {
   const reported = job.progress === undefined ? Number.NaN : job.progress <= 1 ? job.progress * 100 : job.progress
   const measured = job.bytes_total > 0 ? (job.bytes_transferred / job.bytes_total) * 100 : 0
   return Math.max(0, Math.min(100, Number.isFinite(reported) ? reported : measured))
+}
+
+function formatProgress(value: number) {
+  const rounded = Math.round(value * 10) / 10
+  return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)
+}
+
+function SmoothProgress({ value, label }: { value: number; label: string }) {
+  const progress = Math.max(0, Math.min(100, value))
+  return <div
+    className="storage-progress"
+    role="progressbar"
+    aria-label={label}
+    aria-valuemin={0}
+    aria-valuemax={100}
+    aria-valuenow={Math.round(progress * 10) / 10}
+  ><span style={{ transform: `scaleX(${progress / 100})` }} /></div>
 }
 
 function isActive(job: StorageTransferJob) {
@@ -193,7 +213,7 @@ export function StoragePage() {
   }
 
   const finishDownload = async (node: StorageNode, model: StorageModel) => {
-    if (!hasPartialDownload(model) || !node.online) return
+    if (!isPartialModel(model) || !node.online) return
     if (!await confirm({
       title: `Finish downloading ${model.model_id}?`,
       message: `Resume the Hugging Face download on ${node.name}? SparkDeck will reuse the partial cache and remove the warning when the download completes.`,
@@ -318,7 +338,7 @@ export function StoragePage() {
                       setDropTargetId(undefined)
                     }}
                   >
-                    {hasPartialDownload(model) ? <button
+                    {isPartialModel(model) ? <button
                       type="button"
                       className="storage-partial-action"
                       aria-label={`Finish download of ${model.model_id} on ${node.name}`}
@@ -326,7 +346,7 @@ export function StoragePage() {
                       disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
-                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : model.has_partial_download ? ' · Incomplete download' : ''}</small></div>
+                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                     <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
@@ -339,13 +359,12 @@ export function StoragePage() {
                   const progress = jobProgress(job)
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
-                  const indeterminate = downloading && running && job.bytes_transferred <= 0
                   const activity = downloading
                     ? running ? 'Downloading from Hugging Face' : 'Download queued'
                     : running ? `Transferring from ${job.source_node_name}` : 'Transfer queued'
                   return <li className="storage-active-weight" key={`job:${job.id}`} aria-label={`${activity} ${job.model_id} on ${node.name}`}>
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <UploadCloud size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><progress max="100" value={indeterminate ? undefined : progress} aria-label={`${activity} ${job.model_id} progress`} /><small>{indeterminate ? 'In progress' : `${Math.round(progress)}% · ${formatBytes(job.bytes_transferred)} of ${formatBytes(job.bytes_total)}`}</small></div>
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}</small></div>
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
                 })}
@@ -395,7 +414,7 @@ export function StoragePage() {
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
               <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => {
                 const location = locations.get(node.id)
-                const resumable = Boolean(location && hasPartialDownload(location))
+                const resumable = Boolean(location && isPartialModel(location))
                 return <span key={node.id} className={resumable ? 'partial' : location ? 'available' : ''}>{resumable && location ? <button
                   type="button"
                   className="storage-availability-action"
@@ -419,7 +438,7 @@ export function StoragePage() {
                 <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
                 <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
                 <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert">{job.error}</small>}</div>
-                <div role="cell" data-label="Progress" className="storage-job-progress"><progress max="100" value={progress} aria-label={`Transfer ${job.model_id} progress`} /><span>{Math.round(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}</span></div>
+                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}</span></div>
                 <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
               </div>
             })}

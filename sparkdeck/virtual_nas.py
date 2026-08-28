@@ -618,19 +618,6 @@ class VirtualNAS:
                 continue
             snapshot_revisions = _complete_snapshot_revisions(repository)
             partial = not bool(snapshot_revisions)
-            snapshots_root = repository / "snapshots"
-            incomplete_snapshot = False
-            if snapshots_root.is_dir() and not snapshots_root.is_symlink():
-                complete_revision_set = set(snapshot_revisions)
-                try:
-                    incomplete_snapshot = any(
-                        child.is_dir()
-                        and not child.is_symlink()
-                        and child.name not in complete_revision_set
-                        for child in snapshots_root.iterdir()
-                    )
-                except OSError:
-                    incomplete_snapshot = False
             size_bytes = 0
             incomplete_size_bytes = 0
             file_count = 0
@@ -653,11 +640,9 @@ class VirtualNAS:
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions),
             )
-            unassigned_incomplete_bytes = incomplete_size_bytes
             if len(incomplete_revision_bytes) == 1:
                 only_revision = next(iter(incomplete_revision_bytes))
                 incomplete_revision_bytes[only_revision] += incomplete_size_bytes
-                unassigned_incomplete_bytes = 0
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
@@ -679,13 +664,10 @@ class VirtualNAS:
                 "file_count": file_count,
                 "partial": partial,
                 "has_partial_download": (
-                    partial or incomplete_snapshot or incomplete_size_bytes > 0
+                    partial or bool(incomplete_revision_bytes)
                 ),
                 "partial_size_bytes": (
-                    size_bytes if partial else (
-                        unassigned_incomplete_bytes
-                        + sum(incomplete_revision_bytes.values())
-                    )
+                    size_bytes if partial else sum(incomplete_revision_bytes.values())
                 ),
                 "partial_revision_size_bytes": incomplete_revision_bytes,
                 "revisions": sorted(revisions),
@@ -1027,6 +1009,7 @@ class VirtualNAS:
             if download_cache_baseline_bytes is not None else None
         )
         download_baselines: dict[str, int] = {}
+        download_progress_bytes: dict[str, int] = {}
         targets = list(dict.fromkeys(
             str(value) for value in transfer_target_node_ids if value
         ))
@@ -1085,10 +1068,13 @@ class VirtualNAS:
                 )
             )
             download_baselines[node_id] = baseline
+            cached_bytes = min(
+                expected_bytes,
+                cached_download_bytes(cached_model, baseline, revision),
+            )
+            download_progress_bytes[node_id] = cached_bytes
             download_required = download_required_free_bytes(
-                expected_bytes, cached_download_bytes(
-                    cached_model, baseline, revision,
-                ),
+                expected_bytes, cached_bytes,
             )
             download_free = _optional_nonnegative_int(download_storage.get("free_size"))
             if download_free is None:
@@ -1145,7 +1131,8 @@ class VirtualNAS:
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
             "status": "queued", "bytes_total": expected_bytes,
-            "bytes_transferred": 0, "created_at": created,
+            "bytes_transferred": download_progress_bytes[node_id],
+            "created_at": created,
             "started_at": None, "completed_at": None, "error": None,
         } for node_id in download_nodes]
         primary_download_job = jobs[0]
@@ -1233,7 +1220,10 @@ class VirtualNAS:
                 "disk": {"free": _local_free_bytes(self._hub())},
             }
         node = self.node_registry.get(node_id)
-        status = await self.node_registry.probe(node, force=True)
+        # Queueing is preceded by a cluster/preflight inventory. Reuse that
+        # fresh status instead of bypassing the probe cache and allowing a
+        # second transient callback failure to misclassify a live node.
+        status = await self.node_registry.probe(node)
         if not status.get("online"):
             raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
         return status
@@ -1689,12 +1679,13 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
     try:
         snapshots = repository / "snapshots"
         blobs = repository / "blobs"
-        if (
-            not snapshots.is_dir() or snapshots.is_symlink()
-            or not blobs.is_dir() or blobs.is_symlink()
-        ):
+        if not snapshots.is_dir() or snapshots.is_symlink():
             return set()
-        blob_root = blobs.resolve(strict=True)
+        blob_root = None
+        if blobs.exists():
+            if not blobs.is_dir() or blobs.is_symlink():
+                return set()
+            blob_root = blobs.resolve(strict=True)
         complete = set()
         for snapshot in snapshots.iterdir():
             if (
@@ -1714,12 +1705,13 @@ def _incomplete_snapshot_reusable_bytes(
     try:
         snapshots = repository / "snapshots"
         blobs = repository / "blobs"
-        if (
-            not snapshots.is_dir() or snapshots.is_symlink()
-            or not blobs.is_dir() or blobs.is_symlink()
-        ):
+        if not snapshots.is_dir() or snapshots.is_symlink():
             return {}
-        blob_root = blobs.resolve(strict=True)
+        blob_root = None
+        if blobs.exists():
+            if not blobs.is_dir() or blobs.is_symlink():
+                return {}
+            blob_root = blobs.resolve(strict=True)
         complete_blobs: set[Path] = set()
         for revision in complete_revisions:
             snapshot = snapshots / revision
@@ -1727,6 +1719,8 @@ def _incomplete_snapshot_reusable_bytes(
                 continue
             for item in snapshot.rglob("*"):
                 if not item.is_symlink() or not item.is_file():
+                    continue
+                if blob_root is None:
                     continue
                 resolved = item.resolve(strict=True)
                 if resolved.is_relative_to(blob_root) and resolved.is_file():
@@ -1743,7 +1737,7 @@ def _incomplete_snapshot_reusable_bytes(
                 if item.name.endswith((".incomplete", ".lock")):
                     continue
                 if item.is_symlink():
-                    if not item.is_file():
+                    if blob_root is None or not item.is_file():
                         continue
                     resolved = item.resolve(strict=True)
                     if (
@@ -1764,13 +1758,13 @@ def _incomplete_snapshot_reusable_bytes(
         return {}
 
 
-def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:
+def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     files: dict[str, Path] = {}
     try:
         for item in snapshot.rglob("*"):
             relative = item.relative_to(snapshot).as_posix()
             if item.is_symlink():
-                if not item.is_file():
+                if blob_root is None or not item.is_file():
                     return False
                 resolved = item.resolve(strict=True)
                 if not resolved.is_relative_to(blob_root) or not resolved.is_file():

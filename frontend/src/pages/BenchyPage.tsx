@@ -15,14 +15,21 @@ import {
 import { useResource } from '../hooks/useResource'
 import { BenchyChart } from '../components/BenchyChart'
 
-function parseNumberList(text: string): number[] {
+function parseNumberList(text: string): { values: number[]; invalid: string[] } {
   const values: number[] = []
+  const invalid: string[] = []
   for (const part of text.split(/[\s,]+/)) {
     if (!part) continue
+    // Whole positive integers only: parseInt would silently truncate
+    // "1.5" to 1 and "2foo" to 2, running a different workload than entered.
+    if (!/^[1-9]\d*$/.test(part)) {
+      invalid.push(part)
+      continue
+    }
     const value = Number.parseInt(part, 10)
-    if (Number.isFinite(value) && value > 0 && !values.includes(value)) values.push(value)
+    if (!values.includes(value)) values.push(value)
   }
-  return values
+  return { values, invalid }
 }
 
 function formatSeconds(value?: number | null) {
@@ -85,13 +92,19 @@ export function BenchyPage() {
   // run changes, including completing (which clears active_run_id).
   const previousActiveRef = useRef<string | undefined>(undefined)
   useEffect(() => {
-    if (previousActiveRef.current && previousActiveRef.current !== activeRunId) runs.reload()
+    if (previousActiveRef.current && previousActiveRef.current !== activeRunId) {
+      runs.reload()
+      // The selected run may just have become terminal: fetch its results.
+      detail.reload()
+    }
     previousActiveRef.current = activeRunId ?? undefined
     if (!activeRunId) return
     const timer = window.setInterval(() => {
       activeRun.reload()
       status.reload()
       runs.reload()
+      // Keep an open detail of the active run live while it progresses.
+      detail.reload()
     }, 2_000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -113,19 +126,24 @@ export function BenchyPage() {
     const concurrency = parseNumberList(concurrencyText)
     const promptSizes = parseNumberList(promptText)
     const responseSizes = parseNumberList(responseText)
+    const invalid = [...promptSizes.invalid, ...responseSizes.invalid, ...concurrency.invalid]
+    if (invalid.length) {
+      setFormError(`Invalid values: ${invalid.join(', ')}. Use whole numbers, e.g. 2048.`)
+      return
+    }
     if (!modelId) { setFormError('Select a served model to benchmark.'); return }
-    if (!promptSizes.length) { setFormError('Enter at least one prompt size.'); return }
-    if (!responseSizes.length) { setFormError('Enter at least one output token count.'); return }
-    if (!concurrency.length) { setFormError('Enter at least one concurrency level.'); return }
+    if (!promptSizes.values.length) { setFormError('Enter at least one prompt size.'); return }
+    if (!responseSizes.values.length) { setFormError('Enter at least one output token count.'); return }
+    if (!concurrency.values.length) { setFormError('Enter at least one concurrency level.'); return }
     setFormError(undefined)
     setActionError(undefined)
     setStarting(true)
     try {
       await api.benchy.start({
         model_id: modelId,
-        prompt_sizes: promptSizes,
-        response_sizes: responseSizes,
-        concurrency_levels: concurrency,
+        prompt_sizes: promptSizes.values,
+        response_sizes: responseSizes.values,
+        concurrency_levels: concurrency.values,
         context_depths: [0],
         runs: Math.min(10, Math.max(1, runsPerTest || 3)),
         warmup_runs: 1,
@@ -312,12 +330,12 @@ export function BenchyPage() {
         />
       )}
       {runs.data && runs.data.length > 0 && (
-        <Panel className="table-panel"><div className="responsive-table" role="table" aria-label="Benchmark run history">
+        <Panel className="table-panel"><div className="responsive-table benchy-history-table" role="table" aria-label="Benchmark run history">
           <div className="table-row table-header" role="row">
-            <span role="columnheader">Run</span><span role="columnheader">Model</span>
-            <span role="columnheader">Quantization</span><span role="columnheader">Configuration</span>
-            <span role="columnheader">Results</span><span role="columnheader">Duration</span>
-            <span role="columnheader">Status</span><span role="columnheader">Actions</span>
+            <div role="columnheader">Run</div><div role="columnheader">Model</div>
+            <div role="columnheader">Quantization</div><div role="columnheader">Configuration</div>
+            <div role="columnheader">Results</div><div role="columnheader">Duration</div>
+            <div role="columnheader">Status</div><div role="columnheader">Actions</div>
           </div>
           {runs.data.map((run) => (
             <div
@@ -334,18 +352,18 @@ export function BenchyPage() {
                 }
               }}
             >
-              <span role="cell" data-label="Run"><strong>{new Date(run.created_at).toLocaleString()}</strong></span>
-              <span role="cell" data-label="Model">{run.model}</span>
-              <span role="cell" data-label="Quantization">{run.quantization ?? 'Default precision'}</span>
-              <span role="cell" data-label="Configuration"><small>{configSummary(run)}</small></span>
-              <span role="cell" data-label="Results">{run.result_count ?? 0} rows</span>
-              <span role="cell" data-label="Duration">{formatSeconds(run.duration_seconds)}</span>
-              <span role="cell" data-label="Status">
+              <div role="cell" data-label="Run"><strong>{new Date(run.created_at).toLocaleString()}</strong></div>
+              <div role="cell" data-label="Model">{run.model}</div>
+              <div role="cell" data-label="Quantization">{run.quantization ?? 'Default precision'}</div>
+              <div role="cell" data-label="Configuration"><small>{configSummary(run)}</small></div>
+              <div role="cell" data-label="Results">{run.result_count ?? 0} rows</div>
+              <div role="cell" data-label="Duration">{formatSeconds(run.duration_seconds)}</div>
+              <div role="cell" data-label="Status">
                 <Status status={run.status === 'completed' ? 'completed' : run.status}>
                   {RUN_STATUS_LABEL[run.status] ?? run.status}
                 </Status>
-              </span>
-              <span role="cell" data-label="Actions" className="benchy-run-actions-cell">
+              </div>
+              <div role="cell" data-label="Actions" className="benchy-run-actions-cell">
                 {run.status === 'completed' && (
                   <a
                     className="icon-button"
@@ -362,7 +380,7 @@ export function BenchyPage() {
                     onClick={(event) => { event.stopPropagation(); void remove(run.id) }}
                   ><Trash2 size={15} /></Button>
                 )}
-              </span>
+              </div>
             </div>
           ))}
         </div></Panel>
@@ -412,22 +430,22 @@ export function BenchyPage() {
                 metric="tg_tokens_per_second_request"
               />
             </div>
-            <Panel className="table-panel"><div className="responsive-table" role="table" aria-label="Run measurements">
+            <Panel className="table-panel"><div className="responsive-table benchy-measure-table" role="table" aria-label="Run measurements">
               <div className="table-row table-header" role="row">
-                <span role="columnheader">Prompt</span><span role="columnheader">Output</span>
-                <span role="columnheader">Concurrency</span><span role="columnheader">Prompt tok/s</span>
-                <span role="columnheader">Generation tok/s</span><span role="columnheader">Per-request tok/s</span>
-                <span role="columnheader">TTFR</span>
+                <div role="columnheader">Prompt</div><div role="columnheader">Output</div>
+                <div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>
+                <div role="columnheader">Generation tok/s</div><div role="columnheader">Per-request tok/s</div>
+                <div role="columnheader">TTFR</div>
               </div>
               {activeDetail.results.map((row, index) => (
                 <div className="table-row" role="row" key={index}>
-                  <span role="cell" data-label="Prompt">{row.prompt_size?.toLocaleString()}</span>
-                  <span role="cell" data-label="Output">{row.response_size}</span>
-                  <span role="cell" data-label="Concurrency">C{row.concurrency}</span>
-                  <span role="cell" data-label="Prompt tok/s">{formatRate(row.pp_tokens_per_second ?? undefined)}</span>
-                  <span role="cell" data-label="Generation tok/s">{formatRate(row.tg_tokens_per_second ?? undefined)}</span>
-                  <span role="cell" data-label="Per-request tok/s">{formatRate(row.tg_tokens_per_second_request ?? undefined)}</span>
-                  <span role="cell" data-label="TTFR">{row.ttfr_ms ? `${Math.round(row.ttfr_ms)} ms` : '—'}</span>
+                  <div role="cell" data-label="Prompt">{row.prompt_size?.toLocaleString()}</div>
+                  <div role="cell" data-label="Output">{row.response_size}</div>
+                  <div role="cell" data-label="Concurrency">C{row.concurrency}</div>
+                  <div role="cell" data-label="Prompt tok/s">{formatRate(row.pp_tokens_per_second ?? undefined)}</div>
+                  <div role="cell" data-label="Generation tok/s">{formatRate(row.tg_tokens_per_second ?? undefined)}</div>
+                  <div role="cell" data-label="Per-request tok/s">{formatRate(row.tg_tokens_per_second_request ?? undefined)}</div>
+                  <div role="cell" data-label="TTFR">{row.ttfr_ms ? `${Math.round(row.ttfr_ms)} ms` : '—'}</div>
                 </div>
               ))}
             </div></Panel>

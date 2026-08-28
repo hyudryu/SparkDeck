@@ -162,6 +162,23 @@ describe('BenchyPage', () => {
     expect(startCalls).toHaveLength(0)
   })
 
+  it('rejects malformed numeric input instead of truncating it', async () => {
+    stubFetch()
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })
+    await user.clear(screen.getByLabelText(/Prompt sizes/))
+    await user.type(screen.getByLabelText(/Prompt sizes/), '1.5')
+    await user.click(screen.getByRole('button', { name: 'Start benchmark' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Invalid values: 1.5')
+    const startCalls = vi.mocked(globalThis.fetch).mock.calls.filter(
+      ([input, init]) => String(input).endsWith('/api/v1/benchy/runs') && init?.method === 'POST',
+    )
+    expect(startCalls).toHaveLength(0)
+  })
+
   it('charts prompt processing, generation, and per-output speed for a selected run', async () => {
     stubFetch()
     const user = userEvent.setup()

@@ -604,3 +604,6 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .benchy-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .benchy-detail-head h3 { margin: 0; font-size: 15px; }
 .benchy-detail-head p { margin: 2px 0 0; font-size: 12px; }
+/* Benchy tables: explicit columns so desktop rows form a real grid. */
+.benchy-history-table .table-row { grid-template-columns: minmax(150px, 1.25fr) minmax(150px, 1.35fr) minmax(95px, .8fr) minmax(150px, 1.2fr) minmax(65px, .6fr) minmax(75px, .7fr) minmax(95px, .8fr) 92px; }
+.benchy-measure-table .table-row { grid-template-columns: repeat(7, minmax(0, 1fr)); }

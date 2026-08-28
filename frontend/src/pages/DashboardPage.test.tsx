@@ -133,9 +133,9 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('Loading system overview')).not.toBeInTheDocument()
     expect(screen.getByText('Loading cluster nodes')).toBeInTheDocument()
     expect(screen.getAllByText('Loading deployments')).toHaveLength(2)
-    expect(screen.getByText('Loading inference status')).toBeInTheDocument()
+    expect(screen.getByText('No active inference')).toBeInTheDocument()
+    expect(screen.getAllByText(/queue loading/)).toHaveLength(2)
     expect(screen.queryByText('Idle')).not.toBeInTheDocument()
-    expect(screen.queryByText('No active inference')).not.toBeInTheDocument()
   })
 
   it('does not abort a slow initial load when the refresh interval elapses', async () => {
@@ -214,7 +214,7 @@ describe('DashboardPage', () => {
         headers: { 'Content-Type': 'application/json' },
       })
       if (tracked === '/api/stats') return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
-      if (tracked === '/api/inference-queue') return json({})
+      if (tracked === '/api/inference-queue') return json({ model: { running: 0, queued: 2 } })
       if (tracked === '/api/v1/deployments') return json({ items: [] })
       if (tracked === '/api/v1/community/sync') return json({ consent: false, outbox: {} })
       return json({ items: [] })
@@ -229,7 +229,52 @@ describe('DashboardPage', () => {
     expect(screen.getByText(/Local telemetry refresh paused: refresh failed/)).toBeInTheDocument()
     expect(screen.getByText(/Cluster inventory refresh paused: refresh failed/)).toBeInTheDocument()
     expect(screen.getByText(/Deployment refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getByText(/Queue refresh paused: refresh failed/)).toBeInTheDocument()
+    expect(screen.getAllByText(/2 queued · refresh paused/)).toHaveLength(2)
     expect(screen.getByText(/0 pending · 0 synced · refresh paused/)).toBeInTheDocument()
+  })
+
+  it('keeps live session details visible when initial queue loading fails', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({
+        cpu_pct: 25, mem: {}, gpus: [],
+        active_requests: { 'live-model': { connections: 1, output_tok_s: 12 } },
+      })
+      if (path.includes('/api/inference-queue')) return new Response(
+        JSON.stringify({ detail: 'queue unavailable' }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } },
+      )
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('Processing')).toBeInTheDocument()
+    expect(screen.getByText(/Queue status unavailable: queue unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText('Active session status unavailable')).not.toBeInTheDocument()
+  })
+
+  it('prefers fresh local stats over retained local node telemetry', () => {
+    const snapshot = clusterResourceSnapshot([{
+      id: 'local', name: 'This node', local: true, online: true,
+      stats: {
+        cpu_pct: 10, cpu_logical_count: 8,
+        mem: { used: 2, total: 10 },
+        gpus: [{ index: 0, util: 10 }],
+      },
+    }], {
+      cpu_pct: 80, cpu_logical_count: 8,
+      mem: { used: 8, total: 10 },
+      gpus: [{ index: 0, util: 70 }],
+    })
+
+    expect(snapshot.cpuPct).toBe(80)
+    expect(snapshot.ramUsed).toBe(8)
+    expect(snapshot.gpuPct).toBe(70)
   })
 
   it('uses equal node weighting when logical CPU counts are incomplete', () => {

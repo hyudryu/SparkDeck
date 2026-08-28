@@ -3025,6 +3025,29 @@ class Manager:
             ),
         }
 
+    @classmethod
+    def _validated_sg_scalar(cls, key: str, value: Any) -> Any:
+        """Normalize an SGLang scalar so it can never emit an invalid flag.
+
+        sg_tp_size / sg_context_length / sg_max_running_requests become
+        positive integers; sg_mem_fraction must land in (0, 1].
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a number") from exc
+        if key == "sg_mem_fraction":
+            if not 0 < number <= 1:
+                raise ValueError("sg_mem_fraction must be between 0 and 1")
+            return number
+        if not number.is_integer() or number < 1:
+            raise ValueError(f"{key} must be a positive integer")
+        return int(number)
+
     def _apply_deployment_launch_controls(
         self, args: list[str], engine: str, controls: dict
     ) -> list[str]:
@@ -3115,6 +3138,9 @@ class Manager:
         """Save the inputs used to rebuild a stopped clustered deployment."""
         if "extra_args" in body:
             self._reject_sensitive_cli_credentials(body.get("extra_args"))
+        for sg_key in ("sg_tp_size", "sg_mem_fraction"):
+            if sg_key in body:
+                body[sg_key] = self._validated_sg_scalar(sg_key, body[sg_key])
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -8151,12 +8177,19 @@ class Manager:
         node_ids: list[str] | None = None,
         launch_controls: dict | None = None,
         force_new: bool = False,
+        replace_launch_inputs: bool = False,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if not model:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
+        sg_tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
+        sg_context_length = self._validated_sg_scalar("sg_context_length", sg_context_length)
+        sg_max_running_requests = self._validated_sg_scalar(
+            "sg_max_running_requests", sg_max_running_requests,
+        )
+        sg_mem_fraction = self._validated_sg_scalar("sg_mem_fraction", sg_mem_fraction)
         deployment_mode = deployment_mode or "single"
         if deployment_mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
@@ -8213,6 +8246,17 @@ class Manager:
                         r["sg_mem_fraction"] = sg_mem_fraction
                     if sg_image is not None:
                         r["sg_image"] = sg_image
+                    if replace_launch_inputs:
+                        # Re-imports must mirror the container exactly: a
+                        # managed option removed from the command clears the
+                        # stored scalar instead of keeping a stale value.
+                        r["extra_args"] = list(extra_args or [])
+                        r["gpu_memory_utilization"] = gpu_memory_utilization
+                        r["gpu_memory_gb"] = gpu_memory_gb
+                        r["sg_tp_size"] = sg_tp_size
+                        r["sg_context_length"] = sg_context_length
+                        r["sg_max_running_requests"] = sg_max_running_requests
+                        r["sg_mem_fraction"] = sg_mem_fraction
                     r["deployment_mode"] = deployment_mode or "single"
                     r["node_ids"] = list(node_ids or [LOCAL_NODE_ID])
                     self._save_recipes()
@@ -8265,6 +8309,12 @@ class Manager:
             raise ValueError(f"unsupported recipe field(s): {', '.join(unknown)}")
         if "extra_args" in changes:
             self._reject_hf_cli_credentials(changes.get("extra_args"))
+        for sg_key in (
+            "sg_tp_size", "sg_context_length",
+            "sg_max_running_requests", "sg_mem_fraction",
+        ):
+            if sg_key in changes:
+                changes[sg_key] = self._validated_sg_scalar(sg_key, changes[sg_key])
         async with self.lock:
             recipe = next((r for r in self.recipes if r.get("id") == rid), None)
             if not recipe:
@@ -8756,19 +8806,25 @@ class Manager:
         attrs = c.attrs or {}
         image_tag = attrs.get("Config", {}).get("Image") or attrs.get("Image") or None
         engine = _label_value(labels, ENGINE_LABEL, "")
-        if engine not in {"vllm", "sglang"}:
+        if not engine:
             engine = "sglang" if _is_sglang_image(image_tag) else "vllm"
 
         cmd = [str(value) for value in (attrs.get("Config", {}).get("Cmd") or [])]
-        if not model:
-            if engine == "sglang" and "--model-path" in cmd:
-                i = cmd.index("--model-path")
-                if i + 1 < len(cmd):
-                    model = cmd[i + 1]
-            elif "serve" in cmd:
+        if not model and engine == "sglang":
+            # _cli_option understands both "--model-path x" and "--model-path=x".
+            model = self._cli_option(cmd, {"--model-path"}) or ""
+        if not model and engine != "sglang":
+            if "serve" in cmd:
                 i = cmd.index("serve")
                 if i + 1 < len(cmd):
                     model = cmd[i + 1]
+            elif len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
+                match = self._shell_vllm_command(cmd[-1])
+                if match:
+                    try:
+                        model = shlex.split(match.group("model"))[0]
+                    except (ValueError, IndexError):
+                        model = match.group("model")
         if not model:
             raise ValueError(
                 f"could not determine the served model from container '{name}'"
@@ -8811,6 +8867,7 @@ class Manager:
             sg_mem_fraction=sg_mem_fraction,
             sg_image=image_tag if engine == "sglang" else None,
             launch_controls=launch_controls or None,
+            replace_launch_inputs=True,
         )
 
     # ---------- cross-backend mutual exclusion ----------
@@ -8848,9 +8905,10 @@ class Manager:
 
         is_managed = _label_value(labels, CONTROLLER_LABEL) == "1"
         engine_label = _label_value(labels, ENGINE_LABEL, "")
-        if engine_label not in {"vllm", "sglang"}:
+        if not engine_label:
             # Unlabelled containers are inferred from the image so external
-            # SGLang runs are parsed as SGLang instead of vLLM.
+            # SGLang runs are parsed as SGLang instead of vLLM. Explicit
+            # labels (including llama.cpp) are always preserved.
             engine_label = "sglang" if _is_sglang_image(image_tag) else "vllm"
         is_atlas_serving = _is_atlas_serving_container(c.name, image_tag)
         if (

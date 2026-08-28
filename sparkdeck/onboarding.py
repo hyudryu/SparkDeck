@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -235,11 +235,15 @@ def is_forwardable_path(path: str) -> bool:
 
 
 class OnboardingService:
-    def __init__(self, manager: Any, data_dir: Path, port: int = 7878):
+    def __init__(
+        self, manager: Any, data_dir: Path, port: int = 7878,
+        revoke_community_consent: Callable[[], Awaitable[Any]] | None = None,
+    ):
         self.manager = manager
         self.data_dir = Path(data_dir)
         self.port = int(port)
         self.assignment = ControllerAssignment(data_dir)
+        self._revoke_community_consent = revoke_community_consent
         self._join_attempts: dict[str, deque[float]] = defaultdict(deque)
         self._membership_lock = asyncio.Lock()
 
@@ -682,6 +686,8 @@ class OnboardingService:
         # worker before deleting the only durable record of that controller.
         # If the atomic credential write fails, leave controller.json intact
         # so the user can retry and the process cannot report a false leave.
+        if self._revoke_community_consent is not None:
+            await self._revoke_community_consent()
         self.manager.agent_credentials.revoke_remote_access()
         self.assignment.clear()
         adopt_controller = getattr(self.manager, "adopt_controller_role", None)
@@ -694,6 +700,8 @@ class OnboardingService:
     async def detach(self) -> dict[str, Any]:
         """Honor an authenticated controller request to remove this worker."""
         await self._assert_no_owned_workloads("leave")
+        if self._revoke_community_consent is not None:
+            await self._revoke_community_consent()
         self.manager.agent_credentials.revoke_remote_access()
         self.assignment.clear()
         adopt_controller = getattr(self.manager, "adopt_controller_role", None)

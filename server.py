@@ -45,7 +45,10 @@ from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
-onboarding = OnboardingService(manager, data_dir=ROOT / "data", port=7878)
+onboarding = OnboardingService(
+    manager, data_dir=ROOT / "data", port=7878,
+    revoke_community_consent=lambda: sparkdeck.set_community_consent(False),
+)
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(

@@ -471,6 +471,17 @@ class SparkDeckService:
             raw_model_id, deployment.get("id") or deployment_id,
             upload_model_id=upload_model_id,
         )
+        deployment_model = deployment.get("model") or {}
+        quantization = (
+            _optional_string(deployment_model.get("quantization"))
+            or _optional_string(settings.get("quantization"))
+            or quantization_from_text(
+                settings.get("gguf_variant"),
+                deployment_model.get("artifact"),
+                raw_model_id,
+            )
+            or "unknown"
+        ).upper()
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -504,7 +515,9 @@ class SparkDeckService:
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=point["created_at"],
             deployment_id=deployment.get("id"),
-            model=ModelIdentity(repository=upload_model_id), runtime=runtime,
+            model=ModelIdentity(
+                repository=upload_model_id, quantization=quantization,
+            ), runtime=runtime,
             runtime_version=_optional_string(settings.get("runtime_version")),
             hardware=hardware, configuration=configuration,
             input_tokens=prompt_tokens, output_tokens=generation_tokens,
@@ -1898,11 +1911,12 @@ class SparkDeckService:
 
     def _community_observation_start(self) -> dict[str, Any] | None:
         snapshot = self.store.community_consent_snapshot()
-        if not snapshot.get("enabled"):
-            return {"enabled": False, "generation": snapshot.get("generation", 0)}
         observation = {
             "id": str(uuid.uuid4()),
-            "enabled": True,
+            # Opted-out requests carry only lifecycle state. They never reach
+            # sample collection, but remain visible long enough to invalidate
+            # an opted-in request whose decode overlaps them.
+            "enabled": bool(snapshot.get("enabled")),
             "generation": int(snapshot.get("generation") or 0),
             "contaminated": bool(self._community_active_observations),
         }

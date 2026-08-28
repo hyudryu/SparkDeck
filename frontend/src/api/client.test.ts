@@ -31,6 +31,26 @@ describe('API client adapters', () => {
     }))
   })
 
+  it('updates fan settings on the selected node with optimistic mode matching', async () => {
+    const curve = {
+      curve_points: [[30, 20], [60, 55], [80, 100]],
+      curve_min_temp: 30,
+      curve_max_temp: 80,
+      min_floor_pct: 20,
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      node_id: 'node/1', mode: 'curve', previous_mode: 'pid', active_settings: curve,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.fanControl.updateSettings('node/1', 'curve', curve, 'pid')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/fan-control/nodes/node%2F1/settings', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ mode: 'curve', active_settings: curve, expected_mode: 'pid' }),
+    }))
+  })
+
   it('restores sanitized community state from the node session', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       status: 'signed-in', email: 'user@example.com', token_invalid: false,

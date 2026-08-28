@@ -328,6 +328,31 @@ class FanControlClusterTests(unittest.IsolatedAsyncioTestCase):
             timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
         )
 
+    async def test_remote_settings_update_uses_authenticated_agent_contract(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1", "name": "Rack", "online": True,
+            "stats": {"fan": self.live_fan()},
+        }])
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(return_value={
+            "mode": "curve", "previous_mode": "pid", "active_settings": CURVE,
+        })
+
+        result = await instance.update_node_fan_settings(
+            "worker-1", "curve", CURVE, "pid",
+        )
+
+        self.assertEqual(result["node_id"], "worker-1")
+        self.assertEqual(result["active_settings"], CURVE)
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "PATCH", "/api/agent/fan-control/settings",
+            json_body={
+                "mode": "curve", "active_settings": CURVE, "expected_mode": "pid",
+            },
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
     async def test_max_speed_rejects_non_boolean_before_routing(self) -> None:
         instance = Manager.__new__(Manager)
         instance.cluster_nodes = mock.AsyncMock()

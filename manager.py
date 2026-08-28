@@ -1436,6 +1436,44 @@ class Manager:
             raise RuntimeError("FanController did not accept the requested mode")
         return {"node_id": normalized, "enabled": enabled}
 
+    async def update_node_fan_settings(
+        self, node_id: str, mode: Any, settings: Any, expected_mode: Any,
+    ) -> dict:
+        """Atomically update FanController settings on one capable cluster node."""
+        validated = self._validate_fan_settings(mode, settings)
+        if expected_mode not in FAN_MODE_DEFAULTS:
+            raise ValueError("unknown expected fan mode")
+        normalized = str(node_id or "").strip()
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        node = available.get(normalized)
+        if node is None:
+            raise ValueError("cluster node not found")
+        if not node.get("online"):
+            raise RuntimeError(f"{node.get('name', normalized)} is offline")
+        if self._sanitize_fan_state((node.get("stats") or {}).get("fan")) is None:
+            raise FanSettingsConflict("FanController state is unavailable")
+
+        body = {
+            "mode": mode,
+            "active_settings": validated,
+            "expected_mode": expected_mode,
+        }
+        if normalized == LOCAL_NODE_ID:
+            result = self.update_fan_settings(mode, validated, expected_mode)
+        else:
+            result = await self.node_registry.request(
+                normalized, "PATCH", "/api/agent/fan-control/settings",
+                json_body=body, timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+            )
+        if (
+            not isinstance(result, dict)
+            or result.get("mode") != mode
+            or result.get("previous_mode") != expected_mode
+            or result.get("active_settings") != validated
+        ):
+            raise RuntimeError("FanController did not accept the requested settings")
+        return {**result, "node_id": normalized}
+
     async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
         """Durably rename a local or paired node without exposing credentials.
 

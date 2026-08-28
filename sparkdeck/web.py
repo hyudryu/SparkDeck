@@ -17,6 +17,7 @@ SPA_PATHS = (
     "/chat",
     "/compare",
     "/cluster",
+    "/fan-control",
     "/switch",
     "/storage",
     "/benchmarks",

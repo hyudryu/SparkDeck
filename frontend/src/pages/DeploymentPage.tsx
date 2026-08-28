@@ -52,7 +52,7 @@ function splitFlags(input: string): string[] {
   return values
 }
 
-type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'extra_args', string>
+type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'extra_args', string>
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
   context_window: detail.launch_controls.context_window?.toString() ?? '',
@@ -64,6 +64,8 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   max_num_batched_tokens: detail.launch_controls.max_num_batched_tokens?.toString() ?? '',
   gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
   gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
+  sg_tp_size: detail.sg_tp_size?.toString() ?? '',
+  sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
   extra_args: detail.extra_args.map(quoteArg).join(' '),
 })
 
@@ -83,6 +85,8 @@ function updateInput(editor: Editor): DeploymentUpdateInput {
     },
     gpu_memory_utilization: optionalNumber(editor.gpu_memory_utilization),
     gpu_memory_gb: optionalNumber(editor.gpu_memory_gb),
+    sg_tp_size: optionalNumber(editor.sg_tp_size),
+    sg_mem_fraction: optionalNumber(editor.sg_mem_fraction),
   }
 }
 
@@ -159,8 +163,14 @@ export function DeploymentPage() {
         <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>
         <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>
         <label className="field"><span>Max batched tokens</span><input disabled={disabled} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} /></label>
-        <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
-        <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
+        {detail.runtime === 'vllm' && <>
+          <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
+          <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
+        </>}
+        {detail.runtime === 'sglang' && <>
+          <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
+          <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
+        </>}
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
         <div className="settings-save wide-field"><Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button><Button type="button" variant="primary" disabled={disabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button></div>
       </form>

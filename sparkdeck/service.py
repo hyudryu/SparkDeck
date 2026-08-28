@@ -916,6 +916,8 @@ class SparkDeckService:
                 (launch_settings or {}).get("gpu_memory_utilization")
             ),
             "gpu_memory_gb": (launch_settings or {}).get("gpu_memory_gb"),
+            "sg_tp_size": (launch_settings or {}).get("sg_tp_size"),
+            "sg_mem_fraction": (launch_settings or {}).get("sg_mem_fraction"),
             "image": (launch_settings or {}).get("image"),
         }
 
@@ -926,6 +928,7 @@ class SparkDeckService:
         allowed = {
             "extra_args", "launch_controls",
             "gpu_memory_utilization", "gpu_memory_gb",
+            "sg_tp_size", "sg_mem_fraction",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:

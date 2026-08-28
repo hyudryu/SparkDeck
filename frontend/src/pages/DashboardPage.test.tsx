@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NodeInventoryItem } from '../api/types'
@@ -8,7 +8,7 @@ function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
   it('renders pooled CPU, GPU, and RAM while excluding hidden nodes', async () => {
@@ -106,6 +106,65 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('No nodes shown on the dashboard')).toBeInTheDocument()
     expect(screen.getByText(/0 of 0 visible nodes online.*1 hidden/)).toBeInTheDocument()
     expect(screen.queryByText('Hidden node')).not.toBeInTheDocument()
+  })
+
+  it('does not abort a slow initial load when the refresh interval elapses', async () => {
+    vi.useFakeTimers()
+    let finishNodeInventory: ((response: Response) => void) | undefined
+    let nodeInventorySignal: AbortSignal | undefined
+    let nodeInventoryCalls = 0
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      nodeInventoryCalls += 1
+      nodeInventorySignal ??= init?.signal ?? undefined
+      return new Promise<Response>((resolve) => { finishNodeInventory = resolve })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(nodeInventoryCalls).toBe(1)
+    expect(nodeInventorySignal?.aborted).toBe(false)
+
+    await act(async () => { finishNodeInventory?.(json({ items: [] })) })
+    expect(screen.getByText('Pooled CPU')).toBeInTheDocument()
+  })
+
+  it('lets a stuck initial request reach the client timeout', async () => {
+    vi.useFakeTimers()
+    let statsSignal: AbortSignal | undefined
+    let statsCalls = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) {
+        statsCalls += 1
+        statsSignal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          statsSignal?.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'))
+          }, { once: true })
+        })
+      }
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(statsCalls).toBe(1)
+    expect(statsSignal?.aborted).toBe(false)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    expect(screen.getByText('The request timed out. Check the node connection and retry.')).toBeInTheDocument()
+    expect(screen.queryByText('Loading system overview')).not.toBeInTheDocument()
   })
 
   it('uses equal node weighting when logical CPU counts are incomplete', () => {

@@ -4129,7 +4129,52 @@ class Manager:
             "fabrics": fabrics,
         }
 
-    async def create_deployment(self, body: dict) -> dict:
+    async def create_deployment(
+        self, body: dict, *, launch_persisted: asyncio.Future | None = None,
+    ) -> dict:
+        """Create a clustered deployment and optionally signal durable launch state.
+
+        ``launch_persisted`` is an internal hand-off used by the v1 service. It
+        completes after the deployment and its queued member identities have
+        been flushed to ``deployments.json``, before any potentially long image
+        pull. Existing callers retain the original wait-for-launch contract.
+        """
+        try:
+            return await self._create_deployment(body, launch_persisted)
+        except asyncio.CancelledError:
+            record_id = body.get("sparkdeck_record_id")
+            interrupted = next(
+                (
+                    deployment for deployment in self.deployments
+                    if deployment.get("sparkdeck_record_id") == record_id
+                ),
+                None,
+            )
+            if interrupted is not None:
+                interrupted["status"] = "recovering"
+                interrupted["status_message"] = (
+                    "Controller stopped while launch was in progress; "
+                    "reconciling node state"
+                )
+                for member in interrupted.get("members") or []:
+                    member["phase"] = {
+                        "phase": "recovering",
+                        "message": interrupted["status_message"],
+                    }
+                self._save_deployments()
+            if launch_persisted is not None and not launch_persisted.done():
+                launch_persisted.set_exception(RuntimeError(
+                    "deployment launch stopped before it was accepted"
+                ))
+            raise
+        except BaseException as exc:
+            if launch_persisted is not None and not launch_persisted.done():
+                launch_persisted.set_exception(exc)
+            raise
+
+    async def _create_deployment(
+        self, body: dict, launch_persisted: asyncio.Future | None = None,
+    ) -> dict:
         plan = await self._preflight_deployment_launch(body)
         body = plan["body"]
         engine = plan["engine"]
@@ -4276,6 +4321,8 @@ class Manager:
             "port": requested_port,
         })
         self._save_deployments()
+        if launch_persisted is not None and not launch_persisted.done():
+            launch_persisted.set_result(deployment)
 
         created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []

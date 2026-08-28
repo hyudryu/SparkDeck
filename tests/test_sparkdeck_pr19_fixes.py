@@ -484,6 +484,175 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(errors[0], ValueError)
         self.assertEqual(len(self.service.store.deployments()), 1)
 
+    async def test_background_cluster_launch_returns_after_durable_start_and_reports_progress(self):
+        release_launch = asyncio.Event()
+        cluster = {
+            "id": "cluster-queued", "status": "launching", "api_port": 8123,
+            "node_ids": ["local"], "model_source": "unknown",
+            "members": [{
+                "node_id": "local", "node_name": "Controller", "rank": 0,
+                "container_name": "cluster-queued-r0-model", "status": "creating",
+                "phase": {
+                    "phase": "pulling_image",
+                    "message": "Downloading Docker image example/vllm:latest",
+                },
+            }],
+        }
+
+        async def launch(_body, *, launch_persisted=None):
+            self.manager.deployments = [cluster]
+            launch_persisted.set_result(cluster)
+            await release_launch.wait()
+            cluster.update({
+                "status": "error", "error": "Controller: image pull failed",
+            })
+            raise RuntimeError(cluster["error"])
+
+        self.manager.deployments = []
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller",
+        }])
+        self.manager.create_deployment = AsyncMock(side_effect=launch)
+        self.manager.public_target_node = Mock(side_effect=lambda node: node)
+        self.manager.get_state = AsyncMock(side_effect=lambda: {
+            "deployments": self.manager.deployments,
+        })
+        self.manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller",
+        }])
+
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "model", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        }, background=True)
+
+        self.assertEqual(created["status"], "starting")
+        self.assertEqual(created["launch_phase"], "pulling_image")
+        self.assertIn("Downloading Docker image", created["launch_message"])
+        self.assertFalse(self.service._deployment_launch_tasks[created["id"]].done())
+        with self.assertRaisesRegex(RuntimeError, "launch is still in progress"):
+            await self.service.deployment_action(created["id"], "stop")
+        stored = self.service.store.deployment(created["id"], include_private=True)
+        self.assertEqual(
+            stored["settings"]["manager_deployment_id"], "cluster-queued",
+        )
+        self.assertEqual(stored["_base_url"], "http://127.0.0.1:8123")
+
+        loading = (await self.service.deployments())[0]
+        self.assertEqual(loading["status"], "starting")
+        self.assertEqual(loading["launch_phase"], "pulling_image")
+
+        launch_complete = self.service._deployment_launches[created["id"]]
+        release_launch.set()
+        await asyncio.wait_for(launch_complete.wait(), 1)
+        failed = (await self.service.deployments())[0]
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["launch_phase"], "error")
+        self.assertEqual(failed["last_error"], "Controller: image pull failed")
+
+    async def test_background_cluster_preflight_failure_removes_provisional_card(self):
+        async def reject(_body, *, launch_persisted=None):
+            error = ValueError("selected port is unavailable")
+            launch_persisted.set_exception(error)
+            raise error
+
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller",
+        }])
+        self.manager.create_deployment = AsyncMock(side_effect=reject)
+
+        with self.assertRaisesRegex(ValueError, "selected port is unavailable"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "model", "runtime": "vllm",
+                "node_ids": ["local"], "deployment_mode": "single",
+            }, background=True)
+
+        self.assertIsNone(self.service.store.deployment("model"))
+
+    async def test_client_cancellation_keeps_accepted_launch_owned_by_service(self):
+        entered = asyncio.Event()
+        accept = asyncio.Event()
+        cluster = {
+            "id": "cluster-accepted", "status": "starting", "api_port": 8123,
+            "node_ids": ["local"], "members": [{
+                "node_id": "local", "node_name": "Controller", "rank": 0,
+                "container_name": "cluster-accepted-r0-model", "status": "starting",
+                "phase": {"phase": "starting", "message": "Starting model"},
+            }],
+        }
+
+        async def launch(_body, *, launch_persisted=None):
+            entered.set()
+            await accept.wait()
+            self.manager.deployments = [cluster]
+            launch_persisted.set_result(cluster)
+            return cluster
+
+        self.manager.deployments = []
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller",
+        }])
+        self.manager.create_deployment = AsyncMock(side_effect=launch)
+        self.manager.public_target_node = Mock(side_effect=lambda node: node)
+        request = asyncio.create_task(self.service.create_deployment({
+            "model": "org/model", "alias": "model", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        }, background=True))
+        await asyncio.wait_for(entered.wait(), 1)
+
+        request.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await request
+
+        provisional = self.service.store.deployment("model")
+        self.assertIsNotNone(provisional)
+        launch_complete = next(iter(self.service._deployment_launches.values()))
+        accept.set()
+        await asyncio.wait_for(launch_complete.wait(), 1)
+        stored = self.service.store.deployment("model")
+        self.assertEqual(
+            stored["settings"]["manager_deployment_id"], "cluster-accepted",
+        )
+
+    async def test_service_close_removes_launch_cancelled_before_manager_persistence(self):
+        manager = FakeManager()
+        manager.deployments = []
+        manager.selected_cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller",
+        }])
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def launch(_body, *, launch_persisted=None):
+            entered.set()
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                launch_persisted.set_exception(RuntimeError(
+                    "deployment launch stopped before it was accepted"
+                ))
+                raise
+
+        manager.create_deployment = AsyncMock(side_effect=launch)
+        with tempfile.TemporaryDirectory() as directory:
+            service = SparkDeckService(manager, Path(directory))
+            request = asyncio.create_task(service.create_deployment({
+                "model": "org/model", "alias": "model", "runtime": "vllm",
+                "node_ids": ["local"], "deployment_mode": "single",
+            }, background=True))
+            await asyncio.wait_for(entered.wait(), 1)
+            with patch.object(
+                service.store, "delete_deployment",
+                wraps=service.store.delete_deployment,
+            ) as delete:
+                await service.close()
+                with self.assertRaisesRegex(
+                    RuntimeError, "stopped before it was accepted",
+                ):
+                    await request
+                delete.assert_called_once()
+        await manager.http.aclose()
+
     async def test_failed_persistence_removes_launched_container(self):
         launched = {
             "name": "sparkdeck-model-deadbeef", "port": 8000, "status": "running",

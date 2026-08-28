@@ -1887,14 +1887,17 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._allocate_port = allocate_port
             instance._create_member = create_member
 
+            launch_persisted = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
-            }))
+            }, launch_persisted=launch_persisted))
+            durable = await asyncio.wait_for(launch_persisted, 1)
             await asyncio.wait_for(both_entered.wait(), 1)
 
+            self.assertIs(durable, instance.deployments[0])
             self.assertEqual(len(instance.deployments[0]["members"]), 2)
             self.assertTrue(all(
                 member["status"] == "queued"
@@ -1926,6 +1929,42 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Controller launch progress", logs)
         self.assertIn("Downloading Docker image", logs)
         self.assertIn("Container has not been created yet", logs)
+
+    async def test_cancelled_durable_launch_is_marked_for_reconciliation(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "cluster-1",
+            "sparkdeck_record_id": "record-1",
+            "status": "launching",
+            "members": [{"rank": 0, "phase": {"phase": "queued"}}],
+        }]
+        instance._save_deployments = mock.Mock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_create(_body, _persisted):
+            entered.set()
+            await release.wait()
+
+        instance._create_deployment = blocked_create
+        persisted = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(instance.create_deployment(
+            {"sparkdeck_record_id": "record-1"}, launch_persisted=persisted,
+        ))
+        await asyncio.wait_for(entered.wait(), 1)
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(instance.deployments[0]["status"], "recovering")
+        self.assertEqual(
+            instance.deployments[0]["members"][0]["phase"]["phase"],
+            "recovering",
+        )
+        instance._save_deployments.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError, "stopped before it was accepted"):
+            await persisted
 
     async def test_cluster_logs_preserve_launch_progress_when_docker_is_offline(self) -> None:
         instance = Manager.__new__(Manager)

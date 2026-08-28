@@ -130,6 +130,8 @@ interface WireDeployment {
   model_revision?: string
   created_at?: string
   desired_state?: 'running' | 'stopped'
+  launch_phase?: string
+  launch_message?: string
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -177,6 +179,8 @@ function deploymentFromWire(item: WireDeployment): Deployment {
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
     desired_state: item.desired_state,
+    launch_phase: item.launch_phase,
+    launch_message: item.launch_message,
   }
 }
 

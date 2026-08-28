@@ -310,6 +310,64 @@ describe('model discovery', () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v1/settings'))).toBe(true)
   })
 
+  it('applies the selected community GGUF variant to the deployment form and request', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({
+          id: 'qwen-q4', alias: 'Qwen3.8-27B', runtime: 'llama.cpp', kind: 'managed',
+          model: {
+            repository: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M',
+            artifact: 'artifacts/qwen3.8-q4_k_m.gguf',
+          },
+          status: 'starting',
+          settings: {
+            context_length: 24576, parallel_slots: 1, gpu_layers: 99,
+            quantization: 'Q4_K_M', artifact: 'artifacts/qwen3.8-q4_k_m.gguf',
+          },
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/settings')
+        ? { default_runtime: 'sglang', default_context_length: 24576 }
+        : path.includes('/api/v1/nodes')
+        ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
+        : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={[
+      '/models?model=RadixArk%2FQwen3.8-27B&quantization=Q4_K_M&artifact=artifacts%2Fqwen3.8-q4_k_m.gguf',
+    ]}><ModelsPage /></MemoryRouter>)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add a model server' })
+    expect(within(dialog).getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('RadixArk/Qwen3.8-27B')
+    expect(within(dialog).getByRole('textbox', { name: 'Quantization (optional)' })).toHaveValue('Q4_K_M')
+    expect(within(dialog).getByRole('textbox', { name: 'GGUF artifact' })).toHaveValue('artifacts/qwen3.8-q4_k_m.gguf')
+    await waitFor(() => {
+      expect(within(dialog).getByRole('combobox', { name: 'Runtime' })).toHaveValue('llama.cpp')
+      expect(within(dialog).getByRole('spinbutton', { name: 'Context length' })).toHaveValue(24576)
+    })
+
+    await user.click(within(dialog).getByRole('button', { name: 'Add to 1 node' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments',
+      expect.objectContaining({ method: 'POST' }),
+    ))
+    const createRequest = fetchMock.mock.calls.find(([input, init]) => (
+      String(input) === '/api/v1/deployments' && init?.method === 'POST'
+    ))
+    expect(JSON.parse(String(createRequest?.[1]?.body))).toEqual(expect.objectContaining({
+      model: 'RadixArk/Qwen3.8-27B',
+      runtime: 'llama.cpp',
+      quantization: 'Q4_K_M',
+      settings: expect.objectContaining({
+        quantization: 'Q4_K_M',
+        artifact: 'artifacts/qwen3.8-q4_k_m.gguf',
+      }),
+    }))
+  })
+
   it('turns an aggregate-fit catalog deployment into a valid sharded layout', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

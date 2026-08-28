@@ -38,7 +38,7 @@ describe('ExplorePage model rows', () => {
           id: 'org/model', author: 'org', name: 'model', downloads: 1000, likes: 12,
           parameter_count: 7_000_000_000, weight_size_bytes: 14 * gib,
           runtime_compatibility: [],
-          community: { model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 31.25, sample_count: 14 },
+          community: { model_id: 'org/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
         }],
         total: 1,
       })
@@ -61,7 +61,7 @@ describe('ExplorePage model rows', () => {
     const estimate = screen.getByLabelText('Community inference-speed estimate for org/model')
     expect(within(estimate).getByText('Sampled from other SparkDeck users')).toBeInTheDocument()
     expect(within(estimate).getByText('31.3 tok/s')).toBeInTheDocument()
-    expect(within(estimate).getByText(/8,192-token context window/)).toBeInTheDocument()
+    expect(within(estimate).getByText(/1,000-token prompt-length bucket/)).toBeInTheDocument()
     expect(within(estimate).getByText(/estimate, not a guarantee/)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')
   })
@@ -71,7 +71,7 @@ describe('ExplorePage model rows', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models')) return json({ items: [
-        { id: 'org/easy', name: 'easy', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', context_window_size: 8192, inference_tokens_per_second: 40, sample_count: 10 } },
+        { id: 'org/easy', name: 'easy', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', prompt_tokens_bucket: 1000, inference_tokens_per_second: 40, sample_count: 10 } },
         { id: 'zai-org/GLM-5.3-Flash', name: 'GLM-5.3-Flash', parameter_count: 321_300_000_000, weight_size_bytes: 306 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
         { id: 'org/tight', name: 'tight', parameter_count: 400_000_000_000, weight_size_bytes: 400 * gib, downloads: 15, likes: 1, runtime_compatibility: [] },
         { id: 'org/large', name: 'large', parameter_count: 600_000_000_000, weight_size_bytes: 600 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
@@ -157,7 +157,7 @@ describe('ExplorePage model rows', () => {
       if (path.includes('/api/v1/catalog/models')) return json({ detail: 'Hugging Face unavailable' }, 503)
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({
-        items: [{ model_id: 'community/model', context_window_size: 32768, inference_tokens_per_second: 18.5, sample_count: 22 }],
+        items: [{ model_id: 'community/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 18.5, sample_count: 22 }],
         availability: 'local',
         evidence_policy: {},
       })
@@ -166,11 +166,11 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
 
-    expect(await screen.findByRole('button', { name: 'Expand community/model (unknown, 33K tokens)' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Expand community/model (unknown, 1,000-token prompt bucket)' })).toBeInTheDocument()
     expect(screen.queryByText('Hugging Face unavailable')).not.toBeInTheDocument()
     expect(screen.getByText('Based on aggregated benchmark samples—not live session tracking.')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeChecked()
-    await user.click(screen.getByRole('button', { name: 'Expand community/model (unknown, 33K tokens)' }))
+    await user.click(screen.getByRole('button', { name: 'Expand community/model (unknown, 1,000-token prompt bucket)' }))
     expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
   })
@@ -179,7 +179,7 @@ describe('ExplorePage model rows', () => {
     const user = userEvent.setup()
     const items = Array.from({ length: 120 }, (_, index) => ({
       model_id: `community/model-${index}`,
-      context_window_size: 8192,
+      prompt_tokens_bucket: 1000,
       inference_tokens_per_second: 20 + index,
       sample_count: 10,
     }))
@@ -219,9 +219,9 @@ describe('ExplorePage model rows', () => {
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({
         items: [
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', context_window_size: 8192, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', context_window_size: 8192, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', context_window_size: 2048, inference_tokens_per_second: 60.1, sample_count: 10, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 1000, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 400, inference_tokens_per_second: 60.1, sample_count: 10, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -235,9 +235,9 @@ describe('ExplorePage model rows', () => {
     expect(header).toHaveTextContent('Unique clusters')
     expect(screen.queryByText('Downloads')).not.toBeInTheDocument()
     expect(screen.queryByText('Likes')).not.toBeInTheDocument()
-    const nvfp4 = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 8,192 tokens)' })
-    const gguf = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (Q4_K_M, 8,192 tokens)' })
-    const shortContext = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 2,048 tokens)' })
+    const nvfp4 = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 1,000-token prompt bucket)' })
+    const gguf = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (Q4_K_M, 1,000-token prompt bucket)' })
+    const shortContext = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 400-token prompt bucket)' })
     expect(within(nvfp4).getByText('52.4 tok/s')).toBeInTheDocument()
     expect(within(nvfp4).getByText('7')).toBeInTheDocument()
     expect(within(gguf).getByText('31.2 tok/s')).toBeInTheDocument()
@@ -249,6 +249,15 @@ describe('ExplorePage model rows', () => {
     expect(await screen.findByText('Available quantizations and artifacts')).toBeInTheDocument()
     expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
     expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    expect(within(nvfp4.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=NVFP4',
+    )
+
+    await user.click(gguf)
+    expect(await within(gguf.closest('article')!).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    expect(within(gguf.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
+    )
   })
 
   it('locks community features behind sign-in and telemetry opt-in', async () => {
@@ -261,7 +270,7 @@ describe('ExplorePage model rows', () => {
           id: 'org/model', author: 'org', name: 'model', downloads: 1000, likes: 12,
           parameter_count: 7_000_000_000, weight_size_bytes: 14 * gib,
           runtime_compatibility: [],
-          community: { model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 31.25, sample_count: 14 },
+          community: { model_id: 'org/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
         }],
         total: 1,
       })

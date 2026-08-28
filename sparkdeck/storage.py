@@ -13,18 +13,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .catalog import canonical_quantization
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 
 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
-    "model_id", "quantization", "context_window_size",
+    "model_id", "quantization", "prompt_tokens_bucket",
     "inference_tokens_per_second", "telemetry_cluster_id",
     "concurrency",
 })
 COMMUNITY_CONSENT_CONTRACT_VERSION = 3
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
-    "exact_match_dimensions": ["model_id", "quantization"],
+    "exact_match_dimensions": [
+        "model_id", "quantization", "prompt_tokens_bucket",
+    ],
     "metric": "inference_tokens_per_second",
 }
 # The community backend is built in — every installation talks to the hosted
@@ -715,17 +718,17 @@ class SparkDeckStore:
                         continue
                     model_id = str(model.get("repository") or "").strip()
                     quantization = _community_quantization(model)
-                    context_window = _community_context_bucket(
+                    prompt_bucket = _community_prompt_bucket(
                         row["input_tokens"]
                     )
                     speed = _positive_speed(row["generation_tps"])
                     cluster_id = row["telemetry_cluster_id"]
                     if (
-                        not model_id or context_window is None or speed is None
+                        not model_id or prompt_bucket is None or speed is None
                         or not _valid_telemetry_cluster_id(cluster_id)
                     ):
                         continue
-                    key = (model_id, quantization, context_window)
+                    key = (model_id, quantization, prompt_bucket)
                     aggregate = grouped.setdefault(key, {
                         "total": 0.0, "count": 0, "clusters": set(),
                     })
@@ -737,18 +740,18 @@ class SparkDeckStore:
             {
                 "model_id": model_id,
                 "quantization": quantization,
-                "context_window_size": context_window,
+                "prompt_tokens_bucket": prompt_bucket,
                 "inference_tokens_per_second": value["total"] / value["count"],
                 "sample_count": value["count"],
                 "unique_cluster_count": len(value["clusters"]),
             }
-            for (model_id, quantization, context_window), value in grouped.items()
+            for (model_id, quantization, prompt_bucket), value in grouped.items()
         ]
         return sorted(
             items,
             key=lambda item: (
                 -item["sample_count"], item["model_id"].casefold(),
-                item["quantization"].casefold(), item["context_window_size"],
+                item["quantization"].casefold(), item["prompt_tokens_bucket"],
             ),
         )
 
@@ -973,6 +976,33 @@ class SparkDeckStore:
                 "telemetry_cluster_id": cluster_id,
             }
 
+    def revoke_community_membership(self) -> dict[str, Any]:
+        """Atomically sever worker consent and its former cluster identity."""
+        with self._lock, self._connection:
+            current = self._community_consent_snapshot_locked()
+            generation = current["generation"] + 1
+            for key, value in (
+                ("community_consent", False),
+                ("community_consent_generation", generation),
+            ):
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    (key, json.dumps(value)),
+                )
+            self._connection.execute(
+                "DELETE FROM settings WHERE key = 'telemetry_cluster_id'"
+            )
+            self._connection.execute(
+                "DELETE FROM upload_outbox WHERE status IN "
+                "('pending', 'failed', 'waiting_for_account')"
+            )
+            return {
+                "enabled": False,
+                "generation": generation,
+                "telemetry_cluster_id": None,
+            }
+
 
 def _benchmark_matches_series_point(
     sample_row: sqlite3.Row | dict[str, Any],
@@ -1024,21 +1054,21 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
 def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     """Build the strict cloud payload allowlist, separate from local history."""
     value = _benchmark_row(row)
-    context_window = _community_context_bucket(value["input_tokens"])
+    prompt_bucket = _community_prompt_bucket(value["input_tokens"])
     speed = _positive_speed(value["generation_tokens_per_second"])
     model = value.get("model", {})
     model_id = str(model.get("repository") or "").strip()
     quantization = _community_quantization(model)
     cluster_id = row["telemetry_cluster_id"]
     if (
-        not model_id or context_window is None or speed is None
+        not model_id or prompt_bucket is None or speed is None
         or not _valid_telemetry_cluster_id(cluster_id)
     ):
         return None
     payload = {
         "model_id": model_id,
         "quantization": quantization,
-        "context_window_size": context_window,
+        "prompt_tokens_bucket": prompt_bucket,
         "inference_tokens_per_second": speed,
         "telemetry_cluster_id": cluster_id,
         "concurrency": 1,
@@ -1064,10 +1094,7 @@ def _community_sample_eligible(sample: BenchmarkSample) -> bool:
 
 def _community_quantization(model: dict[str, Any]) -> str:
     """Return one explicit aggregate dimension without guessing locally."""
-    value = str(model.get("quantization") or "").strip()
-    if not value or len(value) > 100 or any(ord(char) < 32 for char in value):
-        return "UNKNOWN"
-    return value.upper()
+    return canonical_quantization(model.get("quantization")) or "UNKNOWN"
 
 
 def _community_prompt_tokens(value: Any) -> int | None:
@@ -1076,14 +1103,14 @@ def _community_prompt_tokens(value: Any) -> int | None:
     return parsed if parsed is not None and parsed < 10_000 else None
 
 
-def _community_context_bucket(value: Any) -> int | None:
+def _community_prompt_bucket(value: Any) -> int | None:
     """Normalize prompt occupancy for useful local aggregate cohorts."""
     tokens = _community_prompt_tokens(value)
     if tokens is None:
         return None
     if tokens <= 800:
         return 400
-    return min(9_000, max(1_000, int(round(tokens / 1_000.0)) * 1_000))
+    return min(9_000, max(1_000, ((tokens + 500) // 1_000) * 1_000))
 
 
 def _telemetry_cluster_id(value: Any) -> str:

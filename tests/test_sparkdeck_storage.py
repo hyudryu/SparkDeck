@@ -14,6 +14,7 @@ from sparkdeck.storage import (
     COMMUNITY_UPLOAD_FIELDS,
     SparkDeckStore,
     _COMMUNITY_AGGREGATE_BATCH_SIZE,
+    _community_prompt_bucket,
 )
 
 
@@ -25,6 +26,15 @@ class SparkDeckStoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.temp.cleanup()
+
+    def test_prompt_bucket_contract_uses_explicit_half_up_rounding(self):
+        self.assertEqual(_community_prompt_bucket(1), 400)
+        self.assertEqual(_community_prompt_bucket(800), 400)
+        self.assertEqual(_community_prompt_bucket(801), 1000)
+        self.assertEqual(_community_prompt_bucket(2_499), 2000)
+        self.assertEqual(_community_prompt_bucket(2_500), 3000)
+        self.assertEqual(_community_prompt_bucket(9_999), 9000)
+        self.assertIsNone(_community_prompt_bucket(10_000))
 
     def test_consent_defaults_off_and_deployment_hides_endpoint(self):
         self.assertFalse(self.store.sync_status()["consent"])
@@ -142,7 +152,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.outbox_batch(), [{
             "model_id": "org/model",
             "quantization": "NVFP4",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 300.0,
             "telemetry_cluster_id": consent["telemetry_cluster_id"],
             "concurrency": 1,
@@ -334,6 +344,38 @@ class SparkDeckStoreTests(unittest.TestCase):
             replace(sample, id="stale-cluster"), first["generation"],
         ))
 
+    def test_membership_revocation_clears_cluster_identity_and_unsent_rows(self):
+        first = self.store.set_community_consent(
+            True, "99999999-9999-4999-8999-999999999999",
+        )
+        sample = BenchmarkSample(
+            id="former-cluster", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=4_000, ttft_ms=100,
+            generation_tokens_per_second=80,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, first["generation"],
+        ))
+
+        revoked = self.store.revoke_community_membership()
+
+        self.assertEqual(revoked, {
+            "enabled": False,
+            "generation": first["generation"] + 1,
+            "telemetry_cluster_id": None,
+        })
+        self.assertIsNone(self.store.get_setting("telemetry_cluster_id"))
+        self.assertEqual(self.store.outbox_batch(), [])
+        reenabled = self.store.set_community_consent(True)
+        self.assertNotEqual(
+            reenabled["telemetry_cluster_id"], first["telemetry_cluster_id"],
+        )
+
     def test_migration_requires_fresh_consent_for_expanded_payload_contract(self):
         sample = BenchmarkSample(
             id="legacy-consent", created_at="2026-08-25T00:00:00+00:00",
@@ -471,7 +513,9 @@ class SparkDeckStoreTests(unittest.TestCase):
     def test_community_evidence_policy_uses_only_upload_dimensions(self):
         self.assertEqual(COMMUNITY_EVIDENCE_POLICY, {
             "minimum_samples": 10,
-            "exact_match_dimensions": ["model_id", "quantization"],
+            "exact_match_dimensions": [
+                "model_id", "quantization", "prompt_tokens_bucket",
+            ],
             "metric": "inference_tokens_per_second",
         })
 
@@ -706,7 +750,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
         self.assertEqual(self.store.outbox_batch(), [{
             "model_id": "org/model", "quantization": "UNKNOWN",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 50.0,
             "telemetry_cluster_id": consent["telemetry_cluster_id"],
             "concurrency": 1,
@@ -768,7 +812,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             {
                 "model_id": "org/model",
                 "quantization": "NVFP4",
-                "context_window_size": 400,
+                "prompt_tokens_bucket": 400,
                 "inference_tokens_per_second": 226.66666666666666,
                 "sample_count": 3,
                 "unique_cluster_count": 2,
@@ -776,7 +820,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             {
                 "model_id": "org/model",
                 "quantization": "NVFP4",
-                "context_window_size": 2000,
+                "prompt_tokens_bucket": 2000,
                 "inference_tokens_per_second": 40.0,
                 "sample_count": 1,
                 "unique_cluster_count": 1,
@@ -825,7 +869,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(aggregates, [{
             "model_id": "org/model",
             "quantization": "NVFP4",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
             "sample_count": row_count,
             "unique_cluster_count": 1,

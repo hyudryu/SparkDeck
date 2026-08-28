@@ -134,16 +134,16 @@ describe('BenchmarksPage community privacy', () => {
       else if (path.endsWith('/api/v1/community/aggregates')) body = {
         items: [
           {
-            model_id: 'org/model', quantization: 'NVFP4', context_window_size: 16384,
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
             inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           },
           {
-            model_id: 'org/model', quantization: 'Q4_K_M', context_window_size: 16384,
+            model_id: 'org/model', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
             inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
           },
         ],
         availability: 'available',
-        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'context_window_size'], metric: 'inference_tokens_per_second' },
+        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
       }
       else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
         consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
@@ -157,17 +157,18 @@ describe('BenchmarksPage community privacy', () => {
 
     expect(await screen.findByText('42.5 tok/s')).toBeInTheDocument()
     expect(screen.getByText('31.2 tok/s')).toBeInTheDocument()
-    expect(screen.getAllByText('16,384 tokens')).toHaveLength(2)
+    expect(screen.getAllByText('1,000 tokens')).toHaveLength(2)
     expect(screen.getByText('NVFP4')).toBeInTheDocument()
     expect(screen.getByText('Q4_K_M')).toBeInTheDocument()
     expect(screen.getByText('12 samples')).toBeInTheDocument()
-    expect(screen.getByText(/matched only on model name, quantization, and context window/)).toBeInTheDocument()
+    expect(screen.getByText(/matched only on model name, quantization, and prompt-length bucket/)).toBeInTheDocument()
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Review & enable' }))
     const dialog = screen.getByRole('dialog', { name: 'Enable community sharing?' })
-    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, context-window size, measured inference tok/s')
+    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, prompt-length/context-occupancy bucket, measured inference tok/s')
+    expect(dialog).toHaveTextContent('only samples captured after you enable sharing can be uploaded; existing benchmark history stays local')
     expect(dialog).toHaveTextContent('stable opaque telemetry cluster ID')
     expect(dialog).toHaveTextContent('contains no account ID, hostname, node name, or endpoint alias')
     expect(dialog).toHaveTextContent('Never in benchmark JSON: prompts or outputs')
@@ -208,11 +209,11 @@ describe('BenchmarksPage community privacy', () => {
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {
           items: deleted ? [] : [{
-            model_id: 'org/model', quantization: 'NVFP4', context_window_size: 8192,
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
             inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
           }],
           availability: deleted ? 'not_configured' : 'local',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
         }
       } else {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
@@ -245,11 +246,11 @@ describe('BenchmarksPage community privacy', () => {
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {
           items: [{
-            model_id: 'org/model', quantization: 'NVFP4', context_window_size: 16384,
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
             inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           }],
           availability: 'available',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
         }
       } else {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }

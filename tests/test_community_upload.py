@@ -95,7 +95,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
                 "items": [{
                     "model_id": "org/model",
                     "quantization": "Q4_K_M",
-                    "context_window_size": 4096,
+                    "prompt_tokens_bucket": 400,
                     "inference_tokens_per_second": 42.5,
                     "sample_count": 12,
                     "unique_cluster_count": 3,
@@ -150,7 +150,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={
                 "items": [{
                     "model_id": "org/model",
-                    "context_window_size": "4096",
+                    "prompt_tokens_bucket": "400",
                     "inference_tokens_per_second": 42.5,
                     "sample_count": 12,
                 }],
@@ -255,7 +255,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(uploads[0].content), {
             "model_id": "org/model",
             "quantization": "UNKNOWN",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 300.0,
             "concurrency": 1,
             "telemetry_cluster_id": self.store.get_setting(

@@ -10,7 +10,7 @@ export interface RuntimeCompatibility {
 export interface BenchmarkAggregate {
   model_id: string
   quantization: string
-  context_window_size: number
+  prompt_tokens_bucket: number
   inference_tokens_per_second: number
   sample_count: number
   unique_cluster_count: number
@@ -20,7 +20,7 @@ export interface BenchmarkAggregate {
 
 export interface CommunityEvidencePolicy {
   minimum_samples: number
-  exact_match_dimensions: Array<'model_id' | 'quantization' | 'context_window_size'>
+  exact_match_dimensions: Array<'model_id' | 'quantization' | 'prompt_tokens_bucket'>
   metric: 'inference_tokens_per_second'
 }
 
@@ -66,6 +66,7 @@ export interface DeploymentSettings {
   parallel_slots?: number
   gpu_split?: string
   quantization?: string
+  artifact?: string
   dtype?: string
   gpu_memory_utilization?: number
   port?: number

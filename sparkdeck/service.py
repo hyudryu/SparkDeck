@@ -16,13 +16,17 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
 
-from .catalog import HuggingFaceCatalog, quantization_from_text
+from .catalog import (
+    HuggingFaceCatalog,
+    canonical_quantization,
+    quantization_from_text,
+)
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtimes import (
     RuntimeRegistry,
@@ -234,8 +238,8 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             raise ValueError("community aggregate item must be an object")
         model_id = str(raw.get("model_id") or "").strip()
-        quantization = str(raw.get("quantization") or "unknown").strip().upper()
-        context_window = raw.get("context_window_size")
+        quantization = canonical_quantization(raw.get("quantization")) or "UNKNOWN"
+        prompt_bucket = raw.get("prompt_tokens_bucket")
         speed = raw.get("inference_tokens_per_second")
         sample_count = raw.get("sample_count")
         unique_cluster_count = raw.get("unique_cluster_count", 1)
@@ -243,11 +247,8 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             not model_id
             or len(model_id) > 500
             or any(ord(char) < 32 for char in model_id)
-            or not quantization
-            or len(quantization) > 100
-            or any(ord(char) < 32 for char in quantization)
-            or isinstance(context_window, bool)
-            or not isinstance(context_window, int)
+            or isinstance(prompt_bucket, bool)
+            or not isinstance(prompt_bucket, int)
             or isinstance(sample_count, bool)
             or not isinstance(sample_count, int)
             or isinstance(unique_cluster_count, bool)
@@ -258,8 +259,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             raise ValueError("community aggregate item is invalid")
         speed = float(speed)
         if (
-            context_window <= 0
-            or context_window > 100_000_000
+            prompt_bucket not in {400, *range(1_000, 10_000, 1_000)}
             or sample_count <= 0
             or sample_count > 1_000_000_000
             or unique_cluster_count <= 0
@@ -268,14 +268,14 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             or speed <= 0
         ):
             raise ValueError("community aggregate item is invalid")
-        key = (model_id, quantization, context_window)
+        key = (model_id, quantization, prompt_bucket)
         if key in seen:
             raise ValueError("community aggregate response contains duplicate evidence")
         seen.add(key)
         result.append({
             "model_id": model_id,
             "quantization": quantization,
-            "context_window_size": context_window,
+            "prompt_tokens_bucket": prompt_bucket,
             "inference_tokens_per_second": speed,
             "sample_count": sample_count,
             "unique_cluster_count": unique_cluster_count,
@@ -313,6 +313,13 @@ class SparkDeckService:
         async with self._community_upload_lock:
             return await asyncio.to_thread(
                 self.store.set_community_consent, enabled, telemetry_cluster_id
+            )
+
+    async def revoke_community_membership(self) -> dict[str, Any]:
+        """Disable sharing and forget a former controller's cluster identity."""
+        async with self._community_upload_lock:
+            return await asyncio.to_thread(
+                self.store.revoke_community_membership
             )
 
     async def delete_benchmark(self, sample_id: str) -> bool:
@@ -406,11 +413,12 @@ class SparkDeckService:
             if detail:
                 value["parameter_count"] = detail.get("parameter_count")
                 value["weight_size_bytes"] = detail.get("weight_size_bytes")
-                quantization = str(item.get("quantization") or "unknown")
+                quantization = (
+                    canonical_quantization(item.get("quantization")) or "UNKNOWN"
+                )
                 variant = next((
                     candidate for candidate in detail.get("quantizations") or []
-                    if str(candidate.get("name") or "").casefold()
-                    == quantization.casefold()
+                    if canonical_quantization(candidate.get("name")) == quantization
                 ), None)
                 if variant and variant.get("weight_size_bytes"):
                     value["weight_size_bytes"] = variant["weight_size_bytes"]
@@ -473,15 +481,15 @@ class SparkDeckService:
         )
         deployment_model = deployment.get("model") or {}
         quantization = (
-            _optional_string(deployment_model.get("quantization"))
-            or _optional_string(settings.get("quantization"))
+            canonical_quantization(deployment_model.get("quantization"))
+            or canonical_quantization(settings.get("quantization"))
             or quantization_from_text(
                 settings.get("gguf_variant"),
                 deployment_model.get("artifact"),
                 raw_model_id,
             )
-            or "unknown"
-        ).upper()
+            or "UNKNOWN"
+        )
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1068,6 +1076,51 @@ class SparkDeckService:
         )
         return await self.deployment_detail(deployment_id)
 
+    async def _prepare_public_gguf_artifact(
+        self, repository: str, artifact: str, revision: str,
+        quantization: str | None,
+    ) -> str:
+        """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
+        if _public_model_id(repository) != repository:
+            raise ValueError(
+                "repo-relative GGUF artifacts require a public Hugging Face repository"
+            )
+        relative = PurePosixPath(artifact)
+        if (
+            relative.is_absolute() or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in artifact or relative.suffix.casefold() != ".gguf"
+        ):
+            raise ValueError("artifact must be a safe repo-relative .gguf filename")
+        inferred = quantization_from_text(artifact)
+        if quantization and inferred and quantization != inferred:
+            raise ValueError("artifact quantization does not match the selected quantization")
+
+        virtual_nas = getattr(self.manager, "virtual_nas", None)
+        if virtual_nas is None:
+            raise RuntimeError("model preparation is unavailable")
+        resolution = await virtual_nas.resolve_download_revision(repository, revision)
+        resolved_revision = str(resolution.get("resolved_revision") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", resolved_revision):
+            raise RuntimeError("model preparation did not resolve an immutable revision")
+        await virtual_nas.download_model_checked(
+            repository, resolved_revision, requested_revision=revision,
+        )
+        model_root = virtual_nas._model_path(repository).resolve()
+        candidate = model_root / "snapshots" / resolved_revision
+        for part in relative.parts:
+            candidate = candidate / part
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(model_root)
+        except ValueError as exc:
+            raise RuntimeError("prepared GGUF artifact escapes the model cache") from exc
+        if not resolved.is_file():
+            raise RuntimeError(
+                "model preparation completed without the selected GGUF artifact"
+            )
+        return str(resolved)
+
     async def create_deployment(self, body: dict[str, Any]) -> dict[str, Any]:
         model = str(body.get("model") or "").strip()
         alias = str(body.get("alias") or model).strip()
@@ -1078,6 +1131,20 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
+        quantization = canonical_quantization(
+            body.get("quantization") or settings.get("quantization")
+        )
+        if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED and artifact:
+            artifact_path = Path(artifact).expanduser()
+            if not artifact_path.is_file():
+                artifact = await self._prepare_public_gguf_artifact(
+                    model, artifact, _optional_string(body.get("revision")) or "main",
+                    quantization,
+                )
+            settings["artifact"] = artifact
+            if quantization:
+                settings["quantization"] = quantization
         requested_node_ids = _requested_node_ids(body)
         deployment_mode = str(body.get("deployment_mode") or "").strip() or None
         if requested_node_ids is not None and kind is DeploymentKind.EXTERNAL:
@@ -1085,8 +1152,8 @@ class SparkDeckService:
         deployment_id = str(uuid.uuid4())
         identity = ModelIdentity(
             repository=model, revision=_optional_string(body.get("revision")),
-            artifact=_optional_string(body.get("artifact") or settings.get("artifact")),
-            quantization=_optional_string(body.get("quantization") or settings.get("quantization")),
+            artifact=artifact,
+            quantization=quantization,
         )
         deployment = Deployment(
             id=deployment_id, alias=alias, runtime=runtime, kind=kind,
@@ -1869,12 +1936,14 @@ class SparkDeckService:
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None) -> dict[str, Any] | AsyncIterator[str]:
-        observation = self._community_observation_start()
+        requested_model = str(body.get("model") or "")
+        deployment = self.store.deployment(requested_model, include_private=True)
+        observation = self._community_observation_start(
+            self._community_observation_scopes(deployment, requested_model)
+        )
         context_token = self._community_observation.set(observation)
         streaming = False
         try:
-            requested_model = str(body.get("model") or "")
-            deployment = self.store.deployment(requested_model, include_private=True)
             if deployment:
                 result = await self._proxy_registered(
                     deployment, body, endpoint, cancel
@@ -1909,8 +1978,47 @@ class SparkDeckService:
             if not streaming:
                 self._community_observation_end(observation)
 
-    def _community_observation_start(self) -> dict[str, Any] | None:
+    def _community_observation_scopes(
+        self, deployment: dict[str, Any] | None, requested_model: str,
+    ) -> frozenset[str]:
+        """Return private in-memory identities for potentially shared hardware."""
+        if deployment:
+            settings = deployment.get("settings") or {}
+            manager_id = settings.get("manager_deployment_id")
+            linked = next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ), None)
+            node_ids = {
+                str(node_id)
+                for source in (
+                    deployment.get("node_ids") or [],
+                    settings.get("node_ids") or [],
+                    (linked or {}).get("node_ids") or [],
+                )
+                for node_id in source
+                if str(node_id)
+            }
+            node_ids.update(
+                str(member.get("node_id"))
+                for member in (linked or {}).get("members") or []
+                if isinstance(member, dict) and member.get("node_id")
+            )
+            if node_ids:
+                return frozenset(f"node:{node_id}" for node_id in node_ids)
+            if deployment.get("kind") == DeploymentKind.MANAGED.value:
+                return frozenset({"node:local"})
+            endpoint = normalize_openai_base_url(deployment.get("_base_url") or "")
+            if endpoint:
+                return frozenset({f"endpoint:{endpoint.casefold()}"})
+            return frozenset({f"deployment:{deployment.get('id')}"})
+        return frozenset({f"legacy-model:{requested_model.casefold()}"})
+
+    def _community_observation_start(
+        self, scopes: frozenset[str] | None = None,
+    ) -> dict[str, Any] | None:
         snapshot = self.store.community_consent_snapshot()
+        scopes = scopes or frozenset({"unspecified"})
         observation = {
             "id": str(uuid.uuid4()),
             # Opted-out requests carry only lifecycle state. They never reach
@@ -1918,10 +2026,12 @@ class SparkDeckService:
             # an opted-in request whose decode overlaps them.
             "enabled": bool(snapshot.get("enabled")),
             "generation": int(snapshot.get("generation") or 0),
-            "contaminated": bool(self._community_active_observations),
+            "scopes": scopes,
+            "contaminated": False,
         }
-        if self._community_active_observations:
-            for active in self._community_active_observations.values():
+        for active in self._community_active_observations.values():
+            if scopes.intersection(active.get("scopes") or ()):
+                observation["contaminated"] = True
                 active["contaminated"] = True
         self._community_active_observations[observation["id"]] = observation
         return observation
@@ -2155,6 +2265,7 @@ class SparkDeckService:
                 usage, first_token_at,
                 revision=deployment["model"].get("revision"),
                 hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
+                stream_timing_trusted=False,
             )
 
     async def _observe_stream(self, stream: AsyncIterator[str], deployment_id: str | None,
@@ -2184,6 +2295,7 @@ class SparkDeckService:
                 deployment_id, model, runtime, settings, started, usage,
                 first_token_at, revision=revision, hardware=hardware,
                 hardware_verified=hardware_verified,
+                stream_timing_trusted=False,
             )
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
@@ -2209,13 +2321,15 @@ class SparkDeckService:
                       native_prompt_tps: float | None = None,
                       revision: str | None = None,
                       hardware: dict[str, Any] | None = None,
-                      hardware_verified: bool = True) -> None:
+                      hardware_verified: bool = True,
+                      stream_timing_trusted: bool = True) -> None:
         observation = self._community_observation.get()
         passive_observation = observation is not None
         # Community sharing is the authority for passive inference telemetry.
         # When it is off, do not even create a local sample row.
         if passive_observation and (
             not observation.get("enabled") or observation.get("contaminated")
+            or not stream_timing_trusted
         ):
             return
         completed = time.monotonic()
@@ -2226,12 +2340,12 @@ class SparkDeckService:
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
         quantization = (
-            _optional_string(settings.get("quantization"))
+            canonical_quantization(settings.get("quantization"))
             or quantization_from_text(
                 settings.get("gguf_variant"), settings.get("artifact"), model,
             )
-            or "unknown"
-        ).upper()
+            or "UNKNOWN"
+        )
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
             if output_tokens and first_token_at is not None else None
@@ -2309,6 +2423,7 @@ class SparkDeckService:
 
     @staticmethod
     def _community_sample_setting(model: str, quantization: str) -> str:
+        quantization = canonical_quantization(quantization) or "UNKNOWN"
         digest = hashlib.sha256(
             f"{model.casefold()}\0{quantization.casefold()}".encode("utf-8")
         ).hexdigest()

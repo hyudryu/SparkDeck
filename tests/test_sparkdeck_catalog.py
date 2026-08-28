@@ -175,7 +175,18 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls.count("/api/models/org/first"), 1)
         self.assertEqual(calls.count("/api/models/org/second"), 1)
         self.assertEqual(maximum_active, 2)
+        self.assertEqual(catalog._detail_locks, {})
+
+        async def fail(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404)
+
         await http.aclose()
+        failed_http = httpx.AsyncClient(transport=httpx.MockTransport(fail))
+        failed_catalog = HuggingFaceCatalog(failed_http)
+        with self.assertRaises(httpx.HTTPStatusError):
+            await failed_catalog.details("org/missing")
+        self.assertEqual(failed_catalog._detail_locks, {})
+        await failed_http.aclose()
 
     async def test_details_uses_tree_sizes_and_excludes_auxiliary_ggufs(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -199,7 +210,38 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             "name": "Q4_0",
             "files": [{"filename": "model-Q4_0.gguf", "size_bytes": 16}],
             "weight_size_bytes": 16,
+            "artifacts": [{
+                "filename": "model-Q4_0.gguf",
+                "files": [{"filename": "model-Q4_0.gguf", "size_bytes": 16}],
+                "weight_size_bytes": 16,
+                "sharded": False,
+            }],
         }])
+        await http.aclose()
+
+    async def test_details_keeps_same_quantization_alternatives_separate(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [
+                    {"rfilename": "original/model-Q4_K_M.gguf", "size": 10},
+                    {"rfilename": "imatrix/model-Q4_K_M.gguf", "size": 12},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        variant = item["quantizations"][0]
+        self.assertEqual(variant["weight_size_bytes"], 10)
+        self.assertEqual(len(variant["artifacts"]), 2)
+        self.assertEqual(
+            {artifact["weight_size_bytes"] for artifact in variant["artifacts"]},
+            {10, 12},
+        )
+        self.assertTrue(all(
+            len(artifact["files"]) == 1 for artifact in variant["artifacts"]
+        ))
         await http.aclose()
 
     async def test_details_paginates_entire_tree_before_summing_gguf_shards(self):
@@ -210,7 +252,7 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
                 tree_requests.append(request)
                 if request.url.params.get("cursor") == "second-page":
                     return httpx.Response(200, json=[
-                        {"path": "Q4_K_M/model-00002-of-00002-Q4_K_M.gguf", "size": 12},
+                        {"path": "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf", "size": 12},
                     ])
                 return httpx.Response(200, headers={
                     "Link": (
@@ -218,13 +260,13 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
                         '?recursive=true&limit=1000&cursor=second-page>; rel="next"'
                     ),
                 }, json=[
-                    {"path": "Q4_K_M/model-00001-of-00002-Q4_K_M.gguf", "size": 10},
+                    {"path": "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf", "size": 10},
                 ])
             return httpx.Response(200, json={
                 "id": "org/model-GGUF", "tags": ["gguf"],
                 "siblings": [
-                    {"rfilename": "Q4_K_M/model-00001-of-00002-Q4_K_M.gguf"},
-                    {"rfilename": "Q4_K_M/model-00002-of-00002-Q4_K_M.gguf"},
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf"},
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf"},
                 ],
             })
 

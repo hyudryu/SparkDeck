@@ -115,6 +115,8 @@ export interface DeploymentDetail extends Deployment {
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
+  sg_tp_size?: number | null
+  sg_mem_fraction?: number | null
   image?: string
 }
 
@@ -123,6 +125,8 @@ export interface DeploymentUpdateInput {
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
+  sg_tp_size?: number | null
+  sg_mem_fraction?: number | null
 }
 
 export interface CreateDeploymentInput {
@@ -723,6 +727,11 @@ export interface RecipeUpdateInput {
   launch_controls?: LaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
+  sg_tp_size?: number | null
+  sg_context_length?: number | null
+  sg_max_running_requests?: number | null
+  sg_mem_fraction?: number | null
+  sg_image?: string | null
 }
 
 export interface CreateStorageTransferInput {

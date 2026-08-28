@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
@@ -169,6 +169,8 @@ const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
     max_num_batched_tokens: controls.max_num_batched_tokens?.toString() ?? '',
     gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
     gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
+    sg_tp_size: detail.sg_tp_size?.toString() ?? '',
+    sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
     remaining_flags: remainingArgs(detail.extra_args ?? []),
   }
 }
@@ -546,6 +548,24 @@ export function ModelsPage() {
     }
   }
 
+  const importContainerRecipe = async (deployment: Deployment) => {
+    const containerName = deployment.id.startsWith('container:')
+      ? decodeURIComponent(deployment.id.slice('container:'.length))
+      : deployment.id
+    setBusy(deployment.id)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      const recipe = await api.recipes.importFromContainer(containerName)
+      setActionNotice(`Imported ${recipe.name || recipe.model} into Recipes.`)
+      recipes.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not import the container as a recipe')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const confirmStart = async () => {
     if (!startSelection) return
     const { deployment, nodeIds } = startSelection
@@ -812,6 +832,16 @@ export function ModelsPage() {
       return Number.isFinite(parsed) ? parsed : null
     }
     const editorForm = editor.form
+    const sgTpSize = numeric(editorForm.sg_tp_size)
+    const sgMemFraction = numeric(editorForm.sg_mem_fraction)
+    if (sgTpSize !== null && (!Number.isInteger(sgTpSize) || sgTpSize < 1)) {
+      setArgsEditor(recipe.id, { error: 'TP size must be a positive integer' })
+      return
+    }
+    if (sgMemFraction !== null && (sgMemFraction <= 0 || sgMemFraction > 1)) {
+      setArgsEditor(recipe.id, { error: 'Mem fraction must be between 0 and 1' })
+      return
+    }
     const payload: RecipeUpdateInput = {
       extra_args: shellSplit(editorForm.remaining_flags ?? ''),
       launch_controls: {
@@ -825,6 +855,8 @@ export function ModelsPage() {
       },
       gpu_memory_utilization: numeric(editorForm.gpu_memory_utilization),
       gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
+      sg_tp_size: sgTpSize,
+      sg_mem_fraction: sgMemFraction,
     }
     setArgsEditor(recipe.id, { saving: true, error: undefined, saved: false })
     try {
@@ -1100,6 +1132,9 @@ export function ModelsPage() {
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
+                    {deployment.id.startsWith('container:') && (
+                      <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Save ${deployment.alias} as recipe`} title="Save as recipe" onClick={() => void importContainerRecipe(deployment)}><FolderPlus size={16} /></Button>
+                    )}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => void confirm({
                       title: `Remove ${deployment.alias}?`,
@@ -1174,9 +1209,13 @@ export function ModelsPage() {
                           <label className="field"><span>Speculative tokens</span><input type="number" min="1" value={editor.form.dspark_num_speculative_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, dspark_num_speculative_tokens: event.target.value } })} /></label>
                           <label className="field"><span>Cudagraph capture size</span><input type="number" min="1" value={editor.form.max_cudagraph_capture_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_cudagraph_capture_size: event.target.value } })} /></label>
                           <label className="field"><span>Batched tokens</span><input type="number" min="1" value={editor.form.max_num_batched_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_num_batched_tokens: event.target.value } })} /></label>
+                          <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" value={editor.form.gpu_memory_utilization} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_utilization: event.target.value } })} /></label>
+                          <label className="field"><span>Reserve GB</span><input type="number" min="1" value={editor.form.gpu_memory_gb} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_gb: event.target.value } })} /></label>
                         </>}
-                        <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" value={editor.form.gpu_memory_utilization} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_utilization: event.target.value } })} /></label>
-                        <label className="field"><span>Reserve GB</span><input type="number" min="1" value={editor.form.gpu_memory_gb} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, gpu_memory_gb: event.target.value } })} /></label>
+                        {!isVllm && <>
+                          <label className="field"><span>TP size</span><input type="number" min="1" value={editor.form.sg_tp_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_tp_size: event.target.value } })} /></label>
+                          <label className="field"><span>Mem fraction (static)</span><input type="number" step="0.01" min="0.01" max="1" value={editor.form.sg_mem_fraction} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_mem_fraction: event.target.value } })} /></label>
+                        </>}
                       </div>
                       <label className="field"><span>Other flags</span><textarea rows={3} value={editor.form.remaining_flags} spellCheck={false} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, remaining_flags: event.target.value } })} /></label>
                       <p className="field-note">Blank fields remove the flag. Structured fields above override matching flags in &quot;Other flags&quot;.</p>

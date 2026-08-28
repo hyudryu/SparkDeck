@@ -690,7 +690,15 @@ def build_server(
 
     @server.tool()
     async def create_cluster_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
-        """Create a reusable cluster recipe from structured launch settings."""
+        """Create a reusable cluster recipe from structured launch settings.
+
+        Pass engine flags in ``extra_args`` (array of tokens). SGLang also
+        accepts ``launch_settings`` with ``context_length``,
+        ``max_running_requests``, ``mem_fraction_static``, and
+        ``tensor_parallel_size``; vLLM accepts ``max_model_len``,
+        ``max_running_requests``, and ``gpu_memory_utilization``. Values
+        outside these fields are ignored.
+        """
         return await client.create_recipe(recipe)
 
     @server.tool()

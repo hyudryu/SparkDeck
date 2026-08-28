@@ -1422,6 +1422,18 @@ async def get_logs(name: str, tail: int = 200):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/containers/{name}/recipe", status_code=201)
+async def save_container_recipe(name: str):
+    """Import a running container's launch command into a saved recipe."""
+    try:
+        recipe = await manager.container_to_recipe(name)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _recipe_detail(recipe)
+
+
 # ---------- images ----------
 @app.get("/api/images")
 async def list_images():
@@ -1636,11 +1648,76 @@ async def clear_finished():
 
 
 # ---------- recipe compatibility API ----------
+def _merge_recipe_launch_settings(body: dict) -> dict:
+    """Translate structured ``launch_settings`` into recipe fields.
+
+    Uses the same key names as the cluster launch settings, so callers that
+    describe a launch (MCP controller, importers) do not silently lose flags
+    the recipe contract spells differently.
+    """
+    settings = body.get("launch_settings")
+    if settings is None:
+        return body
+    if not isinstance(settings, dict):
+        raise HTTPException(400, "launch_settings must be an object")
+
+    payload = {key: value for key, value in body.items() if key != "launch_settings"}
+    engine = payload.get("engine") or "vllm"
+    if engine not in {"vllm", "sglang"}:
+        raise HTTPException(400, "engine must be vllm or sglang")
+    raw_controls = payload.get("launch_controls")
+    if raw_controls is not None and not isinstance(raw_controls, dict):
+        raise HTTPException(400, "launch_controls must be an object")
+    controls = dict(raw_controls or {})
+
+    extra_args = (
+        payload["extra_args"]
+        if payload.get("extra_args") is not None
+        else settings.get("extra_args")
+    )
+    if extra_args is not None:
+        if not isinstance(extra_args, list) or any(
+            not isinstance(value, str) for value in extra_args
+        ):
+            raise HTTPException(400, "extra_args must be an array of strings")
+        payload["extra_args"] = extra_args
+    if settings.get("kv_cache_dtype") and controls.get("kv_cache_dtype") is None:
+        controls["kv_cache_dtype"] = settings["kv_cache_dtype"]
+
+    if engine == "sglang":
+        for key in ("sg_tp_size", "sg_context_length", "sg_max_running_requests", "sg_mem_fraction"):
+            source = {
+                "sg_tp_size": "tensor_parallel_size",
+                "sg_context_length": "context_length",
+                "sg_max_running_requests": "max_running_requests",
+                "sg_mem_fraction": "mem_fraction_static",
+            }[key]
+            if payload.get(key) is None and settings.get(source) is not None:
+                payload[key] = settings[source]
+        if payload.get("sg_image") is None and settings.get("image"):
+            payload["sg_image"] = settings["image"]
+    else:
+        if payload.get("gpu_memory_utilization") is None and settings.get("gpu_memory_utilization") is not None:
+            payload["gpu_memory_utilization"] = settings["gpu_memory_utilization"]
+        context_length = settings.get("max_model_len") or settings.get("context_length")
+        if context_length is not None and controls.get("context_window") is None:
+            controls["context_window"] = context_length
+        max_running = settings.get("max_running_requests")
+        if max_running is not None and controls.get("max_concurrency") is None:
+            controls["max_concurrency"] = max_running
+
+    payload["launch_controls"] = controls or None
+    if payload.get("image") is None and settings.get("image"):
+        payload["image"] = settings["image"]
+    return payload
+
+
 @app.post("/api/recipes")
 async def create_recipe(req: Request):
     body = await req.json()
     if not body.get("model"):
         raise HTTPException(400, "model is required")
+    body = _merge_recipe_launch_settings(body)
     try:
         return await manager.add_recipe(
             model=body["model"],
@@ -1733,6 +1810,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
     allowed = {
         "extra_args", "launch_controls",
         "gpu_memory_utilization", "gpu_memory_gb",
+        "sg_tp_size", "sg_mem_fraction",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -1772,6 +1850,18 @@ def _public_recipe(recipe: dict) -> dict:
     }
     contract = manager.recipe_deployment_contract(safe_recipe)
     supported = recipe.get("supported", True) is not False and contract["supported"]
+    # The card count must reflect everything the recipe would launch with:
+    # SGLang keeps context/concurrency/memory as scalar fields rather than
+    # flags in extra_args, so those count too.
+    saved_count = len(safe_recipe.get("extra_args") or [])
+    if (recipe.get("engine") or "vllm") == "sglang":
+        saved_count += sum(
+            1 for key in (
+                "sg_tp_size", "sg_context_length",
+                "sg_max_running_requests", "sg_mem_fraction",
+            )
+            if recipe.get(key) is not None
+        )
     return {
         "id": recipe.get("id"),
         "name": recipe.get("name") or recipe.get("model"),
@@ -1787,7 +1877,7 @@ def _public_recipe(recipe: dict) -> dict:
         "sg_image": recipe.get("sg_image"),
         **contract,
         "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
-        "extra_args_count": len(safe_recipe.get("extra_args") or []),
+        "extra_args_count": saved_count,
         "supported": supported,
         "error": recipe.get("error") or contract.get("error"),
         "launch": dict(manager.recipe_launches.get(recipe.get("id")) or {}),
@@ -1833,6 +1923,8 @@ async def v1_update_recipe(recipe_id: str, req: Request):
     allowed = {
         "name", "extra_args", "launch_controls",
         "gpu_memory_utilization", "gpu_memory_gb",
+        "sg_tp_size", "sg_context_length",
+        "sg_max_running_requests", "sg_mem_fraction", "sg_image",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:

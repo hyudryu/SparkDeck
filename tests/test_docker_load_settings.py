@@ -377,5 +377,256 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(original.removed)
 
 
+class ContainerToRecipeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.manager = Manager.__new__(Manager)
+
+    def _attach(self, containers) -> tempfile.TemporaryDirectory:
+        self.manager.client = SimpleNamespace(containers=containers)
+        self.manager.lock = asyncio.Lock()
+        self.manager.recipes = []
+        directory = tempfile.TemporaryDirectory()
+        self.manager.recipes_path = Path(directory.name) / "recipes.json"
+        return directory
+
+    async def test_sglang_container_imports_scalars_and_preserves_flags(self):
+        model = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+        command = [
+            "python3", "-m", "sglang.launch_server",
+            "--model-path", model,
+            "--host", "0.0.0.0", "--port", "8888",
+            "--tp-size", "1",
+            "--context-length", "262144",
+            "--max-running-requests", "10",
+            "--mem-fraction-static", "0.90",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--reasoning-parser", "qwen3",
+            "--mamba-full-memory-ratio", "4.21",
+            "--enable-metrics",
+        ]
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "sglang-cid", "qwen3.8-27b-sglang",
+            {"Image": "lmsysorg/sglang:latest", "Cmd": command, "Labels": {}},
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("qwen3.8-27b-sglang")
+
+        self.assertEqual(recipe["engine"], "sglang")
+        self.assertEqual(recipe["model"], model)
+        self.assertEqual(recipe["sg_context_length"], 262144)
+        self.assertEqual(recipe["sg_max_running_requests"], 10)
+        self.assertEqual(recipe["sg_mem_fraction"], 0.9)
+        self.assertEqual(recipe["sg_tp_size"], 1)
+        args = recipe["extra_args"]
+        self.assertEqual(args[args.index("--kv-cache-dtype") + 1], "fp8_e4m3")
+        self.assertIn("--mamba-full-memory-ratio", args)
+        self.assertIn("--reasoning-parser", args)
+        self.assertIn("--enable-metrics", args)
+        self.assertNotIn("--context-length", args)
+        self.assertNotIn(model, args)
+
+    async def test_vllm_container_imports_controls_into_extra_args(self):
+        model = "example/Model"
+        command = [
+            "vllm", "serve", model,
+            "--host", "0.0.0.0", "--port", "8000",
+            "--gpu-memory-utilization", "0.85",
+            "--max-num-seqs", "12",
+            "--max-model-len", "1048576",
+            "--kv-cache-dtype", "fp8",
+            "--max-cudagraph-capture-size", "512",
+            "--enable-prefix-caching",
+        ]
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "vllm-cid", "vllm-example",
+            {"Image": "example/vllm:latest", "Cmd": command, "Labels": {}},
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("vllm-example")
+
+        self.assertEqual(recipe["engine"], "vllm")
+        self.assertEqual(recipe["model"], model)
+        self.assertEqual(recipe["gpu_memory_utilization"], 0.85)
+        args = recipe["extra_args"]
+        self.assertEqual(
+            self.manager._cli_option(args, {"--max-model-len"}, int), 1048576
+        )
+        self.assertEqual(self.manager._cli_option(args, {"--max-num-seqs"}, int), 12)
+        self.assertEqual(self.manager._cli_option(args, {"--kv-cache-dtype"}), "fp8")
+        self.assertEqual(
+            self.manager._cli_option(args, {"--max-cudagraph-capture-size"}, int), 512
+        )
+        self.assertIn("--enable-prefix-caching", args)
+
+    async def test_missing_container_raises_lookup_error(self):
+        with self._attach(FakeContainers()):
+            with self.assertRaises(LookupError):
+                await self.manager.container_to_recipe("gone")
+
+    async def test_command_without_model_raises_value_error(self):
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "cid", "mystery",
+            {"Image": "lmsysorg/sglang:latest", "Cmd": ["--help"], "Labels": {}},
+            {},
+        ))
+        with self._attach(containers):
+            with self.assertRaises(ValueError):
+                await self.manager.container_to_recipe("mystery")
+
+    async def test_shell_wrapped_vllm_container_imports_model(self):
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "cid", "wrapped-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": ["sh", "-c", "vllm serve org/model --max-num-seqs 8 --enable-prefix-caching"],
+                "Labels": {},
+            },
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("wrapped-vllm")
+
+        self.assertEqual(recipe["model"], "org/model")
+        self.assertEqual(recipe["engine"], "vllm")
+        self.assertIn("--enable-prefix-caching", recipe["extra_args"])
+
+    async def test_sglang_inline_model_path_imports(self):
+        command = [
+            "python3", "-m", "sglang.launch_server",
+            "--model-path=org/inline-model",
+            "--host", "0.0.0.0", "--port", "8888",
+        ]
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "cid", "inline-sglang",
+            {"Image": "lmsysorg/sglang:latest", "Cmd": command, "Labels": {}},
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("inline-sglang")
+
+        self.assertEqual(recipe["model"], "org/inline-model")
+        self.assertEqual(recipe["engine"], "sglang")
+
+    async def test_reimport_clears_removed_scalars(self):
+        base_cmd = [
+            "python3", "-m", "sglang.launch_server",
+            "--model-path", "org/model", "--host", "0.0.0.0", "--port", "8888",
+            "--context-length", "262144",
+        ]
+        trimmed_cmd = [
+            "python3", "-m", "sglang.launch_server",
+            "--model-path", "org/model", "--host", "0.0.0.0", "--port", "8888",
+        ]
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "cid", "sglang-a",
+            {"Image": "lmsysorg/sglang:latest", "Cmd": base_cmd, "Labels": {}},
+            {},
+        ))
+        with self._attach(containers):
+            first = await self.manager.container_to_recipe("sglang-a")
+            self.assertEqual(first["sg_context_length"], 262144)
+
+            containers.items.pop("sglang-a")
+            replacement = FakeContainer(
+                containers, "cid2", "sglang-a",
+                {"Image": "lmsysorg/sglang:latest", "Cmd": trimmed_cmd, "Labels": {}},
+                {},
+            )
+            containers.add(replacement)
+            second = await self.manager.container_to_recipe("sglang-a")
+
+        self.assertEqual(second["id"], first["id"])
+        self.assertIsNone(second["sg_context_length"])
+
+    async def test_summary_preserves_llama_runtime_label(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "llama-cid", "llama-box",
+            {
+                "Image": "ghcr.io/ggml/llama.cpp:server",
+                "Cmd": ["llama-server", "--port", "8080"],
+                "Labels": {
+                    "io.sparkdeck.managed": "1",
+                    "io.sparkdeck.runtime": "llama.cpp",
+                },
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["engine"], "llama.cpp")
+
+    async def test_add_recipe_rejects_invalid_sg_scalars(self):
+        with self._attach(FakeContainers()):
+            with self.assertRaises(ValueError):
+                await self.manager.add_recipe("org/model", sg_tp_size=1.5)
+            with self.assertRaises(ValueError):
+                await self.manager.add_recipe("org/model", sg_mem_fraction=1.2)
+            recipe = await self.manager.add_recipe(
+                "org/model", sg_tp_size="2", sg_mem_fraction="0.9",
+            )
+
+        self.assertEqual(recipe["sg_tp_size"], 2)
+        self.assertEqual(recipe["sg_mem_fraction"], 0.9)
+
+    async def test_update_recipe_validates_sg_scalars(self):
+        with self._attach(FakeContainers()):
+            recipe = await self.manager.add_recipe("org/model", sg_tp_size=1)
+            with self.assertRaises(ValueError):
+                await self.manager.update_recipe(
+                    recipe["id"], {"sg_mem_fraction": 1.2},
+                )
+            with self.assertRaises(ValueError):
+                await self.manager.update_recipe(
+                    recipe["id"], {"sg_tp_size": 1.5},
+                )
+            updated = await self.manager.update_recipe(
+                recipe["id"], {"sg_tp_size": 2},
+            )
+
+        self.assertEqual(updated["sg_tp_size"], 2)
+
+    async def test_update_deployment_settings_validates_sg_scalars(self):
+        with self.assertRaises(ValueError):
+            await self.manager.update_deployment_settings(
+                "dep-1", {"sg_mem_fraction": 1.2},
+            )
+        with self.assertRaises(ValueError):
+            await self.manager.update_deployment_settings(
+                "dep-1", {"sg_tp_size": 0},
+            )
+
+    def test_summary_infers_sglang_engine_from_image(self):
+        model = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+        command = [
+            "python3", "-m", "sglang.launch_server",
+            "--model-path", model, "--host", "0.0.0.0", "--port", "8888",
+            "--context-length", "262144", "--max-running-requests", "10",
+        ]
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "sglang-cid", "qwen3.8-27b-sglang",
+            {"Image": "lmsysorg/sglang:latest", "Cmd": command, "Labels": {}},
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["engine"], "sglang")
+        self.assertEqual(summary["model"], model)
+        self.assertEqual(summary["load_settings"]["context_window"], 262144)
+
+
 if __name__ == "__main__":
     unittest.main()

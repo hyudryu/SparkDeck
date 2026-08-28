@@ -307,6 +307,32 @@ describe('settings page', () => {
     expect(oldNode!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
+  it('labels preflight-ready nodes as queued during a rollout', async () => {
+    const current = 'b'.repeat(40)
+    const old = 'a'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: old,
+        target: { branch: 'main', revision: current, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
+        up_to_date: false, can_update: false, blockers: [], nodes: [],
+        job: {
+          id: 'active-job', active: true, phase: 'updating_workers', target_branch: 'main', target_revision: current,
+          nodes: [{ id: 'queued', name: 'Queued worker', local: false, online: true, current_revision: old, blockers: [], phase: 'ready' }],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', default_runtime: 'vllm', default_context_length: 8192,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const node = (await screen.findByText('Queued worker')).closest<HTMLElement>('.update-node')
+    expect(node).not.toBeNull()
+    expect(within(node!).getByText('Queued')).toBeInTheDocument()
+    expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
+  })
+
   it('does not trust an up-to-date phase saved for an older target', async () => {
     const current = 'b'.repeat(40)
     const old = 'a'.repeat(40)

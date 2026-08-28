@@ -101,7 +101,7 @@ For a TP2 configuration, SparkDeck requires two selected nodes. Nodes without th
 
 Cluster onboards machines over Tailscale and manages recognizable node names.
 
-![Cluster onboarding with illustrative nodes](screenshots/readme/cluster-management-dark.png)
+![Cluster Management with illustrative nodes](screenshots/readme/cluster-management-dark.png)
 
 The page shows:
 
@@ -234,7 +234,7 @@ Choose **Follow system**, **Light**, or **Dark**. The selection is saved on the 
 
 ### DGX Spark cluster settings
 
-Open Cluster onboarding and review private-network guidance. Cluster membership itself is managed on the Cluster tab, not by editing hidden files.
+Open Cluster Management and review private-network guidance. Cluster membership itself is managed on the Cluster tab, not by editing hidden files.
 
 ### Hugging Face access
 

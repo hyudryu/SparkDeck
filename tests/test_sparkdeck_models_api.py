@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -224,6 +225,319 @@ class DeploymentRenameStoreTests(unittest.TestCase):
                 self.assertEqual(store.deployment("dep-1")["alias"], "new-name")
             finally:
                 store.close()
+
+
+class ContainerRecipeImportTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    async def test_import_returns_public_detail_with_sglang_scalars(self):
+        imported = {
+            "id": "r9", "name": "qwen3.8-27b-sglang",
+            "model": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+            "engine": "sglang",
+            "extra_args": ["--kv-cache-dtype", "fp8_e4m3"],
+            "deployment_mode": "single", "node_ids": ["local"],
+            "sg_context_length": 262144, "sg_max_running_requests": 10,
+        }
+        to_recipe = AsyncMock(return_value=dict(imported))
+        with patch.object(server.manager, "container_to_recipe", to_recipe):
+            response = await self.client.post(
+                "/api/containers/qwen3.8-27b-sglang/recipe",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        to_recipe.assert_awaited_once_with("qwen3.8-27b-sglang")
+        body = response.json()
+        self.assertEqual(body["extra_args_count"], 4)
+        self.assertEqual(body["launch_controls"]["context_window"], 262144)
+
+    async def test_import_maps_container_and_value_errors(self):
+        missing = AsyncMock(side_effect=LookupError("Container 'gone' not found"))
+        bad = AsyncMock(side_effect=ValueError("could not determine the served model"))
+        with patch.object(server.manager, "container_to_recipe", missing):
+            not_found = await self.client.post("/api/containers/gone/recipe")
+        with patch.object(server.manager, "container_to_recipe", bad):
+            invalid = await self.client.post("/api/containers/broken/recipe")
+
+        self.assertEqual(not_found.status_code, 404)
+        self.assertEqual(invalid.status_code, 400)
+
+
+class RecipeLaunchSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    async def test_sglang_launch_settings_map_to_recipe_scalars(self):
+        add_recipe = AsyncMock(return_value={"id": "r2"})
+        payload = {
+            "model": "org/model", "engine": "sglang",
+            "launch_settings": {
+                "context_length": 262144,
+                "max_running_requests": 10,
+                "mem_fraction_static": 0.9,
+                "tensor_parallel_size": 1,
+                "kv_cache_dtype": "fp8_e4m3",
+                "extra_args": ["--enable-metrics"],
+            },
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        kwargs = add_recipe.await_args.kwargs
+        self.assertEqual(kwargs["sg_context_length"], 262144)
+        self.assertEqual(kwargs["sg_max_running_requests"], 10)
+        self.assertEqual(kwargs["sg_mem_fraction"], 0.9)
+        self.assertEqual(kwargs["sg_tp_size"], 1)
+        self.assertEqual(kwargs["extra_args"], ["--enable-metrics"])
+        self.assertEqual(kwargs["launch_controls"], {"kv_cache_dtype": "fp8_e4m3"})
+
+    async def test_vllm_launch_settings_map_to_launch_controls(self):
+        add_recipe = AsyncMock(return_value={"id": "r3"})
+        payload = {
+            "model": "org/model", "engine": "vllm",
+            "launch_settings": {
+                "max_model_len": 65536,
+                "max_running_requests": 16,
+                "gpu_memory_utilization": 0.85,
+            },
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        kwargs = add_recipe.await_args.kwargs
+        self.assertEqual(kwargs["gpu_memory_utilization"], 0.85)
+        self.assertEqual(kwargs["launch_controls"], {
+            "context_window": 65536, "max_concurrency": 16,
+        })
+
+    async def test_launch_settings_reject_non_string_extra_args(self):
+        add_recipe = AsyncMock(return_value={"id": "r4"})
+        payload = {
+            "model": "org/model", "engine": "vllm",
+            "launch_settings": {"extra_args": "--enable-metrics"},
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        add_recipe.assert_not_awaited()
+
+    async def test_launch_settings_reject_non_object_launch_controls(self):
+        add_recipe = AsyncMock(return_value={"id": "r5"})
+        payload = {
+            "model": "org/model", "engine": "sglang",
+            "launch_settings": {"context_length": 262144},
+            "launch_controls": "max_concurrency=10",
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        add_recipe.assert_not_awaited()
+
+    async def test_launch_settings_reject_out_of_range_sg_scalars(self):
+        add_recipe = AsyncMock(
+            side_effect=ValueError("sg_mem_fraction must be between 0 and 1")
+        )
+        payload = {
+            "model": "org/model", "engine": "sglang",
+            "launch_settings": {"mem_fraction_static": 1.2},
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("sg_mem_fraction", response.json()["detail"])
+
+    async def test_update_recipe_accepts_sglang_scalars(self):
+        update = AsyncMock(return_value=dict(RECIPE))
+        with patch.object(server.manager, "update_recipe", update):
+            response = await self.client.put(
+                "/api/v1/recipes/r1",
+                json={"sg_mem_fraction": 0.9, "sg_tp_size": 1},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        update.assert_awaited_once_with(
+            "r1", {"sg_mem_fraction": 0.9, "sg_tp_size": 1},
+        )
+
+
+class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    def _stub_discovered(self, card, container):
+        return (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck,
+                "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+        )
+
+    async def test_discovered_vllm_detail_surfaces_container_flags(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {
+            "name": "vllm-dspark", "image": "example/dspark:latest",
+            "load_settings": {
+                "engine": "vllm", "editable": True,
+                "extra_args": [
+                    "--tensor-parallel-size", "2",
+                    "--speculative-config",
+                    '{"method":"mtp","num_speculative_tokens":4}',
+                    "--enable-prefix-caching",
+                ],
+                "context_window": 65536, "max_concurrency": 8,
+                "kv_cache_dtype": "fp8", "thinking_mode": "default",
+                "gpu_memory_utilization": 0.85, "tensor_parallel_size": 2,
+            },
+        }
+        patches = self._stub_discovered(card, container)
+        with patches[0], patches[1]:
+            response = await self.client.get("/api/v1/deployments/container:vllm-dspark")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["editable"])
+        self.assertIn("read-only", body["edit_reason"])
+        self.assertEqual(body["launch_controls"]["context_window"], 65536)
+        self.assertEqual(body["launch_controls"]["max_concurrency"], 8)
+        self.assertEqual(body["launch_controls"]["kv_cache_dtype"], "fp8")
+        self.assertEqual(
+            body["launch_controls"]["dspark_num_speculative_tokens"], 4,
+        )
+        self.assertEqual(body["gpu_memory_utilization"], 0.85)
+        self.assertIsNone(body["sg_mem_fraction"])
+        self.assertEqual(body["image"], "example/dspark:latest")
+        self.assertIn("--enable-prefix-caching", body["extra_args"])
+        self.assertIn("--tensor-parallel-size", body["extra_args"])
+        self.assertNotIn("--max-model-len", body["extra_args"])
+
+    async def test_discovered_sglang_detail_maps_sglang_scalars(self):
+        card = {
+            "id": "container:qwen3.8-27b-sglang", "alias": "qwen",
+            "runtime": "sglang", "kind": "external",
+            "model": {"repository": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "qwen3.8-27b-sglang", "image": "lmsysorg/sglang:latest",
+            "load_settings": {
+                "engine": "sglang", "editable": True,
+                "extra_args": ["--enable-metrics"],
+                "context_window": 262144, "max_concurrency": 10,
+                "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
+                "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1,
+            },
+        }
+        patches = self._stub_discovered(card, container)
+        with patches[0], patches[1]:
+            response = await self.client.get(
+                "/api/v1/deployments/container:qwen3.8-27b-sglang",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["launch_controls"]["context_window"], 262144)
+        self.assertEqual(body["launch_controls"]["max_concurrency"], 10)
+        self.assertEqual(body["launch_controls"]["kv_cache_dtype"], "fp8_e4m3")
+        self.assertEqual(body["sg_mem_fraction"], 0.9)
+        self.assertEqual(body["sg_tp_size"], 1)
+        self.assertIsNone(body["gpu_memory_utilization"])
+        self.assertEqual(body["extra_args"], ["--enable-metrics"])
+
+    async def test_discovered_detail_falls_back_when_container_is_gone(self):
+        card = {
+            "id": "container:vanished", "alias": "vanished", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        patches = (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck,
+                "_resolve_discovered_container",
+                AsyncMock(side_effect=LookupError("managed container not found")),
+            ),
+        )
+        with patches[0], patches[1]:
+            response = await self.client.get("/api/v1/deployments/container:vanished")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["extra_args"], [])
+        self.assertEqual(body["launch_controls"], {})
+
+
+class ExternalEndpointProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovered_card_without_port_keeps_docker_status(self):
+        deployment = {
+            "id": "container:host-net", "kind": "external",
+            "runtime": "sglang", "status": "running", "port": None,
+        }
+        await server.sparkdeck._probe_external_endpoint(deployment)
+
+        self.assertEqual(deployment["status"], "running")
+        self.assertNotIn("last_error", deployment)
+
+    async def test_discovered_card_with_port_probes_derived_url(self):
+        deployment = {
+            "id": "container:bound", "kind": "external",
+            "runtime": "vllm", "status": "running", "port": 8123,
+        }
+        health = AsyncMock()
+        with patch.object(
+            server.sparkdeck.registry, "get",
+            Mock(return_value=SimpleNamespace(health=health)),
+        ), patch.object(
+            server.sparkdeck, "_get_credential", Mock(return_value=None),
+        ):
+            await server.sparkdeck._probe_external_endpoint(deployment)
+
+        health.assert_awaited_once()
+        self.assertEqual(health.await_args.args[1], "http://127.0.0.1:8123")
+        self.assertEqual(deployment["status"], "running")
+
+    async def test_stored_external_still_probes_saved_base_url(self):
+        deployment = {
+            "id": "dep-ext", "kind": "external",
+            "runtime": "vllm", "status": "unknown", "_base_url": "http://10.0.0.9:8000",
+        }
+        health = AsyncMock(side_effect=RuntimeError("unreachable"))
+        with patch.object(
+            server.sparkdeck.registry, "get",
+            Mock(return_value=SimpleNamespace(health=health)),
+        ), patch.object(
+            server.sparkdeck, "_get_credential", Mock(return_value=None),
+        ):
+            await server.sparkdeck._probe_external_endpoint(deployment)
+
+        self.assertEqual(deployment["status"], "error")
+        self.assertEqual(deployment["last_error"], "Endpoint health check failed")
 
 
 if __name__ == "__main__":

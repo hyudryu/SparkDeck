@@ -501,6 +501,10 @@ def _is_vllm_image(tag: str) -> bool:
     return "vllm" in (tag or "").lower()
 
 
+def _is_sglang_image(tag: str) -> bool:
+    return "sglang" in (tag or "").lower()
+
+
 def _normalize_node_name(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("name must be a string")
@@ -3157,6 +3161,29 @@ class Manager:
             ),
         }
 
+    @classmethod
+    def _validated_sg_scalar(cls, key: str, value: Any) -> Any:
+        """Normalize an SGLang scalar so it can never emit an invalid flag.
+
+        sg_tp_size / sg_context_length / sg_max_running_requests become
+        positive integers; sg_mem_fraction must land in (0, 1].
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a number") from exc
+        if key == "sg_mem_fraction":
+            if not 0 < number <= 1:
+                raise ValueError("sg_mem_fraction must be between 0 and 1")
+            return number
+        if not number.is_integer() or number < 1:
+            raise ValueError(f"{key} must be a positive integer")
+        return int(number)
+
     def _apply_deployment_launch_controls(
         self, args: list[str], engine: str, controls: dict
     ) -> list[str]:
@@ -3247,6 +3274,9 @@ class Manager:
         """Save the inputs used to rebuild a stopped clustered deployment."""
         if "extra_args" in body:
             self._reject_sensitive_cli_credentials(body.get("extra_args"))
+        for sg_key in ("sg_tp_size", "sg_mem_fraction"):
+            if sg_key in body:
+                body[sg_key] = self._validated_sg_scalar(sg_key, body[sg_key])
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -8526,12 +8556,19 @@ class Manager:
         node_ids: list[str] | None = None,
         launch_controls: dict | None = None,
         force_new: bool = False,
+        replace_launch_inputs: bool = False,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if not model:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
+        sg_tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
+        sg_context_length = self._validated_sg_scalar("sg_context_length", sg_context_length)
+        sg_max_running_requests = self._validated_sg_scalar(
+            "sg_max_running_requests", sg_max_running_requests,
+        )
+        sg_mem_fraction = self._validated_sg_scalar("sg_mem_fraction", sg_mem_fraction)
         deployment_mode = deployment_mode or "single"
         if deployment_mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
@@ -8588,6 +8625,17 @@ class Manager:
                         r["sg_mem_fraction"] = sg_mem_fraction
                     if sg_image is not None:
                         r["sg_image"] = sg_image
+                    if replace_launch_inputs:
+                        # Re-imports must mirror the container exactly: a
+                        # managed option removed from the command clears the
+                        # stored scalar instead of keeping a stale value.
+                        r["extra_args"] = list(extra_args or [])
+                        r["gpu_memory_utilization"] = gpu_memory_utilization
+                        r["gpu_memory_gb"] = gpu_memory_gb
+                        r["sg_tp_size"] = sg_tp_size
+                        r["sg_context_length"] = sg_context_length
+                        r["sg_max_running_requests"] = sg_max_running_requests
+                        r["sg_mem_fraction"] = sg_mem_fraction
                     r["deployment_mode"] = deployment_mode or "single"
                     r["node_ids"] = list(node_ids or [LOCAL_NODE_ID])
                     self._save_recipes()
@@ -8640,6 +8688,12 @@ class Manager:
             raise ValueError(f"unsupported recipe field(s): {', '.join(unknown)}")
         if "extra_args" in changes:
             self._reject_hf_cli_credentials(changes.get("extra_args"))
+        for sg_key in (
+            "sg_tp_size", "sg_context_length",
+            "sg_max_running_requests", "sg_mem_fraction",
+        ):
+            if sg_key in changes:
+                changes[sg_key] = self._validated_sg_scalar(sg_key, changes[sg_key])
         async with self.lock:
             recipe = next((r for r in self.recipes if r.get("id") == rid), None)
             if not recipe:
@@ -9108,7 +9162,13 @@ class Manager:
         return list(run.get("log_lines") or [])
 
     async def container_to_recipe(self, name: str) -> dict:
-        """Inspect a container's config and create a recipe from it."""
+        """Inspect a container's config and create a recipe from it.
+
+        Parsing is delegated to ``_container_load_settings`` so an imported
+        recipe uses exactly the same managed-flag split as container
+        discovery: common controls become recipe scalars / launch controls
+        and every remaining flag is preserved in ``extra_args``.
+        """
         def _inspect():
             try:
                 c = self.client.containers.get(name)
@@ -9118,103 +9178,75 @@ class Manager:
 
         c = await asyncio.to_thread(_inspect)
         if c is None:
-            raise ValueError(f"Container '{name}' not found")
+            raise LookupError(f"Container '{name}' not found")
 
         labels = c.labels or {}
         model = _label_value(labels, MODEL_LABEL, "")
-        engine = _label_value(labels, ENGINE_LABEL, "vllm")
         attrs = c.attrs or {}
         image_tag = attrs.get("Config", {}).get("Image") or attrs.get("Image") or None
+        engine = _label_value(labels, ENGINE_LABEL, "")
+        if not engine:
+            engine = "sglang" if _is_sglang_image(image_tag) else "vllm"
 
-        # Parse command to extract gpu_memory_utilization and extra_args
-        cmd = c.attrs.get("Config", {}).get("Cmd") or []
-        gpu_mem = None
-        extra_args = []
-        sg_tp_size = sg_context_length = sg_max_running_requests = sg_mem_fraction = None
-
-        if cmd and engine == "sglang":
-            # SGLang containers run: python -m sglang.launch_server
-            # --model-path <model> --host … --port … [sg flags] [extra args].
-            # Map the controller-managed flags into recipe fields; keep the
-            # rest as extra args.
-            def _sg_flag(flag, cast):
-                try:
-                    i = cmd.index(flag)
-                    return cast(cmd[i + 1])
-                except (ValueError, IndexError):
-                    return None
-
-            sg_tp_size = _sg_flag("--tp-size", int)
-            sg_context_length = _sg_flag("--context-length", int)
-            sg_max_running_requests = _sg_flag("--max-running-requests", int)
-            sg_mem_fraction = _sg_flag("--mem-fraction-static", float)
-            managed = {
-                "--model-path", "--host", "--port", "--tp-size",
-                "--context-length", "--max-running-requests",
-                "--mem-fraction-static", "--max-total-tokens",
-            }
-            skip_tokens = {"-m", "python", "python3", "sglang.launch_server", model}
-            i = 0
-            while i < len(cmd):
-                tok = cmd[i]
-                if tok in managed:
-                    i += 2  # skip flag + value
-                    continue
-                if tok in skip_tokens:
-                    i += 1
-                    continue
-                extra_args.append(tok)
-                i += 1
-
-        elif cmd:
-            # Find --gpu-memory-utilization value
-            try:
-                gmu_idx = cmd.index("--gpu-memory-utilization")
-                if gmu_idx + 1 < len(cmd):
-                    gpu_mem = float(cmd[gmu_idx + 1])
-            except (ValueError, IndexError):
-                pass
-
-            # Collect extra args: everything after the model that isn't
-            # --host, --port, --gpu-memory-utilization (which we manage)
-            # or the model itself, or "vllm"/"serve"
-            skip_flags = {"--host", "--port", "--gpu-memory-utilization"}
-            # Find model position in cmd
-            model_idx = None
+        cmd = [str(value) for value in (attrs.get("Config", {}).get("Cmd") or [])]
+        if not model and engine == "sglang":
+            # _cli_option understands both "--model-path x" and "--model-path=x".
+            model = self._cli_option(cmd, {"--model-path"}) or ""
+        if not model and engine != "sglang":
             if "serve" in cmd:
-                si = cmd.index("serve")
-                if si + 1 < len(cmd):
-                    model_idx = si + 1
-            elif model and model in cmd:
-                model_idx = cmd.index(model)
-
-            if model_idx is not None:
-                # Walk tokens after the model
-                i = model_idx + 1
-                while i < len(cmd):
-                    tok = cmd[i]
-                    if tok in skip_flags:
-                        i += 2  # skip flag + value
-                        continue
-                    extra_args.append(tok)
-                    i += 1
-
+                i = cmd.index("serve")
+                if i + 1 < len(cmd):
+                    model = cmd[i + 1]
+            elif len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
+                match = self._shell_vllm_command(cmd[-1])
+                if match:
+                    try:
+                        model = shlex.split(match.group("model"))[0]
+                    except (ValueError, IndexError):
+                        model = match.group("model")
         if not model:
-            # Fallback: use container name as model hint
-            model = name.replace("vllm-", "", 1).replace("sglang-", "", 1)
+            raise ValueError(
+                f"could not determine the served model from container '{name}'"
+            )
+
+        settings = self._container_load_settings(cmd, engine, model)
+        extra_args = [str(value) for value in settings.get("extra_args") or []]
+        launch_controls: dict = {}
+        if settings.get("kv_cache_dtype"):
+            launch_controls["kv_cache_dtype"] = settings["kv_cache_dtype"]
+        if settings.get("thinking_mode") not in (None, "", "default"):
+            launch_controls["thinking_mode"] = settings["thinking_mode"]
+
+        gpu_memory_utilization = None
+        sg_tp_size = sg_context_length = sg_max_running_requests = sg_mem_fraction = None
+        if engine == "sglang":
+            # The SGLang parser reports --mem-fraction-static through the
+            # gpu_memory_utilization key; the recipe keeps it as sg_mem_fraction.
+            sg_tp_size = settings.get("tensor_parallel_size")
+            sg_context_length = settings.get("context_window")
+            sg_max_running_requests = settings.get("max_concurrency")
+            sg_mem_fraction = settings.get("gpu_memory_utilization")
+        else:
+            gpu_memory_utilization = settings.get("gpu_memory_utilization")
+            if settings.get("context_window") is not None:
+                launch_controls["context_window"] = settings["context_window"]
+            if settings.get("max_concurrency") is not None:
+                launch_controls["max_concurrency"] = settings["max_concurrency"]
 
         return await self.add_recipe(
             model=model,
             name=model,
             image=image_tag,
             extra_args=extra_args if extra_args else None,
-            gpu_memory_utilization=gpu_mem,
+            gpu_memory_utilization=gpu_memory_utilization,
             engine=engine,
             sg_tp_size=sg_tp_size,
             sg_context_length=sg_context_length,
             sg_max_running_requests=sg_max_running_requests,
             sg_mem_fraction=sg_mem_fraction,
             sg_image=image_tag if engine == "sglang" else None,
+            launch_controls=launch_controls or None,
+            replace_launch_inputs=True,
         )
 
     # ---------- cross-backend mutual exclusion ----------
@@ -9251,9 +9283,19 @@ class Manager:
         )
 
         is_managed = _label_value(labels, CONTROLLER_LABEL) == "1"
-        engine_label = _label_value(labels, ENGINE_LABEL, "vllm")
+        engine_label = _label_value(labels, ENGINE_LABEL, "")
+        if not engine_label:
+            # Unlabelled containers are inferred from the image so external
+            # SGLang runs are parsed as SGLang instead of vLLM. Explicit
+            # labels (including llama.cpp) are always preserved.
+            engine_label = "sglang" if _is_sglang_image(image_tag) else "vllm"
         is_atlas_serving = _is_atlas_serving_container(c.name, image_tag)
-        if not is_managed and not _is_vllm_image(image_tag) and not is_atlas_serving:
+        if (
+            not is_managed
+            and not _is_vllm_image(image_tag)
+            and not _is_sglang_image(image_tag)
+            and not is_atlas_serving
+        ):
             return None
 
         # parse model from cmd or label

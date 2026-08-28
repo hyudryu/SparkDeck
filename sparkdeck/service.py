@@ -60,6 +60,34 @@ _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 
 
+def _discovered_launch_controls(
+    manager: Any, engine: str, settings: dict[str, Any], extra_args: list[str],
+) -> dict[str, Any]:
+    """Launch controls for a discovered container's parsed command.
+
+    ``Manager._container_load_settings`` lifts the managed flags out of
+    ``extra_args`` into dedicated keys, so overlay them onto the controls
+    parsed from the remaining flags.
+    """
+    controls = manager._deployment_launch_controls({
+        "engine": engine,
+        "extra_args": extra_args,
+        **(
+            {
+                "sg_context_length": settings.get("context_window"),
+                "sg_max_running_requests": settings.get("max_concurrency"),
+            }
+            if engine == "sglang" else {}
+        ),
+    })
+    if engine != "sglang":
+        controls["context_window"] = settings.get("context_window")
+        controls["max_concurrency"] = settings.get("max_concurrency")
+    controls["kv_cache_dtype"] = settings.get("kv_cache_dtype")
+    controls["thinking_mode"] = settings.get("thinking_mode")
+    return controls
+
+
 async def _public_connection_urls(
     url: httpx.URL, resolver: Any = socket.getaddrinfo,
 ) -> tuple[tuple[httpx.URL, ...], str, str]:
@@ -912,31 +940,44 @@ class SparkDeckService:
                         "Docker is unavailable" if docker_unavailable
                         else "Managed container is missing"
                     )
-        async def probe_external(deployment: dict[str, Any]) -> None:
-            if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
-                return
-            try:
-                adapter = self.registry.get(deployment["runtime"])
-                await asyncio.wait_for(
-                    adapter.health(
-                        self.manager.http,
-                        deployment.get("_base_url") or "",
-                        self._get_credential(
-                            deployment["id"], deployment.get("_credential_ref")
-                        ),
-                    ),
-                    timeout=3,
-                )
-                deployment["status"] = "running"
-            except Exception:
-                deployment["status"] = "error"
-                deployment["last_error"] = "Endpoint health check failed"
-
-        await asyncio.gather(*(probe_external(item) for item in registered))
+        await asyncio.gather(
+            *(self._probe_external_endpoint(item) for item in registered)
+        )
         for deployment in registered:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         return registered
+
+    async def _probe_external_endpoint(self, deployment: dict[str, Any]) -> None:
+        if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
+            return
+        base_url = deployment.get("_base_url")
+        if not base_url and str(deployment.get("id") or "").startswith("container:"):
+            # Discovered cards have no stored endpoint: only probe when the
+            # container exposes a mappable port, and keep the Docker status
+            # otherwise (host-network containers have none).
+            port = deployment.get("port")
+            if not port:
+                return
+            base_url = f"http://127.0.0.1:{int(port)}"
+        if not base_url:
+            return
+        try:
+            adapter = self.registry.get(deployment["runtime"])
+            await asyncio.wait_for(
+                adapter.health(
+                    self.manager.http,
+                    base_url,
+                    self._get_credential(
+                        deployment["id"], deployment.get("_credential_ref")
+                    ),
+                ),
+                timeout=3,
+            )
+            deployment["status"] = "running"
+        except Exception:
+            deployment["status"] = "error"
+            deployment["last_error"] = "Endpoint health check failed"
 
     async def deployment_detail(self, deployment_id: str) -> dict[str, Any]:
         """Return one deployment with only its safe, editable launch inputs."""
@@ -980,16 +1021,39 @@ class SparkDeckService:
             and isinstance(manager_deployment.get("launch_settings"), dict)
             else None
         )
-        extra_args = self.manager._without_sensitive_cli_credentials(
-            (launch_settings or {}).get("extra_args") or []
-        )
-        launch_controls = (
-            self.manager._deployment_launch_controls({
-                **launch_settings,
-                "extra_args": extra_args,
-            })
-            if launch_settings is not None else {}
-        )
+        # Discovered containers have no saved launch settings, but their
+        # parsed command is still shown read-only so the deployment page
+        # reflects the flags the container actually runs with.
+        discovered_settings: dict[str, Any] | None = None
+        discovered_image = None
+        if launch_settings is None and str(deployment_id).startswith("container:"):
+            try:
+                container = await self._resolve_discovered_container(deployment_id)
+            except LookupError:
+                container = None
+            if container:
+                discovered_settings = container.get("load_settings") or {}
+                discovered_image = container.get("image")
+
+        if discovered_settings is not None:
+            engine = str(public.get("runtime") or "vllm")
+            extra_args = self.manager._without_sensitive_cli_credentials(
+                [str(value) for value in discovered_settings.get("extra_args") or []]
+            )
+            launch_controls = _discovered_launch_controls(
+                self.manager, engine, discovered_settings, extra_args,
+            )
+        else:
+            extra_args = self.manager._without_sensitive_cli_credentials(
+                (launch_settings or {}).get("extra_args") or []
+            )
+            launch_controls = (
+                self.manager._deployment_launch_controls({
+                    **launch_settings,
+                    "extra_args": extra_args,
+                })
+                if launch_settings is not None else {}
+            )
 
         raw_status = str(
             (manager_deployment or {}).get("status") or public.get("status") or ""
@@ -1014,7 +1078,11 @@ class SparkDeckService:
         if editable:
             edit_reason = None
         elif stored is None or str(deployment_id).startswith("container:"):
-            edit_reason = "Discovered deployments do not have editable saved launch settings."
+            edit_reason = (
+                "Discovered deployments do not have editable saved launch "
+                "settings. The flags below are read-only; use Save as recipe "
+                "on the Models page to import them."
+            )
         elif public.get("kind") != DeploymentKind.MANAGED.value:
             edit_reason = "External deployments do not have SparkDeck-managed launch settings."
         elif not manager_id or manager_deployment is None or launch_settings is None:
@@ -1042,6 +1110,20 @@ class SparkDeckService:
         # field below.
         public_settings = self._safe_configuration(public.get("settings") or {})
         public_settings.pop("extra_args", None)
+        gpu_memory_utilization = (launch_settings or {}).get("gpu_memory_utilization")
+        sg_tp_size = (launch_settings or {}).get("sg_tp_size")
+        sg_mem_fraction = (launch_settings or {}).get("sg_mem_fraction")
+        image = (launch_settings or {}).get("image")
+        if discovered_settings is not None:
+            engine = str(public.get("runtime") or "vllm")
+            if engine == "sglang":
+                # The SGLang parser reports --mem-fraction-static through the
+                # gpu_memory_utilization key; surface it under the sg fields.
+                sg_mem_fraction = discovered_settings.get("gpu_memory_utilization")
+                sg_tp_size = discovered_settings.get("tensor_parallel_size")
+            else:
+                gpu_memory_utilization = discovered_settings.get("gpu_memory_utilization")
+            image = image or discovered_image
         return {
             **public,
             "settings": public_settings,
@@ -1050,11 +1132,11 @@ class SparkDeckService:
             "desired_state": desired_state,
             "extra_args": extra_args,
             "launch_controls": launch_controls,
-            "gpu_memory_utilization": (
-                (launch_settings or {}).get("gpu_memory_utilization")
-            ),
+            "gpu_memory_utilization": gpu_memory_utilization,
             "gpu_memory_gb": (launch_settings or {}).get("gpu_memory_gb"),
-            "image": (launch_settings or {}).get("image"),
+            "sg_tp_size": sg_tp_size,
+            "sg_mem_fraction": sg_mem_fraction,
+            "image": image,
         }
 
     async def update_deployment_settings(
@@ -1064,6 +1146,7 @@ class SparkDeckService:
         allowed = {
             "extra_args", "launch_controls",
             "gpu_memory_utilization", "gpu_memory_gb",
+            "sg_tp_size", "sg_mem_fraction",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:

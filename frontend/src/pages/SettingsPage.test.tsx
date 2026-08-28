@@ -270,6 +270,41 @@ describe('settings page', () => {
     expect(await screen.findByText('Running bbbbbbbb')).toBeInTheDocument()
     expect(screen.getByText('origin/main bbbbbbbb · 1 cluster node')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Up to date' })).toBeDisabled()
+    const node = screen.getByText('Controller').closest<HTMLElement>('.update-node')
+    expect(node).not.toBeNull()
+    expect(within(node!).getByText('Latest')).toBeInTheDocument()
+    expect(node!.querySelector('.status-dot')).toHaveClass('status-running')
+  })
+
+  it('marks each node already on the target revision as latest', async () => {
+    const current = 'b'.repeat(40)
+    const old = 'a'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: old,
+        target: { branch: 'main', revision: current, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
+        up_to_date: false,
+        can_update: true, blockers: [],
+        nodes: [
+          { id: 'current', name: 'Already current', local: false, online: true, current_revision: current, blockers: [] },
+          { id: 'old', name: 'Needs update', local: true, online: true, current_revision: old, blockers: [] },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({
+        theme: 'system', default_runtime: 'vllm', default_context_length: 8192,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    const currentNode = (await screen.findByText('Already current')).closest<HTMLElement>('.update-node')
+    const oldNode = screen.getByText('Needs update').closest<HTMLElement>('.update-node')
+    expect(currentNode).not.toBeNull()
+    expect(oldNode).not.toBeNull()
+    expect(within(currentNode!).getByText('Latest')).toBeInTheDocument()
+    expect(currentNode!.querySelector('.status-dot')).toHaveClass('status-running')
+    expect(within(oldNode!).getByText('Ready')).toBeInTheDocument()
+    expect(oldNode!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 })
 

@@ -149,7 +149,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         self.manager.virtual_nas = virtual_nas
         launch = AsyncMock(return_value={
             "name": "sparkdeck-gguf", "port": 8080, "status": "running",
-            "model_source": "public_repository",
+            "model_source": "unknown",
         })
 
         with patch("sparkdeck.service.launch_managed_container", launch):
@@ -169,9 +169,90 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         )
         launch_settings = launch.await_args.args[5]
         self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
+        self.assertEqual(launch_settings["model_source"], "public_repository")
         self.assertEqual(created["model"]["repository"], "org/model")
         self.assertEqual(created["model"]["quantization"], "FP16")
         self.assertEqual(created["model"]["artifact"], str(artifact.resolve()))
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+        stored = self.service.store.deployment(created["id"], include_private=True)
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+
+    async def test_repo_relative_gguf_ignores_coincidental_cwd_file(self):
+        prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
+        ambient_cwd = Path(self.temp.name) / "ambient-cwd"
+        ambient_cwd.mkdir()
+        ambient_cwd.joinpath("model.gguf").write_bytes(b"unrelated")
+        prepare = AsyncMock(return_value=prepared)
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-coincidental", "port": 8080, "status": "running",
+        })
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(ambient_cwd)
+            with (
+                patch.object(
+                    self.service, "_prepare_public_gguf_artifact", prepare,
+                ),
+                patch("sparkdeck.service.launch_managed_container", launch),
+            ):
+                created = await self.service.create_deployment({
+                    "model": "org/model", "alias": "coincidental",
+                    "runtime": "llama.cpp", "revision": "release-1",
+                    "settings": {"artifact": "model.gguf"},
+                })
+        finally:
+            os.chdir(original_cwd)
+
+        prepare.assert_awaited_once_with(
+            "org/model", "model.gguf", "release-1", None,
+        )
+        self.assertEqual(created["model"]["artifact"], prepared)
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+
+    async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
+        self.service.store.add_deployment(Deployment(
+            id="existing", alias="duplicate", runtime=RuntimeKind.LLAMA_CPP,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/existing"),
+        ))
+        prepare = AsyncMock()
+
+        with (
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            self.assertRaisesRegex(ValueError, "alias 'duplicate' is already in use"),
+        ):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "duplicate",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": "model.gguf"},
+            })
+
+        prepare.assert_not_awaited()
+
+    async def test_absolute_local_gguf_remains_local(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+        prepare = AsyncMock()
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-local", "port": 8080, "status": "running",
+            "model_source": "unknown",
+        })
+
+        with (
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            patch("sparkdeck.service.launch_managed_container", launch),
+        ):
+            created = await self.service.create_deployment({
+                "model": "local/model", "alias": "local-gguf",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": str(artifact)},
+            })
+
+        prepare.assert_not_awaited()
+        self.assertEqual(created["settings"]["model_source"], "local")
 
     @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
     async def test_prepared_gguf_preserves_logical_snapshot_symlink_name(self):

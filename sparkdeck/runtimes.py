@@ -99,36 +99,41 @@ class LlamaCppAdapter(RuntimeAdapter):
         shard = _GGUF_SHARD_PATTERN.match(artifact_path.name)
         if shard:
             shard_count = int(shard.group("count"))
-            shard_paths = [
-                artifact_path.with_name(
-                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
-                )
+            shards_by_index: dict[int, list[Path]] = {}
+            for candidate in artifact_path.parent.iterdir():
+                candidate_shard = _GGUF_SHARD_PATTERN.match(candidate.name)
+                if (
+                    candidate_shard
+                    and candidate_shard.group("stem").casefold()
+                    == shard.group("stem").casefold()
+                    and int(candidate_shard.group("count")) == shard_count
+                    and candidate.is_file()
+                ):
+                    index = int(candidate_shard.group("index"))
+                    shards_by_index.setdefault(index, []).append(candidate)
+            if any(
+                len(shards_by_index.get(index, [])) != 1
                 for index in range(1, shard_count + 1)
-            ]
-            missing = [path for path in shard_paths if not path.is_file()]
-            if missing:
+            ):
                 raise ValueError(
                     "llama.cpp managed deployment requires every GGUF shard"
                 )
+            shard_paths = [
+                shards_by_index[index][0]
+                for index in range(1, shard_count + 1)
+            ]
             artifact_path = shard_paths[0]
-            if any(path.is_symlink() for path in shard_paths):
-                resolved_shards = [path.resolve(strict=True) for path in shard_paths]
-                if len(set(resolved_shards)) != len(resolved_shards):
-                    raise ValueError(
-                        "llama.cpp managed deployment requires distinct GGUF shards"
-                    )
-                volumes = {
-                    str(source): {
-                        "bind": f"/models/{logical.name}", "mode": "ro",
-                    }
-                    for logical, source in zip(shard_paths, resolved_shards, strict=True)
+            resolved_shards = [path.resolve(strict=True) for path in shard_paths]
+            if len(set(resolved_shards)) != len(resolved_shards):
+                raise ValueError(
+                    "llama.cpp managed deployment requires distinct GGUF shards"
+                )
+            volumes = {
+                str(source): {
+                    "bind": f"/models/{logical.name}", "mode": "ro",
                 }
-            else:
-                volumes = {
-                    str(artifact_path.parent.resolve()): {
-                        "bind": "/models", "mode": "ro",
-                    }
-                }
+                for logical, source in zip(shard_paths, resolved_shards, strict=True)
+            }
             artifact = f"/models/{artifact_path.name}"
         else:
             volumes = {

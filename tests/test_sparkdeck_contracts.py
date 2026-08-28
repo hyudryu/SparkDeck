@@ -144,7 +144,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         virtual_nas.resolve_download_revision = AsyncMock(return_value={
             "resolved_revision": revision,
         })
-        virtual_nas.download_model_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
         launch = AsyncMock(return_value={
@@ -163,8 +163,8 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         virtual_nas.resolve_download_revision.assert_awaited_once_with(
             "org/model", "main",
         )
-        virtual_nas.download_model_checked.assert_awaited_once_with(
-            "org/model", revision, requested_revision="main",
+        virtual_nas.download_model_files_checked.assert_awaited_once_with(
+            "org/model", revision, ["FP16/model-F16.gguf"],
         )
         launch_settings = launch.await_args.args[5]
         self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
@@ -193,7 +193,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         virtual_nas.resolve_download_revision = AsyncMock(return_value={
             "resolved_revision": revision,
         })
-        virtual_nas.download_model_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
 
@@ -212,6 +212,33 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             await self.service._prepare_public_gguf_artifact(
                 "org/model", "model-00001-of-00002.gguf", "main", None,
             )
+
+    async def test_prepared_gguf_preserves_uppercase_shard_filename_casing(self):
+        revision = "c" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        snapshot = model_root / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        first = snapshot / "MODEL-00001-OF-00002.GGUF"
+        second = snapshot / "MODEL-00002-OF-00002.GGUF"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+
+        prepared = await self.service._prepare_public_gguf_artifact(
+            "org/model", "MODEL-00001-OF-00002.GGUF", "main", None,
+        )
+
+        self.assertEqual(prepared, str(first))
+        virtual_nas.download_model_files_checked.assert_awaited_once_with(
+            "org/model", revision,
+            ["MODEL-00001-OF-00002.GGUF", "MODEL-00002-OF-00002.GGUF"],
+        )
 
     async def test_managed_ownership_is_durable_before_container_launch(self):
         async def fail_launch(*args):

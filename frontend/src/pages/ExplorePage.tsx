@@ -111,6 +111,28 @@ function ggufArtifactOptions(quantizations: NonNullable<CatalogModel['quantizati
   })
 }
 
+function mergeRuntimeCompatibility(
+  searchCompatibility: NonNullable<CatalogModel['runtime_compatibility']>,
+  detailCompatibility: NonNullable<CatalogModel['runtime_compatibility']>,
+) {
+  const merged = new Map(detailCompatibility.map((item) => [item.runtime, item]))
+  for (const item of searchCompatibility) {
+    const existing = merged.get(item.runtime)
+    merged.set(item.runtime, existing
+      ? { ...existing, ...item, supported: existing.supported || item.supported }
+      : item)
+  }
+  return [...merged.values()]
+}
+
+function requiresControllerCapacity(model: DisplayCatalogModel) {
+  const compatibility = model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const hasNonLlamaRuntime = compatibility.some((item) => item.runtime !== 'llama.cpp' && item.supported)
+  const hasLlamaRuntime = compatibility.some((item) => item.runtime === 'llama.cpp' && item.supported)
+  const hasGgufArtifact = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS).length > 0
+  return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
+}
+
 function deployHref(
   model: DisplayCatalogModel,
   runtime: RuntimeKind,
@@ -160,7 +182,10 @@ function ModelRow({
     expanded,
   )
   const detailedModel = details.data?.model
-  const compatibility = detailedModel?.runtime_compatibility ?? model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const compatibility = useMemo(() => mergeRuntimeCompatibility(
+    model.runtime_compatibility ?? EMPTY_COMPATIBILITY,
+    detailedModel?.runtime_compatibility ?? EMPTY_COMPATIBILITY,
+  ), [detailedModel?.runtime_compatibility, model.runtime_compatibility])
   const supportedRuntimes = useMemo(
     () => compatibility.filter((item) => item.supported),
     [compatibility],
@@ -208,6 +233,9 @@ function ModelRow({
     : model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
+  const fitWeightSize = deploymentRuntime === 'llama.cpp'
+    ? selectedArtifact?.weightSize ?? weightSize
+    : weightSize
   const fitCapacity = deploymentRuntime === 'llama.cpp' ? localCapacity : capacity
   const fitAggregate = deploymentRuntime !== 'llama.cpp' && aggregate
   const fitMeasuredNodes = deploymentRuntime === 'llama.cpp'
@@ -225,7 +253,7 @@ function ModelRow({
     >
       <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket` : ''}</small></span>
       <span className="catalog-model-stat"><small>Parameters</small><strong>{formatParameters(parameterCount)}</strong></span>
-      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(weightSize, fitCapacity)}`}><small>Weights</small><strong>{weightSize ? formatBytes(weightSize) : '—'}</strong><em>{fitLabel(fitTone(weightSize, fitCapacity))}</em></span>
+      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(fitWeightSize, fitCapacity)}`}><small>Weights</small><strong>{fitWeightSize ? formatBytes(fitWeightSize) : '—'}</strong><em>{fitLabel(fitTone(fitWeightSize, fitCapacity))}</em></span>
       {communityMode
         ? <>
           <span className="catalog-model-stat"><small>Output speed</small><strong>{formatRate(model.community?.inference_tokens_per_second)}</strong></span>
@@ -241,7 +269,7 @@ function ModelRow({
       <div className="catalog-model-detail-grid">
         <div>
           <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : 'Cluster fit'}</span>
-          <strong className={`fit-${fitTone(weightSize, fitCapacity)}`}>{fitLabel(fitTone(weightSize, fitCapacity))} · {weightSize ? formatBytes(weightSize) : 'Weight size unavailable'}</strong>
+          <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}</strong>
           <p>{fitCapacity > 0
             ? deploymentRuntime === 'llama.cpp'
               ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
@@ -370,14 +398,19 @@ export function ExplorePage() {
       ))
     }
     if (communityOnly || tab === 'community') visible = visible.filter((model) => Boolean(model.community))
-    if (fitsOnly) visible = visible.filter((model) => ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, catalogFitCapacity)))
+    if (fitsOnly) visible = visible.filter((model) => {
+      const applicableCapacity = runtime === 'llama.cpp' || (runtime === '' && requiresControllerCapacity(model))
+        ? memory.localCapacity
+        : memory.capacity
+      return ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, applicableCapacity))
+    })
     if (fitsOnly) {
       visible = [...visible].sort((left, right) => Number(right.weight_size_bytes ?? 0) - Number(left.weight_size_bytes ?? 0))
     } else if (tab === 'community') {
       visible = [...visible].sort((left, right) => Number(right.community?.sample_count ?? 0) - Number(left.community?.sample_count ?? 0))
     }
     return visible
-  }, [aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, catalogFitCapacity, communityOnly, fitsOnly, query, tab])
+  }, [aggregates.data?.availability, aggregates.data?.items, catalog.data?.items, communityOnly, fitsOnly, memory, query, runtime, tab])
   const displayedModels = tab === 'community' ? models.slice(0, communityLimit) : models
   const remainingCommunityModels = tab === 'community' ? models.length - displayedModels.length : 0
 

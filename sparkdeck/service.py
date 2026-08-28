@@ -59,7 +59,8 @@ _COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
-    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
+    r"(?P<count>\d{5})(?P<suffix>\.gguf)$",
     re.IGNORECASE,
 )
 
@@ -1225,8 +1226,20 @@ class SparkDeckService:
         resolved_revision = str(resolution.get("resolved_revision") or "")
         if not re.fullmatch(r"[0-9a-f]{40}", resolved_revision):
             raise RuntimeError("model preparation did not resolve an immutable revision")
-        await virtual_nas.download_model_checked(
-            repository, resolved_revision, requested_revision=revision,
+        selected_files = [relative.as_posix()]
+        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name)
+        if shard:
+            shard_count = int(shard.group("count"))
+            selected_files = [
+                str(relative.with_name(
+                    f"{shard.group('stem')}-{index:05d}"
+                    f"{shard.group('separator')}{shard_count:05d}"
+                    f"{shard.group('suffix')}"
+                ))
+                for index in range(1, shard_count + 1)
+            ]
+        await virtual_nas.download_model_files_checked(
+            repository, resolved_revision, selected_files,
         )
         model_root = virtual_nas._model_path(repository).resolve()
         snapshot_root = model_root / "snapshots" / resolved_revision
@@ -1252,13 +1265,10 @@ class SparkDeckService:
             candidate,
             "model preparation completed without the selected GGUF artifact",
         )
-        shard = _PUBLIC_GGUF_SHARD_PATTERN.match(candidate.name)
         if shard:
-            shard_count = int(shard.group("count"))
-            for index in range(1, shard_count + 1):
-                logical_shard = candidate.with_name(
-                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
-                )
+            for selected_file in selected_files:
+                selected_relative = PurePosixPath(selected_file)
+                logical_shard = snapshot_root.joinpath(*selected_relative.parts)
                 validate_artifact_path(
                     logical_shard,
                     "model preparation completed without the complete selected GGUF shard set",

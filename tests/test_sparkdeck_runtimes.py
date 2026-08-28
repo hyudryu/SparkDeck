@@ -47,7 +47,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "existing local GGUF artifact"):
             LlamaCppAdapter().launch_spec("org/model", {})
 
-    def test_llama_server_mounts_complete_shard_directory(self):
+    def test_llama_server_mounts_only_complete_shard_files(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             first = root / "model-Q4_K_M-00001-of-00002.gguf"
@@ -65,8 +65,42 @@ class RuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             spec.volumes,
-            {str(root.resolve()): {"bind": "/models", "mode": "ro"}},
+            {
+                str(first.resolve()): {
+                    "bind": "/models/model-Q4_K_M-00001-of-00002.gguf",
+                    "mode": "ro",
+                },
+                str(second.resolve()): {
+                    "bind": "/models/model-Q4_K_M-00002-of-00002.gguf",
+                    "mode": "ro",
+                },
+            },
         )
+
+    def test_llama_server_preserves_actual_shard_filename_casing(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "Model-00001-of-00002.GGUF"
+            second = root / "Model-00002-of-00002.GGUF"
+            first.touch()
+            second.touch()
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/Model-00001-of-00002.GGUF",
+        )
+        self.assertEqual(spec.volumes, {
+            str(first.resolve()): {
+                "bind": "/models/Model-00001-of-00002.GGUF", "mode": "ro",
+            },
+            str(second.resolve()): {
+                "bind": "/models/Model-00002-of-00002.GGUF", "mode": "ro",
+            },
+        })
 
     def test_llama_server_rejects_incomplete_shard_set(self):
         with TemporaryDirectory() as directory:

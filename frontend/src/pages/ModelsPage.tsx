@@ -1088,7 +1088,7 @@ export function ModelsPage() {
         const weightsReady = nodeIds.every((id) => weighted.has(id))
         const activeSelected = nodeIds.some((id) => recipeTransferJobs[recipeJobKey(recipe.id, recipe.model, id)])
         const coordinatorReady = recipe.deployment_mode !== 'sharded' || Boolean(localNodeId && nodeIds.includes(localNodeId))
-        const ready = !nodes.loading && !nodes.error && (localPath || (!modelCache.loading && !modelCache.error)) && exactCount && allEligible && weightsReady && coordinatorReady
+        const ready = !nodes.loading && !nodes.error && exactCount && allEligible && weightsReady && coordinatorReady
         const canPrepare = !localPath && Boolean(transferPreflight.data?.enabled) && !transferPreflight.loading && exactCount && allEligible && !weightsReady && !activeSelected && coordinatorReady
         const recipeBusy = busy === `recipe:${recipe.id}` || busy === `recipe-prepare:${recipe.id}`
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
@@ -1097,14 +1097,13 @@ export function ModelsPage() {
             <p className="modal-description">{recipe.tensor_parallel_size > 1 ? `TP${recipe.tensor_parallel_size} requires exactly ${recipe.required_node_count} nodes.` : `Select exactly ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}.`} Eligible nodes without weights can be prepared before deployment.</p>
             {recipeError && <p className="form-error" role="alert">{recipeError}</p>}
             {recipeTransferNotice && <p className="inline-success" role="status">{recipeTransferNotice}</p>}
-            {!localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setRecipeDeployment({ recipe, nodeIds: next.length <= recipe.required_node_count ? next : nodeIds })}
-              loading={nodes.loading || (!localPath && modelCache.loading)}
+              loading={nodes.loading}
               error={nodes.error}
-              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              onRetry={nodes.reload}
               multiple={recipe.required_node_count > 1}
               disabled={recipeBusy}
               requiredIds={localRequired}

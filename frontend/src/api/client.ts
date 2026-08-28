@@ -63,10 +63,10 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
-// Deployment launches, image pulls, and non-streaming inference already have
-// backend-owned, multi-minute limits. Keep their browser connection alive so
-// the server can return the authoritative result instead of inviting a
-// duplicate retry after 30 seconds.
+// Long-running mutations and non-streaming inference already have
+// backend-owned limits. Keep their browser connection alive so the server can
+// return the authoritative result instead of inviting a duplicate retry after
+// 30 seconds while the original state change is still completing.
 const NO_REQUEST_TIMEOUT: null = null
 
 async function request<T>(
@@ -305,13 +305,17 @@ export const api = {
     },
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
       if (action === 'remove') {
-        return request<void>(`/api/v1/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        return request<void>(
+          `/api/v1/deployments/${encodeURIComponent(id)}`,
+          { method: 'DELETE' },
+          NO_REQUEST_TIMEOUT,
+        )
       }
       const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
         body,
-      }, action === 'start' ? NO_REQUEST_TIMEOUT : REQUEST_TIMEOUT_MS)
+      }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {
@@ -380,6 +384,7 @@ export const api = {
     updateFanSettings: (nodeId: string, settings: Record<string, unknown>) => request<RouterOSNodeOverview>(
       `/api/v1/routeros/nodes/${encodeURIComponent(nodeId)}/fan-settings`,
       { method: 'PATCH', body: JSON.stringify(settings) },
+      NO_REQUEST_TIMEOUT,
     ),
   },
   fanControl: {
@@ -515,7 +520,12 @@ export const api = {
       return result ?? { ok: true, image, node_ids: nodeIds ?? ['local'], results: [] }
     },
     remove: (id: string) =>
-      requestWithFallback<void>(`/api/v1/images/${encodeURIComponent(id)}`, `/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+      requestWithFallback<void>(
+        `/api/v1/images/${encodeURIComponent(id)}`,
+        `/api/images/${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+        NO_REQUEST_TIMEOUT,
+      ),
   },
   storage: {
     get: (signal?: AbortSignal) => request<StorageState>('/api/v1/storage', { signal }),
@@ -546,6 +556,7 @@ export const api = {
     removeModel: (nodeId: string, modelId: string) => request<void>(
       `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}`,
       { method: 'DELETE' },
+      NO_REQUEST_TIMEOUT,
     ),
   },
   modelCache: {

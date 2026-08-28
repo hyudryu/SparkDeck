@@ -19,7 +19,13 @@ from cluster import (
     NodeRegistry,
     normalize_agent_url,
 )
-from manager import DEPLOYMENT_LABEL, Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
+from manager import (
+    DEPLOYMENT_LABEL,
+    MODE_LABEL,
+    SERVICE_PORT_LABEL,
+    Manager,
+    PERSISTED_DEPLOYMENT_ARGS_ERROR,
+)
 from sparkdeck.onboarding import resolve_agent_connection
 
 
@@ -3199,6 +3205,284 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "id": "failed", "status": "error", "api_port": 8000,
             "members": [{"node_id": "local", "port": 8000}],
         }]
+        self.assertEqual(await instance._allocate_port(), 8000)
+
+    async def test_remote_only_api_port_does_not_reserve_controller_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = [{
+            "id": "remote-only", "status": "starting", "api_port": 8000,
+            "members": [{"node_id": "remote-1", "port": 8000}],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8000)
+        self.assertEqual(await instance._validate_available_port(8000), 8000)
+
+    async def test_remote_primary_api_port_does_not_mask_local_member_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = [{
+            "id": "remote-primary", "status": "starting", "api_port": 8000,
+            "members": [
+                {"node_id": "remote-1", "rank": 0, "port": 8000},
+                {"node_id": "local", "rank": 1, "port": 8001},
+            ],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8000)
+        with self.assertRaisesRegex(RuntimeError, "Port 8001 is already in use"):
+            await instance._validate_available_port(8001)
+
+    async def test_malformed_primary_rank_falls_back_to_member_order(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = [{
+            "id": "legacy", "status": "starting", "api_port": 8000,
+            "members": [
+                {"node_id": "remote-1", "rank": "corrupt", "port": 8000},
+                {"node_id": "local", "rank": 1, "port": 8001},
+            ],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8000)
+        with self.assertRaisesRegex(RuntimeError, "Port 8001 is already in use"):
+            await instance._validate_available_port(8001)
+
+    async def test_corrupt_member_does_not_hide_later_local_rank_zero(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = [{
+            "id": "legacy", "status": "starting", "api_port": 8000,
+            "members": [
+                {"node_id": "remote-1", "rank": "9" * 5000, "port": None},
+                {"node_id": "local", "rank": 0, "port": None},
+            ],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8001)
+        with self.assertRaisesRegex(RuntimeError, "Port 8000 is already in use"):
+            await instance._validate_available_port(8000)
+
+    async def test_legacy_sharded_cmd_port_is_reserved_without_label(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = []
+        container = mock.Mock()
+        container.labels = {
+            DEPLOYMENT_LABEL: "legacy-sharded",
+            MODE_LABEL: "sharded",
+            SERVICE_PORT_LABEL: "",
+        }
+        container.ports = {}
+        container.status = "exited"
+        container.attrs = {
+            "Config": {
+                "Cmd": [
+                    "vllm", "serve", "org/model", "--port=8000", "--headless",
+                ],
+            },
+        }
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = [container]
+
+        self.assertEqual(await instance._allocate_port(), 8001)
+        self.assertEqual(
+            await instance._allocate_port(exclude_deployment_id="legacy-sharded"),
+            8000,
+        )
+
+    async def test_sequential_sharded_creates_keep_labeled_host_ports_reserved(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "port_range_start": 8000, "port_range_end": 8001,
+            "vllm_image": "vllm/test:latest",
+            "default_gpu_memory_utilization": 0.8,
+            "hf_cache": "C:/cache", "shm_size": "1g",
+        }
+        instance.deployments = []
+        containers = []
+        run_options = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.side_effect = lambda all=True: list(containers)
+        instance.client.images.get.return_value = mock.Mock()
+        instance._gpu_total_gb = mock.AsyncMock(return_value=122.0)
+        instance._try_fit_new_model = mock.Mock()
+        instance._read_gpu_memory_gb = mock.Mock(return_value=(0.0, 0.0))
+        instance._cluster_launch_update = mock.Mock()
+        instance._build_volumes = mock.Mock(return_value={})
+        instance._container_hf_environment = mock.Mock(return_value={})
+        instance._created_container_model_source = mock.Mock(
+            return_value="public_repository",
+        )
+
+        def run_container(options):
+            run_options.append(options)
+            container = mock.Mock()
+            container.labels = dict(options["labels"])
+            container.ports = {}
+            container.status = "exited"
+            container.attrs = {"Config": {"Cmd": options["command"]}}
+            container.reload.return_value = None
+            containers.append(container)
+            return container
+
+        instance._run_managed_container = mock.Mock(side_effect=run_container)
+        instance._container_summary = mock.Mock(side_effect=lambda container: {
+            "name": container.labels[DEPLOYMENT_LABEL],
+            "port": int(container.labels[SERVICE_PORT_LABEL]),
+        })
+
+        first = await instance.create_container(
+            "org/first", name="first-r1",
+            cluster_member={
+                "deployment_id": "first", "node_id": "remote-1", "rank": 1,
+                "nnodes": 2, "mode": "sharded",
+            },
+        )
+        second = await instance.create_container(
+            "org/second", name="second-r1",
+            cluster_member={
+                "deployment_id": "second", "node_id": "remote-1", "rank": 1,
+                "nnodes": 2, "mode": "sharded",
+            },
+        )
+
+        self.assertEqual([first["port"], second["port"]], [8000, 8001])
+        self.assertEqual(
+            [options["labels"][SERVICE_PORT_LABEL] for options in run_options],
+            ["8000", "8001"],
+        )
+        self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
+        self.assertEqual(instance._host_port_reservations, set())
+
+        instance.evict_other_backends = mock.AsyncMock()
+        sglang = await instance.create_container(
+            "org/sglang", port=9000, engine="sglang", name="sglang-r1",
+            cluster_member={
+                "deployment_id": "sglang", "node_id": "remote-1", "rank": 1,
+                "nnodes": 2, "mode": "sharded",
+            },
+        )
+        self.assertEqual(sglang["port"], 9000)
+        self.assertEqual(run_options[-1]["labels"][SERVICE_PORT_LABEL], "9000")
+        self.assertEqual(run_options[-1]["network_mode"], "host")
+
+        # A stopped host-network container still owns its restart port. Once
+        # that container is removed from Docker inventory, the port is reusable.
+        containers.pop(0)
+        self.assertEqual(await instance._allocate_port(), 8000)
+
+    async def test_remote_agent_reserves_ports_across_slow_container_creates(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+        both_creating = asyncio.Event()
+        release = asyncio.Event()
+        assigned_ports = []
+
+        async def slow_create(**kwargs):
+            assigned_ports.append(kwargs["port"])
+            if len(assigned_ports) == 2:
+                both_creating.set()
+            await release.wait()
+            return {"name": kwargs["name"], "port": kwargs["port"]}
+
+        instance._create_container_with_port = slow_create
+        first = asyncio.create_task(instance.create_container(
+            "org/first", name="first-r0",
+            cluster_member={
+                "deployment_id": "first", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        second = asyncio.create_task(instance.create_container(
+            "org/second", name="second-r0",
+            cluster_member={
+                "deployment_id": "second", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        await asyncio.wait_for(both_creating.wait(), 1)
+
+        self.assertEqual(sorted(assigned_ports), [8000, 8001])
+        self.assertEqual(instance._host_port_reservations, {8000, 8001})
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 1)
+
+        self.assertEqual(sorted(result["port"] for result in results), [8000, 8001])
+        self.assertEqual(instance._host_port_reservations, set())
+
+    async def test_cancelled_remote_create_keeps_port_until_inner_task_finishes(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+        creating = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def slow_create(**kwargs):
+            self.assertEqual(kwargs["port"], 8000)
+            creating.set()
+            await release.wait()
+            finished.set()
+            return {"name": kwargs["name"], "port": kwargs["port"]}
+
+        instance._create_container_with_port = slow_create
+        launch = asyncio.create_task(instance.create_container(
+            "org/model", name="remote-r0",
+            cluster_member={
+                "deployment_id": "deployment", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        await asyncio.wait_for(creating.wait(), 1)
+        launch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await launch
+
+        self.assertEqual(instance._host_port_reservations, {8000})
+        with self.assertRaisesRegex(RuntimeError, "No available ports"):
+            await instance._allocate_port()
+        release.set()
+        await asyncio.wait_for(finished.wait(), 1)
+        await asyncio.sleep(0)
+
+        self.assertEqual(instance._host_port_reservations, set())
+        self.assertEqual(await instance._allocate_port(), 8000)
+
+    async def test_failed_remote_create_releases_reserved_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        async def failed_create(**_kwargs):
+            raise RuntimeError("container creation failed")
+
+        instance._create_container_with_port = failed_create
+        with self.assertRaisesRegex(RuntimeError, "container creation failed"):
+            await instance.create_container(
+                "org/model", name="remote-r0",
+                cluster_member={
+                    "deployment_id": "deployment", "node_id": "remote-1",
+                    "rank": 0, "nnodes": 1, "mode": "single",
+                },
+            )
+
+        self.assertEqual(instance._host_port_reservations, set())
         self.assertEqual(await instance._allocate_port(), 8000)
 
     async def test_interrupted_launch_restarts_with_same_public_link_and_port(self) -> None:

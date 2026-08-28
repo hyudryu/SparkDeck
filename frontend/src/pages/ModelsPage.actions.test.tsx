@@ -1,0 +1,199 @@
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ModelsPage } from './ModelsPage'
+
+const fetchMock = vi.fn<typeof fetch>()
+
+const nodes = [
+  { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+  { id: 'worker-1', name: 'Node 4', online: true, docker_ready: true, selectable: true },
+  { id: 'worker-2', name: 'Node 3', online: true, docker_ready: true, selectable: true },
+  { id: 'worker-3', name: 'Node 2', online: true, docker_ready: true, selectable: true },
+  { id: 'worker-4', name: 'Node 1', online: false, docker_ready: true, selectable: true },
+]
+
+const runningDeployment = {
+  id: 'dep-1', alias: 'Chat model', runtime: 'vllm', kind: 'managed',
+  model: { repository: 'org/model' }, status: 'running',
+  settings: { context_length: 8192, tensor_parallel_size: 1 },
+  node_ids: ['worker-1'], selected_nodes: [{ id: 'worker-1', name: 'Node 4' }],
+  deployment_mode: 'single', required_node_count: 1,
+  desired_state: 'running',
+}
+
+const modelCache = {
+  nodes: [
+    { id: 'worker-1', name: 'Node 4', online: true, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
+    { id: 'worker-2', name: 'Node 3', online: true, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
+    { id: 'worker-3', name: 'Node 2', online: true, models: [] },
+    { id: 'worker-4', name: 'Node 1', online: false, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
+  ],
+}
+
+beforeEach(() => {
+  vi.stubGlobal('fetch', fetchMock)
+  fetchMock.mockClear()
+  fetchMock.mockImplementation(async (input) => {
+    const path = String(input)
+    if (path === '/api/v1/deployments') {
+      return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (path === '/api/v1/nodes') {
+      return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (path === '/api/v1/model-cache') {
+      return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (path === '/api/v1/recipes') {
+      return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (path === '/api/v1/onboarding') {
+      return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (path === '/api/v1/settings') {
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  })
+})
+
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
+
+function renderPage() {
+  return render(<MemoryRouter initialEntries={['/models']}><ModelsPage /></MemoryRouter>)
+}
+
+describe('models page running actions', () => {
+  it('shows the running nodes in a status tooltip', async () => {
+    renderPage()
+
+    const badge = await screen.findByText('running')
+    fireEvent.mouseOver(badge)
+
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent('Running on')
+    expect(tooltip).toHaveTextContent('Node 4')
+  })
+
+  it('keeps the running replica while launching on an additional node', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('Chat model')
+    await user.click(screen.getByRole('button', { name: 'More actions for Chat model' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Launch on additional nodes…' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add nodes to Chat model' })
+    // The node that is already running is locked into the selection.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeDisabled()
+    // Nodes without cached weights stay unavailable.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 2/ })).toBeDisabled()
+    // A cached-but-offline node reports its real status, not a bogus
+    // "weights not cached" reason, and stays unselectable.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 1/ })).toBeDisabled()
+    expect(within(dialog).getByText(/Offline/)).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+
+    await waitFor(() => {
+      const start = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/dep-1/start') && init?.method === 'POST'
+      ))
+      expect(start).toBeDefined()
+      expect(JSON.parse(String(start?.[1]?.body))).toEqual({ additional_node_ids: ['worker-2'] })
+    })
+  })
+
+  it('stops the deployment from the split-button main action', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('Chat model')
+    await user.click(screen.getByRole('button', { name: 'Stop' }))
+
+    await waitFor(() => {
+      const stop = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/dep-1/stop') && init?.method === 'POST'
+      ))
+      expect(stop).toBeDefined()
+    })
+  })
+
+  it('falls back to a plain start button when stopped', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({
+          items: [{ ...runningDeployment, status: 'stopped', desired_state: 'stopped' }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Chat model')
+    expect(screen.queryByRole('button', { name: 'More actions for Chat model' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start' })).toBeInTheDocument()
+  })
+
+  it('shows the controller tooltip and no add-nodes action for standalone deployments', async () => {
+    const standalone = {
+      id: 'dep-2', alias: 'Local runner', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'running',
+      settings: {}, desired_state: 'running',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [standalone] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(standalone), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const badge = await screen.findByText('running')
+    fireEvent.mouseOver(badge)
+
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent('Running on')
+    expect(tooltip).toHaveTextContent('This device')
+    // No cluster to grow: the standalone card keeps a plain Stop button.
+    expect(screen.queryByRole('button', { name: 'More actions for Local runner' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+  })
+})

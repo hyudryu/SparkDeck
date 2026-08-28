@@ -3,7 +3,7 @@ import { Bookmark, Check, ChevronDown, ChevronRight, HardDrive, Pencil, Play, Pl
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
-import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
+import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
@@ -252,6 +252,8 @@ export function ModelsPage() {
   const [logError, setLogError] = useState<string>()
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [startError, setStartError] = useState<string>()
+  const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
+  const [additionalError, setAdditionalError] = useState<string>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -357,12 +359,29 @@ export function ModelsPage() {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
     const sharded = searchParams.get('layout') === 'sharded'
+    const quantization = searchParams.get('quantization')?.trim()
+    const artifact = searchParams.get('artifact')?.trim()
+    const ggufArtifact = Boolean(artifact?.toLocaleLowerCase().endsWith('.gguf'))
     catalogShardedLayout.current = sharded
+    if (ggufArtifact) runtimeTouched.current = true
     setForm((current) => ({
       ...current,
       model_id: modelId,
       alias: current.alias || modelId.split('/').at(-1) || modelId,
-      deployment_mode: sharded ? 'sharded' : current.deployment_mode,
+      runtime: ggufArtifact ? 'llama.cpp' : current.runtime,
+      deployment_mode: ggufArtifact ? 'single' : sharded ? 'sharded' : current.deployment_mode,
+      settings: ggufArtifact
+        ? {
+          context_length: current.settings.context_length,
+          parallel_slots: current.settings.parallel_slots ?? 1,
+          gpu_layers: current.settings.gpu_layers ?? 99,
+          quantization: quantization || undefined,
+          artifact,
+        }
+        : {
+          ...current.settings,
+          quantization: quantization || current.settings.quantization,
+        },
     }))
     setCreating(true)
     setSearchParams({}, { replace: true })
@@ -420,8 +439,18 @@ export function ModelsPage() {
         node_ids: nodeIds,
         deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
-          ? { context_length: contextLength, parallel_slots: current.settings.parallel_slots ?? 1, gpu_layers: current.settings.gpu_layers ?? 99 }
-          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1 },
+          ? {
+            context_length: contextLength,
+            parallel_slots: current.settings.parallel_slots ?? 1,
+            gpu_layers: current.settings.gpu_layers ?? 99,
+            quantization: current.settings.quantization,
+            artifact: current.settings.artifact,
+          }
+          : {
+            context_length: contextLength,
+            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
+            quantization: current.settings.quantization,
+          },
       }
     })
   }, [appSettings.data, localNodeId])
@@ -505,6 +534,10 @@ export function ModelsPage() {
     setActionError(undefined)
     try {
       await api.deployments.action(deployment.id, action)
+      if (action === 'remove') {
+        acceptedDeployments.current.delete(deployment.id)
+        resource.setData((current) => current?.filter((item) => item.id !== deployment.id))
+      }
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
@@ -563,6 +596,54 @@ export function ModelsPage() {
     }
     setStartError(undefined)
     setStartSelection({ deployment, nodeIds })
+  }
+
+  const deploymentRunningNodeNames = (deployment: Deployment) => {
+    const ids = deployment.node_ids ?? deployment.selected_nodes?.map((node) => node.id) ?? []
+    if (!ids.length) {
+      // Managed standalone deployments (llama.cpp, legacy single containers)
+      // always run on the controller, matching the Target column fallback.
+      // External endpoints are not bound to a node.
+      return deployment.managed ? [localLabel] : []
+    }
+    return ids.map((id) => id === 'local'
+      ? localLabel
+      : (nodes.data?.find((node) => node.id === id)?.name ?? id))
+  }
+
+  // Growing the replica set requires a Manager cluster: standalone and legacy
+  // containers have no persisted layout and no cluster to grow, controller-
+  // local artifacts cannot leave the controller, and sharded layouts have a
+  // fixed tensor-parallel node count.
+  const supportsAdditionalNodes = (deployment: Deployment) => (
+    deployment.deployment_mode !== undefined
+    && !isControllerArtifact(deployment)
+    && deployment.deployment_mode !== 'sharded'
+  )
+
+  const openAdditionalPicker = (deployment: Deployment) => {
+    const currentIds = deployment.node_ids ?? deployment.selected_nodes?.map((node) => node.id) ?? []
+    setAdditionalError(undefined)
+    setAdditionalLaunch({ deployment, currentIds, additionalIds: [] })
+  }
+
+  const confirmAdditionalLaunch = async () => {
+    if (!additionalLaunch) return
+    const { deployment, additionalIds } = additionalLaunch
+    setBusy(deployment.id)
+    setAdditionalError(undefined)
+    try {
+      await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
+      setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
+      setAdditionalLaunch(undefined)
+      resource.reload()
+    } catch (reason) {
+      // Render inside the dialog: the page-level alert sits behind the
+      // modal backdrop where the user cannot see it.
+      setAdditionalError(reason instanceof Error ? reason.message : 'Could not launch on additional nodes')
+    } finally {
+      setBusy(undefined)
+    }
   }
 
   const saveRename = async () => {
@@ -922,8 +1003,18 @@ export function ModelsPage() {
         node_ids: nodeIds,
         deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
-          ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1 },
+          ? {
+            context_length: contextLength,
+            parallel_slots: 1,
+            gpu_layers: 99,
+            quantization: current.settings.quantization,
+            artifact: current.settings.artifact,
+          }
+          : {
+            context_length: contextLength,
+            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
+            quantization: current.settings.quantization,
+          },
       }
     })
   }
@@ -990,13 +1081,23 @@ export function ModelsPage() {
                   <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
                   <div role="cell" data-label="Status" className="deployment-status-cell" aria-live="polite">
-                    <Status status={deployment.status} />
+                    {STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && deploymentRunningNodeNames(deployment).length > 0
+                      ? <Tooltip label={<><strong>{deployment.status === 'starting' || deployment.status === 'launching' ? 'Starting on' : 'Running on'}</strong><span>{deploymentRunningNodeNames(deployment).join(', ')}</span></>}><Status status={deployment.status} /></Tooltip>
+                      : <Status status={deployment.status} />}
                     {showLaunchDetails(deployment) && deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
                     {showLaunchDetails(deployment) && deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
-                      ? <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>
+                      ? (supportsAdditionalNodes(deployment)
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
+                            onMainAction={() => void act(deployment, 'stop')}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
+                          />
+                        : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
@@ -1235,6 +1336,46 @@ export function ModelsPage() {
         </div>
       })()}
 
+      {additionalLaunch && (() => {
+        const { deployment, currentIds, additionalIds } = additionalLaunch
+        const weighted = deploymentWeightedNodes(deployment)
+        // Gate on the cache predicate only: cached nodes that are offline or
+        // Docker-unready stay in allowedIds so the selector reports their
+        // real status ("Offline", "Docker unavailable") instead of a
+        // misleading "weights not cached".
+        const cachedIds = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
+        const allowedIds = [...currentIds, ...cachedIds]
+        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached']))
+        const additionalBusy = busy === deployment.id
+        const ready = additionalIds.length > 0 && !nodes.loading && !nodes.error
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !additionalBusy && setAdditionalLaunch(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="additional-nodes-title">
+            <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">Currently running on {selectedNodeLabel(nodes.data ?? [], currentIds, localLabel)}. Choose the nodes that should also run {deployment.model_id}; the running nodes stay selected. SparkDeck relaunches the deployment, so existing replicas restart briefly.</p>
+            {additionalError && <p className="form-error" role="alert">{additionalError}</p>}
+            {modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={[...currentIds, ...additionalIds]}
+              onChange={(next) => setAdditionalLaunch({ deployment, currentIds, additionalIds: next.filter((id) => !currentIds.includes(id)) })}
+              loading={nodes.loading || modelCache.loading}
+              error={nodes.error}
+              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              multiple
+              disabled={additionalBusy}
+              requiredIds={currentIds}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={currentIds[0]}
+              legend="Additional nodes"
+              help={`Only nodes with ${deployment.model_id} already cached can join. The running nodes above cannot be removed here.`}
+            />
+            <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
       {creating && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setCreating(false)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-deployment-title">
@@ -1246,6 +1387,8 @@ export function ModelsPage() {
                 <label className="field"><span>Runtime</span><select value={form.runtime} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="llama.cpp">llama.cpp</option><option value="sglang">SGLang</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>
+              {form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /></label>}
               <label className="check-field"><input type="checkbox" checked={!form.managed} onChange={(event) => setForm({ ...form, managed: !event.target.checked })} /><span><strong>Connect an existing endpoint</strong><small>SparkDeck will not manage its process or container.</small></span></label>
               {!form.managed && <label className="field"><span>Endpoint URL</span><input type="url" required value={form.endpoint_url} onChange={(event) => setForm({ ...form, endpoint_url: event.target.value })} placeholder="http://127.0.0.1:8001" /></label>}
               {!form.managed && <label className="field"><span>API key (optional)</span><input type="password" autoComplete="off" value={form.api_key ?? ''} onChange={(event) => setForm({ ...form, api_key: event.target.value })} /><small>Stored in your operating system credential store, never in SparkDeck's database.</small></label>}

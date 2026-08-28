@@ -47,7 +47,10 @@ ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 benchy = BenchyService(manager, sparkdeck, data_dir=ROOT / "data")
-onboarding = OnboardingService(manager, data_dir=ROOT / "data", port=7878)
+onboarding = OnboardingService(
+    manager, data_dir=ROOT / "data", port=7878,
+    revoke_community_consent=sparkdeck.revoke_community_membership,
+)
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
@@ -709,9 +712,11 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         body = await req.json()
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
+            "download_cache_baseline_bytes",
         }:
             raise ValueError(
-                "request may contain only revision, requested_revision, and hf_token"
+                "request may contain only revision, requested_revision, hf_token, "
+                "and download_cache_baseline_bytes"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
@@ -722,10 +727,18 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             raise ValueError("hf_token must be a string")
         if requested_revision is not None and not isinstance(requested_revision, str):
             raise ValueError("requested_revision must be a string")
-        result = await manager.virtual_nas.download_model_checked(
+        baseline = body.get("download_cache_baseline_bytes")
+        if baseline is not None and (
+            isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
+        ):
+            raise ValueError("download_cache_baseline_bytes must be a non-negative integer")
+        download_args = [
             model_id, revision or "main", token if token is not None else "",
             requested_revision or revision or "main",
-        )
+        ]
+        if baseline is not None:
+            download_args.append(baseline)
+        result = await manager.virtual_nas.download_model_checked(*download_args)
         return _public_storage_payload(result)
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
@@ -926,9 +939,17 @@ async def agent_apply_community_consent(req: Request):
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body must be valid JSON") from exc
     enabled = body.get("enabled") if isinstance(body, dict) else None
+    telemetry_cluster_id = (
+        body.get("telemetry_cluster_id") if isinstance(body, dict) else None
+    )
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    await sparkdeck.set_community_consent(enabled)
+    if telemetry_cluster_id is not None and not isinstance(telemetry_cluster_id, str):
+        raise HTTPException(400, "telemetry_cluster_id must be a string")
+    if telemetry_cluster_id is None:
+        await sparkdeck.set_community_consent(enabled)
+    else:
+        await sparkdeck.set_community_consent(enabled, telemetry_cluster_id)
     return {"applied": True, "enabled": enabled}
 
 
@@ -1675,6 +1696,19 @@ async def catalog_models(q: str = "", runtime: str | None = None, limit: int = 2
         raise HTTPException(502, f"model catalog unavailable: {e}")
 
 
+@app.get("/api/v1/catalog/models/{model_id:path}")
+async def catalog_model_details(model_id: str):
+    try:
+        return await sparkdeck.catalog_details(model_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        status = 404 if exc.response.status_code == 404 else 502
+        raise HTTPException(status, "model metadata is unavailable") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, "model metadata is unavailable") from exc
+
+
 @app.get("/api/v1/deployments")
 async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
@@ -2316,6 +2350,31 @@ async def v1_storage_delete_model(node_id: str, model_id: str):
         raise _storage_error(exc) from exc
 
 
+@app.post(
+    "/api/v1/storage/nodes/{node_id}/models/{model_id:path}/download",
+    status_code=202,
+)
+async def v1_storage_finish_model_download(node_id: str, model_id: str, req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) - {"revision"}:
+            raise ValueError("request may contain only revision")
+        revision = body.get("revision")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        return _public_storage_payload(
+            await manager.queue_virtual_nas_download(
+                model_id.strip(), node_id.strip(), revision,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
 @app.post("/api/v1/deployments", status_code=201)
 async def v1_create_deployment(req: Request):
     try:
@@ -2342,7 +2401,18 @@ async def v1_deployment_action(deployment_id: str, action: str, req: Request):
             ):
                 raise ValueError("node_ids must contain non-empty node IDs")
             node_ids = [item.strip() for item in node_ids]
-        return await sparkdeck.deployment_action(deployment_id, action, node_ids)
+        additional_node_ids = body.get("additional_node_ids")
+        if additional_node_ids is not None:
+            if (
+                not isinstance(additional_node_ids, list)
+                or not additional_node_ids
+                or any(not isinstance(item, str) or not item.strip() for item in additional_node_ids)
+            ):
+                raise ValueError("additional_node_ids must contain non-empty node IDs")
+            additional_node_ids = [item.strip() for item in additional_node_ids]
+        return await sparkdeck.deployment_action(
+            deployment_id, action, node_ids, additional_node_ids,
+        )
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "request body must be valid JSON")
     except LookupError as e:
@@ -2694,8 +2764,16 @@ async def v1_community_consent(req: Request):
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    await sparkdeck.set_community_consent(enabled)
-    cluster = await manager.push_community_consent(enabled)
+    snapshot = await sparkdeck.set_community_consent(enabled)
+    cluster_id = (
+        snapshot.get("telemetry_cluster_id")
+        if isinstance(snapshot, dict) else None
+    )
+    cluster = (
+        await manager.push_community_consent(enabled, cluster_id)
+        if cluster_id
+        else await manager.push_community_consent(enabled)
+    )
     status = _community_sync_status()
     status["cluster"] = cluster
     return status
@@ -2844,7 +2922,7 @@ async def v1_community_aggregates(req: Request):
         return _community_aggregates_unavailable()
     try:
         upstream = await _community_http.get(
-            f"{api_url}/v1/aggregates",
+            f"{api_url}/v2/aggregates",
             headers={
                 "Authorization": f"Bearer {id_token}",
             },
@@ -2861,6 +2939,7 @@ async def v1_community_aggregates(req: Request):
     try:
         body = upstream.json()
         items = _public_community_aggregates(body)
+        items = await sparkdeck.enrich_community_aggregates(items)
     except (TypeError, ValueError):
         return _community_aggregates_unavailable()
     evidence_policy = body.get("evidence_policy")
@@ -3006,7 +3085,7 @@ async def _post_community_sample(
 ) -> httpx.Response | None:
     try:
         return await _community_http.post(
-            f"{api_url}/v1/samples",
+            f"{api_url}/v2/samples",
             json=payload,
             headers={
                 "Authorization": f"Bearer {id_token}",
@@ -3020,6 +3099,11 @@ async def _post_community_sample(
 async def community_upload_once() -> dict:
     """Upload one batch of pending consented samples; transient errors stay pending."""
     global _community_upload_not_before
+    # Joined workers never contact the hosted service. Cluster inference is
+    # observed and uploaded by the authoritative controller, which also makes
+    # a controller-side opt-out fail closed even if a worker is unreachable.
+    if manager.is_joined_worker():
+        return {"uploaded": 0, "failed": 0, "reason": "controller_owned"}
     if time.time() < _community_upload_not_before:
         return {"uploaded": 0, "failed": 0, "reason": "rate_limited"}
     store = sparkdeck.store
@@ -3049,33 +3133,35 @@ async def community_upload_once() -> dict:
     failed: list[str] = []
     for entry in batch:
         sample_id = entry["sample_id"]
-        # Consent, pairing, or deletion may change mid-batch. Stop rather than
-        # upload under stale authorization.
-        if not store.get_setting("community_consent", False):
-            break
-        current_pairing = store.get_setting(
-            "device_pairing", {"status": "not_paired"})
-        if (
-            not isinstance(current_pairing, dict)
-            or current_pairing.get("status") != "paired"
-            or current_pairing.get("sub") != batch_sub
-            or current_pairing.get("refresh_token") != refresh_token
-        ):
-            break
-        # The batch is only a scheduling snapshot; re-read the row at the
-        # outbound boundary so a deleted or transitioned sample never sends.
-        current = store.outbox_entry(sample_id)
-        if current is None:
-            continue
-        response = await _post_community_sample(
-            api_url, id_token, current["payload"], sample_id)
-        if response is not None and response.status_code == 401:
-            # The cached token expired early; mint once and retry this sample.
-            id_token = await _community_id_token(refresh_token, force=True)
-            if not id_token:
+        # Hold the same mutation lock used by opt-out across the final consent
+        # check and POST. Once disabling returns, no older upload can still be
+        # in flight or begin from a stale batch snapshot.
+        async with sparkdeck._community_upload_lock:
+            if not store.get_setting("community_consent", False):
                 break
+            current_pairing = store.get_setting(
+                "device_pairing", {"status": "not_paired"})
+            if (
+                not isinstance(current_pairing, dict)
+                or current_pairing.get("status") != "paired"
+                or current_pairing.get("sub") != batch_sub
+                or current_pairing.get("refresh_token") != refresh_token
+            ):
+                break
+            # The batch is only a scheduling snapshot; re-read the row at the
+            # outbound boundary so a deleted or transitioned sample never sends.
+            current = store.outbox_entry(sample_id)
+            if current is None:
+                continue
             response = await _post_community_sample(
                 api_url, id_token, current["payload"], sample_id)
+            if response is not None and response.status_code == 401:
+                # The cached token expired early; mint once and retry this sample.
+                id_token = await _community_id_token(refresh_token, force=True)
+                if not id_token:
+                    break
+                response = await _post_community_sample(
+                    api_url, id_token, current["payload"], sample_id)
         if response is None:
             continue  # transient transport error: leave pending
         if response.is_success:

@@ -38,6 +38,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
+    VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VirtualNAS,
     validate_model_id,
     validate_revision,
@@ -100,6 +101,7 @@ DEFAULT_SETTINGS = {
 
 logger = logging.getLogger(__name__)
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
+IMMUTABLE_HF_REVISION = re.compile(r"^[0-9a-f]{40}$")
 PERSISTED_RECIPE_ARGS_ERROR = (
     "unsupported persisted extra_args: expected an array of strings"
 )
@@ -1024,7 +1026,7 @@ class Manager:
             "name": self.settings.get("cluster_node_name") or socket.gethostname(),
             "hostname": socket.gethostname(),
             "protocol_version": AGENT_PROTOCOL_VERSION,
-            "capabilities": [CAPABILITY],
+            "capabilities": [CAPABILITY, VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
             "update_protocol": 1,
             "app_revision": current_revision(Path(__file__).parent),
             "status": "online" if docker_ready else "degraded",
@@ -1385,6 +1387,23 @@ class Manager:
             return None
         return result if result >= 0 else None
 
+    @staticmethod
+    def _model_has_pinned_revision(
+        model: dict, requested_revision: str, resolved_revision: str | None,
+    ) -> bool:
+        if (
+            not resolved_revision
+            or model.get("partial")
+            or resolved_revision not in (model.get("revisions") or [])
+        ):
+            return False
+        if requested_revision == resolved_revision:
+            return True
+        return (
+            (model.get("revision_refs") or {}).get(requested_revision)
+            == resolved_revision
+        )
+
     async def model_cache_inventory(self) -> list[dict]:
         """Return safe Hugging Face cache sizes even when transfers are off.
 
@@ -1427,6 +1446,11 @@ class Manager:
             return {
                 "id": node.get("id"), "name": node.get("name"),
                 "online": online,
+                "virtual_nas_download_capable": bool(
+                    node.get("id") == LOCAL_NODE_ID
+                    or VIRTUAL_NAS_DOWNLOAD_CAPABILITY
+                    in (node.get("capabilities") or [])
+                ),
                 "total_size": self._byte_count(raw_total),
                 "cache_free_size": cache_free,
                 "free_size": cache_free if cache_free is not None else self._byte_count(raw_free),
@@ -1441,16 +1465,18 @@ class Manager:
         target_node_ids: list[str], revision: str | None = None,
         workflow_id: str | None = None,
         workflow_node_ids: list[str] | None = None,
+        requested_revision: str | None = None,
     ) -> dict:
         result = await self.virtual_nas.queue_transfer(
             model_id, source_node_id, target_node_ids, revision,
-            workflow_id, workflow_node_ids,
+            workflow_id, workflow_node_ids, requested_revision,
         )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
+        resolved_download: dict | None = None,
     ) -> dict:
         """Return authoritative recipe-transfer choices without exposing paths."""
         model_id = validate_model_id(model_id)
@@ -1458,6 +1484,7 @@ class Manager:
         nodes = await self.model_cache_inventory()
         active_jobs = {}
         conflicting_jobs = {}
+        active_candidates: list[tuple[dict, str]] = []
         for job in self.virtual_nas_transfers()["items"]:
             if (
                 job.get("model_id") != model_id
@@ -1465,11 +1492,39 @@ class Manager:
             ):
                 continue
             try:
-                job_revision = validate_revision(job.get("revision"))
+                job_revision = validate_revision(
+                    job.get("requested_revision") or job.get("revision")
+                )
             except ValueError:
                 conflicting_jobs[job["target_node_id"]] = job
                 continue
-            if job_revision == required_revision:
+            active_candidates.append((job, job_revision))
+        resolved_revision = None
+        download_size = None
+        download_error = None
+        if self.virtual_nas_enabled():
+            try:
+                resolution = resolved_download or (
+                    await self.virtual_nas.resolve_download_revision(
+                        model_id, required_revision,
+                    )
+                )
+                if resolution.get("requested_revision") != required_revision:
+                    raise RuntimeError("resolved download does not match the requested revision")
+                resolved_revision = validate_revision(
+                    resolution.get("resolved_revision")
+                )
+                download_size = self._byte_count(resolution.get("size_bytes"))
+                if not download_size:
+                    raise RuntimeError("Hugging Face reported an empty model repository")
+            except (ValueError, RuntimeError) as exc:
+                download_error = str(exc)
+        for job, job_revision in active_candidates:
+            if (
+                resolved_revision
+                and job_revision == required_revision
+                and job.get("revision") == resolved_revision
+            ):
                 active_jobs[job["target_node_id"]] = job
             else:
                 conflicting_jobs[job["target_node_id"]] = job
@@ -1480,8 +1535,9 @@ class Manager:
             model = next((
                 item for item in node.get("models", [])
                 if item.get("model_id") == model_id
-                and not item.get("partial")
-                and required_revision in (item.get("revisions") or [])
+                and self._model_has_pinned_revision(
+                    item, required_revision, resolved_revision,
+                )
                 and self._byte_count(item.get("size_bytes"))
             ), None)
             if model:
@@ -1492,15 +1548,6 @@ class Manager:
                 })
         sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
         source = sources[0] if sources else None
-        download_size = None
-        download_error = None
-        if self.virtual_nas_enabled():
-            try:
-                download_size = await self.virtual_nas.estimate_download_size(
-                    model_id, required_revision,
-                )
-            except RuntimeError as exc:
-                download_error = str(exc)
         required_free = (
             source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if source else None
@@ -1530,8 +1577,15 @@ class Manager:
                 "Another revision of this model is already being prepared"
                 if conflicting else None
             )
-            has_required_weights = bool(existing and not existing.get("partial") and (
-                required_revision in (existing.get("revisions") or [])
+            has_required_weights = bool(existing and (
+                self._model_has_pinned_revision(
+                    existing, required_revision, resolved_revision,
+                )
+                or (
+                    not self.virtual_nas_enabled()
+                    and not existing.get("partial")
+                    and required_revision in (existing.get("revisions") or [])
+                )
             ))
             eligible = True
             reason = None
@@ -1585,6 +1639,9 @@ class Manager:
             elif conflicting is not None:
                 download_eligible = False
                 download_reason = conflict_reason
+            elif not node.get("virtual_nas_download_capable"):
+                download_eligible = False
+                download_reason = "Node must be updated before downloading from Hugging Face"
             elif free_bytes is None:
                 download_eligible = False
                 download_reason = "Free cache capacity is unavailable"
@@ -1643,6 +1700,7 @@ class Manager:
             "enabled": self.virtual_nas_enabled(),
             "model_id": model_id,
             "revision": required_revision,
+            "resolved_revision": resolved_revision,
             "source": source,
             "sources": sources,
             "download": ({
@@ -1656,12 +1714,15 @@ class Manager:
 
     async def recipe_model_preparation_preflight(
         self, model_id: str, revision: str | None, node_ids: list[str],
+        resolved_download: dict | None = None,
     ) -> dict:
         """Plan one selected-set preparation without mutating cluster state."""
         selected_ids = list(dict.fromkeys(str(value).strip() for value in node_ids if str(value).strip()))
         if not selected_ids:
             raise ValueError("node_ids must contain at least one node")
-        preflight = await self.virtual_nas_transfer_preflight(model_id, revision)
+        preflight = await self.virtual_nas_transfer_preflight(
+            model_id, revision, resolved_download,
+        )
         options = {item["node_id"]: item for item in preflight["targets"]}
         unknown = [node_id for node_id in selected_ids if node_id not in options]
         if unknown:
@@ -1680,6 +1741,14 @@ class Manager:
                 "action": "ready", "download_node_id": None,
                 "download_node_ids": [],
                 "transfer_target_node_ids": [], "reason": None,
+            }
+        if not preflight.get("enabled"):
+            return {
+                **preflight, "node_ids": selected_ids, "eligible": False,
+                "action": "download", "download_node_id": None,
+                "download_node_ids": [],
+                "transfer_target_node_ids": missing_ids,
+                "reason": "Virtual NAS is disabled",
             }
 
         if selected_sources:
@@ -1700,7 +1769,12 @@ class Manager:
                 free_bytes = self._byte_count(option.get("free_bytes"))
                 if option.get("has_model_cache"):
                     download_ids.append(node_id)
-                    if option.get("active_job_id"):
+                    if not option.get("download_eligible"):
+                        blocked_reasons.append(
+                            option.get("download_reason")
+                            or "Node cannot download from Hugging Face"
+                        )
+                    elif option.get("active_job_id"):
                         blocked_reasons.append("Model preparation is already active")
                     elif option.get("has_preparation_conflict"):
                         blocked_reasons.append(
@@ -1746,17 +1820,6 @@ class Manager:
         download = preflight.get("download")
         download_error = preflight.get("download_error")
         if not download:
-            try:
-                size_bytes = await self.virtual_nas.estimate_download_size(
-                    preflight["model_id"], preflight["revision"],
-                )
-                download = {
-                    "size_bytes": size_bytes,
-                    "required_free_bytes": size_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES,
-                }
-            except RuntimeError as exc:
-                download_error = str(exc)
-        if not download:
             return {
                 **preflight, "node_ids": selected_ids, "eligible": False,
                 "action": "download", "download_node_id": None,
@@ -1798,7 +1861,12 @@ class Manager:
             for download_id in download_ids:
                 target = options[download_id]
                 target_free = self._byte_count(target.get("free_bytes"))
-                if target.get("active_job_id"):
+                if not target.get("download_eligible"):
+                    blocked.append(
+                        target.get("download_reason")
+                        or "Node cannot download from Hugging Face"
+                    )
+                elif target.get("active_job_id"):
                     blocked.append("Model preparation is already active")
                 elif target.get("has_preparation_conflict"):
                     blocked.append(
@@ -1841,6 +1909,49 @@ class Manager:
             ),
         }
 
+    async def recipe_model_revision_readiness(
+        self, model_id: str, revision: str | None, node_ids: list[str],
+    ) -> dict:
+        """Verify that every selected node has one current immutable revision."""
+        model_id = validate_model_id(model_id)
+        requested_revision = validate_revision(revision)
+        if IMMUTABLE_HF_REVISION.fullmatch(requested_revision):
+            resolved_revision = requested_revision
+        else:
+            resolution = await self.virtual_nas.resolve_download_revision(
+                model_id, requested_revision,
+            )
+            if resolution.get("requested_revision") != requested_revision:
+                raise RuntimeError("resolved download does not match the requested revision")
+            resolved_revision = validate_revision(
+                resolution.get("resolved_revision")
+            )
+            if not IMMUTABLE_HF_REVISION.fullmatch(resolved_revision):
+                raise RuntimeError("Hugging Face did not report an immutable revision")
+        inventory = {
+            str(node.get("id")): node for node in await self.model_cache_inventory()
+        }
+        missing = []
+        for node_id in node_ids:
+            node = inventory.get(str(node_id)) or {}
+            model = next((
+                item for item in node.get("models") or []
+                if item.get("model_id") == model_id
+                and self._model_has_pinned_revision(
+                    item, requested_revision, resolved_revision,
+                )
+            ), None)
+            if model is None:
+                missing.append(str(node_id))
+        return {
+            "model_id": model_id,
+            "requested_revision": requested_revision,
+            "resolved_revision": resolved_revision,
+            "node_ids": [str(node_id) for node_id in node_ids],
+            "missing_node_ids": missing,
+            "ready": not missing,
+        }
+
     async def queue_recipe_model_preparation(
         self, model_id: str, revision: str | None, node_ids: list[str],
     ) -> dict:
@@ -1854,26 +1965,49 @@ class Manager:
             lock = asyncio.Lock()
             self._recipe_preparation_lock = lock
         async with lock:
-            active = [
-                job for job in self.virtual_nas.list_transfers()["items"]
-                if job.get("model_id") == model_id
-                and (job.get("revision") or "main") == normalized_revision
-                and job.get("workflow_node_ids") == normalized_nodes
+            jobs = self.virtual_nas.list_transfers()["items"]
+            active_workflow_ids = list(dict.fromkeys(
+                job.get("workflow_id") for job in jobs
+                if job.get("workflow_id")
                 and job.get("status") in {"queued", "running"}
-            ]
-            if active:
-                workflow_id = active[0].get("workflow_id")
+                and job.get("model_id") == model_id
+                and (
+                    job.get("requested_revision") or job.get("revision") or "main"
+                ) == normalized_revision
+                and job.get("workflow_node_ids") == normalized_nodes
+            ))
+            for workflow_id in active_workflow_ids:
                 workflow_jobs = [
-                    job for job in self.virtual_nas.list_transfers()["items"]
-                    if job.get("workflow_id") == workflow_id
+                    job for job in jobs if job.get("workflow_id") == workflow_id
                 ]
-                return {
-                    "workflow_id": workflow_id,
-                    "job_ids": [job["id"] for job in workflow_jobs],
-                    "jobs": [self._public_virtual_nas_job(job) for job in workflow_jobs],
-                }
+                revisions = {job.get("revision") for job in workflow_jobs}
+                if (
+                    workflow_jobs
+                    and len(revisions) == 1
+                    and IMMUTABLE_HF_REVISION.fullmatch(str(next(iter(revisions)) or ""))
+                    and all(
+                        job.get("model_id") == model_id
+                        and (
+                            job.get("requested_revision")
+                            or job.get("revision") or "main"
+                        ) == normalized_revision
+                        and job.get("workflow_node_ids") == normalized_nodes
+                        for job in workflow_jobs
+                    )
+                ):
+                    return {
+                        "workflow_id": workflow_id,
+                        "job_ids": [job["id"] for job in workflow_jobs],
+                        "jobs": [
+                            self._public_virtual_nas_job(job)
+                            for job in workflow_jobs
+                        ],
+                    }
+            resolution = await self.virtual_nas.resolve_download_revision(
+                model_id, normalized_revision,
+            )
             plan = await self.recipe_model_preparation_preflight(
-                model_id, normalized_revision, normalized_nodes,
+                model_id, normalized_revision, normalized_nodes, resolution,
             )
             if not plan.get("eligible"):
                 raise RuntimeError(str(plan.get("reason") or "selected nodes are not eligible"))
@@ -1883,18 +2017,20 @@ class Manager:
             if plan["action"] == "transfer":
                 result = await self.queue_virtual_nas_transfer(
                     plan["model_id"], plan["source"]["node_id"],
-                    plan["transfer_target_node_ids"], plan["revision"],
+                    plan["transfer_target_node_ids"], plan["resolved_revision"],
                     workflow_id, plan["node_ids"],
+                    plan["revision"],
                 )
             else:
                 result = await self.virtual_nas.queue_download_and_transfer(
-                    plan["model_id"], plan["revision"], plan["download_node_id"],
+                    plan["model_id"], plan["resolved_revision"], plan["download_node_id"],
                     plan["transfer_target_node_ids"], plan["download"]["size_bytes"],
                     workflow_id, plan["node_ids"],
                     additional_download_node_ids=(
                         plan.get("download_node_ids") or []
                     )[1:],
                     source_node_id=(plan.get("source") or {}).get("node_id"),
+                    requested_revision=plan["revision"],
                 )
                 result["jobs"] = [
                     self._public_virtual_nas_job(job) for job in result["jobs"]

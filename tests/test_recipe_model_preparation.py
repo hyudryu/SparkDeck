@@ -10,12 +10,14 @@ from manager import Manager
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
+    VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VirtualNAS,
 )
 
 
 MODEL_ID = "org/model"
 REVISION = "release-2026-08-27"
+RESOLVED_REVISION = "a" * 40
 MODEL_BYTES = 100
 AMPLE_BYTES = 10 * 1024 * 1024 * 1024
 
@@ -36,6 +38,11 @@ def target(
         "has_model_cache": has_model_cache,
         "active_job_id": active_job_id,
         "reason": "Model preparation is already active" if active_job_id else None,
+        "download_eligible": not has_required_weights,
+        "download_reason": (
+            "Required model weights are already available"
+            if has_required_weights else None
+        ),
     }
 
 
@@ -47,6 +54,7 @@ def preparation_preflight(
         "enabled": True,
         "model_id": MODEL_ID,
         "revision": REVISION,
+        "resolved_revision": RESOLVED_REVISION,
         "source": sources[0] if sources else None,
         "sources": sources,
         "download": {
@@ -68,6 +76,11 @@ def planning_manager(preflight: dict) -> Manager:
     manager.virtual_nas.estimate_download_size = AsyncMock(
         return_value=MODEL_BYTES
     )
+    manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+        "requested_revision": REVISION,
+        "resolved_revision": RESOLVED_REVISION,
+        "size_bytes": MODEL_BYTES,
+    })
     manager.virtual_nas.list_transfers.return_value = {"items": []}
     manager.settings = {
         "virtual_nas_enabled": True, "cluster_node_name": "Coordinator",
@@ -80,6 +93,51 @@ def planning_manager(preflight: dict) -> Manager:
 
 
 class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_virtual_nas_blocks_missing_weights_without_hub_lookup(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": False}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker", "name": "Worker", "online": True,
+            "cache_free_size": AMPLE_BYTES,
+            "virtual_nas_download_capable": True, "models": [],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock()
+        manager.virtual_nas.estimate_download_size = AsyncMock()
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION, ["worker"],
+        )
+
+        self.assertFalse(plan["eligible"])
+        self.assertEqual(plan["reason"], "Virtual NAS is disabled")
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+        manager.virtual_nas.estimate_download_size.assert_not_awaited()
+
+    async def test_disabled_virtual_nas_allows_already_cached_recipe(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": False}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker", "name": "Worker", "online": True,
+            "cache_free_size": AMPLE_BYTES,
+            "models": [{
+                "model_id": MODEL_ID, "partial": False,
+                "revisions": [REVISION], "size_bytes": MODEL_BYTES,
+            }],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock()
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION, ["worker"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["action"], "ready")
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+
     async def test_no_selected_source_seeds_first_node_then_fans_out(self):
         manager = planning_manager(preparation_preflight([
             target("node-b"), target("node-a"), target("node-c"),
@@ -209,15 +267,24 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         manager.settings = {"virtual_nas_enabled": True}
         manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "worker", "name": "Worker", "online": True,
+            "virtual_nas_download_capable": True,
             "cache_free_size": AMPLE_BYTES, "models": [],
         }])
         manager.virtual_nas = Mock()
         manager.virtual_nas.estimate_download_size = AsyncMock(
             return_value=MODEL_BYTES,
         )
+        manager.virtual_nas.resolve_download_revision = AsyncMock(
+            side_effect=lambda _model, requested: {
+                "requested_revision": requested,
+                "resolved_revision": RESOLVED_REVISION,
+                "size_bytes": MODEL_BYTES,
+            },
+        )
         manager.virtual_nas_transfers = Mock(return_value={"items": [{
             "id": "revision-a-job", "model_id": MODEL_ID,
-            "target_node_id": "worker", "revision": "revision-a",
+            "target_node_id": "worker", "revision": RESOLVED_REVISION,
+            "requested_revision": "revision-a",
             "status": "running",
         }]})
 
@@ -273,6 +340,7 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         manager.settings = {"virtual_nas_enabled": True}
         manager.cluster_nodes = AsyncMock(return_value=[{
             "id": "worker", "name": "Worker", "online": True,
+            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
             "disk": {"free": AMPLE_BYTES},
         }])
         manager.node_registry = Mock()
@@ -285,6 +353,11 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         manager.virtual_nas.estimate_download_size = AsyncMock(
             return_value=MODEL_BYTES
         )
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": REVISION,
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": MODEL_BYTES,
+        })
 
         plan = await manager.recipe_model_preparation_preflight(
             MODEL_ID, REVISION, ["worker"],
@@ -311,7 +384,8 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
             {
                 "id": "download", "kind": "download", "model_id": MODEL_ID,
                 "source_node_id": "huggingface", "target_node_id": "node-a",
-                "revision": REVISION, "depends_on_job_id": None,
+                "revision": RESOLVED_REVISION,
+                "requested_revision": REVISION, "depends_on_job_id": None,
                 "workflow_id": "workflow-1",
                 "workflow_node_ids": ["node-a", "node-b"],
                 "status": "running", "bytes_total": MODEL_BYTES,
@@ -321,7 +395,9 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
             {
                 "id": "fanout", "kind": "transfer", "model_id": MODEL_ID,
                 "source_node_id": "node-a", "target_node_id": "node-b",
-                "revision": REVISION, "depends_on_job_id": "download",
+                "revision": RESOLVED_REVISION,
+                "requested_revision": REVISION,
+                "depends_on_job_id": "download",
                 "workflow_id": "workflow-1",
                 "workflow_node_ids": ["node-a", "node-b"],
                 "status": "queued", "bytes_total": MODEL_BYTES,
@@ -338,7 +414,9 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["workflow_id"], "workflow-1")
         self.assertEqual(result["job_ids"], ["download", "fanout"])
-        self.assertTrue(all(job["revision"] == REVISION for job in result["jobs"]))
+        self.assertTrue(
+            all(job["revision"] == RESOLVED_REVISION for job in result["jobs"])
+        )
         manager.recipe_model_preparation_preflight.assert_not_awaited()
 
     async def test_transfer_queue_retains_exact_revision_and_workflow_scope(self):
@@ -363,7 +441,7 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
 
         call = manager.queue_virtual_nas_transfer.await_args
         self.assertEqual(call.args[:4], (
-            MODEL_ID, "source", ["target"], REVISION,
+            MODEL_ID, "source", ["target"], RESOLVED_REVISION,
         ))
         self.assertEqual(call.args[5], ["source", "target"])
         self.assertEqual(result["workflow_id"], call.args[4])
@@ -393,12 +471,20 @@ class RecipePreparationQueueTests(unittest.IsolatedAsyncioTestCase):
 
         call = manager.virtual_nas.queue_download_and_transfer.await_args
         self.assertEqual(call.args[:5], (
-            MODEL_ID, REVISION, "partial", ["empty"], MODEL_BYTES,
+            MODEL_ID, RESOLVED_REVISION, "partial", ["empty"], MODEL_BYTES,
         ))
         self.assertEqual(
             call.kwargs["additional_download_node_ids"], ["wrong-revision"],
         )
         self.assertEqual(call.kwargs["source_node_id"], "source")
+        self.assertEqual(call.kwargs["requested_revision"], REVISION)
+        manager.virtual_nas.resolve_download_revision.assert_awaited_once_with(
+            MODEL_ID, REVISION,
+        )
+        self.assertIs(
+            manager.virtual_nas_transfer_preflight.await_args.args[2],
+            manager.virtual_nas.resolve_download_revision.return_value,
+        )
         self.assertEqual(
             result["job_ids"], ["download-a", "download-b", "transfer"],
         )
@@ -417,14 +503,18 @@ class Registry:
         return self.nodes.get(node_id)
 
     async def probe(self, node, force=False):
-        return {**node, "online": True}
+        return {
+            **node, "online": True,
+            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+        }
 
 
 def queued_job(**overrides) -> dict:
     job = {
         "id": "job-1", "kind": "transfer", "model_id": MODEL_ID,
         "source_node_id": "seed", "target_node_id": "target",
-        "revision": REVISION, "depends_on_job_id": None,
+        "revision": RESOLVED_REVISION, "requested_revision": REVISION,
+        "depends_on_job_id": None,
         "workflow_id": "workflow-1", "workflow_node_ids": ["seed", "target"],
         "status": "queued", "bytes_total": 10, "bytes_transferred": 0,
         "created_at": 1, "started_at": None, "completed_at": None,
@@ -435,6 +525,47 @@ def queued_job(**overrides) -> dict:
 
 
 class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transfer_rejects_target_with_wrong_requested_ref_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            job = queued_job(target_node_id="local")
+            nas.jobs = [job]
+            exact_source = {
+                "model_id": MODEL_ID, "partial": False,
+                "revisions": [REVISION, RESOLVED_REVISION],
+                "revision_refs": {REVISION: RESOLVED_REVISION},
+                "size_bytes": MODEL_BYTES,
+            }
+            wrong_alias = {
+                "model_id": MODEL_ID, "partial": False,
+                "revisions": [REVISION, RESOLVED_REVISION, "b" * 40],
+                "revision_refs": {REVISION: "b" * 40},
+                "size_bytes": MODEL_BYTES,
+            }
+            nas._node_storage = AsyncMock(side_effect=[
+                {"models": [exact_source], "free_size": AMPLE_BYTES},
+                {"models": [], "free_size": AMPLE_BYTES},
+                {"models": [wrong_alias], "free_size": AMPLE_BYTES},
+            ])
+
+            async def source_bytes():
+                yield b"archive"
+
+            source_response = Mock(status_code=200)
+            source_response.aiter_bytes = source_bytes
+            source_response.aclose = AsyncMock()
+            registry.open_stream.return_value = source_response
+            nas.import_model = AsyncMock(return_value={"ok": True})
+
+            await nas._run_transfer(job)
+
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("complete requested revision", job["error"])
+
     async def test_transfer_revalidates_capacity_against_actual_source_size(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = Registry()
@@ -452,7 +583,9 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "models": [{
                         "model_id": MODEL_ID, "partial": False,
-                        "revisions": [REVISION], "size_bytes": actual_size,
+                        "revisions": [REVISION, RESOLVED_REVISION],
+                        "revision_refs": {REVISION: RESOLVED_REVISION},
+                        "size_bytes": actual_size,
                     }],
                     "free_size": AMPLE_BYTES,
                 },
@@ -490,7 +623,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job["bytes_total"], MODEL_BYTES)
             self.assertIn("insufficient free cache space", job["error"])
             nas.estimate_download_size.assert_awaited_once_with(
-                MODEL_ID, REVISION, "", force_refresh=True,
+                MODEL_ID, RESOLVED_REVISION, "", force_refresh=True,
             )
             registry.request.assert_not_awaited()
 
@@ -598,13 +731,17 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             })
 
             result = await nas.queue_download_and_transfer(
-                MODEL_ID, REVISION, "seed", ["target"], MODEL_BYTES,
+                MODEL_ID, RESOLVED_REVISION, "seed", ["target"], MODEL_BYTES,
                 "workflow-1", ["seed", "target"],
+                requested_revision=REVISION,
             )
 
             self.assertEqual(len(result["jobs"]), 2)
             self.assertTrue(
-                all(job["revision"] == REVISION for job in result["jobs"])
+                all(job["revision"] == RESOLVED_REVISION for job in result["jobs"])
+            )
+            self.assertTrue(
+                all(job["requested_revision"] == REVISION for job in result["jobs"])
             )
             persisted = nas.path.read_text(encoding="utf-8")
             self.assertNotIn(secret, persisted)
@@ -631,16 +768,19 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 {"models": [], "free_size": AMPLE_BYTES},
                 {"models": [{
                     "model_id": MODEL_ID, "partial": False,
-                    "revisions": [REVISION], "size_bytes": MODEL_BYTES,
+                    "revisions": [REVISION, RESOLVED_REVISION],
+                    "revision_refs": {REVISION: RESOLVED_REVISION},
+                    "size_bytes": MODEL_BYTES,
                 }], "free_size": AMPLE_BYTES},
                 {"models": [], "free_size": AMPLE_BYTES},
             ])
 
             result = await nas.queue_download_and_transfer(
-                MODEL_ID, REVISION, "partial", ["empty"], MODEL_BYTES,
+                MODEL_ID, RESOLVED_REVISION, "partial", ["empty"], MODEL_BYTES,
                 "workflow-mixed", ["source", "partial", "wrong", "empty"],
                 additional_download_node_ids=["wrong"],
                 source_node_id="source",
+                requested_revision=REVISION,
             )
 
             self.assertEqual(
@@ -674,8 +814,9 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             })
 
             result = await nas.queue_download_and_transfer(
-                MODEL_ID, REVISION, "seed", [], MODEL_BYTES,
+                MODEL_ID, RESOLVED_REVISION, "seed", [], MODEL_BYTES,
                 source_node_id="offline-unused-source",
+                requested_revision=REVISION,
             )
 
             self.assertEqual(len(result["jobs"]), 1)

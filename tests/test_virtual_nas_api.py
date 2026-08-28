@@ -268,8 +268,9 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item.status_code == 401 for item in responses))
 
     async def test_agent_download_uses_local_capacity_checked_operation(self):
+        resolved = "a" * 40
         checked = AsyncMock(return_value={
-            "ok": True, "model_id": "org/model", "revision": "main",
+            "ok": True, "model_id": "org/model", "revision": resolved,
             "size_bytes": 20,
         })
         with (
@@ -278,11 +279,17 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             response = await self.client.post(
                 "/api/agent/virtual-nas/models/org/model/download",
-                json={"revision": "main", "hf_token": "ephemeral"},
+                json={
+                    "revision": resolved,
+                    "requested_revision": "main",
+                    "hf_token": "ephemeral",
+                },
             )
 
         self.assertEqual(response.status_code, 200)
-        checked.assert_awaited_once_with("org/model", "main", "ephemeral")
+        checked.assert_awaited_once_with(
+            "org/model", resolved, "ephemeral", "main",
+        )
         self.assertNotIn("ephemeral", response.text)
 
     async def test_agent_inventory_export_import_and_delete_contracts(self):

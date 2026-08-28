@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Check, Clipboard, Edit3, Link2, Network, RefreshCw, Server, ShieldCheck, Trash2, Unlink } from 'lucide-react'
+import { Check, Clipboard, Edit3, Eye, EyeOff, Link2, Network, RefreshCw, Server, ShieldCheck, Trash2, Unlink } from 'lucide-react'
 import { api } from '../api/client'
 import type { JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -31,6 +31,7 @@ export function ClusterPage() {
   const [nodeName, setNodeName] = useState('')
   const [renamingNodeId, setRenamingNodeId] = useState<string>()
   const [removingNodeId, setRemovingNodeId] = useState<string>()
+  const [visibilityNodeId, setVisibilityNodeId] = useState<string>()
   const [nodeError, setNodeError] = useState<{ id: string; message: string }>()
 
   useEffect(() => {
@@ -170,6 +171,22 @@ export function ClusterPage() {
     }
   }
 
+  const toggleDashboardVisibility = async (node: NodeInventoryItem) => {
+    const hidden = node.hidden_from_dashboard !== true
+    setVisibilityNodeId(node.id)
+    setNodeError(undefined)
+    setNotice(undefined)
+    try {
+      const updated = await api.nodes.setDashboardHidden(node.id, hidden)
+      nodes.setData((nodes.data ?? []).map((item) => item.id === node.id ? { ...item, ...updated } : item))
+      setNotice(`${node.name} ${hidden ? 'is hidden from' : 'will appear on'} the dashboard.`)
+    } catch (reason) {
+      setNodeError({ id: node.id, message: reason instanceof Error ? reason.message : 'Could not change dashboard visibility' })
+    } finally {
+      setVisibilityNodeId(undefined)
+    }
+  }
+
   const status = resource.data
   const controller = status?.role === 'controller'
   const canRegisterWorkers = Boolean(status?.join_code) && Boolean(controller || status?.controller_reachable)
@@ -203,7 +220,9 @@ export function ClusterPage() {
               const saving = renamingNodeId === node.id
               const removing = removingNodeId === node.id
               const removable = !isCurrentEntryNode(node, status) && node.id !== 'local' && !node.local
-              return <li key={node.id} className="node-management-row" aria-busy={saving || removing}>
+              const changingVisibility = visibilityNodeId === node.id
+              const dashboardHidden = node.hidden_from_dashboard === true
+              return <li key={node.id} className="node-management-row" aria-busy={saving || removing || changingVisibility}>
                 <div className="node-management-icon" aria-hidden="true"><Server size={17} /></div>
                 <div className="node-management-identity">
                   <strong>{node.name}</strong>
@@ -217,7 +236,8 @@ export function ClusterPage() {
                   <label className="field"><span className="sr-only">New name for {node.name}</span><input autoFocus required maxLength={maximumNodeNameLength} value={nodeName} disabled={saving || removing} onChange={(event) => setNodeName(event.target.value)} aria-invalid={nodeError?.id === node.id} aria-describedby={nodeError?.id === node.id ? `node-error-${node.id}` : undefined} /></label>
                   <div className="node-rename-actions"><Button type="submit" variant="primary" disabled={saving || removing}>{saving ? 'Saving…' : 'Save'}</Button><Button type="button" disabled={saving || removing} onClick={cancelNodeEdit}>Cancel</Button>{removable && <Button type="button" variant="danger" className="node-remove-button" disabled={saving || removing} onClick={() => void removeNode(node)}><Trash2 size={15} aria-hidden="true" /> {removing ? 'Removing…' : node.online === false ? 'Forget node' : 'Remove node'}</Button>}</div>
                   {nodeError?.id === node.id && <p id={`node-error-${node.id}`} className="inline-error" role="alert">{nodeError.message}</p>}
-                </form> : <Button type="button" className="node-edit-button" onClick={() => editNode(node)} disabled={Boolean(renamingNodeId) || Boolean(removingNodeId)} aria-label={`Edit name for ${node.name}`}><Edit3 size={15} aria-hidden="true" /> Edit</Button>}
+                </form> : <div className="node-management-actions"><Button type="button" variant="tertiary" onClick={() => void toggleDashboardVisibility(node)} disabled={Boolean(renamingNodeId) || Boolean(removingNodeId) || Boolean(visibilityNodeId)} aria-label={`${dashboardHidden ? 'Show' : 'Hide'} ${node.name} ${dashboardHidden ? 'on' : 'from'} dashboard`}>{dashboardHidden ? <Eye size={15} aria-hidden="true" /> : <EyeOff size={15} aria-hidden="true" />}{changingVisibility ? 'Saving…' : dashboardHidden ? 'Show' : 'Hide'}</Button><Button type="button" className="node-edit-button" onClick={() => editNode(node)} disabled={Boolean(renamingNodeId) || Boolean(removingNodeId) || Boolean(visibilityNodeId)} aria-label={`Edit name for ${node.name}`}><Edit3 size={15} aria-hidden="true" /> Edit</Button></div>}
+                {!editing && nodeError?.id === node.id && <p id={`node-error-${node.id}`} className="inline-error node-management-error" role="alert">{nodeError.message}</p>}
               </li>
             })}
           </ul>}

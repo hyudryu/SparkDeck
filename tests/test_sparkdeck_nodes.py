@@ -190,6 +190,77 @@ class NodeRenameTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_forwardable_path("/api/agent/node"))
 
 
+class NodeDashboardVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registry_visibility_persists_and_overrides_agent_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient()
+            registry = NodeRegistry(Path(directory), client)
+            remote = {
+                "id": "remote-1", "name": "Inference PC", "enabled": True,
+                "agent_url": "https://private", "agent_token": "secret",
+            }
+            registry.nodes = [remote]
+            registry.update("remote-1", {"hidden_from_dashboard": True})
+            registry.request = AsyncMock(return_value={
+                "name": "Inference PC",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "docker_ready": True,
+                "hidden_from_dashboard": False,
+            })
+
+            result = await registry.probe(remote, force=True)
+
+            self.assertTrue(result["hidden_from_dashboard"])
+            saved = json.loads((Path(directory) / "nodes.json").read_text())
+            self.assertTrue(saved[0]["hidden_from_dashboard"])
+            await client.aclose()
+
+    async def test_local_visibility_is_persisted_without_changing_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager.__new__(Manager)
+            manager.settings = {"cluster_node_name": "Coordinator"}
+            manager.settings_path = Path(directory) / "settings.json"
+            manager.lock = asyncio.Lock()
+
+            result = await manager.set_cluster_node_dashboard_hidden(
+                "local", True,
+            )
+
+            self.assertEqual(result, {
+                "id": "local", "hidden_from_dashboard": True,
+            })
+            saved = json.loads(manager.settings_path.read_text())
+            self.assertTrue(saved["cluster_node_hidden_from_dashboard"])
+
+    async def test_remote_visibility_updates_only_controller_registry(self):
+        manager = Manager.__new__(Manager)
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "remote-1", "name": "Inference PC",
+        }
+        manager.node_registry.update.return_value = {
+            "id": "remote-1", "hidden_from_dashboard": True,
+        }
+
+        result = await manager.set_cluster_node_dashboard_hidden(
+            "remote-1", True,
+        )
+
+        manager.node_registry.update.assert_called_once_with(
+            "remote-1", {"hidden_from_dashboard": True},
+        )
+        self.assertEqual(result, {
+            "id": "remote-1", "hidden_from_dashboard": True,
+        })
+
+    async def test_visibility_requires_a_boolean(self):
+        manager = Manager.__new__(Manager)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            await manager.set_cluster_node_dashboard_hidden(
+                "local", "true",
+            )
+
+
 class FakeServiceManager:
     def __init__(self):
         self.http = httpx.AsyncClient()

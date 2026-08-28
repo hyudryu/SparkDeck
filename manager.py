@@ -78,6 +78,9 @@ DEFAULT_SETTINGS = {
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
     "cluster_node_name": socket.gethostname(),
+    # Controller-owned presentation preference. Hidden nodes remain paired and
+    # selectable for inference; only the dashboard excludes them.
+    "cluster_node_hidden_from_dashboard": False,
     "cluster_fabric_ip": "",
     "cluster_fabric_interface": "",
     # llama-server launcher (GGUF models from the local HF cache). One server
@@ -1125,6 +1128,9 @@ class Manager:
 
     async def cluster_nodes(self, local_stats: dict | None = None) -> list[dict]:
         local = await self.agent_status(local_stats)
+        local["hidden_from_dashboard"] = self.settings.get(
+            "cluster_node_hidden_from_dashboard", False,
+        )
         local["fabric_ip"], local["fabric_interface"] = self._inferred_fabric(
             local,
             self.settings.get("cluster_fabric_ip"),
@@ -1160,10 +1166,11 @@ class Manager:
             for key in (
                 "id", "name", "local", "enabled", "status", "online",
                 "last_seen", "protocol_version", "docker_ready", "fabric_ready",
-                "stats", "disk",
+                "stats", "disk", "hidden_from_dashboard",
                 "routeros",
             )
         } | {
+            "hidden_from_dashboard": bool(node.get("hidden_from_dashboard", False)),
             "selectable": bool(
                 node.get("enabled", True)
                 and node.get("online")
@@ -1357,6 +1364,25 @@ class Manager:
             }),
             "name_sync": sync,
         }
+
+    async def set_cluster_node_dashboard_hidden(
+        self, node_id: str, hidden: Any,
+    ) -> dict:
+        """Persist presentation-only visibility without changing membership."""
+        if not isinstance(hidden, bool):
+            raise ValueError("hidden_from_dashboard must be a boolean")
+        node_id = str(node_id or "").strip()
+        if node_id == LOCAL_NODE_ID:
+            async with self.lock:
+                self.settings["cluster_node_hidden_from_dashboard"] = hidden
+                self._save_settings()
+        else:
+            if not self.node_registry.get(node_id):
+                raise LookupError("node not found")
+            self.node_registry.update(
+                node_id, {"hidden_from_dashboard": hidden},
+            )
+        return {"id": node_id, "hidden_from_dashboard": hidden}
 
     def virtual_nas_enabled(self) -> bool:
         return bool(self.settings.get("virtual_nas_enabled", False))
@@ -11730,6 +11756,7 @@ class Manager:
             cpu_clock = self._read_cpu_clock_mhz()
             return {
                 "cpu_pct": self._read_cpu_pct(),
+                "cpu_logical_count": os.cpu_count(),
                 "cpu_temp_c": self._read_cpu_temp(),
                 "cpu_clock_mhz": cpu_clock.get("current"),
                 "cpu_clock_max_mhz": cpu_clock.get("max"),

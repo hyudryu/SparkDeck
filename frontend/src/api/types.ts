@@ -104,6 +104,7 @@ export interface NodeSummary {
 
 export interface NodeInventoryItem extends NodeSummary {
   online?: boolean
+  hidden_from_dashboard?: boolean
   docker_ready?: boolean
   fabric_ready?: boolean
   selectable?: boolean
@@ -395,6 +396,7 @@ export interface ActiveRequestStats {
 
 export interface SystemStats {
   cpu_pct?: number | null
+  cpu_logical_count?: number | null
   cpu_temp_c?: number | null
   mem?: { total?: number; used?: number; available?: number; pct?: number }
   gpus?: GpuStats[]

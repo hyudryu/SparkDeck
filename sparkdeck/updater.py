@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 
+from .node_toolchain import resolve_node_toolchain
+
 
 REPOSITORY = "hyudryu/SparkDeck"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
@@ -264,9 +266,16 @@ def local_blockers(root: Path) -> list[str]:
             blockers.append("Git origin is not the official SparkDeck repository")
         if _run(root, "git", "status", "--porcelain", "--untracked-files=no"):
             blockers.append("Tracked files have local changes")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        blockers.append(f"Installation preflight failed: {str(exc)[:240]}")
+    try:
         _service_preflight(root)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         blockers.append(f"Installation preflight failed: {str(exc)[:240]}")
+    try:
+        resolve_node_toolchain()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        blockers.append(f"Frontend build preflight failed: {str(exc)[:240]}")
     return blockers
 
 

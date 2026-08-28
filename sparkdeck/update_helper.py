@@ -13,6 +13,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .node_toolchain import frontend_build_environment, resolve_node_toolchain
+
 from .updater import (
     CAPABILITY,
     MAIN_BRANCH,
@@ -56,11 +58,7 @@ def run(root: Path, *args: str, timeout: int = 600, env: dict[str, str] | None =
 
 def npm_executable() -> str:
     """Resolve npm's platform-specific executable for shell-free subprocesses."""
-    name = "npm.cmd" if platform.system() == "Windows" else "npm"
-    executable = shutil.which(name)
-    if not executable:
-        raise RuntimeError("Node.js and npm are required to build the SparkDeck web app")
-    return executable
+    return str(resolve_node_toolchain().npm)
 
 
 def _remove_path(path: Path) -> None:
@@ -275,8 +273,13 @@ def apply(root: Path, state_path: Path, branch: str, revision: str) -> None:
         run(stage_dir, os.fspath(Path(os.sys.executable)), "-m", "compileall", "-q", ".")
         build_environment = os.environ.copy()
         if (stage_dir / "frontend" / "package-lock.json").exists():
-            npm = npm_executable()
-            run(stage_dir, npm, "--prefix", "frontend", "ci", "--ignore-scripts")
+            toolchain = resolve_node_toolchain()
+            npm = str(toolchain.npm)
+            build_environment = frontend_build_environment(toolchain)
+            run(
+                stage_dir, npm, "--prefix", "frontend", "ci", "--ignore-scripts",
+                env=build_environment,
+            )
             if platform.system() != "Windows":
                 build_environment["SPARKDECK_VERSION"] = f"{branch}-{revision[:8]}"
             run(stage_dir, npm, "--prefix", "frontend", "run", "build", env=build_environment)

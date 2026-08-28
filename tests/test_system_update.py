@@ -309,6 +309,20 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "failed")
         self.assertIn("interrupted", status["error"].lower())
 
+    async def test_agent_poll_does_not_succeed_before_helper_verification(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "restarting", "target_revision": "b" * 40,
+            "helper_pid": 1234,
+        })
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._helper_alive", return_value=True):
+            status = self.service.agent_status()
+
+        self.assertEqual(status["current_revision"], "b" * 40)
+        self.assertEqual(status["phase"], "restarting")
+        self.assertEqual(self.service._read(self.service.agent_path)["phase"], "restarting")
+
     async def test_interrupted_controller_job_is_unblocked(self):
         self.service._write(self.service.cluster_path, {
             "id": "stale", "active": True, "phase": "preflight",

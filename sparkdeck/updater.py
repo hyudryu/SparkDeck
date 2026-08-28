@@ -323,11 +323,7 @@ class UpdateService:
         revision = current_revision(self.root)
         state = self._read(self.agent_path)
         if state.get("phase") in {"accepted", "staging", "restarting"}:
-            if revision and revision == state.get("target_revision"):
-                state["phase"] = "succeeded"
-                state["message"] = "Updated and restarted successfully"
-                self._write(self.agent_path, state)
-            elif not _helper_alive(state):
+            if not _helper_alive(state):
                 state["phase"] = "failed"
                 state["error"] = "The local update helper was interrupted"
                 state["message"] = "Interrupted update can be retried"

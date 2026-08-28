@@ -68,6 +68,31 @@ function renderPage() {
   return render(<MemoryRouter initialEntries={['/models']}><ModelsPage /></MemoryRouter>)
 }
 
+describe('models page llama.cpp pull targets', () => {
+  it('lets llama.cpp deployments select remote pull nodes and a Hub seed', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: /Add model/ }))
+
+    const runtimeSelect = await screen.findByLabelText('Runtime')
+    await user.selectOptions(runtimeSelect, 'llama.cpp')
+
+    const controllerCheckbox = screen.getByRole('checkbox', { name: /Controller/ })
+    expect(controllerCheckbox).toBeChecked()
+    expect(controllerCheckbox).toBeDisabled()
+    const remoteCheckbox = screen.getByRole('checkbox', { name: /Node 4/ })
+    expect(remoteCheckbox).toBeEnabled()
+
+    await user.click(remoteCheckbox)
+
+    const seedSelect = await screen.findByLabelText(/Hub download seed/)
+    expect(seedSelect).toBeEnabled()
+    expect(screen.getByRole('option', { name: 'Node 4' })).toBeInTheDocument()
+  })
+})
+
 describe('models page running actions', () => {
   it('shows the running nodes in a status tooltip', async () => {
     renderPage()

@@ -455,7 +455,7 @@ describe('API client adapters', () => {
     }))
   })
 
-  it('keeps llama.cpp local in the UI without sending cluster target fields', async () => {
+  it('sends llama.cpp pull targets and seed while keeping the cluster mode local', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       id: 'dep-llama', alias: 'local-gguf', runtime: 'llama.cpp', kind: 'managed',
       model: { repository: 'models/local.gguf' }, status: 'registered', settings: {},
@@ -464,11 +464,16 @@ describe('API client adapters', () => {
 
     await api.deployments.create({
       alias: 'local-gguf', model_id: 'models/local.gguf', runtime: 'llama.cpp', managed: true,
-      settings: { context_length: 8192, gpu_layers: 99 }, node_ids: ['local'], deployment_mode: 'single',
+      settings: { context_length: 8192, gpu_layers: 99 },
+      node_ids: ['local', 'spark-2'], deployment_mode: 'single',
+      download_node_id: 'spark-2',
     })
 
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>
-    expect(body).not.toHaveProperty('node_ids')
+    expect(body).toMatchObject({
+      node_ids: ['local', 'spark-2'],
+      download_node_id: 'spark-2',
+    })
     expect(body).not.toHaveProperty('selected_nodes')
     expect(body).not.toHaveProperty('deployment_mode')
   })

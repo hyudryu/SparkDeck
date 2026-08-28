@@ -145,6 +145,7 @@ export interface CreateDeploymentInput {
   settings: DeploymentSettings
   node_ids?: string[]
   deployment_mode?: 'single' | 'replicated' | 'sharded'
+  download_node_id?: string
 }
 
 export interface NodeSummary {

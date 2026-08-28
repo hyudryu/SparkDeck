@@ -40,6 +40,7 @@ from .storage import (
     SparkDeckStore,
     community_context_window,
 )
+from .virtual_nas import LOCAL_NODE_ID
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -1199,9 +1200,36 @@ class SparkDeckService:
         )
         return await self.deployment_detail(deployment_id)
 
+    def _llama_cpp_artifact_homes(
+        self, requested_node_ids: list[str] | None, body: dict[str, Any],
+    ) -> tuple[list[str] | None, str | None]:
+        """Resolve GGUF home nodes and the optional Hub seed for a launch.
+
+        Llama server always runs on the controller, so the controller is the
+        required first home; the remaining nodes only receive a copy of the
+        artifact for later distribution. The seed is validated here so the
+        controller-only fast path cannot silently ignore a seed that names
+        a node outside the selection.
+        """
+        requested_seed = _optional_string(body.get("download_node_id"))
+        if requested_node_ids is None:
+            if requested_seed is not None and requested_seed != LOCAL_NODE_ID:
+                raise ValueError("download_node_id must be one of the selected nodes")
+            return None, requested_seed
+        if requested_node_ids[0] != LOCAL_NODE_ID:
+            raise ValueError(
+                "llama.cpp deployments run on the controller; "
+                "the first selected node must be the controller"
+            )
+        if requested_seed is not None and requested_seed not in requested_node_ids:
+            raise ValueError("download_node_id must be one of the selected nodes")
+        return list(requested_node_ids), requested_seed
+
     async def _prepare_public_gguf_artifact(
         self, repository: str, artifact: str, revision: str,
         quantization: str | None,
+        home_node_ids: list[str] | None = None,
+        download_node_id: str | None = None,
     ) -> str:
         """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
         if _public_model_id(repository) != repository:
@@ -1238,10 +1266,16 @@ class SparkDeckService:
                 ))
                 for index in range(1, shard_count + 1)
             ]
-        await virtual_nas.download_model_files_checked(
-            repository, resolved_revision, selected_files,
-            requested_revision=revision,
-        )
+        if home_node_ids and set(home_node_ids) - {LOCAL_NODE_ID}:
+            await self._distribute_gguf_artifact(
+                repository, resolved_revision, selected_files,
+                home_node_ids, download_node_id, revision,
+            )
+        else:
+            await virtual_nas.download_model_files_checked(
+                repository, resolved_revision, selected_files,
+                requested_revision=revision,
+            )
         model_root = virtual_nas._model_path(repository).resolve()
         snapshot_root = model_root / "snapshots" / resolved_revision
         candidate = snapshot_root
@@ -1278,6 +1312,91 @@ class SparkDeckService:
         # are normally symlinks into blobs/, whose content-addressed targets
         # have no .gguf suffix and do not retain multi-shard names.
         return str(candidate)
+
+    async def _distribute_gguf_artifact(
+        self, repository: str, resolved_revision: str, selected_files: list[str],
+        home_node_ids: list[str], download_node_id: str | None,
+        requested_revision: str,
+    ) -> None:
+        """Place the selected GGUF files on every home node with one Hub pull.
+
+        Nodes that already hold the artifact act as streaming sources; when
+        no node has it, exactly one home node seeds from Hugging Face and
+        the rest receive file-scoped Virtual NAS streams, so the cluster
+        never pays duplicate Hub bandwidth for the same artifact. The
+        streams deliberately bypass the whole-repository transfer jobs:
+        selective snapshots are not complete revisions, and targets may
+        already cache the same repository under another quantization.
+        """
+        await self.manager.selected_cluster_nodes(home_node_ids)
+        if download_node_id is not None and download_node_id not in home_node_ids:
+            raise ValueError("download_node_id must be one of the selected nodes")
+        if not self.manager.virtual_nas.enabled:
+            raise RuntimeError(
+                "Virtual NAS is required to distribute GGUF artifacts between nodes"
+            )
+        # Validate the whole set before any Hub download starts so a mixed
+        # cluster fails fast instead of after creating partial side effects.
+        unsupported = [
+            node_id for node_id in home_node_ids
+            if node_id != LOCAL_NODE_ID
+            and not await self.manager.node_supports_selective_downloads(node_id)
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "node(s) do not support selective model file transfers; "
+                "update their SparkDeck agent: " + ", ".join(unsupported)
+            )
+        complete: dict[str, bool] = {}
+        for node_id in home_node_ids:
+            try:
+                complete[node_id] = await self.manager.node_has_model_files(
+                    node_id, repository, resolved_revision, selected_files,
+                )
+            except Exception:
+                # A node that cannot answer the presence check (for example a
+                # pre-selective-download agent) is treated as incomplete so
+                # preparation falls back to copying or re-seeding instead of
+                # silently assuming the artifact exists.
+                complete[node_id] = False
+        targets = [node_id for node_id in home_node_ids if not complete[node_id]]
+        if not targets:
+            return
+        sources = [node_id for node_id in home_node_ids if complete[node_id]]
+        if sources:
+            source = download_node_id if download_node_id in sources else sources[0]
+            for node_id in targets:
+                await self.manager.node_transfer_model_files(
+                    source, node_id, repository, resolved_revision,
+                    selected_files, requested_revision,
+                )
+            return
+        candidates = [download_node_id] if download_node_id else [
+            node_id for node_id in home_node_ids
+            if await self.manager.node_supports_selective_downloads(node_id)
+        ]
+        failures: list[str] = []
+        for candidate in candidates:
+            try:
+                await self.manager.node_download_model_files(
+                    candidate, repository, resolved_revision, selected_files,
+                    requested_revision,
+                )
+            except Exception as exc:
+                failures.append(f"{candidate}: {exc}")
+                continue
+            for node_id in targets:
+                if node_id == candidate:
+                    continue
+                await self.manager.node_transfer_model_files(
+                    candidate, node_id, repository, resolved_revision,
+                    selected_files, requested_revision,
+                )
+            return
+        raise RuntimeError(
+            "no selected node could download the GGUF artifact: "
+            + "; ".join(failures)
+        )
 
     async def create_deployment(
         self, body: dict[str, Any], *, background: bool = False,
@@ -1322,12 +1441,26 @@ class SparkDeckService:
                         raise ValueError(
                             "llama.cpp managed deployments require an existing local GGUF artifact"
                         )
+                    if requested_node_ids and any(
+                        node_id != LOCAL_NODE_ID
+                        for node_id in requested_node_ids
+                    ):
+                        raise ValueError(
+                            "local GGUF artifact files live outside the cluster cache "
+                            "and cannot be distributed; select the controller only or "
+                            "use a repo-relative Hub artifact"
+                        )
                     settings["model_source"] = "local"
                 else:
+                    home_node_ids, requested_seed = self._llama_cpp_artifact_homes(
+                        requested_node_ids, body,
+                    )
                     artifact = await self._prepare_public_gguf_artifact(
                         model, artifact,
                         _optional_string(body.get("revision")) or "main",
                         quantization,
+                        home_node_ids=home_node_ids,
+                        download_node_id=requested_seed,
                     )
                     settings["model_source"] = "public_repository"
                 settings["artifact"] = artifact
@@ -1353,11 +1486,7 @@ class SparkDeckService:
                     raise
                 return (self.store.deployment(deployment_id) or deployment.to_dict())
 
-            if requested_node_ids is not None:
-                if runtime is RuntimeKind.LLAMA_CPP:
-                    raise ValueError(
-                        "explicit node selection currently supports managed vLLM and SGLang deployments"
-                    )
+            if requested_node_ids is not None and runtime is not RuntimeKind.LLAMA_CPP:
                 selected = await self.manager.selected_cluster_nodes(requested_node_ids)
                 mode = deployment_mode or (
                     "replicated" if len(requested_node_ids) > 1 else "single"

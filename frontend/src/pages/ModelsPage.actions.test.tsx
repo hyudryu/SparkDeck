@@ -11,6 +11,7 @@ const nodes = [
   { id: 'worker-1', name: 'Node 4', online: true, docker_ready: true, selectable: true },
   { id: 'worker-2', name: 'Node 3', online: true, docker_ready: true, selectable: true },
   { id: 'worker-3', name: 'Node 2', online: true, docker_ready: true, selectable: true },
+  { id: 'worker-4', name: 'Node 1', online: false, docker_ready: true, selectable: true },
 ]
 
 const runningDeployment = {
@@ -27,6 +28,7 @@ const modelCache = {
     { id: 'worker-1', name: 'Node 4', online: true, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
     { id: 'worker-2', name: 'Node 3', online: true, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
     { id: 'worker-3', name: 'Node 2', online: true, models: [] },
+    { id: 'worker-4', name: 'Node 1', online: false, models: [{ model_id: 'org/model', size_bytes: 10, revisions: ['main'] }] },
   ],
 }
 
@@ -91,6 +93,10 @@ describe('models page running actions', () => {
     expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeDisabled()
     // Nodes without cached weights stay unavailable.
     expect(within(dialog).getByRole('checkbox', { name: /Node 2/ })).toBeDisabled()
+    // A cached-but-offline node reports its real status, not a bogus
+    // "weights not cached" reason, and stays unselectable.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 1/ })).toBeDisabled()
+    expect(within(dialog).getByText(/Offline/)).toBeInTheDocument()
     await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
     await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
 

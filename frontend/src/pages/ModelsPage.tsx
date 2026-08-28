@@ -1257,8 +1257,12 @@ export function ModelsPage() {
       {additionalLaunch && (() => {
         const { deployment, currentIds, additionalIds } = additionalLaunch
         const weighted = deploymentWeightedNodes(deployment)
-        const eligible = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id) && isNodeSelectable(node))
-        const allowedIds = [...currentIds, ...eligible.map((node) => node.id)]
+        // Gate on the cache predicate only: cached nodes that are offline or
+        // Docker-unready stay in allowedIds so the selector reports their
+        // real status ("Offline", "Docker unavailable") instead of a
+        // misleading "weights not cached".
+        const cachedIds = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
+        const allowedIds = [...currentIds, ...cachedIds]
         const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached']))
         const additionalBusy = busy === deployment.id
         const ready = additionalIds.length > 0 && !nodes.loading && !nodes.error

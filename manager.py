@@ -647,6 +647,8 @@ class Manager:
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
+        self._host_port_reservation_lock = asyncio.Lock()
+        self._host_port_reservations: set[int] = set()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -9388,12 +9390,30 @@ class Manager:
                 or deployment.get("status") in {"error", "stopped", "removed"}
             ):
                 continue
-            values = [deployment.get("api_port")]
+            members = [
+                member for member in (deployment.get("members") or [])
+                if isinstance(member, dict)
+            ]
+            primary_member = next(
+                (
+                    member for member in members
+                    if int(member.get("rank") or 0) == 0
+                ),
+                members[0] if members else None,
+            )
+            # api_port belongs to the primary member. A remote-only
+            # deployment's primary port lives in that worker's host namespace
+            # and must not consume the same number on the controller.
+            values = (
+                [deployment.get("api_port")]
+                if primary_member
+                and primary_member.get("node_id") == LOCAL_NODE_ID
+                else []
+            )
             values.extend(
                 member.get("port")
-                for member in (deployment.get("members") or [])
-                if isinstance(member, dict)
-                and member.get("node_id") == LOCAL_NODE_ID
+                for member in members
+                if member.get("node_id") == LOCAL_NODE_ID
             )
             for value in values:
                 try:
@@ -9402,6 +9422,7 @@ class Manager:
                     continue
                 if 1 <= port <= 65535:
                     used.add(port)
+        used.update(getattr(self, "_host_port_reservations", set()))
         return used
 
     async def _validate_available_port(
@@ -9434,6 +9455,69 @@ class Manager:
         raise RuntimeError("No available ports in configured range")
 
     async def create_container(
+        self,
+        model: str,
+        port: int | None = None,
+        engine: str = "vllm",
+        gpu_memory_utilization: float | None = None,
+        gpu_memory_gb: float | None = None,
+        extra_args: list[str] | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        sg_tp_size: int | None = None,
+        sg_context_length: int | None = None,
+        sg_max_running_requests: int | None = None,
+        sg_mem_fraction: float | None = None,
+        sg_image: str | None = None,
+        recipe_id: str | None = None,
+        cluster_member: dict | None = None,
+        hf_token: str | None = None,
+        sparkdeck_deployment_id: str | None = None,
+    ) -> dict:
+        reserved_port = None
+        if cluster_member is not None and port is None:
+            lock = getattr(self, "_host_port_reservation_lock", None)
+            if lock is None:
+                lock = self._host_port_reservation_lock = asyncio.Lock()
+            async with lock:
+                reserved_port = await self._allocate_port()
+                reservations = getattr(self, "_host_port_reservations", None)
+                if reservations is None:
+                    reservations = self._host_port_reservations = set()
+                reservations.add(reserved_port)
+            port = reserved_port
+        create_call = self._create_container_with_port(
+            model=model, port=port, engine=engine,
+            gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_gb=gpu_memory_gb, extra_args=extra_args,
+            name=name, image=image, sg_tp_size=sg_tp_size,
+            sg_context_length=sg_context_length,
+            sg_max_running_requests=sg_max_running_requests,
+            sg_mem_fraction=sg_mem_fraction, sg_image=sg_image,
+            recipe_id=recipe_id, cluster_member=cluster_member,
+            hf_token=hf_token,
+            sparkdeck_deployment_id=sparkdeck_deployment_id,
+        )
+        if reserved_port is None:
+            return await create_call
+
+        # Docker work runs in asyncio.to_thread below and cannot be cancelled
+        # once started. Own and shield the lower-level task so cancellation of
+        # the request does not release its port while that thread is still
+        # pulling an image or creating the container.
+        creation_task = asyncio.create_task(create_call)
+
+        def release_reservation(task: asyncio.Task) -> None:
+            self._host_port_reservations.discard(reserved_port)
+            if not task.cancelled():
+                # A cancelled caller no longer awaits this owned task. Consume
+                # its eventual exception after releasing the reservation.
+                task.exception()
+
+        creation_task.add_done_callback(release_reservation)
+        return await asyncio.shield(creation_task)
+
+    async def _create_container_with_port(
         self,
         model: str,
         port: int | None = None,

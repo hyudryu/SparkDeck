@@ -505,6 +505,10 @@ export function ModelsPage() {
     setActionError(undefined)
     try {
       await api.deployments.action(deployment.id, action)
+      if (action === 'remove') {
+        acceptedDeployments.current.delete(deployment.id)
+        resource.setData((current) => current?.filter((item) => item.id !== deployment.id))
+      }
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')

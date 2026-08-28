@@ -3201,6 +3201,141 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         }]
         self.assertEqual(await instance._allocate_port(), 8000)
 
+    async def test_remote_only_api_port_does_not_reserve_controller_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = [{
+            "id": "remote-only", "status": "starting", "api_port": 8000,
+            "members": [{"node_id": "remote-1", "port": 8000}],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8000)
+        self.assertEqual(await instance._validate_available_port(8000), 8000)
+
+    async def test_remote_primary_api_port_does_not_mask_local_member_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = [{
+            "id": "remote-primary", "status": "starting", "api_port": 8000,
+            "members": [
+                {"node_id": "remote-1", "rank": 0, "port": 8000},
+                {"node_id": "local", "rank": 1, "port": 8001},
+            ],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8000)
+        with self.assertRaisesRegex(RuntimeError, "Port 8001 is already in use"):
+            await instance._validate_available_port(8001)
+
+    async def test_remote_agent_reserves_ports_across_slow_container_creates(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+        both_creating = asyncio.Event()
+        release = asyncio.Event()
+        assigned_ports = []
+
+        async def slow_create(**kwargs):
+            assigned_ports.append(kwargs["port"])
+            if len(assigned_ports) == 2:
+                both_creating.set()
+            await release.wait()
+            return {"name": kwargs["name"], "port": kwargs["port"]}
+
+        instance._create_container_with_port = slow_create
+        first = asyncio.create_task(instance.create_container(
+            "org/first", name="first-r0",
+            cluster_member={
+                "deployment_id": "first", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        second = asyncio.create_task(instance.create_container(
+            "org/second", name="second-r0",
+            cluster_member={
+                "deployment_id": "second", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        await asyncio.wait_for(both_creating.wait(), 1)
+
+        self.assertEqual(sorted(assigned_ports), [8000, 8001])
+        self.assertEqual(instance._host_port_reservations, {8000, 8001})
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 1)
+
+        self.assertEqual(sorted(result["port"] for result in results), [8000, 8001])
+        self.assertEqual(instance._host_port_reservations, set())
+
+    async def test_cancelled_remote_create_keeps_port_until_inner_task_finishes(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+        creating = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def slow_create(**kwargs):
+            self.assertEqual(kwargs["port"], 8000)
+            creating.set()
+            await release.wait()
+            finished.set()
+            return {"name": kwargs["name"], "port": kwargs["port"]}
+
+        instance._create_container_with_port = slow_create
+        launch = asyncio.create_task(instance.create_container(
+            "org/model", name="remote-r0",
+            cluster_member={
+                "deployment_id": "deployment", "node_id": "remote-1", "rank": 0,
+                "nnodes": 1, "mode": "single",
+            },
+        ))
+        await asyncio.wait_for(creating.wait(), 1)
+        launch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await launch
+
+        self.assertEqual(instance._host_port_reservations, {8000})
+        with self.assertRaisesRegex(RuntimeError, "No available ports"):
+            await instance._allocate_port()
+        release.set()
+        await asyncio.wait_for(finished.wait(), 1)
+        await asyncio.sleep(0)
+
+        self.assertEqual(instance._host_port_reservations, set())
+        self.assertEqual(await instance._allocate_port(), 8000)
+
+    async def test_failed_remote_create_releases_reserved_port(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8000}
+        instance.deployments = []
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        async def failed_create(**_kwargs):
+            raise RuntimeError("container creation failed")
+
+        instance._create_container_with_port = failed_create
+        with self.assertRaisesRegex(RuntimeError, "container creation failed"):
+            await instance.create_container(
+                "org/model", name="remote-r0",
+                cluster_member={
+                    "deployment_id": "deployment", "node_id": "remote-1",
+                    "rank": 0, "nnodes": 1, "mode": "single",
+                },
+            )
+
+        self.assertEqual(instance._host_port_reservations, set())
+        self.assertEqual(await instance._allocate_port(), 8000)
+
     async def test_interrupted_launch_restarts_with_same_public_link_and_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

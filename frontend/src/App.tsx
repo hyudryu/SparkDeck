@@ -10,6 +10,7 @@ import { ExplorePage } from './pages/ExplorePage'
 import { ImagesPage } from './pages/ImagesPage'
 import { LogsPage } from './pages/LogsPage'
 import { ModelsPage } from './pages/ModelsPage'
+import { DeploymentPage } from './pages/DeploymentPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StoragePage } from './pages/StoragePage'
 import { UsagePage } from './pages/UsagePage'
@@ -24,6 +25,7 @@ export default function App() {
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/explore" element={<ExplorePage />} />
           <Route path="/models" element={<ModelsPage />} />
+          <Route path="/models/:deploymentId" element={<DeploymentPage />} />
           <Route path="/cluster" element={<ClusterPage />} />
           <Route path="/switch" element={<SwitchPage />} />
           <Route path="/chat" element={<ChatPage />} />

@@ -279,6 +279,7 @@ class SparkDeckService:
         )
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
+        self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
@@ -699,6 +700,18 @@ class SparkDeckService:
                 stored["settings"] = settings
                 stored["container_name"] = container_name
                 manager_id = cluster.get("id")
+            manager_desired = cluster.get("desired_state")
+            stored_desired = stored.get("desired_state")
+            # A persisted stop is sticky until an explicit SparkDeck start.
+            # This also migrates legacy SQLite rows when the Manager record is
+            # already authoritative about a stopped deployment.
+            if manager_desired == "stopped" and stored_desired != "stopped":
+                self.store.update_desired_state(stored["id"], "stopped")
+                stored["desired_state"] = "stopped"
+            elif manager_desired == "running" and stored_desired != "stopped":
+                if stored_desired != "running":
+                    self.store.update_desired_state(stored["id"], "running")
+                stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             stored["port"] = cluster.get("api_port")
@@ -786,6 +799,179 @@ class SparkDeckService:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         return registered
+
+    async def deployment_detail(self, deployment_id: str) -> dict[str, Any]:
+        """Return one deployment with only its safe, editable launch inputs."""
+        public = next(
+            (
+                item for item in await self.deployments()
+                if item.get("id") == deployment_id
+            ),
+            None,
+        )
+        if public is None:
+            raise LookupError("deployment not found")
+
+        stored = self.store.deployment(deployment_id, include_private=True)
+        manager_deployment = None
+        manager_id = None
+        if stored is not None:
+            manager_id = (stored.get("settings") or {}).get(
+                "manager_deployment_id"
+            )
+            lookup = getattr(self.manager, "_deployment", None)
+            if manager_id and callable(lookup):
+                manager_deployment = lookup(manager_id)
+            if manager_deployment is None:
+                manager_deployment = next(
+                    (
+                        item
+                        for item in getattr(self.manager, "deployments", [])
+                        if isinstance(item, dict)
+                        and (
+                            (manager_id and item.get("id") == manager_id)
+                            or item.get("sparkdeck_record_id") == deployment_id
+                        )
+                    ),
+                    None,
+                )
+
+        launch_settings = (
+            manager_deployment.get("launch_settings")
+            if isinstance(manager_deployment, dict)
+            and isinstance(manager_deployment.get("launch_settings"), dict)
+            else None
+        )
+        extra_args = self.manager._without_sensitive_cli_credentials(
+            (launch_settings or {}).get("extra_args") or []
+        )
+        launch_controls = (
+            self.manager._deployment_launch_controls({
+                **launch_settings,
+                "extra_args": extra_args,
+            })
+            if launch_settings is not None else {}
+        )
+
+        raw_status = str(
+            (manager_deployment or {}).get("status") or public.get("status") or ""
+        ).lower()
+        repairable_error = bool(
+            raw_status == "error"
+            and (
+                (manager_deployment or {}).get("launch_settings_error")
+                or "persisted launch_settings.extra_args" in str(
+                    (manager_deployment or {}).get("error") or ""
+                )
+            )
+        )
+        editable = bool(
+            stored is not None
+            and manager_id
+            and manager_deployment is not None
+            and launch_settings is not None
+            and str(public.get("runtime") or "") in {"vllm", "sglang"}
+            and (raw_status == "stopped" or repairable_error)
+        )
+        if editable:
+            edit_reason = None
+        elif stored is None or str(deployment_id).startswith("container:"):
+            edit_reason = "Discovered deployments do not have editable saved launch settings."
+        elif public.get("kind") != DeploymentKind.MANAGED.value:
+            edit_reason = "External deployments do not have SparkDeck-managed launch settings."
+        elif not manager_id or manager_deployment is None or launch_settings is None:
+            edit_reason = "Saved launch settings are unavailable for this deployment."
+        elif str(public.get("runtime") or "") not in {"vllm", "sglang"}:
+            edit_reason = "This runtime does not support editing saved launch settings."
+        else:
+            edit_reason = "Stop the deployment before changing its launch settings."
+
+        desired_state = (
+            (manager_deployment or {}).get("desired_state")
+            or (stored or {}).get("desired_state")
+        )
+        if desired_state not in {"running", "stopped"}:
+            desired_state = (
+                "running"
+                if str(public.get("status") or "").lower() in {"running", "starting"}
+                else "stopped"
+            )
+
+        # The ordinary deployment list carries controller-local routing keys
+        # in ``settings`` so lifecycle actions can reconcile records. A detail
+        # response is an editor contract, not a routing contract: expose only
+        # safe runtime configuration and keep argv in the sanitized top-level
+        # field below.
+        public_settings = self._safe_configuration(public.get("settings") or {})
+        public_settings.pop("extra_args", None)
+        return {
+            **public,
+            "settings": public_settings,
+            "editable": editable,
+            "edit_reason": edit_reason,
+            "desired_state": desired_state,
+            "extra_args": extra_args,
+            "launch_controls": launch_controls,
+            "gpu_memory_utilization": (
+                (launch_settings or {}).get("gpu_memory_utilization")
+            ),
+            "gpu_memory_gb": (launch_settings or {}).get("gpu_memory_gb"),
+            "image": (launch_settings or {}).get("image"),
+        }
+
+    async def update_deployment_settings(
+        self, deployment_id: str, changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update a stopped manager-backed deployment by its public record ID."""
+        allowed = {
+            "extra_args", "launch_controls",
+            "gpu_memory_utilization", "gpu_memory_gb",
+        }
+        unknown = sorted(set(changes) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+
+        # Listing first performs the normal manager/store reconciliation, so a
+        # settings save cannot target a manager deployment ID that was replaced
+        # by an earlier relaunch.
+        await self.deployments()
+        stored = self.store.deployment(deployment_id, include_private=True)
+        if stored is None:
+            raise LookupError("deployment not found")
+        manager_id = (stored.get("settings") or {}).get(
+            "manager_deployment_id"
+        )
+        if not manager_id:
+            raise ValueError(
+                "deployment does not have editable saved launch settings"
+            )
+
+        updated = self.manager.update_deployment_settings(manager_id, changes)
+        launch_settings = updated.get("launch_settings") or {}
+        controls = self.manager._deployment_launch_controls(launch_settings)
+        contract = self.manager.recipe_deployment_contract(launch_settings)
+        safe_args = self.manager._without_sensitive_cli_credentials(
+            launch_settings.get("extra_args") or []
+        )
+        current_settings = dict(stored.get("settings") or {})
+        refreshed_settings = self._local_configuration({
+            **current_settings,
+            **launch_settings,
+            "extra_args": safe_args,
+            "context_length": controls.get("context_window"),
+            "tensor_parallel_size": contract.get("tensor_parallel_size"),
+            "deployment_mode": updated.get("mode")
+            or launch_settings.get("deployment_mode"),
+            "node_ids": list(updated.get("node_ids") or []),
+            "manager_deployment_id": manager_id,
+        })
+        self.store.update_managed_routing(
+            deployment_id,
+            refreshed_settings,
+            stored.get("container_name"),
+            stored.get("_base_url"),
+        )
+        return await self.deployment_detail(deployment_id)
 
     async def create_deployment(self, body: dict[str, Any]) -> dict[str, Any]:
         model = str(body.get("model") or "").strip()
@@ -1241,6 +1427,18 @@ class SparkDeckService:
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        lock = self._deployment_action_locks.setdefault(
+            deployment_id, asyncio.Lock(),
+        )
+        async with lock:
+            return await self._deployment_action_locked(
+                deployment_id, action, node_ids,
+            )
+
+    async def _deployment_action_locked(
+        self, deployment_id: str, action: str,
+        node_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
         if not deployment and deployment_id.startswith("container:"):
@@ -1278,6 +1476,11 @@ class SparkDeckService:
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
             await self._validate_start_selection(deployment, node_ids, launch_settings)
+        if discovered is None and action == "stop":
+            # Persist intent before the first container call. A failed or
+            # partially completed stop must still prevent queued inference or
+            # health traffic from waking the deployment again.
+            self.store.update_desired_state(deployment_id, "stopped")
         if manager_id:
             if node_ids is None:
                 result = await self.manager.deployment_action(manager_id, action)
@@ -1298,6 +1501,8 @@ class SparkDeckService:
                     primary.get("container_name") or deployment.get("container_name"),
                     f"http://127.0.0.1:{int(replacement['api_port'])}",
                 )
+            if action == "start":
+                self.store.update_desired_state(deployment_id, "running")
             current = self.store.deployment(deployment_id) or deployment
             current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
@@ -1333,9 +1538,11 @@ class SparkDeckService:
             if current is None:
                 raise LookupError("managed container not found")
         if action == "start":
-            await self.manager.start_container(container)
+            await self.manager.start_container(container, explicit=True)
+            if discovered is None:
+                self.store.update_desired_state(deployment_id, "running")
         elif action == "stop":
-            await self.manager.stop_container(container)
+            await self.manager.stop_container(container, explicit=True)
         else:
             raise ValueError("action must be start or stop")
         current = self.store.deployment(deployment_id) or deployment
@@ -1588,6 +1795,29 @@ class SparkDeckService:
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
+        manager_desired = None
+        manager_id = (deployment.get("settings") or {}).get(
+            "manager_deployment_id"
+        )
+        if manager_id:
+            linked = next(
+                (
+                    item for item in getattr(self.manager, "deployments", [])
+                    if isinstance(item, dict) and item.get("id") == manager_id
+                ),
+                None,
+            )
+            manager_desired = (linked or {}).get("desired_state")
+        if (
+            deployment.get("kind") == DeploymentKind.MANAGED.value
+            and (
+                deployment.get("desired_state") == "stopped"
+                or manager_desired == "stopped"
+            )
+        ):
+            raise RuntimeError(
+                "deployment is stopped; start it before sending inference requests"
+            )
         if (
             deployment.get("kind") == DeploymentKind.MANAGED.value
             and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)

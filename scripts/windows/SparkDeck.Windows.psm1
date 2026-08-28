@@ -689,6 +689,21 @@ function Get-SparkDeckStatus {
     return 2
 }
 
+function Get-SparkDeckProcessStatus {
+    $paths = Get-SparkDeckPaths
+    $record = Get-SparkDeckPidRecord $paths
+    if ($null -eq $record) {
+        Write-Host "SparkDeck is stopped."
+        return 1
+    }
+    if (-not (Test-SparkDeckProcessIdentity $paths $record)) {
+        Write-Host "SparkDeck is stopped (the PID record is stale)." -ForegroundColor Yellow
+        return 1
+    }
+    Write-Host ("SparkDeck process {0} is owned by this launcher." -f $record.pid) -ForegroundColor Green
+    return 0
+}
+
 function Show-SparkDeckLogs {
     param([string[]]$Arguments)
     $Arguments = @($Arguments)
@@ -835,6 +850,9 @@ function Invoke-SparkDeckCommand {
             return (Start-SparkDeck)
         }
         "status" { return (Get-SparkDeckStatus) }
+        # Internal updater preflight: the API endpoint handling this command is
+        # already healthy, so probing it again would deadlock that request.
+        "process-status" { return (Get-SparkDeckProcessStatus) }
         "logs" { return (Show-SparkDeckLogs -Arguments $Arguments) }
         "run" { return (Start-SparkDeckForeground) }
         "help" { return (Show-SparkDeckHelp) }

@@ -94,6 +94,7 @@ class SparkDeckStore:
                     container_name TEXT,
                     settings_json TEXT NOT NULL DEFAULT '{}',
                     credential_ref TEXT,
+                    desired_state TEXT NOT NULL DEFAULT 'running',
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS benchmark_samples (
@@ -188,6 +189,11 @@ class SparkDeckStore:
             if "created_at" not in deployment_columns:
                 self._connection.execute(
                     "ALTER TABLE deployments ADD COLUMN created_at TEXT"
+                )
+            if "desired_state" not in deployment_columns:
+                self._connection.execute(
+                    "ALTER TABLE deployments ADD COLUMN desired_state TEXT "
+                    "NOT NULL DEFAULT 'running'"
                 )
             self._connection.execute(
                 "UPDATE deployments SET created_at = ? "
@@ -296,14 +302,15 @@ class SparkDeckStore:
                 """INSERT INTO deployments(
                     id, alias, runtime, kind, repository, revision, artifact,
                     quantization, base_url, container_name, settings_json, credential_ref,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    desired_state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     deployment.id, deployment.alias, deployment.runtime.value,
                     deployment.kind.value, deployment.model.repository,
                     deployment.model.revision, deployment.model.artifact,
                     deployment.model.quantization, base_url, deployment.container_name,
                     json.dumps(deployment.settings), credential_ref,
+                    deployment.desired_state,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -320,6 +327,15 @@ class SparkDeckStore:
             self._connection.execute(
                 "UPDATE deployments SET alias = ? WHERE id = ?",
                 (alias, deployment_id),
+            )
+
+    def update_desired_state(self, deployment_id: str, desired_state: str) -> None:
+        if desired_state not in {"running", "stopped"}:
+            raise ValueError("desired_state must be running or stopped")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET desired_state = ? WHERE id = ?",
+                (desired_state, deployment_id),
             )
 
     def update_runtime_location(self, deployment_id: str, container_name: str,
@@ -362,6 +378,7 @@ class SparkDeckStore:
                 container_name=row["container_name"],
                 settings=json.loads(row["settings_json"] or "{}"),
                 base_url_set=bool(row["base_url"]),
+                desired_state=row["desired_state"] or "running",
             ).to_dict()
             deployment["created_at"] = row["created_at"]
             if include_private:

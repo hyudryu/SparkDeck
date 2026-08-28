@@ -14,6 +14,7 @@ from sparkdeck.storage import (
     COMMUNITY_UPLOAD_FIELDS,
     SparkDeckStore,
     _COMMUNITY_AGGREGATE_BATCH_SIZE,
+    _community_prompt_bucket,
 )
 
 
@@ -25,6 +26,15 @@ class SparkDeckStoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.temp.cleanup()
+
+    def test_prompt_bucket_contract_uses_explicit_half_up_rounding(self):
+        self.assertEqual(_community_prompt_bucket(1), 400)
+        self.assertEqual(_community_prompt_bucket(800), 400)
+        self.assertEqual(_community_prompt_bucket(801), 1000)
+        self.assertEqual(_community_prompt_bucket(2_499), 2000)
+        self.assertEqual(_community_prompt_bucket(2_500), 3000)
+        self.assertEqual(_community_prompt_bucket(9_999), 9000)
+        self.assertIsNone(_community_prompt_bucket(10_000))
 
     def test_consent_defaults_off_and_deployment_hides_endpoint(self):
         self.assertFalse(self.store.sync_status()["consent"])
@@ -110,7 +120,9 @@ class SparkDeckStoreTests(unittest.TestCase):
     def test_only_consented_eligible_samples_enter_outbox(self):
         sample = BenchmarkSample(
             id="sample-1", created_at="2026-08-25T00:00:00+00:00",
-            deployment_id=None, model=ModelIdentity("org/model"),
+            deployment_id=None, model=ModelIdentity(
+                "org/model", quantization="NVFP4",
+            ),
             runtime=RuntimeKind.VLLM, runtime_version=None,
             hardware={"architecture": "x86_64"},
             configuration={"context_length": 4096},
@@ -119,18 +131,31 @@ class SparkDeckStoreTests(unittest.TestCase):
             prompt_tokens_per_second=200, cold_start=False,
             eligible_for_community=True,
         )
-        self.store.add_benchmark(sample, queue=False)
+        initial = self.store.community_consent_snapshot()
+        self.assertEqual(initial, {
+            "enabled": False, "generation": 0, "telemetry_cluster_id": None,
+        })
+        self.assertFalse(self.store.add_benchmark_if_consented(
+            sample, initial["generation"],
+        ))
+        self.assertEqual(self.store.benchmarks()[1], 0)
         self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 0)
-        self.store.set_setting("community_consent", True)
+        consent = self.store.set_community_consent(True)
+        self.assertRegex(consent["telemetry_cluster_id"], r"^[0-9a-f-]{36}$")
         second = replace(sample, id="sample-2")
-        self.store.add_benchmark(second, queue=True)
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            second, consent["generation"],
+        ))
         self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 1)
         self.store.set_setting("device_pairing", {"status": "paired", "device_id": "device-1"})
         self.assertEqual(self.store.retry_outbox(), 1)
         self.assertEqual(self.store.outbox_batch(), [{
             "model_id": "org/model",
-            "context_window_size": 4096,
+            "quantization": "NVFP4",
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 300.0,
+            "telemetry_cluster_id": consent["telemetry_cluster_id"],
+            "concurrency": 1,
         }])
         self.assertEqual(self.store.mark_outbox_failed(["sample-2"], "offline"), 1)
         self.assertEqual(self.store.outbox_batch(), [])
@@ -178,8 +203,10 @@ class SparkDeckStoreTests(unittest.TestCase):
             prompt_tokens_per_second=200, cold_start=False,
             eligible_for_community=True,
         )
-        self.store.set_setting("community_consent", True)
-        self.store.add_benchmark(sample, queue=True)
+        consent = self.store.set_community_consent(True)
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, consent["generation"],
+        ))
         self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 1)
 
         self.assertEqual(self.store.promote_outbox_for_pairing(), 1)
@@ -188,7 +215,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(self.store.sync_status()["outbox"]["pending"], 1)
         self.assertEqual(self.store.promote_outbox_for_pairing(), 0)
 
-    def test_consent_queues_existing_samples_and_upload_drops_artifact(self):
+    def test_enabling_consent_does_not_queue_existing_samples(self):
         sample = BenchmarkSample(
             id="sample-private", created_at="2026-08-25T00:00:00+00:00",
             deployment_id="private-deployment",
@@ -205,22 +232,13 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_community_consent(True)
         self.store.set_setting("device_pairing", {"status": "paired"})
         self.store.retry_outbox()
-        rows = self.store.outbox_batch()
-        self.assertEqual(set(rows[0]), {
-            "model_id", "context_window_size", "inference_tokens_per_second",
-        })
-        self.assertLessEqual(set(rows[0]), COMMUNITY_UPLOAD_FIELDS)
-        self.assertEqual(rows, [{
-            "model_id": "org/model",
-            "context_window_size": 4096,
-            "inference_tokens_per_second": 300.0,
-        }])
+        self.assertEqual(self.store.outbox_batch(), [])
         local, _ = self.store.benchmarks()
         self.assertEqual(local[0]["model"]["artifact"], "C:/private/model.gguf")
         self.assertEqual(local[0]["model"]["revision"], "abc123")
         self.assertEqual(local[0]["runtime_version"], "registry.local/team/image:1")
         self.assertEqual(local[0]["hardware"], {"architecture": "aarch64"})
-        self.assertEqual(local[0]["sync_state"], "pending")
+        self.assertEqual(local[0]["sync_state"], "local")
 
     def test_withdrawing_consent_removes_unsent_uploads_but_keeps_samples(self):
         base = BenchmarkSample(
@@ -248,10 +266,115 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(total, 2)
         self.assertTrue(all(item["sync_state"] == "local" for item in local))
 
-        self.store.set_community_consent(True)
-        uploads = self.store.outbox_batch()
-        self.assertEqual(len(uploads), 2)
-        self.assertTrue(all(set(item) <= COMMUNITY_UPLOAD_FIELDS for item in uploads))
+        reenabled = self.store.set_community_consent(True)
+        self.assertEqual(reenabled["telemetry_cluster_id"], self.store.get_setting(
+            "telemetry_cluster_id",
+        ))
+        self.assertEqual(self.store.outbox_batch(), [])
+
+    def test_consent_generation_rejects_request_across_disable_reenable(self):
+        sample = BenchmarkSample(
+            id="stale-generation", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("RadixArk/Qwen3.8-27B", quantization="NVFP4"),
+            runtime=RuntimeKind.SGLANG, runtime_version=None, hardware={},
+            configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=4_000, ttft_ms=100,
+            generation_tokens_per_second=80,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        first = self.store.set_community_consent(
+            True, "55555555-5555-4555-8555-555555555555",
+        )
+        disabled = self.store.set_community_consent(False)
+        second = self.store.set_community_consent(True)
+
+        self.assertEqual(disabled["generation"], first["generation"] + 1)
+        self.assertEqual(second["generation"], disabled["generation"] + 1)
+        self.assertEqual(
+            second["telemetry_cluster_id"], first["telemetry_cluster_id"],
+        )
+        self.assertFalse(self.store.add_benchmark_if_consented(
+            sample, first["generation"],
+        ))
+        self.assertEqual(self.store.benchmarks()[1], 0)
+
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            replace(sample, id="current-generation"), second["generation"],
+        ))
+        self.assertEqual(self.store.benchmarks()[1], 1)
+
+    def test_controller_cluster_id_is_validated_and_shared_without_rotation(self):
+        cluster_id = "66666666-6666-4666-8666-666666666666"
+        first = self.store.set_community_consent(True, cluster_id.upper())
+        repeated = self.store.set_community_consent(True, cluster_id)
+
+        self.assertEqual(first["telemetry_cluster_id"], cluster_id)
+        self.assertEqual(repeated, first)
+        with self.assertRaisesRegex(ValueError, "must be a UUID"):
+            self.store.set_community_consent(True, "host-or-account-name")
+
+    def test_cluster_identity_change_invalidates_epoch_and_unsent_rows(self):
+        sample = BenchmarkSample(
+            id="old-cluster", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={}, input_tokens=400, output_tokens=32,
+            latency_ms=3_000, ttft_ms=50,
+            generation_tokens_per_second=64,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        first = self.store.set_community_consent(
+            True, "77777777-7777-4777-8777-777777777777",
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, first["generation"],
+        ))
+        self.assertEqual(self.store.sync_status()["outbox"]["waiting_for_account"], 1)
+
+        changed = self.store.set_community_consent(
+            True, "88888888-8888-4888-8888-888888888888",
+        )
+
+        self.assertEqual(changed["generation"], first["generation"] + 1)
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertFalse(self.store.add_benchmark_if_consented(
+            replace(sample, id="stale-cluster"), first["generation"],
+        ))
+
+    def test_membership_revocation_clears_cluster_identity_and_unsent_rows(self):
+        first = self.store.set_community_consent(
+            True, "99999999-9999-4999-8999-999999999999",
+        )
+        sample = BenchmarkSample(
+            id="former-cluster", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=4_000, ttft_ms=100,
+            generation_tokens_per_second=80,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, first["generation"],
+        ))
+
+        revoked = self.store.revoke_community_membership()
+
+        self.assertEqual(revoked, {
+            "enabled": False,
+            "generation": first["generation"] + 1,
+            "telemetry_cluster_id": None,
+        })
+        self.assertIsNone(self.store.get_setting("telemetry_cluster_id"))
+        self.assertEqual(self.store.outbox_batch(), [])
+        reenabled = self.store.set_community_consent(True)
+        self.assertNotEqual(
+            reenabled["telemetry_cluster_id"], first["telemetry_cluster_id"],
+        )
 
     def test_migration_requires_fresh_consent_for_expanded_payload_contract(self):
         sample = BenchmarkSample(
@@ -283,6 +406,61 @@ class SparkDeckStoreTests(unittest.TestCase):
             self.store.get_setting("community_consent_contract_version"),
             COMMUNITY_CONSENT_CONTRACT_VERSION,
         )
+        self.assertGreater(
+            self.store.community_consent_snapshot()["generation"], 1,
+        )
+
+    def test_migration_adds_cluster_id_column_to_legacy_benchmark_table(self):
+        database = Path(self.temp.name) / "legacy-benchmarks.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                """CREATE TABLE benchmark_samples (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    deployment_id TEXT,
+                    model_json TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    runtime_version TEXT,
+                    hardware_json TEXT NOT NULL,
+                    configuration_json TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    ttft_ms REAL,
+                    generation_tps REAL,
+                    prompt_tps REAL,
+                    cold_start INTEGER,
+                    eligible INTEGER NOT NULL
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO benchmark_samples VALUES (
+                    'legacy-row', '2026-08-25T00:00:00+00:00', NULL,
+                    '{"repository":"org/model"}', 'vllm', NULL, '{}', '{}',
+                    400, 32, 4000, 100, 80, NULL, 0, 0
+                )"""
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SparkDeckStore(database)
+        try:
+            columns = {
+                row[1] for row in migrated._connection.execute(
+                    "PRAGMA table_info(benchmark_samples)"
+                )
+            }
+            self.assertIn("telemetry_cluster_id", columns)
+            self.assertEqual(migrated.benchmarks()[1], 1)
+            stored = migrated._connection.execute(
+                "SELECT telemetry_cluster_id FROM benchmark_samples "
+                "WHERE id = 'legacy-row'"
+            ).fetchone()[0]
+            self.assertIsNone(stored)
+        finally:
+            migrated.close()
 
     def test_legacy_device_class_is_normalized_for_local_and_upload_records(self):
         sample = BenchmarkSample(
@@ -312,7 +490,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             deployment_id="dep-private", model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version="1.2.3",
             hardware={"hardware_class": "dgx-spark"}, configuration={},
-            input_tokens=20, output_tokens=30, latency_ms=100, ttft_ms=10,
+            input_tokens=0, output_tokens=30, latency_ms=100, ttft_ms=10,
             generation_tokens_per_second=300, prompt_tokens_per_second=200,
             cold_start=False, eligible_for_community=True,
         )
@@ -322,7 +500,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.add_benchmark(replace(
             base,
             id="missing-speed",
-            configuration={"max_model_len": 8192},
+            input_tokens=400,
             generation_tokens_per_second=None,
         ), queue=True)
 
@@ -335,7 +513,9 @@ class SparkDeckStoreTests(unittest.TestCase):
     def test_community_evidence_policy_uses_only_upload_dimensions(self):
         self.assertEqual(COMMUNITY_EVIDENCE_POLICY, {
             "minimum_samples": 10,
-            "exact_match_dimensions": ["model_id", "context_window_size"],
+            "exact_match_dimensions": [
+                "model_id", "quantization", "prompt_tokens_bucket",
+            ],
             "metric": "inference_tokens_per_second",
         })
 
@@ -510,10 +690,12 @@ class SparkDeckStoreTests(unittest.TestCase):
         finally:
             migrated.close()
 
-    def test_upload_includes_only_optional_benchmark_dimensions_when_recorded(self):
+    def test_manual_non_c1_benchmarks_stay_local_and_are_not_queued(self):
         sample = BenchmarkSample(
-            id="series-upload", created_at="2026-08-27T00:00:00+00:00",
-            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            id="series-upload-c5", created_at="2026-08-27T00:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity(
+                "org/model", quantization="Q4_K_M",
+            ),
             runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
             configuration={
                 "context_length": 16384, "benchmark_concurrency": 5,
@@ -524,13 +706,27 @@ class SparkDeckStoreTests(unittest.TestCase):
             cold_start=False, eligible_for_community=True,
         )
         self.store.set_setting("device_pairing", {"status": "paired"})
-        self.store.add_benchmark(sample, queue=True)
+        consent = self.store.set_community_consent(
+            True, "11111111-1111-4111-8111-111111111111",
+        )
+        for concurrency in (2, 5, 10):
+            self.store.add_benchmark(replace(
+                sample,
+                id=f"series-upload-c{concurrency}",
+                configuration={
+                    **sample.configuration,
+                    "benchmark_concurrency": concurrency,
+                },
+            ), queue=True)
+        self.assertFalse(self.store.add_benchmark_if_consented(
+            replace(sample, id="atomic-c5"), consent["generation"],
+        ))
 
-        self.assertEqual(self.store.outbox_batch(), [{
-            "model_id": "org/model", "context_window_size": 16384,
-            "inference_tokens_per_second": 50.0,
-            "concurrency": 5, "tensor_parallel_size": 2,
-        }])
+        local, total = self.store.benchmarks()
+        self.assertTrue(consent["enabled"])
+        self.assertEqual(total, 3)
+        self.assertTrue(all(not row["eligible_for_community"] for row in local))
+        self.assertEqual(self.store.outbox_batch(), [])
 
     def test_upload_omits_untrusted_benchmark_dimensions_for_ordinary_sample(self):
         sample = BenchmarkSample(
@@ -538,30 +734,36 @@ class SparkDeckStoreTests(unittest.TestCase):
             deployment_id="dep-1", model=ModelIdentity("org/model"),
             runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
             configuration={
-                "context_length": 16384, "benchmark_concurrency": 3,
-                "tensor_parallel_size": 4,
+                "context_length": 16384, "tensor_parallel_size": 4,
             },
             input_tokens=100, output_tokens=50, latency_ms=1000, ttft_ms=None,
             generation_tokens_per_second=50, prompt_tokens_per_second=100,
             cold_start=False, eligible_for_community=True,
         )
         self.store.set_setting("device_pairing", {"status": "paired"})
-        self.store.add_benchmark(sample, queue=True)
+        consent = self.store.set_community_consent(True)
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, consent["generation"],
+        ))
 
         local, _ = self.store.benchmarks()
         self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
-        self.assertEqual(local[0]["configuration"]["benchmark_concurrency"], 3)
         self.assertEqual(self.store.outbox_batch(), [{
-            "model_id": "org/model", "context_window_size": 16384,
+            "model_id": "org/model", "quantization": "UNKNOWN",
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 50.0,
+            "telemetry_cluster_id": consent["telemetry_cluster_id"],
+            "concurrency": 1,
         }])
 
     def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
+        cluster_id = "22222222-2222-4222-8222-222222222222"
+        consent = self.store.set_community_consent(True, cluster_id)
         sample = BenchmarkSample(
             id="eligible-1", created_at="2026-08-25T00:00:00+00:00",
             deployment_id="private-deployment", model=ModelIdentity(
                 "org/model", revision="private-revision",
-                artifact="C:/private/model.gguf",
+                artifact="C:/private/model.gguf", quantization="NVFP4",
             ),
             runtime=RuntimeKind.VLLM, runtime_version="private/image:latest",
             hardware={"hardware_class": "private-device"},
@@ -570,50 +772,58 @@ class SparkDeckStoreTests(unittest.TestCase):
             generation_tokens_per_second=80, prompt_tokens_per_second=200,
             cold_start=False, eligible_for_community=True,
         )
-        self.store.add_benchmark(sample, queue=False)
-        self.store.add_benchmark(replace(
+        candidates = [sample, replace(
             sample, id="eligible-2", generation_tokens_per_second=100,
-        ), queue=False)
-        self.store.add_benchmark(replace(
+        ), replace(
             sample, id="invalid-coordinated-marker",
             configuration={"context_length": 4096, "benchmark_concurrency": 3},
             generation_tokens_per_second=90,
-        ), queue=False)
-        self.store.add_benchmark(replace(
+        ), replace(
             sample, id="ineligible", eligible_for_community=False,
             generation_tokens_per_second=1000,
-        ), queue=False)
-        self.store.add_benchmark(replace(
-            sample, id="other-context", configuration={"max_model_len": 8192},
+        ), replace(
+            sample, id="other-context", input_tokens=2200,
             generation_tokens_per_second=40,
-        ), queue=False)
-        self.store.add_benchmark(replace(
+        ), replace(
             sample, id="coordinated-c1", configuration={
                 "context_length": 4096, "benchmark_concurrency": 1,
                 "tensor_parallel_size": 1,
             }, generation_tokens_per_second=500,
-        ), queue=False)
-        self.store.add_benchmark(replace(
+        ), replace(
             sample, id="coordinated-c10", configuration={
                 "context_length": 4096, "benchmark_concurrency": 10,
                 "tensor_parallel_size": 2,
             }, generation_tokens_per_second=5,
-        ), queue=False)
+        )]
+        for candidate in candidates:
+            self.store.add_benchmark_if_consented(
+                candidate, consent["generation"],
+            )
+        with self.store._connection:
+            self.store._connection.execute(
+                "UPDATE benchmark_samples SET telemetry_cluster_id = ? "
+                "WHERE id = 'eligible-2'",
+                ("44444444-4444-4444-8444-444444444444",),
+            )
 
         aggregates = self.store.community_aggregates()
 
         self.assertEqual(aggregates, [
             {
                 "model_id": "org/model",
-                "context_window_size": 4096,
-                "inference_tokens_per_second": 90.0,
+                "quantization": "NVFP4",
+                "prompt_tokens_bucket": 400,
+                "inference_tokens_per_second": 226.66666666666666,
                 "sample_count": 3,
+                "unique_cluster_count": 2,
             },
             {
                 "model_id": "org/model",
-                "context_window_size": 8192,
+                "quantization": "NVFP4",
+                "prompt_tokens_bucket": 2000,
                 "inference_tokens_per_second": 40.0,
                 "sample_count": 1,
+                "unique_cluster_count": 1,
             },
         ])
         serialized = str(aggregates)
@@ -626,9 +836,11 @@ class SparkDeckStoreTests(unittest.TestCase):
     def test_local_community_aggregates_scan_large_history_in_bounded_batches(self):
         row_count = _COMMUNITY_AGGREGATE_BATCH_SIZE * 20 + 17
         rows = [{
-            "model_json": '{"repository":"org/model"}',
+            "model_json": '{"repository":"org/model","quantization":"NVFP4"}',
             "configuration_json": '{"context_length":4096}',
+            "input_tokens": 400,
             "generation_tps": 80.0,
+            "telemetry_cluster_id": "33333333-3333-4333-8333-333333333333",
         } for _ in range(row_count)]
 
         class BatchCursor:
@@ -656,9 +868,11 @@ class SparkDeckStoreTests(unittest.TestCase):
 
         self.assertEqual(aggregates, [{
             "model_id": "org/model",
-            "context_window_size": 4096,
+            "quantization": "NVFP4",
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
             "sample_count": row_count,
+            "unique_cluster_count": 1,
         }])
         self.assertGreater(len(cursor.batch_sizes), 20)
         self.assertEqual(set(cursor.batch_sizes), {_COMMUNITY_AGGREGATE_BATCH_SIZE})

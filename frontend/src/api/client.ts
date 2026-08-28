@@ -448,11 +448,12 @@ export const api = {
         `/api/v1/catalog/models${queryString({ q: query, runtime, cursor, limit: 100 })}`,
         { signal },
       ),
-    model: (id: string, signal?: AbortSignal) =>
+    details: (id: string, signal?: AbortSignal) =>
       request<{ model: CatalogResponse['items'][number]; aggregates: BenchmarkAggregate[] }>(
         `/api/v1/catalog/models/${encodeURIComponent(id)}`,
         { signal },
       ),
+    model: (id: string, signal?: AbortSignal) => api.catalog.details(id, signal),
   },
   deployments: {
     list: async (signal?: AbortSignal) => {
@@ -488,7 +489,7 @@ export const api = {
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
-    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(
           `/api/v1/deployments/${encodeURIComponent(id)}`,
@@ -496,10 +497,12 @@ export const api = {
           NO_REQUEST_TIMEOUT,
         )
       }
-      const body = action === 'start' && nodeIds?.length ? JSON.stringify({ node_ids: nodeIds }) : undefined
+      const payload = action === 'start' && additionalNodeIds?.length
+        ? { additional_node_ids: additionalNodeIds }
+        : action === 'start' && nodeIds?.length ? { node_ids: nodeIds } : undefined
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
-        body,
+        body: payload ? JSON.stringify(payload) : undefined,
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
@@ -764,6 +767,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
+    finishDownload: (nodeId: string, modelId: string, revision?: string) => request<StorageTransferResult>(
+      `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}/download`,
+      {
+        method: 'POST',
+        body: JSON.stringify(revision ? { revision } : {}),
+      },
+      NO_REQUEST_TIMEOUT,
+    ),
     preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',
       body: JSON.stringify({ node_ids: nodeIds }),

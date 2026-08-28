@@ -37,10 +37,12 @@ from cluster import (
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import (
-    DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VirtualNAS,
+    cached_download_bytes,
+    download_required_free_bytes,
+    partial_download_size_bytes,
     validate_model_id,
     validate_revision,
 )
@@ -647,6 +649,8 @@ class Manager:
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
+        self._host_port_reservation_lock = asyncio.Lock()
+        self._host_port_reservations: set[int] = set()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -1687,6 +1691,94 @@ class Manager:
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
+    async def queue_virtual_nas_download(
+        self, model_id: str, node_id: str, revision: str | None = None,
+    ) -> dict:
+        """Queue a resumable Hub download for an existing partial cache."""
+        model_id = validate_model_id(model_id)
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("node_id must not be empty")
+        requested_revision = validate_revision(revision) if revision is not None else None
+        recovered_resolution = None
+        if requested_revision is None:
+            previous_downloads = sorted(
+                (
+                    job for job in self.virtual_nas.list_transfers()["items"]
+                    if job.get("kind") == "download"
+                    and job.get("model_id") == model_id
+                    and job.get("target_node_id") == node_id
+                    and job.get("status") in {"failed", "canceled", "cancelled"}
+                    and (
+                        job.get("download_attempted_at") is not None
+                        or (
+                            job.get("legacy_download_attempt_tracking")
+                            and job.get("status") == "failed"
+                            and job.get("started_at") is not None
+                        )
+                    )
+                ),
+                key=lambda job: float(job.get("created_at") or 0),
+                reverse=True,
+            )
+            for job in previous_downloads:
+                try:
+                    requested_revision = validate_revision(
+                        job.get("requested_revision") or job.get("revision")
+                    )
+                    resolved_revision = str(job.get("revision") or "").strip()
+                    if not IMMUTABLE_HF_REVISION.fullmatch(resolved_revision):
+                        continue
+                    recovered_size = self._byte_count(job.get("bytes_total"))
+                    if not recovered_size:
+                        recovered_size = await self.virtual_nas.estimate_download_size(
+                            model_id, resolved_revision,
+                        )
+                    recovered_resolution = {
+                        "requested_revision": requested_revision,
+                        "resolved_revision": resolved_revision,
+                        "size_bytes": recovered_size,
+                        "resume_node_id": node_id,
+                        "download_cache_baseline_bytes": job.get(
+                            "download_cache_baseline_bytes"
+                        ),
+                    }
+                except ValueError:
+                    continue
+                break
+        requested_revision = requested_revision or "main"
+        resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
+            model_id, requested_revision,
+        )
+        preflight = await self.virtual_nas_transfer_preflight(
+            model_id, requested_revision, resolution,
+        )
+        target = next((
+            item for item in preflight["targets"] if item["node_id"] == node_id
+        ), None)
+        if target is None:
+            raise LookupError(f"storage node '{node_id}' not found")
+        if not target.get("has_partial_model_cache"):
+            raise LookupError("partial model cache not found on the selected node")
+        if not target.get("download_eligible"):
+            raise RuntimeError(
+                str(target.get("download_reason") or "node is not eligible for download")
+            )
+        result = await self.virtual_nas.queue_download_and_transfer(
+            model_id,
+            preflight["resolved_revision"],
+            node_id,
+            [],
+            preflight["download"]["size_bytes"],
+            requested_revision=requested_revision,
+            require_partial_cache=True,
+            download_cache_baseline_bytes=resolution.get(
+                "download_cache_baseline_bytes"
+            ),
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
         resolved_download: dict | None = None,
@@ -1765,10 +1857,6 @@ class Manager:
             source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if source else None
         )
-        download_required_free = (
-            download_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
-            if download_size else None
-        )
         transfer_after_download_required_free = (
             download_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if download_size else None
@@ -1784,6 +1872,20 @@ class Manager:
             # Generic node-disk telemetry is display-only and must never make
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
+            cached_bytes = partial_download_size_bytes(existing)
+            if (
+                resolved_download
+                and resolved_download.get("resume_node_id") == node_id
+                and resolved_download.get("download_cache_baseline_bytes") is not None
+            ):
+                cached_bytes = cached_download_bytes(
+                    existing,
+                    resolved_download.get("download_cache_baseline_bytes"),
+                )
+            node_download_required_free = (
+                download_required_free_bytes(download_size, cached_bytes)
+                if download_size else None
+            )
             active = active_jobs.get(node_id)
             conflicting = conflicting_jobs.get(node_id)
             conflict_reason = (
@@ -1840,7 +1942,7 @@ class Manager:
             elif download_error:
                 download_eligible = False
                 download_reason = download_error
-            elif download_required_free is None:
+            elif node_download_required_free is None:
                 download_eligible = False
                 download_reason = "Hugging Face download size is unavailable"
             elif not node.get("online"):
@@ -1858,7 +1960,7 @@ class Manager:
             elif free_bytes is None:
                 download_eligible = False
                 download_reason = "Free cache capacity is unavailable"
-            elif free_bytes < download_required_free:
+            elif free_bytes < node_download_required_free:
                 download_eligible = False
                 download_reason = "Not enough free cache space for the Hugging Face download"
 
@@ -1902,9 +2004,12 @@ class Manager:
                 "preparation_conflict_reason": conflict_reason,
                 "has_required_weights": has_required_weights,
                 "has_model_cache": existing is not None,
+                "has_partial_model_cache": bool(existing and (
+                    existing.get("partial") or existing.get("has_partial_download")
+                )),
                 "download_eligible": download_eligible,
                 "download_reason": download_reason,
-                "download_required_free_bytes": download_required_free,
+                "download_required_free_bytes": node_download_required_free,
                 "transfer_after_download_eligible": transfer_after_download_eligible,
                 "transfer_after_download_reason": transfer_after_download_reason,
                 "transfer_after_download_required_free_bytes": transfer_after_download_required_free,
@@ -1918,7 +2023,7 @@ class Manager:
             "sources": sources,
             "download": ({
                 "size_bytes": download_size,
-                "required_free_bytes": download_required_free,
+                "required_free_bytes": download_required_free_bytes(download_size),
             } if download_size else None),
             "download_error": download_error,
             "targets": targets,
@@ -1969,7 +2074,7 @@ class Manager:
             source = selected_sources[0]
             transfer_required = source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             download = preflight.get("download")
-            download_required = (
+            default_download_required = (
                 self._byte_count(download.get("required_free_bytes"))
                 if download else None
             )
@@ -1980,6 +2085,11 @@ class Manager:
             for node_id in missing_ids:
                 option = options[node_id]
                 free_bytes = self._byte_count(option.get("free_bytes"))
+                download_required = self._byte_count(
+                    option.get("download_required_free_bytes")
+                )
+                if download_required is None:
+                    download_required = default_download_required
                 if option.get("has_model_cache"):
                     download_ids.append(node_id)
                     if not option.get("download_eligible"):
@@ -2041,7 +2151,6 @@ class Manager:
                 "reason": download_error or "Hugging Face download size is unavailable",
             }
 
-        download_required = download["required_free_bytes"]
         transfer_required = (
             download["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
         )
@@ -2074,6 +2183,13 @@ class Manager:
             for download_id in download_ids:
                 target = options[download_id]
                 target_free = self._byte_count(target.get("free_bytes"))
+                target_download_required = self._byte_count(
+                    target.get("download_required_free_bytes")
+                )
+                if target_download_required is None:
+                    target_download_required = self._byte_count(
+                        download.get("required_free_bytes")
+                    )
                 if not target.get("download_eligible"):
                     blocked.append(
                         target.get("download_reason")
@@ -2088,7 +2204,9 @@ class Manager:
                     )
                 elif target_free is None:
                     blocked.append("Free cache capacity is unavailable")
-                elif target_free < download_required:
+                elif target_download_required is None:
+                    blocked.append("Hugging Face download size is unavailable")
+                elif target_free < target_download_required:
                     blocked.append("Not enough free cache space for the Hugging Face download")
             for target_id in transfer_ids:
                 target = options[target_id]
@@ -2451,7 +2569,9 @@ class Manager:
         ), return_exceptions=True)
         return _community_pairing_fanout(nodes, results)
 
-    async def push_community_consent(self, enabled: bool) -> dict:
+    async def push_community_consent(
+        self, enabled: bool, telemetry_cluster_id: str | None = None,
+    ) -> dict:
         """Best-effort fan-out of consent to every joined peer.
 
         Disabled nodes still own their local upload workers, so privacy state
@@ -2461,7 +2581,13 @@ class Manager:
         results = await asyncio.gather(*(
             self.node_registry.request(
                 node["id"], "PUT", "/api/agent/community-consent",
-                json_body={"enabled": enabled},
+                json_body={
+                    "enabled": enabled,
+                    **(
+                        {"telemetry_cluster_id": telemetry_cluster_id}
+                        if telemetry_cluster_id else {}
+                    ),
+                },
                 timeout=20,
                 allow_disabled=True,
             )
@@ -4545,15 +4671,19 @@ class Manager:
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        relaunch_mode: str | None = None,
     ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
-            return await self._deployment_action_locked(deployment_id, action, node_ids)
+            return await self._deployment_action_locked(
+                deployment_id, action, node_ids, relaunch_mode,
+            )
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        relaunch_mode: str | None = None,
     ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
@@ -4590,6 +4720,10 @@ class Manager:
             launch_body["recipe_id"] = deployment.get("recipe_id")
             if node_ids:
                 launch_body["node_ids"] = [str(item) for item in node_ids]
+            if relaunch_mode:
+                # Growing the node set (for example single -> replicated)
+                # changes the persisted layout, not just the node list.
+                launch_body["deployment_mode"] = relaunch_mode
             # Reuse create_deployment's complete launch preflight before the
             # first destructive action. A selectable node can still lack the
             # fabric identity a sharded runtime requires; discovering that
@@ -9375,6 +9509,34 @@ class Manager:
                             used.add(int(b["HostPort"]))
                         except Exception:
                             pass
+                try:
+                    service_port = int(
+                        _label_value(c.labels or {}, SERVICE_PORT_LABEL)
+                    )
+                except (TypeError, ValueError):
+                    service_port = 0
+                if (
+                    not 1 <= service_port <= 65535
+                    and _label_value(c.labels or {}, MODE_LABEL) == "sharded"
+                ):
+                    command = (
+                        ((c.attrs or {}).get("Config") or {}).get("Cmd") or []
+                    )
+                    if isinstance(command, str):
+                        try:
+                            command = shlex.split(command)
+                        except ValueError:
+                            command = command.split()
+                    elif not isinstance(command, (list, tuple)):
+                        command = []
+                    service_port = self._cli_option(
+                        list(command), {"--port"}, int,
+                    ) or 0
+                if 1 <= service_port <= 65535:
+                    # Sharded members use host networking, so Docker exposes
+                    # no c.ports binding. Their explicit service-port label
+                    # carries ownership until the container is removed.
+                    used.add(service_port)
             return used
 
         used = await asyncio.to_thread(_scan)
@@ -9388,12 +9550,46 @@ class Manager:
                 or deployment.get("status") in {"error", "stopped", "removed"}
             ):
                 continue
-            values = [deployment.get("api_port")]
+            members = [
+                member for member in (deployment.get("members") or [])
+                if isinstance(member, dict)
+            ]
+            # Persisted member order is the compatibility fallback. Inspect
+            # ranks individually so one corrupt entry cannot hide a later
+            # valid rank 0, and never infer primary ownership from negatives.
+            primary_member = members[0] if members else None
+            for member in members:
+                raw_rank = member.get("rank")
+                if isinstance(raw_rank, bool):
+                    continue
+                if isinstance(raw_rank, int):
+                    rank = raw_rank
+                elif (
+                    isinstance(raw_rank, str)
+                    and re.fullmatch(r"[+-]?\d+", raw_rank.strip())
+                ):
+                    try:
+                        rank = int(raw_rank)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                if rank == 0:
+                    primary_member = member
+                    break
+            # api_port belongs to the primary member. A remote-only
+            # deployment's primary port lives in that worker's host namespace
+            # and must not consume the same number on the controller.
+            values = (
+                [deployment.get("api_port")]
+                if primary_member
+                and primary_member.get("node_id") == LOCAL_NODE_ID
+                else []
+            )
             values.extend(
                 member.get("port")
-                for member in (deployment.get("members") or [])
-                if isinstance(member, dict)
-                and member.get("node_id") == LOCAL_NODE_ID
+                for member in members
+                if member.get("node_id") == LOCAL_NODE_ID
             )
             for value in values:
                 try:
@@ -9402,6 +9598,7 @@ class Manager:
                     continue
                 if 1 <= port <= 65535:
                     used.add(port)
+        used.update(getattr(self, "_host_port_reservations", set()))
         return used
 
     async def _validate_available_port(
@@ -9434,6 +9631,69 @@ class Manager:
         raise RuntimeError("No available ports in configured range")
 
     async def create_container(
+        self,
+        model: str,
+        port: int | None = None,
+        engine: str = "vllm",
+        gpu_memory_utilization: float | None = None,
+        gpu_memory_gb: float | None = None,
+        extra_args: list[str] | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        sg_tp_size: int | None = None,
+        sg_context_length: int | None = None,
+        sg_max_running_requests: int | None = None,
+        sg_mem_fraction: float | None = None,
+        sg_image: str | None = None,
+        recipe_id: str | None = None,
+        cluster_member: dict | None = None,
+        hf_token: str | None = None,
+        sparkdeck_deployment_id: str | None = None,
+    ) -> dict:
+        reserved_port = None
+        if cluster_member is not None and port is None:
+            lock = getattr(self, "_host_port_reservation_lock", None)
+            if lock is None:
+                lock = self._host_port_reservation_lock = asyncio.Lock()
+            async with lock:
+                reserved_port = await self._allocate_port()
+                reservations = getattr(self, "_host_port_reservations", None)
+                if reservations is None:
+                    reservations = self._host_port_reservations = set()
+                reservations.add(reserved_port)
+            port = reserved_port
+        create_call = self._create_container_with_port(
+            model=model, port=port, engine=engine,
+            gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_gb=gpu_memory_gb, extra_args=extra_args,
+            name=name, image=image, sg_tp_size=sg_tp_size,
+            sg_context_length=sg_context_length,
+            sg_max_running_requests=sg_max_running_requests,
+            sg_mem_fraction=sg_mem_fraction, sg_image=sg_image,
+            recipe_id=recipe_id, cluster_member=cluster_member,
+            hf_token=hf_token,
+            sparkdeck_deployment_id=sparkdeck_deployment_id,
+        )
+        if reserved_port is None:
+            return await create_call
+
+        # Docker work runs in asyncio.to_thread below and cannot be cancelled
+        # once started. Own and shield the lower-level task so cancellation of
+        # the request does not release its port while that thread is still
+        # pulling an image or creating the container.
+        creation_task = asyncio.create_task(create_call)
+
+        def release_reservation(task: asyncio.Task) -> None:
+            self._host_port_reservations.discard(reserved_port)
+            if not task.cancelled():
+                # A cancelled caller no longer awaits this owned task. Consume
+                # its eventual exception after releasing the reservation.
+                task.exception()
+
+        creation_task.add_done_callback(release_reservation)
+        return await asyncio.shield(creation_task)
+
+    async def _create_container_with_port(
         self,
         model: str,
         port: int | None = None,
@@ -9555,12 +9815,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
@@ -9708,12 +9963,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),

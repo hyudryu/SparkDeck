@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from manager import DEFAULT_SETTINGS, Manager
 from sparkdeck.virtual_nas import (
+    DOWNLOAD_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VirtualNAS,
     validate_model_id,
@@ -220,6 +221,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
+            (complete / "blobs" / "next.incomplete").write_bytes(b"partial")
+            (complete / "snapshots" / "revision-2").mkdir()
             (complete / "refs").mkdir()
             (complete / "refs" / "main").write_text("revision-1")
             (complete / "refs" / "stale").write_text("missing-revision")
@@ -237,6 +240,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(models[0]["revisions"], ["main", "revision-1"])
             self.assertEqual(models[0]["revision_refs"], {"main": "revision-1"})
             self.assertFalse(models[0]["partial"])
+            self.assertTrue(models[0]["has_partial_download"])
+            self.assertEqual(models[0]["partial_size_bytes"], len(b"partial"))
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
@@ -561,6 +566,91 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
 
+    async def test_finish_download_never_starts_without_the_partial_cache(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+
+        with self.assertRaisesRegex(LookupError, "partial model cache no longer exists"):
+            await nas.queue_download_and_transfer(
+                "other/model", RESOLVED_REVISION, "local", [], 100,
+                requested_revision="release-1", require_partial_cache=True,
+            )
+
+        self.assertEqual(nas.jobs, [])
+
+    async def test_resume_queue_capacity_uses_attempt_baseline_credit(self):
+        expected = 100
+        cached = 25
+        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        for free_bytes, succeeds in ((required, True), (required - 1, False)):
+            with self.subTest(free_bytes=free_bytes), tempfile.TemporaryDirectory() as directory:
+                nas = VirtualNAS(
+                    Path(directory), lambda: Path(directory) / "hub",
+                    FakeRegistry(), lambda: True,
+                )
+                nas.start = Mock()
+                nas._node_storage = AsyncMock(return_value={
+                    "models": [{
+                        "model_id": "org/model", "size_bytes": 125,
+                        "partial": False, "has_partial_download": True,
+                        "partial_size_bytes": cached,
+                    }],
+                    "free_size": free_bytes,
+                })
+                if succeeds:
+                    result = await nas.queue_download_and_transfer(
+                        "org/model", RESOLVED_REVISION, "local", [], expected,
+                        requested_revision="release-1", require_partial_cache=True,
+                        download_cache_baseline_bytes=100,
+                    )
+                    self.assertEqual(len(result["jobs"]), 1)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
+                        await nas.queue_download_and_transfer(
+                            "org/model", RESOLVED_REVISION, "local", [], expected,
+                            requested_revision="release-1", require_partial_cache=True,
+                            download_cache_baseline_bytes=100,
+                        )
+                    self.assertEqual(nas.jobs, [])
+
+    async def test_agent_resume_capacity_uses_attempt_baseline_credit(self):
+        expected = 100
+        cached = 25
+        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        for free_bytes, succeeds in ((required, True), (required - 1, False)):
+            with self.subTest(free_bytes=free_bytes), tempfile.TemporaryDirectory() as directory:
+                nas = VirtualNAS(
+                    Path(directory), lambda: Path(directory) / "hub",
+                    FakeRegistry(), lambda: True,
+                )
+                nas.inventory = Mock(return_value=[{
+                    "model_id": "org/model", "size_bytes": 125,
+                    "partial": False, "has_partial_download": True,
+                    "partial_size_bytes": cached, "revisions": [],
+                }])
+                nas.free_bytes = Mock(return_value=free_bytes)
+                nas.estimate_download_size = AsyncMock(return_value=expected)
+                nas.download_model = Mock(return_value={
+                    "ok": True, "model_id": "org/model", "size_bytes": expected,
+                })
+                if succeeds:
+                    await nas.download_model_checked(
+                        "org/model", RESOLVED_REVISION,
+                        requested_revision="release-1",
+                        download_cache_baseline_bytes=100,
+                    )
+                    nas.download_model.assert_called_once()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
+                        await nas.download_model_checked(
+                            "org/model", RESOLVED_REVISION,
+                            requested_revision="release-1",
+                            download_cache_baseline_bytes=100,
+                        )
+                    nas.download_model.assert_not_called()
+
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_requested_ref_cannot_seed_pinned_workflow(self):
@@ -610,6 +700,136 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["targets"][0]["download_eligible"])
         self.assertIn("updated", result["targets"][0]["download_reason"])
+
+    async def test_manager_queues_resumable_download_for_partial_cache(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {}
+        manager.node_registry = FakeRegistry()
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [
+            {
+                "id": "failed-download", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-1", "revision": RESOLVED_REVISION,
+                "status": "failed", "started_at": 4,
+                "download_attempted_at": 4.5,
+                "legacy_download_attempt_tracking": False, "created_at": 5,
+                "bytes_total": 20, "download_cache_baseline_bytes": 3,
+            },
+            {
+                "id": "failed-before-attempt", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-2", "revision": "b" * 40,
+                "status": "failed", "started_at": 6,
+                "download_attempted_at": None,
+                "legacy_download_attempt_tracking": False, "created_at": 7,
+            },
+            {
+                "id": "canceled-before-start", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-3", "revision": "c" * 40,
+                "status": "canceled", "started_at": None,
+                "download_attempted_at": None,
+                "legacy_download_attempt_tracking": False, "created_at": 8,
+            },
+        ]}
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "release-1",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a",
+                "has_partial_model_cache": True,
+                "download_eligible": True,
+            }],
+        })
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["download-1"],
+            "jobs": [{
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "worker-a",
+                "status": "queued", "bytes_total": 20, "bytes_transferred": 0,
+                "created_at": 1,
+            }],
+        })
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "worker-a",
+        )
+
+        self.assertEqual(result["job_ids"], ["download-1"])
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "worker-a", [], 20,
+            requested_revision="release-1", require_partial_cache=True,
+            download_cache_baseline_bytes=3,
+        )
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+        manager.virtual_nas_transfer_preflight.assert_awaited_once_with(
+            "org/model", "release-1", {
+                "requested_revision": "release-1",
+                "resolved_revision": RESOLVED_REVISION,
+                "size_bytes": 20,
+                "resume_node_id": "worker-a",
+                "download_cache_baseline_bytes": 3,
+            },
+        )
+
+        manager.virtual_nas_transfer_preflight.return_value = {
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a",
+                "has_partial_model_cache": False,
+                "download_eligible": False,
+            }],
+        }
+        with self.assertRaisesRegex(LookupError, "partial model cache not found"):
+            await manager.queue_virtual_nas_download(
+                "org/model", "worker-a",
+            )
+        self.assertEqual(
+            manager.virtual_nas.queue_download_and_transfer.await_count, 1,
+        )
+
+    async def test_resume_preflight_credits_only_bytes_after_attempt_baseline(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        cached = 25
+        expected = 100
+        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker", "online": True,
+            "cache_free_size": required,
+            "virtual_nas_download_capable": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 125,
+                "partial": False, "has_partial_download": True,
+                "partial_size_bytes": cached,
+                "revisions": ["old-revision"],
+            }],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        resolution = {
+            "requested_revision": "release-1",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": expected,
+            "resume_node_id": "worker-a",
+            "download_cache_baseline_bytes": 100,
+        }
+
+        result = await manager.virtual_nas_transfer_preflight(
+            "org/model", "release-1", resolution,
+        )
+        target = result["targets"][0]
+
+        self.assertTrue(target["has_partial_model_cache"])
+        self.assertTrue(target["download_eligible"])
+        self.assertEqual(target["download_required_free_bytes"], required)
 
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
         manager = Manager.__new__(Manager)

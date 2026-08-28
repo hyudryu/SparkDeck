@@ -171,7 +171,6 @@ Describe "SparkDeck Windows launcher" {
         }
 
         It "checks updater process ownership without recursively probing API health" {
-            Mock Get-SparkDeckPaths { [pscustomobject]@{ Root = "C:\SparkDeck" } }
             Mock Get-SparkDeckPidRecord { [pscustomobject]@{ pid = 1234 } }
             Mock Test-SparkDeckProcessIdentity { $true }
             Mock Test-SparkDeckHealth { throw "process-status must not probe the API" }

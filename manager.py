@@ -4671,15 +4671,19 @@ class Manager:
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        relaunch_mode: str | None = None,
     ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
-            return await self._deployment_action_locked(deployment_id, action, node_ids)
+            return await self._deployment_action_locked(
+                deployment_id, action, node_ids, relaunch_mode,
+            )
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        relaunch_mode: str | None = None,
     ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
@@ -4716,6 +4720,10 @@ class Manager:
             launch_body["recipe_id"] = deployment.get("recipe_id")
             if node_ids:
                 launch_body["node_ids"] = [str(item) for item in node_ids]
+            if relaunch_mode:
+                # Growing the node set (for example single -> replicated)
+                # changes the persisted layout, not just the node list.
+                launch_body["deployment_mode"] = relaunch_mode
             # Reuse create_deployment's complete launch preflight before the
             # first destructive action. A selectable node can still lack the
             # fabric identity a sharded runtime requires; discovering that

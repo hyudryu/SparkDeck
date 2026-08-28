@@ -18,7 +18,7 @@ from cluster import (
     NodeRegistry,
     normalize_agent_url,
 )
-from manager import Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
+from manager import DEPLOYMENT_LABEL, Manager, PERSISTED_DEPLOYMENT_ARGS_ERROR
 from sparkdeck.onboarding import resolve_agent_connection
 
 
@@ -2733,6 +2733,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 return replacement
 
             instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
             instance.create_deployment = create_deployment
 
             result = await instance.deployment_action("deployment-old", "start")
@@ -2816,6 +2817,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("launch_settings_error", persisted[0])
 
             instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
 
             async def create_deployment(body):
                 replacement = {
@@ -2835,6 +2837,202 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 [deployment["id"] for deployment in instance.deployments],
                 ["deployment-new"],
             )
+
+    async def test_relaunch_preflight_preserves_ranks_when_worker_has_no_fabric_ip(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            old = {
+                "id": "deployment-old", "name": "Sharded model",
+                "model": "example/Model", "engine": "vllm",
+                "mode": "sharded", "node_ids": ["local", "remote-1"],
+                "status": "stopped", "settings_dirty": False,
+                "members": [
+                    {"node_id": "local", "container_name": "old-r0", "rank": 0},
+                    {"node_id": "remote-1", "container_name": "old-r1", "rank": 1},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Sharded model",
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": ["--tensor-parallel-size", "2"],
+                    "port": 8000,
+                },
+            }
+            instance.deployments = [old]
+            instance.cluster_nodes = mock.AsyncMock(return_value=[
+                {
+                    "id": "local", "name": "Controller", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.1",
+                    "fabric_interface": "cx7-local", "interfaces": [],
+                },
+                {
+                    "id": "remote-1", "name": "Worker without fabric",
+                    "online": True, "docker_ready": True,
+                    "fabric_ip": None, "fabric_interface": None,
+                    "interfaces": [],
+                },
+            ])
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+            instance.client = mock.Mock()
+            instance.client.containers.list.return_value = []
+
+            with self.assertRaisesRegex(
+                ValueError, "could not determine fabric IP for Worker without fabric",
+            ):
+                await instance.deployment_action(
+                    "deployment-old", "start",
+                    node_ids=["local", "remote-1"],
+                )
+
+            instance._member_action.assert_not_awaited()
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(instance.deployments, [old])
+            self.assertEqual(
+                [member["container_name"] for member in old["members"]],
+                ["old-r0", "old-r1"],
+            )
+            self.assertEqual(old["status"], "stopped")
+
+    async def test_relaunch_preflight_reuses_only_replaced_deployments_port(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "port_range_start": 8000,
+            "port_range_end": 8001,
+            "cluster_fabric_ip": None,
+            "cluster_fabric_interface": None,
+        }
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "docker_ready": True, "fabric_ip": None,
+            "fabric_interface": None, "interfaces": [],
+        }])
+
+        replaced = mock.Mock()
+        replaced.labels = {DEPLOYMENT_LABEL: "deployment-old"}
+        replaced.ports = {"8000/tcp": [{"HostPort": "8000"}]}
+        replaced.status = "exited"
+        unrelated = mock.Mock()
+        unrelated.labels = {DEPLOYMENT_LABEL: "deployment-other"}
+        unrelated.ports = {"8001/tcp": [{"HostPort": "8001"}]}
+        unrelated.status = "running"
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = [replaced, unrelated]
+        launch_body = {
+            "model": "example/Model", "engine": "vllm",
+            "deployment_mode": "single", "node_ids": ["local"],
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError, "No available ports in configured range",
+        ):
+            await instance._preflight_deployment_launch(launch_body)
+
+        plan = await instance._preflight_deployment_launch(
+            launch_body, exclude_deployment_id="deployment-old",
+        )
+
+        self.assertEqual(plan["local_port"], 8000)
+
+    async def test_relaunch_preflight_allows_fixed_port_owned_by_old_rank(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "port_range_start": 8000,
+            "port_range_end": 8000,
+            "cluster_fabric_ip": None,
+            "cluster_fabric_interface": None,
+        }
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "docker_ready": True, "fabric_ip": None,
+            "fabric_interface": None, "interfaces": [],
+        }])
+        replaced = mock.Mock()
+        replaced.labels = {DEPLOYMENT_LABEL: "deployment-old"}
+        replaced.ports = {"8000/tcp": [{"HostPort": "8000"}]}
+        replaced.status = "exited"
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = [replaced]
+        launch_body = {
+            "model": "example/Model", "engine": "vllm",
+            "deployment_mode": "single", "node_ids": ["local"],
+            "port": 8000,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "Port 8000 is already in use"):
+            await instance._preflight_deployment_launch(launch_body)
+
+        plan = await instance._preflight_deployment_launch(
+            launch_body, exclude_deployment_id="deployment-old",
+        )
+
+        self.assertEqual(plan["local_port"], 8000)
+
+    async def test_relaunch_fixed_port_collision_preserves_old_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.settings = {
+                "port_range_start": 8000,
+                "port_range_end": 8000,
+                "cluster_fabric_ip": None,
+                "cluster_fabric_interface": None,
+            }
+            old = {
+                "id": "deployment-old", "name": "Fixed port model",
+                "model": "example/Model", "engine": "vllm",
+                "mode": "single", "node_ids": ["local"],
+                "status": "stopped", "settings_dirty": True,
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": {
+                    "deployment_name": "Fixed port model",
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [], "port": 8000,
+                },
+            }
+            instance.deployments = [old]
+            instance.cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "name": "Controller", "online": True,
+                "docker_ready": True, "fabric_ip": None,
+                "fabric_interface": None, "interfaces": [],
+            }])
+            replaced = mock.Mock()
+            replaced.labels = {DEPLOYMENT_LABEL: "deployment-old"}
+            replaced.ports = {"8000/tcp": [{"HostPort": "8000"}]}
+            replaced.status = "exited"
+            unrelated = mock.Mock()
+            unrelated.labels = {DEPLOYMENT_LABEL: "deployment-other"}
+            unrelated.ports = {"8000/tcp": [{"HostPort": "8000"}]}
+            unrelated.status = "running"
+            instance.client = mock.Mock()
+            instance.client.containers.list.return_value = [replaced, unrelated]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+
+            with self.assertRaisesRegex(
+                RuntimeError, "Port 8000 is already in use",
+            ):
+                await instance.deployment_action("deployment-old", "start")
+
+            instance._member_action.assert_not_awaited()
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(instance.deployments, [old])
+            self.assertEqual(old["members"][0]["container_name"], "old-r0")
 
     def test_explicit_args_repair_preserves_unrelated_deployment_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

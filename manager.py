@@ -3793,7 +3793,10 @@ class Manager:
         )
         return bool((result or {}).get("ready"))
 
-    async def create_deployment(self, body: dict) -> dict:
+    async def _preflight_deployment_launch(
+        self, body: dict, *, exclude_deployment_id: str | None = None,
+    ) -> dict:
+        """Validate and normalize a launch without mutating runtime state."""
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
@@ -3871,10 +3874,19 @@ class Manager:
                 vllm_parallel_layout = (1, len(node_ids))
         requested_port = body.get("port")
         local_port = requested_port
-        if LOCAL_NODE_ID in node_ids and local_port is None:
+        if LOCAL_NODE_ID in node_ids and local_port is not None:
+            local_port = await self._validate_available_port(
+                local_port, exclude_deployment_id=exclude_deployment_id,
+            )
+        elif LOCAL_NODE_ID in node_ids:
             # A controller port is meaningful only for the controller member.
             # Remote agents allocate against their own Docker/host namespace.
-            local_port = await self._allocate_port()
+            if exclude_deployment_id:
+                local_port = await self._allocate_port(
+                    exclude_deployment_id=exclude_deployment_id,
+                )
+            else:
+                local_port = await self._allocate_port()
         master_ip, _ = self._inferred_fabric(
             available[LOCAL_NODE_ID],
             self.settings.get("cluster_fabric_ip"),
@@ -3892,6 +3904,34 @@ class Manager:
                 raise ValueError(
                     f"could not determine fabric IP for {node.get('name', node_id)}"
                 )
+
+        return {
+            "body": body,
+            "engine": engine,
+            "mode": mode,
+            "node_ids": node_ids,
+            "available": available,
+            "model": model,
+            "vllm_parallel_layout": vllm_parallel_layout,
+            "requested_port": requested_port,
+            "local_port": local_port,
+            "master_ip": master_ip,
+            "fabrics": fabrics,
+        }
+
+    async def create_deployment(self, body: dict) -> dict:
+        plan = await self._preflight_deployment_launch(body)
+        body = plan["body"]
+        engine = plan["engine"]
+        mode = plan["mode"]
+        node_ids = plan["node_ids"]
+        available = plan["available"]
+        model = plan["model"]
+        vllm_parallel_layout = plan["vllm_parallel_layout"]
+        requested_port = plan["requested_port"]
+        local_port = plan["local_port"]
+        master_ip = plan["master_ip"]
+        fabrics = plan["fabrics"]
 
         # Persist only after every preflight check succeeds. A failed launch
         # remains visible for diagnosis, but invalid input does not leave a
@@ -4169,6 +4209,19 @@ class Manager:
         # relaunching the deployment through the fully validated path.
         relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
         if relaunch:
+            launch_body = dict(deployment.get("launch_settings") or {})
+            launch_body["recipe_id"] = deployment.get("recipe_id")
+            if node_ids:
+                launch_body["node_ids"] = [str(item) for item in node_ids]
+            # Reuse create_deployment's complete launch preflight before the
+            # first destructive action. A selectable node can still lack the
+            # fabric identity a sharded runtime requires; discovering that
+            # after removing the old ranks would turn a rejected relocation
+            # into an outage.
+            await self._preflight_deployment_launch(
+                launch_body, exclude_deployment_id=deployment_id,
+            )
+
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
             # settings so every node/rank receives a coherent replacement.
@@ -4189,10 +4242,6 @@ class Manager:
             deployment["members"] = []
             deployment["error"] = None
             self._save_deployments()
-            launch_body = dict(deployment.get("launch_settings") or {})
-            launch_body["recipe_id"] = deployment.get("recipe_id")
-            if node_ids:
-                launch_body["node_ids"] = [str(item) for item in node_ids]
             try:
                 replacement = await self.create_deployment(launch_body)
             except Exception:
@@ -8682,10 +8731,18 @@ class Manager:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
         return self._parse_phase(logs)
 
-    async def _allocate_port(self) -> int:
+    async def _used_host_ports(
+        self, *, exclude_deployment_id: str | None = None,
+    ) -> set[int]:
         def _scan():
             used = set()
             for c in self.client.containers.list(all=True):
+                if (
+                    exclude_deployment_id
+                    and _label_value(c.labels or {}, DEPLOYMENT_LABEL)
+                    == exclude_deployment_id
+                ):
+                    continue
                 for _, bindings in (c.ports or {}).items():
                     for b in (bindings or []):
                         try:
@@ -8693,7 +8750,33 @@ class Manager:
                         except Exception:
                             pass
             return used
-        used = await asyncio.to_thread(_scan)
+
+        return await asyncio.to_thread(_scan)
+
+    async def _validate_available_port(
+        self, port: Any, *, exclude_deployment_id: str | None = None,
+    ) -> int:
+        if isinstance(port, bool):
+            raise ValueError("port must be an integer between 1 and 65535")
+        try:
+            port_number = int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("port must be an integer between 1 and 65535") from exc
+        if not 1 <= port_number <= 65535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        used = await self._used_host_ports(
+            exclude_deployment_id=exclude_deployment_id,
+        )
+        if port_number in used:
+            raise RuntimeError(f"Port {port_number} is already in use")
+        return port_number
+
+    async def _allocate_port(
+        self, *, exclude_deployment_id: str | None = None,
+    ) -> int:
+        used = await self._used_host_ports(
+            exclude_deployment_id=exclude_deployment_id,
+        )
         for p in range(self.settings["port_range_start"], self.settings["port_range_end"] + 1):
             if p not in used:
                 return p

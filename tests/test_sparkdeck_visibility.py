@@ -76,6 +76,7 @@ class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
             },
         }]
         manager._member_action = AsyncMock(return_value={"ok": True})
+        manager._preflight_deployment_launch = AsyncMock(return_value={})
         manager.create_deployment = AsyncMock(return_value={
             "id": "cluster-2", "members": [], "node_ids": ["a", "b"], "api_port": 8000,
         })

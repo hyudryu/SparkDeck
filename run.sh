@@ -22,12 +22,8 @@ elif find frontend \
 fi
 
 if [ "$frontend_needs_build" -eq 1 ]; then
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "SparkDeck's web app needs Node.js and npm for the first build." >&2
-    exit 1
-  fi
-  npm --prefix frontend ci --no-audit --no-fund
-  npm --prefix frontend run build
+  python -m sparkdeck.node_toolchain --prefix frontend ci --no-audit --no-fund
+  python -m sparkdeck.node_toolchain --prefix frontend run build
 fi
 
 exec python server.py

@@ -1207,16 +1207,23 @@ class SparkDeckService:
 
         Llama server always runs on the controller, so the controller is the
         required first home; the remaining nodes only receive a copy of the
-        artifact for later distribution.
+        artifact for later distribution. The seed is validated here so the
+        controller-only fast path cannot silently ignore a seed that names
+        a node outside the selection.
         """
+        requested_seed = _optional_string(body.get("download_node_id"))
         if requested_node_ids is None:
-            return None, None
+            if requested_seed is not None and requested_seed != LOCAL_NODE_ID:
+                raise ValueError("download_node_id must be one of the selected nodes")
+            return None, requested_seed
         if requested_node_ids[0] != LOCAL_NODE_ID:
             raise ValueError(
                 "llama.cpp deployments run on the controller; "
                 "the first selected node must be the controller"
             )
-        return list(requested_node_ids), _optional_string(body.get("download_node_id"))
+        if requested_seed is not None and requested_seed not in requested_node_ids:
+            raise ValueError("download_node_id must be one of the selected nodes")
+        return list(requested_node_ids), requested_seed
 
     async def _prepare_public_gguf_artifact(
         self, repository: str, artifact: str, revision: str,

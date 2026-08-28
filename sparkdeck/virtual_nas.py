@@ -44,10 +44,16 @@ TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 
 
-def partial_download_size_bytes(model: dict[str, Any] | None) -> int:
+def partial_download_size_bytes(
+    model: dict[str, Any] | None, revision: str | None = None,
+) -> int:
     """Return bytes already reusable by a resumable Hub download."""
     if not model or not (model.get("partial") or model.get("has_partial_download")):
         return 0
+    if revision is not None:
+        return _nonnegative_int(
+            (model.get("partial_revision_size_bytes") or {}).get(revision)
+        )
     value = model.get("size_bytes") if model.get("partial") else model.get("partial_size_bytes")
     return _nonnegative_int(value)
 
@@ -61,10 +67,11 @@ def download_required_free_bytes(expected_bytes: int, cached_bytes: int = 0) -> 
 
 def cached_download_bytes(
     model: dict[str, Any] | None, baseline_bytes: int | None = None,
+    revision: str | None = None,
 ) -> int:
     """Return target-download bytes added since its immutable attempt began."""
     if baseline_bytes is None:
-        return partial_download_size_bytes(model)
+        return partial_download_size_bytes(model, revision)
     current = _nonnegative_int((model or {}).get("size_bytes"))
     return max(0, current - _nonnegative_int(baseline_bytes))
 
@@ -507,7 +514,9 @@ class VirtualNAS:
             free_bytes = await asyncio.to_thread(self.free_bytes)
             required = download_required_free_bytes(
                 expected_bytes,
-                cached_download_bytes(cached_model, download_cache_baseline_bytes),
+                cached_download_bytes(
+                    cached_model, download_cache_baseline_bytes, revision,
+                ),
             )
             if free_bytes is None:
                 raise RuntimeError("download node did not report free cache capacity")
@@ -641,9 +650,14 @@ class VirtualNAS:
                         incomplete_size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
-            incomplete_snapshot_bytes = _incomplete_snapshot_reusable_bytes(
+            incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions),
             )
+            unassigned_incomplete_bytes = incomplete_size_bytes
+            if len(incomplete_revision_bytes) == 1:
+                only_revision = next(iter(incomplete_revision_bytes))
+                incomplete_revision_bytes[only_revision] += incomplete_size_bytes
+                unassigned_incomplete_bytes = 0
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
@@ -669,9 +683,11 @@ class VirtualNAS:
                 ),
                 "partial_size_bytes": (
                     size_bytes if partial else (
-                        incomplete_size_bytes + incomplete_snapshot_bytes
+                        unassigned_incomplete_bytes
+                        + sum(incomplete_revision_bytes.values())
                     )
                 ),
+                "partial_revision_size_bytes": incomplete_revision_bytes,
                 "revisions": sorted(revisions),
                 "revision_refs": revision_refs,
                 "last_modified": (
@@ -1058,7 +1074,7 @@ class VirtualNAS:
                 raise LookupError(
                     f"partial model cache no longer exists on node '{node_id}'"
                 )
-            fallback_cached = partial_download_size_bytes(cached_model)
+            fallback_cached = partial_download_size_bytes(cached_model, revision)
             baseline = (
                 explicit_baseline
                 if node_id == download_node_id and explicit_baseline is not None
@@ -1070,7 +1086,9 @@ class VirtualNAS:
             )
             download_baselines[node_id] = baseline
             download_required = download_required_free_bytes(
-                expected_bytes, cached_download_bytes(cached_model, baseline),
+                expected_bytes, cached_download_bytes(
+                    cached_model, baseline, revision,
+                ),
             )
             download_free = _optional_nonnegative_int(download_storage.get("free_size"))
             if download_free is None:
@@ -1371,7 +1389,8 @@ class VirtualNAS:
                     free_bytes = _optional_nonnegative_int(storage.get("free_size"))
                     required = download_required_free_bytes(
                         current_size, cached_download_bytes(
-                            cached_model, job.get("download_cache_baseline_bytes"),
+                        cached_model, job.get("download_cache_baseline_bytes"),
+                        job.get("revision") or "main",
                         ),
                     )
                     if free_bytes is None:
@@ -1690,7 +1709,7 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
 
 def _incomplete_snapshot_reusable_bytes(
     repository: Path, complete_revisions: set[str],
-) -> int:
+) -> dict[str, int]:
     """Count unique completed blobs referenced only by incomplete snapshots."""
     try:
         snapshots = repository / "snapshots"
@@ -1699,7 +1718,7 @@ def _incomplete_snapshot_reusable_bytes(
             not snapshots.is_dir() or snapshots.is_symlink()
             or not blobs.is_dir() or blobs.is_symlink()
         ):
-            return 0
+            return {}
         blob_root = blobs.resolve(strict=True)
         complete_blobs: set[Path] = set()
         for revision in complete_revisions:
@@ -1712,13 +1731,14 @@ def _incomplete_snapshot_reusable_bytes(
                 resolved = item.resolve(strict=True)
                 if resolved.is_relative_to(blob_root) and resolved.is_file():
                     complete_blobs.add(resolved)
-        reusable: set[Path] = set()
+        reusable_by_revision: dict[str, set[Path]] = {}
         for snapshot in snapshots.iterdir():
             if (
                 snapshot.name in complete_revisions
                 or not snapshot.is_dir() or snapshot.is_symlink()
             ):
                 continue
+            reusable = reusable_by_revision.setdefault(snapshot.name, set())
             for item in snapshot.rglob("*"):
                 if item.name.endswith((".incomplete", ".lock")):
                     continue
@@ -1734,9 +1754,14 @@ def _incomplete_snapshot_reusable_bytes(
                         reusable.add(resolved)
                 elif item.is_file():
                     reusable.add(item)
-        return sum(item.stat().st_size for item in reusable)
+        reusable_sizes: dict[str, int] = {}
+        for revision, reusable in reusable_by_revision.items():
+            size_bytes = sum(item.stat().st_size for item in reusable)
+            if size_bytes > 0:
+                reusable_sizes[revision] = size_bytes
+        return reusable_sizes
     except (OSError, RuntimeError, ValueError):
-        return 0
+        return {}
 
 
 def _is_complete_snapshot(snapshot: Path, blob_root: Path) -> bool:

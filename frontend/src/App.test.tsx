@@ -309,6 +309,71 @@ describe('model discovery', () => {
     })
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v1/settings'))).toBe(true)
   })
+
+  it('turns an aggregate-fit catalog deployment into a valid sharded layout', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({
+          id: 'glm-sharded', alias: 'GLM-5.3-Flash', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'zai-org/GLM-5.3-Flash' }, status: 'starting', settings: {},
+          node_ids: ['local', 'node-2', 'node-3', 'node-4'],
+          selected_nodes: [
+            { id: 'local', name: 'Controller' }, { id: 'node-2', name: 'Worker Two' },
+            { id: 'node-3', name: 'Worker Three' }, { id: 'node-4', name: 'Worker Four' },
+          ],
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/settings') ? { default_runtime: 'vllm', default_context_length: 8192 }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+          { id: 'node-2', name: 'Worker Two', online: true, docker_ready: true, selectable: true },
+          { id: 'node-3', name: 'Worker Three', online: true, docker_ready: true, selectable: true },
+          { id: 'node-4', name: 'Worker Four', online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/onboarding') ? { role: 'controller', node: { id: 'controller', name: 'Controller' } }
+          : path.includes('/api/v1/model-cache') ? { nodes: [] }
+            : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter initialEntries={['/models?model=zai-org/GLM-5.3-Flash&layout=sharded']}><ModelsPage /></MemoryRouter>)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add a model server' })
+    await waitFor(() => expect(within(dialog).getAllByRole('combobox')).toHaveLength(2))
+    const deploymentLayout = within(dialog).getAllByRole('combobox')[1]
+    await waitFor(() => expect(deploymentLayout).toHaveValue('sharded'))
+    for (const node of ['Controller', 'Worker Two', 'Worker Three', 'Worker Four']) {
+      expect(within(dialog).getByRole('checkbox', { name: new RegExp(node) })).toBeChecked()
+    }
+    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeDisabled()
+    const tensorParallel = within(dialog).getByRole('spinbutton', { name: /^Tensor parallel size/ })
+    expect(tensorParallel).toHaveValue(4)
+    expect(tensorParallel).toHaveAttribute('readonly')
+
+    await user.selectOptions(deploymentLayout, 'replicated')
+    expect(tensorParallel).toHaveValue(1)
+    expect(tensorParallel).not.toHaveAttribute('readonly')
+    await user.selectOptions(deploymentLayout, 'sharded')
+    expect(tensorParallel).toHaveValue(4)
+
+    await user.click(within(dialog).getByRole('button', { name: 'Add to 4 nodes' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'zai-org/GLM-5.3-Flash',
+          alias: 'GLM-5.3-Flash',
+          runtime: 'vllm',
+          kind: 'managed',
+          settings: { context_length: 8192, tensor_parallel_size: 4, extra_args: [] },
+          node_ids: ['local', 'node-2', 'node-3', 'node-4'],
+          deployment_mode: 'sharded',
+        }),
+      }),
+    ))
+  })
 })
 
 describe('model deployments', () => {

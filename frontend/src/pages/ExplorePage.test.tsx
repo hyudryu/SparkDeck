@@ -94,12 +94,15 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('306 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
     expect(screen.getByText('400 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
     expect(screen.getByText('600 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
-    expect(screen.getByText('512 GB aggregate memory across 4 measured nodes')).toBeInTheDocument()
+    expect(screen.getByText('512 GB aggregate sharded memory across 4 measured nodes')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Expand zai-org/GLM-5.3-Flash' }))
     const fitDetails = screen.getByText(/Fit assumes a sharded deployment/)
     expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
     expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
+    expect(screen.getByRole('link', { name: 'Deploy zai-org/GLM-5.3-Flash' })).toHaveAttribute(
+      'href', '/models?model=zai-org%2FGLM-5.3-Flash&layout=sharded',
+    )
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
@@ -115,6 +118,36 @@ describe('ExplorePage model rows', () => {
     await user.click(screen.getByRole('checkbox', { name: /Only with community data/ }))
     expect(screen.getByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Expand org/tight' })).not.toBeInTheDocument()
+  })
+
+  it('does not pool worker memory when the controller cannot join a sharded deployment', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/worker-pool-only', name: 'worker-pool-only', weight_size_bytes: 200 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: false, selectable: false, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'node-2', name: 'Worker Two', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'node-3', name: 'Worker Three', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    const expand = await screen.findByRole('button', { name: 'Expand org/worker-pool-only' })
+    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
+    await user.click(expand)
+    expect(screen.getByRole('link', { name: 'Deploy org/worker-pool-only' })).toHaveAttribute(
+      'href', '/models?model=org%2Fworker-pool-only',
+    )
+
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+    expect(screen.queryByRole('button', { name: 'Expand org/worker-pool-only' })).not.toBeInTheDocument()
   })
 
   it('lists aggregated benchmark models in the community tab without claiming live tracking', async () => {

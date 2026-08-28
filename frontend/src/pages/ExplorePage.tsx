@@ -74,7 +74,7 @@ function aggregateQuantization(item: BenchmarkAggregate) {
 }
 
 function communityVariantKey(item: BenchmarkAggregate) {
-  return `${item.model_id}::${aggregateQuantization(item)}`
+  return `${item.model_id}::${aggregateQuantization(item)}::${item.context_window_size}`
 }
 
 function ModelRow({
@@ -107,7 +107,7 @@ function ModelRow({
   )
   const quantizations = details.data?.model?.quantizations ?? model.quantizations ?? []
   const rowLabel = communityMode && model.community
-    ? `${model.id} (${aggregateQuantization(model.community)})`
+    ? `${model.id} (${aggregateQuantization(model.community)}, ${formatNumber(model.community.context_window_size)} tokens)`
     : model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
@@ -121,7 +121,7 @@ function ModelRow({
       aria-label={`${expanded ? 'Collapse' : 'Expand'} ${rowLabel}`}
       onClick={onToggle}
     >
-      <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)}` : ''}</small></span>
+      <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.context_window_size)}-token context` : ''}</small></span>
       <span className="catalog-model-stat"><small>Parameters</small><strong>{formatParameters(parameterCount)}</strong></span>
       <span className={`catalog-model-stat catalog-model-size fit-${fitTone(weightSize, capacity)}`}><small>Weights</small><strong>{weightSize ? formatBytes(weightSize) : '—'}</strong><em>{fitLabel(fitTone(weightSize, capacity))}</em></span>
       {communityMode

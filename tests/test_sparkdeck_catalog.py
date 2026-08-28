@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -138,6 +139,44 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 0)
         await http.aclose()
 
+    async def test_details_deduplicates_same_key_without_serializing_other_models(self):
+        calls: list[str] = []
+        active = 0
+        maximum_active = 0
+        different_models_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, maximum_active
+            calls.append(request.url.path)
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if len(set(calls)) >= 2:
+                different_models_started.set()
+            try:
+                await asyncio.wait_for(different_models_started.wait(), timeout=1)
+                return httpx.Response(200, json={
+                    "id": request.url.path.removeprefix("/api/models/"),
+                    "tags": ["safetensors"], "siblings": [],
+                })
+            finally:
+                active -= 1
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http)
+
+        first, duplicate, other = await asyncio.gather(
+            catalog.details("org/first"),
+            catalog.details("org/first"),
+            catalog.details("org/second"),
+        )
+
+        self.assertEqual(first, duplicate)
+        self.assertEqual(other["id"], "org/second")
+        self.assertEqual(calls.count("/api/models/org/first"), 1)
+        self.assertEqual(calls.count("/api/models/org/second"), 1)
+        self.assertEqual(maximum_active, 2)
+        await http.aclose()
+
     async def test_details_uses_tree_sizes_and_excludes_auxiliary_ggufs(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/tree/main"):
@@ -161,6 +200,44 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             "files": [{"filename": "model-Q4_0.gguf", "size_bytes": 16}],
             "weight_size_bytes": 16,
         }])
+        await http.aclose()
+
+    async def test_details_paginates_entire_tree_before_summing_gguf_shards(self):
+        tree_requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                tree_requests.append(request)
+                if request.url.params.get("cursor") == "second-page":
+                    return httpx.Response(200, json=[
+                        {"path": "Q4_K_M/model-00002-of-00002-Q4_K_M.gguf", "size": 12},
+                    ])
+                return httpx.Response(200, headers={
+                    "Link": (
+                        '<https://huggingface.co/api/models/org/model-GGUF/tree/main'
+                        '?recursive=true&limit=1000&cursor=second-page>; rel="next"'
+                    ),
+                }, json=[
+                    {"path": "Q4_K_M/model-00001-of-00002-Q4_K_M.gguf", "size": 10},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [
+                    {"rfilename": "Q4_K_M/model-00001-of-00002-Q4_K_M.gguf"},
+                    {"rfilename": "Q4_K_M/model-00002-of-00002-Q4_K_M.gguf"},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        self.assertEqual(len(tree_requests), 2)
+        self.assertEqual(tree_requests[1].url.params["cursor"], "second-page")
+        self.assertEqual(item["quantizations"][0]["weight_size_bytes"], 22)
+        self.assertEqual(
+            [file["size_bytes"] for file in item["quantizations"][0]["files"]],
+            [10, 12],
+        )
         await http.aclose()
 
     async def test_details_follows_one_same_origin_repository_rename(self):

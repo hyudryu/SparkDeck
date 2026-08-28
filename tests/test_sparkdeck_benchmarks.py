@@ -137,6 +137,36 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
 
+    async def test_opted_out_request_still_contaminates_overlapping_opted_in_request(self):
+        opted_out = self.service._community_observation_start()
+        self.assertFalse(opted_out["enabled"])
+        self.assertEqual(
+            set(opted_out), {"id", "enabled", "generation", "contaminated"},
+        )
+
+        self.service.store.set_community_consent(True)
+        opted_in = self.service._community_observation_start()
+        self.assertTrue(opted_in["enabled"])
+        self.assertTrue(opted_in["contaminated"])
+        self.assertTrue(opted_out["contaminated"])
+
+        token = self.service._community_observation.set(opted_in)
+        try:
+            now = time.monotonic()
+            self.service._record_usage(
+                "dep-1", "org/model", "vllm", {}, now - 4.1,
+                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+                hardware={"hardware_class": "dgx-spark"},
+                hardware_verified=True,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(opted_in)
+            self.service._community_observation_end(opted_out)
+
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+        self.assertEqual(self.service._community_active_observations, {})
+
     def _record_passive_sample(
         self, *, model="org/model", settings=None, input_tokens=400,
         output_tokens=320, decode_seconds=4.0,
@@ -265,6 +295,37 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["generation_tokens_per_second"], 250.0)
         self.assertEqual(self.service.store.benchmark_model_detail("org/model")["points"][0]["concurrency"], 5)
         self.assertEqual(self.service.store.outbox_batch(), [])
+
+    async def test_coordinated_c1_upload_preserves_deployment_quantization(self):
+        self.service.store.add_deployment(Deployment(
+            id="dep-quant", alias="quant", runtime=RuntimeKind.SGLANG,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("RadixArk/Qwen3.8-27B", quantization="NVFP4"),
+            settings={
+                "context_length": 16_384,
+                "model_source": "public_repository",
+            },
+        ))
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        self.service._managed_hardware_snapshot = AsyncMock(return_value=(
+            {"hardware_class": "dgx-spark", "gpu_count": 1, "gpus": []}, True,
+        ))
+
+        await self.service.record_benchmark_series_point({
+            "deployment_id": "dep-quant", "concurrency": 1,
+            "request_count": 2, "prompt_tokens": 400,
+            "generation_tokens": 64, "prompt_seconds": 0.5,
+            "wall_seconds": 2,
+        })
+
+        self.assertEqual(
+            self.service.store.outbox_batch()[0]["quantization"], "NVFP4",
+        )
+        self.assertEqual(
+            self.service.store.benchmarks()[0][0]["model"]["quantization"],
+            "NVFP4",
+        )
 
     async def test_coordinated_run_groups_private_models_by_distinct_opaque_local_ids(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})

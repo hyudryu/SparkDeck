@@ -41,7 +41,10 @@ class HuggingFaceCatalog:
         self.token_provider = token_provider
         self._cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
         self._detail_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-        self._lock = asyncio.Lock()
+        # Deduplicate only identical requests. Different repositories must be
+        # able to fetch concurrently during bulk community enrichment.
+        self._search_locks: dict[tuple[str, int, str], asyncio.Lock] = {}
+        self._detail_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def search(self, query: str, limit: int = 24) -> list[dict[str, Any]]:
         query = query.strip()
@@ -53,7 +56,7 @@ class HuggingFaceCatalog:
         cached = self._cache.get(key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
-        async with self._lock:
+        async with self._search_locks.setdefault(key, asyncio.Lock()):
             cached = self._cache.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
                 return cached[1]
@@ -97,7 +100,7 @@ class HuggingFaceCatalog:
         cached = self._detail_cache.get(key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
-        async with self._lock:
+        async with self._detail_locks.setdefault(key, asyncio.Lock()):
             cached = self._detail_cache.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
                 return cached[1]
@@ -140,33 +143,66 @@ class HuggingFaceCatalog:
             detail_repository = str(raw.get("id") or repository)
             siblings = raw.get("siblings")
             if _gguf_sizes_missing(siblings):
-                tree_response = await self.http.get(
-                    f"https://huggingface.co/api/models/{quote(detail_repository, safe='/')}/tree/main",
-                    params={"recursive": "true", "limit": 1000},
+                tree_path = (
+                    f"/api/models/{quote(detail_repository, safe='/')}/tree/main"
+                )
+                tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
+                tree_params: dict[str, Any] | None = {
+                    "recursive": "true", "limit": 1000,
+                }
+                tree: list[dict[str, Any]] = []
+                seen_pages: set[str] = set()
+                while True:
+                    tree_response = await self.http.get(
+                    tree_url,
+                    params=tree_params,
                     headers=request_headers,
                     timeout=15,
-                )
-                tree_response.raise_for_status()
-                tree = tree_response.json()
-                if isinstance(tree, list):
-                    sizes = {
-                        str(entry.get("path") or ""): _positive_int(entry.get("size"))
-                        for entry in tree if isinstance(entry, dict)
-                    }
-                    if isinstance(siblings, list):
-                        siblings = [
-                            {
-                                **sibling,
-                                **(
-                                    {"size": sizes[str(sibling.get("rfilename") or "")]}
-                                    if sizes.get(str(sibling.get("rfilename") or ""))
-                                    else {}
-                                ),
-                            }
-                            if isinstance(sibling, dict) else sibling
-                            for sibling in siblings
-                        ]
-                        raw["siblings"] = siblings
+                    )
+                    tree_response.raise_for_status()
+                    current_page = str(tree_response.url)
+                    if current_page in seen_pages:
+                        raise ValueError(
+                            "Hugging Face returned a repeated model tree page"
+                        )
+                    seen_pages.add(current_page)
+                    page = tree_response.json()
+                    if not isinstance(page, list):
+                        raise ValueError("Hugging Face returned an invalid model tree")
+                    tree.extend(entry for entry in page if isinstance(entry, dict))
+
+                    next_href = tree_response.links.get("next", {}).get("url")
+                    if not next_href:
+                        break
+                    next_url = tree_response.url.join(str(next_href))
+                    if (
+                        next_url.scheme != "https"
+                        or next_url.host != "huggingface.co"
+                        or next_url.path != tree_path
+                    ):
+                        raise ValueError(
+                            "Hugging Face returned an unsafe model tree page"
+                        )
+                    tree_url = next_url
+                    tree_params = None
+                sizes = {
+                    str(entry.get("path") or ""): _positive_int(entry.get("size"))
+                    for entry in tree
+                }
+                if isinstance(siblings, list):
+                    siblings = [
+                        {
+                            **sibling,
+                            **(
+                                {"size": sizes[str(sibling.get("rfilename") or "")]}
+                                if sizes.get(str(sibling.get("rfilename") or ""))
+                                else {}
+                            ),
+                        }
+                        if isinstance(sibling, dict) else sibling
+                        for sibling in siblings
+                    ]
+                    raw["siblings"] = siblings
             item = self._public_item(raw)
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
             self._detail_cache[key] = (time.monotonic(), item)

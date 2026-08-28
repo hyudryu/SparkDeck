@@ -333,6 +333,20 @@ class UpdateService:
             state.pop("error", None)
         self._write(self.cluster_path, state)
 
+    @staticmethod
+    def _reconcile_local_node_success(state: dict, revision: str) -> bool:
+        for node in state.get("nodes", []):
+            if node.get("local"):
+                changed = (
+                    node.get("phase") != "succeeded"
+                    or node.get("current_revision") != revision
+                    or "error" in node
+                )
+                node.update(phase="succeeded", current_revision=revision)
+                node.pop("error", None)
+                return changed
+        return False
+
     def agent_status(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.agent_path)
@@ -450,9 +464,21 @@ class UpdateService:
     async def overview(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.cluster_path)
+        agent_state = self._read(self.agent_path)
         task_live = self._task is not None and not self._task.done()
+        target_revision = state.get("target_revision")
+        controller_verified = bool(
+            revision
+            and revision == target_revision
+            and agent_state.get("phase") == "succeeded"
+            and agent_state.get("target_revision") == target_revision
+        )
+        completed_job_reconciled = False
+        if state.get("phase") == "succeeded" and controller_verified:
+            completed_job_reconciled = self._reconcile_local_node_success(
+                state, revision,
+            )
         if state.get("active") and not task_live:
-            agent_state = self._read(self.agent_path)
             if state.get("phase") == "updating_controller":
                 local = next(
                     (node for node in state.get("nodes", []) if node.get("local")),
@@ -506,10 +532,14 @@ class UpdateService:
                         )
                 if state.get("nodes"):
                     self._finish_cluster_state(state)
+        elif completed_job_reconciled:
+            self._write(self.cluster_path, state)
         main_target, main_error = await self.resolve_main()
         nodes = await self.manager.cluster_nodes()
         public_nodes = []
-        blockers = local_blockers(self.root)
+        # Windows service preflight launches a bundled status command that can
+        # probe this process. Keep synchronous checks off the event loop.
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         for node in nodes:
             node_blockers: list[str] = []
             if not node.get("enabled", True):
@@ -678,7 +708,7 @@ class UpdateService:
     async def preflight_local(self, branch: str, revision: str) -> dict:
         if branch != MAIN_BRANCH:
             raise ValueError("The active update target is origin/main")
-        blockers = local_blockers(self.root)
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
         remote_ref = f"refs/remotes/origin/{MAIN_BRANCH}"
@@ -707,7 +737,7 @@ class UpdateService:
         release, error = await self.resolve_release(tag, force=True)
         if error or not release or release["revision"] != revision.lower():
             raise ValueError("Update target is not an official published GitHub release")
-        blockers = local_blockers(self.root)
+        blockers = await asyncio.to_thread(local_blockers, self.root)
         if blockers:
             raise RuntimeError("; ".join(blockers))
         _run(self.root, "git", "fetch", "--force", "origin", f"refs/tags/{tag}:refs/tags/{tag}", timeout=60)

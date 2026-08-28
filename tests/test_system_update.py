@@ -1,6 +1,8 @@
+import asyncio
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -344,6 +346,27 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
             "git", "merge-base", "--is-ancestor", "b" * 40, "c" * 40,
         ])
 
+    async def test_preflight_keeps_event_loop_responsive_during_local_checks(self):
+        check_started = threading.Event()
+        event_loop_progressed = threading.Event()
+
+        def blocking_local_check(_root):
+            check_started.set()
+            if not event_loop_progressed.wait(timeout=1):
+                return ["event loop stalled during local installation checks"]
+            return ["expected local blocker"]
+
+        async def prove_event_loop_progress():
+            while not check_started.is_set():
+                await asyncio.sleep(0)
+            event_loop_progressed.set()
+
+        with patch("sparkdeck.updater.local_blockers", side_effect=blocking_local_check):
+            progress = asyncio.create_task(prove_event_loop_progress())
+            with self.assertRaisesRegex(RuntimeError, "expected local blocker"):
+                await self.service.preflight_local("main", "b" * 40)
+            await progress
+
     async def test_preflight_rejects_checkout_collision(self):
         def command(_root, *args, **_kwargs):
             if args[:2] == ("git", "rev-parse"):
@@ -424,6 +447,61 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview["job"]["phase"], "partial")
         self.assertEqual(overview["job"]["nodes"][0]["error"], "Docker unavailable")
         self.assertEqual(overview["job"]["nodes"][1]["phase"], "succeeded")
+
+    async def test_restarted_controller_reconciles_local_node_success(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "stale", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {
+                    "id": "local", "name": "Controller", "local": True,
+                    "phase": "updating", "current_revision": "a" * 40,
+                    "error": "stale error",
+                },
+                {
+                    "id": "worker", "name": "Worker", "local": False,
+                    "phase": "succeeded", "current_revision": "b" * 40,
+                },
+            ],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "succeeded", "target_revision": "b" * 40,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        local = next(node for node in overview["job"]["nodes"] if node["local"])
+        self.assertFalse(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "succeeded")
+        self.assertEqual(local["phase"], "succeeded")
+        self.assertEqual(local["current_revision"], "b" * 40)
+        self.assertNotIn("error", local)
+
+    async def test_completed_controller_job_self_heals_stale_local_node(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "completed", "active": False, "phase": "succeeded",
+            "target_revision": "b" * 40,
+            "nodes": [{
+                "id": "local", "name": "Controller", "local": True,
+                "phase": "updating", "current_revision": "a" * 40,
+            }],
+        })
+        self.service._write(self.service.agent_path, {
+            "phase": "succeeded", "target_revision": "b" * 40,
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        local = overview["job"]["nodes"][0]
+        self.assertEqual(local["phase"], "succeeded")
+        self.assertEqual(local["current_revision"], "b" * 40)
+        self.assertEqual(self.service._read(self.service.cluster_path), overview["job"])
 
     async def test_controller_checkout_waits_for_helper_success_before_finishing(self):
         self.service._write(self.service.cluster_path, {

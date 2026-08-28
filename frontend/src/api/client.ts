@@ -63,18 +63,26 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
+// Deployment launches and image pulls already have backend-owned, multi-minute
+// limits. Keep their browser connection alive so the server can return the
+// authoritative result instead of inviting a duplicate retry after 30 seconds.
+const NO_REQUEST_TIMEOUT: null = null
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+): Promise<T> {
   const controller = new AbortController()
   const callerSignal = init?.signal
   let timedOut = false
   const forwardAbort = () => controller.abort(callerSignal?.reason)
   if (callerSignal?.aborted) forwardAbort()
   else callerSignal?.addEventListener('abort', forwardAbort, { once: true })
-  const timeout = globalThis.setTimeout(() => {
+  const timeout = timeoutMs === null ? undefined : globalThis.setTimeout(() => {
     timedOut = true
     controller.abort()
-  }, REQUEST_TIMEOUT_MS)
+  }, timeoutMs)
 
   let response: Response
   try {
@@ -95,7 +103,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw error
   } finally {
-    globalThis.clearTimeout(timeout)
+    if (timeout !== undefined) globalThis.clearTimeout(timeout)
     callerSignal?.removeEventListener('abort', forwardAbort)
   }
   if (!response.ok) {
@@ -115,12 +123,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function requestWithFallback<T>(primary: string, fallback: string, init?: RequestInit) {
+async function requestWithFallback<T>(
+  primary: string,
+  fallback: string,
+  init?: RequestInit,
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+) {
   try {
-    return await request<T>(primary, init)
+    return await request<T>(primary, init, timeoutMs)
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 404) throw error
-    return request<T>(fallback, init)
+    return request<T>(fallback, init, timeoutMs)
   }
 }
 
@@ -285,7 +298,7 @@ export const api = {
           node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
           deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
         }),
-      })
+      }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[]) => {
@@ -296,7 +309,7 @@ export const api = {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
         body,
-      })
+      }, action === 'start' ? NO_REQUEST_TIMEOUT : REQUEST_TIMEOUT_MS)
       return deploymentFromWire(data)
     },
     logs: async (id: string, tail = 300) => {
@@ -330,6 +343,7 @@ export const api = {
     deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
+      NO_REQUEST_TIMEOUT,
     ).then(deploymentFromWire),
   },
   nodes: {
@@ -495,7 +509,7 @@ export const api = {
       const result = await requestWithFallback<ImagePullResult>('/api/v1/images/pull', '/api/images/pull', {
         method: 'POST',
         body: JSON.stringify({ image, node_ids: nodeIds }),
-      })
+      }, NO_REQUEST_TIMEOUT)
       return result ?? { ok: true, image, node_ids: nodeIds ?? ['local'], results: [] }
     },
     remove: (id: string) =>

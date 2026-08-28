@@ -24,6 +24,7 @@ from urllib.parse import quote
 LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
@@ -558,7 +559,7 @@ class VirtualNAS:
             explicit_token if explicit_token is not None else self._token_provider() or ""
         ).strip()
 
-        def inspect() -> tuple[dict[str, int], list[str]]:
+        def inspect() -> tuple[dict[str, int], list[str], dict[str, str]]:
             try:
                 from huggingface_hub import HfApi
             except ImportError as exc:
@@ -579,6 +580,7 @@ class VirtualNAS:
                     )
                 repository_files: list[str] = []
                 sizes: dict[str, int] = {}
+                blob_keys: dict[str, str] = {}
                 for sibling in list(getattr(info, "siblings", None) or []):
                     filename = getattr(sibling, "rfilename", None)
                     if not isinstance(filename, str):
@@ -592,12 +594,27 @@ class VirtualNAS:
                             "Hugging Face did not report complete selected file sizes"
                         )
                     sizes[filename] = size
+                    lfs = getattr(sibling, "lfs", None)
+                    if lfs is not None:
+                        cache_key = getattr(lfs, "sha256", None)
+                        if (
+                            isinstance(cache_key, str)
+                            and re.fullmatch(r"[0-9a-fA-F]{64}", cache_key)
+                        ):
+                            blob_keys[filename] = cache_key.lower()
+                    else:
+                        cache_key = getattr(sibling, "blob_id", None)
+                        if (
+                            isinstance(cache_key, str)
+                            and _HUB_BLOB_KEY.fullmatch(cache_key)
+                        ):
+                            blob_keys[filename] = cache_key.lower()
                 missing = [filename for filename in selected if filename not in sizes]
                 if missing:
                     raise RuntimeError(
                         "Hugging Face did not report every selected repository file"
                     )
-                return sizes, repository_files
+                return sizes, repository_files, blob_keys
             except Exception as exc:
                 if isinstance(exc, RuntimeError):
                     raise
@@ -605,7 +622,7 @@ class VirtualNAS:
                     "could not inspect Hugging Face model; verify repository access, revision, credentials, and network"
                 ) from exc
 
-        sizes, repository_files = await asyncio.to_thread(inspect)
+        sizes, repository_files, blob_keys = await asyncio.to_thread(inspect)
 
         def download_selected() -> dict[str, Any]:
             try:
@@ -629,8 +646,16 @@ class VirtualNAS:
                 ]
                 if missing:
                     expected_bytes = sum(sizes[filename] for filename in missing)
+                    cached_bytes = sum(
+                        _safe_incomplete_blob_bytes(
+                            repository, blob_keys.get(filename), sizes[filename],
+                        )
+                        for filename in missing
+                    )
                     free_bytes = self.free_bytes()
-                    required = download_required_free_bytes(expected_bytes)
+                    required = download_required_free_bytes(
+                        expected_bytes, cached_bytes,
+                    )
                     if free_bytes is None:
                         raise RuntimeError(
                             "download node did not report free cache capacity"
@@ -1907,6 +1932,29 @@ def _safe_cached_snapshot_file(
         return candidate
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def _safe_incomplete_blob_bytes(
+    repository: Path, cache_key: str | None, expected_bytes: int,
+) -> int:
+    """Return resumable bytes for one exact Hub sibling, failing closed."""
+    if not isinstance(cache_key, str) or not _HUB_BLOB_KEY.fullmatch(cache_key):
+        return 0
+    try:
+        if not repository.is_dir() or repository.is_symlink():
+            return 0
+        blobs = repository / "blobs"
+        if not blobs.is_dir() or blobs.is_symlink():
+            return 0
+        blob_root = blobs.resolve(strict=True)
+        candidate = blobs / f"{cache_key.lower()}.incomplete"
+        if candidate.is_symlink() or not candidate.is_file():
+            return 0
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(blob_root)
+        return min(_nonnegative_int(expected_bytes), candidate.stat().st_size)
+    except (OSError, RuntimeError, ValueError):
+        return 0
 
 
 def _is_complete_repository(repository: Path) -> bool:

@@ -1644,19 +1644,22 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
     engine = payload.get("engine") or "vllm"
     if engine not in {"vllm", "sglang"}:
         raise HTTPException(400, "engine must be vllm or sglang")
+    raw_controls = payload.get("launch_controls")
+    if raw_controls is not None and not isinstance(raw_controls, dict):
+        raise HTTPException(400, "launch_controls must be an object")
+    controls = dict(raw_controls or {})
 
-    def _first(key):
-        return payload[key] if payload.get(key) is not None else settings.get(key)
-
-    extra_args = _first("extra_args")
+    extra_args = (
+        payload["extra_args"]
+        if payload.get("extra_args") is not None
+        else settings.get("extra_args")
+    )
     if extra_args is not None:
         if not isinstance(extra_args, list) or any(
             not isinstance(value, str) for value in extra_args
         ):
             raise HTTPException(400, "extra_args must be an array of strings")
         payload["extra_args"] = extra_args
-
-    controls = dict(payload.get("launch_controls") or {})
     if settings.get("kv_cache_dtype") and controls.get("kv_cache_dtype") is None:
         controls["kv_cache_dtype"] = settings["kv_cache_dtype"]
 

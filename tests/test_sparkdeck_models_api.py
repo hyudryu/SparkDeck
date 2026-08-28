@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -334,6 +335,33 @@ class RecipeLaunchSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         add_recipe.assert_not_awaited()
 
+    async def test_launch_settings_reject_non_object_launch_controls(self):
+        add_recipe = AsyncMock(return_value={"id": "r5"})
+        payload = {
+            "model": "org/model", "engine": "sglang",
+            "launch_settings": {"context_length": 262144},
+            "launch_controls": "max_concurrency=10",
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        add_recipe.assert_not_awaited()
+
+    async def test_launch_settings_reject_out_of_range_sg_scalars(self):
+        add_recipe = AsyncMock(
+            side_effect=ValueError("sg_mem_fraction must be between 0 and 1")
+        )
+        payload = {
+            "model": "org/model", "engine": "sglang",
+            "launch_settings": {"mem_fraction_static": 1.2},
+        }
+        with patch.object(server.manager, "add_recipe", add_recipe):
+            response = await self.client.post("/api/recipes", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("sg_mem_fraction", response.json()["detail"])
+
     async def test_update_recipe_accepts_sglang_scalars(self):
         update = AsyncMock(return_value=dict(RECIPE))
         with patch.object(server.manager, "update_recipe", update):
@@ -463,6 +491,53 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         body = response.json()
         self.assertEqual(body["extra_args"], [])
         self.assertEqual(body["launch_controls"], {})
+
+
+class ExternalEndpointProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovered_card_without_port_keeps_docker_status(self):
+        deployment = {
+            "id": "container:host-net", "kind": "external",
+            "runtime": "sglang", "status": "running", "port": None,
+        }
+        await server.sparkdeck._probe_external_endpoint(deployment)
+
+        self.assertEqual(deployment["status"], "running")
+        self.assertNotIn("last_error", deployment)
+
+    async def test_discovered_card_with_port_probes_derived_url(self):
+        deployment = {
+            "id": "container:bound", "kind": "external",
+            "runtime": "vllm", "status": "running", "port": 8123,
+        }
+        health = AsyncMock()
+        with patch.object(
+            server.sparkdeck.registry, "get",
+            Mock(return_value=SimpleNamespace(health=health)),
+        ), patch.object(
+            server.sparkdeck, "_get_credential", Mock(return_value=None),
+        ):
+            await server.sparkdeck._probe_external_endpoint(deployment)
+
+        health.assert_awaited_once()
+        self.assertEqual(health.await_args.args[1], "http://127.0.0.1:8123")
+        self.assertEqual(deployment["status"], "running")
+
+    async def test_stored_external_still_probes_saved_base_url(self):
+        deployment = {
+            "id": "dep-ext", "kind": "external",
+            "runtime": "vllm", "status": "unknown", "_base_url": "http://10.0.0.9:8000",
+        }
+        health = AsyncMock(side_effect=RuntimeError("unreachable"))
+        with patch.object(
+            server.sparkdeck.registry, "get",
+            Mock(return_value=SimpleNamespace(health=health)),
+        ), patch.object(
+            server.sparkdeck, "_get_credential", Mock(return_value=None),
+        ):
+            await server.sparkdeck._probe_external_endpoint(deployment)
+
+        self.assertEqual(deployment["status"], "error")
+        self.assertEqual(deployment["last_error"], "Endpoint health check failed")
 
 
 if __name__ == "__main__":

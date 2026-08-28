@@ -802,31 +802,44 @@ class SparkDeckService:
                     "Docker is unavailable" if docker_unavailable
                     else "Managed container is missing"
                 )
-        async def probe_external(deployment: dict[str, Any]) -> None:
-            if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
-                return
-            try:
-                adapter = self.registry.get(deployment["runtime"])
-                await asyncio.wait_for(
-                    adapter.health(
-                        self.manager.http,
-                        deployment.get("_base_url") or "",
-                        self._get_credential(
-                            deployment["id"], deployment.get("_credential_ref")
-                        ),
-                    ),
-                    timeout=3,
-                )
-                deployment["status"] = "running"
-            except Exception:
-                deployment["status"] = "error"
-                deployment["last_error"] = "Endpoint health check failed"
-
-        await asyncio.gather(*(probe_external(item) for item in registered))
+        await asyncio.gather(
+            *(self._probe_external_endpoint(item) for item in registered)
+        )
         for deployment in registered:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         return registered
+
+    async def _probe_external_endpoint(self, deployment: dict[str, Any]) -> None:
+        if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
+            return
+        base_url = deployment.get("_base_url")
+        if not base_url and str(deployment.get("id") or "").startswith("container:"):
+            # Discovered cards have no stored endpoint: only probe when the
+            # container exposes a mappable port, and keep the Docker status
+            # otherwise (host-network containers have none).
+            port = deployment.get("port")
+            if not port:
+                return
+            base_url = f"http://127.0.0.1:{int(port)}"
+        if not base_url:
+            return
+        try:
+            adapter = self.registry.get(deployment["runtime"])
+            await asyncio.wait_for(
+                adapter.health(
+                    self.manager.http,
+                    base_url,
+                    self._get_credential(
+                        deployment["id"], deployment.get("_credential_ref")
+                    ),
+                ),
+                timeout=3,
+            )
+            deployment["status"] = "running"
+        except Exception:
+            deployment["status"] = "error"
+            deployment["last_error"] = "Endpoint health check failed"
 
     async def deployment_detail(self, deployment_id: str) -> dict[str, Any]:
         """Return one deployment with only its safe, editable launch inputs."""

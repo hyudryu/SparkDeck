@@ -718,6 +718,16 @@ export function ModelsPage() {
       return Number.isFinite(parsed) ? parsed : null
     }
     const editorForm = editor.form
+    const sgTpSize = numeric(editorForm.sg_tp_size)
+    const sgMemFraction = numeric(editorForm.sg_mem_fraction)
+    if (sgTpSize !== null && (!Number.isInteger(sgTpSize) || sgTpSize < 1)) {
+      setArgsEditor(recipe.id, { error: 'TP size must be a positive integer' })
+      return
+    }
+    if (sgMemFraction !== null && (sgMemFraction <= 0 || sgMemFraction > 1)) {
+      setArgsEditor(recipe.id, { error: 'Mem fraction must be between 0 and 1' })
+      return
+    }
     const payload: RecipeUpdateInput = {
       extra_args: shellSplit(editorForm.remaining_flags ?? ''),
       launch_controls: {
@@ -731,8 +741,8 @@ export function ModelsPage() {
       },
       gpu_memory_utilization: numeric(editorForm.gpu_memory_utilization),
       gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
-      sg_tp_size: numeric(editorForm.sg_tp_size),
-      sg_mem_fraction: numeric(editorForm.sg_mem_fraction),
+      sg_tp_size: sgTpSize,
+      sg_mem_fraction: sgMemFraction,
     }
     setArgsEditor(recipe.id, { saving: true, error: undefined, saved: false })
     try {

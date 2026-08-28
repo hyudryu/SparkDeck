@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api } from './client'
+import type { ChatStreamUpdate } from './types'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -7,6 +8,86 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('streams split reasoning, output, usage, and per-response metrics', async () => {
+    const encoder = new TextEncoder()
+    const payload = [
+      'data: {"choices":[{"delta":{"reasoning":"Inspecting the request"}}],"usage":{"prompt_tokens":10,"completion_tokens":1}}\r\n\r\n',
+      'data: {"choices":[{"delta":{"content":"Hello from the model"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}\n\n',
+      'data: [DONE]\n\n',
+    ].join('')
+    const bytes = encoder.encode(payload)
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, 17))
+        controller.enqueue(bytes.slice(17, 79))
+        controller.enqueue(bytes.slice(79))
+      },
+      cancel() {
+        cancelled = true
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response)
+    vi.stubGlobal('fetch', fetchMock)
+    const times = [0, 250, 250, 500, 1000, 1000]
+    vi.spyOn(performance, 'now').mockImplementation(() => times.shift() ?? 1000)
+    let cancelled = false
+    const updates: ChatStreamUpdate[] = []
+
+    const result = await api.chatStream('reasoner', [{ role: 'user', content: 'Hello' }], {
+      onUpdate: (update) => updates.push(update),
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/chat/completions', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ Accept: 'text/event-stream' }),
+    }))
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({
+      model: 'reasoner', stream: true, stream_options: { include_usage: true },
+    }))
+    expect(updates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reasoning: 'Inspecting the request' }),
+      expect.objectContaining({ content: 'Hello from the model' }),
+    ]))
+    expect(updates[0]?.metrics?.prompt_tokens_per_second).toBeUndefined()
+    expect(cancelled).toBe(false)
+    expect(result.message.content).toBe('Hello from the model')
+    expect(result.reasoning).toBe('Inspecting the request')
+    expect(result.metrics).toEqual(expect.objectContaining({
+      prompt_tokens_per_second: 32,
+      ttft_ms: 250,
+      prompt_tokens: 10,
+      completion_tokens: 4,
+    }))
+    expect(result.metrics.output_tokens_per_second).toBeCloseTo(5.33, 1)
+    await response.body?.cancel()
+    expect(cancelled).toBe(true)
+  })
+
+  it('surfaces an error sent inside an otherwise successful SSE response', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      'data: {"error":{"message":"GPU worker stopped"}}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )))
+
+    await expect(api.chatStream('reasoner', [])).rejects.toThrow('GPU worker stopped')
+  })
+
+  it('rejects non-SSE and truncated successful responses', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('{"choices":[]}', {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.chatStream('reasoner', [])).rejects.toThrow('non-streaming response')
+    await expect(api.chatStream('reasoner', [])).rejects.toThrow('ended unexpectedly')
+  })
+
   it('does not reuse mutable API responses from the browser cache', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [] }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

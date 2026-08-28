@@ -984,6 +984,10 @@ async def update_cluster_node(node_id: str, req: Request):
             raise ValueError("request body must be an object")
         if set(body) == {"name"}:
             return await manager.rename_cluster_node(node_id, body["name"])
+        if set(body) == {"hidden_from_dashboard"}:
+            return await manager.set_cluster_node_dashboard_hidden(
+                node_id, body["hidden_from_dashboard"],
+            )
         # Preserve the legacy general registry editor for enabled/network
         # configuration. Only its exact name-only form gains propagation.
         try:
@@ -1435,14 +1439,20 @@ async def v1_nodes():
 
 
 @app.patch("/api/v1/nodes/{node_id}")
-async def v1_rename_node(node_id: str, req: Request):
+async def v1_update_node(node_id: str, req: Request):
     try:
         body = await req.json()
         if not isinstance(body, dict):
             raise ValueError("request body must be an object")
-        if set(body) != {"name"}:
-            raise ValueError("request body must contain only name")
-        return await manager.rename_cluster_node(node_id, body.get("name"))
+        if set(body) == {"name"}:
+            return await manager.rename_cluster_node(node_id, body.get("name"))
+        if set(body) == {"hidden_from_dashboard"}:
+            return await manager.set_cluster_node_dashboard_hidden(
+                node_id, body.get("hidden_from_dashboard"),
+            )
+        raise ValueError(
+            "request body must contain only name or hidden_from_dashboard"
+        )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (ValueError, json.JSONDecodeError) as exc:

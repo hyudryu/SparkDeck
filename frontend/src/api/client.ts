@@ -272,6 +272,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(input),
     }),
+    setDashboardHidden: (id: string, hidden_from_dashboard: boolean) => request<Pick<NodeInventoryItem, 'id' | 'hidden_from_dashboard'>>(`/api/v1/nodes/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ hidden_from_dashboard }),
+    }),
     remove: (id: string, force = false) => request<{ ok: boolean; node_id: string; forced: boolean }>(
       `/api/v1/nodes/${encodeURIComponent(id)}${force ? '?force=true' : ''}`,
       { method: 'DELETE' },

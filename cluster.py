@@ -276,6 +276,7 @@ class NodeRegistry:
             "fabric_ip": (fabric_ip or "").strip() or None,
             "fabric_interface": (fabric_interface or "").strip() or None,
             "enabled": True,
+            "hidden_from_dashboard": False,
             "protocol_version": paired.get("protocol_version"),
             "paired_at": time.time(),
             "usage_reconciled": False,
@@ -290,7 +291,15 @@ class NodeRegistry:
         node = self.get(node_id)
         if not node or node_id == LOCAL_NODE_ID:
             raise ValueError("remote node not found")
-        for key in ("name", "fabric_ip", "fabric_interface", "enabled"):
+        if (
+            "hidden_from_dashboard" in changes
+            and not isinstance(changes["hidden_from_dashboard"], bool)
+        ):
+            raise ValueError("hidden_from_dashboard must be a boolean")
+        for key in (
+            "name", "fabric_ip", "fabric_interface", "enabled",
+            "hidden_from_dashboard",
+        ):
             if key in changes:
                 node[key] = changes[key]
         if "agent_url" in changes:
@@ -500,8 +509,12 @@ class NodeRegistry:
                 }
                 # The controller's durable registry is authoritative for the
                 # user-assigned display name. Agent status may briefly retain
-                # the prior local name after an offline rename.
+                # the prior local name after an offline rename. Dashboard
+                # visibility is also controller-owned presentation state.
                 result["name"] = public.get("name") or status.get("name")
+                result["hidden_from_dashboard"] = bool(
+                    public.get("hidden_from_dashboard", False)
+                )
                 result["status_message"] = "; ".join(issues) or None
             except Exception as exc:
                 previous = cached[1] if cached else {}

@@ -7,12 +7,11 @@ import {
   HardDrive,
   RefreshCw,
   Server,
-  Thermometer,
   Users,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ActiveRequestStats, GpuStats } from '../api/types'
+import type { ActiveRequestStats, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
@@ -40,11 +39,6 @@ function MetricBar({ value, label }: { value: number | null | undefined; label: 
   )
 }
 
-function GpuSummary({ gpu }: { gpu?: GpuStats }) {
-  if (!gpu || gpu.error) return <p className="metric-unavailable">GPU telemetry unavailable</p>
-  return <p className="metric-context">{gpu.name ?? `GPU ${gpu.index}`} · {displayValue(gpu.util, '%')} utilized</p>
-}
-
 function memorySnapshot(stats?: { gpus?: GpuStats[]; mem?: { total?: number; used?: number; pct?: number } }) {
   const gpu = stats?.gpus?.find((item) => !item.error)
   if (Number.isFinite(gpu?.mem_total_mib) && Number(gpu?.mem_total_mib) > 0) {
@@ -60,6 +54,56 @@ function memorySnapshot(stats?: { gpus?: GpuStats[]; mem?: { total?: number; use
   return undefined
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined || typeof value === 'boolean') return undefined
+  const number = Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
+
+export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStats?: SystemStats) {
+  const visibleOnline = nodes.filter((node) => node.hidden_from_dashboard !== true && node.online)
+  const telemetry = nodes.length
+    ? visibleOnline.flatMap((node) => node.stats ? [{ id: node.id, stats: node.stats }] : [])
+    : fallbackStats ? [{ id: 'entry-node', stats: fallbackStats }] : []
+  let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let cpuNodesWithKnownProcessors = 0
+  let ramUsed = 0; let ramTotal = 0; let ramNodes = 0
+  let gpuUtilTotal = 0; let measuredGpus = 0; let gpuCount = 0; const gpuNodes = new Set<string>()
+
+  telemetry.forEach(({ id, stats }) => {
+    const cpuPct = finiteNumber(stats.cpu_pct)
+    if (cpuPct !== undefined) {
+      const knownProcessors = finiteNumber(stats.cpu_logical_count)
+      const weight = knownProcessors && knownProcessors > 0 ? knownProcessors : 1
+      cpuWeightedTotal += cpuPct * weight; cpuWeight += weight; cpuNodes += 1
+      if (knownProcessors && knownProcessors > 0) { logicalProcessors += knownProcessors; cpuNodesWithKnownProcessors += 1 }
+    }
+    const used = finiteNumber(stats.mem?.used); const total = finiteNumber(stats.mem?.total)
+    if (used !== undefined && total !== undefined && total > 0) {
+      ramUsed += used; ramTotal += total; ramNodes += 1
+    }
+    const healthyGpus = (stats.gpus ?? []).filter((gpu) => !gpu.error)
+    if (healthyGpus.length) gpuNodes.add(id)
+    gpuCount += healthyGpus.length
+    healthyGpus.forEach((gpu) => {
+      const util = finiteNumber(gpu.util)
+      if (util !== undefined) { gpuUtilTotal += util; measuredGpus += 1 }
+    })
+  })
+
+  return {
+    cpuPct: cpuWeight ? cpuWeightedTotal / cpuWeight : undefined,
+    cpuNodes,
+    logicalProcessors: cpuNodes && cpuNodesWithKnownProcessors === cpuNodes ? logicalProcessors : undefined,
+    gpuPct: measuredGpus ? gpuUtilTotal / measuredGpus : undefined,
+    gpuCount,
+    gpuNodes: gpuNodes.size,
+    ramUsed,
+    ramTotal,
+    ramPct: ramTotal ? ramUsed / ramTotal * 100 : undefined,
+    ramNodes,
+  }
+}
+
 export function DashboardPage() {
   const resource = useResource((signal) => api.dashboard.load(signal))
   const communityAccess = useCommunityAccess()
@@ -71,21 +115,22 @@ export function DashboardPage() {
   }, [resource.reload])
 
   const stats = resource.data?.stats
-  const gpu = stats?.gpus?.find((item) => !item.error)
   const activeRequests = Object.entries(stats?.active_requests ?? {})
   const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
   const queuedRequests = Object.values(resource.data?.admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
   const runningDeployments = resource.data?.deployments.filter((item) => item.status === 'running') ?? []
-  const memory = memorySnapshot(stats)
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
-  const clusterNodes = resource.data?.nodes ?? []
+  const allClusterNodes = resource.data?.nodes ?? []
+  const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
+  const hiddenNodeCount = allClusterNodes.length - clusterNodes.length
+  const pooled = clusterResourceSnapshot(allClusterNodes, stats)
 
   return (
     <div className="page dashboard-page">
       <PageHeader
         eyebrow="Cluster command center"
         title="Dashboard"
-        description="Live health for this entry node and every SparkDeck node in the cluster."
+        description="Live pooled resource health and per-machine telemetry for the SparkDeck cluster."
         actions={
           <div className="dashboard-refresh">
             <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Waiting for telemetry'}</span>
@@ -102,22 +147,22 @@ export function DashboardPage() {
         <>
           <section className="metric-grid" aria-label="System overview">
             <Panel className="metric-panel">
-              <div className="metric-label"><Cpu size={16} /><span>CPU</span></div>
-              <strong className={temperatureTone(stats?.cpu_temp_c)}>{displayValue(stats?.cpu_temp_c, '°C', 1)}</strong>
-              <p className="metric-context">{displayValue(stats?.cpu_pct, '%', 1)} load</p>
-              <MetricBar value={stats?.cpu_pct} label="CPU load" />
+              <div className="metric-label"><Cpu size={16} /><span>Pooled CPU</span></div>
+              <strong>{displayValue(pooled.cpuPct, '%', 1)}</strong>
+              <p className="metric-context">{pooled.cpuNodes ? `${pooled.logicalProcessors ? `${pooled.logicalProcessors} logical processors · ` : ''}${pooled.cpuNodes} measured ${pooled.cpuNodes === 1 ? 'node' : 'nodes'}` : 'CPU telemetry unavailable'}</p>
+              <MetricBar value={pooled.cpuPct} label="Pooled CPU load" />
             </Panel>
             <Panel className="metric-panel">
-              <div className="metric-label"><Thermometer size={16} /><span>GPU</span></div>
-              <strong className={temperatureTone(gpu?.temp)}>{displayValue(gpu?.temp, '°C', 1)}</strong>
-              <GpuSummary gpu={gpu} />
-              <MetricBar value={gpu?.util} label="GPU utilization" />
+              <div className="metric-label"><Gauge size={16} /><span>Pooled GPU</span></div>
+              <strong>{displayValue(pooled.gpuPct, '%', 1)}</strong>
+              <p className="metric-context">{pooled.gpuCount ? `${pooled.gpuCount} ${pooled.gpuCount === 1 ? 'GPU' : 'GPUs'} across ${pooled.gpuNodes} ${pooled.gpuNodes === 1 ? 'node' : 'nodes'}` : 'GPU telemetry unavailable'}</p>
+              <MetricBar value={pooled.gpuPct} label="Pooled GPU utilization" />
             </Panel>
             <Panel className="metric-panel">
-              <div className="metric-label"><HardDrive size={16} /><span>{memory?.label ?? 'GPU memory'}</span></div>
-              <strong>{memory ? `${memory.used.toFixed(1)} GB` : '—'}</strong>
-              <p className="metric-context">{memory ? `of ${memory.total.toFixed(1)} GB · ${memory.context}` : 'Memory telemetry unavailable'}</p>
-              <MetricBar value={memory?.percent} label={`${memory?.label ?? 'GPU memory'} allocation`} />
+              <div className="metric-label"><HardDrive size={16} /><span>Pooled RAM</span></div>
+              <strong>{pooled.ramTotal ? `${(pooled.ramUsed / 1024 ** 3).toFixed(1)} GB` : '—'}</strong>
+              <p className="metric-context">{pooled.ramTotal ? `of ${(pooled.ramTotal / 1024 ** 3).toFixed(1)} GB across ${pooled.ramNodes} ${pooled.ramNodes === 1 ? 'node' : 'nodes'}` : 'RAM telemetry unavailable'}</p>
+              <MetricBar value={pooled.ramPct} label="Pooled RAM allocation" />
             </Panel>
             <Panel className="metric-panel">
               <div className="metric-label"><Activity size={16} /><span>Inference</span></div>
@@ -128,10 +173,11 @@ export function DashboardPage() {
           </section>
 
           <section className="cluster-health" aria-labelledby="cluster-health-title">
-            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{clusterNodes.filter((node) => node.online).length} of {clusterNodes.length} nodes online · telemetry is shown per machine</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
+            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{clusterNodes.filter((node) => node.online).length} of {clusterNodes.length} visible nodes online · pooled above, telemetry per machine{hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
             <div className="cluster-health-grid">
+              {!clusterNodes.length && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
               {clusterNodes.map((node) => {
-                const nodeStats = node.local ? stats : node.stats
+                const nodeStats = node.stats
                 const nodeGpu = nodeStats?.gpus?.find((item) => !item.error)
                 const nodeMemory = memorySnapshot(nodeStats)
                 const sessions = Object.values(nodeStats?.active_requests ?? {}).reduce((sum, request) => sum + (request.connections ?? 0), 0)

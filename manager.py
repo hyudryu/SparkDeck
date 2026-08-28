@@ -39,6 +39,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VirtualNAS,
     cached_download_bytes,
     download_required_free_bytes,
@@ -1067,7 +1068,11 @@ class Manager:
             "name": self.settings.get("cluster_node_name") or socket.gethostname(),
             "hostname": socket.gethostname(),
             "protocol_version": AGENT_PROTOCOL_VERSION,
-            "capabilities": [CAPABILITY, VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+            "capabilities": [
+                CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+            ],
             "update_protocol": 1,
             "app_revision": getattr(self, "app_revision", None),
             "status": "online" if docker_ready else "degraded",
@@ -1725,21 +1730,22 @@ class Manager:
                 key=lambda job: float(job.get("created_at") or 0),
                 reverse=True,
             )
-            for job in previous_downloads:
+            if previous_downloads:
+                job = previous_downloads[0]
                 try:
-                    requested_revision = validate_revision(
+                    candidate_requested_revision = validate_revision(
                         job.get("requested_revision") or job.get("revision")
                     )
                     resolved_revision = str(job.get("revision") or "").strip()
                     if not IMMUTABLE_HF_REVISION.fullmatch(resolved_revision):
-                        continue
+                        raise ValueError("stored download revision is not immutable")
                     recovered_size = self._byte_count(job.get("bytes_total"))
                     if not recovered_size:
                         recovered_size = await self.virtual_nas.estimate_download_size(
                             model_id, resolved_revision,
                         )
                     recovered_resolution = {
-                        "requested_revision": requested_revision,
+                        "requested_revision": candidate_requested_revision,
                         "resolved_revision": resolved_revision,
                         "size_bytes": recovered_size,
                         "resume_node_id": node_id,
@@ -1747,9 +1753,15 @@ class Manager:
                             "download_cache_baseline_bytes"
                         ),
                     }
-                except ValueError:
-                    continue
-                break
+                    requested_revision = candidate_requested_revision
+                except ValueError as exc:
+                    raise LookupError(
+                        "partial download revision cannot be recovered safely"
+                    ) from exc
+            if previous_downloads and recovered_resolution is None:
+                raise LookupError(
+                    "partial download revision cannot be recovered safely"
+                )
         requested_revision = requested_revision or "main"
         resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
             model_id, requested_revision,
@@ -1876,7 +1888,9 @@ class Manager:
             # Generic node-disk telemetry is display-only and must never make
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
-            cached_bytes = partial_download_size_bytes(existing)
+            cached_bytes = partial_download_size_bytes(
+                existing, resolved_revision,
+            )
             if (
                 resolved_download
                 and resolved_download.get("resume_node_id") == node_id

@@ -11,6 +11,7 @@ from manager import DEFAULT_SETTINGS, Manager
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VirtualNAS,
     validate_model_id,
     validate_revision,
@@ -77,7 +78,10 @@ class FakeRegistry:
     async def probe(self, node, force=False):
         return {
             **node, "online": True,
-            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+            "capabilities": [
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+            ],
             "disk": {"free": 10 * 1024 * 1024 * 1024},
         }
 
@@ -222,7 +226,22 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             hub = Path(directory) / "hub"
             complete = create_cached_model(hub)
             (complete / "blobs" / "next.incomplete").write_bytes(b"partial")
-            (complete / "snapshots" / "revision-2").mkdir()
+            next_snapshot = complete / "snapshots" / "revision-2"
+            next_snapshot.mkdir()
+            completed_blob = complete / "blobs" / "next-complete"
+            completed_blob.write_bytes(b"completed")
+            try:
+                (next_snapshot / "config.json").symlink_to(completed_blob)
+            except OSError:
+                (next_snapshot / "config.json").write_bytes(b"completed")
+            older_snapshot = complete / "snapshots" / "revision-3"
+            older_snapshot.mkdir()
+            older_blob = complete / "blobs" / "older-complete"
+            older_blob.write_bytes(b"older")
+            try:
+                (older_snapshot / "config.json").symlink_to(older_blob)
+            except OSError:
+                (older_snapshot / "config.json").write_bytes(b"older")
             (complete / "refs").mkdir()
             (complete / "refs" / "main").write_text("revision-1")
             (complete / "refs" / "stale").write_text("missing-revision")
@@ -241,7 +260,14 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(models[0]["revision_refs"], {"main": "revision-1"})
             self.assertFalse(models[0]["partial"])
             self.assertTrue(models[0]["has_partial_download"])
-            self.assertEqual(models[0]["partial_size_bytes"], len(b"partial"))
+            self.assertEqual(
+                models[0]["partial_size_bytes"],
+                len(b"partial") + len(b"completed") + len(b"older"),
+            )
+            self.assertEqual(models[0]["partial_revision_size_bytes"], {
+                "revision-2": len(b"completed"),
+                "revision-3": len(b"older"),
+            })
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
@@ -809,6 +835,10 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "model_id": "org/model", "size_bytes": 125,
                 "partial": False, "has_partial_download": True,
                 "partial_size_bytes": cached,
+                "partial_revision_size_bytes": {
+                    RESOLVED_REVISION: cached,
+                    "b" * 40: 90,
+                },
                 "revisions": ["old-revision"],
             }],
         }])
@@ -819,7 +849,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": RESOLVED_REVISION,
             "size_bytes": expected,
             "resume_node_id": "worker-a",
-            "download_cache_baseline_bytes": 100,
+            "download_cache_baseline_bytes": None,
         }
 
         result = await manager.virtual_nas_transfer_preflight(
@@ -830,6 +860,36 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(target["has_partial_model_cache"])
         self.assertTrue(target["download_eligible"])
         self.assertEqual(target["download_required_free_bytes"], required)
+
+    async def test_finish_rejects_legacy_attempt_without_immutable_revision(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {}
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [{
+            "id": "legacy-download", "kind": "download",
+            "model_id": "org/model", "target_node_id": "worker-a",
+            "requested_revision": "release-1", "revision": "release-1",
+            "status": "failed", "started_at": 4,
+            "download_attempted_at": 4.5,
+            "legacy_download_attempt_tracking": False, "created_at": 5,
+        }, {
+            "id": "older-pinned-download", "kind": "download",
+            "model_id": "org/model", "target_node_id": "worker-a",
+            "requested_revision": "older", "revision": RESOLVED_REVISION,
+            "status": "failed", "started_at": 2,
+            "download_attempted_at": 2.5,
+            "legacy_download_attempt_tracking": False, "created_at": 3,
+        }]}
+        manager.virtual_nas.resolve_download_revision = AsyncMock()
+        manager.virtual_nas_transfer_preflight = AsyncMock()
+
+        with self.assertRaisesRegex(LookupError, "cannot be recovered safely"):
+            await manager.queue_virtual_nas_download(
+                "org/model", "worker-a",
+            )
+
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+        manager.virtual_nas_transfer_preflight.assert_not_awaited()
 
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
         manager = Manager.__new__(Manager)

@@ -48,6 +48,7 @@ from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 from sparkdeck.workload_ownership import ManagedWorkloadLedger
 
 LEGACY_DEFAULT_HF_CACHE = "/home/hyudryu/.cache/huggingface"
+LEGACY_ROOT_HF_CACHE = "/root/.cache/huggingface"
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 
 DEFAULT_SETTINGS = {
@@ -1077,7 +1078,13 @@ class Manager:
 
         try:
             return await asyncio.to_thread(probe)
-        except Exception:
+        except Exception as exc:
+            detail = str(exc).casefold()
+            if "permission denied" in detail or "errno 13" in detail:
+                return False, (
+                    "SparkDeck's service user cannot access Docker. Add this "
+                    "user to the docker group, then restart the user session."
+                )
             return False, "Docker is unavailable"
 
     def _cluster_launch_update(
@@ -1184,7 +1191,7 @@ class Manager:
             for key in (
                 "id", "name", "local", "enabled", "status", "online",
                 "last_seen", "protocol_version", "docker_ready", "fabric_ready",
-                "stats", "disk", "hidden_from_dashboard",
+                "status_message", "stats", "disk", "hidden_from_dashboard",
                 "routeros",
             )
         } | {
@@ -5756,12 +5763,14 @@ class Manager:
                 # opt-out so an older settings file cannot silently leave a
                 # node out of Usage totals.
                 data.pop("sync_token_usage", None)
-                # Early builds persisted the original developer's Linux home
-                # as the default on every platform. Migrate only that exact
-                # legacy value so explicit custom cache locations are kept.
+                # Early builds and root-run services persisted a different
+                # account's default Linux cache. Migrate only those exact
+                # defaults so explicit custom cache locations are kept.
                 if (
-                    data.get("hf_cache") == LEGACY_DEFAULT_HF_CACHE
-                    and DEFAULT_HF_CACHE != LEGACY_DEFAULT_HF_CACHE
+                    data.get("hf_cache") in {
+                        LEGACY_DEFAULT_HF_CACHE, LEGACY_ROOT_HF_CACHE,
+                    }
+                    and data.get("hf_cache") != DEFAULT_HF_CACHE
                 ):
                     data["hf_cache"] = DEFAULT_HF_CACHE
                     try:

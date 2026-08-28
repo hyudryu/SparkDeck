@@ -417,6 +417,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 "node_id": "remote-1",
                 "protocol_version": 1,
                 "docker_ready": docker_ready,
+                "status_message": None if docker_ready else (
+                    "SparkDeck's service user cannot access Docker. Add this "
+                    "user to the docker group, then restart the user session."
+                ),
                 "fabric_ready": True,
                 "interfaces": [],
                 "stats": {},
@@ -440,7 +444,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 degraded = await registry.probe(node, force=True)
                 self.assertEqual(degraded["status"], "degraded")
                 self.assertTrue(degraded["online"])
-                self.assertIn("Docker", degraded["status_message"])
+                self.assertIn(
+                    "service user cannot access Docker",
+                    degraded["status_message"],
+                )
             finally:
                 await client.aclose()
 
@@ -1076,6 +1083,21 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(settings["max_retries"], 7)
         self.assertEqual(settings["hf_cache"], str(Path.home() / ".cache" / "huggingface"))
+
+    def test_root_service_hf_cache_default_is_migrated_to_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings_path = Path(directory) / "settings.json"
+            instance.settings_path.write_text(json.dumps({
+                "hf_cache": "/root/.cache/huggingface",
+                "max_retries": 7,
+            }))
+
+            settings = instance._load_settings()
+
+        self.assertEqual(
+            settings["hf_cache"], str(Path.home() / ".cache" / "huggingface")
+        )
 
     def test_token_usage_sync_reset_epoch_rejects_stale_totals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

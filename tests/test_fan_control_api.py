@@ -88,6 +88,10 @@ class FanControlApiTests(unittest.IsolatedAsyncioTestCase):
                     "expected_mode": "pid", "enabled": True,
                 },
             )
+            invalid_expected_mode = await self.client.patch(
+                "/api/v1/fan-control/nodes/node-1/settings",
+                json={"mode": "curve", "active_settings": curve, "expected_mode": []},
+            )
             accepted = await self.client.patch(
                 "/api/v1/fan-control/nodes/node-1/settings",
                 json={"mode": "curve", "active_settings": curve, "expected_mode": "pid"},
@@ -95,8 +99,28 @@ class FanControlApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rejected.status_code, 403)
         self.assertEqual(extra.status_code, 400)
+        self.assertEqual(invalid_expected_mode.status_code, 400)
         self.assertEqual(accepted.status_code, 200)
         update.assert_awaited_once_with("node-1", "curve", curve, "pid")
+
+    async def test_node_settings_preserve_mode_conflicts_as_http_409(self) -> None:
+        curve = {
+            "curve_points": [[30, 20], [60, 55]],
+            "curve_min_temp": 30,
+            "curve_max_temp": 80,
+            "min_floor_pct": 20,
+        }
+        update = AsyncMock(side_effect=FanSettingsConflict(
+            "fan mode changed; refresh and try again",
+        ))
+        with patch.object(server.manager, "update_node_fan_settings", update):
+            response = await self.client.patch(
+                "/api/v1/fan-control/nodes/node-1/settings",
+                json={"mode": "curve", "active_settings": curve, "expected_mode": "pid"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("fan mode changed", response.text)
 
     async def test_agent_routes_require_auth_and_report_stale_state(self) -> None:
         local = Mock(side_effect=FanSettingsConflict("FanController state is unavailable"))
@@ -169,6 +193,11 @@ class FanControlApiTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(server.manager, "update_fan_settings", update),
         ):
+            invalid_expected_mode = await self.client.patch(
+                "/api/agent/fan-control/settings",
+                headers={"authorization": "Bearer paired"},
+                json={"mode": "curve", "active_settings": curve, "expected_mode": {}},
+            )
             accepted = await self.client.patch(
                 "/api/agent/fan-control/settings",
                 headers={"authorization": "Bearer paired"},
@@ -176,6 +205,7 @@ class FanControlApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(invalid_expected_mode.status_code, 400)
         self.assertEqual(accepted.status_code, 200)
         update.assert_called_once_with("curve", curve, "curve")
 

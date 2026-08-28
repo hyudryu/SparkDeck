@@ -609,6 +609,8 @@ async def agent_update_fan_settings(req: Request):
             raise ValueError(
                 "request body must contain only mode, active_settings, and expected_mode"
             )
+        if not isinstance(body["expected_mode"], str):
+            raise ValueError("expected_mode must be a string")
         return manager.update_fan_settings(
             body["mode"], body["active_settings"], body["expected_mode"],
         )
@@ -2035,6 +2037,8 @@ async def update_fan_control_settings(node_id: str, req: Request):
             raise ValueError(
                 "request body must contain only mode, active_settings, and expected_mode"
             )
+        if not isinstance(body["expected_mode"], str):
+            raise ValueError("expected_mode must be a string")
         return await manager.update_node_fan_settings(
             node_id, body["mode"], body["active_settings"], body["expected_mode"],
         )

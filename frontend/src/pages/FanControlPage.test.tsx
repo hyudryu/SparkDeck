@@ -135,6 +135,137 @@ describe('FanControlPage', () => {
     expect(await screen.findByText('Fan curve saved.')).toBeInTheDocument()
   })
 
+  it('disables every curve editor while a save is in flight', async () => {
+    let resolvePatch!: (response: Response) => void
+    const submittedCurve = {
+      ...settings.settings.curve,
+      curve_points: [[30, 20], [55, 51], [80, 100]],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'PATCH') {
+        return new Promise<Response>((resolve) => { resolvePatch = resolve })
+      }
+      return json(overview)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    const point = await screen.findByRole('button', { name: 'Move point 2, 55 degrees, 50 percent' })
+    fireEvent.keyDown(point, { key: 'ArrowUp' })
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 fan duty' })).toHaveValue(51)
+    await user.click(screen.getByRole('button', { name: 'Save curve' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/fan-control/nodes/node%2F1/settings', expect.anything()))
+
+    const savingPoint = screen.getByRole('button', { name: 'Move point 2, 55 degrees, 51 percent' })
+    expect(savingPoint).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('combobox', { name: 'FanController node' })).toBeDisabled()
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 temperature' })).toBeDisabled()
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 fan duty' })).toBeDisabled()
+    fireEvent.keyDown(savingPoint, { key: 'ArrowUp' })
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 fan duty' })).toHaveValue(51)
+
+    await act(async () => {
+      resolvePatch(json({
+        node_id: 'node/1', mode: 'curve', previous_mode: 'curve', active_settings: submittedCurve,
+      }))
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('Fan curve saved.')).toBeInTheDocument()
+  })
+
+  it('reports inactive-curve activation only after matching newer telemetry', async () => {
+    let overviewRequests = 0
+    const submittedCurve = {
+      ...settings.settings.curve,
+      curve_points: [[30, 20], [55, 51], [80, 100]],
+    }
+    const transitionalNode = {
+      ...overview.nodes[1],
+      fan: { ...overview.nodes[1].fan, ts: overview.nodes[1].fan.ts + 1 },
+      settings: {
+        ...overview.nodes[1].settings,
+        settings: { ...overview.nodes[1].settings.settings, curve: submittedCurve },
+      },
+    }
+    const activatedNode = {
+      ...transitionalNode,
+      fan: {
+        ...transitionalNode.fan,
+        mode: 'curve' as const,
+        active_settings: submittedCurve,
+        ts: overview.nodes[1].fan.ts + 2,
+      },
+      settings: { ...transitionalNode.settings, mode: 'curve' as const },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'PATCH') return json({
+        node_id: 'node-2', mode: 'curve', previous_mode: 'pid', active_settings: submittedCurve,
+      })
+      overviewRequests += 1
+      if (overviewRequests === 1) return json(overview)
+      if (overviewRequests === 2) return json({ available: true, nodes: [overview.nodes[0], transitionalNode] })
+      return json({ available: true, nodes: [overview.nodes[0], activatedNode] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'FanController node' }), 'node-2')
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Move point 2, 55 degrees, 50 percent' }), { key: 'ArrowUp' })
+    await user.click(screen.getByRole('button', { name: 'Save and activate curve' }))
+
+    expect(await screen.findByText('Fan curve configuration saved. Waiting for activation telemetry…')).toBeInTheDocument()
+    await waitFor(() => expect(overviewRequests).toBe(2))
+    expect(screen.queryByText('Fan curve saved and activation confirmed.')).not.toBeInTheDocument()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText('Fan curve saved and activation confirmed.')).toBeInTheDocument()
+  })
+
+  it('surfaces newer telemetry that never activates the saved curve', async () => {
+    let overviewRequests = 0
+    const submittedCurve = {
+      ...settings.settings.curve,
+      curve_points: [[30, 20], [55, 51], [80, 100]],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'PATCH') return json({
+        node_id: 'node-2', mode: 'curve', previous_mode: 'pid', active_settings: submittedCurve,
+      })
+      overviewRequests += 1
+      if (overviewRequests === 1) return json(overview)
+      return json({
+        available: true,
+        nodes: [overview.nodes[0], {
+          ...overview.nodes[1],
+          fan: { ...overview.nodes[1].fan, ts: overview.nodes[1].fan.ts + overviewRequests - 1 },
+          settings: {
+            ...overview.nodes[1].settings,
+            settings: { ...overview.nodes[1].settings.settings, curve: submittedCurve },
+          },
+        }],
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'FanController node' }), 'node-2')
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Move point 2, 55 degrees, 50 percent' }), { key: 'ArrowUp' })
+    await user.click(screen.getByRole('button', { name: 'Save and activate curve' }))
+    await waitFor(() => expect(overviewRequests).toBe(2))
+
+    for (const expectedRequests of [3, 4]) {
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled())
+      await user.click(screen.getByRole('button', { name: 'Refresh' }))
+      await waitFor(() => expect(overviewRequests).toBe(expectedRequests))
+    }
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('curve mode activation was not confirmed')
+  })
+
   it('keeps an unsaved curve draft when live polling returns older settings', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json(overview))
     vi.stubGlobal('fetch', fetchMock)

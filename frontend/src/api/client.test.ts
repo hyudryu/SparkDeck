@@ -35,6 +35,46 @@ describe('API client adapters', () => {
     await result
   })
 
+  it('does not time out a long-running deployment launch', async () => {
+    vi.useFakeTimers()
+    let finishRequest: ((response: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => new Promise((resolve) => {
+      finishRequest = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = api.deployments.create({
+      alias: 'slow-model', model_id: 'org/model', runtime: 'vllm', managed: true,
+      settings: { context_length: 16_384 }, node_ids: ['local'], deployment_mode: 'single',
+    })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    finishRequest?.(new Response(JSON.stringify({
+      id: 'dep-slow', alias: 'slow-model', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'running', settings: {},
+    }), { status: 201, headers: { 'Content-Type': 'application/json' } }))
+    await expect(result).resolves.toEqual(expect.objectContaining({ id: 'dep-slow', status: 'running' }))
+  })
+
+  it('does not time out a long-running image pull', async () => {
+    vi.useFakeTimers()
+    let finishRequest: ((response: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => new Promise((resolve) => {
+      finishRequest = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = api.images.pull('vllm/vllm-openai:v1', ['local'])
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    finishRequest?.(new Response(JSON.stringify({
+      ok: true, image: 'vllm/vllm-openai:v1', node_ids: ['local'], results: [],
+    }), { status: 201, headers: { 'Content-Type': 'application/json' } }))
+    await expect(result).resolves.toEqual(expect.objectContaining({ ok: true, node_ids: ['local'] }))
+  })
+
   it('updates a node fan override with an encoded ID and boolean body', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ node_id: 'node/1', enabled: true }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

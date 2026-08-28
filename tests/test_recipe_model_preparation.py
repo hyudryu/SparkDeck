@@ -180,7 +180,7 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["transfer_target_node_ids"], ["empty"])
         self.assertEqual(plan["source"]["node_id"], "source")
 
-    async def test_no_source_prefers_cached_seed_and_resumes_other_cached_nodes(self):
+    async def test_no_source_uses_empty_seed_and_resumes_cached_nodes_independently(self):
         manager = planning_manager(preparation_preflight([
             target("empty-a"),
             target("partial", has_model_cache=True),
@@ -194,13 +194,50 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(plan["eligible"])
-        self.assertEqual(plan["download_node_id"], "partial")
+        self.assertEqual(plan["download_node_id"], "empty-a")
         self.assertEqual(
-            plan["download_node_ids"], ["partial", "wrong-revision"],
+            plan["download_node_ids"], [
+                "empty-a", "partial", "wrong-revision",
+            ],
         )
         self.assertEqual(
-            plan["transfer_target_node_ids"], ["empty-a", "empty-b"],
+            plan["transfer_target_node_ids"], ["empty-b"],
         )
+
+    async def test_other_revision_job_blocks_without_being_adopted(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker", "name": "Worker", "online": True,
+            "cache_free_size": AMPLE_BYTES, "models": [],
+        }])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.estimate_download_size = AsyncMock(
+            return_value=MODEL_BYTES,
+        )
+        manager.virtual_nas_transfers = Mock(return_value={"items": [{
+            "id": "revision-a-job", "model_id": MODEL_ID,
+            "target_node_id": "worker", "revision": "revision-a",
+            "status": "running",
+        }]})
+
+        conflict = await manager.virtual_nas_transfer_preflight(
+            MODEL_ID, "revision-b",
+        )
+        exact = await manager.virtual_nas_transfer_preflight(
+            MODEL_ID, "revision-a",
+        )
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, "revision-b", ["worker"],
+        )
+
+        conflicting_target = conflict["targets"][0]
+        self.assertFalse(conflicting_target["download_eligible"])
+        self.assertIn("Another revision", conflicting_target["download_reason"])
+        self.assertIsNone(conflicting_target["active_job_id"])
+        self.assertEqual(exact["targets"][0]["active_job_id"], "revision-a-job")
+        self.assertFalse(plan["eligible"])
+        self.assertIn("Another revision", plan["reason"])
 
     async def test_insufficient_or_unknown_authoritative_capacity_blocks(self):
         required = MODEL_BYTES * 2 + TRANSFER_STAGING_RESERVE_BYTES

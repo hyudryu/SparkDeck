@@ -1457,6 +1457,7 @@ class Manager:
         required_revision = validate_revision(revision)
         nodes = await self.model_cache_inventory()
         active_jobs = {}
+        conflicting_jobs = {}
         for job in self.virtual_nas_transfers()["items"]:
             if (
                 job.get("model_id") != model_id
@@ -1466,9 +1467,12 @@ class Manager:
             try:
                 job_revision = validate_revision(job.get("revision"))
             except ValueError:
+                conflicting_jobs[job["target_node_id"]] = job
                 continue
             if job_revision == required_revision:
                 active_jobs[job["target_node_id"]] = job
+            else:
+                conflicting_jobs[job["target_node_id"]] = job
         sources = []
         for node in nodes:
             if not node.get("online"):
@@ -1521,6 +1525,11 @@ class Manager:
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
             active = active_jobs.get(node_id)
+            conflicting = conflicting_jobs.get(node_id)
+            conflict_reason = (
+                "Another revision of this model is already being prepared"
+                if conflicting else None
+            )
             has_required_weights = bool(existing and not existing.get("partial") and (
                 required_revision in (existing.get("revisions") or [])
             ))
@@ -1544,6 +1553,9 @@ class Manager:
             elif active is not None:
                 eligible = False
                 reason = f"Transfer already {active['status']}"
+            elif conflicting is not None:
+                eligible = False
+                reason = conflict_reason
             elif free_bytes is None:
                 eligible = False
                 reason = "Free cache capacity is unavailable"
@@ -1570,6 +1582,9 @@ class Manager:
             elif active is not None:
                 download_eligible = False
                 download_reason = f"Model preparation already {active['status']}"
+            elif conflicting is not None:
+                download_eligible = False
+                download_reason = conflict_reason
             elif free_bytes is None:
                 download_eligible = False
                 download_reason = "Free cache capacity is unavailable"
@@ -1594,6 +1609,9 @@ class Manager:
             elif active is not None:
                 transfer_after_download_eligible = False
                 transfer_after_download_reason = f"Model preparation already {active['status']}"
+            elif conflicting is not None:
+                transfer_after_download_eligible = False
+                transfer_after_download_reason = conflict_reason
             elif free_bytes is None:
                 transfer_after_download_eligible = False
                 transfer_after_download_reason = "Free cache capacity is unavailable"
@@ -1610,6 +1628,8 @@ class Manager:
                 "active_job_id": active.get("id") if active else None,
                 "active_job_status": active.get("status") if active else None,
                 "active_job_kind": active.get("kind") if active else None,
+                "has_preparation_conflict": conflicting is not None,
+                "preparation_conflict_reason": conflict_reason,
                 "has_required_weights": has_required_weights,
                 "has_model_cache": existing is not None,
                 "download_eligible": download_eligible,
@@ -1682,6 +1702,11 @@ class Manager:
                     download_ids.append(node_id)
                     if option.get("active_job_id"):
                         blocked_reasons.append("Model preparation is already active")
+                    elif option.get("has_preparation_conflict"):
+                        blocked_reasons.append(
+                            option.get("preparation_conflict_reason")
+                            or "Another revision of this model is already being prepared"
+                        )
                     elif download_error or download_required is None:
                         blocked_reasons.append(
                             download_error or "Hugging Face download size is unavailable"
@@ -1696,6 +1721,11 @@ class Manager:
                 transfer_ids.append(node_id)
                 if option.get("active_job_id"):
                     blocked_reasons.append("Model preparation is already active")
+                elif option.get("has_preparation_conflict"):
+                    blocked_reasons.append(
+                        option.get("preparation_conflict_reason")
+                        or "Another revision of this model is already being prepared"
+                    )
                 elif free_bytes is None:
                     blocked_reasons.append("Free cache capacity is unavailable")
                 elif free_bytes < transfer_required:
@@ -1743,13 +1773,15 @@ class Manager:
         chosen = None
         chosen_download_ids: list[str] = []
         chosen_transfer_ids: list[str] = []
-        candidate_ids = sorted(
-            selected_ids,
-            key=lambda node_id: (
-                not options[node_id].get("has_model_cache"),
-                selected_ids.index(node_id),
-            ),
-        )
+        empty_candidate_ids = [
+            node_id for node_id in selected_ids
+            if not options[node_id].get("has_model_cache")
+        ]
+        # A cached seed's export contains its whole repository, including
+        # other revisions and blobs that are absent from the Hub estimate for
+        # this revision. Use a cache-empty seed whenever fan-out is needed so
+        # target sizing remains tied to the requested snapshot size.
+        candidate_ids = empty_candidate_ids or selected_ids
         for candidate_id in candidate_ids:
             download_ids = [
                 candidate_id,
@@ -1768,6 +1800,11 @@ class Manager:
                 target_free = self._byte_count(target.get("free_bytes"))
                 if target.get("active_job_id"):
                     blocked.append("Model preparation is already active")
+                elif target.get("has_preparation_conflict"):
+                    blocked.append(
+                        target.get("preparation_conflict_reason")
+                        or "Another revision of this model is already being prepared"
+                    )
                 elif target_free is None:
                     blocked.append("Free cache capacity is unavailable")
                 elif target_free < download_required:
@@ -1777,6 +1814,11 @@ class Manager:
                 target_free = self._byte_count(target.get("free_bytes"))
                 if target.get("active_job_id"):
                     blocked.append("Model preparation is already active")
+                elif target.get("has_preparation_conflict"):
+                    blocked.append(
+                        target.get("preparation_conflict_reason")
+                        or "Another revision of this model is already being prepared"
+                    )
                 elif target_free is None:
                     blocked.append("Free cache capacity is unavailable")
                 elif target_free < transfer_required:

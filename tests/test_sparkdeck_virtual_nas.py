@@ -501,7 +501,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "Free cache capacity is unavailable",
         )
 
-    async def test_recipe_transfer_preflight_ignores_active_job_for_other_revision(self):
+    async def test_recipe_transfer_preflight_blocks_but_does_not_adopt_other_revision(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}
         required = 20 * 2 + 64 * 1024 * 1024
@@ -529,8 +529,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         result = await manager.virtual_nas_transfer_preflight("org/model", "rev-b")
         target = next(item for item in result["targets"] if item["node_id"] == "target")
 
-        self.assertTrue(target["eligible"])
-        self.assertTrue(target["download_eligible"])
+        self.assertFalse(target["eligible"])
+        self.assertFalse(target["download_eligible"])
+        self.assertIn("Another revision", target["reason"])
         self.assertIsNone(target["active_job_id"])
 
     async def test_manager_refuses_active_container_then_deletes_exact_cache(self):

@@ -478,6 +478,8 @@ export interface StorageTransferPreflightTarget {
   active_job_id?: string | null
   active_job_status?: string | null
   active_job_kind?: string | null
+  has_preparation_conflict?: boolean
+  preparation_conflict_reason?: string | null
   has_required_weights?: boolean
   has_model_cache?: boolean
   download_eligible?: boolean

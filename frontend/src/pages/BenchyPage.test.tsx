@@ -185,4 +185,25 @@ describe('BenchyPage', () => {
     const csv = screen.getByRole('link', { name: 'Download CSV' })
     expect(csv).toHaveAttribute('href', '/api/v1/benchy/runs/run-1/csv')
   })
+
+  it('keeps response sizes as separate chart series instead of overwriting points', async () => {
+    const multiResponse = {
+      ...completedRun,
+      results: [
+        { ...completedRun.results[0], response_size: 64, tg_tokens_per_second: 44.0, tg_tokens_per_second_request: 44.0 },
+        { ...completedRun.results[0], response_size: 128 },
+      ],
+    }
+    stubFetch({ runDetail: multiResponse })
+    const user = userEvent.setup()
+    renderPage()
+
+    const history = await screen.findByRole('table', { name: 'Benchmark run history' })
+    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2'))
+
+    expect(await screen.findAllByText('C1 · 64 tok').then((items) => items.length)).toBeGreaterThan(0)
+    expect(screen.getAllByText('C1 · 128 tok').length).toBeGreaterThan(0)
+    // 3 charts × 2 series = 6 measured points, none overwritten.
+    expect(document.querySelectorAll('.chart-series circle').length).toBe(6)
+  })
 })

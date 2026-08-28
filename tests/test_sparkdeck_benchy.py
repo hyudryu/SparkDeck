@@ -103,6 +103,9 @@ class FakeSparkdeck:
         self.store.deployment = Mock(return_value=stored)
         self.models = AsyncMock(return_value={"data": []})
 
+    def _get_credential(self, deployment_id, credential_ref):
+        return "secret-key" if credential_ref == "cred-1" else None
+
 
 class FakeFinishedProcess:
     def __init__(self, returncode=0):
@@ -169,6 +172,26 @@ class ValidateConfigTests(unittest.TestCase):
         ):
             with self.assertRaises(BenchyError, msg=str(body)):
                 self.service._validate_config(body)
+
+    def test_requires_at_least_one_measured_run(self):
+        with self.assertRaises(BenchyError):
+            self.service._validate_config({"model_id": "m", "runs": 0})
+        config = self.service._validate_config(
+            {"model_id": "m", "runs": 1, "warmup_runs": 0}
+        )
+        self.assertEqual(config["runs"], 1)
+        self.assertEqual(config["warmup_runs"], 0)
+
+    def test_requires_boolean_exact_tg(self):
+        for bad in ("false", "true", 1):
+            with self.assertRaises(BenchyError, msg=str(bad)):
+                self.service._validate_config({"model_id": "m", "exact_tg": bad})
+        self.assertFalse(
+            self.service._validate_config({"model_id": "m"})["exact_tg"]
+        )
+        self.assertTrue(
+            self.service._validate_config({"model_id": "m", "exact_tg": True})["exact_tg"]
+        )
 
     def test_rejects_explosive_shape_combinations(self):
         body = {
@@ -259,6 +282,19 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
         self.assertEqual(models[0]["model"], "org/model")
         self.assertEqual(models[0]["quantization"], "FP8")
+
+    async def test_keyed_deployment_resolves_credential_internally(self):
+        sparkdeck = FakeSparkdeck(stored={
+            "id": "dep-1", "kind": "external",
+            "_base_url": "http://10.0.0.9:8000", "_credential_ref": "cred-1",
+        })
+        sparkdeck.models = AsyncMock(return_value={"data": [{
+            "id": "org/model", "runtime": "vllm", "deployment_id": "dep-1",
+            "model": {"repository": "org/model", "quantization": None},
+        }]})
+        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        models = await service.served_models()
+        self.assertEqual(models[0]["_api_key"], "secret-key")
 
     async def test_managed_deployment_uses_local_port(self):
         sparkdeck = FakeSparkdeck(stored={"id": "dep-2", "kind": "managed", "_base_url": None})
@@ -382,6 +418,117 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service.delete_run(first["id"])
         self.assertEqual(service.list_runs(), [])
 
+    async def test_concurrent_starts_start_only_one_run(self):
+        service = self._service()
+
+        async def fake_spawn(run):
+            run.pop("_argv")
+            process = FakeLiveProcess()
+            service._processes[run["id"]] = process
+            return process
+
+        with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
+                patch.object(service, "served_models", AsyncMock(return_value=[_target()])), \
+                patch.object(service, "_spawn", AsyncMock(side_effect=fake_spawn)):
+            results = await asyncio.gather(
+                service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"}),
+                service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"}),
+                return_exceptions=True,
+            )
+            started = [item for item in results if not isinstance(item, Exception)]
+            errors = [item for item in results if isinstance(item, BenchyError)]
+            self.assertEqual(len(started), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("already in progress", str(errors[0]))
+
+            await service.cancel_run(started[0]["id"])
+            await _wait_terminal(service, started[0]["id"])
+            service.delete_run(started[0]["id"])
+
+    async def test_monitor_cancellation_terminates_child(self):
+        service = self._service()
+        run_id = "20260101-000000-cancel"
+        run_dir = Path(self.temp.name) / "benchy" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        run = {
+            "id": run_id, "status": "running",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": None, "duration_seconds": None,
+            "config": {"runs": 3, "warmup_runs": 1, "exact_tg": False},
+            "error": None, "progress": {"requests_done": 0, "requests_failed": 0},
+            "results": [], "result_count": 0, "csv_filename": None, "report": None,
+        }
+        process = FakeLiveProcess()
+        service._processes[run_id] = process
+        task = asyncio.create_task(service._monitor_run(run, run_dir))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertIsNotNone(process.returncode, "child must not survive cancellation")
+        self.assertNotIn(run_id, service._processes)
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("interrupted", run["error"])
+        persisted = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+
+    async def test_api_key_reaches_argv_but_not_persisted_state(self):
+        service = self._service()
+        keyed_target = {**_target(), "_api_key": "secret-key"}
+
+        async def fake_spawn(run):
+            run.pop("_argv")
+            run_dir = Path(run["_run_dir"])
+            (run_dir / "report.json").write_text(
+                json.dumps(_report_payload()), encoding="utf-8")
+            process = FakeFinishedProcess(returncode=0)
+            service._processes[run["id"]] = process
+            return process
+
+        with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
+                patch.object(service, "served_models", AsyncMock(return_value=[keyed_target])), \
+                patch.object(service, "_spawn", AsyncMock(side_effect=fake_spawn)):
+            started = await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
+            await _wait_terminal(service, started["id"])
+
+        run = service.get_run(started["id"])
+        self.assertEqual(run["status"], "completed")
+        # The key never reaches the API-visible run, the history list, or disk.
+        self.assertNotIn("secret-key", str(run))
+        self.assertNotIn("secret-key", str(service.list_runs()))
+        state = (service.runs_dir / started["id"] / "state.json").read_text(encoding="utf-8")
+        self.assertNotIn("secret-key", state)
+        service.delete_run(started["id"])
+
+    def test_build_argv_includes_api_key_only_when_present(self):
+        service = self._service()
+        detection = _installed()
+        target = _target()
+        run = {"config": service._validate_config({"model_id": target["id"]})}
+        argv = service._build_argv(run, target, Path("unused"), detection)
+        self.assertNotIn("--api-key", argv)
+        run["_api_key"] = "secret-key"
+        argv = service._build_argv(run, target, Path("unused"), detection)
+        self.assertEqual(argv[argv.index("--api-key") + 1], "secret-key")
+
+    async def test_delete_failure_keeps_run_recorded(self):
+        service = self._service()
+        run_id = "20260101-000000-stuck"
+        run_dir = Path(self.temp.name) / "benchy" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        service.runs[run_id] = {
+            "id": run_id, "status": "completed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "config": {"runs": 1, "warmup_runs": 0, "exact_tg": False},
+        }
+        with patch("sparkdeck.benchy.shutil.rmtree", side_effect=OSError("file busy")):
+            with self.assertRaises(OSError):
+                service.delete_run(run_id)
+        self.assertIn(run_id, service.runs)
+        self.assertEqual(service.list_runs()[0]["id"], run_id)
+
     async def test_unknown_model_is_rejected(self):
         service = self._service()
         with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
@@ -486,6 +633,14 @@ class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/api/v1/benchy/models")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["items"][0]["id"], "unsloth/Qwen3-4B-GGUF")
+
+    async def test_models_list_strips_internal_credential_fields(self):
+        served = AsyncMock(return_value=[{**_target(), "_api_key": "secret-key"}])
+        with patch.object(self.server.benchy, "served_models", served):
+            response = await self.client.get("/api/v1/benchy/models")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("secret-key", response.text)
+        self.assertNotIn("_api_key", response.text)
 
     async def test_start_run_passes_body_through(self):
         started = AsyncMock(return_value={"id": "run-1", "status": "running"})

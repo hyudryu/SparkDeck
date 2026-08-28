@@ -2450,7 +2450,11 @@ async def v1_benchy_install():
 
 @app.get("/api/v1/benchy/models")
 async def v1_benchy_models():
-    return {"items": await benchy.served_models()}
+    items = [
+        {key: value for key, value in model.items() if not key.startswith("_")}
+        for model in await benchy.served_models()
+    ]
+    return {"items": items}
 
 
 @app.post("/api/v1/benchy/runs", status_code=202)
@@ -2496,6 +2500,8 @@ async def v1_benchy_delete_run(run_id: str):
         raise HTTPException(404, str(exc)) from exc
     except BenchyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not delete benchmark run files: {exc}") from exc
     return {"ok": True, "id": run_id}
 
 

@@ -43,6 +43,7 @@ class BenchyService:
         self.runs: dict[str, dict[str, Any]] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._install_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
         self._detect_cache: dict[str, Any] | None = None
         for state_path in sorted(self.runs_dir.glob("*/state.json")):
             run = self._load_state(state_path)
@@ -191,6 +192,12 @@ class BenchyService:
                 base_url = f"http://127.0.0.1:{int(port)}"
         if not base_url:
             return None
+        # Keyed deployments need the stored credential or every benchmark
+        # request would fail authentication, unlike the proxied inference path.
+        # Underscore-prefixed: stripped from the public /models response.
+        api_key = self.sparkdeck._get_credential(
+            deployment_id, stored.get("_credential_ref")
+        )
         identity = entry.get("model") or {}
         return {
             "id": entry["id"],
@@ -200,11 +207,18 @@ class BenchyService:
             "model": identity.get("repository") or entry["id"],
             "quantization": identity.get("quantization"),
             "base_url": base_url,
+            "_api_key": api_key,
         }
 
     # ---------- run lifecycle ----------
 
     async def start_run(self, body: dict[str, Any]) -> dict[str, Any]:
+        # Serialize check-through-registration so two concurrent requests cannot
+        # both pass the active-run probe before either is recorded.
+        async with self._start_lock:
+            return await self._start_run_locked(body)
+
+    async def _start_run_locked(self, body: dict[str, Any]) -> dict[str, Any]:
         detection = await self.detect()
         if not detection.get("installed"):
             raise BenchyError("llama-benchy is not installed")
@@ -248,6 +262,9 @@ class BenchyService:
         }
         self.runs[run_id] = run
         self._save_state(run)
+        # The credential must reach the subprocess but never the persisted or
+        # API-visible state (underscore keys are stripped from both).
+        run["_api_key"] = target.get("_api_key")
         argv = self._build_argv(run, target, run_dir, detection)
         run["_argv"] = argv
         run["_run_dir"] = str(run_dir)
@@ -273,6 +290,9 @@ class BenchyService:
             "--save-result", str(run_dir / "report.json"),
             "--emit-progress", str(run_dir / "progress.jsonl"),
         ]
+        api_key = run.get("_api_key")
+        if api_key:
+            argv += ["--api-key", api_key]
         if config.get("exact_tg"):
             argv.append("--exact-tg")
         return argv
@@ -354,6 +374,16 @@ class BenchyService:
             run.pop("_run_dir", None)
             self._save_state(run)
         except asyncio.CancelledError:
+            # Shutdown cancels this monitor; the subprocess must not survive it
+            # and keep pushing benchmark traffic after the replacement service
+            # has marked the run failed. Finish the cleanup, then propagate.
+            process = self._processes.pop(run_id, None)
+            if process is not None:
+                await _stop_process(process)
+            run["status"] = "failed"
+            run["error"] = "benchmark interrupted by SparkDeck shutdown"
+            run["finished_at"] = _utcnow()
+            self._save_state(run)
             raise
         except Exception as exc:  # defensive: monitoring must never crash the server
             run["status"] = "failed"
@@ -416,8 +446,11 @@ class BenchyService:
             raise LookupError("benchmark run not found")
         if run["status"] in RUN_ACTIVE_STATES:
             raise BenchyError("cancel the running benchmark before deleting it")
+        # Remove the files before dropping the in-memory record: if removal
+        # fails the record must stay consistent with what is on disk, or the
+        # run would reappear from the surviving state.json after a restart.
+        shutil.rmtree(self.runs_dir / run_id)
         self.runs.pop(run_id, None)
-        shutil.rmtree(self.runs_dir / run_id, ignore_errors=True)
 
     def csv_path(self, run_id: str) -> Path:
         run = self.runs.get(run_id)
@@ -471,9 +504,11 @@ class BenchyService:
         depths = _positive_list(
             body.get("context_depths"), "context_depths", [0], allow_zero=True,
         )
-        runs = _bounded_int(body.get("runs"), "runs", default=3, maximum=10)
+        runs = _bounded_int(body.get("runs"), "runs", default=3, maximum=10, minimum=1)
         warmup = _bounded_int(body.get("warmup_runs"), "warmup_runs", default=1, maximum=10)
-        exact_tg = bool(body.get("exact_tg", False))
+        exact_tg_value = body.get("exact_tg", False)
+        if not isinstance(exact_tg_value, bool):
+            raise BenchyError("exact_tg must be a boolean")
         shapes = len(prompt_sizes) * len(response_sizes) * len(concurrency) * len(depths)
         if shapes > 256:
             raise BenchyError(
@@ -487,7 +522,7 @@ class BenchyService:
             "context_depths": depths,
             "runs": runs,
             "warmup_runs": warmup,
-            "exact_tg": exact_tg,
+            "exact_tg": exact_tg_value,
         }
 
     def _load_state(self, state_path: Path) -> dict[str, Any] | None:
@@ -510,6 +545,24 @@ class BenchyService:
 
 
 # ---------- pure helpers (module level for testability) ----------
+
+
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate then, if needed, kill a child; always reap it."""
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 def _flatten_report(run: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -629,13 +682,15 @@ def _positive_list(
     return numbers
 
 
-def _bounded_int(value: Any, name: str, default: int, maximum: int) -> int:
+def _bounded_int(
+    value: Any, name: str, default: int, maximum: int, minimum: int = 0,
+) -> int:
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int):
         raise BenchyError(f"{name} must be an integer")
-    if not 0 <= value <= maximum:
-        raise BenchyError(f"{name} must be between 0 and {maximum}")
+    if not minimum <= value <= maximum:
+        raise BenchyError(f"{name} must be between {minimum} and {maximum}")
     return value
 
 

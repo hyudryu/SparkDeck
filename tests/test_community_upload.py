@@ -64,6 +64,11 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value="server-id-token"),
         )
         self.mint = self.mint_patch.start()
+        self.enrich_patch = patch.object(
+            server.sparkdeck, "enrich_community_aggregates",
+            AsyncMock(side_effect=lambda items: items),
+        )
+        self.enrich_patch.start()
         token = "aggregate-browser-session"
         server._community_browser_sessions[token] = (
             "user-sub-123", time.time() + 3600,
@@ -77,6 +82,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.aclose()
         self.mint_patch.stop()
+        self.enrich_patch.stop()
         self.get_setting_patch.stop()
         server._community_browser_sessions.clear()
 
@@ -88,9 +94,11 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={
                 "items": [{
                     "model_id": "org/model",
-                    "context_window_size": 4096,
+                    "quantization": "Q4_K_M",
+                    "prompt_tokens_bucket": 400,
                     "inference_tokens_per_second": 42.5,
                     "sample_count": 12,
+                    "unique_cluster_count": 3,
                 }],
                 "availability": "ok",
                 "evidence_policy": {"minimum_samples": 10},
@@ -104,7 +112,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "ok")
         self.assertEqual(response.json()["items"][0]["model_id"], "org/model")
-        self.assertEqual(str(seen[0].url), "https://community.example/v1/aggregates")
+        self.assertEqual(str(seen[0].url), "https://community.example/v2/aggregates")
         self.assertEqual(seen[0].headers["authorization"], "Bearer server-id-token")
         self.mint.assert_awaited_once_with("refresh-1")
 
@@ -142,7 +150,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={
                 "items": [{
                     "model_id": "org/model",
-                    "context_window_size": "4096",
+                    "prompt_tokens_bucket": "400",
                     "inference_tokens_per_second": 42.5,
                     "sample_count": 12,
                 }],
@@ -200,7 +208,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         server._community_upload_not_before = 0.0
 
     def configure(self, consent=True, paired=True):
-        self.store.set_setting("community_consent", consent)
+        self.store.set_community_consent(consent)
         if paired:
             self.store.set_setting("device_pairing", {
                 "status": "paired", "sub": "user-sub-123",
@@ -240,14 +248,19 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         uploads = self.sample_requests()
         self.assertEqual(len(uploads), 1)
         self.assertEqual(
-            str(uploads[0].url), "https://community.example/v1/samples")
+            str(uploads[0].url), "https://community.example/v2/samples")
         self.assertEqual(
             uploads[0].headers["authorization"], "Bearer id-1")
         self.assertEqual(uploads[0].headers["idempotency-key"], "sample-1")
         self.assertEqual(json.loads(uploads[0].content), {
             "model_id": "org/model",
-            "context_window_size": 4096,
+            "quantization": "UNKNOWN",
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 300.0,
+            "concurrency": 1,
+            "telemetry_cluster_id": self.store.get_setting(
+                "telemetry_cluster_id"
+            ),
         })
 
     async def test_transport_errors_leave_samples_pending(self):

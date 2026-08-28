@@ -305,15 +305,25 @@ class UpdateService:
         except OSError:
             pass
 
+    @staticmethod
+    def _reconcile_local_node_success(state: dict, revision: str) -> bool:
+        for node in state.get("nodes", []):
+            if node.get("local"):
+                changed = (
+                    node.get("phase") != "succeeded"
+                    or node.get("current_revision") != revision
+                    or "error" in node
+                )
+                node.update(phase="succeeded", current_revision=revision)
+                node.pop("error", None)
+                return changed
+        return False
+
     def agent_status(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.agent_path)
         if state.get("phase") in {"accepted", "staging", "restarting"}:
-            if revision and revision == state.get("target_revision"):
-                state["phase"] = "succeeded"
-                state["message"] = "Updated and restarted successfully"
-                self._write(self.agent_path, state)
-            elif not _helper_alive(state):
+            if not _helper_alive(state):
                 state["phase"] = "failed"
                 state["error"] = "The local update helper was interrupted"
                 state["message"] = "Interrupted update can be retried"
@@ -426,11 +436,23 @@ class UpdateService:
     async def overview(self) -> dict:
         revision = current_revision(self.root)
         state = self._read(self.cluster_path)
+        agent_state = self._read(self.agent_path)
         task_live = self._task is not None and not self._task.done()
+        target_revision = state.get("target_revision")
+        controller_verified = bool(
+            revision
+            and revision == target_revision
+            and agent_state.get("phase") == "succeeded"
+            and agent_state.get("target_revision") == target_revision
+        )
+        completed_job_reconciled = False
+        if state.get("phase") == "succeeded" and controller_verified:
+            completed_job_reconciled = self._reconcile_local_node_success(state, revision)
         if state.get("active") and not task_live:
-            if state.get("phase") == "updating_controller" and revision == state.get("target_revision"):
+            if state.get("phase") == "updating_controller" and controller_verified:
+                self._reconcile_local_node_success(state, revision)
                 state.update(active=False, phase="succeeded", message="Cluster update completed")
-            elif state.get("phase") == "updating_controller" and _helper_alive(self._read(self.agent_path)):
+            elif state.get("phase") == "updating_controller" and _helper_alive(agent_state):
                 pass
             else:
                 changed = any(
@@ -444,6 +466,8 @@ class UpdateService:
                     error="The controller rollout task was interrupted",
                     message="Interrupted rollout can be retried",
                 )
+            self._write(self.cluster_path, state)
+        elif completed_job_reconciled:
             self._write(self.cluster_path, state)
         main_target, main_error = await self.resolve_main()
         nodes = await self.manager.cluster_nodes()

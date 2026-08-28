@@ -76,7 +76,7 @@ SparkDeck is under active development. The management API is not hardened for di
 ### Requirements
 
 - Python 3.11 or newer
-- Node.js 20 or newer with npm (for the web app build)
+- Node.js `^20.19.0` or `>=22.12.0` with npm (for the web app build)
 - Linux with Docker and the NVIDIA Container Toolkit for the recommended GPU-worker setup
 - Windows 10/11 with PowerShell 5.1 or newer for a native controller or UI node
 - Docker Desktop using its WSL2/Linux-container engine for experimental local-container actions on Windows
@@ -244,6 +244,12 @@ cp sparkdeck.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now sparkdeck.service
 ```
+
+SparkDeck automatically discovers Node installations managed by NVM, Volta,
+asdf, and fnm even though systemd does not load an interactive shell. For a
+custom installation, set `SPARKDECK_NODE_BIN=/absolute/path/to/node/bin` in
+`~/.config/sparkdeck/sparkdeck.env`; the directory must contain both `node` and
+`npm`.
 
 Adjust the template if your checkout lives elsewhere. Never place tokens directly in the committed unit file.
 

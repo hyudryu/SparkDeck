@@ -63,7 +63,12 @@ function finiteNumber(value: unknown): number | undefined {
 export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStats?: SystemStats) {
   const visibleOnline = nodes.filter((node) => node.hidden_from_dashboard !== true && node.online)
   const telemetry = nodes.length
-    ? visibleOnline.flatMap((node) => node.stats ? [{ id: node.id, stats: node.stats }] : [])
+    ? visibleOnline.flatMap((node) => {
+      const nodeStats = fallbackStats && (node.local || node.id === 'local')
+        ? fallbackStats
+        : node.stats
+      return nodeStats ? [{ id: node.id, stats: nodeStats }] : []
+    })
     : fallbackStats ? [{ id: 'entry-node', stats: fallbackStats }] : []
   let cpuTotal = 0; let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let allCpuCountsKnown = true
   let ramUsed = 0; let ramTotal = 0; let ramNodes = 0
@@ -133,7 +138,7 @@ export function DashboardPage() {
   const loading = [statsResource, admissionResource, deploymentsResource, syncResource, nodesResource]
     .some((item) => item.loading)
   const queueSummary = admission
-    ? `${queuedRequests} queued`
+    ? `${queuedRequests} queued${admissionResource.error ? ' · refresh paused' : ''}`
     : admissionResource.error ? 'queue unavailable' : 'queue loading'
   const inferenceStatus = runningSessions > 0
     ? 'running'
@@ -252,16 +257,17 @@ export function DashboardPage() {
                 <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{stats ? `${runningSessions} active` : 'Active sessions loading'} · {queueSummary}</p></div></div>
                 <Link className="text-link" to="/chat">Open chat</Link>
               </div>
-              {(statsResource.error && !stats) || (admissionResource.error && !admission) ? (
-                <EmptyState title="Inference status unavailable" description="Refresh to retry loading active sessions and queue pressure." />
-              ) : (!stats || !admission) && activeRequests.length === 0 ? (
-                <LoadingState label="Loading inference status" />
-              ) : activeRequests.length === 0 ? (
-                <EmptyState title="No active inference" description="Current sessions and queue pressure will appear here." />
-              ) : (
+              {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
+              {activeRequests.length > 0 ? (
                 <div className="dashboard-list">
                   {activeRequests.map(([model, request]) => <SessionRow key={model} model={model} request={request} />)}
                 </div>
+              ) : statsResource.error && !stats ? (
+                <EmptyState title="Active session status unavailable" description="Refresh to retry loading current inference sessions." />
+              ) : !stats ? (
+                <LoadingState label="Loading active sessions" />
+              ) : (
+                <EmptyState title="No active inference" description="Current sessions and queue pressure will appear here." />
               )}
               {queuedRequests > 0 && (
                 <div className="queue-note"><Gauge size={15} /><span><strong>{queuedRequests} queued</strong> · oldest wait {displayValue(Math.max(...Object.values(admission ?? {}).map((item) => item.oldest_wait_seconds ?? 0)), 's', 1)}</span></div>

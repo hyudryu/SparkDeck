@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import type { PointerEvent as ReactPointerEvent } from 'react'
 import { Fan, Gauge, RefreshCw, Thermometer, Wind } from 'lucide-react'
 import { api } from '../api/client'
 import type { FanControlNode, FanCurveSettings, FanControlMode } from '../api/types'
@@ -13,6 +14,25 @@ interface PendingFanOverride {
   enabled: boolean
   lastTelemetryTs: number
   mismatches: number
+}
+
+interface CurveDraft {
+  curve: FanCurveSettings
+  serverSignature: string
+  dirty: boolean
+  pendingSignature?: string
+}
+
+function cloneCurve(curve: FanCurveSettings): FanCurveSettings {
+  return { ...curve, curve_points: curve.curve_points.map((point) => [...point]) }
+}
+
+function curveSignature(curve: FanCurveSettings): string {
+  return JSON.stringify(curve)
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, value))
 }
 
 function valueOrDash(value: number | null | undefined, suffix = '') {
@@ -56,27 +76,51 @@ function ModeSettings({ node }: { node: FanControlNode }) {
   </dl>
 }
 
-function CurveChart({ curve, node }: { curve: FanCurveSettings; node: FanControlNode }) {
+function CurveChart({
+  curve,
+  node,
+  onPointChange,
+}: {
+  curve: FanCurveSettings
+  node: FanControlNode
+  onPointChange: (index: number, temperature: number, duty: number) => void
+}) {
   const chartId = node.node_id.replace(/[^a-zA-Z0-9_-]/g, '-')
-  const configuredPoints = curve.curve_points
-    .filter((point) => point.length >= 2 && Number.isFinite(point[0]) && Number.isFinite(point[1]))
-    .map((point) => [point[0], point[1]] as const)
+  const [draggingPoint, setDraggingPoint] = useState<number | null>(null)
+  const configuredPoints = curve.curve_points.flatMap((point, index) => (
+    point.length >= 2 && Number.isFinite(point[0]) && Number.isFinite(point[1])
+      ? [{ temperature: point[0], duty: point[1], index }]
+      : []
+  ))
   const minTemp = Number.isFinite(curve.curve_min_temp) ? curve.curve_min_temp : 0
   const maxTemp = Number.isFinite(curve.curve_max_temp) && curve.curve_max_temp > minTemp ? curve.curve_max_temp : minTemp + 1
-  const points = configuredPoints.filter(([temp]) => temp >= minTemp && temp <= maxTemp)
+  const points = configuredPoints.filter(({ temperature }) => temperature >= minTemp && temperature <= maxTemp)
   const omittedPointCount = configuredPoints.length - points.length
   const x = (temp: number) => 48 + ((temp - minTemp) / (maxTemp - minTemp)) * 432
   const y = (duty: number) => 18 + ((100 - Math.max(0, Math.min(100, duty))) / 100) * 172
-  const line = points.map(([temp, duty]) => `${x(temp)},${y(duty)}`).join(' ')
+  const line = points.map(({ temperature, duty }) => `${x(temperature)},${y(duty)}`).join(' ')
   const liveTemp = node.fan.temp
   const liveDuty = node.fan.duty_pct
   const livePoint = typeof liveTemp === 'number' && typeof liveDuty === 'number'
     && liveTemp >= minTemp && liveTemp <= maxTemp
 
+  const moveFromPointer = (event: ReactPointerEvent<SVGCircleElement>, index: number) => {
+    if (draggingPoint !== index) return
+    const svg = event.currentTarget.ownerSVGElement
+    if (!svg) return
+    const bounds = svg.getBoundingClientRect()
+    if (bounds.width <= 0 || bounds.height <= 0) return
+    const chartX = (event.clientX - bounds.left) * (510 / bounds.width)
+    const chartY = (event.clientY - bounds.top) * (225 / bounds.height)
+    const temperature = minTemp + ((chartX - 48) / 432) * (maxTemp - minTemp)
+    const duty = 100 - ((chartY - 18) / 172) * 100
+    onPointChange(index, temperature, duty)
+  }
+
   return <div className="fan-control-chart-wrap">
-    <svg className="fan-control-chart" viewBox="0 0 510 225" role="img" aria-labelledby={`fan-curve-title-${chartId}`} aria-describedby={`fan-curve-desc-${chartId}`}>
+    <svg className={`fan-control-chart${draggingPoint === null ? '' : ' is-dragging'}`} viewBox="0 0 510 225" role="img" aria-labelledby={`fan-curve-title-${chartId}`} aria-describedby={`fan-curve-desc-${chartId}`}>
       <title id={`fan-curve-title-${chartId}`}>Fan curve for {node.node_name}</title>
-      <desc id={`fan-curve-desc-${chartId}`}>Fan duty percentage by temperature, with the current operating point when available.</desc>
+      <desc id={`fan-curve-desc-${chartId}`}>Fan duty percentage by temperature. Drag a curve point to edit it, or use the numeric fields below.</desc>
       {[0, 25, 50, 75, 100].map((duty) => <g key={duty}>
         <line className="fan-chart-grid" x1="48" x2="480" y1={y(duty)} y2={y(duty)} />
         <text className="fan-chart-label" x="40" y={y(duty) + 4} textAnchor="end">{duty}%</text>
@@ -85,9 +129,38 @@ function CurveChart({ curve, node }: { curve: FanCurveSettings; node: FanControl
       <text className="fan-chart-label" x="48" y="211">{minTemp} °C</text>
       <text className="fan-chart-label" x="480" y="211" textAnchor="end">{maxTemp} °C</text>
       {points.length > 1 && <polyline className="fan-chart-line" points={line} />}
-      {points.map(([temp, duty], index) => <g key={`${temp}-${duty}-${index}`}>
-        <circle className="fan-chart-point" cx={x(temp)} cy={y(duty)} r="4" />
-        <text className="fan-chart-point-label" x={x(temp)} y={y(duty) - 9} textAnchor="middle">{temp}° / {duty}%</text>
+      {points.map(({ temperature, duty, index }) => <g key={index}>
+        <circle
+          className="fan-chart-point fan-chart-point-editable"
+          cx={x(temperature)}
+          cy={y(duty)}
+          r="6"
+          role="button"
+          tabIndex={0}
+          aria-label={`Move point ${index + 1}, ${temperature} degrees, ${duty} percent`}
+          onPointerDown={(event) => {
+            event.preventDefault()
+            setDraggingPoint(index)
+            event.currentTarget.setPointerCapture?.(event.pointerId)
+          }}
+          onPointerMove={(event) => moveFromPointer(event, index)}
+          onPointerUp={(event) => {
+            moveFromPointer(event, index)
+            event.currentTarget.releasePointerCapture?.(event.pointerId)
+            setDraggingPoint(null)
+          }}
+          onPointerCancel={() => setDraggingPoint(null)}
+          onKeyDown={(event) => {
+            const step = event.shiftKey ? 5 : 1
+            if (event.key === 'ArrowLeft') onPointChange(index, temperature - step, duty)
+            else if (event.key === 'ArrowRight') onPointChange(index, temperature + step, duty)
+            else if (event.key === 'ArrowDown') onPointChange(index, temperature, duty - step)
+            else if (event.key === 'ArrowUp') onPointChange(index, temperature, duty + step)
+            else return
+            event.preventDefault()
+          }}
+        />
+        <text className="fan-chart-point-label" x={x(temperature)} y={y(duty) - 11} textAnchor="middle">{temperature}° / {duty}%</text>
       </g>)}
       {livePoint && <g>
         <circle className="fan-chart-live-halo" cx={x(liveTemp)} cy={y(liveDuty)} r="8" />
@@ -95,10 +168,19 @@ function CurveChart({ curve, node }: { curve: FanCurveSettings; node: FanControl
       </g>}
     </svg>
     {omittedPointCount > 0 && <p className="muted">{omittedPointCount} configured {omittedPointCount === 1 ? 'point is' : 'points are'} outside this temperature range and not plotted.</p>}
-    <table className="sr-only">
+    <table className="fan-curve-point-table">
       <caption>Fan curve points for {node.node_name}</caption>
       <thead><tr><th>Temperature Celsius</th><th>Fan duty percent</th></tr></thead>
-      <tbody>{configuredPoints.map(([temp, duty], index) => <tr key={index}><td>{temp}</td><td>{duty}</td></tr>)}</tbody>
+      <tbody>{configuredPoints.map(({ temperature, duty, index }) => <tr key={index}>
+        <td><input type="number" step="0.5" value={temperature} aria-label={`Point ${index + 1} temperature`} onChange={(event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next)) onPointChange(index, next, duty)
+        }} /></td>
+        <td><input type="number" min="0" max="100" step="1" value={duty} aria-label={`Point ${index + 1} fan duty`} onChange={(event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next)) onPointChange(index, temperature, next)
+        }} /></td>
+      </tr>)}</tbody>
     </table>
   </div>
 }
@@ -110,6 +192,7 @@ export function FanControlPage() {
   const [saveError, setSaveError] = useState('')
   const [saveStatus, setSaveStatus] = useState('')
   const [pendingOverrides, setPendingOverrides] = useState<Record<string, PendingFanOverride>>({})
+  const [curveDrafts, setCurveDrafts] = useState<Record<string, CurveDraft>>({})
 
   useEffect(() => {
     if (resource.loading) return
@@ -152,6 +235,32 @@ export function FanControlPage() {
     })
   }, [resource.data])
 
+  useEffect(() => {
+    const nodes = resource.data?.nodes ?? []
+    setCurveDrafts((current) => {
+      const next = { ...current }
+      let changed = false
+      for (const item of nodes) {
+        const serverCurve = item.settings.settings.curve
+        const signature = curveSignature(serverCurve)
+        const existing = next[item.node_id]
+        if (!existing) {
+          next[item.node_id] = { curve: cloneCurve(serverCurve), serverSignature: signature, dirty: false }
+          changed = true
+        } else if (existing.pendingSignature) {
+          if (existing.pendingSignature === signature) {
+            next[item.node_id] = { curve: cloneCurve(serverCurve), serverSignature: signature, dirty: false }
+            changed = true
+          }
+        } else if (!existing.dirty && existing.serverSignature !== signature) {
+          next[item.node_id] = { curve: cloneCurve(serverCurve), serverSignature: signature, dirty: false }
+          changed = true
+        }
+      }
+      return changed ? next : current
+    })
+  }, [resource.data])
+
   const node = useMemo(
     () => resource.data?.nodes.find((item) => item.node_id === selectedNodeId) ?? resource.data?.nodes[0],
     [resource.data, selectedNodeId],
@@ -187,13 +296,82 @@ export function FanControlPage() {
   }
 
   const curve = node?.settings.settings.curve
+  const curveDraft = node && curveDrafts[node.node_id]?.curve
+    ? curveDrafts[node.node_id].curve
+    : curve
+  const curveDirty = node ? Boolean(curveDrafts[node.node_id]?.dirty) : false
   const maxSpeed = node ? pendingOverrides[node.node_id]?.enabled ?? node.fan.max_speed : false
+
+  const updateCurvePoint = (index: number, temperature: number, duty: number) => {
+    if (!node || !curve || !curveDraft) return
+    const points = curveDraft.curve_points
+    if (!points[index]) return
+    const minimum = index === 0 ? curveDraft.curve_min_temp : points[index - 1][0] + 0.5
+    const maximum = index === points.length - 1 ? curveDraft.curve_max_temp : points[index + 1][0] - 0.5
+    const nextTemperature = Math.round(clamp(temperature, minimum, maximum) * 2) / 2
+    const nextDuty = Math.round(clamp(duty, 0, 100))
+    if (points[index][0] === nextTemperature && points[index][1] === nextDuty) return
+    const nextCurve = cloneCurve(curveDraft)
+    nextCurve.curve_points[index] = [nextTemperature, nextDuty]
+    setCurveDrafts((current) => ({
+      ...current,
+      [node.node_id]: {
+        curve: nextCurve,
+        serverSignature: current[node.node_id]?.serverSignature ?? curveSignature(curve),
+        dirty: true,
+      },
+    }))
+    setSaveError('')
+    setSaveStatus('')
+  }
+
+  const resetCurve = () => {
+    if (!node || !curve) return
+    setCurveDrafts((current) => ({
+      ...current,
+      [node.node_id]: {
+        curve: cloneCurve(curve),
+        serverSignature: curveSignature(curve),
+        dirty: false,
+      },
+    }))
+    setSaveError('')
+    setSaveStatus('')
+  }
+
+  const saveCurve = async () => {
+    if (!node || !curveDraft || !curveDirty || saving) return
+    const submitted = cloneCurve(curveDraft)
+    const signature = curveSignature(submitted)
+    setSaving(true)
+    setSaveError('')
+    setSaveStatus('')
+    try {
+      await api.fanControl.updateSettings(node.node_id, 'curve', submitted, node.fan.mode)
+      setCurveDrafts((current) => ({
+        ...current,
+        [node.node_id]: {
+          curve: submitted,
+          serverSignature: signature,
+          dirty: false,
+          pendingSignature: signature,
+        },
+      }))
+      setSaveStatus(node.fan.mode === 'curve' ? 'Fan curve saved.' : 'Fan curve saved and activated.')
+      resource.reload()
+      window.dispatchEvent(new Event(presenceEvent))
+    } catch (reason) {
+      setSaveError(reason instanceof Error ? reason.message : 'Could not save the fan curve.')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return <div className="page fan-control-page">
     <PageHeader
       eyebrow="Node cooling"
       title="Fan Control"
-      description="Monitor FanController telemetry and switch each node between automatic control and maximum fan speed."
+      description="Monitor FanController telemetry, tune each node's curve, and control its fan speed override."
       actions={<Button type="button" onClick={refresh} disabled={resource.loading}><RefreshCw size={15} aria-hidden="true" /> Refresh</Button>}
     />
     {resource.loading && !resource.data && <LoadingState label="Looking for FanController nodes" />}
@@ -251,7 +429,16 @@ export function FanControlPage() {
             <div><p className="eyebrow">Temperature response</p><h2>Fan curve</h2></div>
             {node.fan.mode !== 'curve' && <span className="badge">Inactive saved curve</span>}
           </div>
-          {curve && <CurveChart curve={curve} node={node} />}
+          {curveDraft && <>
+            <p className="muted fan-curve-help">Drag points on the graph or enter exact values below.</p>
+            <CurveChart curve={curveDraft} node={node} onPointChange={updateCurvePoint} />
+            <div className="fan-curve-actions">
+              <Button type="button" onClick={resetCurve} disabled={!curveDirty || saving}>Reset</Button>
+              <Button type="button" onClick={() => void saveCurve()} disabled={!curveDirty || saving}>
+                {saving ? 'Saving…' : node.fan.mode === 'curve' ? 'Save curve' : 'Save and activate curve'}
+              </Button>
+            </div>
+          </>}
         </Panel>
         <Panel className="fan-control-settings-panel">
           <p className="eyebrow">Controller settings</p>

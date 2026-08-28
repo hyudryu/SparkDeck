@@ -47,7 +47,13 @@ import type {
   RouterOSOverview,
   RouterOSPresence,
   FanControlOverview,
+  FanControlMode,
+  FanCurveSettings,
+  FanHysteresisSettings,
+  FanManualSettings,
   FanMaxSpeedResult,
+  FanPidSettings,
+  FanSettingsUpdateResult,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -346,6 +352,15 @@ export const api = {
     setMaxSpeed: (nodeId: string, enabled: boolean) => request<FanMaxSpeedResult>(
       `/api/v1/fan-control/nodes/${encodeURIComponent(nodeId)}/max-speed`,
       { method: 'PATCH', body: JSON.stringify({ enabled }) },
+    ),
+    updateSettings: (
+      nodeId: string,
+      mode: FanControlMode,
+      activeSettings: FanCurveSettings | FanPidSettings | FanHysteresisSettings | FanManualSettings,
+      expectedMode: FanControlMode,
+    ) => request<FanSettingsUpdateResult>(
+      `/api/v1/fan-control/nodes/${encodeURIComponent(nodeId)}/settings`,
+      { method: 'PATCH', body: JSON.stringify({ mode, active_settings: activeSettings, expected_mode: expectedMode }) },
     ),
   },
   onboarding: {

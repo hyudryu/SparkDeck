@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FanControlPage } from './FanControlPage'
@@ -91,7 +91,65 @@ describe('FanControlPage', () => {
     expect(within(chart).queryByText('-500Â° / 10%')).not.toBeInTheDocument()
     expect(within(chart).queryByText('500Â° / 90%')).not.toBeInTheDocument()
     expect(screen.getByText('2 configured points are outside this temperature range and not plotted.')).toBeInTheDocument()
-    expect(within(screen.getByRole('table', { name: 'Fan curve points for Rack Spark' })).getByText('-500')).toBeInTheDocument()
+    expect(within(screen.getByRole('table', { name: 'Fan curve points for Rack Spark' })).getByRole('spinbutton', { name: 'Point 1 temperature' })).toHaveValue(-500)
+  })
+
+  it('drags a curve point and saves the exact curve to the selected node', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'PATCH') return json({
+        node_id: 'node/1', mode: 'curve', previous_mode: 'curve',
+        active_settings: { ...settings.settings.curve, curve_points: [[30, 20], [60, 70], [80, 100]] },
+      })
+      return json(overview)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    const chart = await screen.findByRole('img', { name: 'Fan curve for Rack Spark' })
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 510, bottom: 225,
+      width: 510, height: 225, toJSON: () => ({}),
+    })
+    const point = screen.getByRole('button', { name: 'Move point 2, 55 degrees, 50 percent' })
+    fireEvent.pointerDown(point, { pointerId: 1, clientX: 264, clientY: 104 })
+    await waitFor(() => expect(chart).toHaveClass('is-dragging'))
+    fireEvent.pointerMove(point, { pointerId: 1, clientX: 307.2, clientY: 69.6 })
+    fireEvent.pointerUp(point, { pointerId: 1, clientX: 307.2, clientY: 69.6 })
+
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 temperature' })).toHaveValue(60)
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 fan duty' })).toHaveValue(70)
+    await user.click(screen.getByRole('button', { name: 'Save curve' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/fan-control/nodes/node%2F1/settings', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({
+        mode: 'curve',
+        active_settings: {
+          ...settings.settings.curve,
+          curve_points: [[30, 20], [60, 70], [80, 100]],
+        },
+        expected_mode: 'curve',
+      }),
+    })))
+    expect(await screen.findByText('Fan curve saved.')).toBeInTheDocument()
+  })
+
+  it('keeps an unsaved curve draft when live polling returns older settings', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json(overview))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    const duty = await screen.findByRole('spinbutton', { name: 'Point 2 fan duty' })
+    await user.clear(duty)
+    await user.type(duty, '65')
+    expect(duty).toHaveValue(65)
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('spinbutton', { name: 'Point 2 fan duty' })).toHaveValue(65)
+    expect(screen.getByRole('button', { name: 'Save curve' })).toBeEnabled()
   })
 
   it('selects another controller node and enables max speed with the exact request', async () => {

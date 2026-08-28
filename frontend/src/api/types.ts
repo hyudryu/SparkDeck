@@ -234,6 +234,13 @@ export interface FanControlSettings {
   }
 }
 
+export interface FanSettingsUpdateResult {
+  node_id: string
+  mode: FanControlMode
+  previous_mode: FanControlMode
+  active_settings: FanCurveSettings | FanPidSettings | FanHysteresisSettings | FanManualSettings
+}
+
 export interface FanControlState {
   rpm?: number | null
   duty_byte?: number | null

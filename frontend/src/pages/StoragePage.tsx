@@ -16,6 +16,11 @@ function compareModelIdsDescending(left: StorageModel, right: StorageModel) {
   })
 }
 
+function compareModels(activeModelIds: ReadonlySet<string>, left: StorageModel, right: StorageModel) {
+  const activeOrder = Number(activeModelIds.has(right.model_id)) - Number(activeModelIds.has(left.model_id))
+  return activeOrder || compareModelIdsDescending(left, right)
+}
+
 function formatTimestamp(value?: string | number) {
   if (!value) return 'Not reported'
   const date = new Date(typeof value === 'number' && value < 1_000_000_000_000 ? value * 1000 : value)
@@ -38,6 +43,10 @@ function canCancel(job: StorageTransferJob) {
   return isActive(job) && !(job.kind === 'download' && job.status.toLowerCase() === 'running')
 }
 
+function isActiveDownload(job: StorageTransferJob) {
+  return job.kind === 'download' && ['queued', 'running'].includes(job.status.toLowerCase())
+}
+
 export function StoragePage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const resource = useResource((signal) => api.storage.get(signal))
@@ -51,10 +60,26 @@ export function StoragePage() {
   const [dropTargetId, setDropTargetId] = useState<string>()
   const draggedModelRef = useRef<DraggedModel | undefined>(undefined)
 
-  const nodes = useMemo(() => (resource.data?.nodes ?? []).map((node) => ({
-    ...node,
-    models: [...node.models].sort(compareModelIdsDescending),
-  })), [resource.data?.nodes])
+  const activeDownloadsByNode = useMemo(() => {
+    const downloads = new Map<string, Set<string>>()
+    resource.data?.jobs.forEach((job) => {
+      if (!isActiveDownload(job)) return
+      const models = downloads.get(job.target_node_id) ?? new Set<string>()
+      models.add(job.model_id)
+      downloads.set(job.target_node_id, models)
+    })
+    return downloads
+  }, [resource.data?.jobs])
+  const activeDownloadModels = useMemo(() => new Set(
+    [...activeDownloadsByNode.values()].flatMap((models) => [...models]),
+  ), [activeDownloadsByNode])
+  const nodes = useMemo(() => (resource.data?.nodes ?? []).map((node) => {
+    const activeModelIds = activeDownloadsByNode.get(node.id) ?? new Set<string>()
+    return {
+      ...node,
+      models: [...node.models].sort((left, right) => compareModels(activeModelIds, left, right)),
+    }
+  }), [activeDownloadsByNode, resource.data?.nodes])
   const sourceNode = nodes.find((node) => node.id === sourceNodeId)
   const sourceModels = sourceNode?.models.filter((model) => !model.partial) ?? []
   const inventory = useMemo(() => {
@@ -67,9 +92,9 @@ export function StoragePage() {
       } else models.set(model.model_id, { model, nodes: new Map([[node.id, model]]) })
     }))
     return [...models.values()].sort((left, right) => (
-      compareModelIdsDescending(left.model, right.model)
+      compareModels(activeDownloadModels, left.model, right.model)
     ))
-  }, [nodes])
+  }, [activeDownloadModels, nodes])
   const activeJobsByNode = useMemo(() => {
     const jobs = new Map<string, Map<string, StorageTransferJob>>()
     resource.data?.jobs.filter(isActive).forEach((job) => {
@@ -226,10 +251,14 @@ export function StoragePage() {
         <div className="section-heading"><div><h2>Node storage</h2><p>Drag an individual model to another online node, or use the transfer form below.</p></div></div>
         {nodes.length === 0 ? <EmptyState title="No storage nodes" description="Join a node to the cluster before transferring model weights." /> : <div className="storage-node-grid">
           {nodes.map((node) => {
-            const activeJobs = [...(activeJobsByNode.get(node.id)?.values() ?? [])]
-              .sort((left, right) => right.model_id.localeCompare(left.model_id, undefined, { numeric: true, sensitivity: 'base' }))
-            const activeModelIds = new Set(activeJobs.map((job) => job.model_id))
-            const storedModels = node.models.filter((model) => !activeModelIds.has(model.model_id))
+            const activeJobs = activeJobsByNode.get(node.id) ?? new Map<string, StorageTransferJob>()
+            const modelsById = new Map(node.models.map((model) => [model.model_id, model]))
+            const activeDownloadIds = activeDownloadsByNode.get(node.id) ?? new Set<string>()
+            const weightRows = [...new Set([...modelsById.keys(), ...activeJobs.keys()])]
+              .sort((left, right) => (
+                Number(activeDownloadIds.has(right)) - Number(activeDownloadIds.has(left))
+                || right.localeCompare(left, undefined, { numeric: true, sensitivity: 'base' })
+              ))
             const used = node.models.reduce((total, model) => total + model.size_bytes, 0)
             // "Used" counts SparkDeck-managed model weights only, so the
             // capacity denominator must be that usage plus the free space on
@@ -269,8 +298,32 @@ export function StoragePage() {
               </div>
               <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>
-              {node.models.length === 0 && activeJobs.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
-                {activeJobs.map((job) => {
+              {weightRows.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
+                {weightRows.map((modelId) => {
+                  const job = activeJobs.get(modelId)
+                  const model = modelsById.get(modelId)
+                  if (!job && model) return <li
+                    key={`${node.id}:${model.model_id}`}
+                    draggable={node.online && !model.partial}
+                    aria-label={model.partial ? `Partial cache ${model.model_id} on ${node.name}` : `Transfer ${model.model_id} from ${node.name}`}
+                    onDragStart={(event) => startDrag(event, model, node)}
+                    onDragEnd={() => {
+                      draggedModelRef.current = undefined
+                      setDraggedModel(undefined)
+                      setDropTargetId(undefined)
+                    }}
+                  >
+                    {model.partial ? <AlertTriangle className="storage-partial-icon" size={15} aria-label="Partial cache" /> : <GripVertical size={15} aria-hidden="true" />}
+                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
+                    <Button
+                      variant="tertiary"
+                      aria-label={`Delete ${model.model_id} from ${node.name}`}
+                      title={`Delete from ${node.name}`}
+                      disabled={!node.online || busy === `delete:${node.id}:${model.model_id}`}
+                      onClick={() => void removeModel(node, model)}
+                    ><Trash2 size={15} /></Button>
+                  </li>
+                  if (!job) return null
                   const progress = jobProgress(job)
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
@@ -284,27 +337,6 @@ export function StoragePage() {
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
                 })}
-                {storedModels.map((model) => <li
-                  key={`${node.id}:${model.model_id}`}
-                  draggable={node.online && !model.partial}
-                  aria-label={model.partial ? `Partial cache ${model.model_id} on ${node.name}` : `Transfer ${model.model_id} from ${node.name}`}
-                  onDragStart={(event) => startDrag(event, model, node)}
-                  onDragEnd={() => {
-                    draggedModelRef.current = undefined
-                    setDraggedModel(undefined)
-                    setDropTargetId(undefined)
-                  }}
-                >
-                  {model.partial ? <AlertTriangle className="storage-partial-icon" size={15} aria-label="Partial cache" /> : <GripVertical size={15} aria-hidden="true" />}
-                  <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
-                  <Button
-                    variant="tertiary"
-                    aria-label={`Delete ${model.model_id} from ${node.name}`}
-                    title={`Delete from ${node.name}`}
-                    disabled={!node.online || busy === `delete:${node.id}:${model.model_id}`}
-                    onClick={() => void removeModel(node, model)}
-                  ><Trash2 size={15} /></Button>
-                </li>)}
               </ul>}
             </Panel>
           })}

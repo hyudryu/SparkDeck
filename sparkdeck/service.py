@@ -1313,7 +1313,10 @@ class SparkDeckService:
                 and kind is DeploymentKind.MANAGED
                 and artifact
             ):
-                artifact_path = Path(artifact).expanduser()
+                # Classify the caller's raw artifact. A repo-relative Hub path
+                # such as ~/quantized/model.gguf must not become controller-
+                # local merely because the same path exists under its home.
+                artifact_path = Path(artifact)
                 if artifact_path.is_absolute():
                     if not artifact_path.is_file():
                         raise ValueError(

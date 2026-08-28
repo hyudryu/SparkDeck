@@ -209,6 +209,35 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
 
+    async def test_repo_relative_tilde_gguf_is_not_expanded_to_controller_home(self):
+        prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
+        coincidental_home_artifact = Path(self.temp.name) / "home" / "model.gguf"
+        coincidental_home_artifact.parent.mkdir()
+        coincidental_home_artifact.write_bytes(b"unrelated")
+        prepare = AsyncMock(return_value=prepared)
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-tilde", "port": 8080, "status": "running",
+        })
+
+        with (
+            patch.object(Path, "expanduser", return_value=coincidental_home_artifact),
+            patch.object(
+                self.service, "_prepare_public_gguf_artifact", prepare,
+            ),
+            patch("sparkdeck.service.launch_managed_container", launch),
+        ):
+            created = await self.service.create_deployment({
+                "model": "org/model", "alias": "tilde-repository-path",
+                "runtime": "llama.cpp", "revision": "release-1",
+                "settings": {"artifact": "~/model.gguf"},
+            })
+
+        prepare.assert_awaited_once_with(
+            "org/model", "~/model.gguf", "release-1", None,
+        )
+        self.assertEqual(created["model"]["artifact"], prepared)
+        self.assertEqual(created["settings"]["model_source"], "public_repository")
+
     async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
         self.service.store.add_deployment(Deployment(
             id="existing", alias="duplicate", runtime=RuntimeKind.LLAMA_CPP,

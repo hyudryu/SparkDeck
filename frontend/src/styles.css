@@ -391,13 +391,23 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .fan-control-panel-heading .badge { color: var(--text-secondary); background: var(--bg-subtle); }
 .fan-control-chart-wrap { min-width: 0; margin-top: 8px; }
 .fan-control-chart { display: block; width: 100%; height: auto; overflow: visible; }
+.fan-control-chart.is-dragging { cursor: grabbing; }
 .fan-chart-grid { stroke: var(--border-subtle); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
 .fan-chart-axis { stroke: var(--border-strong); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .fan-chart-label { fill: var(--text-tertiary); font-size: 9px; }
 .fan-chart-line { fill: none; stroke: var(--fan-chart); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .fan-chart-point { fill: var(--bg-surface); stroke: var(--fan-chart); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.fan-chart-point-editable { cursor: grab; touch-action: none; }
+.fan-chart-point-editable:hover, .fan-chart-point-editable:focus-visible { fill: color-mix(in srgb, var(--fan-chart) 18%, var(--bg-surface)); outline: none; stroke-width: 3; }
+.fan-chart-point-editable[aria-disabled="true"] { opacity: .55; cursor: wait; }
 .fan-chart-point-label { fill: var(--text-secondary); font-size: 8px; }
 .fan-chart-live-halo { fill: color-mix(in srgb, var(--success) 22%, transparent); }.fan-chart-live { fill: var(--success); stroke: var(--bg-surface); stroke-width: 1.5; }
+.fan-curve-help { margin-top: 5px; font-size: 11px; }
+.fan-curve-point-table { width: 100%; margin-top: 8px; border-collapse: separate; border-spacing: 8px 5px; }
+.fan-curve-point-table caption { text-align: left; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+.fan-curve-point-table th { color: var(--text-tertiary); font-size: 10px; font-weight: 600; text-align: left; }
+.fan-curve-point-table input { width: 100%; min-width: 0; height: 34px; padding: 6px 8px; color: var(--text-primary); background: var(--bg-subtle); border: 1px solid var(--border-strong); border-radius: 7px; }
+.fan-curve-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 .fan-control-settings-list { display: grid; gap: 0; margin-top: 14px; border-top: 1px solid var(--border-subtle); }
 .fan-control-settings-list > div { display: flex; justify-content: space-between; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
 .fan-control-settings-list dt { color: var(--text-secondary); font-size: 11px; }.fan-control-settings-list dd { font-size: 12px; font-weight: 600; text-align: right; }

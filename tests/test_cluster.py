@@ -15,6 +15,7 @@ from cluster import (
     AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
     AgentCredentials,
+    NodeAgentResponseError,
     NodeRegistry,
     normalize_agent_url,
 )
@@ -101,6 +102,42 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_request_preserves_agent_response_status(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"detail": "fan mode changed; refresh and try again"},
+                request=request,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(Path(directory), client, "controller")
+            registry.nodes = [{
+                "id": "remote-1",
+                "name": "Spark 2",
+                "agent_url": "https://worker.tail.example:7878",
+                "agent_token": "agent-secret",
+                "enabled": True,
+            }]
+            registry._connection_targets = mock.AsyncMock(return_value=[(
+                httpx.URL("https://100.100.20.30:7878/api/agent/fan-control/settings"),
+                {"Host": "worker.tail.example:7878"},
+                {"sni_hostname": "worker.tail.example"},
+            )])
+            try:
+                with self.assertRaises(NodeAgentResponseError) as raised:
+                    await registry.request(
+                        "remote-1", "PATCH", "/api/agent/fan-control/settings",
+                        json_body={"mode": "curve"},
+                    )
+            finally:
+                await client.aclose()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("fan mode changed", raised.exception.detail)
+        self.assertIn("Spark 2 agent error: HTTP 409", str(raised.exception))
+
     async def test_authenticated_consent_can_reach_a_disabled_joined_worker(self) -> None:
         requests = []
 

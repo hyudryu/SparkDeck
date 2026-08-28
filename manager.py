@@ -1130,7 +1130,7 @@ class Manager:
         local = await self.agent_status(local_stats)
         local["hidden_from_dashboard"] = self.settings.get(
             "cluster_node_hidden_from_dashboard", False,
-        )
+        ) is True
         local["fabric_ip"], local["fabric_interface"] = self._inferred_fabric(
             local,
             self.settings.get("cluster_fabric_ip"),
@@ -5501,7 +5501,9 @@ class Manager:
     async def update_settings(self, data: dict) -> dict:
         async with self.lock:
             for k, v in data.items():
-                if k in DEFAULT_SETTINGS:
+                # Dashboard visibility is presentation-only node state. Keep
+                # its strictly typed node endpoint as the sole write path.
+                if k in DEFAULT_SETTINGS and k != "cluster_node_hidden_from_dashboard":
                     # The UI sends an empty password field when an existing
                     # token should remain unchanged.
                     if k == "hf_token" and not str(v or "").strip():

@@ -260,6 +260,44 @@ class NodeDashboardVisibilityTests(unittest.IsolatedAsyncioTestCase):
                 "local", "true",
             )
 
+    async def test_generic_settings_cannot_write_dashboard_visibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager.__new__(Manager)
+            manager.settings = {
+                "virtual_nas_enabled": False,
+                "cluster_node_hidden_from_dashboard": False,
+            }
+            manager.settings_path = Path(directory) / "settings.json"
+            manager.lock = asyncio.Lock()
+            manager.virtual_nas = Mock()
+            manager.virtual_nas.stop = AsyncMock()
+
+            await manager.update_settings({
+                "cluster_node_hidden_from_dashboard": "false",
+            })
+
+            self.assertIs(
+                manager.settings["cluster_node_hidden_from_dashboard"], False,
+            )
+            saved = json.loads(manager.settings_path.read_text())
+            self.assertIs(saved["cluster_node_hidden_from_dashboard"], False)
+
+    async def test_legacy_string_visibility_does_not_hide_local_node(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"cluster_node_hidden_from_dashboard": "false"}
+        manager.agent_status = AsyncMock(return_value={
+            "id": "local", "local": True, "online": True,
+        })
+        manager._inferred_fabric = Mock(return_value=(None, None))
+        manager.node_registry = Mock()
+        manager.node_registry.public_nodes = AsyncMock(
+            side_effect=lambda local: [local],
+        )
+
+        nodes = await manager.cluster_nodes()
+
+        self.assertIs(nodes[0]["hidden_from_dashboard"], False)
+
 
 class FakeServiceManager:
     def __init__(self):

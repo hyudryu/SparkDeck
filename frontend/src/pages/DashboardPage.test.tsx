@@ -1,7 +1,8 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DashboardPage } from './DashboardPage'
+import type { NodeInventoryItem } from '../api/types'
+import { clusterResourceSnapshot, DashboardPage } from './DashboardPage'
 
 function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -20,7 +21,7 @@ describe('DashboardPage', () => {
       cpu_pct: 60, cpu_logical_count: 12, cpu_temp_c: 58, mem: { used: 32 * 1024 ** 3, total: 64 * 1024 ** 3, pct: 50 },
       gpus: [
         { index: 0, name: 'NVIDIA RTX', util: 55, temp: 65, mem_used_mib: 8 * 1024, mem_total_mib: 16 * 1024 },
-        { index: 1, name: 'NVIDIA RTX', util: 75, temp: 67, mem_used_mib: 4 * 1024, mem_total_mib: 16 * 1024 },
+        { index: 1, name: 'NVIDIA RTX', util: null, temp: 67, mem_used_mib: 4 * 1024, mem_total_mib: 16 * 1024 },
       ],
       active_requests: {}, ts: 1_777_000_000,
     }
@@ -44,8 +45,8 @@ describe('DashboardPage', () => {
     expect(screen.getByText('50.0%')).toBeInTheDocument()
     expect(screen.getByText('16 logical processors · 2 measured nodes')).toBeInTheDocument()
     expect(screen.getByText('Pooled GPU')).toBeInTheDocument()
-    expect(screen.getByText('55.0%')).toBeInTheDocument()
-    expect(screen.getByText('3 GPUs across 2 nodes')).toBeInTheDocument()
+    expect(screen.getByText('45.0%')).toBeInTheDocument()
+    expect(screen.getByText('3 GPUs across 2 nodes · 2 measured')).toBeInTheDocument()
     expect(screen.getByText('Pooled RAM')).toBeInTheDocument()
     expect(screen.getByText('96.0 GB')).toBeInTheDocument()
     expect(screen.getByText('of 192.0 GB across 2 nodes')).toBeInTheDocument()
@@ -84,6 +85,8 @@ describe('DashboardPage', () => {
     expect(screen.getByText('64.0 GB')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Cluster nodes' })).toBeInTheDocument()
     expect(screen.getByText(/0 of 0 visible nodes online/)).toBeInTheDocument()
+    expect(screen.getByText('Cluster inventory unavailable')).toBeInTheDocument()
+    expect(screen.queryByText('No nodes shown on the dashboard')).not.toBeInTheDocument()
     expect(screen.queryByText('node probe failed')).not.toBeInTheDocument()
   })
 
@@ -103,5 +106,15 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('No nodes shown on the dashboard')).toBeInTheDocument()
     expect(screen.getByText(/0 of 0 visible nodes online.*1 hidden/)).toBeInTheDocument()
     expect(screen.queryByText('Hidden node')).not.toBeInTheDocument()
+  })
+
+  it('uses equal node weighting when logical CPU counts are incomplete', () => {
+    const snapshot = clusterResourceSnapshot([
+      { id: 'older-node', online: true, stats: { cpu_pct: 0 } },
+      { id: 'newer-node', online: true, stats: { cpu_pct: 100, cpu_logical_count: 64 } },
+    ] as NodeInventoryItem[])
+
+    expect(snapshot.cpuPct).toBe(50)
+    expect(snapshot.logicalProcessors).toBeUndefined()
   })
 })

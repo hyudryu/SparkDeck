@@ -356,6 +356,8 @@ interface WireDeploymentDetail extends WireDeployment {
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
+  sg_tp_size?: number | null
+  sg_mem_fraction?: number | null
   image?: string | null
 }
 
@@ -406,6 +408,8 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     launch_controls: item.launch_controls ?? {},
     gpu_memory_utilization: item.gpu_memory_utilization,
     gpu_memory_gb: item.gpu_memory_gb,
+    sg_tp_size: item.sg_tp_size,
+    sg_mem_fraction: item.sg_mem_fraction,
     image: item.image ?? undefined,
   }
 }
@@ -521,6 +525,10 @@ export const api = {
     remove: (id: string) => request<void>(
       `/api/v1/recipes/${encodeURIComponent(id)}`,
       { method: 'DELETE' },
+    ),
+    importFromContainer: (containerName: string) => request<SavedConfigurationDetail>(
+      `/api/containers/${encodeURIComponent(containerName)}/recipe`,
+      { method: 'POST' },
     ),
     deploy: (id: string, nodeIds: string[]) => request<WireDeployment>(
       `/api/v1/recipes/${encodeURIComponent(id)}/deploy`,

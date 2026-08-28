@@ -99,8 +99,59 @@ class ForegroundSettingsReloadTests(unittest.TestCase):
             self.app_module.byte_to_pct(128), 50.0,
         )
         instance.slew.reset.assert_not_called()
-        instance._sync_settings_widgets.assert_called_once_with(False)
+        instance._sync_settings_widgets.assert_called_once_with(False, False)
         self.app_module.GLib.idle_add.assert_called_with(instance._schedule_poll)
+
+    def test_same_mode_hysteresis_and_new_source_survive_reload(self) -> None:
+        instance = self.app_module.FanApp.__new__(self.app_module.FanApp)
+        instance.settings = Settings(mode="hysteresis", poll_interval_s=1.0)
+        instance.settings_mtime_ns = 100
+        instance._config_mtime = mock.Mock(return_value=200)
+        instance.sources = []
+        instance.source_map = {}
+        instance.hyst = self.app_module.Hysteresis(75.0, 65.0)
+        instance.hyst._on = True
+        instance.temp_smoother = mock.Mock()
+        instance.slew = mock.Mock()
+        instance.current_duty_byte = 180
+        instance.link = None
+        instance._replace_serial_link = mock.Mock()
+        instance._sync_settings_widgets = mock.Mock()
+        instance._schedule_poll = mock.Mock()
+
+        new_source = types.SimpleNamespace(key="gpu")
+        updated = Settings(
+            mode="hysteresis",
+            hyst_on_temp=78.0,
+            hyst_off_temp=62.0,
+            poll_interval_s=1.0,
+            sources=["gpu"],
+        )
+        with (
+            mock.patch.object(self.app_module.Settings, "load", return_value=updated),
+            mock.patch.object(self.app_module, "discover", return_value=[new_source]),
+            mock.patch.object(self.app_module.time, "monotonic", return_value=75.0),
+        ):
+            instance._reload_settings_if_changed()
+
+        self.assertTrue(instance.hyst._on)
+        self.assertEqual(instance.source_map, {"gpu": new_source})
+        instance._sync_settings_widgets.assert_called_once_with(False, True)
+
+    def test_startup_write_race_marks_the_fingerprint_stale(self) -> None:
+        instance = self.app_module.FanApp.__new__(self.app_module.FanApp)
+        instance._config_mtime = mock.Mock(side_effect=[100, 200])
+        loaded = Settings(mode="pid")
+
+        with mock.patch.object(
+            self.app_module.Settings, "load", return_value=loaded,
+        ):
+            self.assertIs(instance._load_initial_settings(), loaded)
+
+        self.assertEqual(
+            instance.settings_mtime_ns,
+            self.app_module.STALE_CONFIG_MTIME_NS,
+        )
 
     def test_ui_only_poll_reloads_before_reading_daemon_state(self) -> None:
         instance = self.app_module.FanApp.__new__(self.app_module.FanApp)

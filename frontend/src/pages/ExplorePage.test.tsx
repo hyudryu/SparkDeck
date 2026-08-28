@@ -233,6 +233,51 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByRole('button', { name: 'Expand org/large-artifact' })).not.toBeInTheDocument()
   })
 
+  it('allows an active fit filter to be cleared after switching to Llama without controller telemetry', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/mixed-runtime', name: 'mixed-runtime', weight_size_bytes: 8 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [
+          { runtime: 'vllm', supported: true },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+          files: [{ filename: 'mixed-q4_k_m.gguf', size_bytes: 8 * gib }],
+          artifacts: [{
+            filename: 'mixed-q4_k_m.gguf', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'mixed-q4_k_m.gguf', size_bytes: 8 * gib }],
+          }],
+        }],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: false, selectable: false, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/mixed-runtime' })).toBeInTheDocument()
+    const fits = screen.getByRole('checkbox', { name: /Only what fits/ })
+    await user.click(fits)
+    expect(fits).toBeChecked()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+
+    expect(await screen.findByText('Controller memory unavailable')).toBeInTheDocument()
+    expect(fits).toBeChecked()
+    expect(fits).toBeEnabled()
+    expect(await screen.findByText('No models found')).toBeInTheDocument()
+
+    await user.click(fits)
+    expect(fits).not.toBeChecked()
+    expect(await screen.findByRole('button', { name: 'Expand org/mixed-runtime' })).toBeInTheDocument()
+  })
+
   it('color codes cluster fit and filters fitting models largest first', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

@@ -783,19 +783,10 @@ class VirtualNAS:
                 continue
             snapshot_revisions = _complete_snapshot_revisions(repository)
             partial = not bool(snapshot_revisions)
-            snapshots_root = repository / "snapshots"
-            incomplete_snapshot = False
-            if snapshots_root.is_dir() and not snapshots_root.is_symlink():
-                complete_revision_set = set(snapshot_revisions)
-                try:
-                    incomplete_snapshot = any(
-                        child.is_dir()
-                        and not child.is_symlink()
-                        and child.name not in complete_revision_set
-                        for child in snapshots_root.iterdir()
-                    )
-                except OSError:
-                    incomplete_snapshot = False
+            incomplete_revisions = _safe_incomplete_snapshot_revisions(
+                repository, set(snapshot_revisions),
+            )
+            incomplete_snapshot = bool(incomplete_revisions)
             size_bytes = 0
             incomplete_size_bytes = 0
             file_count = 0
@@ -811,17 +802,23 @@ class VirtualNAS:
                     except OSError:
                         continue
                     size_bytes += stat.st_size
-                    if name.endswith(".incomplete"):
+                    if (
+                        name.endswith(".incomplete")
+                        and name != _SELECTIVE_SNAPSHOT_MARKER
+                    ):
                         incomplete_size_bytes += stat.st_size
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
-                repository, set(snapshot_revisions),
+                repository, set(snapshot_revisions), incomplete_revisions,
             )
             unassigned_incomplete_bytes = incomplete_size_bytes
-            if len(incomplete_revision_bytes) == 1:
-                only_revision = next(iter(incomplete_revision_bytes))
-                incomplete_revision_bytes[only_revision] += incomplete_size_bytes
+            if len(incomplete_revisions) == 1:
+                only_revision = next(iter(incomplete_revisions))
+                incomplete_revision_bytes[only_revision] = (
+                    incomplete_revision_bytes.get(only_revision, 0)
+                    + incomplete_size_bytes
+                )
                 unassigned_incomplete_bytes = 0
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
@@ -837,14 +834,14 @@ class VirtualNAS:
                             ref_name = ref.relative_to(refs_root).as_posix()
                             revisions.add(ref_name)
                             revision_refs[ref_name] = target
-                        elif target in incomplete_revision_bytes:
+                        elif target in incomplete_revisions:
                             ref_name = ref.relative_to(refs_root).as_posix()
                             partial_revision_refs[ref_name] = target
                     except (OSError, UnicodeError, ValueError):
                         continue
             partial_revision = None
-            if len(incomplete_revision_bytes) == 1:
-                incomplete_revision = next(iter(incomplete_revision_bytes))
+            if len(incomplete_revisions) == 1:
+                incomplete_revision = next(iter(incomplete_revisions))
                 aliases = sorted(
                     name for name, target in partial_revision_refs.items()
                     if target == incomplete_revision
@@ -865,6 +862,7 @@ class VirtualNAS:
                     )
                 ),
                 "partial_revision_size_bytes": incomplete_revision_bytes,
+                "partial_revisions": sorted(incomplete_revisions),
                 "partial_revision_refs": partial_revision_refs,
                 "revision": partial_revision,
                 "revisions": sorted(revisions),
@@ -1936,8 +1934,61 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return set()
 
 
+def _safe_incomplete_snapshot_revisions(
+    repository: Path, complete_revisions: set[str],
+) -> set[str]:
+    """Return incomplete snapshot directories whose contents stay cache-local."""
+    try:
+        snapshots = repository / "snapshots"
+        blobs = repository / "blobs"
+        if (
+            not snapshots.is_dir() or snapshots.is_symlink()
+            or not blobs.is_dir() or blobs.is_symlink()
+        ):
+            return set()
+        blob_root = blobs.resolve(strict=True)
+        incomplete = set()
+        for snapshot in snapshots.iterdir():
+            if (
+                snapshot.name in complete_revisions
+                or not _is_commit_sha(snapshot.name)
+                or not snapshot.is_dir() or snapshot.is_symlink()
+            ):
+                continue
+            try:
+                safe = True
+                has_evidence = False
+                for item in snapshot.rglob("*"):
+                    if item.is_symlink():
+                        if item.name == _SELECTIVE_SNAPSHOT_MARKER or not item.is_file():
+                            safe = False
+                            break
+                        resolved = item.resolve(strict=True)
+                        if not resolved.is_relative_to(blob_root) or not resolved.is_file():
+                            safe = False
+                            break
+                        has_evidence = True
+                    elif item.is_dir():
+                        continue
+                    elif not item.is_file():
+                        safe = False
+                        break
+                    elif item.name == _SELECTIVE_SNAPSHOT_MARKER:
+                        has_evidence = True
+                    elif not item.name.endswith((".incomplete", ".lock")):
+                        has_evidence = True
+                if safe and has_evidence:
+                    incomplete.add(snapshot.name)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return incomplete
+    except OSError:
+        return set()
+
+
 def _incomplete_snapshot_reusable_bytes(
     repository: Path, complete_revisions: set[str],
+    incomplete_revisions: set[str],
 ) -> dict[str, int]:
     """Count unique completed blobs referenced only by incomplete snapshots."""
     try:
@@ -1961,12 +2012,8 @@ def _incomplete_snapshot_reusable_bytes(
                 if resolved.is_relative_to(blob_root) and resolved.is_file():
                     complete_blobs.add(resolved)
         reusable_by_revision: dict[str, set[Path]] = {}
-        for snapshot in snapshots.iterdir():
-            if (
-                snapshot.name in complete_revisions
-                or not snapshot.is_dir() or snapshot.is_symlink()
-            ):
-                continue
+        for revision in incomplete_revisions:
+            snapshot = snapshots / revision
             reusable = reusable_by_revision.setdefault(snapshot.name, set())
             for item in snapshot.rglob("*"):
                 if item.name.endswith((".incomplete", ".lock")):

@@ -31,6 +31,7 @@ TRUSTED_ORIGINS = {
 CAPABILITY = "cluster_update_main_v1"
 CONFIRMATION = "update-entire-cluster"
 UPDATE_STATE_FILENAME = "system-update-agent.json"
+FAILED_NODE_PHASES = {"failed", "rolled_back", "recovery_required"}
 
 _WINDOWS_HELPER_BOOTSTRAP = r"""
 import json
@@ -248,7 +249,7 @@ def _service_preflight(root: Path) -> None:
             "Bypass",
             "-File",
             str(launcher),
-            "status",
+            "process-status",
             timeout=30,
         )
         return
@@ -304,6 +305,33 @@ class UpdateService:
             path.chmod(0o600)
         except OSError:
             pass
+
+    def _finish_cluster_state(self, state: dict) -> None:
+        failures = [
+            node for node in state.get("nodes", [])
+            if node.get("phase") in FAILED_NODE_PHASES or node.get("error")
+        ]
+        completed = [
+            node for node in state.get("nodes", [])
+            if node.get("phase") in {"succeeded", "up_to_date"}
+        ]
+        state["active"] = False
+        if failures:
+            state["phase"] = "partial" if completed else "failed"
+            state["message"] = (
+                f"Updated or verified {len(completed)} node(s); "
+                f"{len(failures)} node(s) could not be updated"
+                if completed else "No cluster nodes could be updated"
+            )
+            state["error"] = "; ".join(
+                f"{node.get('name')}: {node.get('error') or 'update failed'}"
+                for node in failures
+            )[:500]
+        else:
+            state["phase"] = "succeeded"
+            state["message"] = "Cluster update completed"
+            state.pop("error", None)
+        self._write(self.cluster_path, state)
 
     @staticmethod
     def _reconcile_local_node_success(state: dict, revision: str) -> bool:
@@ -447,34 +475,70 @@ class UpdateService:
         )
         completed_job_reconciled = False
         if state.get("phase") == "succeeded" and controller_verified:
-            completed_job_reconciled = self._reconcile_local_node_success(state, revision)
+            completed_job_reconciled = self._reconcile_local_node_success(
+                state, revision,
+            )
         if state.get("active") and not task_live:
-            if state.get("phase") == "updating_controller" and controller_verified:
-                self._reconcile_local_node_success(state, revision)
-                state.update(active=False, phase="succeeded", message="Cluster update completed")
-            elif state.get("phase") == "updating_controller" and _helper_alive(agent_state):
-                pass
+            if state.get("phase") == "updating_controller":
+                local = next(
+                    (node for node in state.get("nodes", []) if node.get("local")),
+                    None,
+                )
+                if (
+                    agent_state.get("phase") == "succeeded"
+                    and revision == state.get("target_revision")
+                    and agent_state.get("target_revision") == state.get("target_revision")
+                ):
+                    if local:
+                        local.update(phase="succeeded", current_revision=revision)
+                        local.pop("error", None)
+                    self._finish_cluster_state(state)
+                elif agent_state.get("phase") in FAILED_NODE_PHASES:
+                    if local:
+                        local.update(
+                            phase=agent_state["phase"],
+                            error=agent_state.get("error") or "Controller update failed",
+                            current_revision=revision,
+                        )
+                    self._finish_cluster_state(state)
+                elif _helper_alive(agent_state):
+                    pass
+                else:
+                    if local:
+                        local.update(
+                            phase="failed",
+                            error="The local update helper was interrupted",
+                            current_revision=revision,
+                        )
+                    self._finish_cluster_state(state)
             else:
-                changed = any(
-                    node.get("phase") == "succeeded"
-                    or node.get("current_revision") == state.get("target_revision")
-                    for node in state.get("nodes", []) if not node.get("local")
-                )
-                state.update(
-                    active=False,
-                    phase="partial" if changed else "failed",
-                    error="The controller rollout task was interrupted",
-                    message="Interrupted rollout can be retried",
-                )
-            self._write(self.cluster_path, state)
+                if not state.get("nodes"):
+                    state.update(
+                        active=False,
+                        phase="failed",
+                        error="The controller rollout task was interrupted",
+                        message="Interrupted rollout can be retried",
+                    )
+                    self._write(self.cluster_path, state)
+                for node in state.get("nodes", []):
+                    if node.get("phase") not in FAILED_NODE_PHASES | {"succeeded", "up_to_date"}:
+                        node.update(
+                            phase="failed",
+                            error=(
+                                "The local update helper was interrupted"
+                                if node.get("local") and state.get("phase") == "updating_controller"
+                                else "The controller rollout task was interrupted"
+                            ),
+                        )
+                if state.get("nodes"):
+                    self._finish_cluster_state(state)
         elif completed_job_reconciled:
             self._write(self.cluster_path, state)
         main_target, main_error = await self.resolve_main()
         nodes = await self.manager.cluster_nodes()
         public_nodes = []
-        # Windows service preflight launches the bundled status command, which
-        # probes this process's /healthz route. Keep that synchronous process
-        # and HTTP check off the event loop so the route can answer it.
+        # Windows service preflight launches a bundled status command that can
+        # probe this process. Keep synchronous checks off the event loop.
         blockers = await asyncio.to_thread(local_blockers, self.root)
         for node in nodes:
             node_blockers: list[str] = []
@@ -498,12 +562,18 @@ class UpdateService:
         up_to_date = bool(main_target and public_nodes) and all(
             node.get("current_revision") == main_target["revision"] for node in public_nodes
         )
+        eligible_nodes = [
+            node for node in public_nodes
+            if main_target
+            and node.get("current_revision") != main_target["revision"]
+            and not node["blockers"]
+        ]
         return {
             "repository": REPOSITORY,
             "current_revision": revision,
             "target": main_target,
             "up_to_date": up_to_date,
-            "can_update": bool(main_target) and not up_to_date and not all_blockers and not state.get("active", False),
+            "can_update": bool(eligible_nodes) and not state.get("active", False),
             "blockers": all_blockers,
             "nodes": public_nodes,
             "job": state or None,
@@ -534,11 +604,12 @@ class UpdateService:
                 raise RuntimeError("Latest origin/main is already installed on every node")
             nodes = [{
                 "id": node["id"], "name": node["name"], "local": node["local"],
+                "online": node["online"], "blockers": list(node["blockers"]),
                 "phase": "pending", "current_revision": node.get("current_revision"),
             } for node in overview["nodes"]]
             state = {
                 "id": uuid.uuid4().hex, "active": True, "phase": "preflight",
-                "message": "Checking every cluster node before making changes",
+                "message": "Checking each cluster node before making changes",
                 "target_branch": release["branch"], "target_revision": release["revision"],
                 "source_url": release.get("url"), "started_at": time.time(), "nodes": nodes,
             }
@@ -547,70 +618,92 @@ class UpdateService:
             return state
 
     async def _run_cluster(self, state: dict) -> None:
-        changed_workers = 0
         try:
-            # Re-probe every worker before mutating the first one.
-            await self.preflight_local(state["target_branch"], state["target_revision"])
+            # Probe every node independently before mutating any of them. A node
+            # failure is durable state for that node, not a cluster-wide abort.
             for node in state["nodes"]:
-                if node["local"]:
+                if node.get("current_revision") == state["target_revision"]:
+                    node["phase"] = "up_to_date"
                     continue
-                status = await self.manager.node_registry.request(
-                    node["id"], "POST", "/api/agent/system-update/preflight",
-                    json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
-                    timeout=60,
-                )
-                if status.get("blockers"):
-                    raise RuntimeError(f"{node['name']}: {'; '.join(status['blockers'])}")
-                if status.get("capability") != CAPABILITY:
-                    raise RuntimeError(f"{node['name']}: one-time manual update required")
-            state.update(phase="updating_workers", message="Updating workers one at a time")
-            self._write(self.cluster_path, state)
-            for node in state["nodes"]:
-                if node["local"]:
-                    continue
-                node["phase"] = "updating"
-                self._write(self.cluster_path, state)
-                await self.manager.node_registry.request(
-                    node["id"], "POST", "/api/agent/system-update",
-                    json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
-                    timeout=120,
-                )
-                deadline = time.monotonic() + 600
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(3)
-                    try:
+                try:
+                    if node.get("blockers"):
+                        raise RuntimeError("; ".join(node["blockers"]))
+                    if node["local"]:
+                        await self.preflight_local(state["target_branch"], state["target_revision"])
+                    else:
                         status = await self.manager.node_registry.request(
-                            node["id"], "GET", "/api/agent/system-update", timeout=10,
+                            node["id"], "POST", "/api/agent/system-update/preflight",
+                            json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
+                            timeout=60,
                         )
-                    except RuntimeError:
-                        continue
-                    node["phase"] = status.get("phase", "updating")
-                    node["current_revision"] = status.get("current_revision")
-                    node["error"] = status.get("error")
-                    self._write(self.cluster_path, state)
-                    if status.get("phase") == "succeeded" and status.get("current_revision") == state["target_revision"]:
-                        changed_workers += 1
-                        break
-                    if status.get("phase") in {"failed", "rolled_back", "recovery_required"}:
-                        raise RuntimeError(f"{node['name']}: {status.get('error') or 'update failed'}")
-                else:
-                    raise RuntimeError(f"{node['name']}: timed out waiting for restart")
-            state.update(phase="updating_controller", message="Workers updated; restarting controller last")
-            local = next(node for node in state["nodes"] if node["local"])
-            local["phase"] = "updating"
-            self._write(self.cluster_path, state)
-            await self.start_local(state["target_branch"], state["target_revision"])
-        except Exception as exc:
+                        if status.get("blockers"):
+                            raise RuntimeError("; ".join(status["blockers"]))
+                        if status.get("capability") != CAPABILITY:
+                            raise RuntimeError("One-time manual update required")
+                    node["phase"] = "ready"
+                    node.pop("error", None)
+                except Exception as exc:
+                    node.update(phase="failed", error=str(exc)[:500])
+                self._write(self.cluster_path, state)
+
+            eligible_workers = [
+                node for node in state["nodes"]
+                if not node["local"] and node.get("phase") == "ready"
+            ]
             state.update(
-                active=False,
-                phase="partial" if changed_workers else "failed",
-                error=str(exc)[:500],
-                message=(
-                    "Update stopped after one or more workers changed"
-                    if changed_workers else "Update stopped before any node changed"
-                ),
+                phase="updating_workers",
+                message=f"Updating {len(eligible_workers)} eligible worker(s) one at a time",
             )
             self._write(self.cluster_path, state)
+            for node in eligible_workers:
+                node["phase"] = "updating"
+                self._write(self.cluster_path, state)
+                try:
+                    await self.manager.node_registry.request(
+                        node["id"], "POST", "/api/agent/system-update",
+                        json_body={"branch": state["target_branch"], "revision": state["target_revision"]},
+                        timeout=120,
+                    )
+                    deadline = time.monotonic() + 600
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(3)
+                        try:
+                            status = await self.manager.node_registry.request(
+                                node["id"], "GET", "/api/agent/system-update", timeout=10,
+                            )
+                        except RuntimeError:
+                            continue
+                        node["phase"] = status.get("phase", "updating")
+                        node["current_revision"] = status.get("current_revision")
+                        node["error"] = status.get("error")
+                        self._write(self.cluster_path, state)
+                        if status.get("phase") == "succeeded" and status.get("current_revision") == state["target_revision"]:
+                            node.pop("error", None)
+                            break
+                        if status.get("phase") in FAILED_NODE_PHASES:
+                            raise RuntimeError(status.get("error") or "Update failed")
+                    else:
+                        raise RuntimeError("Timed out waiting for restart")
+                except Exception as exc:
+                    node.update(phase="failed", error=str(exc)[:500])
+                    self._write(self.cluster_path, state)
+
+            local = next((node for node in state["nodes"] if node["local"]), None)
+            if local and local.get("phase") == "ready":
+                state.update(phase="updating_controller", message="Restarting the eligible controller last")
+                local["phase"] = "updating"
+                self._write(self.cluster_path, state)
+                try:
+                    await self.start_local(state["target_branch"], state["target_revision"])
+                    return
+                except Exception as exc:
+                    local.update(phase="failed", error=str(exc)[:500])
+            self._finish_cluster_state(state)
+        except Exception as exc:
+            for node in state.get("nodes", []):
+                if node.get("phase") not in FAILED_NODE_PHASES | {"succeeded", "up_to_date"}:
+                    node.update(phase="failed", error=f"Rollout interrupted: {str(exc)[:440]}")
+            self._finish_cluster_state(state)
 
     async def preflight_local(self, branch: str, revision: str) -> dict:
         if branch != MAIN_BRANCH:

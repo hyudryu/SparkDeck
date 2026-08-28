@@ -63,7 +63,9 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(discovered["id"], "container:legacy-model")
         self.assertEqual(stopped["status"], "stopped")
         self.assertEqual(removed, {"ok": True, "id": "container:legacy-model"})
-        self.manager.stop_container.assert_awaited_once_with("legacy-model")
+        self.manager.stop_container.assert_awaited_once_with(
+            "legacy-model", explicit=True,
+        )
         self.manager.remove_container.assert_awaited_once_with("legacy-model")
 
     async def test_cluster_member_container_actions_target_whole_cluster(self):
@@ -407,7 +409,9 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(started["status"], "running")
-        self.manager.start_container.assert_awaited_once_with("sparkdeck-gguf")
+        self.manager.start_container.assert_awaited_once_with(
+            "sparkdeck-gguf", explicit=True,
+        )
         self.manager.model_cache_inventory.assert_not_awaited()
 
     async def test_start_weight_check_uses_persisted_revision(self):

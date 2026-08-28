@@ -296,6 +296,25 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('offers Start when stopped intent outlives a still-running container', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-sticky-stop', alias: 'Stopped intent', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'running', desired_state: 'stopped',
+        settings: {}, node_ids: ['local'],
+      }] } : path.includes('/api/v1/nodes') ? { items: [{
+        id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true,
+      }] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('button', { name: 'Start' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+  })
+
   it('deletes a saved recipe without removing deployments or cached weights', async () => {
     const user = userEvent.setup()
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -327,7 +346,7 @@ describe('model deployments', () => {
       '/api/v1/recipes/recipe-1', expect.objectContaining({ method: 'DELETE' }),
     ))
     expect(screen.queryByText('Saved cluster')).not.toBeInTheDocument()
-    expect(screen.getByText('Running model')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Running model' })).toHaveAttribute('href', '/models/dep-1')
     expect(screen.getByRole('status')).toHaveTextContent('Deleted recipe Saved cluster. Existing deployments and cached model weights were left unchanged.')
     expect(localStorage.getItem('sparkdeck:pinned-recipes')).toBe('[]')
   })

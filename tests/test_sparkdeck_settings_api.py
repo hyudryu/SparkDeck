@@ -196,6 +196,12 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
+    def test_positional_token_suffix_is_not_treated_as_a_credential(self):
+        args = ["--served-model-name", "my-token", "--dtype", "auto"]
+
+        self.assertEqual(Manager._without_sensitive_cli_credentials(args), args)
+        Manager._reject_sensitive_cli_credentials(args)
+
     def test_legacy_cli_credentials_are_removed_and_new_ones_are_rejected(self):
         instance = Manager.__new__(Manager)
         instance.recipes = [{
@@ -219,6 +225,18 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(instance.deployments[0]["settings_dirty"])
         with self.assertRaisesRegex(ValueError, "credentials in Settings"):
             instance._reject_hf_cli_credentials(["--hf-token", "hf_new_secret"])
+
+    def test_legacy_stopped_deployment_remains_stopped_after_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments_path.write_text(json.dumps([{
+                "id": "legacy-stopped", "status": "stopped",
+            }]), encoding="utf-8")
+
+            loaded = instance._load_deployments()
+
+            self.assertEqual(loaded[0]["desired_state"], "stopped")
 
     def test_malformed_recipe_args_are_isolated_and_durable_during_startup(self):
         class StartupContinued(Exception):

@@ -28,10 +28,12 @@ function SoftwareUpdatePanel() {
   }, [active, resource.reload])
 
   const start = async () => {
-    const nodeCount = resource.data?.nodes?.length ?? 0
     const targetRevision = resource.data?.target?.revision
     if (!targetRevision) return
-    if (!window.confirm(`Update all ${nodeCount} cluster node${nodeCount === 1 ? '' : 's'} to origin/main at ${shortRevision(targetRevision)}? Workers restart one at a time and the controller restarts last.`)) return
+    const eligibleCount = resource.data?.nodes?.filter((node) => node.current_revision !== targetRevision && node.blockers.length === 0).length ?? 0
+    const unavailableCount = resource.data?.nodes?.filter((node) => node.current_revision !== targetRevision && node.blockers.length > 0).length ?? 0
+    const skipped = unavailableCount > 0 ? ` ${unavailableCount} unavailable node${unavailableCount === 1 ? '' : 's'} will be skipped and reported.` : ''
+    if (!window.confirm(`Update ${eligibleCount} eligible cluster node${eligibleCount === 1 ? '' : 's'} to origin/main at ${shortRevision(targetRevision)}?${skipped} Workers restart one at a time and the eligible controller restarts last.`)) return
     setStarting(true)
     setActionError(undefined)
     try {
@@ -51,7 +53,7 @@ function SoftwareUpdatePanel() {
   const upToDate = Boolean(data?.up_to_date)
   return (
     <Panel className="settings-section software-update-section">
-      <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every cluster node to the latest commit on the main branch.</p></div></div>
+      <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every eligible cluster node to the latest commit on the main branch. Nodes that cannot update are reported and skipped.</p></div></div>
       <div className="settings-fields">
         {resource.loading && !data && <LoadingState label="Checking for updates" />}
         {resource.error && !data && <ErrorState message={resource.error} onRetry={resource.reload} />}
@@ -65,8 +67,8 @@ function SoftwareUpdatePanel() {
             <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
           </div>
           {(data.job?.message || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || data.job?.message}</p>}
-          {blockers.length > 0 && <div className="update-blockers wide-field"><strong>Update unavailable</strong><ul>{blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul></div>}
-          {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={node.error ? 'error' : node.phase === 'succeeded' ? 'running' : node.online === false ? 'stopped' : 'starting'}>{node.error || node.phase || (node.online === false ? 'Offline' : 'Ready')}</Status></div>)}</div>}
+          {blockers.length > 0 && <div className="update-blockers wide-field"><strong>{data.can_update ? 'Nodes that cannot update' : 'Update unavailable'}</strong><ul>{blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul></div>}
+          {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => { const nodeError = node.error || node.blockers?.join('; '); return <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={nodeError ? 'error' : node.phase === 'succeeded' || node.phase === 'up_to_date' ? 'running' : node.online === false ? 'stopped' : 'starting'}>{nodeError || node.phase || (node.online === false ? 'Offline' : 'Ready')}</Status></div> })}</div>}
         </>}
       </div>
     </Panel>

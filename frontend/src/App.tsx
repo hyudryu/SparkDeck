@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider } from './auth/AuthContext'
 import { AppShell } from './components/AppShell'
 import { BenchmarksPage } from './pages/BenchmarksPage'
+import { BenchyPage } from './pages/BenchyPage'
 import { ChatPage } from './pages/ChatPage'
 import { ClusterPage } from './pages/ClusterPage'
 import { ComparePage } from './pages/ComparePage'
@@ -33,6 +34,7 @@ export default function App() {
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/compare" element={<ComparePage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />
+          <Route path="/benchy" element={<BenchyPage />} />
           <Route path="/usage" element={<UsagePage />} />
           <Route path="/images" element={<ImagesPage />} />
           <Route path="/storage" element={<StoragePage />} />

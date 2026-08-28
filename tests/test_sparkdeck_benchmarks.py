@@ -63,8 +63,162 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.temp.cleanup()
 
+    def _record_passive_sample(
+        self, *, model="org/model", settings=None, input_tokens=400,
+        output_tokens=320, decode_seconds=4.0,
+    ):
+        observation = self.service._community_observation_start()
+        token = self.service._community_observation.set(observation)
+        try:
+            now = time.monotonic()
+            self.service._record_usage(
+                "dep-1", model, "vllm", settings or {},
+                now - decode_seconds - 0.1,
+                {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+                now - decode_seconds,
+                hardware={"hardware_class": "dgx-spark"},
+                hardware_verified=True,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+
+    async def test_passive_telemetry_collects_nothing_when_opted_out(self):
+        self._record_passive_sample()
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+        self.assertEqual(self.service.store.outbox_batch(), [])
+
+    async def test_passive_telemetry_uses_canonical_model_quant_and_400_bucket(self):
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(
+            model="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+        )
+        self.assertEqual(self.service.store.outbox_batch(), [{
+            "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+            "quantization": "NVFP4",
+            "context_window_size": 400,
+            "inference_tokens_per_second": 80.0,
+            "telemetry_cluster_id": self.service.store.get_setting(
+                "telemetry_cluster_id"
+            ),
+            "concurrency": 1,
+        }])
+
+    async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
+        self.service.store.set_community_consent(True)
+        first = self.service._community_observation_start()
+        second = self.service._community_observation_start()
+        self.service._community_observation_end(second)
+        token = self.service._community_observation.set(first)
+        try:
+            now = time.monotonic()
+            self.service._record_usage(
+                "dep-1", "org/model", "vllm", {}, now - 4.1,
+                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(first)
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+
+    async def test_passive_telemetry_has_four_hour_model_quant_cooldown(self):
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+
+    async def test_passive_telemetry_rejects_context_at_or_above_10k(self):
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(input_tokens=10_000)
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+
+    def _record_passive_sample(
+        self, *, model="org/model", settings=None, input_tokens=400,
+        output_tokens=320, decode_seconds=4.0,
+    ):
+        observation = self.service._community_observation_start()
+        token = self.service._community_observation.set(observation)
+        try:
+            now = time.monotonic()
+            self.service._record_usage(
+                "dep-1", model, "vllm", settings or {},
+                now - decode_seconds - 0.1,
+                {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+                now - decode_seconds,
+                hardware={"hardware_class": "dgx-spark"},
+                hardware_verified=True,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+
+    async def test_passive_telemetry_collects_nothing_when_opted_out(self):
+        self._record_passive_sample()
+
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+        self.assertEqual(self.service.store.outbox_batch(), [])
+
+    async def test_passive_telemetry_uses_canonical_model_quant_and_400_bucket(self):
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+
+        self._record_passive_sample(
+            model="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+        )
+
+        self.assertEqual(self.service.store.outbox_batch(), [{
+            "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+            "quantization": "NVFP4",
+            "context_window_size": 400,
+            "inference_tokens_per_second": 80.0,
+            "telemetry_cluster_id": self.service.store.get_setting(
+                "telemetry_cluster_id"
+            ),
+            "concurrency": 1,
+        }])
+
+    async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
+        self.service.store.set_community_consent(True)
+        first = self.service._community_observation_start()
+        second = self.service._community_observation_start()
+        self.service._community_observation_end(second)
+        token = self.service._community_observation.set(first)
+        try:
+            now = time.monotonic()
+            self.service._record_usage(
+                "dep-1", "org/model", "vllm", {}, now - 4.1,
+                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(first)
+
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+
+    async def test_passive_telemetry_has_four_hour_model_quant_cooldown(self):
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+
+    async def test_passive_telemetry_rejects_context_at_or_above_10k(self):
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(input_tokens=10_000)
+
+        _, total = self.service.store.benchmarks()
+        self.assertEqual(total, 0)
+
     async def test_response_metrics_persist_without_request_or_output_content(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
         response = {
             "choices": [{"message": {"content": "generated secret"}}],
             "usage": {"prompt_tokens": 32, "completion_tokens": 24},
@@ -85,7 +239,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.sync_status()["outbox"]["waiting_for_account"], 1
         )
 
-    async def test_coordinated_run_records_real_concurrency_and_strict_upload_dimensions(self):
+    async def test_coordinated_run_above_c1_remains_local(self):
         self.service.store.add_deployment(Deployment(
             id="dep-series", alias="series", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
@@ -110,11 +264,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["prompt_tokens_per_second"], 2000.0)
         self.assertEqual(point["generation_tokens_per_second"], 250.0)
         self.assertEqual(self.service.store.benchmark_model_detail("org/model")["points"][0]["concurrency"], 5)
-        self.assertEqual(self.service.store.outbox_batch(), [{
-            "model_id": "org/model", "context_window_size": 16384,
-            "inference_tokens_per_second": 250.0,
-            "concurrency": 5, "tensor_parallel_size": 2,
-        }])
+        self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_coordinated_run_groups_private_models_by_distinct_opaque_local_ids(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
@@ -487,13 +637,15 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["availability"], "available")
         self.assertEqual(result["items"], [{
             "model_id": "org/community-model",
+            "quantization": "UNKNOWN",
             "context_window_size": 8192,
             "inference_tokens_per_second": 42.5,
             "sample_count": 12,
+            "unique_cluster_count": 1,
         }])
         self.assertEqual(
             result["evidence_policy"]["exact_match_dimensions"],
-            ["model_id", "context_window_size"],
+            ["model_id", "quantization"],
         )
 
     async def test_local_community_database_work_runs_off_event_loop(self):
@@ -840,7 +992,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             items[0]["hardware"]["gpus"][0]["model"], "NVIDIA RTX 5090",
         )
-        self.assertTrue(items[0]["eligible_for_community"])
+        self.assertFalse(items[0]["eligible_for_community"])
         self.manager.node_registry.request.assert_awaited_once_with(
             "worker-2", "GET", "/api/agent/stats", timeout=5,
         )
@@ -882,7 +1034,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             items[0]["hardware"]["gpus"][0]["model"], "NVIDIA RTX 5090",
         )
-        self.assertTrue(items[0]["eligible_for_community"])
+        self.assertFalse(items[0]["eligible_for_community"])
         self.manager.node_registry.request.assert_awaited_once_with(
             "worker-2", "GET", "/api/agent/stats", timeout=5,
         )
@@ -891,7 +1043,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         def respond(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={
                 "model": "org/model", "choices": [],
-                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "usage": {"prompt_tokens": 32, "completion_tokens": 320},
                 "timings": {"predicted_per_second": 80.0},
             }, request=request)
 
@@ -900,6 +1052,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager._stats_cache = {
             "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
         }
+        self.service.store.set_community_consent(True)
         for deployment_id, alias, kind in (
             ("managed-llama", "managed", DeploymentKind.MANAGED),
             ("external-llama", "external", DeploymentKind.EXTERNAL),
@@ -917,16 +1070,14 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         items, _ = self.service.store.benchmarks()
         by_deployment = {item["deployment_id"]: item for item in items}
         managed = by_deployment["managed-llama"]
-        external = by_deployment["external-llama"]
 
         self.assertEqual(managed["hardware"]["hardware_class"], "dgx-spark")
         self.assertEqual(managed["hardware"]["gpus"][0]["model"], "NVIDIA GB10")
         self.assertTrue(managed["eligible_for_community"])
-        self.assertEqual(external["hardware"]["hardware_class"], "unknown")
-        self.assertFalse(external["eligible_for_community"])
+        self.assertNotIn("external-llama", by_deployment)
 
     async def test_unknown_endpoint_hardware_stays_local_only(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
 
         self.service._record_response(
             "external", "org/model", "vllm", {}, time.monotonic() - 0.2,
@@ -941,7 +1092,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_short_sample_remains_local_and_is_not_queued(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
         self.service._record_response(
             None, "org/model", "llama.cpp", {}, time.monotonic() - 0.1,
             {"usage": {"prompt_tokens": 4, "completion_tokens": 2}},
@@ -953,7 +1104,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_non_stream_without_native_timing_is_local_only_and_keeps_revision(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
         self.service._record_response(
             "dep-1", "org/model", "sglang", {}, time.monotonic() - 0.2,
             {"usage": {"prompt_tokens": 24, "completion_tokens": 20}},
@@ -965,7 +1116,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["model"]["revision"], "revision-abc")
 
     async def test_local_artifact_and_private_image_never_enter_outbox(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
         self.service._record_response(
             None, "models/customer.gguf", "llama.cpp",
             {"image": "registry.private/team/runtime:latest", "context_length": 4096},
@@ -982,7 +1133,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_repository_shaped_existing_relative_path_is_redacted(self):
-        self.service.store.set_setting("community_consent", True)
+        self.service.store.set_community_consent(True)
         with tempfile.TemporaryDirectory(prefix="private-model-", dir="tests") as directory:
             relative_model = Path(directory).as_posix()
             self.service._record_response(

@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,13 +17,14 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 
 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
-    "model_id", "context_window_size", "inference_tokens_per_second",
-    "concurrency", "tensor_parallel_size",
+    "model_id", "quantization", "context_window_size",
+    "inference_tokens_per_second", "telemetry_cluster_id",
+    "concurrency",
 })
-COMMUNITY_CONSENT_CONTRACT_VERSION = 2
+COMMUNITY_CONSENT_CONTRACT_VERSION = 3
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
-    "exact_match_dimensions": ["model_id", "context_window_size"],
+    "exact_match_dimensions": ["model_id", "quantization"],
     "metric": "inference_tokens_per_second",
 }
 # The community backend is built in — every installation talks to the hosted
@@ -113,7 +115,8 @@ class SparkDeckStore:
                     generation_tps REAL,
                     prompt_tps REAL,
                     cold_start INTEGER,
-                    eligible INTEGER NOT NULL
+                    eligible INTEGER NOT NULL,
+                    telemetry_cluster_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
@@ -146,6 +149,11 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("community_consent", "false"),
             )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
+                ("community_consent_generation", "0"),
+            )
+            consent_enabled = bool(self.get_setting("community_consent", False))
             consent_version_row = self._connection.execute(
                 "SELECT value_json FROM settings WHERE key = ?",
                 ("community_consent_contract_version",),
@@ -158,13 +166,22 @@ class SparkDeckStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 consent_version = None
             if consent_version != COMMUNITY_CONSENT_CONTRACT_VERSION:
-                # The coordinated benchmark payload widens the original
-                # three-field consent contract. Existing opt-ins must not
-                # silently authorize the new concurrency/TP dimensions.
+                # Quantization and the opaque cluster identifier widen the
+                # public payload. Existing opt-ins must not silently authorize
+                # that new contract. Invalidate any in-flight consent snapshot
+                # when migration actually transitions sharing from on to off.
                 self._connection.execute(
                     "UPDATE settings SET value_json = 'false' "
                     "WHERE key = 'community_consent'"
                 )
+                if consent_enabled:
+                    generation = int(self.get_setting(
+                        "community_consent_generation", 0,
+                    )) + 1
+                    self._connection.execute(
+                        "UPDATE settings SET value_json = ? WHERE key = ?",
+                        (json.dumps(generation), "community_consent_generation"),
+                    )
                 self._connection.execute(
                     "DELETE FROM upload_outbox WHERE status IN "
                     "('pending', 'failed', 'waiting_for_account')"
@@ -214,6 +231,16 @@ class SparkDeckStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS benchmark_series_sample "
                 "ON benchmark_series_points(sample_id) WHERE sample_id IS NOT NULL"
             )
+            benchmark_columns = {
+                row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(benchmark_samples)"
+                )
+            }
+            if "telemetry_cluster_id" not in benchmark_columns:
+                self._connection.execute(
+                    "ALTER TABLE benchmark_samples "
+                    "ADD COLUMN telemetry_cluster_id TEXT"
+                )
             self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
@@ -221,17 +248,15 @@ class SparkDeckStore:
             # instructions; the full benchmark rows remain local.
             invalid_sample_ids: list[str] = []
             for row in self._connection.execute(
-                "SELECT id, configuration_json, generation_tps "
+                "SELECT id, input_tokens, generation_tps, telemetry_cluster_id "
                 "FROM benchmark_samples WHERE eligible = 1"
             ).fetchall():
-                try:
-                    configuration = json.loads(row["configuration_json"] or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    configuration = {}
                 if (
-                    not isinstance(configuration, dict)
-                    or community_context_window(configuration) is None
+                    _community_prompt_tokens(row["input_tokens"]) is None
                     or _positive_speed(row["generation_tps"]) is None
+                    or not _valid_telemetry_cluster_id(
+                        row["telemetry_cluster_id"]
+                    )
                 ):
                     invalid_sample_ids.append(row["id"])
             if invalid_sample_ids:
@@ -399,37 +424,86 @@ class SparkDeckStore:
         return items[0] if items else None
 
     def add_benchmark(self, sample: BenchmarkSample, queue: bool) -> None:
-        value = sample.to_dict()
-        community_eligible = bool(
-            sample.eligible_for_community
-            and community_context_window(sample.configuration) is not None
-            and _positive_speed(sample.generation_tokens_per_second) is not None
-        )
         with self._lock, self._connection:
-            self._connection.execute(
-                """INSERT INTO benchmark_samples VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )""",
-                (
-                    sample.id, sample.created_at, sample.deployment_id,
-                    json.dumps(value["model"]), sample.runtime.value,
-                    sample.runtime_version, json.dumps(sample.hardware),
-                    json.dumps(sample.configuration), sample.input_tokens,
-                    sample.output_tokens, sample.latency_ms, sample.ttft_ms,
-                    sample.generation_tokens_per_second,
-                    sample.prompt_tokens_per_second,
-                    None if sample.cold_start is None else int(sample.cold_start),
-                    int(community_eligible),
-                ),
+            consent = self._community_consent_snapshot_locked()
+            cluster_id = (
+                consent["telemetry_cluster_id"]
+                if queue and consent["enabled"] else None
+            )
+            community_eligible = self._insert_benchmark_locked(
+                sample, cluster_id,
             )
             self._link_benchmark_series_point(sample)
             if queue and community_eligible:
-                pairing = self.get_setting("device_pairing", {"status": "not_paired"})
-                status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
-                self._connection.execute(
-                    "INSERT INTO upload_outbox(sample_id, status, created_at) VALUES (?, ?, ?)",
-                    (sample.id, status, sample.created_at),
-                )
+                self._queue_benchmark_locked(sample)
+
+    def add_benchmark_if_consented(
+        self, sample: BenchmarkSample, expected_generation: int,
+    ) -> bool:
+        """Atomically persist and queue telemetry under one consent snapshot.
+
+        The caller captures ``community_consent_snapshot`` when measurement
+        begins. Turning sharing off (or changing cluster identity) increments
+        the generation, so a request that finishes after that boundary cannot
+        write telemetry even if sharing was subsequently enabled again.
+        """
+        with self._lock, self._connection:
+            consent = self._community_consent_snapshot_locked()
+            if (
+                not consent["enabled"]
+                or consent["generation"] != expected_generation
+                or not consent["telemetry_cluster_id"]
+                or not _community_sample_eligible(sample)
+            ):
+                return False
+            if not self._insert_benchmark_locked(
+                sample, consent["telemetry_cluster_id"],
+            ):
+                return False
+            self._link_benchmark_series_point(sample)
+            self._queue_benchmark_locked(sample)
+            return True
+
+    def _insert_benchmark_locked(
+        self, sample: BenchmarkSample, telemetry_cluster_id: str | None,
+    ) -> bool:
+        value = sample.to_dict()
+        community_eligible = bool(
+            telemetry_cluster_id and _community_sample_eligible(sample)
+        )
+        self._connection.execute(
+            """INSERT INTO benchmark_samples(
+                id, created_at, deployment_id, model_json, runtime,
+                runtime_version, hardware_json, configuration_json,
+                input_tokens, output_tokens, latency_ms, ttft_ms,
+                generation_tps, prompt_tps, cold_start, eligible,
+                telemetry_cluster_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sample.id, sample.created_at, sample.deployment_id,
+                json.dumps(value["model"]), sample.runtime.value,
+                sample.runtime_version, json.dumps(sample.hardware),
+                json.dumps(sample.configuration), sample.input_tokens,
+                sample.output_tokens, sample.latency_ms, sample.ttft_ms,
+                sample.generation_tokens_per_second,
+                sample.prompt_tokens_per_second,
+                None if sample.cold_start is None else int(sample.cold_start),
+                int(community_eligible), telemetry_cluster_id,
+            ),
+        )
+        return community_eligible
+
+    def _queue_benchmark_locked(self, sample: BenchmarkSample) -> None:
+        pairing = self.get_setting("device_pairing", {"status": "not_paired"})
+        status = (
+            "pending" if pairing.get("status") == "paired"
+            else "waiting_for_account"
+        )
+        self._connection.execute(
+            "INSERT INTO upload_outbox(sample_id, status, created_at) "
+            "VALUES (?, ?, ?)",
+            (sample.id, status, sample.created_at),
+        )
 
     def _link_benchmark_series_point(self, sample: BenchmarkSample) -> None:
         """Connect a coordinated chart point to its Local history sample."""
@@ -492,55 +566,59 @@ class SparkDeckStore:
         self, point: dict[str, Any], sample: BenchmarkSample, queue: bool,
     ) -> None:
         """Atomically persist one chart point, Local-history row, and outbox row."""
-        value = sample.to_dict()
-        community_eligible = bool(
-            sample.eligible_for_community
-            and community_context_window(sample.configuration) is not None
-            and _positive_speed(sample.generation_tokens_per_second) is not None
-        )
         with self._lock, self._connection:
-            self._connection.execute(
-                """INSERT INTO benchmark_samples VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )""",
-                (
-                    sample.id, sample.created_at, sample.deployment_id,
-                    json.dumps(value["model"]), sample.runtime.value,
-                    sample.runtime_version, json.dumps(sample.hardware),
-                    json.dumps(sample.configuration), sample.input_tokens,
-                    sample.output_tokens, sample.latency_ms, sample.ttft_ms,
-                    sample.generation_tokens_per_second,
-                    sample.prompt_tokens_per_second,
-                    None if sample.cold_start is None else int(sample.cold_start),
-                    int(community_eligible),
-                ),
+            consent = self._community_consent_snapshot_locked()
+            cluster_id = (
+                consent["telemetry_cluster_id"]
+                if queue and consent["enabled"] else None
             )
-            self._connection.execute(
-                """INSERT INTO benchmark_series_points(
-                    id, created_at, deployment_id, model_id, context_window_size,
-                    concurrency, tensor_parallel_size, prompt_tps, generation_tps,
-                    request_count, sample_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    point["id"], point["created_at"], point.get("deployment_id"),
-                    point["model_id"], point["context_window_size"],
-                    point["concurrency"], point["tensor_parallel_size"],
-                    point["prompt_tokens_per_second"],
-                    point["generation_tokens_per_second"], point["request_count"],
-                    sample.id,
-                ),
+            community_eligible = self._insert_benchmark_locked(
+                sample, cluster_id,
             )
+            self._insert_benchmark_series_point_locked(point, sample.id)
             if queue and community_eligible:
-                pairing = self.get_setting("device_pairing", {"status": "not_paired"})
-                status = (
-                    "pending" if pairing.get("status") == "paired"
-                    else "waiting_for_account"
-                )
-                self._connection.execute(
-                    "INSERT INTO upload_outbox(sample_id, status, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (sample.id, status, sample.created_at),
-                )
+                self._queue_benchmark_locked(sample)
+
+    def add_coordinated_benchmark_if_consented(
+        self, point: dict[str, Any], sample: BenchmarkSample,
+        expected_generation: int,
+    ) -> bool:
+        """Consent-aware atomic variant for coordinated telemetry."""
+        with self._lock, self._connection:
+            consent = self._community_consent_snapshot_locked()
+            if (
+                not consent["enabled"]
+                or consent["generation"] != expected_generation
+                or not consent["telemetry_cluster_id"]
+                or not _community_sample_eligible(sample)
+            ):
+                return False
+            if not self._insert_benchmark_locked(
+                sample, consent["telemetry_cluster_id"],
+            ):
+                return False
+            self._insert_benchmark_series_point_locked(point, sample.id)
+            self._queue_benchmark_locked(sample)
+            return True
+
+    def _insert_benchmark_series_point_locked(
+        self, point: dict[str, Any], sample_id: str,
+    ) -> None:
+        self._connection.execute(
+            """INSERT INTO benchmark_series_points(
+                id, created_at, deployment_id, model_id, context_window_size,
+                concurrency, tensor_parallel_size, prompt_tps, generation_tps,
+                request_count, sample_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                point["id"], point["created_at"], point.get("deployment_id"),
+                point["model_id"], point["context_window_size"],
+                point["concurrency"], point["tensor_parallel_size"],
+                point["prompt_tokens_per_second"],
+                point["generation_tokens_per_second"], point["request_count"],
+                sample_id,
+            ),
+        )
 
     def benchmark_model_summaries(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -604,15 +682,15 @@ class SparkDeckStore:
         keeping the public aggregate boundary identical to the upload payload.
         Rows are grouped by the exact dimensions declared in
         ``COMMUNITY_EVIDENCE_POLICY`` and no private benchmark metadata leaves
-        this method. Coordinated runs are excluded because their concurrency
-        and tensor-parallel dimensions cannot be represented by this legacy
-        aggregate contract; the dimension-aware benchmark explorer reads them
-        from ``benchmark_series_points`` instead.
+        this method. Explicit non-C1 runs are excluded because concurrency
+        dimensions cannot be represented by this community contract. Manual
+        benchmark detail remains available from ``benchmark_series_points``.
         """
-        grouped: dict[tuple[str, int], tuple[float, int]] = {}
+        grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT model_json, configuration_json, generation_tps "
+                "SELECT model_json, configuration_json, input_tokens, "
+                "generation_tps, telemetry_cluster_id "
                 "FROM benchmark_samples WHERE eligible = 1"
             )
             while True:
@@ -629,33 +707,48 @@ class SparkDeckStore:
                         continue
                     if not isinstance(model, dict) or not isinstance(configuration, dict):
                         continue
-                    if _coordinated_concurrency(
-                        configuration.get("benchmark_concurrency")
-                    ) is not None:
+                    raw_concurrency = configuration.get("benchmark_concurrency")
+                    if (
+                        raw_concurrency is not None
+                        and _positive_integer(raw_concurrency) != 1
+                    ):
                         continue
                     model_id = str(model.get("repository") or "").strip()
-                    context_window = community_context_window(configuration)
+                    quantization = _community_quantization(model)
+                    context_window = _community_context_bucket(
+                        row["input_tokens"]
+                    )
                     speed = _positive_speed(row["generation_tps"])
-                    if not model_id or context_window is None or speed is None:
+                    cluster_id = row["telemetry_cluster_id"]
+                    if (
+                        not model_id or context_window is None or speed is None
+                        or not _valid_telemetry_cluster_id(cluster_id)
+                    ):
                         continue
-                    key = (model_id, context_window)
-                    total, count = grouped.get(key, (0.0, 0))
-                    grouped[key] = (total + speed, count + 1)
+                    key = (model_id, quantization, context_window)
+                    aggregate = grouped.setdefault(key, {
+                        "total": 0.0, "count": 0, "clusters": set(),
+                    })
+                    aggregate["total"] += speed
+                    aggregate["count"] += 1
+                    aggregate["clusters"].add(cluster_id)
 
         items = [
             {
                 "model_id": model_id,
+                "quantization": quantization,
                 "context_window_size": context_window,
-                "inference_tokens_per_second": total / count,
-                "sample_count": count,
+                "inference_tokens_per_second": value["total"] / value["count"],
+                "sample_count": value["count"],
+                "unique_cluster_count": len(value["clusters"]),
             }
-            for (model_id, context_window), (total, count) in grouped.items()
+            for (model_id, quantization, context_window), value in grouped.items()
         ]
         return sorted(
             items,
             key=lambda item: (
                 -item["sample_count"], item["model_id"].casefold(),
-                item["context_window_size"],
+                item["quantization"].casefold(), item["context_window_size"],
             ),
         )
 
@@ -800,13 +893,57 @@ class SparkDeckStore:
             "cloud_endpoint_configured": bool(COMMUNITY_API_URL),
         }
 
-    def set_community_consent(self, enabled: bool) -> None:
-        """Persist consent and queue eligible local samples only after opt-in."""
+    def community_consent_snapshot(self) -> dict[str, Any]:
+        """Return the epoch-bound state required to begin telemetry capture."""
+        with self._lock:
+            return self._community_consent_snapshot_locked()
+
+    def _community_consent_snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.get_setting("community_consent", False)),
+            "generation": int(self.get_setting(
+                "community_consent_generation", 0,
+            )),
+            "telemetry_cluster_id": self.get_setting("telemetry_cluster_id"),
+        }
+
+    def set_community_consent(
+        self, enabled: bool, telemetry_cluster_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist consent without retroactively queueing local history.
+
+        A cluster identifier is generated only on the first opt-in. Controllers
+        pass that same opaque UUID to agents so one SparkDeck cluster contributes
+        one identity to the hosted aggregate, regardless of node count.
+        """
+        enabled = bool(enabled)
         with self._lock, self._connection:
+            current = self._community_consent_snapshot_locked()
+            cluster_id = current["telemetry_cluster_id"]
+            if enabled:
+                if telemetry_cluster_id is not None:
+                    cluster_id = _telemetry_cluster_id(telemetry_cluster_id)
+                elif cluster_id is None:
+                    cluster_id = str(uuid.uuid4())
+                else:
+                    cluster_id = _telemetry_cluster_id(cluster_id)
+
+            identity_changed = (
+                enabled and cluster_id != current["telemetry_cluster_id"]
+            )
+            state_changed = enabled != current["enabled"]
+            generation = current["generation"] + int(
+                state_changed or identity_changed
+            )
             self._connection.execute(
                 "INSERT INTO settings(key, value_json) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-                ("community_consent", json.dumps(bool(enabled))),
+                ("community_consent", json.dumps(enabled)),
+            )
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                ("community_consent_generation", json.dumps(generation)),
             )
             self._connection.execute(
                 "INSERT INTO settings(key, value_json) VALUES (?, ?) "
@@ -816,21 +953,25 @@ class SparkDeckStore:
                     json.dumps(COMMUNITY_CONSENT_CONTRACT_VERSION),
                 ),
             )
-            if not enabled:
-                # Withdrawing consent removes every unsent upload instruction,
-                # while the benchmark_samples rows remain available locally.
+            if enabled and cluster_id is not None:
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    ("telemetry_cluster_id", json.dumps(cluster_id)),
+                )
+            if not enabled or identity_changed:
+                # Withdrawing consent or changing cluster identity invalidates
+                # every unsent instruction. Synced rows remain local history;
+                # enabling never resurrects historical telemetry.
                 self._connection.execute(
                     "DELETE FROM upload_outbox WHERE status IN "
                     "('pending', 'failed', 'waiting_for_account')"
                 )
-                return
-            pairing = self.get_setting("device_pairing", {"status": "not_paired"})
-            status = "pending" if pairing.get("status") == "paired" else "waiting_for_account"
-            self._connection.execute(
-                """INSERT OR IGNORE INTO upload_outbox(sample_id, status, created_at)
-                   SELECT id, ?, created_at FROM benchmark_samples WHERE eligible = 1""",
-                (status,),
-            )
+            return {
+                "enabled": enabled,
+                "generation": generation,
+                "telemetry_cluster_id": cluster_id,
+            }
 
 
 def _benchmark_matches_series_point(
@@ -883,29 +1024,81 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
 def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     """Build the strict cloud payload allowlist, separate from local history."""
     value = _benchmark_row(row)
-    context_window = community_context_window(value["configuration"])
+    context_window = _community_context_bucket(value["input_tokens"])
     speed = _positive_speed(value["generation_tokens_per_second"])
-    model_id = str(value.get("model", {}).get("repository") or "").strip()
-    if not model_id or context_window is None or speed is None:
+    model = value.get("model", {})
+    model_id = str(model.get("repository") or "").strip()
+    quantization = _community_quantization(model)
+    cluster_id = row["telemetry_cluster_id"]
+    if (
+        not model_id or context_window is None or speed is None
+        or not _valid_telemetry_cluster_id(cluster_id)
+    ):
         return None
     payload = {
         "model_id": model_id,
+        "quantization": quantization,
         "context_window_size": context_window,
         "inference_tokens_per_second": speed,
+        "telemetry_cluster_id": cluster_id,
+        "concurrency": 1,
     }
-    concurrency = _coordinated_concurrency(
-        value["configuration"].get("benchmark_concurrency")
-    )
-    tensor_parallel_size = _positive_integer(
-        value["configuration"].get("tensor_parallel_size")
-    )
-    if concurrency is not None:
-        payload["concurrency"] = concurrency
-        if tensor_parallel_size is not None:
-            payload["tensor_parallel_size"] = tensor_parallel_size
     if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
         raise ValueError("community upload payload exceeds the public field contract")
     return payload
+
+
+def _community_sample_eligible(sample: BenchmarkSample) -> bool:
+    raw_concurrency = sample.configuration.get("benchmark_concurrency")
+    return bool(
+        sample.eligible_for_community
+        and str(sample.model.repository or "").strip()
+        and _community_prompt_tokens(sample.input_tokens) is not None
+        and _positive_speed(sample.generation_tokens_per_second) is not None
+        and (
+            raw_concurrency is None
+            or _positive_integer(raw_concurrency) == 1
+        )
+    )
+
+
+def _community_quantization(model: dict[str, Any]) -> str:
+    """Return one explicit aggregate dimension without guessing locally."""
+    value = str(model.get("quantization") or "").strip()
+    if not value or len(value) > 100 or any(ord(char) < 32 for char in value):
+        return "UNKNOWN"
+    return value.upper()
+
+
+def _community_prompt_tokens(value: Any) -> int | None:
+    """Validate near-empty prompt occupancy used by passive C1 samples."""
+    parsed = _positive_integer(value)
+    return parsed if parsed is not None and parsed < 10_000 else None
+
+
+def _community_context_bucket(value: Any) -> int | None:
+    """Normalize prompt occupancy for useful local aggregate cohorts."""
+    tokens = _community_prompt_tokens(value)
+    if tokens is None:
+        return None
+    if tokens <= 800:
+        return 400
+    return min(9_000, max(1_000, int(round(tokens / 1_000.0)) * 1_000))
+
+
+def _telemetry_cluster_id(value: Any) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("telemetry_cluster_id must be a UUID") from exc
+
+
+def _valid_telemetry_cluster_id(value: Any) -> bool:
+    try:
+        _telemetry_cluster_id(value)
+    except ValueError:
+        return False
+    return True
 
 
 def community_context_window(configuration: dict[str, Any]) -> int | None:

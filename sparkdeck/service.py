@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
 import hashlib
 import inspect
 import ipaddress
@@ -21,7 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .catalog import HuggingFaceCatalog
+from .catalog import HuggingFaceCatalog, quantization_from_text
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtimes import (
     RuntimeRegistry,
@@ -50,6 +51,9 @@ _LOCAL_ROUTING_KEYS = {
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
+_COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
+_COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 
 
 async def _public_connection_urls(
@@ -225,22 +229,29 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         raise ValueError("community aggregate response is too large")
 
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int]] = set()
     for raw in payload["items"]:
         if not isinstance(raw, dict):
             raise ValueError("community aggregate item must be an object")
         model_id = str(raw.get("model_id") or "").strip()
+        quantization = str(raw.get("quantization") or "unknown").strip().upper()
         context_window = raw.get("context_window_size")
         speed = raw.get("inference_tokens_per_second")
         sample_count = raw.get("sample_count")
+        unique_cluster_count = raw.get("unique_cluster_count", 1)
         if (
             not model_id
             or len(model_id) > 500
             or any(ord(char) < 32 for char in model_id)
+            or not quantization
+            or len(quantization) > 100
+            or any(ord(char) < 32 for char in quantization)
             or isinstance(context_window, bool)
             or not isinstance(context_window, int)
             or isinstance(sample_count, bool)
             or not isinstance(sample_count, int)
+            or isinstance(unique_cluster_count, bool)
+            or not isinstance(unique_cluster_count, int)
             or isinstance(speed, bool)
             or not isinstance(speed, (int, float))
         ):
@@ -251,19 +262,23 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             or context_window > 100_000_000
             or sample_count <= 0
             or sample_count > 1_000_000_000
+            or unique_cluster_count <= 0
+            or unique_cluster_count > sample_count
             or not math.isfinite(speed)
             or speed <= 0
         ):
             raise ValueError("community aggregate item is invalid")
-        key = (model_id, context_window)
+        key = (model_id, quantization, context_window)
         if key in seen:
             raise ValueError("community aggregate response contains duplicate evidence")
         seen.add(key)
         result.append({
             "model_id": model_id,
+            "quantization": quantization,
             "context_window_size": context_window,
             "inference_tokens_per_second": speed,
             "sample_count": sample_count,
+            "unique_cluster_count": unique_cluster_count,
         })
     return result
 
@@ -283,14 +298,22 @@ class SparkDeckService:
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
+        self._community_observation: contextvars.ContextVar[dict[str, Any] | None] = (
+            contextvars.ContextVar("sparkdeck_community_observation", default=None)
+        )
+        self._community_active_observations: dict[str, dict[str, Any]] = {}
 
     async def close(self) -> None:
         self.store.close()
 
-    async def set_community_consent(self, enabled: bool) -> None:
+    async def set_community_consent(
+        self, enabled: bool, telemetry_cluster_id: str | None = None,
+    ) -> dict[str, Any]:
         """Serialize consent changes with benchmark queue mutations."""
         async with self._community_upload_lock:
-            await asyncio.to_thread(self.store.set_community_consent, enabled)
+            return await asyncio.to_thread(
+                self.store.set_community_consent, enabled, telemetry_cluster_id
+            )
 
     async def delete_benchmark(self, sample_id: str) -> bool:
         """Serialize deletion with queue mutations; the uploader re-reads the
@@ -321,6 +344,7 @@ class SparkDeckService:
         endpoint = COMMUNITY_API_URL.strip().rstrip("/")
         if not endpoint:
             items = await asyncio.to_thread(self.store.community_aggregates)
+            items = await self.enrich_community_aggregates(items)
             return {
                 "items": items,
                 "availability": "local" if items else "not_configured",
@@ -338,6 +362,7 @@ class SparkDeckService:
             )
             response.raise_for_status()
             items = _public_community_aggregates(response.json())
+            items = await self.enrich_community_aggregates(items)
         except (httpx.HTTPError, TypeError, ValueError) as exc:
             raise RuntimeError("community aggregate service is unavailable") from exc
         return {
@@ -345,6 +370,52 @@ class SparkDeckService:
             "availability": "available",
             "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
         }
+
+    async def enrich_community_aggregates(
+        self, items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach authoritative Hub size metadata without trusting uploads."""
+        repositories = list(dict.fromkeys(
+            str(item.get("model_id") or "") for item in items
+            if str(item.get("model_id") or "").count("/") == 1
+        ))[:100]
+        semaphore = asyncio.Semaphore(8)
+
+        async def load(repository: str) -> tuple[str, dict[str, Any] | None]:
+            async with semaphore:
+                try:
+                    return repository, await self.catalog.details(repository)
+                except (httpx.HTTPError, TypeError, ValueError):
+                    return repository, None
+
+        tasks = [asyncio.create_task(load(value)) for value in repositories]
+        metadata: dict[str, dict[str, Any] | None] = {}
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=8)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            metadata = dict(
+                task.result() for task in done if not task.cancelled()
+            )
+        enriched: list[dict[str, Any]] = []
+        for item in items:
+            value = dict(item)
+            detail = metadata.get(str(item.get("model_id") or ""))
+            if detail:
+                value["parameter_count"] = detail.get("parameter_count")
+                value["weight_size_bytes"] = detail.get("weight_size_bytes")
+                quantization = str(item.get("quantization") or "unknown")
+                variant = next((
+                    candidate for candidate in detail.get("quantizations") or []
+                    if str(candidate.get("name") or "").casefold()
+                    == quantization.casefold()
+                ), None)
+                if variant and variant.get("weight_size_bytes"):
+                    value["weight_size_bytes"] = variant["weight_size_bytes"]
+            enriched.append(value)
+        return enriched
 
     async def record_benchmark_series_point(self, body: dict[str, Any]) -> dict[str, Any]:
         """Record aggregate benchmark counters; raw prompts and outputs are rejected upstream."""
@@ -615,6 +686,17 @@ class SparkDeckService:
             ]
         items = items[:bounded_limit]
         return {"items": items, "total": len(items), "next_cursor": None}
+
+    async def catalog_details(self, repository: str) -> dict[str, Any]:
+        model = await self.catalog.details(repository)
+        local = [
+            item for item in await self.deployments()
+            if (item.get("model") or {}).get("repository") == repository
+        ]
+        if local:
+            model = copy.deepcopy(model)
+            model["local_deployment_ids"] = [item["id"] for item in local]
+        return {"model": model, "aggregates": []}
 
     async def deployments(self) -> list[dict[str, Any]]:
         registered = self.store.deployments(include_private=True)
@@ -1774,24 +1856,76 @@ class SparkDeckService:
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None) -> dict[str, Any] | AsyncIterator[str]:
-        requested_model = str(body.get("model") or "")
-        deployment = self.store.deployment(requested_model, include_private=True)
-        if deployment:
-            return await self._proxy_registered(deployment, body, endpoint, cancel)
-        # Compatibility for existing vLLM/SGLang containers. The manager retains
-        # admission control and cancellation for these established deployments.
-        started = time.monotonic()
-        stream = bool(body.get("stream"))
-        result = (
-            await self.manager.proxy_chat_completions(body, cancel)
-            if endpoint == "chat/completions"
-            else await self.manager.proxy_completions(body, cancel)
-        )
-        runtime = await self._runtime_for_legacy_model(requested_model)
-        if hasattr(result, "__aiter__"):
-            return self._observe_stream(result, None, requested_model, runtime, {}, started)
-        self._record_response(None, requested_model, runtime, {}, started, result)
-        return result
+        observation = self._community_observation_start()
+        context_token = self._community_observation.set(observation)
+        streaming = False
+        try:
+            requested_model = str(body.get("model") or "")
+            deployment = self.store.deployment(requested_model, include_private=True)
+            if deployment:
+                result = await self._proxy_registered(
+                    deployment, body, endpoint, cancel
+                )
+            else:
+                # Compatibility for existing vLLM/SGLang containers. Resolve the
+                # container's source repository rather than publishing an
+                # arbitrary served alias as the model identity.
+                started = time.monotonic()
+                result = (
+                    await self.manager.proxy_chat_completions(body, cancel)
+                    if endpoint == "chat/completions"
+                    else await self.manager.proxy_completions(body, cancel)
+                )
+                model, runtime, settings = await self._legacy_model_identity(
+                    requested_model
+                )
+                if hasattr(result, "__aiter__"):
+                    result = self._observe_stream(
+                        result, None, model, runtime, settings, started
+                    )
+                else:
+                    self._record_response(
+                        None, model, runtime, settings, started, result
+                    )
+            if hasattr(result, "__aiter__"):
+                streaming = True
+                return self._community_observed_stream(result, observation)
+            return result
+        finally:
+            self._community_observation.reset(context_token)
+            if not streaming:
+                self._community_observation_end(observation)
+
+    def _community_observation_start(self) -> dict[str, Any] | None:
+        snapshot = self.store.community_consent_snapshot()
+        if not snapshot.get("enabled"):
+            return {"enabled": False, "generation": snapshot.get("generation", 0)}
+        observation = {
+            "id": str(uuid.uuid4()),
+            "enabled": True,
+            "generation": int(snapshot.get("generation") or 0),
+            "contaminated": bool(self._community_active_observations),
+        }
+        if self._community_active_observations:
+            for active in self._community_active_observations.values():
+                active["contaminated"] = True
+        self._community_active_observations[observation["id"]] = observation
+        return observation
+
+    def _community_observation_end(self, observation: dict[str, Any] | None) -> None:
+        if observation is not None and observation.get("id"):
+            self._community_active_observations.pop(observation["id"], None)
+
+    async def _community_observed_stream(
+        self, stream: AsyncIterator[str], observation: dict[str, Any] | None,
+    ) -> AsyncIterator[str]:
+        token = self._community_observation.set(observation)
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            self._community_observation.reset(token)
+            self._community_observation_end(observation)
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
@@ -1853,7 +1987,8 @@ class SparkDeckService:
         managed = deployment.get("kind") == DeploymentKind.MANAGED.value
         self._record_response(
             deployment["id"], deployment["model"]["repository"],
-            deployment["runtime"], deployment.get("settings") or {}, started, data,
+            deployment["runtime"], self._model_observation_settings(deployment),
+            started, data,
             revision=deployment["model"].get("revision"),
             hardware=(
                 self._hardware_snapshot()
@@ -1871,7 +2006,7 @@ class SparkDeckService:
         upstream_body = {**body, "model": model}
         stream = bool(upstream_body.get("stream"))
         started = time.monotonic()
-        settings = deployment.get("settings") or {}
+        settings = self._model_observation_settings(deployment)
         manager_id = settings.get("manager_deployment_id")
         route_observation: dict[str, Any] = {}
         result = (
@@ -2001,7 +2136,8 @@ class SparkDeckService:
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
-                deployment["runtime"], deployment.get("settings") or {}, started,
+                deployment["runtime"], self._model_observation_settings(deployment),
+                started,
                 usage, first_token_at,
                 revision=deployment["model"].get("revision"),
                 hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
@@ -2060,6 +2196,14 @@ class SparkDeckService:
                       revision: str | None = None,
                       hardware: dict[str, Any] | None = None,
                       hardware_verified: bool = True) -> None:
+        observation = self._community_observation.get()
+        passive_observation = observation is not None
+        # Community sharing is the authority for passive inference telemetry.
+        # When it is off, do not even create a local sample row.
+        if passive_observation and (
+            not observation.get("enabled") or observation.get("contaminated")
+        ):
+            return
         completed = time.monotonic()
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -2067,7 +2211,13 @@ class SparkDeckService:
         generation_seconds = max(0.000001, completed - (first_token_at or started))
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
-        quantization = _optional_string(safe_settings.get("quantization"))
+        quantization = (
+            _optional_string(settings.get("quantization"))
+            or quantization_from_text(
+                settings.get("gguf_variant"), settings.get("artifact"), model,
+            )
+            or "unknown"
+        ).upper()
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
             if output_tokens and first_token_at is not None else None
@@ -2079,13 +2229,39 @@ class SparkDeckService:
         generation_tps = native_generation_tps or observed_generation_tps
         prompt_tps = native_prompt_tps or observed_prompt_tps
         public_model = _public_model_id(model)
-        eligible = bool(
-            public_model != "local-model" and input_tokens > 0 and output_tokens >= 16 and latency > 0
+        measured_decode_seconds = (
+            generation_seconds
+            if first_token_at is not None
+            else (
+                output_tokens / native_generation_tps
+                if native_generation_tps and output_tokens else 0.0
+            )
+        )
+        passive_eligible = bool(
+            public_model != "local-model"
+            and 0 < input_tokens < _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS
+            and output_tokens >= 32
+            and measured_decode_seconds >= _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS
+            and generation_tps is not None
+            and runtime_kind.value in self.registry.kinds
+            and hardware_verified
+            and self._community_sample_due(public_model, quantization)
+        )
+        legacy_eligible = bool(
+            public_model != "local-model" and input_tokens > 0
+            and output_tokens >= 16 and latency > 0
             and generation_tps is not None
             and community_context_window(safe_settings) is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
         )
+        eligible = passive_eligible if passive_observation else legacy_eligible
+        if passive_observation and not eligible:
+            return
+        # For community evidence this compatibility field represents observed
+        # prompt occupancy, not the deployment's configured maximum context.
+        if passive_observation:
+            safe_settings["context_length"] = input_tokens
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
@@ -2104,20 +2280,85 @@ class SparkDeckService:
             prompt_tokens_per_second=prompt_tps,
             cold_start=None, eligible_for_community=eligible,
         )
-        consent = bool(self.store.get_setting("community_consent", False))
-        self.store.add_benchmark(sample, queue=eligible and consent)
+        if not passive_observation:
+            consent = bool(self.store.get_setting("community_consent", False))
+            self.store.add_benchmark(sample, queue=eligible and consent)
+            return
+        inserted = self.store.add_benchmark_if_consented(
+            sample, int(observation.get("generation") or 0)
+        )
+        if inserted:
+            self.store.set_setting(
+                self._community_sample_setting(public_model, quantization),
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+    @staticmethod
+    def _community_sample_setting(model: str, quantization: str) -> str:
+        digest = hashlib.sha256(
+            f"{model.casefold()}\0{quantization.casefold()}".encode("utf-8")
+        ).hexdigest()
+        return f"community_sampled_at:{digest}"
+
+    def _community_sample_due(self, model: str, quantization: str) -> bool:
+        value = self.store.get_setting(
+            self._community_sample_setting(model, quantization), None
+        )
+        if not isinstance(value, str):
+            return True
+        try:
+            sampled_at = datetime.fromisoformat(value)
+            if sampled_at.tzinfo is None:
+                sampled_at = sampled_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        return (
+            datetime.now(timezone.utc) - sampled_at
+        ).total_seconds() >= _COMMUNITY_SAMPLE_INTERVAL_SECONDS
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
-        if await self._native_llama_model() == model:
-            return RuntimeKind.LLAMA_CPP.value
+        _, runtime, _ = await self._legacy_model_identity(model)
+        return runtime
+
+    async def _legacy_model_identity(
+        self, requested_model: str,
+    ) -> tuple[str, str, dict[str, Any]]:
+        if await self._native_llama_model() == requested_model:
+            variant = getattr(self.manager, "_unsloth_variant", lambda value: None)(
+                requested_model
+            )
+            return requested_model, RuntimeKind.LLAMA_CPP.value, {
+                "gguf_variant": variant,
+            }
         try:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
-                if model in ids:
-                    return self._container_runtime(container)
+                if requested_model in ids:
+                    repository = str(container.get("model") or "").strip()
+                    if not repository or "/" not in repository:
+                        repository = "local-model"
+                    settings = dict(
+                        container.get("load_settings")
+                        or container.get("settings")
+                        or {}
+                    )
+                    for key in ("quantization", "artifact", "gguf_variant"):
+                        if container.get(key) is not None:
+                            settings[key] = container[key]
+                    return repository, self._container_runtime(container), settings
         except Exception:
             pass
-        return RuntimeKind.VLLM.value
+        # An unlinked served alias is not a trustworthy public repository.
+        return "local-model", RuntimeKind.VLLM.value, {}
+
+    @staticmethod
+    def _model_observation_settings(deployment: dict[str, Any]) -> dict[str, Any]:
+        settings = dict(deployment.get("settings") or {})
+        model = deployment.get("model") or {}
+        for key in ("quantization", "artifact"):
+            if model.get(key) is not None:
+                settings[key] = model[key]
+        return settings
 
     async def _native_llama_model(self) -> str | None:
         loaded_model = getattr(self.manager, "_unsloth_loaded_model", None)

@@ -924,9 +924,17 @@ async def agent_apply_community_consent(req: Request):
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body must be valid JSON") from exc
     enabled = body.get("enabled") if isinstance(body, dict) else None
+    telemetry_cluster_id = (
+        body.get("telemetry_cluster_id") if isinstance(body, dict) else None
+    )
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    await sparkdeck.set_community_consent(enabled)
+    if telemetry_cluster_id is not None and not isinstance(telemetry_cluster_id, str):
+        raise HTTPException(400, "telemetry_cluster_id must be a string")
+    if telemetry_cluster_id is None:
+        await sparkdeck.set_community_consent(enabled)
+    else:
+        await sparkdeck.set_community_consent(enabled, telemetry_cluster_id)
     return {"applied": True, "enabled": enabled}
 
 
@@ -1671,6 +1679,19 @@ async def catalog_models(q: str = "", runtime: str | None = None, limit: int = 2
         raise HTTPException(e.response.status_code, "model catalog request failed")
     except httpx.HTTPError as e:
         raise HTTPException(502, f"model catalog unavailable: {e}")
+
+
+@app.get("/api/v1/catalog/models/{model_id:path}")
+async def catalog_model_details(model_id: str):
+    try:
+        return await sparkdeck.catalog_details(model_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        status = 404 if exc.response.status_code == 404 else 502
+        raise HTTPException(status, "model metadata is unavailable") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, "model metadata is unavailable") from exc
 
 
 @app.get("/api/v1/deployments")
@@ -2609,8 +2630,16 @@ async def v1_community_consent(req: Request):
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         raise HTTPException(400, "enabled must be a boolean")
-    await sparkdeck.set_community_consent(enabled)
-    cluster = await manager.push_community_consent(enabled)
+    snapshot = await sparkdeck.set_community_consent(enabled)
+    cluster_id = (
+        snapshot.get("telemetry_cluster_id")
+        if isinstance(snapshot, dict) else None
+    )
+    cluster = (
+        await manager.push_community_consent(enabled, cluster_id)
+        if cluster_id
+        else await manager.push_community_consent(enabled)
+    )
     status = _community_sync_status()
     status["cluster"] = cluster
     return status
@@ -2759,7 +2788,7 @@ async def v1_community_aggregates(req: Request):
         return _community_aggregates_unavailable()
     try:
         upstream = await _community_http.get(
-            f"{api_url}/v1/aggregates",
+            f"{api_url}/v2/aggregates",
             headers={
                 "Authorization": f"Bearer {id_token}",
             },
@@ -2776,6 +2805,7 @@ async def v1_community_aggregates(req: Request):
     try:
         body = upstream.json()
         items = _public_community_aggregates(body)
+        items = await sparkdeck.enrich_community_aggregates(items)
     except (TypeError, ValueError):
         return _community_aggregates_unavailable()
     evidence_policy = body.get("evidence_policy")
@@ -2921,7 +2951,7 @@ async def _post_community_sample(
 ) -> httpx.Response | None:
     try:
         return await _community_http.post(
-            f"{api_url}/v1/samples",
+            f"{api_url}/v2/samples",
             json=payload,
             headers={
                 "Authorization": f"Bearer {id_token}",
@@ -2935,6 +2965,11 @@ async def _post_community_sample(
 async def community_upload_once() -> dict:
     """Upload one batch of pending consented samples; transient errors stay pending."""
     global _community_upload_not_before
+    # Joined workers never contact the hosted service. Cluster inference is
+    # observed and uploaded by the authoritative controller, which also makes
+    # a controller-side opt-out fail closed even if a worker is unreachable.
+    if manager.is_joined_worker():
+        return {"uploaded": 0, "failed": 0, "reason": "controller_owned"}
     if time.time() < _community_upload_not_before:
         return {"uploaded": 0, "failed": 0, "reason": "rate_limited"}
     store = sparkdeck.store
@@ -2964,33 +2999,35 @@ async def community_upload_once() -> dict:
     failed: list[str] = []
     for entry in batch:
         sample_id = entry["sample_id"]
-        # Consent, pairing, or deletion may change mid-batch. Stop rather than
-        # upload under stale authorization.
-        if not store.get_setting("community_consent", False):
-            break
-        current_pairing = store.get_setting(
-            "device_pairing", {"status": "not_paired"})
-        if (
-            not isinstance(current_pairing, dict)
-            or current_pairing.get("status") != "paired"
-            or current_pairing.get("sub") != batch_sub
-            or current_pairing.get("refresh_token") != refresh_token
-        ):
-            break
-        # The batch is only a scheduling snapshot; re-read the row at the
-        # outbound boundary so a deleted or transitioned sample never sends.
-        current = store.outbox_entry(sample_id)
-        if current is None:
-            continue
-        response = await _post_community_sample(
-            api_url, id_token, current["payload"], sample_id)
-        if response is not None and response.status_code == 401:
-            # The cached token expired early; mint once and retry this sample.
-            id_token = await _community_id_token(refresh_token, force=True)
-            if not id_token:
+        # Hold the same mutation lock used by opt-out across the final consent
+        # check and POST. Once disabling returns, no older upload can still be
+        # in flight or begin from a stale batch snapshot.
+        async with sparkdeck._community_upload_lock:
+            if not store.get_setting("community_consent", False):
                 break
+            current_pairing = store.get_setting(
+                "device_pairing", {"status": "not_paired"})
+            if (
+                not isinstance(current_pairing, dict)
+                or current_pairing.get("status") != "paired"
+                or current_pairing.get("sub") != batch_sub
+                or current_pairing.get("refresh_token") != refresh_token
+            ):
+                break
+            # The batch is only a scheduling snapshot; re-read the row at the
+            # outbound boundary so a deleted or transitioned sample never sends.
+            current = store.outbox_entry(sample_id)
+            if current is None:
+                continue
             response = await _post_community_sample(
                 api_url, id_token, current["payload"], sample_id)
+            if response is not None and response.status_code == 401:
+                # The cached token expired early; mint once and retry this sample.
+                id_token = await _community_id_token(refresh_token, force=True)
+                if not id_token:
+                    break
+                response = await _post_community_sample(
+                    api_url, id_token, current["payload"], sample_id)
         if response is None:
             continue  # transient transport error: leave pending
         if response.is_success:

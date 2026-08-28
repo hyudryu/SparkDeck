@@ -113,6 +113,59 @@ describe('API client adapters', () => {
     await expect(result).resolves.toEqual(expect.objectContaining({ ok: true, node_ids: ['local'] }))
   })
 
+  it.each([
+    [
+      'deployment stop',
+      121_000,
+      () => api.deployments.action('dep-slow', 'stop'),
+      () => new Response(JSON.stringify({
+        id: 'dep-slow', alias: 'slow-model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: {},
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    ],
+    [
+      'deployment removal',
+      121_000,
+      () => api.deployments.action('dep-slow', 'remove'),
+      () => new Response(null, { status: 204 }),
+    ],
+    [
+      'image removal',
+      121_000,
+      () => api.images.remove('sha256:slow'),
+      () => new Response(null, { status: 204 }),
+    ],
+    [
+      'RouterOS fan update',
+      46_000,
+      () => api.routeros.updateFanSettings('spark-2', { mode: 'curve' }),
+      () => new Response(JSON.stringify({ node_id: 'spark-2' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    ],
+    [
+      'storage model removal',
+      601_000,
+      () => api.storage.removeModel('spark-2', 'org/model'),
+      () => new Response(null, { status: 204 }),
+    ],
+  ] as const)('does not time out a backend-owned %s', async (_name, elapsedMs, run, response) => {
+    vi.useFakeTimers()
+    let finishRequest: ((value: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => new Promise((resolve) => {
+      finishRequest = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = run()
+    await vi.advanceTimersByTimeAsync(elapsedMs)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    finishRequest?.(response())
+    await result
+  })
+
   it('does not time out a long-running non-streaming chat completion', async () => {
     vi.useFakeTimers()
     let finishRequest: ((response: Response) => void) | undefined

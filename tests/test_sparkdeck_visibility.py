@@ -6,6 +6,10 @@ import httpx
 from manager import Manager
 
 
+PINNED_A = "a" * 40
+PINNED_B = "b" * 40
+
+
 with patch("docker.from_env", return_value=Mock()):
     import server
 
@@ -258,9 +262,17 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=[{
                 "id": "local", "models": [{
                     "model_id": "org/model", "size_bytes": 12,
-                    "revisions": ["main"],
+                    "revisions": ["main", PINNED_A],
+                    "revision_refs": {"main": PINNED_A},
                 }],
             }])),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "main",
+                    "resolved_revision": PINNED_A, "size_bytes": 12,
+                }),
+            ),
             patch.object(server.sparkdeck, "create_deployment", AsyncMock(return_value=created)) as create,
         ):
             listed = await self.client.get("/api/v1/recipes")
@@ -479,13 +491,21 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         }], [{
             "id": "local", "models": [{
                 "model_id": "org/model", "size_bytes": 12,
-                "revisions": ["release-b", "revision-b"],
+                "revisions": ["release-b", PINNED_B],
+                "revision_refs": {"release-b": PINNED_B},
             }],
         }]])
         with (
             patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
             patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
             patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "release-b",
+                    "resolved_revision": PINNED_B, "size_bytes": 12,
+                }),
+            ),
             patch.object(
                 server.sparkdeck, "create_deployment", AsyncMock(return_value=created),
             ) as create,
@@ -520,13 +540,21 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         }], [{
             "id": "local", "models": [{
                 "model_id": "org/model", "size_bytes": 12,
-                "revisions": ["main", "main-snapshot"],
+                "revisions": ["main", PINNED_A],
+                "revision_refs": {"main": PINNED_A},
             }],
         }]])
         with (
             patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
             patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
             patch.object(server.manager, "model_cache_inventory", inventory),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "main",
+                    "resolved_revision": PINNED_A, "size_bytes": 12,
+                }),
+            ),
             patch.object(
                 server.sparkdeck, "create_deployment", AsyncMock(return_value=created),
             ) as create,
@@ -558,6 +586,13 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
             patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[{"id": "local"}])),
             patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=inventory)),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "main",
+                    "resolved_revision": PINNED_A, "size_bytes": 12,
+                }),
+            ),
             patch.object(server.sparkdeck, "create_deployment", AsyncMock()) as create,
         ):
             response = await self.client.post("/api/v1/recipes/partial-cache/deploy")
@@ -592,6 +627,52 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         inventory.assert_not_awaited()
         create.assert_awaited_once()
 
+    async def test_recipe_deploy_rejects_nodes_with_mismatched_main_commits(self):
+        recipe = {
+            "id": "mixed-main", "model": "org/model", "engine": "vllm",
+            "extra_args": ["--tensor-parallel-size", "2"],
+        }
+        inventory = [{
+            "id": "local", "models": [{
+                "model_id": "org/model", "partial": False,
+                "size_bytes": 12, "revisions": ["main", PINNED_A],
+                "revision_refs": {"main": PINNED_A},
+            }],
+        }, {
+            "id": "node-2", "models": [{
+                "model_id": "org/model", "partial": False,
+                "size_bytes": 12, "revisions": ["main", PINNED_B],
+                "revision_refs": {"main": PINNED_B},
+            }],
+        }]
+        with (
+            patch.object(server.manager, "get_recipe", AsyncMock(return_value=recipe)),
+            patch.object(
+                server.manager, "selected_cluster_nodes",
+                AsyncMock(return_value=[{"id": "local"}, {"id": "node-2"}]),
+            ),
+            patch.object(
+                server.manager, "model_cache_inventory",
+                AsyncMock(return_value=inventory),
+            ),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "main",
+                    "resolved_revision": PINNED_A, "size_bytes": 12,
+                }),
+            ),
+            patch.object(server.sparkdeck, "create_deployment", AsyncMock()) as create,
+        ):
+            response = await self.client.post(
+                "/api/v1/recipes/mixed-main/deploy",
+                json={"node_ids": ["local", "node-2"]},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("node-2", response.text)
+        create.assert_not_awaited()
+
     async def test_tp2_recipe_requires_two_nodes_with_cached_weights(self):
         recipe = {
             "id": "recipe-tp2", "name": "DeepSeek TP2", "model": "deepseek/model",
@@ -607,11 +688,13 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         inventory = [
             {"id": "local", "models": [{
                 "model_id": "deepseek/model", "size_bytes": 12,
-                "revisions": ["main"],
+                "revisions": ["main", PINNED_A],
+                "revision_refs": {"main": PINNED_A},
             }]},
             {"id": "node-2", "models": [{
                 "model_id": "deepseek/model", "size_bytes": 12,
-                "revisions": ["main"],
+                "revisions": ["main", PINNED_A],
+                "revision_refs": {"main": PINNED_A},
             }]},
             {"id": "node-3", "models": []},
         ]
@@ -623,6 +706,13 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "local"}, {"id": "node-2"},
             ])),
             patch.object(server.manager, "model_cache_inventory", AsyncMock(return_value=inventory)),
+            patch.object(
+                server.manager.virtual_nas, "resolve_download_revision",
+                AsyncMock(return_value={
+                    "requested_revision": "main",
+                    "resolved_revision": PINNED_A, "size_bytes": 12,
+                }),
+            ),
             patch.object(server.sparkdeck, "create_deployment", AsyncMock(return_value=created)) as create,
         ):
             listed = await self.client.get("/api/v1/recipes")

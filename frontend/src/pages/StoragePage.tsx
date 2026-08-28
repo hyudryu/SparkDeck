@@ -9,8 +9,8 @@ import { formatBytes } from '../utils/format'
 
 type DraggedModel = { modelId: string; sourceNodeId: string; sourceNodeName: string }
 
-function compareModelIdsDescending(left: StorageModel, right: StorageModel) {
-  return right.model_id.localeCompare(left.model_id, undefined, {
+function compareModelIdsDescending(leftModelId: string, rightModelId: string) {
+  return rightModelId.localeCompare(leftModelId, undefined, {
     numeric: true,
     sensitivity: 'base',
   })
@@ -18,7 +18,7 @@ function compareModelIdsDescending(left: StorageModel, right: StorageModel) {
 
 function compareModels(activeModelIds: ReadonlySet<string>, left: StorageModel, right: StorageModel) {
   const activeOrder = Number(activeModelIds.has(right.model_id)) - Number(activeModelIds.has(left.model_id))
-  return activeOrder || compareModelIdsDescending(left, right)
+  return activeOrder || right.size_bytes - left.size_bytes || compareModelIdsDescending(left.model_id, right.model_id)
 }
 
 function formatTimestamp(value?: string | number) {
@@ -209,6 +209,28 @@ export function StoragePage() {
     }
   }
 
+  const finishDownload = async (node: StorageNode, model: StorageModel) => {
+    if (!model.partial || !node.online) return
+    if (!await confirm({
+      title: `Finish downloading ${model.model_id}?`,
+      message: `Resume the Hugging Face download on ${node.name}? SparkDeck will reuse the partial cache and remove the warning when the download completes.`,
+      confirmLabel: 'Finish download',
+    })) return
+    const busyKey = `download:${node.id}:${model.model_id}`
+    setBusy(busyKey)
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      await api.storage.finishDownload(node.id, model.model_id, model.revision)
+      setNotice(`Queued ${model.model_id} to finish downloading on ${node.name}.`)
+      resource.reload()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not finish model download')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const cancel = async (job: StorageTransferJob) => {
     setBusy(job.id)
     setError(undefined)
@@ -257,7 +279,9 @@ export function StoragePage() {
             const weightRows = [...new Set([...modelsById.keys(), ...activeJobs.keys()])]
               .sort((left, right) => (
                 Number(activeDownloadIds.has(right)) - Number(activeDownloadIds.has(left))
-                || right.localeCompare(left, undefined, { numeric: true, sensitivity: 'base' })
+                || (modelsById.get(right)?.size_bytes ?? activeJobs.get(right)?.bytes_total ?? 0)
+                  - (modelsById.get(left)?.size_bytes ?? activeJobs.get(left)?.bytes_total ?? 0)
+                || compareModelIdsDescending(left, right)
               ))
             const used = node.models.reduce((total, model) => total + model.size_bytes, 0)
             // "Used" counts SparkDeck-managed model weights only, so the
@@ -313,13 +337,20 @@ export function StoragePage() {
                       setDropTargetId(undefined)
                     }}
                   >
-                    {model.partial ? <AlertTriangle className="storage-partial-icon" size={15} aria-label="Partial cache" /> : <GripVertical size={15} aria-hidden="true" />}
+                    {model.partial ? <button
+                      type="button"
+                      className="storage-partial-action"
+                      aria-label={`Finish download of ${model.model_id} on ${node.name}`}
+                      title={`Finish download on ${node.name}`}
+                      disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
+                      onClick={() => void finishDownload(node, model)}
+                    ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
                     <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                     <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
                       title={`Delete from ${node.name}`}
-                      disabled={!node.online || busy === `delete:${node.id}:${model.model_id}`}
+                      disabled={!node.online || busy === `delete:${node.id}:${model.model_id}` || busy === `download:${node.id}:${model.model_id}`}
                       onClick={() => void removeModel(node, model)}
                     ><Trash2 size={15} /></Button>
                   </li>
@@ -383,7 +414,14 @@ export function StoragePage() {
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
               <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => {
                 const location = locations.get(node.id)
-                return <span key={node.id} className={location?.partial ? 'partial' : location ? 'available' : ''}><span aria-hidden="true">{location?.partial ? '!' : location ? '✓' : '—'}</span> {node.name}</span>
+                return <span key={node.id} className={location?.partial ? 'partial' : location ? 'available' : ''}>{location?.partial ? <button
+                  type="button"
+                  className="storage-availability-action"
+                  aria-label={`Finish download of ${location.model_id} on ${node.name} from inventory`}
+                  title={`Finish download on ${node.name}`}
+                  disabled={!node.online || busy === `download:${node.id}:${location.model_id}` || busy === `delete:${node.id}:${location.model_id}`}
+                  onClick={() => void finishDownload(node, location)}
+                >!</button> : <span aria-hidden="true">{location ? '✓' : '—'}</span>} {node.name}</span>
               })}</div>
             </div>)}
           </div>

@@ -1687,6 +1687,72 @@ class Manager:
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
+    async def queue_virtual_nas_download(
+        self, model_id: str, node_id: str, revision: str | None = None,
+    ) -> dict:
+        """Queue a resumable Hub download for an existing partial cache."""
+        model_id = validate_model_id(model_id)
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("node_id must not be empty")
+        requested_revision = validate_revision(revision) if revision is not None else None
+        if requested_revision is None:
+            previous_downloads = sorted(
+                (
+                    job for job in self.virtual_nas.list_transfers()["items"]
+                    if job.get("kind") == "download"
+                    and job.get("model_id") == model_id
+                    and job.get("target_node_id") == node_id
+                    and job.get("status") in {"failed", "canceled", "cancelled"}
+                    and (
+                        job.get("download_attempted_at") is not None
+                        or (
+                            job.get("status") == "failed"
+                            and job.get("started_at") is not None
+                        )
+                    )
+                ),
+                key=lambda job: float(job.get("created_at") or 0),
+                reverse=True,
+            )
+            for job in previous_downloads:
+                try:
+                    requested_revision = validate_revision(
+                        job.get("requested_revision") or job.get("revision")
+                    )
+                except ValueError:
+                    continue
+                break
+        requested_revision = requested_revision or "main"
+        resolution = await self.virtual_nas.resolve_download_revision(
+            model_id, requested_revision,
+        )
+        preflight = await self.virtual_nas_transfer_preflight(
+            model_id, requested_revision, resolution,
+        )
+        target = next((
+            item for item in preflight["targets"] if item["node_id"] == node_id
+        ), None)
+        if target is None:
+            raise LookupError(f"storage node '{node_id}' not found")
+        if not target.get("has_partial_model_cache"):
+            raise LookupError("partial model cache not found on the selected node")
+        if not target.get("download_eligible"):
+            raise RuntimeError(
+                str(target.get("download_reason") or "node is not eligible for download")
+            )
+        result = await self.virtual_nas.queue_download_and_transfer(
+            model_id,
+            preflight["resolved_revision"],
+            node_id,
+            [],
+            preflight["download"]["size_bytes"],
+            requested_revision=requested_revision,
+            require_partial_cache=True,
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
         resolved_download: dict | None = None,
@@ -1902,6 +1968,7 @@ class Manager:
                 "preparation_conflict_reason": conflict_reason,
                 "has_required_weights": has_required_weights,
                 "has_model_cache": existing is not None,
+                "has_partial_model_cache": bool(existing and existing.get("partial")),
                 "download_eligible": download_eligible,
                 "download_reason": download_reason,
                 "download_required_free_bytes": download_required_free,

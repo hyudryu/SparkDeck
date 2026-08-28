@@ -732,6 +732,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
+    finishDownload: (nodeId: string, modelId: string, revision?: string) => request<StorageTransferResult>(
+      `/api/v1/storage/nodes/${encodeURIComponent(nodeId)}/models/${encodeURIComponent(modelId)}/download`,
+      {
+        method: 'POST',
+        body: JSON.stringify(revision ? { revision } : {}),
+      },
+    ),
     preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',
       body: JSON.stringify({ node_ids: nodeIds }),

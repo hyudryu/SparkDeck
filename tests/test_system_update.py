@@ -198,6 +198,51 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("worker unavailable", state["nodes"][0]["error"])
         self.service.start_local.assert_awaited_once_with("main", "b" * 40)
 
+    async def test_tracked_changes_on_one_worker_do_not_skip_later_nodes(self):
+        state = {
+            "id": "job", "active": True, "phase": "preflight",
+            "target_branch": "main", "target_revision": "b" * 40,
+            "nodes": [
+                {
+                    "id": "desktop", "name": "Mark's Desktop",
+                    "local": False, "phase": "pending",
+                },
+                {
+                    "id": "worker", "name": "Worker 2",
+                    "local": False, "phase": "pending",
+                },
+                {
+                    "id": "local", "name": "Controller",
+                    "local": True, "phase": "pending",
+                },
+            ],
+        }
+        self.manager.node_registry.request.side_effect = [
+            RuntimeError(
+                "Mark's Desktop agent error: HTTP 409: "
+                '{"detail":"Tracked files have local changes"}'
+            ),
+            {"capability": CAPABILITY, "blockers": []},
+            {"phase": "accepted"},
+            {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        self.service.start_local = AsyncMock()
+
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()):
+            await self.service._run_cluster(state)
+
+        self.assertEqual(state["nodes"][0]["phase"], "failed")
+        self.assertIn("Tracked files have local changes", state["nodes"][0]["error"])
+        self.assertEqual(state["nodes"][1]["phase"], "succeeded")
+        self.assertEqual(state["nodes"][1]["current_revision"], "b" * 40)
+        self.assertEqual(state["phase"], "updating_controller")
+        self.assertEqual(
+            [request.args[0] for request in self.manager.node_registry.request.await_args_list],
+            ["desktop", "worker", "worker", "worker"],
+        )
+        self.service.start_local.assert_awaited_once_with("main", "b" * 40)
+
     async def test_blocked_controller_does_not_stop_eligible_worker(self):
         state = {
             "id": "job", "active": True, "phase": "preflight", "target_branch": "main",

@@ -133,6 +133,44 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(launch.await_args.args[5]["revision"], "revision-abc")
 
+    async def test_repo_relative_gguf_is_prepared_and_resolved_before_launch(self):
+        revision = "a" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        artifact = model_root / "snapshots" / revision / "FP16" / "model-F16.gguf"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"gguf")
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-gguf", "port": 8080, "status": "running",
+            "model_source": "public_repository",
+        })
+
+        with patch("sparkdeck.service.launch_managed_container", launch):
+            created = await self.service.create_deployment({
+                "model": "org/model", "alias": "prepared-gguf",
+                "runtime": "llama.cpp", "revision": "main",
+                "quantization": "f16",
+                "settings": {"artifact": "FP16/model-F16.gguf"},
+            })
+
+        virtual_nas.resolve_download_revision.assert_awaited_once_with(
+            "org/model", "main",
+        )
+        virtual_nas.download_model_checked.assert_awaited_once_with(
+            "org/model", revision, requested_revision="main",
+        )
+        launch_settings = launch.await_args.args[5]
+        self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
+        self.assertEqual(created["model"]["repository"], "org/model")
+        self.assertEqual(created["model"]["quantization"], "FP16")
+        self.assertEqual(created["model"]["artifact"], str(artifact.resolve()))
+
     async def test_managed_ownership_is_durable_before_container_launch(self):
         async def fail_launch(*args):
             stored = self.service.store.deployment("durable-launch")

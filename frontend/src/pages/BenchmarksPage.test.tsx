@@ -8,7 +8,7 @@ const communityAccess = vi.hoisted(() => ({ signedIn: true, sharingEnabled: true
 
 vi.mock('../hooks/useCommunityAccess', () => ({
   communityAccessHint: (signedIn: boolean) => signedIn
-    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    ? 'Enable telemetry under Settings → Community Features to see community data.'
     : 'Sign in under Settings → Community Features to see community data.',
   useCommunityAccess: () => communityAccess,
 }))
@@ -132,9 +132,18 @@ describe('BenchmarksPage community privacy', () => {
       let body: unknown
       if (path.includes('/api/v1/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
       else if (path.endsWith('/api/v1/community/aggregates')) body = {
-        items: [{ model_id: 'org/model', context_window_size: 16384, inference_tokens_per_second: 42.5, sample_count: 12 }],
+        items: [
+          {
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
+            inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+          },
+          {
+            model_id: 'org/model', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
+            inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
+          },
+        ],
         availability: 'available',
-        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
       }
       else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
         consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
@@ -147,16 +156,23 @@ describe('BenchmarksPage community privacy', () => {
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('42.5 tok/s')).toBeInTheDocument()
-    expect(screen.getByText('16,384 tokens')).toBeInTheDocument()
+    expect(screen.getByText('31.2 tok/s')).toBeInTheDocument()
+    expect(screen.getAllByText('1,000 tokens')).toHaveLength(2)
+    expect(screen.getByText('NVFP4')).toBeInTheDocument()
+    expect(screen.getByText('Q4_K_M')).toBeInTheDocument()
     expect(screen.getByText('12 samples')).toBeInTheDocument()
-    expect(screen.getByText(/matched only on model name and context window/)).toBeInTheDocument()
+    expect(screen.getByText(/matched only on model name, quantization, and prompt-length bucket/)).toBeInTheDocument()
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Review & enable' }))
     const dialog = screen.getByRole('dialog', { name: 'Enable community sharing?' })
-    expect(dialog).toHaveTextContent('Benchmark JSON: model identifier, context-window size, measured inference tok/s')
+    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, prompt-length/context-occupancy bucket, measured inference tok/s')
+    expect(dialog).toHaveTextContent('only samples captured after you enable sharing can be uploaded; existing benchmark history stays local')
+    expect(dialog).toHaveTextContent('stable opaque telemetry cluster ID')
+    expect(dialog).toHaveTextContent('contains no account ID, hostname, node name, or endpoint alias')
     expect(dialog).toHaveTextContent('Never in benchmark JSON: prompts or outputs')
+    expect(dialog).not.toHaveTextContent('tensor-parallel (TP) size')
     expect(dialog).toHaveTextContent('ordinary authenticated request and network metadata')
     await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
     expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
@@ -192,9 +208,12 @@ describe('BenchmarksPage community privacy', () => {
         }
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {
-          items: deleted ? [] : [{ model_id: 'org/model', context_window_size: 8192, inference_tokens_per_second: 42.5, sample_count: 1 }],
+          items: deleted ? [] : [{
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
+            inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
+          }],
           availability: deleted ? 'not_configured' : 'local',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
         }
       } else {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
@@ -226,9 +245,12 @@ describe('BenchmarksPage community privacy', () => {
         body = { items: [], total: 0, limit: 100, offset: 0 }
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {
-          items: [{ model_id: 'org/model', context_window_size: 16384, inference_tokens_per_second: 42.5, sample_count: 12 }],
+          items: [{
+            model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
+            inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+          }],
           availability: 'available',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
         }
       } else {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
@@ -240,7 +262,7 @@ describe('BenchmarksPage community privacy', () => {
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('Community estimates are locked')).toBeInTheDocument()
-    expect(screen.getByText('Review and enable community sharing on Benchmarks to see community data.')).toBeInTheDocument()
+    expect(screen.getByText('Enable telemetry under Settings → Community Features to see community data.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Review sharing' })).toBeInTheDocument()
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()

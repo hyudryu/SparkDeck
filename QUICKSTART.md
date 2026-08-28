@@ -28,6 +28,17 @@ nvidia-smi
 
 SparkDeck requires Python 3.11 or newer. Its locked Vite toolchain requires Node.js `^20.19.0` or `>=22.12.0`; earlier Node 20 releases are not supported. Linux with Docker and the NVIDIA Container Toolkit is the recommended GPU-worker environment. You also need Git and permission to run Docker.
 
+Run `docker info` without `sudo`. If it reports permission denied, fix the
+service account before continuing, then sign out and back in so the new group
+membership reaches the user service:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+Do not run `./run.sh` with `sudo`. SparkDeck is installed as your user so its
+settings, model-cache path, Node toolchain, and updater all use one identity.
+
 ## 1. Install Tailscale on both Sparks
 
 Run the official one-line Linux installer on **Spark 1** and **Spark 2**:

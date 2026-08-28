@@ -252,11 +252,12 @@ describe('StoragePage', () => {
       return json(enabledStorage)
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const user = userEvent.setup()
     render(<StoragePage />)
 
     await user.click(await screen.findByRole('button', { name: 'Delete org/model from Studio Spark' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete org/model?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Delete weights' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/storage/nodes/node-a/models/org%2Fmodel',
       expect.objectContaining({ method: 'DELETE' }),
@@ -279,11 +280,44 @@ describe('StoragePage', () => {
       body: JSON.stringify({ model_id: 'org/model', source_node_id: 'node-a', target_node_ids: ['node-b'] }),
     })))
 
-    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getAllByRole('button', { name: 'Cancel org/other transfer' })[0])
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/storage/transfers/job-1',
       expect.objectContaining({ method: 'DELETE' }),
     ))
     expect(screen.getByRole('progressbar', { name: 'Transfer org/other progress' })).toHaveValue(40)
+  })
+
+  it('shows active downloads and transfers on their target NAS cards', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-b'
+        ? { ...node, models: [{ model_id: 'org/download', size_bytes: 25, partial: true }] }
+        : node),
+      jobs: [
+        {
+          id: 'download-1', model_id: 'org/download', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
+          bytes_total: 1000, bytes_transferred: 0, progress: 0, created_at: '2026-08-26T12:00:00Z',
+        },
+        {
+          id: 'transfer-1', model_id: 'org/copy', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'transfer',
+          bytes_total: 1000, bytes_transferred: 400, progress: 0.4, created_at: '2026-08-26T12:00:00Z',
+        },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const download = within(nodePanel).getByLabelText('Downloading from Hugging Face org/download on Backup Spark')
+    expect(within(download).getByRole('progressbar', { name: 'Downloading from Hugging Face org/download progress' })).not.toHaveAttribute('value')
+    expect(within(download).getByText('In progress')).toBeInTheDocument()
+    expect(within(nodePanel).getAllByText('org/download')).toHaveLength(1)
+    expect(within(nodePanel).queryByText('No model weights reported')).not.toBeInTheDocument()
+    expect(within(nodePanel).getByRole('progressbar', { name: 'Transferring from Studio Spark org/copy progress' })).toHaveValue(40)
+    expect(within(nodePanel).getByRole('button', { name: 'Cancel org/copy transfer' })).toBeInTheDocument()
+    expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 })

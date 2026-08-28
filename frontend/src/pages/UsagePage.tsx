@@ -3,6 +3,7 @@ import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight,
 import { api } from '../api/client'
 import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 
 type SortKey = 'model' | 'input' | 'cached' | 'output' | 'requests' | 'speed' | 'cost'
@@ -133,6 +134,7 @@ function ModelShare({ rows }: { rows: UsageGroup[] }) {
 }
 
 export function UsagePage() {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const summary = useResource((signal) => api.usage.get(signal))
   const analysis = useResource((signal) => api.usage.analysis(daysAgo(364), daysAgo(0), signal))
   const [range, setRange] = useState<RangeDays>(30)
@@ -146,7 +148,7 @@ export function UsagePage() {
   const daily = analysis.data?.daily ?? []; const streaks = usageStreaks(daily); const peak = Math.max(0, ...daily.map((point) => totalTokens(point)))
   const setSort = (next: SortKey) => { if (next === sortKey) setSortAscending((value) => !value); else { setSortKey(next); setSortAscending(next === 'model') } }
   const reload = () => { summary.reload(); analysis.reload() }
-  const reset = async () => { if (!window.confirm('Reset lifetime token counters for every model? This cannot be undone.')) return; setBusy('reset'); setActionError(undefined); try { await api.usage.reset(); setNotice('Lifetime usage counters reset.'); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not reset lifetime usage') } finally { setBusy(undefined) } }
+  const reset = async () => { if (!await confirm({ title: 'Reset all usage counters?', message: 'This resets lifetime token counters for every model and cannot be undone.', confirmLabel: 'Reset counters', danger: true })) return; setBusy('reset'); setActionError(undefined); try { await api.usage.reset(); setNotice('Lifetime usage counters reset.'); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not reset lifetime usage') } finally { setBusy(undefined) } }
   // member.merge_group holds the destination's resolved group for routed
   // sources; only summary.merge_groups carries the source's own setting.
   const beginEdit = (member: UsageMember) => { setEditing(member); setAlias(member.alias ?? ''); setMergeGroup(summary.data?.merge_groups?.[member.model] ?? ''); setRouteTo(summary.data?.routing_rules?.[member.model] ?? ''); setActionError(undefined) }
@@ -163,7 +165,7 @@ export function UsagePage() {
       setEditing(undefined); setNotice(`Updated usage display for ${editing.model}.`); summary.reload()
     } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not update the usage display') } finally { setBusy(undefined) }
   }
-  const erase = async (model: string) => { if (!window.confirm(`Erase all lifetime and hourly usage for ${model}? This cannot be undone.`)) return; setBusy(`erase:${model}`); setActionError(undefined); try { await api.usage.erase(model); setNotice(`Erased usage for ${model}.`); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not erase model usage') } finally { setBusy(undefined) } }
+  const erase = async (model: string) => { if (!await confirm({ title: `Erase usage for ${model}?`, message: 'This removes all lifetime and hourly usage for this model and cannot be undone.', confirmLabel: 'Erase usage', danger: true })) return; setBusy(`erase:${model}`); setActionError(undefined); try { await api.usage.erase(model); setNotice(`Erased usage for ${model}.`); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not erase model usage') } finally { setBusy(undefined) } }
   const routeModels = [...new Set([...Object.keys(summary.data?.models ?? {}), ...Object.keys(summary.data?.routing_rules ?? {}), ...Object.values(summary.data?.routing_rules ?? {}), ...(summary.data?.groups ?? []).map((group) => group.route_target).filter((target): target is string => Boolean(target))])].sort()
   const routingRules = Object.entries(summary.data?.routing_rules ?? {}).sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
   const routeOptions = editing ? routeModels.filter((model) => model !== editing.model) : []
@@ -206,5 +208,6 @@ export function UsagePage() {
           {open && <div className="usage-members" aria-label={`Models in ${row.label}`}>{row.members.map((member) => <div className="usage-member" key={member.model}><div><strong>{member.alias || member.model}</strong><code>{member.model}</code>{member.routed_to && <small>Displayed under {member.routed_to}</small>}</div><div className="row-actions"><Button variant="tertiary" aria-label={`Edit usage display for ${member.model}`} onClick={() => beginEdit(member)}><Pencil size={14} /> Edit</Button><Button variant="danger" disabled={busy === `erase:${member.model}`} onClick={() => void erase(member.model)}><Trash2 size={14} /> Erase</Button></div></div>)}</div>}</div> })}</div></Panel>}
     </>}
     {editing && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setEditing(undefined)}><section className="modal usage-alias-modal" role="dialog" aria-modal="true" aria-labelledby="usage-alias-title"><div className="modal-heading"><div><p className="eyebrow">Display settings</p><h2 id="usage-alias-title">Edit usage model</h2></div><button className="icon-button" onClick={() => setEditing(undefined)} aria-label="Close dialog"><X size={17} /></button></div><code>{editing.model}</code><form onSubmit={(event) => void saveDisplay(event)}><label className="field"><span>Display alias</span><input maxLength={120} value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Optional friendly name" /></label><label className="field"><span>Merge group</span><input maxLength={120} value={mergeGroup} onChange={(event) => setMergeGroup(event.target.value)} placeholder="Optional group name" /></label><label className="field"><span>Route usage to</span><input maxLength={512} list="usage-route-destinations" value={routeTo} onChange={(event) => setRouteTo(event.target.value)} placeholder="Leave empty to keep this model's own row" /></label><datalist id="usage-route-destinations">{routeOptions.map((model) => <option key={model} value={model} />)}</datalist>{actionError && <p className="inline-error" role="alert">{actionError}</p>}<p>Routing forwards this model's usage totals to another model's row and merge groups combine rows; neither rewrites the underlying counters.</p><div className="modal-actions"><Button type="button" onClick={() => setEditing(undefined)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy === `alias:${editing.model}`}>Save usage display</Button></div></form></section></div>}
+    {confirmationDialog}
   </div>
 }

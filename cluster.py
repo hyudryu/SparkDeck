@@ -483,7 +483,10 @@ class NodeRegistry:
                 if not compatible:
                     issues.append("agent protocol version mismatch")
                 if not status.get("docker_ready"):
-                    issues.append("Docker is unavailable")
+                    issues.append(
+                        str(status.get("status_message") or "").strip()
+                        or "Docker is unavailable"
+                    )
                 authoritative_name = str(public.get("name") or "").strip()
                 if (
                     authoritative_name

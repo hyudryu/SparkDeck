@@ -1936,7 +1936,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             "node_ids": selected_node_ids,
             "deployment_mode": contract["deployment_mode"],
             "recipe_id": recipe_id,
-        })
+        }, background=True)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:

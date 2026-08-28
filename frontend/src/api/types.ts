@@ -1,5 +1,5 @@
 export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
-export type DeploymentStatus = 'registered' | 'running' | 'starting' | 'stopped' | 'error' | 'unknown'
+export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopped' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
   runtime: RuntimeKind
@@ -93,6 +93,8 @@ export interface Deployment {
   node_ids?: string[]
   selected_nodes?: NodeSummary[]
   desired_state?: 'running' | 'stopped'
+  launch_phase?: string
+  launch_message?: string
 }
 
 export interface DeploymentLaunchControls {

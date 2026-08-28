@@ -63,6 +63,24 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
+const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting'])
+const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
+const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
+const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
+
+const deploymentNeedsPoll = (deployment: Deployment) => (
+  ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
+  || Boolean(deployment.launch_phase && !FINISHED_LAUNCH_PHASES.has(deployment.launch_phase))
+)
+
+const showLaunchDetails = (deployment: Deployment) => !(
+  deployment.status === 'stopped' && deployment.launch_phase === 'exited'
+)
+
+const formatLaunchPhase = (phase: string) => phase
+  .replaceAll('_', ' ')
+  .replace(/\b\w/g, (character) => character.toUpperCase())
+
 // Scalar flags the structured argument editor manages; everything else in a
 // saved configuration's extra args is shown verbatim in the "Other flags"
 // field. Compound JSON flags (--speculative-config,
@@ -182,7 +200,15 @@ export function ModelsPage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const [searchParams, setSearchParams] = useSearchParams()
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
-  const resource = useResource((signal) => api.deployments.list(signal))
+  const acceptedDeployments = useRef(new Map<string, Deployment>())
+  const resource = useResource(async (signal) => {
+    const deployments = await api.deployments.list(signal)
+    const accepted = acceptedDeployments.current
+    if (!accepted.size) return deployments
+    const loadedIds = new Set(deployments.map((deployment) => deployment.id))
+    loadedIds.forEach((id) => accepted.delete(id))
+    return [...accepted.values(), ...deployments]
+  })
   const nodes = useResource((signal) => api.nodes.list(signal))
   const onboarding = useResource((signal) => api.onboarding.get(signal))
   const appSettings = useResource((signal) => api.settings.get(signal))
@@ -234,6 +260,13 @@ export function ModelsPage() {
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
   const catalogShardedLayout = useRef(false)
+  const reloadDeployments = resource.reload
+
+  useEffect(() => {
+    if (resource.loading || !resource.data?.some(deploymentNeedsPoll)) return
+    const timer = window.setTimeout(reloadDeployments, 2000)
+    return () => window.clearTimeout(timer)
+  }, [resource.data, resource.loading, reloadDeployments])
 
   useEffect(() => {
     if (!recipeDeployment) return
@@ -499,6 +532,10 @@ export function ModelsPage() {
     setActionError(undefined)
     try {
       await api.deployments.action(deployment.id, action)
+      if (action === 'remove') {
+        acceptedDeployments.current.delete(deployment.id)
+        resource.setData((current) => current?.filter((item) => item.id !== deployment.id))
+      }
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
@@ -858,9 +895,13 @@ export function ModelsPage() {
     try {
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
-      setActionNotice(`Deployed saved configuration ${deployment.alias} on ${selected}.`)
       setRecipeDeployment(undefined)
-      resource.reload()
+      acceptedDeployments.current.set(deployment.id, deployment)
+      resource.setData((current) => [
+        deployment,
+        ...(current ?? []).filter((item) => item.id !== deployment.id),
+      ])
+      setActionNotice(`Started deployment ${deployment.alias} on ${selected}.`)
     } catch (reason) {
       setRecipeError(reason instanceof Error ? reason.message : 'Could not deploy saved configuration')
     } finally {
@@ -989,10 +1030,14 @@ export function ModelsPage() {
                   <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                   <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
-                  <div role="cell" data-label="Status"><Status status={deployment.status} /></div>
+                  <div role="cell" data-label="Status" className="deployment-status-cell" aria-live="polite">
+                    <Status status={deployment.status} />
+                    {showLaunchDetails(deployment) && deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
+                    {showLaunchDetails(deployment) && deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
+                  </div>
                   <div role="cell" data-label="Actions" className="row-actions">
-                    {deployment.managed && (deployment.desired_state !== 'stopped' && (deployment.status === 'running' || deployment.status === 'starting')
-                      ? <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => void act(deployment, 'stop')}>Stop</Button>
+                    {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
+                      ? <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>

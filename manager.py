@@ -270,6 +270,7 @@ CLUSTER_HEALTH_INTERVAL_SECONDS = 120.0
 # counter baseline exists, any single-rank increment is detected immediately.
 CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
+INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 
 # vLLM prints its allocated KV capacity after engine initialization. Poll only
 # deployments that have not produced a usable capacity report yet; once found,
@@ -368,6 +369,10 @@ class StreamNudge(Exception):
 
 class ClusterReplicaUnavailable(RuntimeError):
     """A replica-local availability failure that may be failed over."""
+
+
+class _InterruptedLaunchDeferred(RuntimeError):
+    """Startup relaunch is waiting for one or more selected nodes."""
 
 
 _STREAM_READY = object()
@@ -638,7 +643,12 @@ class Manager:
         self.temperature_recording_task: asyncio.Task | None = None
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
+        self.deployment_resume_task: asyncio.Task | None = None
+        self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
+        self._deployment_acceptance_lock = asyncio.Lock()
+        self._host_port_reservation_lock = asyncio.Lock()
+        self._host_port_reservations: set[int] = set()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -797,6 +807,7 @@ class Manager:
 
     def _start_controller_tasks(self) -> None:
         task_factories = (
+            ("deployment_resume_task", self._resume_interrupted_deployments),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
@@ -815,7 +826,7 @@ class Manager:
         for field in (
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
-            "token_usage_sync_task",
+            "token_usage_sync_task", "deployment_resume_task",
         ):
             task = getattr(self, field, None)
             if task and not task.done():
@@ -861,6 +872,7 @@ class Manager:
             self.temperature_recording_task,
             self.inference_nudger_task,
             self.token_usage_sync_task,
+            self.deployment_resume_task,
         ):
             if t:
                 t.cancel()
@@ -4199,7 +4211,66 @@ class Manager:
             "fabrics": fabrics,
         }
 
-    async def create_deployment(self, body: dict) -> dict:
+    async def create_deployment(
+        self, body: dict, *, launch_persisted: asyncio.Future | None = None,
+    ) -> dict:
+        """Create a clustered deployment and optionally signal durable launch state.
+
+        ``launch_persisted`` is an internal hand-off used by the v1 service. It
+        completes after the deployment and its queued member identities have
+        been flushed to ``deployments.json``, before any potentially long image
+        pull. Existing callers retain the original wait-for-launch contract.
+        """
+        accepted = launch_persisted or asyncio.get_running_loop().create_future()
+        acceptance_lock = getattr(self, "_deployment_acceptance_lock", None)
+        if acceptance_lock is None:
+            acceptance_lock = self._deployment_acceptance_lock = asyncio.Lock()
+        await acceptance_lock.acquire()
+
+        def release_acceptance(_future: asyncio.Future) -> None:
+            if acceptance_lock.locked():
+                acceptance_lock.release()
+
+        accepted.add_done_callback(release_acceptance)
+        identity: dict[str, str] = {}
+        try:
+            return await self._create_deployment(body, accepted, identity)
+        except asyncio.CancelledError:
+            # Track the generated Manager identity directly. Looking up by the
+            # optional SparkDeck reverse-link can select an unrelated legacy
+            # deployment when both values are None.
+            interrupted_id = identity.get("deployment_id")
+            interrupted = self._deployment(interrupted_id) if interrupted_id else None
+            if interrupted is not None:
+                interrupted["status"] = "recovering"
+                interrupted["status_message"] = (
+                    "Controller stopped while launch was in progress; "
+                    "reconciling node state"
+                )
+                for member in interrupted.get("members") or []:
+                    member["phase"] = {
+                        "phase": "recovering",
+                        "message": interrupted["status_message"],
+                    }
+                self._save_deployments()
+            if launch_persisted is not None and not accepted.done():
+                accepted.set_exception(RuntimeError(
+                    "deployment launch stopped before it was accepted"
+                ))
+            elif not accepted.done():
+                accepted.cancel()
+            raise
+        except BaseException as exc:
+            if launch_persisted is not None and not accepted.done():
+                accepted.set_exception(exc)
+            elif not accepted.done():
+                accepted.cancel()
+            raise
+
+    async def _create_deployment(
+        self, body: dict, launch_persisted: asyncio.Future | None = None,
+        launch_identity: dict[str, str] | None = None,
+    ) -> dict:
         plan = await self._preflight_deployment_launch(body)
         body = plan["body"]
         engine = plan["engine"]
@@ -4217,6 +4288,8 @@ class Manager:
         # remains visible for diagnosis, but invalid input does not leave a
         # phantom deployment card behind.
         deployment_id = uuid.uuid4().hex[:12]
+        if launch_identity is not None:
+            launch_identity["deployment_id"] = deployment_id
         deployment = {
             "id": deployment_id,
             "name": body.get("deployment_name") or model,
@@ -4346,6 +4419,8 @@ class Manager:
             "port": requested_port,
         })
         self._save_deployments()
+        if launch_persisted is not None and not launch_persisted.done():
+            launch_persisted.set_result(deployment)
 
         created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []
@@ -4354,9 +4429,17 @@ class Manager:
             if isinstance(result, Exception):
                 spec["status"] = "error"
                 spec["error"] = str(result)
+                spec["phase"] = {
+                    "phase": "error",
+                    "message": f"Launch failed: {result}",
+                }
                 errors.append(f"{spec['node_name']}: {result}")
             else:
                 spec["status"] = result.get("status", "starting")
+                spec["phase"] = result.get("phase") or {
+                    "phase": "starting",
+                    "message": "Container created; starting the model server",
+                }
                 spec["container_id"] = result.get("id")
                 spec["port"] = result.get("port") or spec.get("port")
                 model_source = str(result.get("model_source") or "unknown")
@@ -4599,6 +4682,170 @@ class Manager:
             return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _resume_interrupted_deployments(self) -> None:
+        """Relaunch accepted work whose request died before containers existed."""
+        while True:
+            candidates = [
+                deployment for deployment in list(self.deployments)
+                if isinstance(deployment, dict)
+                and deployment.get("status") in {"launching", "recovering"}
+                and deployment.get("desired_state") != "stopped"
+                and isinstance(deployment.get("launch_settings"), dict)
+            ]
+            if not candidates:
+                return
+            retry_required = False
+            for deployment in candidates:
+                try:
+                    await self._resume_interrupted_deployment(deployment["id"])
+                except asyncio.CancelledError:
+                    raise
+                except _InterruptedLaunchDeferred as exc:
+                    current = self._deployment(deployment.get("id"))
+                    if current is not None:
+                        current["status"] = "recovering"
+                        current["error"] = None
+                        current["status_message"] = str(exc)
+                        self._save_deployments()
+                    retry_required = True
+                except Exception as exc:
+                    current = self._deployment(deployment.get("id"))
+                    if current is not None:
+                        current["status"] = "error"
+                        current["error"] = (
+                            f"Could not resume interrupted launch: {exc}"
+                        )
+                        self._save_deployments()
+            if not retry_required:
+                return
+            await self._wait_for_interrupted_launch_retry()
+
+    async def _wait_for_interrupted_launch_retry(self) -> None:
+        wakeup = getattr(self, "_deployment_resume_wakeup", None)
+        if wakeup is None:
+            wakeup = self._deployment_resume_wakeup = asyncio.Event()
+        try:
+            await asyncio.wait_for(
+                wakeup.wait(), timeout=INTERRUPTED_LAUNCH_RETRY_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        finally:
+            wakeup.clear()
+
+    @staticmethod
+    def _interrupted_launch_reconnect_error(exc: BaseException) -> bool:
+        message = str(exc).casefold()
+        return any(marker in message for marker in (
+            "offline", "unavailable", "unreachable", "connection",
+            "could not connect", "timed out", "timeout",
+        ))
+
+    async def _resume_interrupted_deployment(self, deployment_id: str) -> None:
+        # Startup recovery removes stale members and replaces their durable
+        # record. Serialize that whole transaction with explicit lifecycle
+        # actions so a completed Stop can never be followed by this relaunch.
+        async with self._cluster_action_lock():
+            await self._resume_interrupted_deployment_locked(deployment_id)
+
+    async def _resume_interrupted_deployment_locked(
+        self, deployment_id: str,
+    ) -> None:
+        deployment = self._deployment(deployment_id)
+        if (
+            deployment is None
+            or deployment.get("status") not in {"launching", "recovering"}
+            or deployment.get("desired_state") == "stopped"
+        ):
+            return
+        launch_body = dict(deployment.get("launch_settings") or {})
+        if not launch_body.get("model"):
+            raise RuntimeError("saved launch settings are unavailable")
+        launch_body["recipe_id"] = deployment.get("recipe_id")
+        launch_body["sparkdeck_record_id"] = deployment.get(
+            "sparkdeck_record_id"
+        )
+        resume_token = f"resume-{uuid.uuid4().hex}"
+        launch_body["automation_run_id"] = resume_token
+        # An automatically selected port was intentionally absent from the
+        # generic restart settings. For an interrupted accepted launch, reuse
+        # its durable reservation so the public endpoint does not move.
+        if (
+            LOCAL_NODE_ID in (deployment.get("node_ids") or [])
+            and deployment.get("api_port")
+        ):
+            launch_body["port"] = deployment["api_port"]
+
+        deployment["status"] = "recovering"
+        deployment["status_message"] = "Resuming interrupted deployment launch"
+        self._save_deployments()
+        try:
+            await self.selected_cluster_nodes(
+                list(deployment.get("node_ids") or [LOCAL_NODE_ID])
+            )
+        except Exception as exc:
+            if self._interrupted_launch_reconnect_error(exc):
+                raise _InterruptedLaunchDeferred(
+                    f"Waiting for selected nodes to reconnect: {exc}"
+                ) from exc
+            raise
+        removed = await asyncio.gather(*(
+            self._member_action(member, "remove")
+            for member in deployment.get("members") or []
+        ), return_exceptions=True)
+        remove_errors = self._member_action_errors(removed, "remove")
+        if remove_errors:
+            error = RuntimeError("; ".join(remove_errors))
+            if self._interrupted_launch_reconnect_error(error):
+                raise _InterruptedLaunchDeferred(
+                    f"Waiting for selected nodes to reconnect: {error}"
+                ) from error
+            raise error
+
+        # Remove the stale reservation only after its old member names have
+        # been cleaned up. create_deployment then atomically accepts a fresh
+        # Manager identity with the same SparkDeck reverse-link and port.
+        self.deployments = [
+            item for item in self.deployments if item.get("id") != deployment_id
+        ]
+        self._save_deployments()
+        try:
+            await self.create_deployment(launch_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            replacement = next(
+                (
+                    item for item in self.deployments
+                    if isinstance(item, dict)
+                    and item.get("automation_run_id") == resume_token
+                ),
+                None,
+            )
+            reconnecting = self._interrupted_launch_reconnect_error(exc)
+            if replacement is not None and reconnecting:
+                replacement["status"] = "recovering"
+                replacement["error"] = None
+                replacement["status_message"] = (
+                    f"Waiting for selected nodes to reconnect: {exc}"
+                )
+                self._save_deployments()
+                raise _InterruptedLaunchDeferred(
+                    replacement["status_message"]
+                ) from exc
+            if replacement is None:
+                deployment["status"] = "recovering" if reconnecting else "error"
+                deployment["error"] = None if reconnecting else (
+                    "Interrupted deployment relaunch was rejected"
+                )
+                self.deployments.append(deployment)
+                self._save_deployments()
+                if reconnecting:
+                    raise _InterruptedLaunchDeferred(
+                        f"Waiting for selected nodes to reconnect: {exc}"
+                    ) from exc
+            raise
 
     def _cluster_health_issue(self, deployment: dict, nodes: list[dict]) -> str | None:
         """Describe a recoverable split deployment, or return ``None``.
@@ -9138,9 +9385,97 @@ class Manager:
                             used.add(int(b["HostPort"]))
                         except Exception:
                             pass
+                try:
+                    service_port = int(
+                        _label_value(c.labels or {}, SERVICE_PORT_LABEL)
+                    )
+                except (TypeError, ValueError):
+                    service_port = 0
+                if (
+                    not 1 <= service_port <= 65535
+                    and _label_value(c.labels or {}, MODE_LABEL) == "sharded"
+                ):
+                    command = (
+                        ((c.attrs or {}).get("Config") or {}).get("Cmd") or []
+                    )
+                    if isinstance(command, str):
+                        try:
+                            command = shlex.split(command)
+                        except ValueError:
+                            command = command.split()
+                    elif not isinstance(command, (list, tuple)):
+                        command = []
+                    service_port = self._cli_option(
+                        list(command), {"--port"}, int,
+                    ) or 0
+                if 1 <= service_port <= 65535:
+                    # Sharded members use host networking, so Docker exposes
+                    # no c.ports binding. Their explicit service-port label
+                    # carries ownership until the container is removed.
+                    used.add(service_port)
             return used
 
-        return await asyncio.to_thread(_scan)
+        used = await asyncio.to_thread(_scan)
+        # Docker has no binding to scan while an accepted background launch is
+        # still pulling its image. Its durable Manager record reserves the
+        # controller port during that window and across controller restarts.
+        for deployment in getattr(self, "deployments", []):
+            if (
+                not isinstance(deployment, dict)
+                or deployment.get("id") == exclude_deployment_id
+                or deployment.get("status") in {"error", "stopped", "removed"}
+            ):
+                continue
+            members = [
+                member for member in (deployment.get("members") or [])
+                if isinstance(member, dict)
+            ]
+            # Persisted member order is the compatibility fallback. Inspect
+            # ranks individually so one corrupt entry cannot hide a later
+            # valid rank 0, and never infer primary ownership from negatives.
+            primary_member = members[0] if members else None
+            for member in members:
+                raw_rank = member.get("rank")
+                if isinstance(raw_rank, bool):
+                    continue
+                if isinstance(raw_rank, int):
+                    rank = raw_rank
+                elif (
+                    isinstance(raw_rank, str)
+                    and re.fullmatch(r"[+-]?\d+", raw_rank.strip())
+                ):
+                    try:
+                        rank = int(raw_rank)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                if rank == 0:
+                    primary_member = member
+                    break
+            # api_port belongs to the primary member. A remote-only
+            # deployment's primary port lives in that worker's host namespace
+            # and must not consume the same number on the controller.
+            values = (
+                [deployment.get("api_port")]
+                if primary_member
+                and primary_member.get("node_id") == LOCAL_NODE_ID
+                else []
+            )
+            values.extend(
+                member.get("port")
+                for member in members
+                if member.get("node_id") == LOCAL_NODE_ID
+            )
+            for value in values:
+                try:
+                    port = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= port <= 65535:
+                    used.add(port)
+        used.update(getattr(self, "_host_port_reservations", set()))
+        return used
 
     async def _validate_available_port(
         self, port: Any, *, exclude_deployment_id: str | None = None,
@@ -9172,6 +9507,69 @@ class Manager:
         raise RuntimeError("No available ports in configured range")
 
     async def create_container(
+        self,
+        model: str,
+        port: int | None = None,
+        engine: str = "vllm",
+        gpu_memory_utilization: float | None = None,
+        gpu_memory_gb: float | None = None,
+        extra_args: list[str] | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        sg_tp_size: int | None = None,
+        sg_context_length: int | None = None,
+        sg_max_running_requests: int | None = None,
+        sg_mem_fraction: float | None = None,
+        sg_image: str | None = None,
+        recipe_id: str | None = None,
+        cluster_member: dict | None = None,
+        hf_token: str | None = None,
+        sparkdeck_deployment_id: str | None = None,
+    ) -> dict:
+        reserved_port = None
+        if cluster_member is not None and port is None:
+            lock = getattr(self, "_host_port_reservation_lock", None)
+            if lock is None:
+                lock = self._host_port_reservation_lock = asyncio.Lock()
+            async with lock:
+                reserved_port = await self._allocate_port()
+                reservations = getattr(self, "_host_port_reservations", None)
+                if reservations is None:
+                    reservations = self._host_port_reservations = set()
+                reservations.add(reserved_port)
+            port = reserved_port
+        create_call = self._create_container_with_port(
+            model=model, port=port, engine=engine,
+            gpu_memory_utilization=gpu_memory_utilization,
+            gpu_memory_gb=gpu_memory_gb, extra_args=extra_args,
+            name=name, image=image, sg_tp_size=sg_tp_size,
+            sg_context_length=sg_context_length,
+            sg_max_running_requests=sg_max_running_requests,
+            sg_mem_fraction=sg_mem_fraction, sg_image=sg_image,
+            recipe_id=recipe_id, cluster_member=cluster_member,
+            hf_token=hf_token,
+            sparkdeck_deployment_id=sparkdeck_deployment_id,
+        )
+        if reserved_port is None:
+            return await create_call
+
+        # Docker work runs in asyncio.to_thread below and cannot be cancelled
+        # once started. Own and shield the lower-level task so cancellation of
+        # the request does not release its port while that thread is still
+        # pulling an image or creating the container.
+        creation_task = asyncio.create_task(create_call)
+
+        def release_reservation(task: asyncio.Task) -> None:
+            self._host_port_reservations.discard(reserved_port)
+            if not task.cancelled():
+                # A cancelled caller no longer awaits this owned task. Consume
+                # its eventual exception after releasing the reservation.
+                task.exception()
+
+        creation_task.add_done_callback(release_reservation)
+        return await asyncio.shield(creation_task)
+
+    async def _create_container_with_port(
         self,
         model: str,
         port: int | None = None,
@@ -9293,12 +9691,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
@@ -9446,12 +9839,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
@@ -13054,6 +13442,21 @@ class Manager:
                 )
                 if not node.get("online"):
                     member["status"] = "unreachable"
+                    if saved.get("status") == "recovering":
+                        member["phase"] = {
+                            "phase": "recovering",
+                            "message": saved.get("status_message") or (
+                                "Waiting for selected nodes to reconnect"
+                            ),
+                        }
+                    else:
+                        member["phase"] = {
+                            "phase": "unreachable",
+                            "message": (
+                                f"{member.get('node_name') or member.get('node_id')} "
+                                "is unreachable"
+                            ),
+                        }
                 elif container:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")
@@ -13075,9 +13478,17 @@ class Manager:
                 ):
                     member["status"] = "unknown"
                     member["status_message"] = "Docker is unavailable"
+                    member["phase"] = {
+                        "phase": "unknown",
+                        "message": "Docker is unavailable",
+                    }
                     member_inventory_unknown = True
                 elif saved.get("status") not in {"error", "launching"}:
                     member["status"] = "missing"
+                    member["phase"] = {
+                        "phase": "missing",
+                        "message": "Managed container is missing",
+                    }
                 member["node_status"] = node.get("status", "unknown")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
@@ -13085,6 +13496,14 @@ class Manager:
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif saved.get("status") == "recovering" and any(
+                    s in {"unreachable", "missing", "dead", "error"}
+                    for s in member_states
+                ):
+                    # Startup recovery owns this deployment and will retry when
+                    # its selected nodes reconnect. Keep the public deployment
+                    # active while its member phase carries the honest wait.
+                    deployment["status"] = "recovering"
                 elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):

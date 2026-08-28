@@ -40,7 +40,7 @@ from .curve_widget import FanCurveEditor
 from .plot_widget import HistoryPlot
 from .sensors import aggregate_max, discover
 from .serial_link import MOCK_PORT, SerialLink, list_serial_ports
-from .settings import Settings
+from .settings import CONFIG_PATH, Settings
 from .state_publisher import STATE_DIR, publish as publish_fan_state, read as read_fan_state
 from .control_reader import effective_temperature, read_control
 
@@ -49,6 +49,7 @@ log = logging.getLogger("fancontroller")
 # Held open for the process lifetime by the primary instance (see
 # _acquire_single_instance); a second instance must not fight over the port.
 LOCK_PATH = STATE_DIR / "app.lock"
+STALE_CONFIG_MTIME_NS = -1
 
 MODES = [
     ("curve", "Curve"),
@@ -62,6 +63,7 @@ class FanApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.settings = Settings.load()
+        self.settings_mtime_ns = self._config_mtime()
 
         # sensors
         self.sources = discover()
@@ -509,6 +511,122 @@ class FanApp:
 
     # ====== Event handlers ======
 
+    def _config_mtime(self) -> int | None:
+        try:
+            return os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            return None
+
+    def _replace_serial_link(self, new_port: str) -> None:
+        if self.link is None:
+            return
+        # Neutralise the old link's callbacks *before* stopping so that a
+        # thread that hasn't fully exited yet can't inject stale data.
+        self.link.on_rpm = lambda _rpm: None
+        self.link.on_status = lambda _status: None
+        self.link.stop()
+        if self.link._thread is not None and self.link._thread.is_alive():
+            log.warning("old serial link thread did not stop within timeout")
+        self.link = SerialLink(
+            port=new_port,
+            on_rpm=self._on_rpm_threaded,
+            on_status=self._on_status_threaded,
+        )
+        self.link.start()
+
+    def _sync_settings_widgets(self, port_changed: bool) -> None:
+        previous_building = self._building
+        self._building = True
+        try:
+            self.mode_stack.set_visible_child_name(self.settings.mode)
+            if self.settings.mode in self.mode_buttons:
+                self.mode_buttons[self.settings.mode].set_active(True)
+            if self.settings.mode in getattr(self, "_tray_mode_items", {}):
+                self._tray_mode_items[self.settings.mode].set_active(True)
+
+            self.curve_min_spin.set_value(self.settings.curve_min_temp)
+            self.curve_max_spin.set_value(self.settings.curve_max_temp)
+            self.floor_spin.set_value(self.settings.min_floor_pct)
+            self.curve_editor.set_range(
+                self.settings.curve_min_temp, self.settings.curve_max_temp,
+            )
+            self.curve_editor.set_points([
+                (point[0], point[1]) for point in self.settings.curve_points
+            ])
+            self.pid_setpoint.set_value(self.settings.setpoint)
+            self.pid_kp.set_value(self.settings.kp)
+            self.pid_ki.set_value(self.settings.ki)
+            self.pid_kd.set_value(self.settings.kd)
+            self.pid_floor.set_value(self.settings.min_floor_pct)
+            self.hyst_on.set_value(self.settings.hyst_on_temp)
+            self.hyst_off.set_value(self.settings.hyst_off_temp)
+            self.manual_scale.set_value(self.settings.manual_duty_pct)
+            self.poll_spin.set_value(self.settings.poll_interval_s)
+            self.rate_spin.set_value(self.settings.max_duty_rate_pct_per_s)
+            self.startmin_switch.set_active(self.settings.start_minimized)
+            self.smoothing_spin.set_value(self.settings.temp_smoothing_s)
+            self.maxrpm_spin.set_value(self.settings.max_rpm)
+            for key, checkbox in getattr(self, "source_checks", {}).items():
+                checkbox.set_active(key in self.settings.sources)
+            if port_changed:
+                self._populate_ports()
+        finally:
+            self._building = previous_building
+
+    def _reload_settings_if_changed(self) -> None:
+        observed_mtime_ns = self._config_mtime()
+        if observed_mtime_ns == self.settings_mtime_ns:
+            return
+
+        old_port = self.settings.serial_port
+        old_poll_interval = self.settings.poll_interval_s
+        self.settings = Settings.load()
+        # Keep the observed value so another replacement racing this load is
+        # still detected on the next poll.
+        self.settings_mtime_ns = observed_mtime_ns
+
+        discovered_sources = discover()
+        if discovered_sources:
+            self.sources = discovered_sources
+            self.source_map = {
+                source.key: source for source in discovered_sources
+            }
+        self.settings.sources = [
+            key for key in self.settings.sources if key in self.source_map
+        ]
+        if not self.settings.sources and self.sources:
+            self.settings.sources = [self.sources[0].key]
+
+        self.curve = FanCurve(
+            points=[(point[0], point[1]) for point in self.settings.curve_points],
+            min_floor_pct=self.settings.min_floor_pct,
+        )
+        self.pid = PID(
+            kp=self.settings.kp,
+            ki=self.settings.ki,
+            kd=self.settings.kd,
+            setpoint=self.settings.setpoint,
+            min_floor_pct=self.settings.min_floor_pct,
+        )
+        self.hyst = Hysteresis(
+            on_temp=self.settings.hyst_on_temp,
+            off_temp=self.settings.hyst_off_temp,
+        )
+        self.temp_smoother.reset()
+        self.slew.sync(byte_to_pct(self.current_duty_byte), time.monotonic())
+
+        port_changed = old_port != self.settings.serial_port
+        if port_changed:
+            self._replace_serial_link(self.settings.serial_port)
+        self._sync_settings_widgets(port_changed)
+        if old_poll_interval != self.settings.poll_interval_s:
+            GLib.idle_add(self._schedule_poll)
+        log.info(
+            "reloaded external configuration (mode=%s, port=%s)",
+            self.settings.mode,
+            self.settings.serial_port,
+        )
+
     def _on_window_delete(self, *_args) -> bool:
         # Hide to tray instead of quitting if a tray exists.
         if self.indicator is not None or self.status_icon is not None:
@@ -574,24 +692,11 @@ class FanApp:
         if new_port and new_port != self.settings.serial_port:
             self.settings.serial_port = new_port
             self._save()
-            if self.link is None:
-                return
-            # Neutralise the old link's callbacks *before* stopping so that a
-            # thread that hasn't fully exited yet can't inject stale data from
-            # the old port into the app state.
-            self.link.on_rpm = lambda _rpm: None
-            self.link.on_status = lambda _status: None
-            self.link.stop()
-            if self.link._thread is not None and self.link._thread.is_alive():
-                log.warning("old serial link thread did not stop within timeout")
-            self.link = SerialLink(
-                port=new_port,
-                on_rpm=self._on_rpm_threaded,
-                on_status=self._on_status_threaded,
-            )
-            self.link.start()
+            self._replace_serial_link(new_port)
 
     def _on_curve_changed(self, points: list[tuple[float, float]]) -> None:
+        if self._building:
+            return
         self.settings.curve_points = [[t, d] for t, d in points]
         self.curve.set_points(points)
         self._save()
@@ -616,6 +721,8 @@ class FanApp:
         self._on_curve_changed(pts)
 
     def _on_floor_changed(self, w) -> None:
+        if self._building:
+            return
         v = w.get_value()
         self.settings.min_floor_pct = v
         self.curve.min_floor_pct = v
@@ -701,6 +808,7 @@ class FanApp:
             return True
 
     def _poll_tick_impl(self) -> bool:
+        self._reload_settings_if_changed()
         if self.args.ui_only:
             state = read_fan_state()
             if state is None:
@@ -820,6 +928,17 @@ class FanApp:
     def _save(self) -> None:
         try:
             self.settings.save()
+            written_mtime_ns = self._config_mtime()
+            saved_settings = Settings.load()
+            verified_mtime_ns = self._config_mtime()
+            if (
+                written_mtime_ns == verified_mtime_ns
+                and saved_settings == self.settings
+            ):
+                self.settings_mtime_ns = written_mtime_ns
+            else:
+                # Force the next poll to reload whichever writer won the race.
+                self.settings_mtime_ns = STALE_CONFIG_MTIME_NS
         except OSError as e:
             log.error("settings save failed: %s", e)
 

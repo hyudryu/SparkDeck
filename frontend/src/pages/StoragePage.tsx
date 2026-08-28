@@ -15,6 +15,11 @@ function compareModelIdsDescending(left: StorageModel, right: StorageModel) {
   })
 }
 
+function compareModels(activeModelIds: ReadonlySet<string>, left: StorageModel, right: StorageModel) {
+  const activeOrder = Number(activeModelIds.has(right.model_id)) - Number(activeModelIds.has(left.model_id))
+  return activeOrder || compareModelIdsDescending(left, right)
+}
+
 function formatTimestamp(value?: string | number) {
   if (!value) return 'Not reported'
   const date = new Date(typeof value === 'number' && value < 1_000_000_000_000 ? value * 1000 : value)
@@ -33,6 +38,10 @@ function canCancel(status: string) {
   return !['completed', 'failed', 'cancelled', 'canceled'].includes(status.toLowerCase())
 }
 
+function isActiveDownload(job: StorageTransferJob) {
+  return job.kind === 'download' && ['queued', 'running'].includes(job.status.toLowerCase())
+}
+
 export function StoragePage() {
   const resource = useResource((signal) => api.storage.get(signal))
   const [sourceNodeId, setSourceNodeId] = useState('')
@@ -45,10 +54,26 @@ export function StoragePage() {
   const [dropTargetId, setDropTargetId] = useState<string>()
   const draggedModelRef = useRef<DraggedModel | undefined>(undefined)
 
-  const nodes = useMemo(() => (resource.data?.nodes ?? []).map((node) => ({
-    ...node,
-    models: [...node.models].sort(compareModelIdsDescending),
-  })), [resource.data?.nodes])
+  const activeDownloadsByNode = useMemo(() => {
+    const downloads = new Map<string, Set<string>>()
+    resource.data?.jobs.forEach((job) => {
+      if (!isActiveDownload(job)) return
+      const models = downloads.get(job.target_node_id) ?? new Set<string>()
+      models.add(job.model_id)
+      downloads.set(job.target_node_id, models)
+    })
+    return downloads
+  }, [resource.data?.jobs])
+  const activeDownloadModels = useMemo(() => new Set(
+    [...activeDownloadsByNode.values()].flatMap((models) => [...models]),
+  ), [activeDownloadsByNode])
+  const nodes = useMemo(() => (resource.data?.nodes ?? []).map((node) => {
+    const activeModelIds = activeDownloadsByNode.get(node.id) ?? new Set<string>()
+    return {
+      ...node,
+      models: [...node.models].sort((left, right) => compareModels(activeModelIds, left, right)),
+    }
+  }), [activeDownloadsByNode, resource.data?.nodes])
   const sourceNode = nodes.find((node) => node.id === sourceNodeId)
   const sourceModels = sourceNode?.models.filter((model) => !model.partial) ?? []
   const inventory = useMemo(() => {
@@ -61,9 +86,9 @@ export function StoragePage() {
       } else models.set(model.model_id, { model, nodes: new Map([[node.id, model]]) })
     }))
     return [...models.values()].sort((left, right) => (
-      compareModelIdsDescending(left.model, right.model)
+      compareModels(activeDownloadModels, left.model, right.model)
     ))
-  }, [nodes])
+  }, [activeDownloadModels, nodes])
 
   useEffect(() => {
     if (!nodes.length) return

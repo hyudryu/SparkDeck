@@ -644,6 +644,37 @@ async def agent_virtual_nas_inventory(req: Request):
     return _public_storage_payload({"models": models, "free_size": free_size})
 
 
+@app.post("/api/agent/virtual-nas/models/{model_id:path}/download")
+async def agent_virtual_nas_download(model_id: str, req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) - {
+            "revision", "requested_revision", "hf_token",
+        }:
+            raise ValueError(
+                "request may contain only revision, requested_revision, and hf_token"
+            )
+        revision = body.get("revision")
+        requested_revision = body.get("requested_revision")
+        token = body.get("hf_token")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        if token is not None and not isinstance(token, str):
+            raise ValueError("hf_token must be a string")
+        if requested_revision is not None and not isinstance(requested_revision, str):
+            raise ValueError("requested_revision must be a string")
+        result = await manager.virtual_nas.download_model_checked(
+            model_id, revision or "main", token if token is not None else "",
+            requested_revision or revision or "main",
+        )
+        return _public_storage_payload(result)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
 @app.get("/api/agent/virtual-nas/models/{model_id:path}/export")
 async def agent_virtual_nas_export(model_id: str, req: Request):
     _require_agent(req)
@@ -658,12 +689,17 @@ async def agent_virtual_nas_export(model_id: str, req: Request):
 async def agent_virtual_nas_import(model_id: str, req: Request):
     _require_agent(req)
     expected_header = req.headers.get("x-sparkdeck-expected-bytes")
+    model_bytes_header = req.headers.get("x-sparkdeck-model-bytes")
     try:
         expected_bytes = int(expected_header) if expected_header is not None else None
+        model_bytes = int(model_bytes_header) if model_bytes_header is not None else None
         if expected_bytes is not None and expected_bytes < 0:
             raise ValueError("X-SparkDeck-Expected-Bytes must not be negative")
+        if model_bytes is not None and model_bytes <= 0:
+            raise ValueError("X-SparkDeck-Model-Bytes must be positive")
         result = await manager.virtual_nas.import_model(
             model_id, req.stream(), expected_bytes=expected_bytes,
+            required_model_bytes=model_bytes,
         )
         return _public_storage_payload(result)
     except (TypeError, ValueError, LookupError, RuntimeError, FileExistsError) as exc:
@@ -1716,19 +1752,16 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
     if local_model_path:
         nodes_with_weights = {LOCAL_NODE_ID}
     else:
-        inventory = await manager.model_cache_inventory()
-        requested_revision = contract.get("model_revision")
-        cached_revision = requested_revision or "main"
-        nodes_with_weights = {
-            node.get("id")
-            for node in inventory
-            if any(
-                not model.get("partial")
-                and model.get("model_id") == recipe.get("model")
-                and cached_revision in (model.get("revisions") or [])
-                for model in node.get("models") or []
+        try:
+            readiness = await manager.recipe_model_revision_readiness(
+                str(recipe.get("model") or ""),
+                contract.get("model_revision"), selected_node_ids,
             )
-        }
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        nodes_with_weights = set(selected_node_ids) - set(
+            readiness["missing_node_ids"]
+        )
     missing_weights = [
         node_id for node_id in selected_node_ids if node_id not in nodes_with_weights
     ]
@@ -1962,20 +1995,51 @@ async def v1_storage_settings(req: Request):
     return await v1_storage()
 
 
-@app.post("/api/v1/storage/transfers", status_code=202)
-async def v1_storage_transfer(req: Request):
-    _require_virtual_nas_enabled()
+@app.post("/api/v1/storage/transfers/preflight")
+async def v1_storage_transfer_preflight(req: Request):
     try:
         body = await req.json()
         if not isinstance(body, dict):
             raise ValueError("request body must be an object")
+        if set(body) - {"model_id", "revision"}:
+            raise ValueError("request may contain only model_id and revision")
+        model_id = body.get("model_id")
+        revision = body.get("revision")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("model_id must be a non-empty model ID")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        return _public_storage_payload(
+            await manager.virtual_nas_transfer_preflight(
+                model_id.strip(), revision,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.post("/api/v1/storage/transfers", status_code=202)
+async def v1_storage_transfer(req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        if set(body) - {"model_id", "source_node_id", "target_node_ids", "revision"}:
+            raise ValueError("request contains unsupported fields")
         model_id = body.get("model_id")
         source_node_id = body.get("source_node_id")
         target_node_ids = body.get("target_node_ids")
+        revision = body.get("revision")
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError("model_id must be a non-empty model ID")
         if not isinstance(source_node_id, str) or not source_node_id.strip():
             raise ValueError("source_node_id must be a non-empty node ID")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
         if (
             not isinstance(target_node_ids, list)
             or not target_node_ids
@@ -1987,9 +2051,73 @@ async def v1_storage_transfer(req: Request):
             raise ValueError("target_node_ids must not contain duplicates")
         result = await manager.queue_virtual_nas_transfer(
             model_id.strip(), source_node_id.strip(),
-            targets,
+            targets, revision,
         )
         return _public_storage_payload(result)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
+async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dict, dict, list[str]]:
+    recipe = await manager.get_recipe(recipe_id)
+    if not recipe:
+        raise LookupError("saved configuration not found")
+    contract = manager.recipe_deployment_contract(recipe)
+    if recipe.get("supported") is False or contract.get("supported") is False:
+        raise ValueError(recipe.get("error") or contract.get("error") or "saved runtime is unsupported")
+    if manager._resolve_local_path(str(recipe.get("model") or "")):
+        raise ValueError("local-path recipes do not use model preparation")
+    body = await req.json()
+    if not isinstance(body, dict) or set(body) != {"node_ids"}:
+        raise ValueError("request must contain only node_ids")
+    node_ids = body.get("node_ids")
+    if not isinstance(node_ids, list) or not node_ids or any(
+        not isinstance(item, str) or not item.strip() for item in node_ids
+    ):
+        raise ValueError("node_ids must contain at least one node ID")
+    selected = [item.strip() for item in node_ids]
+    if len(set(selected)) != len(selected):
+        raise ValueError("node_ids must not contain duplicates")
+    if len(selected) != contract["required_node_count"]:
+        raise ValueError(
+            f"this saved configuration requires exactly {contract['required_node_count']} node(s)"
+        )
+    if contract["deployment_mode"] == "sharded":
+        if LOCAL_NODE_ID not in selected:
+            raise ValueError("sharded deployments must include the controller node")
+        selected = [LOCAL_NODE_ID, *(item for item in selected if item != LOCAL_NODE_ID)]
+    await manager.selected_cluster_nodes(selected)
+    return recipe, contract, selected
+
+
+@app.post("/api/v1/recipes/{recipe_id}/prepare/preflight")
+async def v1_recipe_preparation_preflight(recipe_id: str, req: Request):
+    try:
+        recipe, contract, node_ids = await _recipe_preparation_request(recipe_id, req)
+        return _public_storage_payload(
+            await manager.recipe_model_preparation_preflight(
+                str(recipe.get("model") or ""), contract.get("model_revision"), node_ids,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.post("/api/v1/recipes/{recipe_id}/prepare", status_code=202)
+async def v1_recipe_preparation(recipe_id: str, req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        recipe, contract, node_ids = await _recipe_preparation_request(recipe_id, req)
+        return _public_storage_payload(
+            await manager.queue_recipe_model_preparation(
+                str(recipe.get("model") or ""), contract.get("model_revision"), node_ids,
+            )
+        )
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:

@@ -17,12 +17,14 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote
 
 
 LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -37,7 +39,8 @@ _TOKENIZER_FILES = {
 # Imports hold both the received tar and the extracted repository until the
 # final atomic rename. Reserve additional room for tar headers, metadata, and
 # filesystem allocation rounding rather than admitting at an exact 2x edge.
-_TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
+TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
+DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 
 
 class TransferCanceled(Exception):
@@ -55,6 +58,38 @@ def validate_model_id(model_id: str) -> str:
     ):
         raise ValueError("model_id must be a safe Hugging Face owner/repository ID")
     return value
+
+
+def validate_revision(revision: str | None) -> str:
+    value = str(revision or "main").strip() or "main"
+    components = value.split("/")
+    if (
+        len(value) > 200
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(character.isspace() for character in value)
+        or any(character in "~^:?*[\\<>|\"" for character in value)
+        or value == "@"
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or value.endswith(".")
+        or any(
+            component in {"", ".", ".."}
+            or component.startswith(".")
+            or component.endswith(".lock")
+            for component in components
+        )
+    ):
+        raise ValueError("revision must be a bounded Hugging Face revision")
+    return value
+
+
+def _is_commit_sha(revision: str | None) -> bool:
+    return bool(
+        isinstance(revision, str) and _COMMIT_SHA.fullmatch(revision.strip())
+    )
 
 
 def _cache_name(model_id: str) -> str:
@@ -134,11 +169,13 @@ class VirtualNAS:
         hub_path_provider: Callable[[], Path],
         node_registry: Any,
         enabled_provider: Callable[[], bool],
+        token_provider: Callable[[], str] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
         self.node_registry = node_registry
         self._enabled_provider = enabled_provider
+        self._token_provider = token_provider or (lambda: "")
         self.path = self.data_dir / "virtual_nas_transfers.json"
         self.jobs = self._load_jobs()
         self._wake = asyncio.Event()
@@ -147,6 +184,12 @@ class VirtualNAS:
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._last_progress_save: dict[str, float] = {}
         self._streaming_models: dict[str, int] = {}
+        self._download_locks: dict[str, threading.Lock] = {}
+        self._download_locks_guard = threading.Lock()
+        self._download_size_cache: dict[
+            tuple[str, str], tuple[float, str, int]
+        ] = {}
+        self._queue_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -155,12 +198,77 @@ class VirtualNAS:
     def _hub(self) -> Path:
         return Path(self._hub_path_provider()).expanduser().resolve()
 
+    async def _await_uncancelable(self, operation: Awaitable[Any]) -> Any:
+        """Finish work that cannot be safely stopped after it has begun."""
+        task = asyncio.ensure_future(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            return await task
+
     def _model_path(self, model_id: str) -> Path:
         hub = self._hub()
         candidate = hub / _cache_name(model_id)
         if candidate.parent.resolve() != hub:
             raise ValueError("model cache path escapes the Hugging Face hub")
         return candidate
+
+    @staticmethod
+    def _has_revision(
+        model: dict[str, Any], resolved_revision: str,
+        requested_revision: str | None = None,
+    ) -> bool:
+        if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+            return False
+        if not requested_revision or requested_revision == resolved_revision:
+            return True
+        return (model.get("revision_refs") or {}).get(requested_revision) == resolved_revision
+
+    def _write_revision_ref(
+        self, model_id: str, requested_revision: str, resolved_revision: str,
+    ) -> None:
+        requested_revision = validate_revision(requested_revision)
+        resolved_revision = validate_revision(resolved_revision)
+        if requested_revision == resolved_revision:
+            return
+        repository = self._model_path(model_id)
+        snapshot = repository / "snapshots" / resolved_revision
+        if not snapshot.is_dir() or snapshot.is_symlink():
+            raise RuntimeError("download finished without the resolved snapshot")
+        refs_root = repository / "refs"
+        if refs_root.exists() and (not refs_root.is_dir() or refs_root.is_symlink()):
+            raise RuntimeError("Hugging Face refs directory is not safe")
+        refs_root.mkdir(parents=True, exist_ok=True)
+        parts = PurePosixPath(requested_revision).parts
+        parent = refs_root
+        for component in parts[:-1]:
+            candidate = parent / component
+            if candidate.exists():
+                if not candidate.is_dir() or candidate.is_symlink():
+                    raise RuntimeError("Hugging Face revision ref contains an unsafe directory")
+            else:
+                candidate.mkdir()
+            parent = candidate
+        destination = parent / parts[-1]
+        refs_resolved = refs_root.resolve()
+        try:
+            destination.parent.resolve().relative_to(refs_resolved)
+        except ValueError as exc:
+            raise RuntimeError("Hugging Face revision ref escapes the cache") from exc
+        if destination.exists() and (destination.is_symlink() or not destination.is_file()):
+            raise RuntimeError("Hugging Face revision ref is not a safe file")
+        handle, temporary = tempfile.mkstemp(prefix=".sparkdeck-ref-", dir=destination.parent)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(f"{resolved_revision}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def _load_jobs(self) -> list[dict[str, Any]]:
         try:
@@ -176,9 +284,28 @@ class VirtualNAS:
                 continue
             try:
                 validate_model_id(raw.get("model_id"))
+                revision = validate_revision(raw.get("revision")) if raw.get("revision") else None
+                requested_revision = (
+                    validate_revision(raw.get("requested_revision"))
+                    if raw.get("requested_revision") else revision
+                )
             except ValueError:
                 continue
             status = str(raw.get("status") or "failed")
+            legacy_mutable_workflow = bool(
+                raw.get("workflow_id")
+                and revision
+                and not _is_commit_sha(revision)
+                and status in _ACTIVE_TRANSFER_STATES
+            )
+            if legacy_mutable_workflow:
+                status = "failed"
+                raw["completed_at"] = time.time()
+                raw["error"] = (
+                    "model preparation was created before immutable revision "
+                    "pinning; retry the recipe preparation"
+                )
+                recovered = True
             if status == "running":
                 status = "queued"
                 raw["bytes_transferred"] = 0
@@ -187,9 +314,15 @@ class VirtualNAS:
                 status = "failed"
             jobs.append({
                 "id": str(raw.get("id") or uuid.uuid4()),
+                "kind": "download" if raw.get("kind") == "download" else "transfer",
                 "model_id": raw["model_id"],
                 "source_node_id": str(raw.get("source_node_id") or LOCAL_NODE_ID),
                 "target_node_id": str(raw.get("target_node_id") or ""),
+                "revision": revision,
+                "requested_revision": requested_revision,
+                "depends_on_job_id": raw.get("depends_on_job_id"),
+                "workflow_id": raw.get("workflow_id"),
+                "workflow_node_ids": list(raw.get("workflow_node_ids") or []),
                 "status": status,
                 "bytes_total": _nonnegative_int(raw.get("bytes_total")),
                 "bytes_transferred": _nonnegative_int(raw.get("bytes_transferred")),
@@ -227,6 +360,179 @@ class VirtualNAS:
 
     def list_transfers(self) -> dict[str, Any]:
         return {"items": [dict(job) for job in self.jobs]}
+
+    async def resolve_download_revision(
+        self, model_id: str, revision: str = "main",
+        explicit_token: str | None = None,
+        *, force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve a requested Hub ref once to an immutable commit and size."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        cache_key = (model_id, revision)
+        cached = self._download_size_cache.get(cache_key)
+        if (
+            _is_commit_sha(revision)
+            and not force_refresh
+            and cached
+            and time.monotonic() - cached[0] < 300
+        ):
+            return {
+                "requested_revision": revision,
+                "resolved_revision": cached[1],
+                "size_bytes": cached[2],
+            }
+        token = str(
+            explicit_token if explicit_token is not None else self._token_provider() or ""
+        ).strip()
+
+        def inspect() -> tuple[str, int]:
+            try:
+                from huggingface_hub import HfApi
+            except ImportError as exc:
+                raise RuntimeError("huggingface-hub is required to download model weights") from exc
+            try:
+                info = HfApi(token=token or None).model_info(
+                    model_id, revision=revision, files_metadata=True,
+                )
+                resolved_value = getattr(info, "sha", None)
+                if not isinstance(resolved_value, str) or not _COMMIT_SHA.fullmatch(
+                    resolved_value.strip()
+                ):
+                    raise RuntimeError("Hugging Face did not report an immutable revision")
+                resolved_revision = resolved_value.strip().lower()
+                siblings = list(getattr(info, "siblings", None) or [])
+                sizes = [getattr(item, "size", None) for item in siblings]
+                if not siblings or any(
+                    isinstance(size, bool) or not isinstance(size, int) or size < 0
+                    for size in sizes
+                ):
+                    raise RuntimeError("Hugging Face did not report complete file sizes")
+                total = sum(sizes)
+                if total <= 0:
+                    raise RuntimeError("Hugging Face reported an empty model repository")
+                return resolved_revision, total
+            except Exception as exc:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(
+                    "could not inspect Hugging Face model; verify repository access, revision, credentials, and network"
+                ) from exc
+
+        resolved_revision, size_bytes = await asyncio.to_thread(inspect)
+        if _is_commit_sha(revision):
+            self._download_size_cache[cache_key] = (
+                time.monotonic(), resolved_revision, size_bytes,
+            )
+        return {
+            "requested_revision": revision,
+            "resolved_revision": resolved_revision,
+            "size_bytes": size_bytes,
+        }
+
+    async def estimate_download_size(
+        self, model_id: str, revision: str = "main",
+        explicit_token: str | None = None,
+        *, force_refresh: bool = False,
+    ) -> int:
+        """Return the exact Hub file total or fail closed when it is unknown."""
+        resolved = await self.resolve_download_revision(
+            model_id, revision, explicit_token, force_refresh=force_refresh,
+        )
+        return int(resolved["size_bytes"])
+
+    async def download_model_checked(
+        self, model_id: str, revision: str = "main",
+        explicit_token: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Agent-side capacity gate using only this cache filesystem."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        if not _is_commit_sha(revision):
+            raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
+        existing = next((
+            item for item in await asyncio.to_thread(self.inventory)
+            if item.get("model_id") == model_id
+            and self._has_revision(item, revision, requested_revision)
+        ), None)
+        if existing is None:
+            expected_bytes = await self.estimate_download_size(
+                model_id, revision, explicit_token, force_refresh=True,
+            )
+            free_bytes = await asyncio.to_thread(self.free_bytes)
+            required = expected_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            if free_bytes is None:
+                raise RuntimeError("download node did not report free cache capacity")
+            if free_bytes < required:
+                raise RuntimeError(
+                    f"download node has insufficient free cache space "
+                    f"({free_bytes} bytes available; {required} bytes required)"
+                )
+        return await self._await_uncancelable(
+            asyncio.to_thread(
+                self.download_model, model_id, revision, explicit_token,
+                requested_revision,
+            ),
+        )
+
+    def download_model(
+        self, model_id: str, revision: str = "main", explicit_token: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Resume a Hub snapshot into this node's configured cache."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        requested_revision = validate_revision(requested_revision or revision)
+        token = str(
+            explicit_token if explicit_token is not None else self._token_provider() or ""
+        ).strip()
+        existing = next((
+            item for item in self.inventory()
+            if item.get("model_id") == model_id
+            and self._has_revision(item, revision, requested_revision)
+        ), None)
+        if existing is not None:
+            return {
+                "ok": True, "model_id": model_id, "revision": revision,
+                "size_bytes": _nonnegative_int(existing.get("size_bytes")),
+            }
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise RuntimeError("huggingface-hub is required to download model weights") from exc
+        try:
+            with self._download_locks_guard:
+                download_lock = self._download_locks.setdefault(model_id, threading.Lock())
+            # snapshot_download uses resumable temporary blobs and Hub file
+            # locks. This additional per-process lock makes controller retries
+            # idempotent when an earlier HTTP request is still unwinding.
+            with download_lock:
+                snapshot_download(
+                    repo_id=model_id,
+                    revision=revision,
+                    cache_dir=str(self._hub()),
+                    token=token or None,
+                )
+                self._write_revision_ref(
+                    model_id, requested_revision, revision,
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "Hugging Face download failed; verify repository access, revision, credentials, and network"
+            ) from exc
+        model = next((
+            item for item in self.inventory()
+            if item.get("model_id") == model_id
+            and self._has_revision(item, revision, requested_revision)
+        ), None)
+        if model is None:
+            raise RuntimeError("download finished without a complete requested revision")
+        return {
+            "ok": True, "model_id": model_id, "revision": revision,
+            "size_bytes": _nonnegative_int(model.get("size_bytes")),
+        }
 
     def free_bytes(self) -> int | None:
         """Free space on the filesystem hosting the model cache hub.
@@ -274,6 +580,7 @@ class VirtualNAS:
                     file_count += 1
                     last_modified = max(last_modified, stat.st_mtime)
             revisions = set(snapshot_revisions)
+            revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
                 for ref in refs_root.rglob("*"):
@@ -282,7 +589,9 @@ class VirtualNAS:
                             continue
                         target = ref.read_text(encoding="utf-8").strip()
                         if target in snapshot_revisions:
-                            revisions.add(ref.relative_to(refs_root).as_posix())
+                            ref_name = ref.relative_to(refs_root).as_posix()
+                            revisions.add(ref_name)
+                            revision_refs[ref_name] = target
                     except (OSError, UnicodeError, ValueError):
                         continue
             models.append({
@@ -291,6 +600,7 @@ class VirtualNAS:
                 "file_count": file_count,
                 "partial": partial,
                 "revisions": sorted(revisions),
+                "revision_refs": revision_refs,
                 "last_modified": (
                     datetime.fromtimestamp(last_modified, timezone.utc).isoformat()
                     if last_modified else None
@@ -363,12 +673,21 @@ class VirtualNAS:
         model_id: str,
         chunks: AsyncIterator[bytes],
         expected_bytes: int | None = None,
+        required_model_bytes: int | None = None,
         progress: Callable[[int], None] | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         self._reserve_stream(model_id)
         hub = self._hub()
         try:
+            if required_model_bytes is not None:
+                model_bytes = _nonnegative_int(required_model_bytes)
+                required_free = model_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
+                free_bytes = self.free_bytes()
+                if free_bytes is None or free_bytes < required_free:
+                    raise RuntimeError(
+                        "target cache volume no longer has enough free space for import"
+                    )
             hub.mkdir(parents=True, exist_ok=True)
             archive_name = _cache_name(model_id)
             if (hub / archive_name).exists():
@@ -440,11 +759,32 @@ class VirtualNAS:
 
     async def queue_transfer(
         self, model_id: str, source_node_id: str,
-        target_node_ids: list[str],
+        target_node_ids: list[str], revision: str | None = None,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        async with self._queue_lock:
+            return await self._queue_transfer(
+                model_id, source_node_id, target_node_ids, revision,
+                workflow_id, workflow_node_ids, requested_revision,
+            )
+
+    async def _queue_transfer(
+        self, model_id: str, source_node_id: str,
+        target_node_ids: list[str], revision: str | None = None,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
+        revision = validate_revision(revision) if revision else None
+        requested_revision = (
+            validate_revision(requested_revision or revision)
+            if revision else None
+        )
         source_node_id = str(source_node_id or LOCAL_NODE_ID)
         targets = list(dict.fromkeys(str(value) for value in target_node_ids if value))
         if not targets:
@@ -455,32 +795,42 @@ class VirtualNAS:
             target_statuses[target] = await self._validate_online_node(target)
             if target == source_node_id:
                 raise ValueError("source and target nodes must be different")
-        source_inventory = await self._node_inventory(source_node_id)
+        source_storage = await self._node_storage(source_node_id)
+        source_inventory = source_storage["models"]
         source_model = next(
-            (item for item in source_inventory if item.get("model_id") == model_id),
+            (
+                item for item in source_inventory
+                if item.get("model_id") == model_id
+                and (not revision or self._has_revision(
+                    item, revision, requested_revision,
+                ))
+            ),
             None,
         )
         if source_model is None:
-            raise LookupError("cached source model not found")
+            raise LookupError("cached source model revision not found")
         if source_model.get("partial"):
             raise RuntimeError("partial cached models cannot be transferred")
         model_size = _nonnegative_int(source_model.get("size_bytes"))
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")
         existing_targets: list[str] = []
+        target_storage: dict[str, dict[str, Any]] = {}
         for target in targets:
             duplicate = next((
                 job for job in self.jobs
                 if job["model_id"] == model_id
-                and job["source_node_id"] == source_node_id
                 and job["target_node_id"] == target
                 and job["status"] in _ACTIVE_TRANSFER_STATES
             ), None)
             if duplicate:
                 raise ValueError(
-                    f"an active transfer for '{model_id}' to node '{target}' already exists"
+                    f"an active model preparation for '{model_id}' to node "
+                    f"'{target}' already exists"
                 )
-            target_inventory = await self._node_inventory(target)
+            storage = await self._node_storage(target)
+            target_storage[target] = storage
+            target_inventory = storage["models"]
             if any(
                 item.get("model_id") == model_id for item in target_inventory
             ):
@@ -489,9 +839,10 @@ class VirtualNAS:
             raise FileExistsError(
                 f"cached model already exists on target node(s): {', '.join(existing_targets)}"
             )
-        required_free = model_size * 2 + _TRANSFER_STAGING_RESERVE_BYTES
-        for target, status in target_statuses.items():
-            free_bytes = _disk_free_bytes(status.get("disk"))
+        required_free = model_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        for target in target_statuses:
+            raw_free = target_storage[target].get("free_size")
+            free_bytes = None if raw_free is None else _nonnegative_int(raw_free)
             if free_bytes is None:
                 raise RuntimeError(
                     f"target node '{target}' did not report free disk capacity"
@@ -507,8 +858,13 @@ class VirtualNAS:
         jobs = []
         for target in targets:
             job = {
-                "id": str(uuid.uuid4()), "model_id": model_id,
+                "id": str(uuid.uuid4()), "kind": "transfer", "model_id": model_id,
                 "source_node_id": source_node_id, "target_node_id": target,
+                "revision": revision,
+                "requested_revision": requested_revision,
+                "depends_on_job_id": None,
+                "workflow_id": workflow_id,
+                "workflow_node_ids": list(workflow_node_ids or []),
                 "status": "queued",
                 "bytes_total": model_size,
                 "bytes_transferred": 0, "created_at": created,
@@ -522,12 +878,180 @@ class VirtualNAS:
         self._wake.set()
         return {"job_ids": [job["id"] for job in jobs], "jobs": jobs}
 
+    async def queue_download_and_transfer(
+        self,
+        model_id: str,
+        revision: str,
+        download_node_id: str,
+        transfer_target_node_ids: list[str],
+        expected_bytes: int,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+        additional_download_node_ids: list[str] | None = None,
+        source_node_id: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        async with self._queue_lock:
+            return await self._queue_download_and_transfer(
+                model_id, revision, download_node_id,
+                transfer_target_node_ids, expected_bytes, workflow_id,
+                workflow_node_ids, additional_download_node_ids,
+                source_node_id, requested_revision,
+            )
+
+    async def _queue_download_and_transfer(
+        self,
+        model_id: str,
+        revision: str,
+        download_node_id: str,
+        transfer_target_node_ids: list[str],
+        expected_bytes: int,
+        workflow_id: str | None = None,
+        workflow_node_ids: list[str] | None = None,
+        additional_download_node_ids: list[str] | None = None,
+        source_node_id: str | None = None,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist resumable Hub downloads and any dependent NAS fan-out."""
+        if not self.enabled:
+            raise RuntimeError("virtual NAS is disabled")
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        if not _is_commit_sha(revision):
+            raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
+        expected_bytes = _nonnegative_int(expected_bytes)
+        if expected_bytes <= 0:
+            raise ValueError("expected_bytes must be positive")
+        download_node_id = str(download_node_id or LOCAL_NODE_ID)
+        download_nodes = list(dict.fromkeys([
+            download_node_id,
+            *(str(value) for value in (additional_download_node_ids or []) if value),
+        ]))
+        targets = list(dict.fromkeys(
+            str(value) for value in transfer_target_node_ids if value
+        ))
+        overlap = sorted(set(download_nodes) & set(targets))
+        if overlap:
+            raise ValueError(
+                "download nodes cannot also be transfer targets: "
+                + ", ".join(overlap)
+            )
+        transfer_source = str(source_node_id) if source_node_id else download_node_id
+        if transfer_source in targets:
+            raise ValueError("source node cannot also be a transfer target")
+
+        for node_id in download_nodes:
+            await self._validate_download_node(node_id)
+        if targets and transfer_source not in download_nodes:
+            await self._validate_online_node(transfer_source)
+        for target in targets:
+            await self._validate_online_node(target)
+
+        active_targets = {
+            job["target_node_id"]
+            for job in self.jobs
+            if job.get("model_id") == model_id
+            and job.get("status") in _ACTIVE_TRANSFER_STATES
+        }
+        requested_targets = {*download_nodes, *targets}
+        duplicate_targets = sorted(active_targets & requested_targets)
+        if duplicate_targets:
+            raise ValueError(
+                "an active model preparation already exists for node(s): "
+                + ", ".join(duplicate_targets)
+            )
+
+        download_required = expected_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+        for node_id in download_nodes:
+            download_storage = await self._node_storage(node_id)
+            download_free = _optional_nonnegative_int(download_storage.get("free_size"))
+            if download_free is None:
+                raise RuntimeError(
+                    f"download node '{node_id}' did not report free cache capacity"
+                )
+            if download_free < download_required:
+                raise RuntimeError(
+                    f"download node '{node_id}' has insufficient free cache space "
+                    f"({download_free} bytes available; {download_required} bytes required)"
+                )
+
+        transfer_bytes = expected_bytes
+        if targets and transfer_source not in download_nodes:
+            source_storage = await self._node_storage(transfer_source)
+            source_model = next((
+                item for item in source_storage["models"]
+                if item.get("model_id") == model_id
+                and self._has_revision(item, revision, requested_revision)
+            ), None)
+            if source_model is None:
+                raise LookupError("cached source model revision not found")
+            transfer_bytes = _nonnegative_int(source_model.get("size_bytes"))
+            if transfer_bytes <= 0:
+                raise RuntimeError("source node did not report a usable cached model size")
+        transfer_required = transfer_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        for target in targets:
+            storage = await self._node_storage(target)
+            if any(item.get("model_id") == model_id for item in storage["models"]):
+                raise FileExistsError(
+                    f"cached model already exists on target node '{target}'"
+                )
+            free_bytes = _optional_nonnegative_int(storage.get("free_size"))
+            if free_bytes is None:
+                raise RuntimeError(
+                    f"target node '{target}' did not report free cache capacity"
+                )
+            if free_bytes < transfer_required:
+                raise RuntimeError(
+                    f"target node '{target}' has insufficient free cache space "
+                    f"({free_bytes} bytes available; {transfer_required} bytes required)"
+                )
+
+        created = time.time()
+        jobs = [{
+            "id": str(uuid.uuid4()), "kind": "download", "model_id": model_id,
+            "source_node_id": "huggingface", "target_node_id": node_id,
+            "revision": revision, "depends_on_job_id": None,
+            "requested_revision": requested_revision,
+            "workflow_id": workflow_id,
+            "workflow_node_ids": list(workflow_node_ids or []),
+            "status": "queued", "bytes_total": expected_bytes,
+            "bytes_transferred": 0, "created_at": created,
+            "started_at": None, "completed_at": None, "error": None,
+        } for node_id in download_nodes]
+        primary_download_job = jobs[0]
+        for target in targets:
+            jobs.append({
+                "id": str(uuid.uuid4()), "kind": "transfer", "model_id": model_id,
+                "source_node_id": transfer_source, "target_node_id": target,
+                "revision": revision,
+                "requested_revision": requested_revision,
+                "depends_on_job_id": (
+                    None if source_node_id else primary_download_job["id"]
+                ),
+                "workflow_id": workflow_id,
+                "workflow_node_ids": list(workflow_node_ids or []),
+                "status": "queued", "bytes_total": transfer_bytes,
+                "bytes_transferred": 0, "created_at": created,
+                "started_at": None, "completed_at": None, "error": None,
+            })
+        self.jobs.extend(jobs)
+        self._save()
+        self.start()
+        self._wake.set()
+        return {"job_ids": [job["id"] for job in jobs], "jobs": [dict(job) for job in jobs]}
+
     async def cancel_transfer(self, job_id: str) -> dict[str, Any]:
         job = next((item for item in self.jobs if item["id"] == job_id), None)
         if job is None:
             raise LookupError("transfer not found")
         if job["status"] in _FINAL_TRANSFER_STATES:
             return dict(job)
+        if job.get("kind") == "download" and job["status"] == "running":
+            raise RuntimeError(
+                "a running Hugging Face download cannot be canceled safely; "
+                "it is resumable and will finish or fail"
+            )
         job["status"] = "canceled"
         job["completed_at"] = time.time()
         job["error"] = None
@@ -585,13 +1109,32 @@ class VirtualNAS:
             raise RuntimeError(f"node '{node.get('name', node_id)}' is offline")
         return status
 
-    async def _node_inventory(self, node_id: str) -> list[dict[str, Any]]:
+    async def _validate_download_node(self, node_id: str) -> dict[str, Any]:
+        status = await self._validate_online_node(node_id)
+        if (
+            node_id != LOCAL_NODE_ID
+            and VIRTUAL_NAS_DOWNLOAD_CAPABILITY
+            not in (status.get("capabilities") or [])
+        ):
+            raise RuntimeError(
+                f"node '{status.get('name', node_id)}' must be updated before "
+                "it can download models from Hugging Face"
+            )
+        return status
+
+    async def _node_storage(self, node_id: str) -> dict[str, Any]:
         if node_id == LOCAL_NODE_ID:
-            return await asyncio.to_thread(self.inventory)
+            return {
+                "models": await asyncio.to_thread(self.inventory),
+                "free_size": await asyncio.to_thread(self.free_bytes),
+            }
         payload = await self.node_registry.request(
             node_id, "GET", "/api/agent/virtual-nas/inventory", timeout=30,
         )
-        return list((payload or {}).get("models") or [])
+        return {
+            "models": list((payload or {}).get("models") or []),
+            "free_size": (payload or {}).get("free_size"),
+        }
 
     async def _dispatch_loop(self) -> None:
         try:
@@ -602,13 +1145,30 @@ class VirtualNAS:
                 # A single global transfer prevents a multi-target copy from
                 # saturating the source disk and cluster network.
                 if not self._active:
-                    job = next(
-                        (item for item in self.jobs if item["status"] == "queued"),
-                        None,
-                    )
+                    job = None
+                    for candidate in self.jobs:
+                        if candidate["status"] != "queued":
+                            continue
+                        dependency_id = candidate.get("depends_on_job_id")
+                        if dependency_id:
+                            dependency = next((
+                                item for item in self.jobs
+                                if item["id"] == dependency_id
+                            ), None)
+                            if dependency is None or dependency["status"] in {"failed", "canceled"}:
+                                candidate["status"] = "failed"
+                                candidate["completed_at"] = time.time()
+                                candidate["error"] = "required source download did not complete"
+                                self._save()
+                                continue
+                            if dependency["status"] != "completed":
+                                continue
+                        job = candidate
+                        break
                     if job is not None:
                         target = job["target_node_id"]
-                        task = asyncio.create_task(self._run_transfer(job))
+                        runner = self._run_download if job.get("kind") == "download" else self._run_transfer
+                        task = asyncio.create_task(runner(job))
                         self._active[target] = task
                         task.add_done_callback(lambda _task: self._wake.set())
                 self._wake.clear()
@@ -618,6 +1178,102 @@ class VirtualNAS:
                     pass
         except asyncio.CancelledError:
             raise
+
+    async def _run_download(self, job: dict[str, Any]) -> None:
+        event = asyncio.Event()
+        self._cancel_events[job["id"]] = event
+        job.update({
+            "status": "running", "started_at": time.time(),
+            "completed_at": None, "error": None,
+        })
+        self._save()
+        token = str(self._token_provider() or "").strip()
+        try:
+            storage = await self._node_storage(job["target_node_id"])
+            already_complete = next((
+                item for item in storage["models"]
+                if item.get("model_id") == job["model_id"]
+                and self._has_revision(
+                    item, job.get("revision") or "main",
+                    job.get("requested_revision") or job.get("revision") or "main",
+                )
+            ), None)
+            if already_complete is None:
+                current_size = await self.estimate_download_size(
+                    job["model_id"], job.get("revision") or "main", token,
+                    force_refresh=True,
+                )
+                job["bytes_total"] = current_size
+                self._save()
+                # Re-read the authoritative cache filesystem after the Hub
+                # metadata call so both operands of the capacity gate are
+                # current when the download actually begins.
+                storage = await self._node_storage(job["target_node_id"])
+                free_bytes = _optional_nonnegative_int(storage.get("free_size"))
+                required = current_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+                if free_bytes is None:
+                    raise RuntimeError("download node did not report free cache capacity")
+                if free_bytes < required:
+                    raise RuntimeError(
+                        f"download node has insufficient free cache space "
+                        f"({free_bytes} bytes available; {required} bytes required)"
+                    )
+            if job["target_node_id"] == LOCAL_NODE_ID:
+                operation = asyncio.to_thread(
+                    self.download_model, job["model_id"],
+                    job.get("revision") or "main", token,
+                    job.get("requested_revision") or job.get("revision") or "main",
+                )
+            else:
+                await self._validate_download_node(job["target_node_id"])
+                operation = self.node_registry.request(
+                    job["target_node_id"], "POST",
+                    self._model_agent_path(job["model_id"], "download"),
+                    json_body={
+                        "revision": job.get("revision") or "main",
+                        "requested_revision": (
+                            job.get("requested_revision")
+                            or job.get("revision") or "main"
+                        ),
+                        "hf_token": token,
+                    },
+                    timeout=24 * 60 * 60,
+                )
+            # Neither a local snapshot_download worker nor a remote agent's
+            # snapshot worker can be safely canceled once it begins. Retain
+            # ownership until it finishes so stop/restart cannot duplicate it.
+            result = await self._await_uncancelable(operation)
+            if event.is_set() or job["status"] == "canceled":
+                raise TransferCanceled()
+            size_bytes = _nonnegative_int((result or {}).get("size_bytes"))
+            job["status"] = "completed"
+            job["bytes_transferred"] = size_bytes or job["bytes_total"]
+            job["bytes_total"] = size_bytes or job["bytes_total"]
+            job["completed_at"] = time.time()
+            for dependent in self.jobs:
+                if dependent.get("depends_on_job_id") == job["id"]:
+                    dependent["bytes_total"] = job["bytes_total"]
+        except TransferCanceled:
+            job["status"] = "canceled"
+            job["completed_at"] = time.time()
+            job["error"] = None
+        except asyncio.CancelledError:
+            if job["status"] != "canceled":
+                job["status"] = "queued"
+                job["started_at"] = None
+                job["error"] = None
+            raise
+        except Exception as exc:
+            message = str(exc)
+            if token:
+                message = message.replace(token, "[REDACTED]")
+            job["status"] = "failed"
+            job["completed_at"] = time.time()
+            job["error"] = message[:500]
+        finally:
+            self._cancel_events.pop(job["id"], None)
+            self._save()
+            self._wake.set()
 
     async def _run_transfer(self, job: dict[str, Any]) -> None:
         event = asyncio.Event()
@@ -632,6 +1288,36 @@ class VirtualNAS:
         source = None
         tracked_stream = None
         try:
+            source_storage = await self._node_storage(job["source_node_id"])
+            source_model = next((
+                item for item in source_storage["models"]
+                if item.get("model_id") == job["model_id"]
+                and (not job.get("revision") or self._has_revision(
+                    item, job["revision"],
+                    job.get("requested_revision") or job["revision"],
+                ))
+            ), None)
+            if source_model is None:
+                raise RuntimeError("source node does not have the complete requested revision")
+            actual_size = _nonnegative_int(source_model.get("size_bytes"))
+            if actual_size <= 0:
+                raise RuntimeError("source node did not report a usable cached model size")
+            job["bytes_total"] = actual_size
+            target_storage = await self._node_storage(job["target_node_id"])
+            if any(
+                item.get("model_id") == job["model_id"]
+                for item in target_storage["models"]
+            ):
+                raise FileExistsError("cached model already exists on target node")
+            free_bytes = _optional_nonnegative_int(target_storage.get("free_size"))
+            required = actual_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            if free_bytes is None:
+                raise RuntimeError("target node did not report free cache capacity")
+            if free_bytes < required:
+                raise RuntimeError(
+                    f"target node has insufficient free cache space "
+                    f"({free_bytes} bytes available; {required} bytes required)"
+                )
             if job["source_node_id"] == LOCAL_NODE_ID:
                 source = self.export_model(job["model_id"])
             else:
@@ -652,17 +1338,34 @@ class VirtualNAS:
 
             tracked_stream = tracked()
             if job["target_node_id"] == LOCAL_NODE_ID:
-                await self.import_model(job["model_id"], tracked_stream)
+                await self.import_model(
+                    job["model_id"], tracked_stream,
+                    required_model_bytes=actual_size,
+                )
             else:
                 target_response = await self.node_registry.open_stream(
                     job["target_node_id"], "PUT",
                     self._model_agent_path(job["model_id"], "import"),
                     content=tracked_stream,
-                    headers={"Content-Type": "application/x-tar"},
+                    headers={
+                        "Content-Type": "application/x-tar",
+                        "X-SparkDeck-Model-Bytes": str(actual_size),
+                    },
                     timeout=3600,
                 )
                 await _raise_remote_status(target_response, "target")
                 await target_response.aread()
+            imported_storage = await self._node_storage(job["target_node_id"])
+            imported_model = next((
+                item for item in imported_storage["models"]
+                if item.get("model_id") == job["model_id"]
+                and (not job.get("revision") or self._has_revision(
+                    item, job["revision"],
+                    job.get("requested_revision") or job["revision"],
+                ))
+            ), None)
+            if imported_model is None:
+                raise RuntimeError("target did not report the complete requested revision")
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             job["status"] = "completed"
@@ -742,6 +1445,16 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
 
 
 def _disk_free_bytes(disk: Any) -> int | None:

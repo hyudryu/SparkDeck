@@ -4,7 +4,7 @@ import { useResource } from './useResource'
 
 export function communityAccessHint(signedIn: boolean) {
   return signedIn
-    ? 'Review and enable community sharing on Benchmarks to see community data.'
+    ? 'Enable telemetry under Settings → Community Features to see community data.'
     : 'Sign in under Settings → Community Features to see community data.'
 }
 

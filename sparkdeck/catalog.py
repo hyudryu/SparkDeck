@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import re
 import time
+from contextlib import asynccontextmanager
+from urllib.parse import quote
 from typing import Any, Callable
 
 import httpx
@@ -21,6 +24,32 @@ _SAFETENSORS_BYTES_PER_VALUE = {
     "U4": 0.5, "I4": 0.5,
 }
 
+_QUANTIZATION_PATTERN = re.compile(
+    r"(?:^|[/_.-])((?:UD-)?(?:IQ|Q)\d(?:_[A-Z0-9]+)*|NVFP4|FP8|BF16|FP16|F16|AWQ|GPTQ)(?=$|[/_.-])",
+    re.IGNORECASE,
+)
+_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+
+
+@asynccontextmanager
+async def _keyed_lock(pool: dict[Any, dict[str, Any]], key: Any):
+    """Hold one keyed lock and evict it after its last waiter exits."""
+    entry = pool.get(key)
+    if entry is None:
+        entry = {"lock": asyncio.Lock(), "users": 0}
+        pool[key] = entry
+    entry["users"] += 1
+    try:
+        async with entry["lock"]:
+            yield
+    finally:
+        entry["users"] -= 1
+        if entry["users"] == 0 and pool.get(key) is entry:
+            pool.pop(key, None)
+
 
 class HuggingFaceCatalog:
     def __init__(
@@ -33,7 +62,11 @@ class HuggingFaceCatalog:
         self.ttl_seconds = ttl_seconds
         self.token_provider = token_provider
         self._cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
-        self._lock = asyncio.Lock()
+        self._detail_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        # Deduplicate only identical requests. Different repositories must be
+        # able to fetch concurrently during bulk community enrichment.
+        self._search_locks: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self._detail_locks: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def search(self, query: str, limit: int = 24) -> list[dict[str, Any]]:
         query = query.strip()
@@ -45,7 +78,7 @@ class HuggingFaceCatalog:
         cached = self._cache.get(key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
-        async with self._lock:
+        async with _keyed_lock(self._search_locks, key):
             cached = self._cache.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
                 return cached[1]
@@ -73,6 +106,129 @@ class HuggingFaceCatalog:
             ]
             self._cache[key] = (time.monotonic(), items)
             return items
+
+    async def details(self, repository: str) -> dict[str, Any]:
+        """Return public Hub metadata plus every downloadable GGUF quantization."""
+        repository = repository.strip().strip("/")
+        if (
+            repository.count("/") != 1
+            or any(part in {"", ".", ".."} for part in repository.split("/"))
+        ):
+            raise ValueError("model repository must be an owner/name Hugging Face ID")
+        token = str(self.token_provider() or "") if self.token_provider else ""
+        token_key = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "public"
+        key = (repository.casefold(), token_key)
+        now = time.monotonic()
+        cached = self._detail_cache.get(key)
+        if cached and now - cached[0] < self.ttl_seconds:
+            return cached[1]
+        async with _keyed_lock(self._detail_locks, key):
+            cached = self._detail_cache.get(key)
+            if cached and now - cached[0] < self.ttl_seconds:
+                return cached[1]
+            detail_params = [
+                *(('expand[]', field) for field in (
+                    "author", "downloads", "likes", "tags", "safetensors",
+                    "gguf", "pipeline_tag", "gated", "private", "lastModified",
+                    "siblings",
+                )),
+            ]
+            request_headers = {
+                "Authorization": f"Bearer {token}"
+            } if token else {}
+            response = await self.http.get(
+                f"https://huggingface.co/api/models/{quote(repository, safe='/')}",
+                params=detail_params,
+                headers=request_headers,
+                timeout=15,
+            )
+            if response.status_code in {301, 302, 303, 307, 308}:
+                redirected = response.headers.get("location", "")
+                redirected_url = httpx.URL("https://huggingface.co").join(redirected)
+                if (
+                    redirected_url.scheme != "https"
+                    or redirected_url.host != "huggingface.co"
+                    or not redirected_url.path.startswith("/api/models/")
+                ):
+                    raise ValueError("Hugging Face returned an unsafe model redirect")
+                response = await self.http.get(
+                    redirected_url.copy_with(query=None),
+                    params=detail_params,
+                    headers=request_headers,
+                    timeout=15,
+                )
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, dict) or raw.get("private"):
+                raise ValueError("Hugging Face returned an invalid public model")
+            raw.setdefault("id", repository)
+            detail_repository = str(raw.get("id") or repository)
+            siblings = raw.get("siblings")
+            if _gguf_sizes_missing(siblings):
+                tree_path = (
+                    f"/api/models/{quote(detail_repository, safe='/')}/tree/main"
+                )
+                tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
+                tree_params: dict[str, Any] | None = {
+                    "recursive": "true", "limit": 1000,
+                }
+                tree: list[dict[str, Any]] = []
+                seen_pages: set[str] = set()
+                while True:
+                    tree_response = await self.http.get(
+                    tree_url,
+                    params=tree_params,
+                    headers=request_headers,
+                    timeout=15,
+                    )
+                    tree_response.raise_for_status()
+                    current_page = str(tree_response.url)
+                    if current_page in seen_pages:
+                        raise ValueError(
+                            "Hugging Face returned a repeated model tree page"
+                        )
+                    seen_pages.add(current_page)
+                    page = tree_response.json()
+                    if not isinstance(page, list):
+                        raise ValueError("Hugging Face returned an invalid model tree")
+                    tree.extend(entry for entry in page if isinstance(entry, dict))
+
+                    next_href = tree_response.links.get("next", {}).get("url")
+                    if not next_href:
+                        break
+                    next_url = tree_response.url.join(str(next_href))
+                    if (
+                        next_url.scheme != "https"
+                        or next_url.host != "huggingface.co"
+                        or next_url.path != tree_path
+                    ):
+                        raise ValueError(
+                            "Hugging Face returned an unsafe model tree page"
+                        )
+                    tree_url = next_url
+                    tree_params = None
+                sizes = {
+                    str(entry.get("path") or ""): _positive_int(entry.get("size"))
+                    for entry in tree
+                }
+                if isinstance(siblings, list):
+                    siblings = [
+                        {
+                            **sibling,
+                            **(
+                                {"size": sizes[str(sibling.get("rfilename") or "")]}
+                                if sizes.get(str(sibling.get("rfilename") or ""))
+                                else {}
+                            ),
+                        }
+                        if isinstance(sibling, dict) else sibling
+                        for sibling in siblings
+                    ]
+                    raw["siblings"] = siblings
+            item = self._public_item(raw)
+            item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
+            self._detail_cache[key] = (time.monotonic(), item)
+            return item
 
     @staticmethod
     def _public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -153,3 +309,127 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number > 0 else None
+
+
+def quantization_from_text(*values: Any) -> str | None:
+    """Conservatively extract a recognized weight quantization marker."""
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = _QUANTIZATION_PATTERN.search(text)
+        if match:
+            return canonical_quantization(match.group(1))
+    return None
+
+
+def canonical_quantization(value: Any) -> str | None:
+    """Canonicalize one explicit or inferred public quantization label."""
+    normalized = str(value or "").strip().upper()
+    if (
+        not normalized or len(normalized) > 100
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        return None
+    return {"F16": "FP16"}.get(normalized, normalized)
+
+
+def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+    if not isinstance(raw_siblings, list):
+        return []
+    for sibling in raw_siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(
+            sibling.get("rfilename") or sibling.get("path") or sibling.get("name") or ""
+        ).strip()
+        folded_filename = filename.casefold()
+        if (
+            not folded_filename.endswith(".gguf")
+            or "mmproj" in folded_filename
+            or folded_filename.startswith("mtp/")
+            or "/mtp-" in folded_filename
+        ):
+            continue
+        quantization = quantization_from_text(filename)
+        if not quantization:
+            continue
+        size = _positive_int(sibling.get("size"))
+        lfs = sibling.get("lfs")
+        if size is None and isinstance(lfs, dict):
+            size = _positive_int(lfs.get("size"))
+        path = filename.replace("\\", "/")
+        parent, _, basename = path.rpartition("/")
+        shard = _GGUF_SHARD_PATTERN.match(basename)
+        artifact_key = (
+            f"{parent}/{shard.group('stem')}" if parent and shard
+            else shard.group("stem") if shard
+            else path
+        )
+        artifacts = grouped.setdefault(quantization, {})
+        group = artifacts.setdefault(artifact_key, {
+            "filename": filename,
+            "files": [],
+            "weight_size_bytes": 0,
+            "shard_count": int(shard.group("count")) if shard else 1,
+            "shard_indexes": set(),
+        })
+        if shard:
+            group["shard_indexes"].add(int(shard.group("index")))
+            if int(shard.group("count")) != group["shard_count"]:
+                group["shard_count"] = 0
+        file_item: dict[str, Any] = {"filename": filename}
+        if size is not None:
+            file_item["size_bytes"] = size
+            group["weight_size_bytes"] += size
+        group["files"].append(file_item)
+    result = []
+    for quantization, artifact_groups in grouped.items():
+        artifacts = []
+        for group in artifact_groups.values():
+            group["files"].sort(key=lambda item: item["filename"].casefold())
+            verified = (
+                group["shard_count"] == 1
+                or group["shard_indexes"]
+                == set(range(1, group["shard_count"] + 1))
+            )
+            artifacts.append({
+                "filename": group["files"][0]["filename"],
+                "files": group["files"],
+                "weight_size_bytes": (
+                    group["weight_size_bytes"]
+                    if verified and group["weight_size_bytes"] else None
+                ),
+                "sharded": group["shard_count"] > 1,
+            })
+        artifacts.sort(key=lambda item: (
+            item["weight_size_bytes"] is None,
+            item["weight_size_bytes"] or math.inf,
+            item["filename"].casefold(),
+        ))
+        preferred = artifacts[0]
+        result.append({
+            "name": quantization,
+            "files": preferred["files"],
+            "weight_size_bytes": preferred["weight_size_bytes"],
+            "artifacts": artifacts,
+        })
+    return sorted(result, key=lambda item: item["name"].casefold())
+
+
+def _gguf_sizes_missing(raw_siblings: Any) -> bool:
+    if not isinstance(raw_siblings, list):
+        return False
+    for sibling in raw_siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(sibling.get("rfilename") or "")
+        if not filename.casefold().endswith(".gguf"):
+            continue
+        lfs = sibling.get("lfs")
+        if _positive_int(sibling.get("size")) is None and not (
+            isinstance(lfs, dict) and _positive_int(lfs.get("size")) is not None
+        ):
+            return True
+    return False

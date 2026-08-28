@@ -9,14 +9,18 @@ export interface RuntimeCompatibility {
 
 export interface BenchmarkAggregate {
   model_id: string
-  context_window_size: number
+  quantization: string
+  prompt_tokens_bucket: number
   inference_tokens_per_second: number
   sample_count: number
+  unique_cluster_count: number
+  parameter_count?: number | null
+  weight_size_bytes?: number | null
 }
 
 export interface CommunityEvidencePolicy {
   minimum_samples: number
-  exact_match_dimensions: Array<'model_id' | 'context_window_size'>
+  exact_match_dimensions: Array<'model_id' | 'quantization' | 'prompt_tokens_bucket'>
   metric: 'inference_tokens_per_second'
 }
 
@@ -40,6 +44,11 @@ export interface CatalogModel {
   runtime_compatibility?: RuntimeCompatibility[]
   local_deployment_ids?: string[]
   community?: BenchmarkAggregate | null
+  quantizations?: Array<{
+    name: string
+    files: Array<{ filename: string; size_bytes?: number | null }>
+    weight_size_bytes?: number | null
+  }>
 }
 
 export interface CatalogResponse {
@@ -57,6 +66,7 @@ export interface DeploymentSettings {
   parallel_slots?: number
   gpu_split?: string
   quantization?: string
+  artifact?: string
   dtype?: string
   gpu_memory_utilization?: number
   port?: number

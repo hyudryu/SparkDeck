@@ -357,12 +357,29 @@ export function ModelsPage() {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
     const sharded = searchParams.get('layout') === 'sharded'
+    const quantization = searchParams.get('quantization')?.trim()
+    const artifact = searchParams.get('artifact')?.trim()
+    const ggufArtifact = Boolean(artifact?.toLocaleLowerCase().endsWith('.gguf'))
     catalogShardedLayout.current = sharded
+    if (ggufArtifact) runtimeTouched.current = true
     setForm((current) => ({
       ...current,
       model_id: modelId,
       alias: current.alias || modelId.split('/').at(-1) || modelId,
-      deployment_mode: sharded ? 'sharded' : current.deployment_mode,
+      runtime: ggufArtifact ? 'llama.cpp' : current.runtime,
+      deployment_mode: ggufArtifact ? 'single' : sharded ? 'sharded' : current.deployment_mode,
+      settings: ggufArtifact
+        ? {
+          context_length: current.settings.context_length,
+          parallel_slots: current.settings.parallel_slots ?? 1,
+          gpu_layers: current.settings.gpu_layers ?? 99,
+          quantization: quantization || undefined,
+          artifact,
+        }
+        : {
+          ...current.settings,
+          quantization: quantization || current.settings.quantization,
+        },
     }))
     setCreating(true)
     setSearchParams({}, { replace: true })
@@ -420,8 +437,18 @@ export function ModelsPage() {
         node_ids: nodeIds,
         deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
-          ? { context_length: contextLength, parallel_slots: current.settings.parallel_slots ?? 1, gpu_layers: current.settings.gpu_layers ?? 99 }
-          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1 },
+          ? {
+            context_length: contextLength,
+            parallel_slots: current.settings.parallel_slots ?? 1,
+            gpu_layers: current.settings.gpu_layers ?? 99,
+            quantization: current.settings.quantization,
+            artifact: current.settings.artifact,
+          }
+          : {
+            context_length: contextLength,
+            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
+            quantization: current.settings.quantization,
+          },
       }
     })
   }, [appSettings.data, localNodeId])
@@ -926,8 +953,18 @@ export function ModelsPage() {
         node_ids: nodeIds,
         deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
-          ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1 },
+          ? {
+            context_length: contextLength,
+            parallel_slots: 1,
+            gpu_layers: 99,
+            quantization: current.settings.quantization,
+            artifact: current.settings.artifact,
+          }
+          : {
+            context_length: contextLength,
+            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
+            quantization: current.settings.quantization,
+          },
       }
     })
   }
@@ -1250,6 +1287,8 @@ export function ModelsPage() {
                 <label className="field"><span>Runtime</span><select value={form.runtime} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="llama.cpp">llama.cpp</option><option value="sglang">SGLang</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>
+              {form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /></label>}
               <label className="check-field"><input type="checkbox" checked={!form.managed} onChange={(event) => setForm({ ...form, managed: !event.target.checked })} /><span><strong>Connect an existing endpoint</strong><small>SparkDeck will not manage its process or container.</small></span></label>
               {!form.managed && <label className="field"><span>Endpoint URL</span><input type="url" required value={form.endpoint_url} onChange={(event) => setForm({ ...form, endpoint_url: event.target.value })} placeholder="http://127.0.0.1:8001" /></label>}
               {!form.managed && <label className="field"><span>API key (optional)</span><input type="password" autoComplete="off" value={form.api_key ?? ''} onChange={(event) => setForm({ ...form, api_key: event.target.value })} /><small>Stored in your operating system credential store, never in SparkDeck's database.</small></label>}

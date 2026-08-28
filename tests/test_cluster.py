@@ -417,6 +417,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 "node_id": "remote-1",
                 "protocol_version": 1,
                 "docker_ready": docker_ready,
+                "status_message": None if docker_ready else (
+                    "SparkDeck's service user cannot access Docker. Add this "
+                    "user to the docker group, then restart the user session."
+                ),
                 "fabric_ready": True,
                 "interfaces": [],
                 "stats": {},
@@ -440,7 +444,10 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 degraded = await registry.probe(node, force=True)
                 self.assertEqual(degraded["status"], "degraded")
                 self.assertTrue(degraded["online"])
-                self.assertIn("Docker", degraded["status_message"])
+                self.assertIn(
+                    "service user cannot access Docker",
+                    degraded["status_message"],
+                )
             finally:
                 await client.aclose()
 

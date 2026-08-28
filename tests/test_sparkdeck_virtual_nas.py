@@ -268,6 +268,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
                 result = await nas.download_model_files_checked(
                     "org/model", resolved, [selected_name],
+                    requested_revision="release-gguf",
                 )
 
                 self.assertTrue(result["ok"])
@@ -275,7 +276,14 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     (snapshot / ".sparkdeck-selective.incomplete").is_file()
                 )
-                self.assertTrue(nas.inventory()[0]["partial"])
+                partial_model = nas.inventory()[0]
+                self.assertTrue(partial_model["partial"])
+                self.assertEqual(partial_model["revision"], "release-gguf")
+                self.assertEqual(partial_model["revision_refs"], {})
+                self.assertEqual(
+                    partial_model["partial_revision_refs"],
+                    {"release-gguf": resolved},
+                )
                 self.assertEqual(hf_hub_download.call_count, 1)
                 self.assertEqual(
                     hf_hub_download.call_args.kwargs["filename"], selected_name,
@@ -289,7 +297,11 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(
                 (snapshot / ".sparkdeck-selective.incomplete").exists()
             )
-            self.assertFalse(nas.inventory()[0]["partial"])
+            completed_model = nas.inventory()[0]
+            self.assertFalse(completed_model["partial"])
+            self.assertEqual(
+                completed_model["revision_refs"], {"release-gguf": resolved},
+            )
 
     async def test_inventory_lists_complete_and_partial_models_without_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -889,6 +901,67 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             manager.virtual_nas.queue_download_and_transfer.await_count, 1,
+        )
+
+    async def test_manager_finishes_selective_cache_at_its_pinned_non_main_revision(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": []}
+        manager.virtual_nas.resolve_download_revision = AsyncMock()
+        manager.virtual_nas.estimate_download_size = AsyncMock(return_value=100)
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["download-1"],
+            "jobs": [{
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "local",
+                "status": "queued", "bytes_total": 100, "bytes_transferred": 0,
+                "created_at": 1,
+            }],
+        })
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "cache_free_size": 10**9,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 8,
+                "partial": True, "has_partial_download": True,
+                "revision": "release-gguf",
+                "partial_revision_refs": {"release-gguf": RESOLVED_REVISION},
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 8},
+            }],
+        }])
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 100},
+            "targets": [{
+                "node_id": "local", "has_partial_model_cache": True,
+                "download_eligible": True,
+            }],
+        })
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "local",
+        )
+
+        self.assertEqual(result["job_ids"], ["download-1"])
+        manager.virtual_nas.resolve_download_revision.assert_not_awaited()
+        manager.virtual_nas.estimate_download_size.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION,
+        )
+        pinned_resolution = {
+            "requested_revision": "release-gguf",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 100,
+            "resume_node_id": "local",
+            "download_cache_baseline_bytes": None,
+        }
+        manager.virtual_nas_transfer_preflight.assert_awaited_once_with(
+            "org/model", "release-gguf", pinned_resolution,
+        )
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "local", [], 100,
+            requested_revision="release-gguf", require_partial_cache=True,
+            download_cache_baseline_bytes=None,
         )
 
     async def test_resume_preflight_credits_only_bytes_after_attempt_baseline(self):

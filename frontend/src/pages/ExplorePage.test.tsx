@@ -177,6 +177,62 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByRole('button', { name: 'Expand org/vllm-model' })).toBeInTheDocument()
   })
 
+  it('filters Llama models by their default GGUF artifact size instead of model-level weights', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [
+        {
+          id: 'org/small-artifact', name: 'small-artifact', weight_size_bytes: 30 * gib,
+          downloads: 20, likes: 2, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+          quantizations: [{
+            name: 'Q4_K_M', weight_size_bytes: 8 * gib,
+            files: [{ filename: 'small-q4_k_m.gguf', size_bytes: 8 * gib }],
+            artifacts: [{
+              filename: 'small-q4_k_m.gguf', weight_size_bytes: 8 * gib,
+              files: [{ filename: 'small-q4_k_m.gguf', size_bytes: 8 * gib }],
+            }],
+          }],
+        },
+        {
+          id: 'org/large-artifact', name: 'large-artifact', weight_size_bytes: 8 * gib,
+          downloads: 10, likes: 1, runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+          quantizations: [{
+            name: 'F16', weight_size_bytes: 30 * gib,
+            files: [{ filename: 'large-f16.gguf', size_bytes: 30 * gib }],
+            artifacts: [{
+              filename: 'large-f16.gguf', weight_size_bytes: 30 * gib,
+              files: [{ filename: 'large-f16.gguf', size_bytes: 30 * gib }],
+            }],
+          }],
+        },
+      ], total: 2 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+        { id: 'worker', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 64 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Expand org/small-artifact' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
+    expect(await screen.findByText('16 GB controller memory for Llama server')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    expect(screen.getByRole('button', { name: 'Expand org/small-artifact' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Expand org/large-artifact' })).not.toBeInTheDocument()
+  })
+
   it('color codes cluster fit and filters fitting models largest first', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

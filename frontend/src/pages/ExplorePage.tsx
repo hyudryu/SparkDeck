@@ -133,6 +133,11 @@ function requiresControllerCapacity(model: DisplayCatalogModel) {
   return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
 }
 
+function defaultGgufWeightSize(model: DisplayCatalogModel) {
+  const defaultArtifact = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)[0]
+  return defaultArtifact?.weightSize ?? model.weight_size_bytes ?? model.community?.weight_size_bytes
+}
+
 function deployHref(
   model: DisplayCatalogModel,
   runtime: RuntimeKind,
@@ -399,10 +404,14 @@ export function ExplorePage() {
     }
     if (communityOnly || tab === 'community') visible = visible.filter((model) => Boolean(model.community))
     if (fitsOnly) visible = visible.filter((model) => {
-      const applicableCapacity = runtime === 'llama.cpp' || (runtime === '' && requiresControllerCapacity(model))
+      const usesControllerCapacity = runtime === 'llama.cpp' || (runtime === '' && requiresControllerCapacity(model))
+      const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
         : memory.capacity
-      return ['easy', 'tight'].includes(fitTone(model.weight_size_bytes, applicableCapacity))
+      const applicableWeightSize = usesControllerCapacity
+        ? defaultGgufWeightSize(model)
+        : model.weight_size_bytes
+      return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity))
     })
     if (fitsOnly) {
       visible = [...visible].sort((left, right) => Number(right.weight_size_bytes ?? 0) - Number(left.weight_size_bytes ?? 0))

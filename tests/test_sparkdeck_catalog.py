@@ -50,7 +50,7 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             set(request.url.params.get_list("expand[]")),
             {
                 "author", "downloads", "likes", "tags", "safetensors", "gguf",
-                "pipeline_tag", "gated", "private", "lastModified",
+                "pipeline_tag", "gated", "private", "lastModified", "siblings",
             },
         )
         self.assertEqual(request.headers["authorization"], "Bearer hf_private_secret")
@@ -67,6 +67,45 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             if item["runtime"] == "vllm"
         ))
         self.assertNotIn("hf_private_secret", str(items))
+        await http.aclose()
+
+    async def test_search_classifies_and_exposes_sibling_only_gguf_artifacts(self):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json=[{
+                "id": "org/model", "tags": [],
+                "siblings": [
+                    {"rfilename": "model-Q4_K_M.gguf", "size": 8_000_000_000},
+                    {"rfilename": "README.md", "size": 100},
+                ],
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("model", 5)
+
+        self.assertIn("siblings", captured[0].url.params.get_list("expand[]"))
+        self.assertEqual(items[0]["formats"], ["gguf"])
+        self.assertTrue(next(
+            value["supported"] for value in items[0]["runtime_compatibility"]
+            if value["runtime"] == "llama.cpp"
+        ))
+        self.assertEqual(items[0]["quantizations"], [{
+            "name": "Q4_K_M",
+            "files": [{
+                "filename": "model-Q4_K_M.gguf", "size_bytes": 8_000_000_000,
+            }],
+            "weight_size_bytes": 8_000_000_000,
+            "artifacts": [{
+                "filename": "model-Q4_K_M.gguf",
+                "files": [{
+                    "filename": "model-Q4_K_M.gguf", "size_bytes": 8_000_000_000,
+                }],
+                "weight_size_bytes": 8_000_000_000,
+                "sharded": False,
+            }],
+        }])
         await http.aclose()
 
     async def test_gguf_metadata_exposes_parameter_and_weight_size(self):

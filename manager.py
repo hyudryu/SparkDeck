@@ -39,6 +39,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VirtualNAS,
     cached_download_bytes,
     download_required_free_bytes,
@@ -1063,7 +1064,11 @@ class Manager:
             "name": self.settings.get("cluster_node_name") or socket.gethostname(),
             "hostname": socket.gethostname(),
             "protocol_version": AGENT_PROTOCOL_VERSION,
-            "capabilities": [CAPABILITY, VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+            "capabilities": [
+                CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+            ],
             "update_protocol": 1,
             "app_revision": getattr(self, "app_revision", None),
             "status": "online" if docker_ready else "degraded",
@@ -1723,7 +1728,7 @@ class Manager:
             )
             for job in previous_downloads:
                 try:
-                    requested_revision = validate_revision(
+                    candidate_requested_revision = validate_revision(
                         job.get("requested_revision") or job.get("revision")
                     )
                     resolved_revision = str(job.get("revision") or "").strip()
@@ -1735,7 +1740,7 @@ class Manager:
                             model_id, resolved_revision,
                         )
                     recovered_resolution = {
-                        "requested_revision": requested_revision,
+                        "requested_revision": candidate_requested_revision,
                         "resolved_revision": resolved_revision,
                         "size_bytes": recovered_size,
                         "resume_node_id": node_id,
@@ -1743,9 +1748,14 @@ class Manager:
                             "download_cache_baseline_bytes"
                         ),
                     }
+                    requested_revision = candidate_requested_revision
                 except ValueError:
                     continue
                 break
+            if previous_downloads and recovered_resolution is None:
+                raise LookupError(
+                    "partial download revision cannot be recovered safely"
+                )
         requested_revision = requested_revision or "main"
         resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
             model_id, requested_revision,

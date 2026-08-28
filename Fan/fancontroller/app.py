@@ -62,8 +62,7 @@ MODES = [
 class FanApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.settings = Settings.load()
-        self.settings_mtime_ns = self._config_mtime()
+        self.settings = self._load_initial_settings()
 
         # sensors
         self.sources = discover()
@@ -311,25 +310,36 @@ class FanApp:
         return box
 
     def _build_sources_pane(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_border_width(8)
+        self.sources_pane = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4,
+        )
+        self.sources_pane.set_border_width(8)
+        self._rebuild_source_controls()
+        return self.sources_pane
+
+    def _rebuild_source_controls(self) -> None:
+        for child in self.sources_pane.get_children():
+            self.sources_pane.remove(child)
+        self.source_checks: dict[str, Gtk.CheckButton] = {}
         if not self.sources:
-            box.pack_start(Gtk.Label(label="No temperature sources detected.", xalign=0),
-                           False, False, 0)
-            return box
-        box.pack_start(
+            self.sources_pane.pack_start(
+                Gtk.Label(label="No temperature sources detected.", xalign=0),
+                False, False, 0,
+            )
+            self.sources_pane.show_all()
+            return
+        self.sources_pane.pack_start(
             Gtk.Label(label="Selected sources are aggregated by max():", xalign=0),
             False, False, 0,
         )
-        self.source_checks: dict[str, Gtk.CheckButton] = {}
         for s in self.sources:
             cb = Gtk.CheckButton(label=s.label)
             cb.set_tooltip_text("Include this temperature source in the max() aggregation")
             cb.set_active(s.key in self.settings.sources)
             cb.connect("toggled", self._on_source_toggled, s.key)
-            box.pack_start(cb, False, False, 0)
+            self.sources_pane.pack_start(cb, False, False, 0)
             self.source_checks[s.key] = cb
-        return box
+        self.sources_pane.show_all()
 
     def _build_connection_pane(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -517,6 +527,17 @@ class FanApp:
         except OSError:
             return None
 
+    def _load_initial_settings(self) -> Settings:
+        before_mtime_ns = self._config_mtime()
+        settings = Settings.load()
+        after_mtime_ns = self._config_mtime()
+        self.settings_mtime_ns = (
+            before_mtime_ns
+            if before_mtime_ns == after_mtime_ns
+            else STALE_CONFIG_MTIME_NS
+        )
+        return settings
+
     def _replace_serial_link(self, new_port: str) -> None:
         if self.link is None:
             return
@@ -534,7 +555,9 @@ class FanApp:
         )
         self.link.start()
 
-    def _sync_settings_widgets(self, port_changed: bool) -> None:
+    def _sync_settings_widgets(
+        self, port_changed: bool, sources_changed: bool,
+    ) -> None:
         previous_building = self._building
         self._building = True
         try:
@@ -566,8 +589,11 @@ class FanApp:
             self.startmin_switch.set_active(self.settings.start_minimized)
             self.smoothing_spin.set_value(self.settings.temp_smoothing_s)
             self.maxrpm_spin.set_value(self.settings.max_rpm)
-            for key, checkbox in getattr(self, "source_checks", {}).items():
-                checkbox.set_active(key in self.settings.sources)
+            if sources_changed:
+                self._rebuild_source_controls()
+            else:
+                for key, checkbox in getattr(self, "source_checks", {}).items():
+                    checkbox.set_active(key in self.settings.sources)
             if port_changed:
                 self._populate_ports()
         finally:
@@ -580,11 +606,14 @@ class FanApp:
 
         old_port = self.settings.serial_port
         old_poll_interval = self.settings.poll_interval_s
+        old_mode = self.settings.mode
+        old_hysteresis_on = self.hyst._on if old_mode == "hysteresis" else False
         self.settings = Settings.load()
         # Keep the observed value so another replacement racing this load is
         # still detected on the next poll.
         self.settings_mtime_ns = observed_mtime_ns
 
+        old_source_keys = set(self.source_map)
         discovered_sources = discover()
         if discovered_sources:
             self.sources = discovered_sources
@@ -612,13 +641,17 @@ class FanApp:
             on_temp=self.settings.hyst_on_temp,
             off_temp=self.settings.hyst_off_temp,
         )
+        if old_mode == self.settings.mode == "hysteresis":
+            self.hyst._on = old_hysteresis_on
         self.temp_smoother.reset()
         self.slew.sync(byte_to_pct(self.current_duty_byte), time.monotonic())
 
         port_changed = old_port != self.settings.serial_port
         if port_changed:
             self._replace_serial_link(self.settings.serial_port)
-        self._sync_settings_widgets(port_changed)
+        self._sync_settings_widgets(
+            port_changed, old_source_keys != set(self.source_map),
+        )
         if old_poll_interval != self.settings.poll_interval_s:
             GLib.idle_add(self._schedule_poll)
         log.info(

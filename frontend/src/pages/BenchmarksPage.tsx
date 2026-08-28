@@ -124,7 +124,7 @@ export function BenchmarksPage() {
         </button>)}
       </div></Panel>}
 
-      <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name and context window. Results are estimates, not guarantees.</p></div></div>
+      <div className="section-heading" title={communityAccess.enabled ? undefined : accessHint}><div><h2>{localAggregates ? 'Local aggregate estimates' : 'Community estimates'}</h2><p>Evidence is matched only by exact model name, quantization, and prompt-length bucket. Results are estimates, not guarantees.</p></div></div>
       {!communityAccess.enabled && !communityAccess.loading && <EmptyState
         title="Community estimates are locked"
         description={accessHint}
@@ -139,15 +139,15 @@ export function BenchmarksPage() {
         description="The hosted community service could not be reached. Your local benchmarks are unaffected — try again later."
         action={<Button variant="secondary" onClick={aggregates.reload}>Retry</Button>}
       />}
-      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.availability !== 'unavailable' && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name and context window." />}
+      {communityAccess.enabled && !aggregates.loading && !aggregates.error && aggregateResponse?.availability !== 'unavailable' && aggregateResponse?.items.length === 0 && <EmptyState title="No community estimates yet" description="Estimates will appear when enough samples share the same model name, quantization, and prompt-length bucket." />}
       {communityAccess.enabled && aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
-        <Panel className="aggregate-item" key={`${item.model_id}-${item.context_window_size}`}>
-          <div><p className="aggregate-model">{item.model_id}</p><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>
-          <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Context window</dt><dd>{item.context_window_size.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
+        <Panel className="aggregate-item" key={`${item.model_id}-${item.quantization}-${item.prompt_tokens_bucket}`}>
+          <div><div><p className="aggregate-model">{item.model_id}</p><small className="aggregate-quantization">{item.quantization}</small></div><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>
+          <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Prompt-length bucket</dt><dd>{item.prompt_tokens_bucket.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
           {item.sample_count >= aggregateResponse.evidence_policy.minimum_samples ? <span className="proven"><Check size={14} /> Evidence threshold met</span> : <span className="muted">Collecting more evidence</span>}
         </Panel>
       ))}</div>}
-      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name and context window. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
+      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name, quantization, and prompt-length bucket. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
 
       <div className="section-heading"><div><h2>Local history</h2><p>Successful proxied runs are captured automatically.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}
@@ -177,7 +177,7 @@ export function BenchmarksPage() {
           <p className="benchmark-method-note">Each point is the average of completed coordinated runs for the exact model, context window, concurrency, and TP size. Prompt throughput uses measured time to first token; generation throughput uses concurrent batch wall time. Results vary with runtime, thermals, networking, and workload.</p>
         </>}
       </LegalDialog>}
-      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Benchmark JSON:</strong> model identifier, context-window size, measured inference tok/s, and—when a coordinated run records them—concurrency and TP size.</p><p><strong>Never in benchmark JSON:</strong> prompts or outputs, runtime, revision, quantization, hardware, settings, account email, host identity, or paths. The service still receives ordinary authenticated request and network metadata.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
+      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Benchmark JSON:</strong> canonical model identifier, quantization, prompt-length/context-occupancy bucket, measured inference tok/s, concurrency when recorded, and a stable opaque telemetry cluster ID used to count unique contributing clusters.</p><p><strong>Eligibility:</strong> only samples captured after you enable sharing can be uploaded; existing benchmark history stays local.</p><p><strong>The opaque ID:</strong> is randomly generated and contains no account ID, hostname, node name, or endpoint alias.</p><p><strong>Never in benchmark JSON:</strong> prompts or outputs, runtime, revision, hardware, settings, account email, paths, or endpoint aliases. The service still receives ordinary authenticated request and network metadata.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
     </div>
   )
 }

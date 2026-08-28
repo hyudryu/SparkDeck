@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
 import hashlib
 import inspect
 import ipaddress
@@ -15,13 +16,17 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
 
-from .catalog import HuggingFaceCatalog
+from .catalog import (
+    HuggingFaceCatalog,
+    canonical_quantization,
+    quantization_from_text,
+)
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtimes import (
     RuntimeRegistry,
@@ -50,6 +55,9 @@ _LOCAL_ROUTING_KEYS = {
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
+_COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
+_COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 
 
 def _discovered_launch_controls(
@@ -253,45 +261,52 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         raise ValueError("community aggregate response is too large")
 
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int]] = set()
     for raw in payload["items"]:
         if not isinstance(raw, dict):
             raise ValueError("community aggregate item must be an object")
         model_id = str(raw.get("model_id") or "").strip()
-        context_window = raw.get("context_window_size")
+        quantization = canonical_quantization(raw.get("quantization")) or "UNKNOWN"
+        prompt_bucket = raw.get("prompt_tokens_bucket")
         speed = raw.get("inference_tokens_per_second")
         sample_count = raw.get("sample_count")
+        unique_cluster_count = raw.get("unique_cluster_count", 1)
         if (
             not model_id
             or len(model_id) > 500
             or any(ord(char) < 32 for char in model_id)
-            or isinstance(context_window, bool)
-            or not isinstance(context_window, int)
+            or isinstance(prompt_bucket, bool)
+            or not isinstance(prompt_bucket, int)
             or isinstance(sample_count, bool)
             or not isinstance(sample_count, int)
+            or isinstance(unique_cluster_count, bool)
+            or not isinstance(unique_cluster_count, int)
             or isinstance(speed, bool)
             or not isinstance(speed, (int, float))
         ):
             raise ValueError("community aggregate item is invalid")
         speed = float(speed)
         if (
-            context_window <= 0
-            or context_window > 100_000_000
+            prompt_bucket not in {400, *range(1_000, 10_000, 1_000)}
             or sample_count <= 0
             or sample_count > 1_000_000_000
+            or unique_cluster_count <= 0
+            or unique_cluster_count > sample_count
             or not math.isfinite(speed)
             or speed <= 0
         ):
             raise ValueError("community aggregate item is invalid")
-        key = (model_id, context_window)
+        key = (model_id, quantization, prompt_bucket)
         if key in seen:
             raise ValueError("community aggregate response contains duplicate evidence")
         seen.add(key)
         result.append({
             "model_id": model_id,
-            "context_window_size": context_window,
+            "quantization": quantization,
+            "prompt_tokens_bucket": prompt_bucket,
             "inference_tokens_per_second": speed,
             "sample_count": sample_count,
+            "unique_cluster_count": unique_cluster_count,
         })
     return result
 
@@ -307,18 +322,39 @@ class SparkDeckService:
         )
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
+        self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
+        self._community_observation: contextvars.ContextVar[dict[str, Any] | None] = (
+            contextvars.ContextVar("sparkdeck_community_observation", default=None)
+        )
+        self._community_active_observations: dict[str, dict[str, Any]] = {}
 
     async def close(self) -> None:
+        tasks = list(self._deployment_launch_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.store.close()
 
-    async def set_community_consent(self, enabled: bool) -> None:
+    async def set_community_consent(
+        self, enabled: bool, telemetry_cluster_id: str | None = None,
+    ) -> dict[str, Any]:
         """Serialize consent changes with benchmark queue mutations."""
         async with self._community_upload_lock:
-            await asyncio.to_thread(self.store.set_community_consent, enabled)
+            return await asyncio.to_thread(
+                self.store.set_community_consent, enabled, telemetry_cluster_id
+            )
+
+    async def revoke_community_membership(self) -> dict[str, Any]:
+        """Disable sharing and forget a former controller's cluster identity."""
+        async with self._community_upload_lock:
+            return await asyncio.to_thread(
+                self.store.revoke_community_membership
+            )
 
     async def delete_benchmark(self, sample_id: str) -> bool:
         """Serialize deletion with queue mutations; the uploader re-reads the
@@ -349,6 +385,7 @@ class SparkDeckService:
         endpoint = COMMUNITY_API_URL.strip().rstrip("/")
         if not endpoint:
             items = await asyncio.to_thread(self.store.community_aggregates)
+            items = await self.enrich_community_aggregates(items)
             return {
                 "items": items,
                 "availability": "local" if items else "not_configured",
@@ -366,6 +403,7 @@ class SparkDeckService:
             )
             response.raise_for_status()
             items = _public_community_aggregates(response.json())
+            items = await self.enrich_community_aggregates(items)
         except (httpx.HTTPError, TypeError, ValueError) as exc:
             raise RuntimeError("community aggregate service is unavailable") from exc
         return {
@@ -373,6 +411,53 @@ class SparkDeckService:
             "availability": "available",
             "evidence_policy": COMMUNITY_EVIDENCE_POLICY,
         }
+
+    async def enrich_community_aggregates(
+        self, items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach authoritative Hub size metadata without trusting uploads."""
+        repositories = list(dict.fromkeys(
+            str(item.get("model_id") or "") for item in items
+            if str(item.get("model_id") or "").count("/") == 1
+        ))[:100]
+        semaphore = asyncio.Semaphore(8)
+
+        async def load(repository: str) -> tuple[str, dict[str, Any] | None]:
+            async with semaphore:
+                try:
+                    return repository, await self.catalog.details(repository)
+                except (httpx.HTTPError, TypeError, ValueError):
+                    return repository, None
+
+        tasks = [asyncio.create_task(load(value)) for value in repositories]
+        metadata: dict[str, dict[str, Any] | None] = {}
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=8)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            metadata = dict(
+                task.result() for task in done if not task.cancelled()
+            )
+        enriched: list[dict[str, Any]] = []
+        for item in items:
+            value = dict(item)
+            detail = metadata.get(str(item.get("model_id") or ""))
+            if detail:
+                value["parameter_count"] = detail.get("parameter_count")
+                value["weight_size_bytes"] = detail.get("weight_size_bytes")
+                quantization = (
+                    canonical_quantization(item.get("quantization")) or "UNKNOWN"
+                )
+                variant = next((
+                    candidate for candidate in detail.get("quantizations") or []
+                    if canonical_quantization(candidate.get("name")) == quantization
+                ), None)
+                if variant and variant.get("weight_size_bytes"):
+                    value["weight_size_bytes"] = variant["weight_size_bytes"]
+            enriched.append(value)
+        return enriched
 
     async def record_benchmark_series_point(self, body: dict[str, Any]) -> dict[str, Any]:
         """Record aggregate benchmark counters; raw prompts and outputs are rejected upstream."""
@@ -428,6 +513,17 @@ class SparkDeckService:
             raw_model_id, deployment.get("id") or deployment_id,
             upload_model_id=upload_model_id,
         )
+        deployment_model = deployment.get("model") or {}
+        quantization = (
+            canonical_quantization(deployment_model.get("quantization"))
+            or canonical_quantization(settings.get("quantization"))
+            or quantization_from_text(
+                settings.get("gguf_variant"),
+                deployment_model.get("artifact"),
+                raw_model_id,
+            )
+            or "UNKNOWN"
+        )
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -461,7 +557,9 @@ class SparkDeckService:
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=point["created_at"],
             deployment_id=deployment.get("id"),
-            model=ModelIdentity(repository=upload_model_id), runtime=runtime,
+            model=ModelIdentity(
+                repository=upload_model_id, quantization=quantization,
+            ), runtime=runtime,
             runtime_version=_optional_string(settings.get("runtime_version")),
             hardware=hardware, configuration=configuration,
             input_tokens=prompt_tokens, output_tokens=generation_tokens,
@@ -644,6 +742,17 @@ class SparkDeckService:
         items = items[:bounded_limit]
         return {"items": items, "total": len(items), "next_cursor": None}
 
+    async def catalog_details(self, repository: str) -> dict[str, Any]:
+        model = await self.catalog.details(repository)
+        local = [
+            item for item in await self.deployments()
+            if (item.get("model") or {}).get("repository") == repository
+        ]
+        if local:
+            model = copy.deepcopy(model)
+            model["local_deployment_ids"] = [item["id"] for item in local]
+        return {"model": model, "aggregates": []}
+
     async def deployments(self) -> list[dict[str, Any]]:
         registered = self.store.deployments(include_private=True)
         by_container = {item.get("container_name"): item for item in registered}
@@ -676,7 +785,9 @@ class SparkDeckService:
             if isinstance(member, dict) and member.get("container_name")
         }
         cluster_nodes: dict[str, dict[str, Any]] = {}
-        if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
+        if any(
+            item.get("settings", {}).get("manager_deployment_id") for item in registered
+        ) or cluster_by_container:
             try:
                 cluster_nodes = {
                     node["id"]: node for node in await self.manager.cluster_nodes()
@@ -741,6 +852,9 @@ class SparkDeckService:
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
+            stored.update(_deployment_launch_progress(cluster))
+            if cluster.get("error"):
+                stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
@@ -774,7 +888,11 @@ class SparkDeckService:
                 continue
             stored = by_container.get(container.get("name"))
             if stored:
-                stored["status"] = _managed_container_status(container)
+                # A local rank is not the whole clustered deployment. Preserve
+                # Manager's aggregate state while another rank is still
+                # pulling, starting, or failing.
+                if not stored.get("settings", {}).get("manager_deployment_id"):
+                    stored["status"] = _managed_container_status(container)
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -790,6 +908,19 @@ class SparkDeckService:
                 # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
                 discovered.update(self._layout_contract(owner.get("launch_settings")))
+                owner_node_ids = [
+                    str(item) for item in owner.get("node_ids") or [] if str(item).strip()
+                ]
+                if owner_node_ids:
+                    # Without the cluster node set the card would look like a
+                    # standalone container: the running-node tooltip hides and
+                    # an add-nodes picker cannot tell which nodes already run
+                    # the model.
+                    discovered["node_ids"] = owner_node_ids
+                    discovered["selected_nodes"] = [
+                        self.manager.public_target_node(cluster_nodes[node_id])
+                        for node_id in owner_node_ids if node_id in cluster_nodes
+                    ]
             registered.append(discovered)
         for deployment in registered:
             if (
@@ -797,11 +928,18 @@ class SparkDeckService:
                 and deployment.get("id") not in seen
                 and not str(deployment.get("id") or "").startswith("container:")
             ):
-                deployment["status"] = "missing"
-                deployment["last_error"] = (
-                    "Docker is unavailable" if docker_unavailable
-                    else "Managed container is missing"
-                )
+                if deployment.get("id") in self._deployment_launches:
+                    deployment.update({
+                        "status": "starting",
+                        "launch_phase": "queued",
+                        "launch_message": "Preparing deployment launch",
+                    })
+                else:
+                    deployment["status"] = "missing"
+                    deployment["last_error"] = (
+                        "Docker is unavailable" if docker_unavailable
+                        else "Managed container is missing"
+                    )
         await asyncio.gather(
             *(self._probe_external_endpoint(item) for item in registered)
         )
@@ -1056,7 +1194,54 @@ class SparkDeckService:
         )
         return await self.deployment_detail(deployment_id)
 
-    async def create_deployment(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def _prepare_public_gguf_artifact(
+        self, repository: str, artifact: str, revision: str,
+        quantization: str | None,
+    ) -> str:
+        """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
+        if _public_model_id(repository) != repository:
+            raise ValueError(
+                "repo-relative GGUF artifacts require a public Hugging Face repository"
+            )
+        relative = PurePosixPath(artifact)
+        if (
+            relative.is_absolute() or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in artifact or relative.suffix.casefold() != ".gguf"
+        ):
+            raise ValueError("artifact must be a safe repo-relative .gguf filename")
+        inferred = quantization_from_text(artifact)
+        if quantization and inferred and quantization != inferred:
+            raise ValueError("artifact quantization does not match the selected quantization")
+
+        virtual_nas = getattr(self.manager, "virtual_nas", None)
+        if virtual_nas is None:
+            raise RuntimeError("model preparation is unavailable")
+        resolution = await virtual_nas.resolve_download_revision(repository, revision)
+        resolved_revision = str(resolution.get("resolved_revision") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", resolved_revision):
+            raise RuntimeError("model preparation did not resolve an immutable revision")
+        await virtual_nas.download_model_checked(
+            repository, resolved_revision, requested_revision=revision,
+        )
+        model_root = virtual_nas._model_path(repository).resolve()
+        candidate = model_root / "snapshots" / resolved_revision
+        for part in relative.parts:
+            candidate = candidate / part
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(model_root)
+        except ValueError as exc:
+            raise RuntimeError("prepared GGUF artifact escapes the model cache") from exc
+        if not resolved.is_file():
+            raise RuntimeError(
+                "model preparation completed without the selected GGUF artifact"
+            )
+        return str(resolved)
+
+    async def create_deployment(
+        self, body: dict[str, Any], *, background: bool = False,
+    ) -> dict[str, Any]:
         model = str(body.get("model") or "").strip()
         alias = str(body.get("alias") or model).strip()
         if not model:
@@ -1066,6 +1251,20 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
+        quantization = canonical_quantization(
+            body.get("quantization") or settings.get("quantization")
+        )
+        if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED and artifact:
+            artifact_path = Path(artifact).expanduser()
+            if not artifact_path.is_file():
+                artifact = await self._prepare_public_gguf_artifact(
+                    model, artifact, _optional_string(body.get("revision")) or "main",
+                    quantization,
+                )
+            settings["artifact"] = artifact
+            if quantization:
+                settings["quantization"] = quantization
         requested_node_ids = _requested_node_ids(body)
         deployment_mode = str(body.get("deployment_mode") or "").strip() or None
         if requested_node_ids is not None and kind is DeploymentKind.EXTERNAL:
@@ -1073,8 +1272,8 @@ class SparkDeckService:
         deployment_id = str(uuid.uuid4())
         identity = ModelIdentity(
             repository=model, revision=_optional_string(body.get("revision")),
-            artifact=_optional_string(body.get("artifact") or settings.get("artifact")),
-            quantization=_optional_string(body.get("quantization") or settings.get("quantization")),
+            artifact=artifact,
+            quantization=quantization,
         )
         deployment = Deployment(
             id=deployment_id, alias=alias, runtime=runtime, kind=kind,
@@ -1156,6 +1355,11 @@ class SparkDeckService:
                         launch_body["extra_args"] += [
                             "--quantization", str(settings["quantization"]),
                         ]
+                if background:
+                    return await self._begin_cluster_deployment(
+                        deployment, settings, mode, requested_node_ids,
+                        selected, launch_body,
+                    )
                 try:
                     cluster = await self.manager.create_deployment(launch_body)
                 except Exception:
@@ -1251,6 +1455,100 @@ class SparkDeckService:
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment_id, None)
+
+    def _link_cluster_record(
+        self, deployment: Deployment, settings: dict[str, Any], mode: str,
+        node_ids: list[str], cluster: dict[str, Any],
+    ) -> None:
+        """Persist the public record's route to a durable Manager launch."""
+        members = cluster.get("members") or []
+        primary = members[0] if members else {}
+        deployment.container_name = primary.get("container_name")
+        deployment.settings = self._local_configuration({
+            **settings,
+            "deployment_mode": mode,
+            "node_ids": node_ids,
+            "manager_deployment_id": cluster.get("id"),
+            "model_source": cluster.get("model_source") or "unknown",
+        })
+        port = cluster.get("api_port")
+        self.store.update_managed_routing(
+            deployment.id,
+            deployment.settings,
+            deployment.container_name,
+            f"http://127.0.0.1:{int(port)}" if port else None,
+        )
+
+    async def _begin_cluster_deployment(
+        self, deployment: Deployment, settings: dict[str, Any], mode: str,
+        node_ids: list[str], selected: list[dict[str, Any]],
+        launch_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a public card, then continue the slow launch in background."""
+        launch_complete = asyncio.Event()
+        self.store.add_deployment(deployment, None, None)
+        self._deployment_launches[deployment.id] = launch_complete
+        persisted = asyncio.get_running_loop().create_future()
+
+        def consume_persisted_error(future: asyncio.Future) -> None:
+            if not future.cancelled():
+                future.exception()
+
+        persisted.add_done_callback(consume_persisted_error)
+
+        async def launch() -> None:
+            try:
+                cluster = await self.manager.create_deployment(
+                    launch_body, launch_persisted=persisted,
+                )
+                self._link_cluster_record(
+                    deployment, settings, mode, node_ids, cluster,
+                )
+            except BaseException:
+                # Manager persists node-specific launch failures. Once linked,
+                # retaining the SQLite row makes that diagnostic durable and
+                # visible in Deployments. A preflight failure is handled by
+                # the foreground waiter below before any response is returned.
+                linked = any(
+                    item.get("sparkdeck_record_id") == deployment.id
+                    for item in getattr(self.manager, "deployments", [])
+                    if isinstance(item, dict)
+                )
+                if not linked:
+                    self.store.delete_deployment(deployment.id)
+            finally:
+                launch_complete.set()
+                self._deployment_launches.pop(deployment.id, None)
+                self._deployment_launch_tasks.pop(deployment.id, None)
+
+        task = asyncio.create_task(
+            launch(), name=f"sparkdeck-deploy-{deployment.id}",
+        )
+        self._deployment_launch_tasks[deployment.id] = task
+        try:
+            cluster = await asyncio.shield(persisted)
+        except asyncio.CancelledError:
+            # The accepted operation belongs to the service, not the client
+            # connection. Keep the public row and retained launch task alive.
+            raise
+        except BaseException:
+            await task
+            raise
+
+        self._link_cluster_record(
+            deployment, settings, mode, node_ids, cluster,
+        )
+        result = self.store.deployment(deployment.id) or deployment.to_dict()
+        result.update({
+            "status": "starting",
+            "port": cluster.get("api_port"),
+            "node_ids": node_ids,
+            "selected_nodes": [
+                self.manager.public_target_node(node) for node in selected
+            ],
+            **_deployment_launch_progress(cluster),
+        })
+        return result
 
     async def _recover_failed_cluster_launch(
         self, deployment: Deployment, settings: dict[str, Any],
@@ -1509,18 +1807,25 @@ class SparkDeckService:
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        additional_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         lock = self._deployment_action_locks.setdefault(
             deployment_id, asyncio.Lock(),
         )
         async with lock:
+            launch_task = self._deployment_launch_tasks.get(deployment_id)
+            if launch_task is not None and not launch_task.done():
+                raise RuntimeError(
+                    "deployment launch is still in progress; wait for container creation"
+                )
             return await self._deployment_action_locked(
-                deployment_id, action, node_ids,
+                deployment_id, action, node_ids, additional_node_ids,
             )
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        additional_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
@@ -1546,7 +1851,45 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
-        if node_ids and action == "start":
+        relaunch_mode: str | None = None
+        if additional_node_ids and action == "start":
+            # "Launch on additional nodes" grows the running node set instead
+            # of relocating it: the current cluster nodes stay first in the
+            # merged selection so the primary replica is preserved.
+            if not manager_id and not owner:
+                raise ValueError(
+                    "node selection is only available for cluster deployments; "
+                    "this deployment starts on its existing node"
+                )
+            contract = self._layout_contract(launch_settings)
+            if contract.get("deployment_mode") == "sharded":
+                raise ValueError(
+                    "sharded deployments cannot launch on additional nodes; "
+                    "their tensor-parallel layout is fixed"
+                )
+            current_nodes = (owner or linked or {}).get("node_ids")
+            if not isinstance(current_nodes, list) or not current_nodes:
+                current_nodes = (deployment.get("settings") or {}).get("node_ids") or []
+            merged = list(dict.fromkeys([
+                *(str(item) for item in current_nodes if str(item).strip()),
+                *(str(item).strip() for item in additional_node_ids),
+            ]))
+            if all(item in {str(item) for item in current_nodes} for item in merged):
+                # Manager treats any explicit node selection as a relocation:
+                # relaunching with an unchanged set would tear down every
+                # running rank for a semantic no-op.
+                raise ValueError(
+                    "additional_node_ids must include at least one node that "
+                    "is not already running this deployment"
+                )
+            # The picker constrains choices in the UI, but an API client can
+            # bypass it and the cache can change after the inventory loads —
+            # revalidate before relaunching.
+            await self._validate_start_selection(deployment, merged, launch_settings)
+            if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
+                relaunch_mode = "replicated"
+            node_ids = merged
+        elif node_ids and action == "start":
             node_ids = self._normalized_start_selection(launch_settings, node_ids)
             if not manager_id and not owner and any(item != "local" for item in node_ids):
                 # A standalone container runs on the node that holds it; only
@@ -1567,6 +1910,10 @@ class SparkDeckService:
         if manager_id:
             if node_ids is None:
                 result = await self.manager.deployment_action(manager_id, action)
+            elif relaunch_mode:
+                result = await self.manager.deployment_action(
+                    manager_id, action, node_ids, relaunch_mode,
+                )
             else:
                 result = await self.manager.deployment_action(manager_id, action, node_ids)
             if not result.get("ok"):
@@ -1596,7 +1943,12 @@ class SparkDeckService:
             # and the cluster health monitor restarts the whole deployment —
             # the action must address the cluster instead.
             if action == "start" and node_ids:
-                result = await self.manager.deployment_action(owner["id"], action, node_ids)
+                if relaunch_mode:
+                    result = await self.manager.deployment_action(
+                        owner["id"], action, node_ids, relaunch_mode,
+                    )
+                else:
+                    result = await self.manager.deployment_action(owner["id"], action, node_ids)
             else:
                 result = await self.manager.deployment_action(owner["id"], action)
             if not result.get("ok"):
@@ -1859,22 +2211,118 @@ class SparkDeckService:
                     cancel: Any = None) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
         deployment = self.store.deployment(requested_model, include_private=True)
-        if deployment:
-            return await self._proxy_registered(deployment, body, endpoint, cancel)
-        # Compatibility for existing vLLM/SGLang containers. The manager retains
-        # admission control and cancellation for these established deployments.
-        started = time.monotonic()
-        stream = bool(body.get("stream"))
-        result = (
-            await self.manager.proxy_chat_completions(body, cancel)
-            if endpoint == "chat/completions"
-            else await self.manager.proxy_completions(body, cancel)
+        observation = self._community_observation_start(
+            self._community_observation_scopes(deployment, requested_model)
         )
-        runtime = await self._runtime_for_legacy_model(requested_model)
-        if hasattr(result, "__aiter__"):
-            return self._observe_stream(result, None, requested_model, runtime, {}, started)
-        self._record_response(None, requested_model, runtime, {}, started, result)
-        return result
+        context_token = self._community_observation.set(observation)
+        streaming = False
+        try:
+            if deployment:
+                result = await self._proxy_registered(
+                    deployment, body, endpoint, cancel
+                )
+            else:
+                # Compatibility for existing vLLM/SGLang containers. Resolve the
+                # container's source repository rather than publishing an
+                # arbitrary served alias as the model identity.
+                started = time.monotonic()
+                result = (
+                    await self.manager.proxy_chat_completions(body, cancel)
+                    if endpoint == "chat/completions"
+                    else await self.manager.proxy_completions(body, cancel)
+                )
+                model, runtime, settings = await self._legacy_model_identity(
+                    requested_model
+                )
+                if hasattr(result, "__aiter__"):
+                    result = self._observe_stream(
+                        result, None, model, runtime, settings, started
+                    )
+                else:
+                    self._record_response(
+                        None, model, runtime, settings, started, result
+                    )
+            if hasattr(result, "__aiter__"):
+                streaming = True
+                return self._community_observed_stream(result, observation)
+            return result
+        finally:
+            self._community_observation.reset(context_token)
+            if not streaming:
+                self._community_observation_end(observation)
+
+    def _community_observation_scopes(
+        self, deployment: dict[str, Any] | None, requested_model: str,
+    ) -> frozenset[str]:
+        """Return private in-memory identities for potentially shared hardware."""
+        if deployment:
+            settings = deployment.get("settings") or {}
+            manager_id = settings.get("manager_deployment_id")
+            linked = next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ), None)
+            node_ids = {
+                str(node_id)
+                for source in (
+                    deployment.get("node_ids") or [],
+                    settings.get("node_ids") or [],
+                    (linked or {}).get("node_ids") or [],
+                )
+                for node_id in source
+                if str(node_id)
+            }
+            node_ids.update(
+                str(member.get("node_id"))
+                for member in (linked or {}).get("members") or []
+                if isinstance(member, dict) and member.get("node_id")
+            )
+            if node_ids:
+                return frozenset(f"node:{node_id}" for node_id in node_ids)
+            if deployment.get("kind") == DeploymentKind.MANAGED.value:
+                return frozenset({"node:local"})
+            endpoint = normalize_openai_base_url(deployment.get("_base_url") or "")
+            if endpoint:
+                return frozenset({f"endpoint:{endpoint.casefold()}"})
+            return frozenset({f"deployment:{deployment.get('id')}"})
+        return frozenset({f"legacy-model:{requested_model.casefold()}"})
+
+    def _community_observation_start(
+        self, scopes: frozenset[str] | None = None,
+    ) -> dict[str, Any] | None:
+        snapshot = self.store.community_consent_snapshot()
+        scopes = scopes or frozenset({"unspecified"})
+        observation = {
+            "id": str(uuid.uuid4()),
+            # Opted-out requests carry only lifecycle state. They never reach
+            # sample collection, but remain visible long enough to invalidate
+            # an opted-in request whose decode overlaps them.
+            "enabled": bool(snapshot.get("enabled")),
+            "generation": int(snapshot.get("generation") or 0),
+            "scopes": scopes,
+            "contaminated": False,
+        }
+        for active in self._community_active_observations.values():
+            if scopes.intersection(active.get("scopes") or ()):
+                observation["contaminated"] = True
+                active["contaminated"] = True
+        self._community_active_observations[observation["id"]] = observation
+        return observation
+
+    def _community_observation_end(self, observation: dict[str, Any] | None) -> None:
+        if observation is not None and observation.get("id"):
+            self._community_active_observations.pop(observation["id"], None)
+
+    async def _community_observed_stream(
+        self, stream: AsyncIterator[str], observation: dict[str, Any] | None,
+    ) -> AsyncIterator[str]:
+        token = self._community_observation.set(observation)
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            self._community_observation.reset(token)
+            self._community_observation_end(observation)
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
@@ -1936,7 +2384,8 @@ class SparkDeckService:
         managed = deployment.get("kind") == DeploymentKind.MANAGED.value
         self._record_response(
             deployment["id"], deployment["model"]["repository"],
-            deployment["runtime"], deployment.get("settings") or {}, started, data,
+            deployment["runtime"], self._model_observation_settings(deployment),
+            started, data,
             revision=deployment["model"].get("revision"),
             hardware=(
                 self._hardware_snapshot()
@@ -1954,7 +2403,7 @@ class SparkDeckService:
         upstream_body = {**body, "model": model}
         stream = bool(upstream_body.get("stream"))
         started = time.monotonic()
-        settings = deployment.get("settings") or {}
+        settings = self._model_observation_settings(deployment)
         manager_id = settings.get("manager_deployment_id")
         route_observation: dict[str, Any] = {}
         result = (
@@ -2084,10 +2533,12 @@ class SparkDeckService:
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
-                deployment["runtime"], deployment.get("settings") or {}, started,
+                deployment["runtime"], self._model_observation_settings(deployment),
+                started,
                 usage, first_token_at,
                 revision=deployment["model"].get("revision"),
                 hardware=self._unknown_hardware_snapshot(), hardware_verified=False,
+                stream_timing_trusted=False,
             )
 
     async def _observe_stream(self, stream: AsyncIterator[str], deployment_id: str | None,
@@ -2117,6 +2568,7 @@ class SparkDeckService:
                 deployment_id, model, runtime, settings, started, usage,
                 first_token_at, revision=revision, hardware=hardware,
                 hardware_verified=hardware_verified,
+                stream_timing_trusted=False,
             )
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
@@ -2142,7 +2594,17 @@ class SparkDeckService:
                       native_prompt_tps: float | None = None,
                       revision: str | None = None,
                       hardware: dict[str, Any] | None = None,
-                      hardware_verified: bool = True) -> None:
+                      hardware_verified: bool = True,
+                      stream_timing_trusted: bool = True) -> None:
+        observation = self._community_observation.get()
+        passive_observation = observation is not None
+        # Community sharing is the authority for passive inference telemetry.
+        # When it is off, do not even create a local sample row.
+        if passive_observation and (
+            not observation.get("enabled") or observation.get("contaminated")
+            or not stream_timing_trusted
+        ):
+            return
         completed = time.monotonic()
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -2150,7 +2612,13 @@ class SparkDeckService:
         generation_seconds = max(0.000001, completed - (first_token_at or started))
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
-        quantization = _optional_string(safe_settings.get("quantization"))
+        quantization = (
+            canonical_quantization(settings.get("quantization"))
+            or quantization_from_text(
+                settings.get("gguf_variant"), settings.get("artifact"), model,
+            )
+            or "UNKNOWN"
+        )
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
             if output_tokens and first_token_at is not None else None
@@ -2162,13 +2630,39 @@ class SparkDeckService:
         generation_tps = native_generation_tps or observed_generation_tps
         prompt_tps = native_prompt_tps or observed_prompt_tps
         public_model = _public_model_id(model)
-        eligible = bool(
-            public_model != "local-model" and input_tokens > 0 and output_tokens >= 16 and latency > 0
+        measured_decode_seconds = (
+            generation_seconds
+            if first_token_at is not None
+            else (
+                output_tokens / native_generation_tps
+                if native_generation_tps and output_tokens else 0.0
+            )
+        )
+        passive_eligible = bool(
+            public_model != "local-model"
+            and 0 < input_tokens < _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS
+            and output_tokens >= 32
+            and measured_decode_seconds >= _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS
+            and generation_tps is not None
+            and runtime_kind.value in self.registry.kinds
+            and hardware_verified
+            and self._community_sample_due(public_model, quantization)
+        )
+        legacy_eligible = bool(
+            public_model != "local-model" and input_tokens > 0
+            and output_tokens >= 16 and latency > 0
             and generation_tps is not None
             and community_context_window(safe_settings) is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
         )
+        eligible = passive_eligible if passive_observation else legacy_eligible
+        if passive_observation and not eligible:
+            return
+        # For community evidence this compatibility field represents observed
+        # prompt occupancy, not the deployment's configured maximum context.
+        if passive_observation:
+            safe_settings["context_length"] = input_tokens
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
@@ -2187,20 +2681,86 @@ class SparkDeckService:
             prompt_tokens_per_second=prompt_tps,
             cold_start=None, eligible_for_community=eligible,
         )
-        consent = bool(self.store.get_setting("community_consent", False))
-        self.store.add_benchmark(sample, queue=eligible and consent)
+        if not passive_observation:
+            consent = bool(self.store.get_setting("community_consent", False))
+            self.store.add_benchmark(sample, queue=eligible and consent)
+            return
+        inserted = self.store.add_benchmark_if_consented(
+            sample, int(observation.get("generation") or 0)
+        )
+        if inserted:
+            self.store.set_setting(
+                self._community_sample_setting(public_model, quantization),
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+    @staticmethod
+    def _community_sample_setting(model: str, quantization: str) -> str:
+        quantization = canonical_quantization(quantization) or "UNKNOWN"
+        digest = hashlib.sha256(
+            f"{model.casefold()}\0{quantization.casefold()}".encode("utf-8")
+        ).hexdigest()
+        return f"community_sampled_at:{digest}"
+
+    def _community_sample_due(self, model: str, quantization: str) -> bool:
+        value = self.store.get_setting(
+            self._community_sample_setting(model, quantization), None
+        )
+        if not isinstance(value, str):
+            return True
+        try:
+            sampled_at = datetime.fromisoformat(value)
+            if sampled_at.tzinfo is None:
+                sampled_at = sampled_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        return (
+            datetime.now(timezone.utc) - sampled_at
+        ).total_seconds() >= _COMMUNITY_SAMPLE_INTERVAL_SECONDS
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
-        if await self._native_llama_model() == model:
-            return RuntimeKind.LLAMA_CPP.value
+        _, runtime, _ = await self._legacy_model_identity(model)
+        return runtime
+
+    async def _legacy_model_identity(
+        self, requested_model: str,
+    ) -> tuple[str, str, dict[str, Any]]:
+        if await self._native_llama_model() == requested_model:
+            variant = getattr(self.manager, "_unsloth_variant", lambda value: None)(
+                requested_model
+            )
+            return requested_model, RuntimeKind.LLAMA_CPP.value, {
+                "gguf_variant": variant,
+            }
         try:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
-                if model in ids:
-                    return self._container_runtime(container)
+                if requested_model in ids:
+                    repository = str(container.get("model") or "").strip()
+                    if not repository or "/" not in repository:
+                        repository = "local-model"
+                    settings = dict(
+                        container.get("load_settings")
+                        or container.get("settings")
+                        or {}
+                    )
+                    for key in ("quantization", "artifact", "gguf_variant"):
+                        if container.get(key) is not None:
+                            settings[key] = container[key]
+                    return repository, self._container_runtime(container), settings
         except Exception:
             pass
-        return RuntimeKind.VLLM.value
+        # An unlinked served alias is not a trustworthy public repository.
+        return "local-model", RuntimeKind.VLLM.value, {}
+
+    @staticmethod
+    def _model_observation_settings(deployment: dict[str, Any]) -> dict[str, Any]:
+        settings = dict(deployment.get("settings") or {})
+        model = deployment.get("model") or {}
+        for key in ("quantization", "artifact"):
+            if model.get(key) is not None:
+                settings[key] = model[key]
+        return settings
 
     async def _native_llama_model(self) -> str | None:
         loaded_model = getattr(self.manager, "_unsloth_loaded_model", None)
@@ -2407,6 +2967,86 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy", "degraded"):
         return "error"
     return "unknown"
+
+
+def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
+    """Flatten honest per-member launch state for deployment list cards."""
+    if deployment.get("status") == "error" or deployment.get("error"):
+        return {
+            "launch_phase": "error",
+            "launch_message": str(
+                deployment.get("error") or "Deployment launch failed"
+            ),
+        }
+    members = [
+        member for member in (deployment.get("members") or [])
+        if isinstance(member, dict)
+    ]
+    # Report the least-advanced active rank. Rank order is only a tie-breaker:
+    # a queued worker must win over a rank-0 image pull, and an image pull must
+    # win over another rank that has already started loading model weights.
+    phase_order = {
+        "queued": 0,
+        "recovering": 0,
+        "preparing": 1,
+        "checking_image": 2,
+        "pulling_image": 3,
+        "creating": 4,
+        "creating_container": 4,
+        "created": 5,
+        "starting": 5,
+        "running": 5,
+        "downloading": 6,
+        "loading": 7,
+        "initializing": 8,
+        "ready": 9,
+    }
+    terminal_order = {
+        "error": 0, "dead": 1, "unreachable": 2,
+        "missing": 3, "unknown": 4,
+    }
+
+    def member_order(member: dict[str, Any]) -> tuple[int, int, int]:
+        phase = member.get("phase")
+        raw_phase = phase.get("phase") if isinstance(phase, dict) else phase
+        phase_name = str(
+            raw_phase or member.get("status") or "starting"
+        ).casefold()
+        rank = int(member.get("rank") or 0)
+        if phase_name in terminal_order:
+            # Another rank may still be actively pulling/creating/loading.
+            # Keep reporting that work until no active phase remains; only
+            # then surface terminal inventory state ahead of already-ready ranks.
+            return 1, terminal_order[phase_name], rank
+        if phase_name == "ready":
+            return 2, phase_order[phase_name], rank
+        return 0, phase_order.get(phase_name, phase_order["starting"]), rank
+
+    members.sort(key=member_order)
+    for member in members:
+        raw_phase = member.get("phase")
+        phase = raw_phase if isinstance(raw_phase, dict) else {}
+        phase_name = str(
+            phase.get("phase") or raw_phase or member.get("status") or ""
+        ).strip()
+        message = str(phase.get("message") or "").strip()
+        if not message and member.get("error"):
+            message = str(member["error"])
+        if phase_name or message:
+            public_phase = (
+                "error" if phase_name.casefold() in terminal_order else phase_name
+            )
+            return {
+                "launch_phase": public_phase or "starting",
+                "launch_message": (
+                    message or phase_name.replace("_", " ").title()
+                ),
+            }
+    status = str(deployment.get("status") or "starting").strip()
+    return {
+        "launch_phase": status,
+        "launch_message": "Preparing deployment launch",
+    }
 
 
 def _managed_container_status(container: dict[str, Any]) -> str:

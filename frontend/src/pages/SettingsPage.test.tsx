@@ -61,8 +61,14 @@ describe('settings page', () => {
     const privacy = await screen.findByRole('button', { name: 'View policy' })
     await user.click(privacy)
     const policy = screen.getByRole('dialog', { name: 'SparkDeck Privacy Policy' })
-    expect(policy).toHaveTextContent('Telemetry is off unless you sign in and explicitly opt in')
-    expect(policy).toHaveTextContent('Prompt text, system messages, retrieved context, uploaded content, and model output are never included')
+    expect(policy).toHaveTextContent('Telemetry is off unless you sign in and explicitly enable it under Community Features in Settings')
+    expect(policy).toHaveTextContent('Only samples captured after you enable sharing are eligible for upload; existing benchmark history stays local and is never queued retroactively')
+    expect(policy).toHaveTextContent('model quantization')
+    expect(policy).toHaveTextContent('prompt-length/context-occupancy bucket')
+    expect(policy).toHaveTextContent('stable opaque telemetry cluster identifier')
+    expect(policy).toHaveTextContent('randomly generated and does not contain an account ID, hostname, node name, or endpoint alias')
+    expect(policy).toHaveTextContent('Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included')
+    expect(policy).not.toHaveTextContent('tensor-parallel (TP) size')
     expect(policy).toHaveTextContent('California residents may have rights')
     await user.keyboard('{Escape}')
     expect(screen.queryByRole('dialog', { name: 'SparkDeck Privacy Policy' })).not.toBeInTheDocument()
@@ -382,7 +388,10 @@ describe('community features sign-in', () => {
     unpairCluster?: { applied: string[]; conflicts: { node: string; email?: string }[]; errors: string[] }
     session?: { status: 'signed-in' | 'signed-out' | 'reauth-required'; email?: string; token_invalid?: boolean }
     sessionResponse?: () => Response | Promise<Response>
+    sync?: { consent: boolean; pairing?: { status?: string; token_invalid?: boolean }; outbox?: Record<string, number>; upload_configured?: boolean }
+    consentClusterErrors?: string[]
   } = {}) {
+    let consent = options.sync?.consent ?? false
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.endsWith('/api/v1/community/auth-config')) return new Response(JSON.stringify({
@@ -407,6 +416,18 @@ describe('community features sign-in', () => {
         return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path.includes('system-update')) return new Response(JSON.stringify({ can_update: false, blockers: [], nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/sync')) return new Response(JSON.stringify({
+        pairing: options.sync?.pairing ?? { status: options.session?.status === 'signed-in' ? 'paired' : 'not_paired' },
+        outbox: options.sync?.outbox ?? {},
+        upload_configured: options.sync?.upload_configured ?? true,
+        consent,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
+        consent = Boolean((JSON.parse(String(init.body)) as { enabled?: boolean }).enabled)
+        return new Response(JSON.stringify({
+          cluster: { applied: [], conflicts: [], errors: options.consentClusterErrors ?? [] },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
       if (path.endsWith('/api/v1/community/pair') && init?.method === 'POST') {
         if (options.pairResponse) return options.pairResponse()
         return new Response(JSON.stringify({
@@ -442,14 +463,48 @@ describe('community features sign-in', () => {
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
     expect(await screen.findByRole('heading', { name: 'Community Features' })).toBeInTheDocument()
-    expect(screen.getByText('Create an account or sign in to access community data. Benchmark sharing remains off until you explicitly enable it.')).toBeInTheDocument()
-    expect(screen.getByText('Connected to the SparkDeck community service.')).toBeInTheDocument()
+    expect(screen.getByText('Sign in to optionally contribute anonymous model-performance telemetry and view community results.')).toBeInTheDocument()
+    expect(screen.getByText(/While disabled, SparkDeck neither collects samples for upload nor requests hosted community telemetry/)).toBeInTheDocument()
     expect(screen.queryByLabelText('Community API URL')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Email')).toBeInTheDocument()
     expect(screen.getByLabelText('Password')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Create account' })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Pair account' })).not.toBeInTheDocument()
+  })
+
+  it('enables and disables community telemetry from Settings', async () => {
+    const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
+      session: { status: 'signed-in', email: 'driver@example.com' },
+      sync: { consent: false, pairing: { status: 'paired' }, outbox: {} },
+    })
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    const telemetry = await screen.findByRole('switch', { name: 'Community telemetry' })
+    expect(telemetry).toBeEnabled()
+    expect(telemetry).not.toBeChecked()
+
+    await user.click(telemetry)
+    await waitFor(() => expect(telemetry).toBeChecked())
+    await user.click(telemetry)
+    await waitFor(() => expect(telemetry).not.toBeChecked())
+
+    const consentBodies = fetchMock.mock.calls
+      .filter(([input, init]) => String(input).endsWith('/api/v1/community/consent') && init?.method === 'PUT')
+      .map(([, init]) => JSON.parse(String(init?.body)))
+    expect(consentBodies).toEqual([{ enabled: true }, { enabled: false }])
+  })
+
+  it('keeps telemetry opt-in disabled until a community account is signed in', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      sync: { consent: false, pairing: { status: 'not_paired' }, outbox: {} },
+    })
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('switch', { name: 'Community telemetry' })).toBeDisabled()
   })
 
   it('signs in with email and password and pairs the device', async () => {

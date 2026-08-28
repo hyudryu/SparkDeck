@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,219 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         await HuggingFaceCatalog(http).search("model", 5)
 
         self.assertNotIn("authorization", captured[0].headers)
+        await http.aclose()
+
+    async def test_details_lists_all_primary_gguf_quantizations_and_shards(self):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={
+                "id": "unsloth/Qwen3.8-27B-GGUF",
+                "tags": ["gguf"],
+                "gguf": {"total": 27_000_000_000},
+                "siblings": [
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf", "size": 10},
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf", "lfs": {"size": 12}},
+                    {"rfilename": "Q8_0/model-Q8_0.gguf", "size": 30},
+                    {"rfilename": "mmproj-model-f16.gguf", "size": 5},
+                    {"rfilename": "README.md", "size": 9},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details(
+            "unsloth/Qwen3.8-27B-GGUF"
+        )
+
+        self.assertEqual(captured[0].url.path, "/api/models/unsloth/Qwen3.8-27B-GGUF")
+        self.assertIn("siblings", captured[0].url.params.get_list("expand[]"))
+        self.assertEqual(item["parameter_count"], 27_000_000_000)
+        self.assertEqual(
+            [(value["name"], value["weight_size_bytes"]) for value in item["quantizations"]],
+            [("Q4_K_M", 22), ("Q8_0", 30)],
+        )
+        self.assertEqual(len(item["quantizations"][0]["files"]), 2)
+        await http.aclose()
+
+    async def test_details_rejects_non_repository_ids_without_network(self):
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with self.assertRaisesRegex(ValueError, "owner/name"):
+            await HuggingFaceCatalog(http).details("served-alias")
+        self.assertEqual(calls, 0)
+        await http.aclose()
+
+    async def test_details_deduplicates_same_key_without_serializing_other_models(self):
+        calls: list[str] = []
+        active = 0
+        maximum_active = 0
+        different_models_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, maximum_active
+            calls.append(request.url.path)
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if len(set(calls)) >= 2:
+                different_models_started.set()
+            try:
+                await asyncio.wait_for(different_models_started.wait(), timeout=1)
+                return httpx.Response(200, json={
+                    "id": request.url.path.removeprefix("/api/models/"),
+                    "tags": ["safetensors"], "siblings": [],
+                })
+            finally:
+                active -= 1
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http)
+
+        first, duplicate, other = await asyncio.gather(
+            catalog.details("org/first"),
+            catalog.details("org/first"),
+            catalog.details("org/second"),
+        )
+
+        self.assertEqual(first, duplicate)
+        self.assertEqual(other["id"], "org/second")
+        self.assertEqual(calls.count("/api/models/org/first"), 1)
+        self.assertEqual(calls.count("/api/models/org/second"), 1)
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(catalog._detail_locks, {})
+
+        async def fail(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404)
+
+        await http.aclose()
+        failed_http = httpx.AsyncClient(transport=httpx.MockTransport(fail))
+        failed_catalog = HuggingFaceCatalog(failed_http)
+        with self.assertRaises(httpx.HTTPStatusError):
+            await failed_catalog.details("org/missing")
+        self.assertEqual(failed_catalog._detail_locks, {})
+        await failed_http.aclose()
+
+    async def test_details_uses_tree_sizes_and_excludes_auxiliary_ggufs(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                return httpx.Response(200, json=[
+                    {"path": "model-Q4_0.gguf", "size": 16},
+                    {"path": "MTP/mtp-model-Q4_0.gguf", "size": 2},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [
+                    {"rfilename": "model-Q4_0.gguf"},
+                    {"rfilename": "MTP/mtp-model-Q4_0.gguf"},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        self.assertEqual(item["quantizations"], [{
+            "name": "Q4_0",
+            "files": [{"filename": "model-Q4_0.gguf", "size_bytes": 16}],
+            "weight_size_bytes": 16,
+            "artifacts": [{
+                "filename": "model-Q4_0.gguf",
+                "files": [{"filename": "model-Q4_0.gguf", "size_bytes": 16}],
+                "weight_size_bytes": 16,
+                "sharded": False,
+            }],
+        }])
+        await http.aclose()
+
+    async def test_details_keeps_same_quantization_alternatives_separate(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [
+                    {"rfilename": "original/model-Q4_K_M.gguf", "size": 10},
+                    {"rfilename": "imatrix/model-Q4_K_M.gguf", "size": 12},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        variant = item["quantizations"][0]
+        self.assertEqual(variant["weight_size_bytes"], 10)
+        self.assertEqual(len(variant["artifacts"]), 2)
+        self.assertEqual(
+            {artifact["weight_size_bytes"] for artifact in variant["artifacts"]},
+            {10, 12},
+        )
+        self.assertTrue(all(
+            len(artifact["files"]) == 1 for artifact in variant["artifacts"]
+        ))
+        await http.aclose()
+
+    async def test_details_paginates_entire_tree_before_summing_gguf_shards(self):
+        tree_requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                tree_requests.append(request)
+                if request.url.params.get("cursor") == "second-page":
+                    return httpx.Response(200, json=[
+                        {"path": "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf", "size": 12},
+                    ])
+                return httpx.Response(200, headers={
+                    "Link": (
+                        '<https://huggingface.co/api/models/org/model-GGUF/tree/main'
+                        '?recursive=true&limit=1000&cursor=second-page>; rel="next"'
+                    ),
+                }, json=[
+                    {"path": "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf", "size": 10},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf"},
+                    {"rfilename": "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf"},
+                ],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        self.assertEqual(len(tree_requests), 2)
+        self.assertEqual(tree_requests[1].url.params["cursor"], "second-page")
+        self.assertEqual(item["quantizations"][0]["weight_size_bytes"], 22)
+        self.assertEqual(
+            [file["size_bytes"] for file in item["quantizations"][0]["files"]],
+            [10, 12],
+        )
+        await http.aclose()
+
+    async def test_details_follows_one_same_origin_repository_rename(self):
+        paths = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path.endswith("/org/old-name"):
+                return httpx.Response(
+                    307, headers={"location": "/api/models/org/new-name"}
+                )
+            return httpx.Response(200, json={
+                "id": "org/new-name", "tags": ["safetensors"],
+                "safetensors": {"total": 10}, "siblings": [],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/old-name")
+
+        self.assertEqual(paths, [
+            "/api/models/org/old-name", "/api/models/org/new-name",
+        ])
+        self.assertEqual(item["id"], "org/new-name")
         await http.aclose()
 
 

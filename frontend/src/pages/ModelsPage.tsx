@@ -966,7 +966,7 @@ export function ModelsPage() {
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
-                      ? <Button variant="tertiary" disabled={busy === deployment.id || PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase ?? 'queued')} onClick={() => void act(deployment, 'stop')}>Stop</Button>
+                      ? <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>Start</Button>)}
                     {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>

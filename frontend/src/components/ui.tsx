@@ -1,4 +1,4 @@
-import { useRef, useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from 'react'
 import { AlertCircle, ChevronDown, Inbox, LoaderCircle, RefreshCw } from 'lucide-react'
 import { createPortal } from 'react-dom'
 
@@ -154,19 +154,44 @@ export function SplitButton({
   toggleAriaLabel: string
 }) {
   const toggleRef = useRef<HTMLButtonElement>(null)
-  const [anchor, setAnchor] = useState<{ top: number; right: number }>()
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [anchor, setAnchor] = useState<{ top?: number; bottom?: number; right: number }>()
+  const closeMenu = () => {
+    setAnchor(undefined)
+    // The portal lives at the end of document.body, so returning focus to the
+    // toggle keeps keyboard users anchored in the row they started from.
+    toggleRef.current?.focus()
+  }
   const toggleMenu = () => {
     if (anchor) {
-      setAnchor(undefined)
+      closeMenu()
       return
     }
     const rect = toggleRef.current?.getBoundingClientRect()
-    if (rect) setAnchor({ top: rect.bottom + 4, right: window.innerWidth - rect.right })
+    if (!rect) return
+    const right = window.innerWidth - rect.right
+    // Rows near the bottom of the viewport would push a below-anchored menu
+    // off-screen (fixed elements cannot be scrolled into view), so flip to
+    // whichever side has room.
+    const estimatedHeight = items.length * 40 + 12
+    const spaceBelow = window.innerHeight - rect.bottom
+    const spaceAbove = rect.top
+    setAnchor(spaceBelow < estimatedHeight && spaceAbove > spaceBelow
+      ? { bottom: window.innerHeight - rect.top + 4, right }
+      : { top: rect.bottom + 4, right })
   }
   const select = (item: SplitButtonItem) => {
-    setAnchor(undefined)
+    closeMenu()
     item.onSelect()
   }
+
+  // Move keyboard focus into the portal menu once it is committed.
+  useEffect(() => {
+    if (!anchor) return
+    menuRef.current
+      ?.querySelector<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)')
+      ?.focus()
+  }, [anchor])
   return (
     <span className="split-button">
       <Button variant="tertiary" disabled={disabled} aria-label={mainAriaLabel} onClick={onMainAction}>{label}</Button>
@@ -182,8 +207,18 @@ export function SplitButton({
       ><ChevronDown size={14} /></button>
       {anchor && createPortal(
         <>
-          <div className="menu-backdrop" onMouseDown={() => setAnchor(undefined)} />
-          <div className="menu" role="menu" aria-label={toggleAriaLabel} style={{ top: anchor.top, right: anchor.right }}>
+          <div className="menu-backdrop" onMouseDown={closeMenu} />
+          <div
+            ref={menuRef}
+            className="menu"
+            role="menu"
+            aria-label={toggleAriaLabel}
+            style={{
+              right: anchor.right,
+              ...(anchor.top !== undefined ? { top: anchor.top } : { bottom: anchor.bottom }),
+            }}
+            onKeyDown={(event) => event.key === 'Escape' && closeMenu()}
+          >
             {items.map((item) => (
               <button
                 key={item.key}
@@ -191,7 +226,6 @@ export function SplitButton({
                 role="menuitem"
                 disabled={item.disabled}
                 onClick={() => select(item)}
-                onKeyDown={(event) => event.key === 'Escape' && setAnchor(undefined)}
               >{item.label}</button>
             ))}
           </div>

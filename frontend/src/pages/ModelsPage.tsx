@@ -536,16 +536,25 @@ export function ModelsPage() {
 
   const deploymentRunningNodeNames = (deployment: Deployment) => {
     const ids = deployment.node_ids ?? deployment.selected_nodes?.map((node) => node.id) ?? []
+    if (!ids.length) {
+      // Managed standalone deployments (llama.cpp, legacy single containers)
+      // always run on the controller, matching the Target column fallback.
+      // External endpoints are not bound to a node.
+      return deployment.managed ? [localLabel] : []
+    }
     return ids.map((id) => id === 'local'
       ? localLabel
       : (nodes.data?.find((node) => node.id === id)?.name ?? id))
   }
 
-  // Growing the replica set only applies to cluster layouts: controller-local
-  // artifacts cannot leave the controller and sharded layouts have a fixed
-  // tensor-parallel node count.
+  // Growing the replica set requires a Manager cluster: standalone and legacy
+  // containers have no persisted layout and no cluster to grow, controller-
+  // local artifacts cannot leave the controller, and sharded layouts have a
+  // fixed tensor-parallel node count.
   const supportsAdditionalNodes = (deployment: Deployment) => (
-    !isControllerArtifact(deployment) && deployment.deployment_mode !== 'sharded'
+    deployment.deployment_mode !== undefined
+    && !isControllerArtifact(deployment)
+    && deployment.deployment_mode !== 'sharded'
   )
 
   const openAdditionalPicker = (deployment: Deployment) => {

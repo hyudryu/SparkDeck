@@ -500,7 +500,10 @@ async def agent_status(req: Request):
 @app.get("/api/agent/system-update")
 async def agent_system_update(req: Request):
     _require_agent(req)
-    return updater.agent_status()
+    # agent_status runs the local launcher preflight. On Windows that launcher
+    # probes this API's /healthz route, so it cannot run on the event loop that
+    # must answer the probe.
+    return await asyncio.to_thread(updater.agent_status)
 
 
 @app.post("/api/agent/system-update", status_code=202)

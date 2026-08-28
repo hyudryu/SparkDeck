@@ -1946,14 +1946,17 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._allocate_port = allocate_port
             instance._create_member = create_member
 
+            launch_persisted = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
-            }))
+            }, launch_persisted=launch_persisted))
+            durable = await asyncio.wait_for(launch_persisted, 1)
             await asyncio.wait_for(both_entered.wait(), 1)
 
+            self.assertIs(durable, instance.deployments[0])
             self.assertEqual(len(instance.deployments[0]["members"]), 2)
             self.assertTrue(all(
                 member["status"] == "queued"
@@ -1965,6 +1968,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             release.set()
             await task
+            self.assertTrue(all(
+                member["phase"]["phase"] == "starting"
+                for member in instance.deployments[0]["members"]
+            ))
 
     async def test_cluster_logs_show_progress_before_container_exists(self) -> None:
         instance = Manager.__new__(Manager)
@@ -1985,6 +1992,136 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Controller launch progress", logs)
         self.assertIn("Downloading Docker image", logs)
         self.assertIn("Container has not been created yet", logs)
+
+    async def test_cancelled_durable_launch_is_marked_for_reconciliation(self) -> None:
+        instance = Manager.__new__(Manager)
+        unrelated = {
+            "id": "legacy-without-reverse-link",
+            "sparkdeck_record_id": None,
+            "status": "ready",
+            "members": [],
+        }
+        interrupted = {
+            "id": "cluster-1",
+            "sparkdeck_record_id": None,
+            "status": "launching",
+            "members": [{"rank": 0, "phase": {"phase": "queued"}}],
+        }
+        instance.deployments = [unrelated, interrupted]
+        instance._save_deployments = mock.Mock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_create(_body, _persisted, identity):
+            identity["deployment_id"] = "cluster-1"
+            entered.set()
+            await release.wait()
+
+        instance._create_deployment = blocked_create
+        persisted = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(instance.create_deployment(
+            {}, launch_persisted=persisted,
+        ))
+        await asyncio.wait_for(entered.wait(), 1)
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(unrelated["status"], "ready")
+        self.assertEqual(interrupted["status"], "recovering")
+        self.assertEqual(
+            interrupted["members"][0]["phase"]["phase"],
+            "recovering",
+        )
+        instance._save_deployments.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError, "stopped before it was accepted"):
+            await persisted
+
+    async def test_acceptance_lock_releases_before_slow_launch_finishes(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = []
+        entered = []
+        first_accept = asyncio.Event()
+        first_finish = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def controlled_create(body, persisted, identity):
+            identity["deployment_id"] = body["id"]
+            entered.append(body["id"])
+            if body["id"] == "first":
+                await first_accept.wait()
+                persisted.set_result({"id": "first"})
+                await first_finish.wait()
+            else:
+                second_entered.set()
+                persisted.set_result({"id": "second"})
+            return {"id": body["id"]}
+
+        instance._create_deployment = controlled_create
+        first = asyncio.create_task(instance.create_deployment({"id": "first"}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(instance.create_deployment({"id": "second"}))
+        await asyncio.sleep(0)
+        self.assertEqual(entered, ["first"])
+
+        first_accept.set()
+        await asyncio.wait_for(second_entered.wait(), 1)
+        self.assertEqual(entered, ["first", "second"])
+        self.assertFalse(first.done())
+
+        first_finish.set()
+        self.assertEqual((await first)["id"], "first")
+        self.assertEqual((await second)["id"], "second")
+
+    async def test_concurrent_launches_persist_distinct_auto_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = []
+            instance.settings = {
+                "port_range_start": 8000, "port_range_end": 8001,
+                "cluster_fabric_ip": None, "cluster_fabric_interface": None,
+            }
+            instance.cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "name": "Controller", "online": True,
+                "docker_ready": True, "fabric_ip": None,
+                "fabric_interface": None, "interfaces": [],
+            }])
+            instance.client = mock.Mock()
+            instance.client.containers.list.return_value = []
+            instance._resolved_hf_token = mock.Mock(return_value="")
+            both_started = asyncio.Event()
+            finish = asyncio.Event()
+            payloads = []
+
+            async def create_member(_node_id, payload):
+                payloads.append(payload)
+                if len(payloads) == 2:
+                    both_started.set()
+                await finish.wait()
+                return {
+                    "id": payload["name"], "status": "running",
+                    "port": payload["port"], "model_source": "public_repository",
+                }
+
+            instance._create_member = create_member
+            first = asyncio.create_task(instance.create_deployment({
+                "model": "org/first", "deployment_mode": "single",
+                "node_ids": ["local"],
+            }))
+            second = asyncio.create_task(instance.create_deployment({
+                "model": "org/second", "deployment_mode": "single",
+                "node_ids": ["local"],
+            }))
+            await asyncio.wait_for(both_started.wait(), 1)
+
+            self.assertEqual(
+                sorted(item["api_port"] for item in instance.deployments),
+                [8000, 8001],
+            )
+            finish.set()
+            await asyncio.gather(first, second)
 
     async def test_cluster_logs_preserve_launch_progress_when_docker_is_offline(self) -> None:
         instance = Manager.__new__(Manager)
@@ -3038,6 +3175,319 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(plan["local_port"], 8000)
+
+    async def test_persisted_launch_reserves_port_before_container_exists(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"port_range_start": 8000, "port_range_end": 8001}
+        instance.deployments = [{
+            "id": "accepted", "status": "launching", "api_port": 8000,
+            "members": [{"node_id": "local", "port": 8000}],
+        }]
+        instance.client = mock.Mock()
+        instance.client.containers.list.return_value = []
+
+        self.assertEqual(await instance._allocate_port(), 8001)
+        with self.assertRaisesRegex(RuntimeError, "Port 8000 is already in use"):
+            await instance._validate_available_port(8000)
+        self.assertEqual(
+            await instance._validate_available_port(
+                8000, exclude_deployment_id="accepted",
+            ),
+            8000,
+        )
+        instance.deployments = [{
+            "id": "failed", "status": "error", "api_port": 8000,
+            "members": [{"node_id": "local", "port": 8000}],
+        }]
+        self.assertEqual(await instance._allocate_port(), 8000)
+
+    async def test_interrupted_launch_restarts_with_same_public_link_and_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            interrupted = {
+                "id": "old-manager-id", "status": "recovering",
+                "desired_state": "running", "api_port": 8012,
+                "recipe_id": "recipe-1", "sparkdeck_record_id": "public-1",
+                "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": {
+                    "deployment_name": "Model", "model": "org/model",
+                    "engine": "vllm", "deployment_mode": "single",
+                    "node_ids": ["local"], "extra_args": [], "port": None,
+                },
+            }
+            instance.deployments = [interrupted]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
+            instance._member_action = mock.AsyncMock(
+                side_effect=ValueError("cluster member not found"),
+            )
+
+            async def relaunch(body):
+                replacement = {
+                    "id": "new-manager-id", "status": "starting",
+                    "sparkdeck_record_id": body.get("sparkdeck_record_id"),
+                }
+                instance.deployments.append(replacement)
+                instance._save_deployments()
+                return replacement
+
+            instance.create_deployment = mock.AsyncMock(side_effect=relaunch)
+
+            await instance._resume_interrupted_deployment("old-manager-id")
+
+            self.assertEqual(
+                [item["id"] for item in instance.deployments], ["new-manager-id"],
+            )
+            body = instance.create_deployment.await_args.args[0]
+            self.assertEqual(body["sparkdeck_record_id"], "public-1")
+            self.assertEqual(body["recipe_id"], "recipe-1")
+            self.assertEqual(body["port"], 8012)
+            persisted = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(persisted[0]["id"], "new-manager-id")
+
+    async def test_explicit_stop_serializes_before_interrupted_launch_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance._deployment_action_lock = asyncio.Lock()
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "recovering", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "recovering-r0",
+                    "rank": 0,
+                }],
+                "launch_settings": {
+                    "model": "org/model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }
+            instance.deployments = [deployment]
+            stop_entered = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def member_action(_member, action, **_kwargs):
+                self.assertEqual(action, "stop")
+                stop_entered.set()
+                await release_stop.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            instance.selected_cluster_nodes = mock.AsyncMock()
+            instance.create_deployment = mock.AsyncMock()
+
+            stop_task = asyncio.create_task(
+                instance.deployment_action("recovering", "stop")
+            )
+            await asyncio.wait_for(stop_entered.wait(), 1)
+            resume_task = asyncio.create_task(
+                instance._resume_interrupted_deployment("recovering")
+            )
+            await asyncio.sleep(0)
+
+            self.assertFalse(resume_task.done())
+            instance.selected_cluster_nodes.assert_not_awaited()
+            release_stop.set()
+            stop_result, _ = await asyncio.wait_for(
+                asyncio.gather(stop_task, resume_task), 1,
+            )
+
+            self.assertTrue(stop_result["ok"])
+            self.assertEqual(deployment["desired_state"], "stopped")
+            self.assertEqual(deployment["status"], "stopped")
+            instance.selected_cluster_nodes.assert_not_awaited()
+            instance.create_deployment.assert_not_awaited()
+
+    async def test_start_resumes_recovering_launch_and_stop_consumes_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "old-manager-id", "status": "recovering",
+                "desired_state": "running", "api_port": 8012,
+                "sparkdeck_record_id": "public-1", "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": {
+                    "model": "org/model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                },
+            }]
+            first_probe = asyncio.Event()
+            probes = 0
+
+            async def selected_nodes(_node_ids):
+                nonlocal probes
+                probes += 1
+                if probes == 1:
+                    first_probe.set()
+                    raise ValueError("cluster node(s) are offline: Controller")
+                return [{"id": "local", "online": True, "docker_ready": True}]
+
+            instance.selected_cluster_nodes = mock.AsyncMock(
+                side_effect=selected_nodes,
+            )
+            instance._deployment_resume_wakeup = asyncio.Event()
+            instance._member_action = mock.AsyncMock(
+                side_effect=ValueError("cluster member not found"),
+            )
+            resumed = asyncio.Event()
+
+            async def relaunch(body):
+                instance.deployments.append({
+                    "id": "new-manager-id", "status": "starting",
+                    "sparkdeck_record_id": body["sparkdeck_record_id"],
+                })
+                resumed.set()
+                return instance.deployments[-1]
+
+            instance.create_deployment = mock.AsyncMock(side_effect=relaunch)
+            never = asyncio.Event()
+
+            async def monitor_loop():
+                await never.wait()
+
+            for name in (
+                "_worker_loop", "_idle_monitor_loop", "_cluster_health_monitor_loop",
+                "_deployment_capacity_monitor_loop", "_fan_cluster_monitor_loop",
+                "_token_usage_sync_loop", "_inference_nudger_loop",
+                "_temperature_history_monitor_loop",
+            ):
+                setattr(instance, name, monitor_loop)
+            for field in (
+                "worker_task", "idle_task", "cluster_health_task",
+                "deployment_capacity_task", "fan_cluster_task",
+                "token_usage_sync_task", "deployment_resume_task",
+                "inference_nudger_task", "temperature_history_task",
+                "temperature_recording_task",
+            ):
+                setattr(instance, field, None)
+            instance.routeros = None
+            instance.is_joined_worker = mock.Mock(return_value=False)
+            instance.virtual_nas = mock.Mock()
+            instance.virtual_nas.stop = mock.AsyncMock()
+            instance._start_mem_bw_monitor = mock.Mock()
+            instance._stop_mem_bw_monitor = mock.Mock()
+            instance.http = mock.Mock()
+            instance.http.aclose = mock.AsyncMock()
+
+            await instance.start()
+            resume_task = instance.deployment_resume_task
+            await asyncio.wait_for(first_probe.wait(), 1)
+            self.assertEqual(instance.deployments[0]["status"], "recovering")
+            self.assertFalse(resume_task.done())
+            instance._deployment_resume_wakeup.set()
+            await asyncio.wait_for(resumed.wait(), 1)
+            await instance.stop()
+
+            self.assertTrue(resume_task.done())
+            self.assertIsNone(resume_task.exception())
+            self.assertEqual(
+                [item["id"] for item in instance.deployments], ["new-manager-id"],
+            )
+            self.assertEqual(
+                instance.deployments[0]["sparkdeck_record_id"], "public-1",
+            )
+            self.assertEqual(probes, 2)
+            instance.http.aclose.assert_awaited_once_with()
+
+    async def test_resume_retries_transient_failed_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            base_settings = {
+                "model": "org/model", "engine": "vllm",
+                "deployment_mode": "single", "node_ids": ["local"],
+                "extra_args": [],
+            }
+            instance.deployments = [{
+                "id": "old", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": dict(base_settings),
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
+            instance._member_action = mock.AsyncMock(
+                side_effect=ValueError("cluster member not found"),
+            )
+            instance._deployment_resume_wakeup = asyncio.Event()
+            first_failed = asyncio.Event()
+            attempts = 0
+
+            async def relaunch(body):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    replacement = {
+                        "id": "failed-replacement", "status": "error",
+                        "desired_state": "running", "node_ids": ["local"],
+                        "members": [{
+                            "node_id": "local", "container_name": "failed-r0",
+                            "rank": 0, "status": "error",
+                        }],
+                        "launch_settings": dict(base_settings),
+                        "automation_run_id": body["automation_run_id"],
+                    }
+                    instance.deployments.append(replacement)
+                    instance._save_deployments()
+                    first_failed.set()
+                    raise RuntimeError("Controller connection unavailable")
+                final = {"id": "final", "status": "starting"}
+                instance.deployments.append(final)
+                instance._save_deployments()
+                return final
+
+            instance.create_deployment = mock.AsyncMock(side_effect=relaunch)
+            resume = asyncio.create_task(instance._resume_interrupted_deployments())
+            await asyncio.wait_for(first_failed.wait(), 1)
+            await asyncio.sleep(0)
+            recovering = instance._deployment("failed-replacement")
+            self.assertEqual(recovering["status"], "recovering")
+            self.assertIsNone(recovering["error"])
+            instance._deployment_resume_wakeup.set()
+            await asyncio.wait_for(resume, 1)
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(
+                [item["id"] for item in instance.deployments], ["final"],
+            )
+
+    async def test_resume_keeps_terminal_validation_failure_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "invalid", "status": "recovering",
+                "desired_state": "running", "node_ids": ["missing-node"],
+                "members": [],
+                "launch_settings": {
+                    "model": "org/model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["missing-node"],
+                    "extra_args": [],
+                },
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(
+                side_effect=ValueError("unknown cluster node(s): missing-node"),
+            )
+            instance._wait_for_interrupted_launch_retry = mock.AsyncMock()
+
+            await instance._resume_interrupted_deployments()
+
+            self.assertEqual(instance.deployments[0]["status"], "error")
+            self.assertIn("unknown cluster node", instance.deployments[0]["error"])
+            instance._wait_for_interrupted_launch_retry.assert_not_awaited()
 
     async def test_relaunch_fixed_port_collision_preserves_old_rank(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

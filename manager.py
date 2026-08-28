@@ -633,7 +633,9 @@ class Manager:
         self.temperature_recording_task: asyncio.Task | None = None
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
+        self.deployment_resume_task: asyncio.Task | None = None
         self._deployment_action_lock = asyncio.Lock()
+        self._deployment_acceptance_lock = asyncio.Lock()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -792,6 +794,7 @@ class Manager:
 
     def _start_controller_tasks(self) -> None:
         task_factories = (
+            ("deployment_resume_task", self._resume_interrupted_deployments),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
@@ -810,7 +813,7 @@ class Manager:
         for field in (
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
-            "token_usage_sync_task",
+            "token_usage_sync_task", "deployment_resume_task",
         ):
             task = getattr(self, field, None)
             if task and not task.done():
@@ -856,6 +859,7 @@ class Manager:
             self.temperature_recording_task,
             self.inference_nudger_task,
             self.token_usage_sync_task,
+            self.deployment_resume_task,
         ):
             if t:
                 t.cancel()
@@ -4139,17 +4143,26 @@ class Manager:
         been flushed to ``deployments.json``, before any potentially long image
         pull. Existing callers retain the original wait-for-launch contract.
         """
+        accepted = launch_persisted or asyncio.get_running_loop().create_future()
+        acceptance_lock = getattr(self, "_deployment_acceptance_lock", None)
+        if acceptance_lock is None:
+            acceptance_lock = self._deployment_acceptance_lock = asyncio.Lock()
+        await acceptance_lock.acquire()
+
+        def release_acceptance(_future: asyncio.Future) -> None:
+            if acceptance_lock.locked():
+                acceptance_lock.release()
+
+        accepted.add_done_callback(release_acceptance)
+        identity: dict[str, str] = {}
         try:
-            return await self._create_deployment(body, launch_persisted)
+            return await self._create_deployment(body, accepted, identity)
         except asyncio.CancelledError:
-            record_id = body.get("sparkdeck_record_id")
-            interrupted = next(
-                (
-                    deployment for deployment in self.deployments
-                    if deployment.get("sparkdeck_record_id") == record_id
-                ),
-                None,
-            )
+            # Track the generated Manager identity directly. Looking up by the
+            # optional SparkDeck reverse-link can select an unrelated legacy
+            # deployment when both values are None.
+            interrupted_id = identity.get("deployment_id")
+            interrupted = self._deployment(interrupted_id) if interrupted_id else None
             if interrupted is not None:
                 interrupted["status"] = "recovering"
                 interrupted["status_message"] = (
@@ -4162,18 +4175,23 @@ class Manager:
                         "message": interrupted["status_message"],
                     }
                 self._save_deployments()
-            if launch_persisted is not None and not launch_persisted.done():
-                launch_persisted.set_exception(RuntimeError(
+            if launch_persisted is not None and not accepted.done():
+                accepted.set_exception(RuntimeError(
                     "deployment launch stopped before it was accepted"
                 ))
+            elif not accepted.done():
+                accepted.cancel()
             raise
         except BaseException as exc:
-            if launch_persisted is not None and not launch_persisted.done():
-                launch_persisted.set_exception(exc)
+            if launch_persisted is not None and not accepted.done():
+                accepted.set_exception(exc)
+            elif not accepted.done():
+                accepted.cancel()
             raise
 
     async def _create_deployment(
         self, body: dict, launch_persisted: asyncio.Future | None = None,
+        launch_identity: dict[str, str] | None = None,
     ) -> dict:
         plan = await self._preflight_deployment_launch(body)
         body = plan["body"]
@@ -4192,6 +4210,8 @@ class Manager:
         # remains visible for diagnosis, but invalid input does not leave a
         # phantom deployment card behind.
         deployment_id = uuid.uuid4().hex[:12]
+        if launch_identity is not None:
+            launch_identity["deployment_id"] = deployment_id
         deployment = {
             "id": deployment_id,
             "name": body.get("deployment_name") or model,
@@ -4576,6 +4596,88 @@ class Manager:
             return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _resume_interrupted_deployments(self) -> None:
+        """Relaunch accepted work whose request died before containers existed."""
+        candidates = [
+            deployment for deployment in list(self.deployments)
+            if isinstance(deployment, dict)
+            and deployment.get("status") in {"launching", "recovering"}
+            and deployment.get("desired_state") != "stopped"
+            and isinstance(deployment.get("launch_settings"), dict)
+        ]
+        for deployment in candidates:
+            try:
+                await self._resume_interrupted_deployment(deployment["id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                current = self._deployment(deployment.get("id"))
+                if current is not None:
+                    current["status"] = "error"
+                    current["error"] = f"Could not resume interrupted launch: {exc}"
+                    self._save_deployments()
+
+    async def _resume_interrupted_deployment(self, deployment_id: str) -> None:
+        deployment = self._deployment(deployment_id)
+        if (
+            deployment is None
+            or deployment.get("status") not in {"launching", "recovering"}
+            or deployment.get("desired_state") == "stopped"
+        ):
+            return
+        launch_body = dict(deployment.get("launch_settings") or {})
+        if not launch_body.get("model"):
+            raise RuntimeError("saved launch settings are unavailable")
+        launch_body["recipe_id"] = deployment.get("recipe_id")
+        launch_body["sparkdeck_record_id"] = deployment.get(
+            "sparkdeck_record_id"
+        )
+        resume_token = f"resume-{uuid.uuid4().hex}"
+        launch_body["automation_run_id"] = resume_token
+        # An automatically selected port was intentionally absent from the
+        # generic restart settings. For an interrupted accepted launch, reuse
+        # its durable reservation so the public endpoint does not move.
+        if (
+            LOCAL_NODE_ID in (deployment.get("node_ids") or [])
+            and deployment.get("api_port")
+        ):
+            launch_body["port"] = deployment["api_port"]
+
+        deployment["status"] = "recovering"
+        deployment["status_message"] = "Resuming interrupted deployment launch"
+        self._save_deployments()
+        removed = await asyncio.gather(*(
+            self._member_action(member, "remove")
+            for member in deployment.get("members") or []
+        ), return_exceptions=True)
+        remove_errors = self._member_action_errors(removed, "remove")
+        if remove_errors:
+            raise RuntimeError("; ".join(remove_errors))
+
+        # Remove the stale reservation only after its old member names have
+        # been cleaned up. create_deployment then atomically accepts a fresh
+        # Manager identity with the same SparkDeck reverse-link and port.
+        self.deployments = [
+            item for item in self.deployments if item.get("id") != deployment_id
+        ]
+        self._save_deployments()
+        try:
+            await self.create_deployment(launch_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            replacement_exists = any(
+                isinstance(item, dict)
+                and item.get("automation_run_id") == resume_token
+                for item in self.deployments
+            )
+            if not replacement_exists:
+                deployment["status"] = "error"
+                deployment["error"] = "Interrupted deployment relaunch was rejected"
+                self.deployments.append(deployment)
+                self._save_deployments()
+            raise
 
     def _cluster_health_issue(self, deployment: dict, nodes: list[dict]) -> str | None:
         """Describe a recoverable split deployment, or return ``None``.
@@ -9115,7 +9217,32 @@ class Manager:
                             pass
             return used
 
-        return await asyncio.to_thread(_scan)
+        used = await asyncio.to_thread(_scan)
+        # Docker has no binding to scan while an accepted background launch is
+        # still pulling its image. Its durable Manager record reserves the
+        # controller port during that window and across controller restarts.
+        for deployment in getattr(self, "deployments", []):
+            if (
+                not isinstance(deployment, dict)
+                or deployment.get("id") == exclude_deployment_id
+                or deployment.get("status") in {"error", "stopped", "removed"}
+            ):
+                continue
+            values = [deployment.get("api_port")]
+            values.extend(
+                member.get("port")
+                for member in (deployment.get("members") or [])
+                if isinstance(member, dict)
+                and member.get("node_id") == LOCAL_NODE_ID
+            )
+            for value in values:
+                try:
+                    port = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= port <= 65535:
+                    used.add(port)
+        return used
 
     async def _validate_available_port(
         self, port: Any, *, exclude_deployment_id: str | None = None,

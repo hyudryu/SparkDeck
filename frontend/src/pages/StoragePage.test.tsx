@@ -139,7 +139,7 @@ describe('StoragePage', () => {
     ])
   })
 
-  it('keeps in-progress downloads above the descending model order', async () => {
+  it('keeps in-progress downloads in strict descending size order', async () => {
     const storage: StorageState = {
       ...enabledStorage,
       nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
@@ -180,7 +180,7 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
     expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
-      'org/alpha', 'org/zeta', 'org/model', 'org/beta', 'org/aardvark',
+      'org/zeta', 'org/model', 'org/beta', 'org/alpha', 'org/aardvark',
     ])
 
     const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
@@ -190,7 +190,7 @@ describe('StoragePage', () => {
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     expect([...inventory.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
-      'org/alpha', 'org/offline-model', 'org/zeta', 'org/model', 'org/beta', 'org/aardvark',
+      'org/offline-model', 'org/zeta', 'org/model', 'org/beta', 'org/alpha', 'org/aardvark',
     ])
     expect(storage.nodes[0].models.map((model) => model.model_id)).toEqual([
       'org/alpha', 'org/zeta', 'org/model', 'org/aardvark', 'org/beta',
@@ -230,6 +230,11 @@ describe('StoragePage', () => {
             models: [
               ...node.models,
               { model_id: 'org/partial-model', size_bytes: 400_000_000, partial: true },
+              {
+                model_id: 'org/mixed-model', size_bytes: 600_000_000,
+                partial: false, has_partial_download: true,
+                partial_size_bytes: 50_000_000, revision: 'complete-a',
+              },
             ],
           }
         : node),
@@ -258,6 +263,11 @@ describe('StoragePage', () => {
     const partial = await screen.findByLabelText('Partial cache org/partial-model on Studio Spark')
     expect(partial).toHaveTextContent('Partial')
     expect(partial).toHaveAttribute('draggable', 'false')
+    const mixed = screen.getByLabelText('Transfer org/mixed-model from Studio Spark')
+    expect(mixed).toHaveTextContent('Incomplete download')
+    expect(mixed).toHaveAttribute('draggable', 'true')
+    expect(screen.getByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'org/mixed-model' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
     let dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))

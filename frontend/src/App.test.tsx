@@ -985,6 +985,123 @@ describe('model deployments', () => {
     expect(screen.getByText('Launch accepted')).toBeInTheDocument()
   })
 
+  it('does not restore an accepted recipe row removed before the first deployment load finishes', async () => {
+    const user = userEvent.setup()
+    let deploymentListCalls = 0
+    let resolveInitialList: (response: Response) => void = () => undefined
+    const initialList = new Promise<Response>((resolve) => { resolveInitialList = resolve })
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [{ node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-remove/deploy')) {
+        return new Response(JSON.stringify({
+          id: 'dep-remove', alias: 'Remove accepted', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {},
+          node_ids: ['local'], launch_phase: 'queued', launch_message: 'Launch accepted',
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (init?.method === 'DELETE' && path.endsWith('/api/v1/deployments/dep-remove')) {
+        return new Response(null, { status: 204 })
+      }
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        if (deploymentListCalls === 1) return initialList
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-remove', name: 'Remove accepted', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Deploy Remove accepted' })).getByRole('button', { name: 'Deploy on 1 node' }))
+    expect(screen.getByRole('link', { name: 'Remove accepted' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Remove Remove accepted' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Remove Remove accepted?' })
+    await user.click(within(confirmation).getByRole('button', { name: 'Remove deployment' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-remove', expect.objectContaining({ method: 'DELETE' }),
+    ))
+    await waitFor(() => expect(screen.queryByRole('link', { name: 'Remove accepted' })).not.toBeInTheDocument())
+
+    resolveInitialList(new Response(JSON.stringify({ items: [] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    await waitFor(() => expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument())
+    expect(screen.queryByRole('link', { name: 'Remove accepted' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Launch accepted')).not.toBeInTheDocument()
+  })
+
+  it('keeps an accepted recipe row when removal fails before the first deployment load finishes', async () => {
+    const user = userEvent.setup()
+    let resolveInitialList: (response: Response) => void = () => undefined
+    const initialList = new Promise<Response>((resolve) => { resolveInitialList = resolve })
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [{ node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-remove-failure/deploy')) {
+        return new Response(JSON.stringify({
+          id: 'dep-remove-failure', alias: 'Removal failure', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {},
+          node_ids: ['local'], launch_phase: 'queued', launch_message: 'Launch accepted',
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (init?.method === 'DELETE' && path.endsWith('/api/v1/deployments/dep-remove-failure')) {
+        return new Response(JSON.stringify({ detail: 'runtime cleanup failed' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path.includes('/api/v1/deployments')) return initialList
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-remove-failure', name: 'Removal failure', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Deploy Removal failure' })).getByRole('button', { name: 'Deploy on 1 node' }))
+    expect(screen.getByRole('link', { name: 'Removal failure' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Remove Removal failure' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Remove Removal failure?' })
+    await user.click(within(confirmation).getByRole('button', { name: 'Remove deployment' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('runtime cleanup failed')
+    expect(screen.getByRole('link', { name: 'Removal failure' })).toBeInTheDocument()
+
+    resolveInitialList(new Response(JSON.stringify({ items: [] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    await waitFor(() => expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument())
+    expect(screen.getByRole('link', { name: 'Removal failure' })).toBeInTheDocument()
+    expect(screen.getByText('Launch accepted')).toBeInTheDocument()
+  })
+
   it('deduplicates saved node IDs before filling an exact-count selector', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

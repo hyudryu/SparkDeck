@@ -155,16 +155,17 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         with patch("sparkdeck.service.launch_managed_container", launch):
             created = await self.service.create_deployment({
                 "model": "org/model", "alias": "prepared-gguf",
-                "runtime": "llama.cpp", "revision": "main",
+                "runtime": "llama.cpp", "revision": "release-gguf",
                 "quantization": "f16",
                 "settings": {"artifact": "FP16/model-F16.gguf"},
             })
 
         virtual_nas.resolve_download_revision.assert_awaited_once_with(
-            "org/model", "main",
+            "org/model", "release-gguf",
         )
         virtual_nas.download_model_files_checked.assert_awaited_once_with(
             "org/model", revision, ["FP16/model-F16.gguf"],
+            requested_revision="release-gguf",
         )
         launch_settings = launch.await_args.args[5]
         self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
@@ -238,6 +239,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         virtual_nas.download_model_files_checked.assert_awaited_once_with(
             "org/model", revision,
             ["MODEL-00001-OF-00002.GGUF", "MODEL-00002-OF-00002.GGUF"],
+            requested_revision="main",
         )
 
     async def test_managed_ownership_is_durable_before_container_launch(self):

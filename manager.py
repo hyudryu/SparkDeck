@@ -1762,6 +1762,60 @@ class Manager:
                 raise LookupError(
                     "partial download revision cannot be recovered safely"
                 )
+        if recovered_resolution is None:
+            nodes = await self.model_cache_inventory()
+            target_node = next((
+                item for item in nodes if str(item.get("id")) == node_id
+            ), None)
+            partial_model = next((
+                item for item in (target_node or {}).get("models", [])
+                if item.get("model_id") == model_id
+                and (item.get("partial") or item.get("has_partial_download"))
+            ), None)
+            if partial_model is not None:
+                candidate_requested = requested_revision or partial_model.get("revision")
+                if candidate_requested is not None:
+                    try:
+                        candidate_requested = validate_revision(candidate_requested)
+                    except ValueError:
+                        candidate_requested = None
+                partial_refs = partial_model.get("partial_revision_refs")
+                if not isinstance(partial_refs, dict):
+                    partial_refs = {}
+                partial_sizes = partial_model.get("partial_revision_size_bytes")
+                if not isinstance(partial_sizes, dict):
+                    partial_sizes = {}
+                candidate_resolved = (
+                    partial_refs.get(candidate_requested)
+                    if candidate_requested else None
+                )
+                if (
+                    candidate_resolved is None
+                    and candidate_requested
+                    and IMMUTABLE_HF_REVISION.fullmatch(candidate_requested)
+                    and candidate_requested in partial_sizes
+                ):
+                    candidate_resolved = candidate_requested
+                if (
+                    candidate_requested
+                    and isinstance(candidate_resolved, str)
+                    and IMMUTABLE_HF_REVISION.fullmatch(candidate_resolved)
+                    and self._byte_count(partial_sizes.get(candidate_resolved))
+                ):
+                    recovered_resolution = {
+                        "requested_revision": candidate_requested,
+                        "resolved_revision": candidate_resolved,
+                        "size_bytes": await self.virtual_nas.estimate_download_size(
+                            model_id, candidate_resolved,
+                        ),
+                        "resume_node_id": node_id,
+                        "download_cache_baseline_bytes": None,
+                    }
+                    requested_revision = candidate_requested
+                if recovered_resolution is None:
+                    raise LookupError(
+                        "partial download revision cannot be recovered safely"
+                    )
         requested_revision = requested_revision or "main"
         resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
             model_id, requested_revision,

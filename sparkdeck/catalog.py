@@ -90,6 +90,7 @@ class HuggingFaceCatalog:
                     *(("expand[]", field) for field in (
                         "author", "downloads", "likes", "tags", "safetensors",
                         "gguf", "pipeline_tag", "gated", "private", "lastModified",
+                        "siblings",
                     )),
                 ],
                 headers={"Authorization": f"Bearer {token}"} if token else {},
@@ -99,11 +100,15 @@ class HuggingFaceCatalog:
             raw_items = response.json()
             if not isinstance(raw_items, list):
                 raise ValueError("Hugging Face returned an invalid model list")
-            items = [
-                public for item in raw_items
-                if isinstance(item, dict) and not item.get("private")
-                if (public := self._public_item(item)).get("id")
-            ]
+            items = []
+            for item in raw_items:
+                if not isinstance(item, dict) or item.get("private"):
+                    continue
+                public = self._public_item(item)
+                if not public.get("id"):
+                    continue
+                public["quantizations"] = _gguf_quantizations(item.get("siblings"))
+                items.append(public)
             self._cache[key] = (time.monotonic(), items)
             return items
 

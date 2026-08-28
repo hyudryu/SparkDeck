@@ -1240,6 +1240,7 @@ class SparkDeckService:
             ]
         await virtual_nas.download_model_files_checked(
             repository, resolved_revision, selected_files,
+            requested_revision=revision,
         )
         model_root = virtual_nas._model_path(repository).resolve()
         snapshot_root = model_root / "snapshots" / resolved_revision

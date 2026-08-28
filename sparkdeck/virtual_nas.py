@@ -536,6 +536,7 @@ class VirtualNAS:
     async def download_model_files_checked(
         self, model_id: str, revision: str, filenames: list[str],
         explicit_token: str | None = None,
+        requested_revision: str | None = None,
     ) -> dict[str, Any]:
         """Download an exact subset of one immutable Hub revision.
 
@@ -547,6 +548,7 @@ class VirtualNAS:
         revision = validate_revision(revision)
         if not _is_commit_sha(revision):
             raise ValueError("download revision must be an immutable Hugging Face commit SHA")
+        requested_revision = validate_revision(requested_revision or revision)
         selected = list(dict.fromkeys(
             _validate_repo_relative_file(filename) for filename in filenames
         ))
@@ -676,6 +678,9 @@ class VirtualNAS:
                     for filename in repository_files
                 ):
                     marker.unlink(missing_ok=True)
+                self._write_revision_ref(
+                    model_id, requested_revision, revision,
+                )
                 return {
                     "ok": True,
                     "model_id": model_id,
@@ -820,6 +825,7 @@ class VirtualNAS:
                 unassigned_incomplete_bytes = 0
             revisions = set(snapshot_revisions)
             revision_refs: dict[str, str] = {}
+            partial_revision_refs: dict[str, str] = {}
             refs_root = repository / "refs"
             if refs_root.is_dir() and not refs_root.is_symlink():
                 for ref in refs_root.rglob("*"):
@@ -831,8 +837,19 @@ class VirtualNAS:
                             ref_name = ref.relative_to(refs_root).as_posix()
                             revisions.add(ref_name)
                             revision_refs[ref_name] = target
+                        elif target in incomplete_revision_bytes:
+                            ref_name = ref.relative_to(refs_root).as_posix()
+                            partial_revision_refs[ref_name] = target
                     except (OSError, UnicodeError, ValueError):
                         continue
+            partial_revision = None
+            if len(incomplete_revision_bytes) == 1:
+                incomplete_revision = next(iter(incomplete_revision_bytes))
+                aliases = sorted(
+                    name for name, target in partial_revision_refs.items()
+                    if target == incomplete_revision
+                )
+                partial_revision = aliases[0] if aliases else incomplete_revision
             models.append({
                 "model_id": model_id,
                 "size_bytes": size_bytes,
@@ -848,6 +865,8 @@ class VirtualNAS:
                     )
                 ),
                 "partial_revision_size_bytes": incomplete_revision_bytes,
+                "partial_revision_refs": partial_revision_refs,
+                "revision": partial_revision,
                 "revisions": sorted(revisions),
                 "revision_refs": revision_refs,
                 "last_modified": (

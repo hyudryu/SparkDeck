@@ -31,6 +31,7 @@ from cluster import (
     AGENT_PROTOCOL_VERSION,
     LOCAL_NODE_ID,
     AgentCredentials,
+    NodeAgentResponseError,
     NodeRegistry,
 )
 from sparkdeck.onboarding import resolve_agent_connection
@@ -1441,7 +1442,7 @@ class Manager:
     ) -> dict:
         """Atomically update FanController settings on one capable cluster node."""
         validated = self._validate_fan_settings(mode, settings)
-        if expected_mode not in FAN_MODE_DEFAULTS:
+        if not isinstance(expected_mode, str) or expected_mode not in FAN_MODE_DEFAULTS:
             raise ValueError("unknown expected fan mode")
         normalized = str(node_id or "").strip()
         available = {node["id"]: node for node in await self.cluster_nodes()}
@@ -1461,10 +1462,23 @@ class Manager:
         if normalized == LOCAL_NODE_ID:
             result = self.update_fan_settings(mode, validated, expected_mode)
         else:
-            result = await self.node_registry.request(
-                normalized, "PATCH", "/api/agent/fan-control/settings",
-                json_body=body, timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
-            )
+            try:
+                result = await self.node_registry.request(
+                    normalized, "PATCH", "/api/agent/fan-control/settings",
+                    json_body=body, timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+                )
+            except NodeAgentResponseError as exc:
+                if exc.status_code == 409:
+                    try:
+                        payload = json.loads(exc.detail)
+                    except ValueError:
+                        payload = None
+                    detail = payload.get("detail") if isinstance(payload, dict) else None
+                    raise FanSettingsConflict(
+                        detail if isinstance(detail, str)
+                        else "fan mode changed; refresh and try again"
+                    ) from exc
+                raise
         if (
             not isinstance(result, dict)
             or result.get("mode") != mode
@@ -5730,7 +5744,7 @@ class Manager:
         """Atomically update one mode and optionally make it the active mode."""
         validated = self._validate_fan_settings(mode, updates)
         expected_mode = mode if expected_mode is None else expected_mode
-        if expected_mode not in FAN_MODE_DEFAULTS:
+        if not isinstance(expected_mode, str) or expected_mode not in FAN_MODE_DEFAULTS:
             raise ValueError("unknown expected fan mode")
         with self._fan_settings_lock:
             state = self._read_fan_state()

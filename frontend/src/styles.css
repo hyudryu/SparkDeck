@@ -397,6 +397,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .fan-chart-point { fill: var(--bg-surface); stroke: var(--fan-chart); stroke-width: 2; vector-effect: non-scaling-stroke; }
 .fan-chart-point-editable { cursor: grab; touch-action: none; }
 .fan-chart-point-editable:hover, .fan-chart-point-editable:focus-visible { fill: color-mix(in srgb, var(--fan-chart) 18%, var(--bg-surface)); outline: none; stroke-width: 3; }
+.fan-chart-point-editable[aria-disabled="true"] { opacity: .55; cursor: wait; }
 .fan-chart-point-label { fill: var(--text-secondary); font-size: 8px; }
 .fan-chart-live-halo { fill: color-mix(in srgb, var(--success) 22%, transparent); }.fan-chart-live { fill: var(--success); stroke: var(--bg-surface); stroke-width: 1.5; }
 .fan-curve-help { margin-top: 5px; font-size: 11px; }

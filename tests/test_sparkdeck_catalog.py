@@ -78,6 +78,21 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["parameter_count"], 30_532_122_624)
         self.assertEqual(item["weight_size_bytes"], 17_310_784_672)
         self.assertEqual(item["weight_size_source"], "gguf")
+        self.assertTrue(next(
+            value["supported"] for value in item["runtime_compatibility"]
+            if value["runtime"] == "llama.cpp"
+        ))
+
+    async def test_gguf_sibling_enables_llama_without_gguf_tag(self):
+        item = HuggingFaceCatalog._public_item({
+            "id": "org/model", "tags": [],
+            "siblings": [{"rfilename": "model-Q4_K_M.gguf"}],
+        })
+
+        self.assertTrue(next(
+            value["supported"] for value in item["runtime_compatibility"]
+            if value["runtime"] == "llama.cpp"
+        ))
 
     async def test_public_search_omits_authorization(self):
         captured = []
@@ -242,6 +257,21 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(
             len(artifact["files"]) == 1 for artifact in variant["artifacts"]
         ))
+        await http.aclose()
+
+    async def test_details_omits_incomplete_gguf_shard_groups(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "id": "org/model-GGUF", "tags": ["gguf"],
+                "siblings": [{
+                    "rfilename": "model-Q4_K_M-00001-of-00002.gguf", "size": 10,
+                }],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model-GGUF")
+
+        self.assertEqual(item["quantizations"], [])
         await http.aclose()
 
     async def test_details_paginates_entire_tree_before_summing_gguf_shards(self):

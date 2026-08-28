@@ -19,6 +19,10 @@ SPARKDECK_LABEL = "io.sparkdeck.managed"
 SPARKDECK_MODEL_LABEL = "io.sparkdeck.model"
 SPARKDECK_RUNTIME_LABEL = "io.sparkdeck.runtime"
 SPARKDECK_DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
+_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -92,9 +96,35 @@ class LlamaCppAdapter(RuntimeAdapter):
             raise ValueError(
                 "llama.cpp managed deployments require an existing local GGUF artifact"
             )
-        resolved = str(artifact_path.resolve())
-        volumes = {resolved: {"bind": "/models/model.gguf", "mode": "ro"}}
-        artifact = "/models/model.gguf"
+        artifact_path = artifact_path.resolve()
+        shard = _GGUF_SHARD_PATTERN.match(artifact_path.name)
+        if shard:
+            shard_count = int(shard.group("count"))
+            missing = [
+                artifact_path.with_name(
+                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
+                )
+                for index in range(1, shard_count + 1)
+                if not artifact_path.with_name(
+                    f"{shard.group('stem')}-{index:05d}-of-{shard_count:05d}.gguf"
+                ).is_file()
+            ]
+            if missing:
+                raise ValueError(
+                    "llama.cpp managed deployment requires every GGUF shard"
+                )
+            artifact_path = artifact_path.with_name(
+                f"{shard.group('stem')}-00001-of-{shard_count:05d}.gguf"
+            )
+            volumes = {
+                str(artifact_path.parent): {"bind": "/models", "mode": "ro"}
+            }
+            artifact = f"/models/{artifact_path.name}"
+        else:
+            volumes = {
+                str(artifact_path): {"bind": "/models/model.gguf", "mode": "ro"}
+            }
+            artifact = "/models/model.gguf"
         command = ["--host", "0.0.0.0", "--port", "8080", "--model", artifact]
         context_size = settings.get("context_size") or settings.get("context_length")
         if context_size:

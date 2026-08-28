@@ -3,6 +3,7 @@ import { Cable, Fan, Link2, RefreshCw, Save, Server, Thermometer, Trash2 } from 
 import { api } from '../api/client'
 import type { RouterOSConnectionInput, RouterOSDiscoveryCandidate, RouterOSNodeOverview } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 
 const presenceEvent = 'sparkdeck:routeros-presence-changed'
@@ -52,6 +53,7 @@ function normalizedConnectionUrl(value: string) {
 }
 
 function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onChanged: () => void }) {
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const [form, setForm] = useState<RouterOSConnectionInput>({
     base_url: node.base_url?.trim() || discoveredUrl(node.discovery?.[0]),
     username: node.username?.trim() ?? '',
@@ -130,7 +132,12 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
   }
 
   const remove = async () => {
-    if (!window.confirm(`Remove the RouterOS connection from ${node.node_name}?`)) return
+    if (!await confirm({
+      title: 'Remove RouterOS connection?',
+      message: `SparkDeck will remove the saved RouterOS connection from ${node.node_name}.`,
+      confirmLabel: 'Remove connection',
+      danger: true,
+    })) return
     setBusy(true)
     setError(undefined)
     setNotice(undefined)
@@ -146,7 +153,7 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
     }
   }
 
-  return <details className="switch-connection" open={!node.configured}>
+  return <><details className="switch-connection" open={!node.configured}>
     <summary><span><Link2 size={15} aria-hidden="true" /> {node.configured ? 'Update connection' : 'Connect this switch'}</span><small>Credentials stay on {node.node_name}</small></summary>
     <form onSubmit={(event) => void save(event)}>
       {(node.discovery?.length ?? 0) > 0 && <div className="switch-discovery-list" aria-label={`Discovered RouterOS candidates on ${node.node_name}`}>
@@ -164,7 +171,7 @@ function ConnectionForm({ node, onChanged }: { node: RouterOSNodeOverview; onCha
       {notice && <p className="inline-success" role="status">{notice}</p>}
       <div className="switch-form-actions"><Button type="submit" variant="primary" disabled={busy}>{busy ? 'Saving…' : 'Save connection'}</Button>{node.configured && <Button type="button" variant="danger" disabled={busy} onClick={() => void remove()}><Trash2 size={14} aria-hidden="true" /> Remove</Button>}</div>
     </form>
-  </details>
+  </details>{confirmationDialog}</>
 }
 
 const fanFields: Record<string, { label: string; kind: 'number' | 'boolean' | 'duration'; unit?: string; min?: number; max?: number }> = {

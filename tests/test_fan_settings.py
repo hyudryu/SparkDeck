@@ -9,6 +9,7 @@ from unittest import mock
 
 import manager as manager_module
 from manager import FanSettingsConflict, Manager
+from cluster import NodeAgentResponseError
 
 
 CURVE = {
@@ -46,6 +47,12 @@ class FanSettingsTests(unittest.TestCase):
             Manager._validate_fan_settings("pid", {**PID, "curve_points": []})
         with self.assertRaisesRegex(ValueError, "unknown fan mode"):
             Manager._validate_fan_settings([], {})
+
+    def test_unhashable_expected_mode_is_rejected_before_state_access(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        with self.assertRaisesRegex(ValueError, "unknown expected fan mode"):
+            instance.update_fan_settings("curve", CURVE, expected_mode=[])
 
     def test_curve_validation_requires_sorted_unique_points(self) -> None:
         invalid = {**CURVE, "curve_points": [[60, 20], [60, 30]]}
@@ -327,6 +334,74 @@ class FanControlClusterTests(unittest.IsolatedAsyncioTestCase):
             json_body={"enabled": True},
             timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
         )
+
+    async def test_remote_settings_update_uses_authenticated_agent_contract(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1", "name": "Rack", "online": True,
+            "stats": {"fan": self.live_fan()},
+        }])
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(return_value={
+            "mode": "curve", "previous_mode": "pid", "active_settings": CURVE,
+        })
+
+        result = await instance.update_node_fan_settings(
+            "worker-1", "curve", CURVE, "pid",
+        )
+
+        self.assertEqual(result["node_id"], "worker-1")
+        self.assertEqual(result["active_settings"], CURVE)
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "PATCH", "/api/agent/fan-control/settings",
+            json_body={
+                "mode": "curve", "active_settings": CURVE, "expected_mode": "pid",
+            },
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_remote_settings_preserve_agent_mode_conflict(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1", "name": "Rack", "online": True,
+            "stats": {"fan": self.live_fan()},
+        }])
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(side_effect=NodeAgentResponseError(
+            "Rack", 409, '{"detail":"fan mode changed; refresh and try again"}',
+        ))
+
+        with self.assertRaisesRegex(FanSettingsConflict, "fan mode changed"):
+            await instance.update_node_fan_settings(
+                "worker-1", "curve", CURVE, "pid",
+            )
+
+    async def test_remote_settings_rethrow_non_conflict_agent_errors(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock(return_value=[{
+            "id": "worker-1", "name": "Rack", "online": True,
+            "stats": {"fan": self.live_fan()},
+        }])
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(side_effect=NodeAgentResponseError(
+            "Rack", 500, '{"detail":"write failed"}',
+        ))
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+            await instance.update_node_fan_settings(
+                "worker-1", "curve", CURVE, "pid",
+            )
+
+    async def test_node_settings_reject_unhashable_expected_mode_before_routing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.cluster_nodes = mock.AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "unknown expected fan mode"):
+            await instance.update_node_fan_settings(
+                "worker-1", "curve", CURVE, {},
+            )
+
+        instance.cluster_nodes.assert_not_awaited()
 
     async def test_max_speed_rejects_non_boolean_before_routing(self) -> None:
         instance = Manager.__new__(Manager)

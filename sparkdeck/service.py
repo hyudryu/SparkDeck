@@ -757,7 +757,9 @@ class SparkDeckService:
             if isinstance(member, dict) and member.get("container_name")
         }
         cluster_nodes: dict[str, dict[str, Any]] = {}
-        if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
+        if any(
+            item.get("settings", {}).get("manager_deployment_id") for item in registered
+        ) or cluster_by_container:
             try:
                 cluster_nodes = {
                     node["id"]: node for node in await self.manager.cluster_nodes()
@@ -878,6 +880,19 @@ class SparkDeckService:
                 # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
                 discovered.update(self._layout_contract(owner.get("launch_settings")))
+                owner_node_ids = [
+                    str(item) for item in owner.get("node_ids") or [] if str(item).strip()
+                ]
+                if owner_node_ids:
+                    # Without the cluster node set the card would look like a
+                    # standalone container: the running-node tooltip hides and
+                    # an add-nodes picker cannot tell which nodes already run
+                    # the model.
+                    discovered["node_ids"] = owner_node_ids
+                    discovered["selected_nodes"] = [
+                        self.manager.public_target_node(cluster_nodes[node_id])
+                        for node_id in owner_node_ids if node_id in cluster_nodes
+                    ]
             registered.append(discovered)
         for deployment in registered:
             if (
@@ -1709,6 +1724,7 @@ class SparkDeckService:
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        additional_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         lock = self._deployment_action_locks.setdefault(
             deployment_id, asyncio.Lock(),
@@ -1720,12 +1736,13 @@ class SparkDeckService:
                     "deployment launch is still in progress; wait for container creation"
                 )
             return await self._deployment_action_locked(
-                deployment_id, action, node_ids,
+                deployment_id, action, node_ids, additional_node_ids,
             )
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
+        additional_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
@@ -1751,7 +1768,45 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
-        if node_ids and action == "start":
+        relaunch_mode: str | None = None
+        if additional_node_ids and action == "start":
+            # "Launch on additional nodes" grows the running node set instead
+            # of relocating it: the current cluster nodes stay first in the
+            # merged selection so the primary replica is preserved.
+            if not manager_id and not owner:
+                raise ValueError(
+                    "node selection is only available for cluster deployments; "
+                    "this deployment starts on its existing node"
+                )
+            contract = self._layout_contract(launch_settings)
+            if contract.get("deployment_mode") == "sharded":
+                raise ValueError(
+                    "sharded deployments cannot launch on additional nodes; "
+                    "their tensor-parallel layout is fixed"
+                )
+            current_nodes = (owner or linked or {}).get("node_ids")
+            if not isinstance(current_nodes, list) or not current_nodes:
+                current_nodes = (deployment.get("settings") or {}).get("node_ids") or []
+            merged = list(dict.fromkeys([
+                *(str(item) for item in current_nodes if str(item).strip()),
+                *(str(item).strip() for item in additional_node_ids),
+            ]))
+            if all(item in {str(item) for item in current_nodes} for item in merged):
+                # Manager treats any explicit node selection as a relocation:
+                # relaunching with an unchanged set would tear down every
+                # running rank for a semantic no-op.
+                raise ValueError(
+                    "additional_node_ids must include at least one node that "
+                    "is not already running this deployment"
+                )
+            # The picker constrains choices in the UI, but an API client can
+            # bypass it and the cache can change after the inventory loads —
+            # revalidate before relaunching.
+            await self._validate_start_selection(deployment, merged, launch_settings)
+            if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
+                relaunch_mode = "replicated"
+            node_ids = merged
+        elif node_ids and action == "start":
             node_ids = self._normalized_start_selection(launch_settings, node_ids)
             if not manager_id and not owner and any(item != "local" for item in node_ids):
                 # A standalone container runs on the node that holds it; only
@@ -1772,6 +1827,10 @@ class SparkDeckService:
         if manager_id:
             if node_ids is None:
                 result = await self.manager.deployment_action(manager_id, action)
+            elif relaunch_mode:
+                result = await self.manager.deployment_action(
+                    manager_id, action, node_ids, relaunch_mode,
+                )
             else:
                 result = await self.manager.deployment_action(manager_id, action, node_ids)
             if not result.get("ok"):
@@ -1801,7 +1860,12 @@ class SparkDeckService:
             # and the cluster health monitor restarts the whole deployment —
             # the action must address the cluster instead.
             if action == "start" and node_ids:
-                result = await self.manager.deployment_action(owner["id"], action, node_ids)
+                if relaunch_mode:
+                    result = await self.manager.deployment_action(
+                        owner["id"], action, node_ids, relaunch_mode,
+                    )
+                else:
+                    result = await self.manager.deployment_action(owner["id"], action, node_ids)
             else:
                 result = await self.manager.deployment_action(owner["id"], action)
             if not result.get("ok"):

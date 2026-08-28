@@ -1340,6 +1340,12 @@ class VirtualNAS:
             # archive's own marker state defines snapshot completeness.
             os.replace(extracted, destination)
             return
+        # Mirror the download, inventory, and delete paths: a repository
+        # entry that is not a real cache-local directory must never be
+        # written through, or a tampered link would export merge writes
+        # outside the configured Hub directory.
+        if destination.is_symlink() or not destination.is_dir():
+            raise RuntimeError("cached model repository is not a safe directory")
         self._merge_model_directory(extracted, destination)
         shutil.rmtree(extracted, ignore_errors=True)
 

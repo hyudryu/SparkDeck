@@ -124,6 +124,16 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "no selected node could download"):
             await self.prepare(home_node_ids=["local", "worker-1"])
 
+    async def test_unsupported_agent_blocks_distribution_before_downloading(self):
+        self.manager.node_supports_selective_downloads = AsyncMock(
+            side_effect=lambda node_id: node_id == "local"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "worker-1"):
+            await self.prepare(home_node_ids=["local", "worker-1"])
+
+        self.manager.node_download_model_files.assert_not_awaited()
+
     async def test_distribution_requires_the_virtual_nas(self):
         self.virtual_nas.enabled = False
 
@@ -421,6 +431,22 @@ class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 stale_ref.read_text(encoding="utf-8").strip(), revision,
             )
+
+    async def test_merge_refuses_a_destination_that_is_not_a_real_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            decoy = target_hub / "models--org--model"
+            decoy.parent.mkdir(parents=True)
+            decoy.write_bytes(b"not a directory")
+
+            export = source.export_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"], "main",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "not a safe directory"):
+                await target.import_model_files("org/model", export)
 
     async def test_multi_shard_transfer_carries_every_selected_file(self):
         with tempfile.TemporaryDirectory() as directory:

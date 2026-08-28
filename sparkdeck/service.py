@@ -1335,6 +1335,18 @@ class SparkDeckService:
             raise RuntimeError(
                 "Virtual NAS is required to distribute GGUF artifacts between nodes"
             )
+        # Validate the whole set before any Hub download starts so a mixed
+        # cluster fails fast instead of after creating partial side effects.
+        unsupported = [
+            node_id for node_id in home_node_ids
+            if node_id != LOCAL_NODE_ID
+            and not await self.manager.node_supports_selective_downloads(node_id)
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "node(s) do not support selective model file transfers; "
+                "update their SparkDeck agent: " + ", ".join(unsupported)
+            )
         complete: dict[str, bool] = {}
         for node_id in home_node_ids:
             try:

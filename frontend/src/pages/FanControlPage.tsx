@@ -10,7 +10,9 @@ const presenceEvent = 'sparkdeck:fan-control-presence-changed'
 const pollDelayMs = 2_000
 const pendingOverrideMismatchLimit = 2
 const pendingCurveActivationMismatchLimit = 3
-const pendingCurveActivationTimeoutMs = 10_000
+const pendingCurveReconciliationMismatchLimit = 3
+// FanController may publish only after its maximum 10-second poll; reserve another 5 seconds for overview/network latency.
+const pendingCurveActivationTimeoutMs = 15_000
 
 interface PendingFanOverride {
   enabled: boolean
@@ -22,7 +24,9 @@ interface CurveDraft {
   curve: FanCurveSettings
   serverSignature: string
   dirty: boolean
+  expectedMode?: FanControlMode
   pendingSignature?: string
+  pendingMismatches?: number
 }
 
 interface PendingCurveActivation {
@@ -30,6 +34,16 @@ interface PendingCurveActivation {
   lastTelemetryTs: number
   mismatches: number
   deadlineAt: number
+}
+
+interface FanControlFeedback {
+  status?: string
+  error?: string
+}
+
+interface CurvePointUpdate {
+  temperature?: number
+  duty?: number
 }
 
 function cloneCurve(curve: FanCurveSettings): FanCurveSettings {
@@ -105,7 +119,7 @@ function CurveChart({
 }: {
   curve: FanCurveSettings
   node: FanControlNode
-  onPointChange: (index: number, temperature: number, duty: number) => void
+  onPointChange: (index: number, update: CurvePointUpdate, snap: boolean) => void
   disabled: boolean
 }) {
   const chartId = node.node_id.replace(/[^a-zA-Z0-9_-]/g, '-')
@@ -137,7 +151,7 @@ function CurveChart({
     const chartY = (event.clientY - bounds.top) * (225 / bounds.height)
     const temperature = minTemp + ((chartX - 48) / 432) * (maxTemp - minTemp)
     const duty = 100 - ((chartY - 18) / 172) * 100
-    onPointChange(index, temperature, duty)
+    onPointChange(index, { temperature, duty }, true)
   }
 
   return <div className="fan-control-chart-wrap">
@@ -178,10 +192,10 @@ function CurveChart({
           onKeyDown={(event) => {
             if (disabled) return
             const step = event.shiftKey ? 5 : 1
-            if (event.key === 'ArrowLeft') onPointChange(index, temperature - step, duty)
-            else if (event.key === 'ArrowRight') onPointChange(index, temperature + step, duty)
-            else if (event.key === 'ArrowDown') onPointChange(index, temperature, duty - step)
-            else if (event.key === 'ArrowUp') onPointChange(index, temperature, duty + step)
+            if (event.key === 'ArrowLeft') onPointChange(index, { temperature: temperature - step }, true)
+            else if (event.key === 'ArrowRight') onPointChange(index, { temperature: temperature + step }, true)
+            else if (event.key === 'ArrowDown') onPointChange(index, { duty: duty - step }, true)
+            else if (event.key === 'ArrowUp') onPointChange(index, { duty: duty + step }, true)
             else return
             event.preventDefault()
           }}
@@ -200,11 +214,11 @@ function CurveChart({
       <tbody>{configuredPoints.map(({ temperature, duty, index }) => <tr key={index}>
         <td><input type="number" step="0.5" value={temperature} disabled={disabled} aria-label={`Point ${index + 1} temperature`} onChange={(event) => {
           const next = Number(event.target.value)
-          if (Number.isFinite(next)) onPointChange(index, next, duty)
+          if (Number.isFinite(next)) onPointChange(index, { temperature: next }, false)
         }} /></td>
         <td><input type="number" min="0" max="100" step="1" value={duty} disabled={disabled} aria-label={`Point ${index + 1} fan duty`} onChange={(event) => {
           const next = Number(event.target.value)
-          if (Number.isFinite(next)) onPointChange(index, temperature, next)
+          if (Number.isFinite(next)) onPointChange(index, { duty: next }, false)
         }} /></td>
       </tr>)}</tbody>
     </table>
@@ -215,8 +229,7 @@ export function FanControlPage() {
   const resource = useResource((signal) => api.fanControl.get(signal))
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState('')
-  const [saveStatus, setSaveStatus] = useState('')
+  const [feedbackByNode, setFeedbackByNode] = useState<Record<string, FanControlFeedback>>({})
   const [pendingOverrides, setPendingOverrides] = useState<Record<string, PendingFanOverride>>({})
   const [curveDrafts, setCurveDrafts] = useState<Record<string, CurveDraft>>({})
   const [pendingCurveActivations, setPendingCurveActivations] = useState<Record<string, PendingCurveActivation>>({})
@@ -267,7 +280,7 @@ export function FanControlPage() {
     if (!overview || Object.keys(pendingCurveActivations).length === 0) return
     const next = { ...pendingCurveActivations }
     let changed = false
-    let selectedOutcome: 'confirmed' | 'mismatch' | undefined
+    const outcomes: Record<string, FanControlFeedback> = {}
     for (const item of overview.nodes) {
       const pending = next[item.node_id]
       if (!pending) continue
@@ -275,13 +288,13 @@ export function FanControlPage() {
         if (curveActivationConfirmed(item, pending.expectedSignature)) {
           delete next[item.node_id]
           changed = true
-          if (item.node_id === selectedNodeId) selectedOutcome = 'confirmed'
+          outcomes[item.node_id] = { status: 'Fan curve saved and activation confirmed.' }
           continue
         }
         const mismatches = pending.mismatches + 1
         if (mismatches >= pendingCurveActivationMismatchLimit) {
           delete next[item.node_id]
-          if (item.node_id === selectedNodeId) selectedOutcome = 'mismatch'
+          outcomes[item.node_id] = { error: 'Fan curve was saved, but curve mode activation was not confirmed. Refresh and verify the controller mode.' }
         } else {
           next[item.node_id] = { ...pending, lastTelemetryTs: item.fan.ts, mismatches }
         }
@@ -289,14 +302,10 @@ export function FanControlPage() {
       }
     }
     if (changed) setPendingCurveActivations(next)
-    if (selectedOutcome === 'confirmed') {
-      setSaveError('')
-      setSaveStatus('Fan curve saved and activation confirmed.')
-    } else if (selectedOutcome === 'mismatch') {
-      setSaveStatus('')
-      setSaveError('Fan curve was saved, but curve mode activation was not confirmed. Refresh and verify the controller mode.')
+    if (Object.keys(outcomes).length > 0) {
+      setFeedbackByNode((current) => ({ ...current, ...outcomes }))
     }
-  }, [pendingCurveActivations, resource.data, selectedNodeId])
+  }, [pendingCurveActivations, resource.data])
 
   useEffect(() => {
     const deadlines = Object.values(pendingCurveActivations).map((pending) => pending.deadlineAt)
@@ -314,13 +323,16 @@ export function FanControlPage() {
         }
         return next
       })
-      if (expiredNodeIds.includes(selectedNodeId)) {
-        setSaveStatus('')
-        setSaveError('Fan curve was saved, but curve mode activation timed out. Refresh and verify the controller mode.')
-      }
+      setFeedbackByNode((current) => {
+        const next = { ...current }
+        for (const nodeId of expiredNodeIds) {
+          next[nodeId] = { error: 'Fan curve was saved, but curve mode activation timed out. Refresh and verify the controller mode.' }
+        }
+        return next
+      })
     }, Math.max(0, Math.min(...deadlines) - Date.now()))
     return () => window.clearTimeout(timeout)
-  }, [pendingCurveActivations, selectedNodeId])
+  }, [pendingCurveActivations])
 
   useEffect(() => {
     const nodes = resource.data?.nodes ?? []
@@ -337,6 +349,14 @@ export function FanControlPage() {
         } else if (existing.pendingSignature) {
           if (existing.pendingSignature === signature) {
             next[item.node_id] = { curve: cloneCurve(serverCurve), serverSignature: signature, dirty: false }
+            changed = true
+          } else {
+            const pendingMismatches = (existing.pendingMismatches ?? 0) + 1
+            if (pendingMismatches >= pendingCurveReconciliationMismatchLimit) {
+              next[item.node_id] = { curve: cloneCurve(serverCurve), serverSignature: signature, dirty: false }
+            } else {
+              next[item.node_id] = { ...existing, pendingMismatches }
+            }
             changed = true
           }
         } else if (!existing.dirty && existing.serverSignature !== signature) {
@@ -361,8 +381,7 @@ export function FanControlPage() {
   const setMaxSpeed = async (enabled: boolean) => {
     if (!node || saving) return
     setSaving(true)
-    setSaveError('')
-    setSaveStatus('')
+    setFeedbackByNode((current) => ({ ...current, [node.node_id]: {} }))
     try {
       await api.fanControl.setMaxSpeed(node.node_id, enabled)
       setPendingOverrides((current) => ({
@@ -373,30 +392,46 @@ export function FanControlPage() {
           mismatches: 0,
         },
       }))
-      setSaveStatus(enabled ? 'Max fan speed enabled.' : 'Automatic fan control enabled.')
+      setFeedbackByNode((current) => ({
+        ...current,
+        [node.node_id]: { status: enabled ? 'Max fan speed enabled.' : 'Automatic fan control enabled.' },
+      }))
       window.dispatchEvent(new Event(presenceEvent))
     } catch (reason) {
-      setSaveError(reason instanceof Error ? reason.message : 'Could not update fan control.')
+      setFeedbackByNode((current) => ({
+        ...current,
+        [node.node_id]: { error: reason instanceof Error ? reason.message : 'Could not update fan control.' },
+      }))
     } finally {
       setSaving(false)
     }
   }
 
   const curve = node?.settings.settings.curve
-  const curveDraft = node && curveDrafts[node.node_id]?.curve
-    ? curveDrafts[node.node_id].curve
+  const curveDraftState = node ? curveDrafts[node.node_id] : undefined
+  const curveDraft = curveDraftState?.curve
+    ? curveDraftState.curve
     : curve
-  const curveDirty = node ? Boolean(curveDrafts[node.node_id]?.dirty) : false
+  const curveDirty = Boolean(curveDraftState?.dirty)
   const maxSpeed = node ? pendingOverrides[node.node_id]?.enabled ?? node.fan.max_speed : false
+  const feedback = node ? feedbackByNode[node.node_id] : undefined
 
-  const updateCurvePoint = (index: number, temperature: number, duty: number) => {
+  const updateCurvePoint = (index: number, update: CurvePointUpdate, snap: boolean) => {
     if (!node || !curve || !curveDraft || saving) return
     const points = curveDraft.curve_points
     if (!points[index]) return
     const minimum = index === 0 ? curveDraft.curve_min_temp : points[index - 1][0] + 0.5
     const maximum = index === points.length - 1 ? curveDraft.curve_max_temp : points[index + 1][0] - 0.5
-    const nextTemperature = Math.round(clamp(temperature, minimum, maximum) * 2) / 2
-    const nextDuty = Math.round(clamp(duty, 0, 100))
+    const currentTemperature = points[index][0]
+    const currentDuty = points[index][1]
+    const clampedTemperature = update.temperature === undefined
+      ? currentTemperature
+      : clamp(update.temperature, minimum, maximum)
+    const clampedDuty = update.duty === undefined ? currentDuty : clamp(update.duty, 0, 100)
+    const nextTemperature = update.temperature !== undefined && snap
+      ? Math.round(clampedTemperature * 2) / 2
+      : clampedTemperature
+    const nextDuty = update.duty !== undefined && snap ? Math.round(clampedDuty) : clampedDuty
     if (points[index][0] === nextTemperature && points[index][1] === nextDuty) return
     const nextCurve = cloneCurve(curveDraft)
     nextCurve.curve_points[index] = [nextTemperature, nextDuty]
@@ -406,10 +441,12 @@ export function FanControlPage() {
         curve: nextCurve,
         serverSignature: current[node.node_id]?.serverSignature ?? curveSignature(curve),
         dirty: true,
+        expectedMode: current[node.node_id]?.dirty
+          ? current[node.node_id].expectedMode ?? node.fan.mode
+          : node.fan.mode,
       },
     }))
-    setSaveError('')
-    setSaveStatus('')
+    setFeedbackByNode((current) => ({ ...current, [node.node_id]: {} }))
   }
 
   const resetCurve = () => {
@@ -422,19 +459,18 @@ export function FanControlPage() {
         dirty: false,
       },
     }))
-    setSaveError('')
-    setSaveStatus('')
+    setFeedbackByNode((current) => ({ ...current, [node.node_id]: {} }))
   }
 
   const saveCurve = async () => {
     if (!node || !curveDraft || !curveDirty || saving) return
     const submitted = cloneCurve(curveDraft)
     const signature = curveSignature(submitted)
+    const expectedMode = curveDraftState?.expectedMode ?? node.fan.mode
     setSaving(true)
-    setSaveError('')
-    setSaveStatus('')
+    setFeedbackByNode((current) => ({ ...current, [node.node_id]: {} }))
     try {
-      await api.fanControl.updateSettings(node.node_id, 'curve', submitted, node.fan.mode)
+      await api.fanControl.updateSettings(node.node_id, 'curve', submitted, expectedMode)
       setCurveDrafts((current) => ({
         ...current,
         [node.node_id]: {
@@ -442,10 +478,11 @@ export function FanControlPage() {
           serverSignature: signature,
           dirty: false,
           pendingSignature: signature,
+          pendingMismatches: 0,
         },
       }))
-      if (node.fan.mode === 'curve') {
-        setSaveStatus('Fan curve saved.')
+      if (expectedMode === 'curve') {
+        setFeedbackByNode((current) => ({ ...current, [node.node_id]: { status: 'Fan curve saved.' } }))
       } else {
         setPendingCurveActivations((current) => ({
           ...current,
@@ -456,12 +493,18 @@ export function FanControlPage() {
             deadlineAt: Date.now() + pendingCurveActivationTimeoutMs,
           },
         }))
-        setSaveStatus('Fan curve configuration saved. Waiting for activation telemetry…')
+        setFeedbackByNode((current) => ({
+          ...current,
+          [node.node_id]: { status: 'Fan curve configuration saved. Waiting for activation telemetry…' },
+        }))
       }
       resource.reload()
       window.dispatchEvent(new Event(presenceEvent))
     } catch (reason) {
-      setSaveError(reason instanceof Error ? reason.message : 'Could not save the fan curve.')
+      setFeedbackByNode((current) => ({
+        ...current,
+        [node.node_id]: { error: reason instanceof Error ? reason.message : 'Could not save the fan curve.' },
+      }))
     } finally {
       setSaving(false)
     }
@@ -520,8 +563,8 @@ export function FanControlPage() {
           <span>Max fan speed</span>
         </label>
       </Panel>
-      {saveError && <p className="inline-error" role="alert">{saveError}</p>}
-      {saveStatus && <p className="inline-success" role="status">{saveStatus}</p>}
+      {feedback?.error && <p className="inline-error" role="alert">{feedback.error}</p>}
+      {feedback?.status && <p className="inline-success" role="status">{feedback.status}</p>}
 
       <div className="fan-control-details">
         <Panel className="fan-control-curve-panel">

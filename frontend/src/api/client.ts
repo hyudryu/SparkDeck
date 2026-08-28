@@ -63,9 +63,10 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
-// Deployment launches and image pulls already have backend-owned, multi-minute
-// limits. Keep their browser connection alive so the server can return the
-// authoritative result instead of inviting a duplicate retry after 30 seconds.
+// Deployment launches, image pulls, and non-streaming inference already have
+// backend-owned, multi-minute limits. Keep their browser connection alive so
+// the server can return the authoritative result instead of inviting a
+// duplicate retry after 30 seconds.
 const NO_REQUEST_TIMEOUT: null = null
 
 async function request<T>(
@@ -84,9 +85,8 @@ async function request<T>(
     controller.abort()
   }, timeoutMs)
 
-  let response: Response
   try {
-    response = await fetch(path, {
+    const response = await fetch(path, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...init,
@@ -97,6 +97,23 @@ async function request<T>(
         ...init?.headers,
       },
     })
+    if (!response.ok) {
+      let message = `${response.status} ${response.statusText}`
+      let body: { detail?: unknown; message?: string } | undefined
+      try {
+        body = (await response.json()) as { detail?: unknown; message?: string }
+        if (typeof body.detail === 'string') message = body.detail
+        else if (body.message) message = body.message
+      } catch (error) {
+        // Abort still needs to propagate while the response body is being read.
+        if (controller.signal.aborted) throw error
+        // The status text is still useful for non-JSON failures.
+      }
+      throw new ApiError(message, response.status, body)
+    }
+    if (response.status === 204) return undefined as T
+    if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T
+    return await response.json() as T
   } catch (error) {
     if (timedOut) {
       throw new ApiError('The request timed out. Check the node connection and retry.', 408)
@@ -106,21 +123,6 @@ async function request<T>(
     if (timeout !== undefined) globalThis.clearTimeout(timeout)
     callerSignal?.removeEventListener('abort', forwardAbort)
   }
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`
-    let body: { detail?: unknown; message?: string } | undefined
-    try {
-      body = (await response.json()) as { detail?: unknown; message?: string }
-      if (typeof body.detail === 'string') message = body.detail
-      else if (body.message) message = body.message
-    } catch {
-      // The status text is still useful for non-JSON failures.
-    }
-    throw new ApiError(message, response.status, body)
-  }
-  if (response.status === 204) return undefined as T
-  if (!response.headers.get('content-type')?.includes('application/json')) return undefined as T
-  return response.json() as Promise<T>
 }
 
 async function requestWithFallback<T>(
@@ -403,7 +405,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ model, messages, stream: false }),
       signal,
-    }),
+    }, NO_REQUEST_TIMEOUT),
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {
       const data = await request<{ items: WireBenchmark[] }>('/api/v1/benchmarks?limit=100&offset=0', { signal })

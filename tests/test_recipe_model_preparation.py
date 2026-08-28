@@ -11,6 +11,7 @@ from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VirtualNAS,
 )
 
@@ -340,7 +341,10 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         manager.settings = {"virtual_nas_enabled": True}
         manager.cluster_nodes = AsyncMock(return_value=[{
             "id": "worker", "name": "Worker", "online": True,
-            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+            "capabilities": [
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+            ],
             "disk": {"free": AMPLE_BYTES},
         }])
         manager.node_registry = Mock()
@@ -505,7 +509,10 @@ class Registry:
     async def probe(self, node, force=False):
         return {
             **node, "online": True,
-            "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+            "capabilities": [
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+            ],
         }
 
 
@@ -661,6 +668,108 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 request.kwargs["json_body"]["download_cache_baseline_bytes"], 100,
             )
+
+    async def test_remote_download_omits_baseline_for_legacy_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+
+            async def legacy_probe(node, force=False):
+                return {
+                    **node, "online": True,
+                    "capabilities": [VIRTUAL_NAS_DOWNLOAD_CAPABILITY],
+                }
+
+            registry.probe = legacy_probe
+            registry.request.return_value = {"ok": True, "size_bytes": MODEL_BYTES}
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="seed", bytes_total=MODEL_BYTES,
+                download_cache_baseline_bytes=0,
+            )
+            nas.jobs = [job]
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": AMPLE_BYTES,
+            })
+
+            await nas._run_download(job)
+
+            self.assertEqual(job["status"], "completed")
+            self.assertNotIn(
+                "download_cache_baseline_bytes",
+                registry.request.await_args.kwargs["json_body"],
+            )
+
+    async def test_finish_job_preserves_alias_for_revision_completed_while_queued(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+            registry.request.return_value = {
+                "ok": True, "size_bytes": MODEL_BYTES,
+            }
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="seed", bytes_total=MODEL_BYTES,
+                require_partial_cache=True,
+            )
+            nas.jobs = [job]
+            nas._node_storage = AsyncMock(return_value={
+                "models": [{
+                    "model_id": MODEL_ID, "size_bytes": MODEL_BYTES,
+                    "partial": False, "revisions": [RESOLVED_REVISION],
+                }],
+                "free_size": AMPLE_BYTES,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+
+            await nas._run_download(job)
+
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["bytes_transferred"], MODEL_BYTES)
+            nas.estimate_download_size.assert_awaited_once()
+            registry.request.assert_awaited_once()
+            self.assertEqual(
+                registry.request.await_args.kwargs["json_body"]["requested_revision"],
+                REVISION,
+            )
+
+    async def test_finish_job_rechecks_partial_cache_after_metadata_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="seed", bytes_total=MODEL_BYTES,
+                require_partial_cache=True,
+            )
+            nas.jobs = [job]
+            nas._node_storage = AsyncMock(side_effect=[
+                {
+                    "models": [{
+                        "model_id": MODEL_ID, "size_bytes": 25,
+                        "partial": True, "revisions": [],
+                    }],
+                    "free_size": AMPLE_BYTES,
+                },
+                {"models": [], "free_size": AMPLE_BYTES},
+            ])
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+
+            await nas._run_download(job)
+
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("partial model cache no longer exists", job["error"])
+            registry.request.assert_not_awaited()
 
     async def test_stop_waits_for_uncancelable_local_download_without_requeue(self):
         with tempfile.TemporaryDirectory() as directory:

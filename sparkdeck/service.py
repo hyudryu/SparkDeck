@@ -59,6 +59,9 @@ _LOCAL_ROUTING_KEYS = {
     "port", "image", "sg_image", "gpu_memory_gb",
     "sg_tp_size", "sg_context_length", "sg_max_running_requests",
     "sg_mem_fraction",
+    # The immutable revision weight preparation resolved, so the launch uses
+    # exactly the prepared snapshot instead of re-resolving a mutable name.
+    "prepared_revision",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -952,7 +955,6 @@ class SparkDeckService:
                 never_launched = (
                     not deployment.get("container_name")
                     and not settings.get("manager_deployment_id")
-                    and not settings.get("model_source")
                     and deployment.get("desired_state") == "stopped"
                 )
                 if never_launched:
@@ -1050,12 +1052,14 @@ class SparkDeckService:
         )
         # A saved deployment is a launch bookmark: it owns a record with the
         # model, settings, and node preferences but no launched runtime yet.
+        # Local-GGUF bookmarks record their provenance up front, so ownership
+        # (not model_source) decides bookmark state.
         saved_only = bool(
             stored is not None
             and stored.get("kind") == DeploymentKind.MANAGED.value
             and not manager_id
             and manager_deployment is None
-            and not (stored.get("settings") or {}).get("model_source")
+            and not stored.get("container_name")
         )
         # Discovered containers have no saved launch settings, but their
         # parsed command is still shown read-only so the deployment page
@@ -1113,12 +1117,13 @@ class SparkDeckService:
             )
         )
         saved_only = bool(saved_only)
+        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp"}
         editable = bool(
             stored is not None
             and manager_id
             and manager_deployment is not None
             and launch_settings is not None
-            and str(public.get("runtime") or "") in {"vllm", "sglang"}
+            and str(public.get("runtime") or "") in _EDITABLE_RUNTIMES
             and (raw_status == "stopped" or repairable_error)
         ) or saved_only
         if editable:
@@ -1133,7 +1138,7 @@ class SparkDeckService:
             edit_reason = "External deployments do not have SparkDeck-managed launch settings."
         elif not manager_id or manager_deployment is None or launch_settings is None:
             edit_reason = "Saved launch settings are unavailable for this deployment."
-        elif str(public.get("runtime") or "") not in {"vllm", "sglang"}:
+        elif str(public.get("runtime") or "") not in _EDITABLE_RUNTIMES:
             edit_reason = "This runtime does not support editing saved launch settings."
         else:
             edit_reason = "Stop the deployment before changing its launch settings."
@@ -1275,10 +1280,19 @@ class SparkDeckService:
         if "artifact" in changes:
             artifact = _optional_string(changes.get("artifact"))
             if artifact and str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value:
-                self._validate_public_gguf_artifact(
-                    str((stored.get("model") or {}).get("repository") or ""),
-                    artifact, settings.get("quantization"),
-                )
+                artifact_path = Path(artifact)
+                if artifact_path.is_absolute():
+                    # Controller-local artifacts keep the same rule as
+                    # creation: the file must already exist on the controller.
+                    if not artifact_path.is_file():
+                        raise ValueError(
+                            "llama.cpp managed deployments require an existing local GGUF artifact"
+                        )
+                else:
+                    self._validate_public_gguf_artifact(
+                        str((stored.get("model") or {}).get("repository") or ""),
+                        artifact, settings.get("quantization"),
+                    )
             settings["artifact"] = artifact
         if "extra_args" in changes:
             extra_args = changes.get("extra_args")
@@ -1622,6 +1636,7 @@ class SparkDeckService:
                 launch_body = self._cluster_launch_body(
                     runtime, model, alias, deployment_id, identity, settings,
                     requested_node_ids, mode, llama_artifact=None,
+                    recipe_id=body.get("recipe_id"),
                 )
                 if background:
                     return await self._begin_cluster_deployment(
@@ -1950,14 +1965,25 @@ class SparkDeckService:
             )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
-        await self._validate_start_selection(deployment_dict, selected_ids, None)
+        if record.runtime is not RuntimeKind.LLAMA_CPP:
+            # Llama.cpp readiness is per-file inside the resolved snapshot and
+            # is verified by each node when its container is created; the
+            # whole-repository inventory check would reject selective GGUF
+            # snapshots that are perfectly launchable.
+            await self._validate_start_selection(deployment_dict, selected_ids, None)
         llama_artifact = None
         if record.runtime is RuntimeKind.LLAMA_CPP:
             if not artifact:
                 raise ValueError("llama.cpp deployments require a GGUF artifact")
-            resolved_revision = await self._resolved_model_revision(
-                model, record.model.revision or "main",
-            )
+            prepared = _optional_string(settings.get("prepared_revision"))
+            if prepared and re.fullmatch(r"[0-9a-f]{40}", prepared):
+                # Reuse the exact snapshot weight preparation resolved so a
+                # repository update cannot invalidate a just-prepared launch.
+                resolved_revision = prepared
+            else:
+                resolved_revision = await self._resolved_model_revision(
+                    model, record.model.revision or "main",
+                )
             llama_artifact = self._hub_relative_llama_artifact(
                 model, artifact, resolved_revision,
             )
@@ -2559,11 +2585,194 @@ class SparkDeckService:
         )
         return deployment, model, revision
 
+    def _llama_selective_artifact(
+        self, deployment: dict[str, Any], model: str,
+    ) -> list[str] | None:
+        """Return the selected GGUF files for a repo-relative llama bookmark.
+
+        ``None`` means this deployment does not download a selected GGUF set
+        (a controller-local artifact, or a non-llama runtime).
+        """
+        if deployment.get("runtime") != RuntimeKind.LLAMA_CPP.value:
+            return None
+        artifact = str(
+            (deployment.get("model") or {}).get("artifact")
+            or (deployment.get("settings") or {}).get("artifact")
+            or ""
+        )
+        if not artifact or PurePosixPath(artifact).is_absolute():
+            return None
+        relative = self._validate_public_gguf_artifact(model, artifact, None)
+        return self._expand_gguf_shard_files(relative)
+
+    async def _llama_preparation_plan(
+        self, model: str, revision: str, files: list[str],
+        node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Plan selective GGUF preparation for one llama.cpp bookmark.
+
+        Readiness means the selected files exist inside the node's snapshot of
+        the resolved revision; unlike the whole-repository recipe planner, the
+        required capacity is the selected file set, so capacity checks run on
+        the exact bytes at prepare time.
+        """
+        resolved = await self._resolved_model_revision(model, revision)
+        inventory = {
+            str(node.get("id")): node
+            for node in await self.manager.model_cache_inventory()
+        }
+        nodes = {
+            str(node.get("id")): node
+            for node in await self.manager.cluster_nodes()
+        }
+        targets: list[dict[str, Any]] = []
+        for node_id in node_ids:
+            node = nodes.get(node_id) or {}
+            entry = inventory.get(node_id) or {}
+            model_entry = next((
+                item for item in entry.get("models") or []
+                if isinstance(item, dict) and item.get("model_id") == model
+            ), None)
+            has_weights = bool(
+                model_entry
+                and not model_entry.get("partial")
+                and resolved in (model_entry.get("revisions") or [])
+            )
+            online = node.get("online") is not False
+            capable = node_id == "local" or bool(
+                entry.get("virtual_nas_download_capable", True)
+            )
+            download_eligible = online and capable
+            targets.append({
+                "node_id": node_id,
+                "node_name": str(node.get("name") or node_id),
+                "eligible": False,
+                "reason": None,
+                "free_bytes": entry.get("cache_free_size"),
+                "required_free_bytes": None,
+                "active_job_id": None,
+                "active_job_status": None,
+                "active_job_kind": None,
+                "has_preparation_conflict": False,
+                "preparation_conflict_reason": None,
+                "has_required_weights": has_weights,
+                "has_model_cache": model_entry is not None,
+                "download_eligible": download_eligible,
+                "download_reason": (
+                    None if download_eligible
+                    else "Node is offline" if not online
+                    else "Node must be updated before downloading from Hugging Face"
+                ),
+                "transfer_after_download_eligible": False,
+                "transfer_after_download_reason": None,
+                "transfer_after_download_required_free_bytes": None,
+            })
+        missing = [target for target in targets if not target["has_required_weights"]]
+        blocked = [target for target in missing if not target["download_eligible"]]
+        return {
+            "enabled": True,
+            "model_id": model,
+            "revision": revision,
+            "resolved_revision": resolved,
+            "source": None,
+            "sources": [],
+            "download": None,
+            "download_error": None,
+            "targets": targets,
+            "staging_reserve_bytes": 0,
+            "node_ids": [str(node_id) for node_id in node_ids],
+            "eligible": not blocked,
+            "action": "ready" if not missing else "download",
+            "download_node_id": missing[0]["node_id"] if missing else None,
+            "download_node_ids": [
+                target["node_id"] for target in missing if target["download_eligible"]
+            ],
+            "transfer_target_node_ids": [],
+            "reason": (
+                "; ".join(
+                    f"{target['node_name']}: {target['download_reason']}"
+                    for target in blocked
+                )
+            ) or None,
+        }
+
+    async def _prepare_llama_files(
+        self, deployment: dict[str, Any], model: str, revision: str,
+        files: list[str], node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Download only the selected GGUF files onto each selected node."""
+        virtual_nas = getattr(self.manager, "virtual_nas", None)
+        if virtual_nas is None:
+            raise RuntimeError("model preparation is unavailable")
+        resolved = await self._resolved_model_revision(model, revision)
+        token = getattr(self.manager, "_resolved_hf_token", lambda: "")()
+
+        async def run(node_id: str) -> None:
+            if node_id == "local":
+                await virtual_nas.download_model_files_checked(
+                    model, resolved, files,
+                    explicit_token=token, requested_revision=revision,
+                )
+                return
+            request = getattr(self.manager.node_registry, "request", None)
+            if request is None:
+                raise RuntimeError(f"node {node_id} cannot download model files")
+            await request(
+                node_id, "POST",
+                f"/api/agent/virtual-nas/models/{model}/download",
+                json_body={
+                    "revision": resolved,
+                    "requested_revision": revision,
+                    "hf_token": token,
+                    "files": files,
+                },
+                timeout=3600,
+            )
+
+        results = await asyncio.gather(
+            *(run(node_id) for node_id in node_ids), return_exceptions=True,
+        )
+        failures = [
+            f"{node_id}: {result}"
+            for node_id, result in zip(node_ids, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise RuntimeError(
+                "model preparation failed: " + "; ".join(failures)
+            )
+        plan = await self._llama_preparation_plan(model, revision, files, node_ids)
+        return {"workflow_id": None, "job_ids": [], "jobs": [], "plan": plan}
+
+    async def _persist_prepared_revision(
+        self, deployment_id: str, plan: dict[str, Any] | None,
+    ) -> None:
+        """Record the immutable revision preparation resolved for a launch."""
+        resolved = (plan or {}).get("resolved_revision")
+        if not isinstance(resolved, str) or not resolved:
+            return
+        stored = self.store.deployment(deployment_id, include_private=True)
+        if stored is None:
+            return
+        settings = dict(stored.get("settings") or {})
+        if settings.get("prepared_revision") == resolved:
+            return
+        settings["prepared_revision"] = resolved
+        self.store.update_managed_routing(
+            stored["id"],
+            self._local_configuration(settings),
+            stored.get("container_name"),
+            stored.get("_base_url"),
+        )
+
     async def deployment_preparation_preflight(
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
         """Plan per-node weight preparation for a saved deployment."""
-        _, model, revision = self._preparable_deployment_model(deployment_id)
+        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        files = self._llama_selective_artifact(deployment, model)
+        if files is not None:
+            return await self._llama_preparation_plan(model, revision, files, node_ids)
         return await self.manager.recipe_model_preparation_preflight(
             model, revision, node_ids,
         )
@@ -2572,10 +2781,18 @@ class SparkDeckService:
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
         """Queue Virtual NAS weight preparation for a saved deployment."""
-        _, model, revision = self._preparable_deployment_model(deployment_id)
-        return await self.manager.queue_recipe_model_preparation(
-            model, revision, node_ids,
-        )
+        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        files = self._llama_selective_artifact(deployment, model)
+        if files is not None:
+            result = await self._prepare_llama_files(
+                deployment, model, revision, files, node_ids,
+            )
+        else:
+            result = await self.manager.queue_recipe_model_preparation(
+                model, revision, node_ids,
+            )
+        await self._persist_prepared_revision(deployment_id, result.get("plan"))
+        return result
 
     async def deployment_logs(self, deployment_id: str, tail: Any = 300) -> dict[str, Any]:
         """Return recent container logs for a deployment, all ranks included."""

@@ -712,15 +712,16 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         body = await req.json()
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
-            "download_cache_baseline_bytes",
+            "download_cache_baseline_bytes", "files",
         }:
             raise ValueError(
                 "request may contain only revision, requested_revision, hf_token, "
-                "and download_cache_baseline_bytes"
+                "download_cache_baseline_bytes, and files"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
         token = body.get("hf_token")
+        files = body.get("files")
         if revision is not None and not isinstance(revision, str):
             raise ValueError("revision must be a string")
         if token is not None and not isinstance(token, str):
@@ -732,6 +733,23 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
         ):
             raise ValueError("download_cache_baseline_bytes must be a non-negative integer")
+        if files is not None:
+            if (
+                not isinstance(files, list) or not files
+                or any(not isinstance(item, str) or not item.strip() for item in files)
+            ):
+                raise ValueError("files must contain repo-relative filenames")
+            if baseline is not None:
+                raise ValueError(
+                    "download_cache_baseline_bytes cannot be combined with files"
+                )
+            result = await manager.virtual_nas.download_model_files_checked(
+                model_id, revision or "main",
+                [item.strip() for item in files],
+                explicit_token=token if token is not None else None,
+                requested_revision=requested_revision or revision or "main",
+            )
+            return _public_storage_payload(result)
         download_args = [
             model_id, revision or "main", token if token is not None else "",
             requested_revision or revision or "main",

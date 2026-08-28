@@ -48,6 +48,34 @@ const isLocalArtifact = (artifact?: string) => Boolean(
   artifact && (/^\//.test(artifact) || artifact.startsWith('~') || /^[A-Za-z]:[\\/]/.test(artifact)),
 )
 
+// "Target nodes" alone is ambiguous: a selection can mean one model split
+// across the nodes (tensor parallelism) or one complete model per node
+// (parallel instances). Every picker states which one it means.
+const layoutLegend = (mode: string | undefined, nodeCount: number) => {
+  if (mode === 'sharded') return 'Target nodes · tensor parallelism (one model split across nodes)'
+  if (mode === 'replicated' || nodeCount > 1) return 'Target nodes · parallel instances (a full model copy per node)'
+  return 'Target node · single instance'
+}
+
+const layoutHelp = (mode: string | undefined) => {
+  if (mode === 'sharded') {
+    return 'Tensor parallelism: the selected nodes cooperate on one model, so the node count and tensor parallel size must match.'
+  }
+  if (mode === 'replicated') {
+    return 'Parallel instances: every selected node runs its own complete copy of the model.'
+  }
+  return 'The deployment runs on one node.'
+}
+
+const deploymentTargetLayout = (deployment: Deployment) => {
+  if (deployment.deployment_mode === 'sharded') {
+    const tp = deployment.settings.tensor_parallel_size
+    return tp && tp > 1 ? ` · tensor parallel (TP${tp})` : ' · tensor parallel'
+  }
+  if (deployment.deployment_mode === 'replicated') return ' · parallel instances'
+  return ''
+}
+
 export function recipePreparationRequiredBytes(
   option: StorageTransferPreflightTarget | undefined,
   hasExactSource: boolean,
@@ -597,6 +625,10 @@ export function ModelsPage() {
       if (editing) {
         // Saved deployments are editable bookmarks: the same form updates the
         // recorded runtime settings and node preferences without launching.
+        // Runtime and model are fixed once saved; only the name can change.
+        if (form.alias !== editing.alias) {
+          await api.deployments.rename(editing.id, form.alias)
+        }
         await api.deployments.update(editing.id, {
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
@@ -1268,7 +1300,7 @@ export function ModelsPage() {
                   </div>
                   <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                   <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
-                  <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}</span></div>
+                  <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}{deploymentTargetLayout(deployment)}</span></div>
                   <div role="cell" data-label="Status" className="deployment-status-cell" aria-live="polite">
                     {STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && deploymentRunningNodeNames(deployment).length > 0
                       ? <Tooltip label={<><strong>{deployment.status === 'starting' || deployment.status === 'launching' ? 'Starting on' : 'Running on'}</strong><span>{deploymentRunningNodeNames(deployment).join(', ')}</span></>}><Status status={deployment.status} /></Tooltip>
@@ -1449,8 +1481,8 @@ export function ModelsPage() {
               primaryId={recipe.deployment_mode === 'sharded'
                 ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
                 : nodeIds[0]}
-              legend="Deployment nodes"
-              help={localPath ? 'Local model paths can run only on the controller.' : `Choose the intended deployment nodes. SparkDeck can seed ${recipe.model} from Hugging Face and fan it out through Virtual NAS.`}
+              legend={layoutLegend(recipe.deployment_mode, recipe.required_node_count)}
+              help={localPath ? 'Local model paths can run only on the controller.' : `Choose the intended deployment nodes. ${layoutHelp(recipe.deployment_mode)} SparkDeck can seed ${recipe.model} from Hugging Face and fan it out through Virtual NAS.`}
             />
             {!localPath && missingNodes.length > 0 && <div className="recipe-transfer-options" aria-label="Virtual NAS transfer options">
               <div><strong>Prepare missing weights</strong><small>Select the deployment set above, then confirm one preparation workflow.</small></div>
@@ -1496,15 +1528,15 @@ export function ModelsPage() {
         const weighted = deploymentWeightedNodes(deployment)
         const plan = savedLaunch && !controllerArtifact ? startPreflight.data : undefined
         const planTargets = new Map((plan?.targets ?? []).map((target) => [target.node_id, target]))
-        // Nodes without weights can still launch when the preparation plan
-        // deems the selected set eligible; the transfer happens automatically
-        // on launch. A plan blocked anywhere (for example by free disk space
-        // on the model-cache volume) leaves its nodes unselectable instead.
-        const prepEligible = plan?.eligible
-          ? new Set(plan.targets
-            .filter((target) => !weighted.has(target.node_id))
-            .map((target) => target.node_id))
-          : new Set<string>()
+        // Nodes without weights stay launchable whenever any of their own
+        // preparation paths (transfer, Hugging Face download, or transfer
+        // after a seed download) is feasible; the plan computes each node
+        // independently, so one unrelated node out of cache space never
+        // blocks a viable subset.
+        const prepEligible = new Set((plan?.targets ?? [])
+          .filter((target) => !weighted.has(target.node_id)
+            && (target.eligible || target.download_eligible || target.transfer_after_download_eligible))
+          .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
           .filter((node) => weighted.has(node.id) || prepEligible.has(node.id))
           .map((node) => node.id)
@@ -1553,8 +1585,8 @@ export function ModelsPage() {
               primaryId={sharded
                 ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
                 : nodeIds[0]}
-              legend="Deployment nodes"
-              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected.`}
+              legend={layoutLegend(deployment.deployment_mode, required)}
+              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />
             {sharded && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
@@ -1596,8 +1628,8 @@ export function ModelsPage() {
               unavailableReasons={unavailableReasons}
               localLabel={localLabel}
               primaryId={currentIds[0]}
-              legend="Additional nodes"
-              help={`Only nodes with ${deployment.model_id} already cached can join. The running nodes above cannot be removed here.`}
+              legend="Additional nodes · parallel instances"
+              help={`Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
             />
             <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
@@ -1608,14 +1640,14 @@ export function ModelsPage() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setCreating(false); setEditingDeployment(undefined) } }}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-deployment-title">
             <div className="modal-heading"><div><p className="eyebrow">{editingDeployment ? 'Edit deployment' : 'New deployment'}</p><h2 id="create-deployment-title">{editingDeployment ? `Edit ${editingDeployment.alias}` : 'Create deployment'}</h2></div><button className="icon-button" onClick={() => { setCreating(false); setEditingDeployment(undefined) }} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{editingDeployment ? 'Update the saved runtime, model, and node preferences. Nothing launches until you choose Launch.' : 'Save a runtime, model, and node preferences as a deployment bookmark. Launch it from the deployments list whenever you are ready.'}</p>
+            <p className="modal-description">{editingDeployment ? 'Update the saved settings and node preferences. The runtime and model stay fixed; nothing launches until you choose Launch.' : 'Save a runtime, model, and node preferences as a deployment bookmark. Launch it from the deployments list whenever you are ready.'}</p>
             <form onSubmit={(event) => void create(event)}>
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
               </div>
-              <label className="field"><span>Model repository or GGUF artifact</span><input required value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select
                   value=""
@@ -1660,11 +1692,11 @@ export function ModelsPage() {
                 requiredIds={form.deployment_mode === 'sharded' && localNodeId ? [localNodeId] : []}
                 localLabel={localLabel}
                 primaryId={form.deployment_mode === 'sharded' ? localNodeId : (form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
-                legend="Preferred nodes"
-                help="Saved with the deployment and preselected at launch; you can change the selection every time you launch."
+                legend={layoutLegend(form.deployment_mode, form.node_ids?.length ?? 0)}
+                help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Replicated (full weights per node)</option><option value="sharded" disabled={!shardedAvailable}>Sharded (split one model across nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The controller is required as the primary node, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The controller is required as the primary node, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
                   contextLengthTouched.current = true

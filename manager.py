@@ -2808,7 +2808,7 @@ class Manager:
                     "stopped" if deployment.get("status") == "stopped" else "running",
                 )
                 engine = str(deployment.get("engine") or "vllm")
-                if engine not in {"vllm", "sglang"}:
+                if engine not in {"vllm", "sglang", "llama.cpp"}:
                     deployment["status"] = "error"
                     deployment["error"] = f"unsupported persisted runtime: {engine}"
             return value
@@ -4898,7 +4898,8 @@ class Manager:
             )
         if (
             action == "start"
-            and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
+            and str(deployment.get("engine") or "vllm")
+            not in {"vllm", "sglang", "llama.cpp"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
 
@@ -10068,7 +10069,10 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "local"
+                # The cache-relative artifact only exists for public Hub
+                # repositories; report that provenance so benchmark results
+                # aggregate under the public model instead of a local key.
+                summary["model_source"] = "public_repository"
             return summary
 
         try:

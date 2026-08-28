@@ -250,6 +250,84 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["context_length"], 16384)
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
 
+    async def test_controller_local_gguf_bookmark_is_saved_for_the_controller(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "local-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": str(artifact)},
+        })
+
+        self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["node_ids"], ["local"])
+
+        with self.assertRaisesRegex(ValueError, "controller node"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "remote-local",
+                "runtime": "llama.cpp",
+                "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+                "settings": {"artifact": str(artifact)},
+            })
+
+    async def test_saved_bookmark_response_exposes_required_node_count(self):
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "replica-bookmark", "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+        })
+
+        self.assertEqual(created["required_node_count"], 2)
+        self.assertEqual(created["deployment_mode"], "replicated")
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+    async def test_saved_bookmark_keeps_launch_inputs_for_relaunch(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "with-image", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"image": "private/image", "port": 8021,
+                         "gpu_memory_gb": 40},
+        })
+
+        started = await self.service.deployment_action("with-image", "start")
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["image"], "private/image")
+        self.assertEqual(launch["port"], 8021)
+        self.assertEqual(launch["gpu_memory_gb"], 40)
+        self.assertEqual(started["node_ids"], ["remote-1"])
+
+    async def test_sensitive_launch_arguments_are_rejected_before_saving(self):
+        self.manager._reject_sensitive_cli_credentials = (
+            Manager._reject_sensitive_cli_credentials
+        )
+        with self.assertRaisesRegex(ValueError, "configure credentials"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "credentialed", "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+                "settings": {"extra_args": ["--hf-token", "super-secret"]},
+            })
+        self.assertIsNone(self.service.store.deployment("credentialed"))
+
+    async def test_saved_deployment_mode_and_nodes_are_validated_together(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "deployment_mode": "replicated",
+            "node_ids": ["local", "remote-1"],
+        })
+        self.assertEqual(detail["deployment_mode"], "replicated")
+        self.assertEqual(detail["node_ids"], ["local", "remote-1"])
+
+        with self.assertRaisesRegex(ValueError, "exactly one node"):
+            await self.service.update_deployment_settings("bookmark", {
+                "deployment_mode": "single",
+            })
+
     async def test_external_bookmarks_still_register_without_nodes(self):
         created = await self.service.create_deployment({
             "model": "org/model", "alias": "external", "runtime": "vllm",

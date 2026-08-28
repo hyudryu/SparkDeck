@@ -54,6 +54,11 @@ _LOCAL_ROUTING_KEYS = {
     # Saved deployments relaunch from the persisted record, so their extra
     # argv must survive persistence alongside the routing keys above.
     "extra_args",
+    # Manager consumes these launch inputs at relaunch; dropping them would
+    # silently substitute default ports, images, and memory policies.
+    "port", "image", "sg_image", "gpu_memory_gb",
+    "sg_tp_size", "sg_context_length", "sg_max_running_requests",
+    "sg_mem_fraction",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -955,7 +960,7 @@ class SparkDeckService:
                     # containers until its first explicit start.
                     deployment["status"] = "saved"
                     deployment["node_ids"] = list(settings.get("node_ids") or [])
-                    deployment["deployment_mode"] = settings.get("deployment_mode")
+                    deployment.update(self._saved_layout_contract(settings))
                     continue
                 deployment["status"] = "missing"
                 deployment["last_error"] = (
@@ -1281,6 +1286,7 @@ class SparkDeckService:
                 not isinstance(item, str) for item in extra_args
             ):
                 raise ValueError("extra_args must be an array of strings")
+            self._reject_sensitive_launch_args(extra_args)
             settings["extra_args"] = extra_args
         if "node_ids" in changes:
             node_ids = changes.get("node_ids")
@@ -1293,8 +1299,6 @@ class SparkDeckService:
                     raise ValueError("node_ids must contain non-empty node IDs")
                 node_ids = list(dict.fromkeys(item.strip() for item in node_ids))
                 await self.manager.selected_cluster_nodes(node_ids)
-                if settings.get("deployment_mode") == "single" and len(node_ids) != 1:
-                    raise ValueError("single deployment requires exactly one node")
             settings["node_ids"] = node_ids
         if "deployment_mode" in changes:
             mode = changes.get("deployment_mode")
@@ -1303,6 +1307,23 @@ class SparkDeckService:
                     "deployment_mode must be single, sharded, or replicated"
                 )
             settings["deployment_mode"] = mode
+        # Validate the effective combination: the saved mode plus the new
+        # nodes (or the new mode plus the saved nodes) must stay launchable.
+        if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
+            settings.get("deployment_mode") == "sharded"
+        ):
+            raise ValueError(
+                "llama.cpp deployments support single and replicated layouts, not sharded"
+            )
+        contract = self._saved_layout_contract(settings)
+        effective_nodes = [
+            str(item).strip() for item in settings.get("node_ids") or []
+            if str(item).strip()
+        ]
+        if contract["deployment_mode"] == "single" and len(effective_nodes) > 1:
+            raise ValueError("single deployment requires exactly one node")
+        if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
+            raise ValueError("sharded deployment requires at least two nodes")
         self.store.update_managed_routing(
             stored["id"],
             self._local_configuration(settings),
@@ -1435,6 +1456,42 @@ class SparkDeckService:
         # have no .gguf suffix and do not retain multi-shard names.
         return str(candidate)
 
+    @staticmethod
+    def _saved_layout_contract(settings: dict[str, Any]) -> dict[str, Any]:
+        """Derive the launch layout contract persisted on a saved bookmark.
+
+        Mirrors Manager's contract (replicated = the saved node count, sharded
+        = the tensor-parallel node count) so launch pickers can enforce the
+        required node count before the deployment exists in Manager.
+        """
+        node_ids = [
+            str(item).strip() for item in settings.get("node_ids") or []
+            if str(item).strip()
+        ]
+        mode = str(settings.get("deployment_mode") or "").strip() or (
+            "replicated" if len(node_ids) > 1 else "single"
+        )
+        if mode == "sharded":
+            parallel = settings.get("tensor_parallel_size")
+            count = (
+                parallel
+                if isinstance(parallel, int) and not isinstance(parallel, bool)
+                and parallel > 1
+                else max(2, len(node_ids))
+            )
+        elif mode == "replicated":
+            count = max(2, len(node_ids))
+        else:
+            mode = "single"
+            count = 1
+        return {"deployment_mode": mode, "required_node_count": count}
+
+    def _reject_sensitive_launch_args(self, extra_args: Any) -> None:
+        """Apply Manager's credential-argv policy before anything is saved."""
+        reject = getattr(self.manager, "_reject_sensitive_cli_credentials", None)
+        if callable(reject):
+            reject(extra_args)
+
     async def create_deployment(
         self, body: dict[str, Any], *, launch: bool = False,
         background: bool = False,
@@ -1451,6 +1508,9 @@ class SparkDeckService:
         # Runtime provenance is derived from the resolved launch input below;
         # callers cannot promote a local model to public benchmark evidence.
         settings.pop("model_source", None)
+        # Saved argv persists in SQLite, so credential-bearing flags are
+        # rejected at save time instead of failing (or leaking) at launch.
+        self._reject_sensitive_launch_args(settings.get("extra_args"))
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")
@@ -1520,7 +1580,7 @@ class SparkDeckService:
                 if runtime is RuntimeKind.LLAMA_CPP and (
                     artifact_is_local
                     or (not artifact and _public_model_id(model) == "local-model")
-                ):
+                ) and any(item != "local" for item in requested_node_ids):
                     raise ValueError(
                         "local GGUF artifacts can only be saved for the controller node"
                     )
@@ -1550,7 +1610,10 @@ class SparkDeckService:
                     result.update({
                         "status": "saved",
                         "node_ids": requested_node_ids,
-                        "deployment_mode": mode,
+                        **self._saved_layout_contract({
+                            "deployment_mode": mode,
+                            "node_ids": requested_node_ids,
+                        }),
                         "selected_nodes": [
                             self.manager.public_target_node(node) for node in selected
                         ],

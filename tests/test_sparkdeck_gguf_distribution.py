@@ -1,3 +1,5 @@
+import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +15,7 @@ from sparkdeck.virtual_nas import VirtualNAS
 class FakeManager:
     def __init__(self):
         self.http = httpx.AsyncClient()
-        self.list_containers = AsyncMock(return_value=["local"])
+        self.list_containers = AsyncMock(return_value=[])
         self.remove_container = AsyncMock(return_value={"ok": True})
         self.start_container = AsyncMock(return_value={"status": "running"})
         self.stop_container = AsyncMock(return_value={"status": "exited"})
@@ -25,7 +27,7 @@ class FakeManager:
 
 
 class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
-    """The controller-first GGUF homes flow: one Hub seed, NAS fan-out."""
+    """The controller-first GGUF homes flow: one Hub seed, file-scoped fan-out."""
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -44,19 +46,13 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas._model_path = Mock(return_value=self.model_root)
-        virtual_nas.list_transfers = Mock(return_value={"items": [
-            {"id": "job-1", "status": "completed"},
-        ]})
         virtual_nas.enabled = True
         self.virtual_nas = virtual_nas
         self.manager.virtual_nas = virtual_nas
         self.manager.node_has_model_files = AsyncMock(return_value=False)
         self.manager.node_download_model_files = AsyncMock(return_value={"ok": True})
+        self.manager.node_transfer_model_files = AsyncMock(return_value={"ok": True})
         self.manager.node_supports_selective_downloads = AsyncMock(return_value=True)
-        self.manager.queue_virtual_nas_transfer = AsyncMock(return_value={
-            "job_ids": ["job-1"],
-            "jobs": [{"id": "job-1", "status": "queued"}],
-        })
 
     async def asyncTearDown(self):
         await self.manager.http.aclose()
@@ -68,7 +64,7 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
             "org/model", "UD/model-Q8.gguf", "release-gguf", None, **kwargs,
         )
 
-    async def test_home_without_artifact_receives_transfer_from_seeded_controller(self):
+    async def test_home_without_artifact_receives_stream_from_seeded_controller(self):
         prepared = await self.prepare(home_node_ids=["local", "worker-1"])
 
         self.assertEqual(prepared, str(self.artifact))
@@ -76,12 +72,12 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
             "local", "org/model", self.revision,
             ["UD/model-Q8.gguf"], "release-gguf",
         )
-        self.manager.queue_virtual_nas_transfer.assert_awaited_once_with(
-            "org/model", "local", ["worker-1"], self.revision,
-            requested_revision="release-gguf",
+        self.manager.node_transfer_model_files.assert_awaited_once_with(
+            "local", "worker-1", "org/model", self.revision,
+            ["UD/model-Q8.gguf"], "release-gguf",
         )
 
-    async def test_existing_remote_copy_is_transferred_without_a_hub_download(self):
+    async def test_existing_remote_copy_streams_to_the_controller_without_hub(self):
         self.manager.node_has_model_files = AsyncMock(
             side_effect=lambda node_id, *args, **kwargs: node_id == "worker-1"
         )
@@ -90,9 +86,9 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prepared, str(self.artifact))
         self.manager.node_download_model_files.assert_not_awaited()
-        self.manager.queue_virtual_nas_transfer.assert_awaited_once_with(
-            "org/model", "worker-1", ["local"], self.revision,
-            requested_revision="release-gguf",
+        self.manager.node_transfer_model_files.assert_awaited_once_with(
+            "worker-1", "local", "org/model", self.revision,
+            ["UD/model-Q8.gguf"], "release-gguf",
         )
 
     async def test_all_homes_complete_skips_downloads_and_transfers(self):
@@ -102,7 +98,7 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prepared, str(self.artifact))
         self.manager.node_download_model_files.assert_not_awaited()
-        self.manager.queue_virtual_nas_transfer.assert_not_awaited()
+        self.manager.node_transfer_model_files.assert_not_awaited()
 
     async def test_explicit_seed_node_is_used_for_the_hub_download(self):
         await self.prepare(home_node_ids=["local", "worker-1"], download_node_id="worker-1")
@@ -111,9 +107,9 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
             "worker-1", "org/model", self.revision,
             ["UD/model-Q8.gguf"], "release-gguf",
         )
-        self.manager.queue_virtual_nas_transfer.assert_awaited_once_with(
-            "org/model", "worker-1", ["local"], self.revision,
-            requested_revision="release-gguf",
+        self.manager.node_transfer_model_files.assert_awaited_once_with(
+            "worker-1", "local", "org/model", self.revision,
+            ["UD/model-Q8.gguf"], "release-gguf",
         )
 
     async def test_seed_outside_homes_is_rejected(self):
@@ -128,19 +124,55 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "no selected node could download"):
             await self.prepare(home_node_ids=["local", "worker-1"])
 
-    async def test_transfers_require_the_virtual_nas(self):
+    async def test_distribution_requires_the_virtual_nas(self):
         self.virtual_nas.enabled = False
 
         with self.assertRaisesRegex(RuntimeError, "Virtual NAS is required"):
             await self.prepare(home_node_ids=["local", "worker-1"])
 
-    async def test_failed_transfer_job_fails_preparation(self):
-        self.virtual_nas.list_transfers = Mock(return_value={"items": [
-            {"id": "job-1", "status": "failed", "error": "target offline"},
-        ]})
+    async def test_remote_homes_are_rejected_for_absolute_local_artifacts(self):
+        artifact = Path(self.temp.name) / "controller.gguf"
+        artifact.write_bytes(b"gguf")
 
-        with self.assertRaisesRegex(RuntimeError, "target offline"):
-            await self.prepare(home_node_ids=["local", "worker-1"])
+        with self.assertRaisesRegex(ValueError, "cannot be distributed"):
+            await self.service.create_deployment({
+                "model": "local/model", "alias": "local-gguf",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": str(artifact)},
+                "node_ids": ["local", "worker-1"],
+            })
+
+
+class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_seed_forwards_the_controller_credential(self):
+        manager = Manager.__new__(Manager)
+        manager.node_registry = Mock()
+        manager.node_registry.get = Mock(return_value={
+            "id": "worker-1", "capabilities": ["virtual-nas-files-download-v1"],
+        })
+        manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        manager._resolved_hf_token = Mock(return_value="hf-controller-token")
+
+        await manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
+        )
+
+        self.assertEqual(
+            manager.node_registry.request.await_args.kwargs["json_body"]["hf_token"],
+            "hf-controller-token",
+        )
+
+    async def test_remote_seed_without_capability_fails_instead_of_whole_repo(self):
+        manager = Manager.__new__(Manager)
+        manager.node_registry = Mock()
+        manager.node_registry.get = Mock(return_value={
+            "id": "worker-1", "capabilities": [],
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "does not support selective"):
+            await manager.node_download_model_files(
+                "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
+            )
 
 
 class ManagerNodeFileCheckTests(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +196,180 @@ class ManagerNodeFileCheckTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(present)
             self.assertFalse(missing)
+
+
+class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
+    """Real cache-to-cache round trips for the file-scoped transfer."""
+
+    def build_nodes(self, directory: Path):
+        source_hub = directory / "source" / "hub"
+        target_hub = directory / "target" / "hub"
+        source = VirtualNAS(
+            directory / "source", lambda: source_hub, Mock(), lambda: True,
+        )
+        target = VirtualNAS(
+            directory / "target", lambda: target_hub, Mock(), lambda: True,
+        )
+        return source, target, source_hub, target_hub
+
+    @staticmethod
+    def seed_selective_source(hub: Path, revision: str) -> None:
+        """Cache one UD quantization as a selective (marker-flagged) snapshot."""
+        root = hub / "models--org--model"
+        blob = root / "blobs" / "blob-q8"
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(b"q8-weights")
+        snapshot = root / "snapshots" / revision
+        (snapshot / "UD").mkdir(parents=True)
+        entry = snapshot / "UD" / "model-Q8.gguf"
+        if os.name != "nt":
+            # Mirror the real POSIX Hugging Face cache: a relative symlink
+            # into blobs/ (three levels up from a nested snapshot entry).
+            os.symlink("../../../blobs/blob-q8", entry)
+        else:
+            # Windows without developer mode stores real files instead of
+            # symlinks; the transfer path must support both cache layouts.
+            entry.write_bytes(b"q8-weights")
+        (snapshot / ".sparkdeck-selective.incomplete").write_text("selective\n")
+        refs = root / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(revision, encoding="utf-8")
+
+    @staticmethod
+    def stub_remote_target(source: VirtualNAS, target: VirtualNAS, target_hub: Path) -> None:
+        """Wire source->target through a fake HTTP hop backed by real code.
+
+        Inventory requests are answered from the target directory so the
+        capacity gate and post-checks see real state, and import streams
+        are delivered into the target's real import implementation.
+        """
+
+        async def fake_request(node_id, method, path, **kwargs):
+            models = []
+            if (target_hub / "models--org--model").exists():
+                models = [{"model_id": "org/model", "size_bytes": 10}]
+            return {"models": models, "free_size": 1 << 30}
+
+        async def fake_open_stream(node_id, method, path, *, content=None, headers=None, timeout=600):
+            if method == "PUT" and path.endswith("/files/import"):
+                model_bytes = int(headers["X-SparkDeck-Model-Bytes"])
+                await target.import_model_files(
+                    "org/model", content, required_model_bytes=model_bytes,
+                )
+                response = Mock()
+                response.status_code = 200
+
+                async def aread():
+                    return b'{"ok": true}'
+
+                async def aclose():
+                    return None
+
+                response.aread = aread
+                response.aclose = aclose
+                return response
+            raise AssertionError(f"unexpected agent stream: {method} {path}")
+
+        source.node_registry.request = AsyncMock(side_effect=fake_request)
+        source.node_registry.open_stream = fake_open_stream
+
+    async def test_transfer_places_a_selective_snapshot_on_an_empty_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            self.stub_remote_target(source, target, target_hub)
+
+            result = await source.transfer_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+                "local", "local-2", "main",
+            )
+
+            self.assertTrue(result["ok"])
+            target_file = (
+                target_hub / "models--org--model"
+                / "snapshots" / revision / "UD" / "model-Q8.gguf"
+            )
+            self.assertTrue(target_file.is_file())
+            self.assertEqual(target_file.read_bytes(), b"q8-weights")
+            marker = target_file.parent.parent / ".sparkdeck-selective.incomplete"
+            self.assertTrue(marker.is_file())
+            self.assertTrue(target.has_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+            )["complete"])
+
+    async def test_transfer_merges_into_a_target_caching_another_quantization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            self.stub_remote_target(source, target, target_hub)
+            target_root = target_hub / "models--org--model"
+            q4_blob = target_root / "blobs" / "blob-q4"
+            q4_blob.parent.mkdir(parents=True)
+            q4_blob.write_bytes(b"q4-weights")
+            q4_snapshot = target_root / "snapshots" / revision / "Q4"
+            q4_snapshot.mkdir(parents=True)
+            (q4_snapshot / "model-Q4.gguf").write_bytes(b"q4-weights")
+
+            result = await source.transfer_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+                "local", "local-2", "main",
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                q4_blob.read_bytes(), b"q4-weights",
+                "merging must not disturb the target's existing quantization",
+            )
+            q8 = (
+                target_root / "snapshots" / revision / "UD" / "model-Q8.gguf"
+            )
+            self.assertTrue(q8.is_file())
+            self.assertEqual(q8.read_bytes(), b"q8-weights")
+            self.assertTrue(target.has_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+            )["complete"])
+
+    async def test_stream_round_trip_between_two_real_cache_instances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, _ = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+
+            export = source.export_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"], "main",
+            )
+            result = await target.import_model_files(
+                "org/model", export,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(target.has_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"],
+            )["complete"])
+
+    async def test_multi_shard_transfer_carries_every_selected_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, _, _ = self.build_nodes(Path(directory))
+            revision = "b" * 40
+            root = Path(directory) / "source" / "hub" / "models--org--model"
+            snapshot = root / "snapshots" / revision
+            for index in (1, 2):
+                shard = snapshot / f"model-{index:05d}-of-00002.gguf"
+                shard.parent.mkdir(parents=True, exist_ok=True)
+                shard.write_bytes(f"shard-{index}".encode())
+
+            export = source.export_model_files(
+                "org/model", revision,
+                ["model-00001-of-00002.gguf", "model-00002-of-00002.gguf"],
+            )
+            await target.import_model_files("org/model", export)
+
+            complete = target.has_model_files("org/model", revision, [
+                "model-00001-of-00002.gguf", "model-00002-of-00002.gguf",
+            ])
+            self.assertTrue(complete["complete"])
 
 
 class LlamaCppHomesContractTests(unittest.IsolatedAsyncioTestCase):

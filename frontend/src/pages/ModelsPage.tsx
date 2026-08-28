@@ -1315,7 +1315,9 @@ export function ModelsPage() {
               {transferPreflight.data && !transferPreflight.data.enabled && <p>Virtual NAS is disabled. Enable it on the Storage page before transferring weights.</p>}
               {transferPreflight.data?.enabled && transferPreflight.data.source && <p>A complete copy is available on {transferPreflight.data.source.node_name}; cache-empty nodes will receive it through Virtual NAS, while incomplete caches resume from Hugging Face.</p>}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download && <p>No cluster node has the requested revision. Incomplete selected caches will resume from Hugging Face; a cache-empty selected node will seed any Virtual NAS fan-out.</p>}
-              {transferPreflight.data?.enabled && !transferPreflight.data.source && nodeIds.length > 1 && (
+              {transferPreflight.data?.enabled
+                && !(transferPreflight.data.sources ?? []).some((source) => nodeIds.includes(source.node_id))
+                && nodeIds.length > 1 && (
                 <label className="field">
                   <span>Hub download seed (optional)</span>
                   <select

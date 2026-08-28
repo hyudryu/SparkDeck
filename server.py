@@ -12,7 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -785,6 +785,59 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/files/size")
+async def agent_virtual_nas_files_size(
+    req: Request,
+    model_id: str,
+    revision: str,
+    files: list[str] = Query(min_length=1),
+):
+    _require_agent(req)
+    result = await asyncio.to_thread(
+        manager.virtual_nas.estimate_model_files_bytes,
+        model_id, revision, files,
+    )
+    return _public_storage_payload(result)
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/files/export")
+async def agent_virtual_nas_files_export(
+    model_id: str,
+    revision: str,
+    requested_revision: str | None = None,
+    files: list[str] = Query(min_length=1),
+):
+    _require_agent(req)
+    try:
+        stream = manager.virtual_nas.export_model_files(
+            model_id, revision, files, requested_revision,
+        )
+        return StreamingResponse(stream, media_type="application/x-tar")
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.put("/api/agent/virtual-nas/models/{model_id:path}/files/import")
+async def agent_virtual_nas_files_import(model_id: str, req: Request):
+    _require_agent(req)
+    expected_header = req.headers.get("x-sparkdeck-expected-bytes")
+    model_bytes_header = req.headers.get("x-sparkdeck-model-bytes")
+    try:
+        expected_bytes = int(expected_header) if expected_header is not None else None
+        model_bytes = int(model_bytes_header) if model_bytes_header is not None else None
+        if expected_bytes is not None and expected_bytes < 0:
+            raise ValueError("X-SparkDeck-Expected-Bytes must not be negative")
+        if model_bytes is not None and model_bytes <= 0:
+            raise ValueError("X-SparkDeck-Model-Bytes must be positive")
+        result = await manager.virtual_nas.import_model_files(
+            model_id, req.stream(), expected_bytes=expected_bytes,
+            required_model_bytes=model_bytes,
+        )
+        return _public_storage_payload(result)
+    except (TypeError, ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 
 

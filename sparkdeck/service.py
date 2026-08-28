@@ -1313,14 +1313,21 @@ class SparkDeckService:
     ) -> None:
         """Place the selected GGUF files on every home node with one Hub pull.
 
-        Nodes that already hold the artifact act as transfer sources; when no
-        node has it, exactly one home node seeds from Hugging Face and the
-        rest receive Virtual NAS transfers, so the cluster never pays
-        duplicate Hub bandwidth for the same artifact.
+        Nodes that already hold the artifact act as streaming sources; when
+        no node has it, exactly one home node seeds from Hugging Face and
+        the rest receive file-scoped Virtual NAS streams, so the cluster
+        never pays duplicate Hub bandwidth for the same artifact. The
+        streams deliberately bypass the whole-repository transfer jobs:
+        selective snapshots are not complete revisions, and targets may
+        already cache the same repository under another quantization.
         """
         await self.manager.selected_cluster_nodes(home_node_ids)
         if download_node_id is not None and download_node_id not in home_node_ids:
             raise ValueError("download_node_id must be one of the selected nodes")
+        if not self.manager.virtual_nas.enabled:
+            raise RuntimeError(
+                "Virtual NAS is required to distribute GGUF artifacts between nodes"
+            )
         complete: dict[str, bool] = {}
         for node_id in home_node_ids:
             try:
@@ -1339,11 +1346,11 @@ class SparkDeckService:
         sources = [node_id for node_id in home_node_ids if complete[node_id]]
         if sources:
             source = download_node_id if download_node_id in sources else sources[0]
-            await self._transfer_gguf_to_nodes(
-                repository, resolved_revision, source,
-                [node_id for node_id in targets if node_id != source],
-                requested_revision,
-            )
+            for node_id in targets:
+                await self.manager.node_transfer_model_files(
+                    source, node_id, repository, resolved_revision,
+                    selected_files, requested_revision,
+                )
             return
         candidates = [download_node_id] if download_node_id else [
             node_id for node_id in home_node_ids
@@ -1359,64 +1366,18 @@ class SparkDeckService:
             except Exception as exc:
                 failures.append(f"{candidate}: {exc}")
                 continue
-            remaining = []
             for node_id in targets:
                 if node_id == candidate:
                     continue
-                try:
-                    still_missing = not await self.manager.node_has_model_files(
-                        node_id, repository, resolved_revision, selected_files,
-                    )
-                except Exception:
-                    still_missing = True
-                if still_missing:
-                    remaining.append(node_id)
-            await self._transfer_gguf_to_nodes(
-                repository, resolved_revision, candidate, remaining,
-                requested_revision,
-            )
+                await self.manager.node_transfer_model_files(
+                    candidate, node_id, repository, resolved_revision,
+                    selected_files, requested_revision,
+                )
             return
         raise RuntimeError(
             "no selected node could download the GGUF artifact: "
             + "; ".join(failures)
         )
-
-    async def _transfer_gguf_to_nodes(
-        self, model_id: str, resolved_revision: str, source_node_id: str,
-        target_node_ids: list[str], requested_revision: str,
-    ) -> None:
-        """Queue Virtual NAS transfers for the artifact and await completion."""
-        if not target_node_ids:
-            return
-        if not self.manager.virtual_nas.enabled:
-            raise RuntimeError(
-                "Virtual NAS is required to distribute GGUF artifacts between nodes"
-            )
-        result = await self.manager.queue_virtual_nas_transfer(
-            model_id, source_node_id, target_node_ids, resolved_revision,
-            requested_revision=requested_revision,
-        )
-        job_ids = set(result["job_ids"])
-        while job_ids:
-            statuses = {
-                job["id"]: job
-                for job in self.manager.virtual_nas.list_transfers()["items"]
-            }
-            unfinished: set[str] = set()
-            for job_id in job_ids:
-                job = statuses.get(job_id)
-                if job is None:
-                    raise RuntimeError("GGUF transfer job is no longer tracked")
-                if job.get("status") == "completed":
-                    continue
-                if job.get("status") in {"failed", "canceled", "cancelled"}:
-                    raise RuntimeError(
-                        str(job.get("error") or f"GGUF transfer {job.get('status')}")
-                    )
-                unfinished.add(job_id)
-            if unfinished:
-                await asyncio.sleep(2)
-            job_ids = unfinished
 
     async def create_deployment(
         self, body: dict[str, Any], *, background: bool = False,
@@ -1460,6 +1421,15 @@ class SparkDeckService:
                     if not artifact_path.is_file():
                         raise ValueError(
                             "llama.cpp managed deployments require an existing local GGUF artifact"
+                        )
+                    if requested_node_ids and any(
+                        node_id != LOCAL_NODE_ID
+                        for node_id in requested_node_ids
+                    ):
+                        raise ValueError(
+                            "local GGUF artifact files live outside the cluster cache "
+                            "and cannot be distributed; select the controller only or "
+                            "use a repo-relative Hub artifact"
                         )
                     settings["model_source"] = "local"
                 else:

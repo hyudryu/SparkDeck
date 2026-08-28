@@ -119,7 +119,8 @@ export function DeploymentPage() {
     } finally { setBusy(undefined) }
   }
 
-  const run = async () => {
+  const run = async (form: HTMLFormElement | null) => {
+    if (!form || !form.reportValidity()) return
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       await persist()
@@ -161,7 +162,7 @@ export function DeploymentPage() {
         <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
         <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
-        <div className="settings-save wide-field"><Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button><Button type="button" variant="primary" disabled={disabled} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button></div>
+        <div className="settings-save wide-field"><Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button><Button type="button" variant="primary" disabled={disabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button></div>
       </form>
     </Panel>
   </>

@@ -137,6 +137,7 @@ export interface NodeInventoryItem extends NodeSummary {
   online?: boolean
   hidden_from_dashboard?: boolean
   docker_ready?: boolean
+  status_message?: string | null
   fabric_ready?: boolean
   selectable?: boolean
   // Rename results only: whether the new name reached the node itself
@@ -234,6 +235,13 @@ export interface FanControlSettings {
     hysteresis: FanHysteresisSettings
     manual: FanManualSettings
   }
+}
+
+export interface FanSettingsUpdateResult {
+  node_id: string
+  mode: FanControlMode
+  previous_mode: FanControlMode
+  active_settings: FanCurveSettings | FanPidSettings | FanHysteresisSettings | FanManualSettings
 }
 
 export interface FanControlState {

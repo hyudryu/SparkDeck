@@ -598,6 +598,30 @@ async def agent_set_fan_max_speed(req: Request):
         raise HTTPException(500, f"could not update FanController: {exc}") from exc
 
 
+@app.patch("/api/agent/fan-control/settings")
+async def agent_update_fan_settings(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {
+            "mode", "active_settings", "expected_mode",
+        }:
+            raise ValueError(
+                "request body must contain only mode, active_settings, and expected_mode"
+            )
+        if not isinstance(body["expected_mode"], str):
+            raise ValueError("expected_mode must be a string")
+        return manager.update_fan_settings(
+            body["mode"], body["active_settings"], body["expected_mode"],
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not save FanController settings: {exc}") from exc
+
+
 @app.get("/api/agent/routeros")
 async def agent_routeros(req: Request):
     _require_agent(req)
@@ -2000,6 +2024,32 @@ async def update_fan_control_max_speed(node_id: str, req: Request):
         raise HTTPException(409, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+@app.patch("/api/v1/fan-control/nodes/{node_id}/settings")
+async def update_fan_control_settings(node_id: str, req: Request):
+    _require_same_origin_or_forwarded(req, "FanController changes")
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {
+            "mode", "active_settings", "expected_mode",
+        }:
+            raise ValueError(
+                "request body must contain only mode, active_settings, and expected_mode"
+            )
+        if not isinstance(body["expected_mode"], str):
+            raise ValueError("expected_mode must be a string")
+        return await manager.update_node_fan_settings(
+            node_id, body["mode"], body["active_settings"], body["expected_mode"],
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not save FanController settings: {exc}") from exc
 
 
 @app.get("/api/v1/routeros/presence")

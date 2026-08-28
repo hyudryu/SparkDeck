@@ -17,6 +17,7 @@ SPA_PATHS = (
     "/chat",
     "/compare",
     "/cluster",
+    "/fan-control",
     "/switch",
     "/storage",
     "/benchmarks",
@@ -51,7 +52,13 @@ def register_spa_routes(app: FastAPI, frontend_dist: Path) -> None:
     async def spa_entry() -> Response:
         index_file = frontend_dist / "index.html"
         if index_file.exists():
-            return FileResponse(index_file)
+            # The entry points at content-hashed assets and must be revalidated
+            # on every navigation. Caching it can strand a normal refresh on an
+            # old bundle until the user forces a hard reload.
+            return FileResponse(
+                index_file,
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
         return Response(
             "SparkDeck's web app has not been built. "
             "Run ./run.sh or npm --prefix frontend run build.",

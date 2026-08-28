@@ -398,7 +398,6 @@ describe('model deployments', () => {
 
   it('deletes a saved recipe without removing deployments or cached weights', async () => {
     const user = userEvent.setup()
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     localStorage.setItem('sparkdeck:pinned-recipes', JSON.stringify(['recipe-1']))
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
@@ -421,8 +420,9 @@ describe('model deployments', () => {
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
     await user.click(await screen.findByRole('button', { name: 'org 1' }))
     await user.click(screen.getByRole('button', { name: 'Delete recipe Saved cluster' }))
-
-    expect(confirm).toHaveBeenCalledWith('Delete recipe Saved cluster? Existing deployments and cached model weights will not be removed.')
+    const confirmation = await screen.findByRole('dialog', { name: 'Delete recipe Saved cluster?' })
+    expect(confirmation).toHaveTextContent('Existing deployments and cached model weights will not be removed.')
+    await user.click(within(confirmation).getByRole('button', { name: 'Delete recipe' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/recipes/recipe-1', expect.objectContaining({ method: 'DELETE' }),
     ))
@@ -538,7 +538,6 @@ describe('model deployments', () => {
   it('confirms one selected-set preparation and rejects insufficient targets', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
@@ -600,8 +599,9 @@ describe('model deployments', () => {
     expect(dialog).toHaveTextContent('Not enough free cache space')
     expect(within(dialog).getByRole('radio', { name: /Short/ })).toBeDisabled()
     await user.click(prepare)
-
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Transfer org/model from Source via Virtual NAS to Enough?'))
+    const confirmation = await screen.findByRole('dialog', { name: 'Prepare model weights?' })
+    expect(confirmation).toHaveTextContent('Transfer org/model from Source via Virtual NAS to Enough?')
+    await user.click(within(confirmation).getByRole('button', { name: 'Start preparation' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/recipes/recipe-transfer/prepare',
       expect.objectContaining({
@@ -615,7 +615,6 @@ describe('model deployments', () => {
   it('queues one Hugging Face seed followed by Virtual NAS fan-out for selected nodes', async () => {
     const user = userEvent.setup()
     const gib = 1024 ** 3
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       const targets = [
@@ -666,10 +665,11 @@ describe('model deployments', () => {
     expect(within(dialog).getByRole('checkbox', { name: /Node A/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Node B/ })).toBeChecked()
     await user.click(await within(dialog).findByRole('button', { name: 'Prepare selected nodes' }))
-
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
+    const confirmation = await screen.findByRole('dialog', { name: 'Prepare model weights?' })
+    expect(confirmation).toHaveTextContent(
       'Download org/new-model revision main (4.0 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
-    ))
+    )
+    await user.click(within(confirmation).getByRole('button', { name: 'Start preparation' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/recipes/recipe-seed/prepare',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['node-a', 'node-b'] }) }),

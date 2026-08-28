@@ -31,6 +31,7 @@ from cluster import (
     AGENT_PROTOCOL_VERSION,
     LOCAL_NODE_ID,
     AgentCredentials,
+    NodeAgentResponseError,
     NodeRegistry,
 )
 from sparkdeck.onboarding import resolve_agent_connection
@@ -48,6 +49,7 @@ from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 from sparkdeck.workload_ownership import ManagedWorkloadLedger
 
 LEGACY_DEFAULT_HF_CACHE = "/home/hyudryu/.cache/huggingface"
+LEGACY_ROOT_HF_CACHE = "/root/.cache/huggingface"
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 
 DEFAULT_SETTINGS = {
@@ -1087,7 +1089,13 @@ class Manager:
 
         try:
             return await asyncio.to_thread(probe)
-        except Exception:
+        except Exception as exc:
+            detail = str(exc).casefold()
+            if "permission denied" in detail or "errno 13" in detail:
+                return False, (
+                    "SparkDeck's service user cannot access Docker. Add this "
+                    "user to the docker group, then restart the user session."
+                )
             return False, "Docker is unavailable"
 
     def _cluster_launch_update(
@@ -1194,7 +1202,7 @@ class Manager:
             for key in (
                 "id", "name", "local", "enabled", "status", "online",
                 "last_seen", "protocol_version", "docker_ready", "fabric_ready",
-                "stats", "disk", "hidden_from_dashboard",
+                "status_message", "stats", "disk", "hidden_from_dashboard",
                 "routeros",
             )
         } | {
@@ -1445,6 +1453,57 @@ class Manager:
         if not isinstance(result, dict) or result.get("enabled") is not enabled:
             raise RuntimeError("FanController did not accept the requested mode")
         return {"node_id": normalized, "enabled": enabled}
+
+    async def update_node_fan_settings(
+        self, node_id: str, mode: Any, settings: Any, expected_mode: Any,
+    ) -> dict:
+        """Atomically update FanController settings on one capable cluster node."""
+        validated = self._validate_fan_settings(mode, settings)
+        if not isinstance(expected_mode, str) or expected_mode not in FAN_MODE_DEFAULTS:
+            raise ValueError("unknown expected fan mode")
+        normalized = str(node_id or "").strip()
+        available = {node["id"]: node for node in await self.cluster_nodes()}
+        node = available.get(normalized)
+        if node is None:
+            raise ValueError("cluster node not found")
+        if not node.get("online"):
+            raise RuntimeError(f"{node.get('name', normalized)} is offline")
+        if self._sanitize_fan_state((node.get("stats") or {}).get("fan")) is None:
+            raise FanSettingsConflict("FanController state is unavailable")
+
+        body = {
+            "mode": mode,
+            "active_settings": validated,
+            "expected_mode": expected_mode,
+        }
+        if normalized == LOCAL_NODE_ID:
+            result = self.update_fan_settings(mode, validated, expected_mode)
+        else:
+            try:
+                result = await self.node_registry.request(
+                    normalized, "PATCH", "/api/agent/fan-control/settings",
+                    json_body=body, timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+                )
+            except NodeAgentResponseError as exc:
+                if exc.status_code == 409:
+                    try:
+                        payload = json.loads(exc.detail)
+                    except ValueError:
+                        payload = None
+                    detail = payload.get("detail") if isinstance(payload, dict) else None
+                    raise FanSettingsConflict(
+                        detail if isinstance(detail, str)
+                        else "fan mode changed; refresh and try again"
+                    ) from exc
+                raise
+        if (
+            not isinstance(result, dict)
+            or result.get("mode") != mode
+            or result.get("previous_mode") != expected_mode
+            or result.get("active_settings") != validated
+        ):
+            raise RuntimeError("FanController did not accept the requested settings")
+        return {**result, "node_id": normalized}
 
     async def rename_cluster_node(self, node_id: str, name: Any) -> dict:
         """Durably rename a local or paired node without exposing credentials.
@@ -5928,7 +5987,7 @@ class Manager:
         """Atomically update one mode and optionally make it the active mode."""
         validated = self._validate_fan_settings(mode, updates)
         expected_mode = mode if expected_mode is None else expected_mode
-        if expected_mode not in FAN_MODE_DEFAULTS:
+        if not isinstance(expected_mode, str) or expected_mode not in FAN_MODE_DEFAULTS:
             raise ValueError("unknown expected fan mode")
         with self._fan_settings_lock:
             state = self._read_fan_state()
@@ -5992,12 +6051,14 @@ class Manager:
                 # opt-out so an older settings file cannot silently leave a
                 # node out of Usage totals.
                 data.pop("sync_token_usage", None)
-                # Early builds persisted the original developer's Linux home
-                # as the default on every platform. Migrate only that exact
-                # legacy value so explicit custom cache locations are kept.
+                # Early builds and root-run services persisted a different
+                # account's default Linux cache. Migrate only those exact
+                # defaults so explicit custom cache locations are kept.
                 if (
-                    data.get("hf_cache") == LEGACY_DEFAULT_HF_CACHE
-                    and DEFAULT_HF_CACHE != LEGACY_DEFAULT_HF_CACHE
+                    data.get("hf_cache") in {
+                        LEGACY_DEFAULT_HF_CACHE, LEGACY_ROOT_HF_CACHE,
+                    }
+                    and data.get("hf_cache") != DEFAULT_HF_CACHE
                 ):
                     data["hf_cache"] = DEFAULT_HF_CACHE
                     try:

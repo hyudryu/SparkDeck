@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StorageState } from '../api/types'
@@ -101,6 +101,42 @@ describe('StoragePage', () => {
     // cannot be validated.
     expect(screen.getByText('2.8 GB total')).toBeInTheDocument()
     expect(screen.queryByText('50 GB free')).not.toBeInTheDocument()
+  })
+
+  it('sorts Virtual NAS models by model ID in descending order', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              { model_id: 'org/alpha', size_bytes: 100 },
+              { model_id: 'org/zeta', size_bytes: 300 },
+              { model_id: 'org/model', size_bytes: 200 },
+            ],
+          }
+        : node),
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
+    expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
+      'org/zeta', 'org/model', 'org/alpha',
+    ])
+
+    const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
+    await waitFor(() => expect(
+      within(modelSelect).getAllByRole('option').map((option) => option.textContent),
+    ).toEqual(['Select a model', 'org/zeta', 'org/model', 'org/alpha']))
+
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    expect([...inventory.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
+      'org/zeta', 'org/offline-model', 'org/model', 'org/alpha',
+    ])
+    expect(storage.nodes[0].models.map((model) => model.model_id)).toEqual([
+      'org/alpha', 'org/zeta', 'org/model',
+    ])
   })
 
   it('queues a transfer from the keyboard and touch-friendly form', async () => {

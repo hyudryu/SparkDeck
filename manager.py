@@ -9377,6 +9377,34 @@ class Manager:
                             used.add(int(b["HostPort"]))
                         except Exception:
                             pass
+                try:
+                    service_port = int(
+                        _label_value(c.labels or {}, SERVICE_PORT_LABEL)
+                    )
+                except (TypeError, ValueError):
+                    service_port = 0
+                if (
+                    not 1 <= service_port <= 65535
+                    and _label_value(c.labels or {}, MODE_LABEL) == "sharded"
+                ):
+                    command = (
+                        ((c.attrs or {}).get("Config") or {}).get("Cmd") or []
+                    )
+                    if isinstance(command, str):
+                        try:
+                            command = shlex.split(command)
+                        except ValueError:
+                            command = command.split()
+                    elif not isinstance(command, (list, tuple)):
+                        command = []
+                    service_port = self._cli_option(
+                        list(command), {"--port"}, int,
+                    ) or 0
+                if 1 <= service_port <= 65535:
+                    # Sharded members use host networking, so Docker exposes
+                    # no c.ports binding. Their explicit service-port label
+                    # carries ownership until the container is removed.
+                    used.add(service_port)
             return used
 
         used = await asyncio.to_thread(_scan)
@@ -9394,13 +9422,29 @@ class Manager:
                 member for member in (deployment.get("members") or [])
                 if isinstance(member, dict)
             ]
-            primary_member = next(
-                (
-                    member for member in members
-                    if int(member.get("rank") or 0) == 0
-                ),
-                members[0] if members else None,
-            )
+            # Persisted member order is the compatibility fallback. Inspect
+            # ranks individually so one corrupt entry cannot hide a later
+            # valid rank 0, and never infer primary ownership from negatives.
+            primary_member = members[0] if members else None
+            for member in members:
+                raw_rank = member.get("rank")
+                if isinstance(raw_rank, bool):
+                    continue
+                if isinstance(raw_rank, int):
+                    rank = raw_rank
+                elif (
+                    isinstance(raw_rank, str)
+                    and re.fullmatch(r"[+-]?\d+", raw_rank.strip())
+                ):
+                    try:
+                        rank = int(raw_rank)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                if rank == 0:
+                    primary_member = member
+                    break
             # api_port belongs to the primary member. A remote-only
             # deployment's primary port lives in that worker's host namespace
             # and must not consume the same number on the controller.
@@ -9639,12 +9683,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
@@ -9792,12 +9831,7 @@ class Manager:
                         NODE_LABEL: cluster_member["node_id"],
                         RANK_LABEL: str(cluster_member["rank"]),
                         SERVICE_PORT_LABEL: (
-                            str(serve_port)
-                            if distributed_member and (
-                                cluster_member.get("mode") != "sharded"
-                                or int(cluster_member.get("rank", 0)) == 0
-                            )
-                            else ""
+                            str(serve_port) if distributed_member else ""
                         ),
                         MODE_LABEL: cluster_member.get("mode", "single"),
                         NNODES_LABEL: str(cluster_member.get("nnodes", 1)),

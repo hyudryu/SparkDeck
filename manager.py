@@ -37,10 +37,12 @@ from cluster import (
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.virtual_nas import (
-    DOWNLOAD_STAGING_RESERVE_BYTES,
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VirtualNAS,
+    cached_download_bytes,
+    download_required_free_bytes,
+    partial_download_size_bytes,
     validate_model_id,
     validate_revision,
 )
@@ -1689,6 +1691,94 @@ class Manager:
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
+    async def queue_virtual_nas_download(
+        self, model_id: str, node_id: str, revision: str | None = None,
+    ) -> dict:
+        """Queue a resumable Hub download for an existing partial cache."""
+        model_id = validate_model_id(model_id)
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("node_id must not be empty")
+        requested_revision = validate_revision(revision) if revision is not None else None
+        recovered_resolution = None
+        if requested_revision is None:
+            previous_downloads = sorted(
+                (
+                    job for job in self.virtual_nas.list_transfers()["items"]
+                    if job.get("kind") == "download"
+                    and job.get("model_id") == model_id
+                    and job.get("target_node_id") == node_id
+                    and job.get("status") in {"failed", "canceled", "cancelled"}
+                    and (
+                        job.get("download_attempted_at") is not None
+                        or (
+                            job.get("legacy_download_attempt_tracking")
+                            and job.get("status") == "failed"
+                            and job.get("started_at") is not None
+                        )
+                    )
+                ),
+                key=lambda job: float(job.get("created_at") or 0),
+                reverse=True,
+            )
+            for job in previous_downloads:
+                try:
+                    requested_revision = validate_revision(
+                        job.get("requested_revision") or job.get("revision")
+                    )
+                    resolved_revision = str(job.get("revision") or "").strip()
+                    if not IMMUTABLE_HF_REVISION.fullmatch(resolved_revision):
+                        continue
+                    recovered_size = self._byte_count(job.get("bytes_total"))
+                    if not recovered_size:
+                        recovered_size = await self.virtual_nas.estimate_download_size(
+                            model_id, resolved_revision,
+                        )
+                    recovered_resolution = {
+                        "requested_revision": requested_revision,
+                        "resolved_revision": resolved_revision,
+                        "size_bytes": recovered_size,
+                        "resume_node_id": node_id,
+                        "download_cache_baseline_bytes": job.get(
+                            "download_cache_baseline_bytes"
+                        ),
+                    }
+                except ValueError:
+                    continue
+                break
+        requested_revision = requested_revision or "main"
+        resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
+            model_id, requested_revision,
+        )
+        preflight = await self.virtual_nas_transfer_preflight(
+            model_id, requested_revision, resolution,
+        )
+        target = next((
+            item for item in preflight["targets"] if item["node_id"] == node_id
+        ), None)
+        if target is None:
+            raise LookupError(f"storage node '{node_id}' not found")
+        if not target.get("has_partial_model_cache"):
+            raise LookupError("partial model cache not found on the selected node")
+        if not target.get("download_eligible"):
+            raise RuntimeError(
+                str(target.get("download_reason") or "node is not eligible for download")
+            )
+        result = await self.virtual_nas.queue_download_and_transfer(
+            model_id,
+            preflight["resolved_revision"],
+            node_id,
+            [],
+            preflight["download"]["size_bytes"],
+            requested_revision=requested_revision,
+            require_partial_cache=True,
+            download_cache_baseline_bytes=resolution.get(
+                "download_cache_baseline_bytes"
+            ),
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
         resolved_download: dict | None = None,
@@ -1767,10 +1857,6 @@ class Manager:
             source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if source else None
         )
-        download_required_free = (
-            download_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
-            if download_size else None
-        )
         transfer_after_download_required_free = (
             download_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
             if download_size else None
@@ -1786,6 +1872,20 @@ class Manager:
             # Generic node-disk telemetry is display-only and must never make
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
+            cached_bytes = partial_download_size_bytes(existing)
+            if (
+                resolved_download
+                and resolved_download.get("resume_node_id") == node_id
+                and resolved_download.get("download_cache_baseline_bytes") is not None
+            ):
+                cached_bytes = cached_download_bytes(
+                    existing,
+                    resolved_download.get("download_cache_baseline_bytes"),
+                )
+            node_download_required_free = (
+                download_required_free_bytes(download_size, cached_bytes)
+                if download_size else None
+            )
             active = active_jobs.get(node_id)
             conflicting = conflicting_jobs.get(node_id)
             conflict_reason = (
@@ -1842,7 +1942,7 @@ class Manager:
             elif download_error:
                 download_eligible = False
                 download_reason = download_error
-            elif download_required_free is None:
+            elif node_download_required_free is None:
                 download_eligible = False
                 download_reason = "Hugging Face download size is unavailable"
             elif not node.get("online"):
@@ -1860,7 +1960,7 @@ class Manager:
             elif free_bytes is None:
                 download_eligible = False
                 download_reason = "Free cache capacity is unavailable"
-            elif free_bytes < download_required_free:
+            elif free_bytes < node_download_required_free:
                 download_eligible = False
                 download_reason = "Not enough free cache space for the Hugging Face download"
 
@@ -1904,9 +2004,12 @@ class Manager:
                 "preparation_conflict_reason": conflict_reason,
                 "has_required_weights": has_required_weights,
                 "has_model_cache": existing is not None,
+                "has_partial_model_cache": bool(existing and (
+                    existing.get("partial") or existing.get("has_partial_download")
+                )),
                 "download_eligible": download_eligible,
                 "download_reason": download_reason,
-                "download_required_free_bytes": download_required_free,
+                "download_required_free_bytes": node_download_required_free,
                 "transfer_after_download_eligible": transfer_after_download_eligible,
                 "transfer_after_download_reason": transfer_after_download_reason,
                 "transfer_after_download_required_free_bytes": transfer_after_download_required_free,
@@ -1920,7 +2023,7 @@ class Manager:
             "sources": sources,
             "download": ({
                 "size_bytes": download_size,
-                "required_free_bytes": download_required_free,
+                "required_free_bytes": download_required_free_bytes(download_size),
             } if download_size else None),
             "download_error": download_error,
             "targets": targets,
@@ -1971,7 +2074,7 @@ class Manager:
             source = selected_sources[0]
             transfer_required = source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
             download = preflight.get("download")
-            download_required = (
+            default_download_required = (
                 self._byte_count(download.get("required_free_bytes"))
                 if download else None
             )
@@ -1982,6 +2085,11 @@ class Manager:
             for node_id in missing_ids:
                 option = options[node_id]
                 free_bytes = self._byte_count(option.get("free_bytes"))
+                download_required = self._byte_count(
+                    option.get("download_required_free_bytes")
+                )
+                if download_required is None:
+                    download_required = default_download_required
                 if option.get("has_model_cache"):
                     download_ids.append(node_id)
                     if not option.get("download_eligible"):
@@ -2043,7 +2151,6 @@ class Manager:
                 "reason": download_error or "Hugging Face download size is unavailable",
             }
 
-        download_required = download["required_free_bytes"]
         transfer_required = (
             download["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
         )
@@ -2076,6 +2183,13 @@ class Manager:
             for download_id in download_ids:
                 target = options[download_id]
                 target_free = self._byte_count(target.get("free_bytes"))
+                target_download_required = self._byte_count(
+                    target.get("download_required_free_bytes")
+                )
+                if target_download_required is None:
+                    target_download_required = self._byte_count(
+                        download.get("required_free_bytes")
+                    )
                 if not target.get("download_eligible"):
                     blocked.append(
                         target.get("download_reason")
@@ -2090,7 +2204,9 @@ class Manager:
                     )
                 elif target_free is None:
                     blocked.append("Free cache capacity is unavailable")
-                elif target_free < download_required:
+                elif target_download_required is None:
+                    blocked.append("Hugging Face download size is unavailable")
+                elif target_free < target_download_required:
                     blocked.append("Not enough free cache space for the Hugging Face download")
             for target_id in transfer_ids:
                 target = options[target_id]

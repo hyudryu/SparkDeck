@@ -627,6 +627,41 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             registry.request.assert_not_awaited()
 
+    async def test_resumed_download_revalidates_with_attempt_baseline_credit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            cached = 25
+            required = MODEL_BYTES * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+            job = queued_job(
+                kind="download", source_node_id="huggingface",
+                target_node_id="seed", bytes_total=MODEL_BYTES,
+                require_partial_cache=True,
+                download_cache_baseline_bytes=100,
+            )
+            nas.jobs = [job]
+            nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
+            nas._node_storage = AsyncMock(return_value={
+                "models": [{
+                    "model_id": MODEL_ID, "size_bytes": 125,
+                    "partial": False, "has_partial_download": True,
+                    "partial_size_bytes": cached,
+                }],
+                "free_size": required,
+            })
+            registry.request.return_value = {"ok": True, "size_bytes": MODEL_BYTES}
+
+            await nas._run_download(job)
+
+            self.assertEqual(job["status"], "completed")
+            request = registry.request.await_args
+            self.assertEqual(
+                request.kwargs["json_body"]["download_cache_baseline_bytes"], 100,
+            )
+
     async def test_stop_waits_for_uncancelable_local_download_without_requeue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

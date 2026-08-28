@@ -103,15 +103,15 @@ describe('StoragePage', () => {
     expect(screen.queryByText('50 GB free')).not.toBeInTheDocument()
   })
 
-  it('sorts Virtual NAS models by model ID in descending order', async () => {
+  it('sorts Virtual NAS models by size in descending order', async () => {
     const storage: StorageState = {
       ...enabledStorage,
       nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
         ? {
             ...node,
             models: [
-              { model_id: 'org/alpha', size_bytes: 100 },
-              { model_id: 'org/zeta', size_bytes: 300 },
+              { model_id: 'org/alpha', size_bytes: 300 },
+              { model_id: 'org/zeta', size_bytes: 100 },
               { model_id: 'org/model', size_bytes: 200 },
             ],
           }
@@ -122,24 +122,24 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
     expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
-      'org/zeta', 'org/model', 'org/alpha',
+      'org/alpha', 'org/model', 'org/zeta',
     ])
 
     const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
     await waitFor(() => expect(
       within(modelSelect).getAllByRole('option').map((option) => option.textContent),
-    ).toEqual(['Select a model', 'org/zeta', 'org/model', 'org/alpha']))
+    ).toEqual(['Select a model', 'org/alpha', 'org/model', 'org/zeta']))
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     expect([...inventory.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
-      'org/zeta', 'org/offline-model', 'org/model', 'org/alpha',
+      'org/offline-model', 'org/alpha', 'org/model', 'org/zeta',
     ])
     expect(storage.nodes[0].models.map((model) => model.model_id)).toEqual([
       'org/alpha', 'org/zeta', 'org/model',
     ])
   })
 
-  it('keeps in-progress downloads above the descending model order', async () => {
+  it('keeps in-progress downloads in strict descending size order', async () => {
     const storage: StorageState = {
       ...enabledStorage,
       nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
@@ -180,7 +180,7 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
     expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
-      'org/alpha', 'org/zeta', 'org/model', 'org/beta', 'org/aardvark',
+      'org/zeta', 'org/model', 'org/beta', 'org/alpha', 'org/aardvark',
     ])
 
     const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
@@ -190,7 +190,7 @@ describe('StoragePage', () => {
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     expect([...inventory.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
-      'org/alpha', 'org/zeta', 'org/offline-model', 'org/model', 'org/beta', 'org/aardvark',
+      'org/offline-model', 'org/zeta', 'org/model', 'org/beta', 'org/alpha', 'org/aardvark',
     ])
     expect(storage.nodes[0].models.map((model) => model.model_id)).toEqual([
       'org/alpha', 'org/zeta', 'org/model', 'org/aardvark', 'org/beta',
@@ -230,18 +230,59 @@ describe('StoragePage', () => {
             models: [
               ...node.models,
               { model_id: 'org/partial-model', size_bytes: 400_000_000, partial: true },
+              {
+                model_id: 'org/mixed-model', size_bytes: 600_000_000,
+                partial: false, has_partial_download: true,
+                partial_size_bytes: 50_000_000, revision: 'complete-a',
+              },
             ],
           }
         : node),
     }
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    let finished = false
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/nodes/node-a/models/org%2Fpartial-model/download') && init?.method === 'POST') {
+        finished = true
+        return json({ job_ids: ['download-1'], jobs: [] }, 202)
+      }
+      return json(finished ? {
+        ...storage,
+        nodes: storage.nodes.map((node) => node.id === 'node-a' ? {
+          ...node,
+          models: node.models.map((model) => model.model_id === 'org/partial-model'
+            ? { ...model, partial: false, revision: 'release-1' }
+            : model),
+        } : node),
+      } : storage)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
     render(<StoragePage />)
 
     const partial = await screen.findByLabelText('Partial cache org/partial-model on Studio Spark')
     expect(partial).toHaveTextContent('Partial')
     expect(partial).toHaveAttribute('draggable', 'false')
-    expect(screen.getByLabelText('Partial cache')).toBeInTheDocument()
-    expect(screen.queryByRole('option', { name: 'org/partial-model' })).not.toBeInTheDocument()
+    const mixed = screen.getByLabelText('Transfer org/mixed-model from Studio Spark')
+    expect(mixed).toHaveTextContent('Incomplete download')
+    expect(mixed).toHaveAttribute('draggable', 'true')
+    expect(screen.getByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'org/mixed-model' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
+    let dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false)
+
+    await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark from inventory' }))
+    dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Finish download' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/storage/nodes/node-a/models/org%2Fpartial-model/download',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({}) }),
+    ))
+    expect(await screen.findByRole('status')).toHaveTextContent('Queued org/partial-model to finish downloading on Studio Spark.')
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Finish download of org\/partial-model/ })).not.toBeInTheDocument())
+    expect(screen.getByRole('option', { name: 'org/partial-model' })).toBeInTheDocument()
   })
 
   it('supports drag transfer, per-node deletion, and queue cancellation', async () => {

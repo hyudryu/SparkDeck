@@ -1,6 +1,8 @@
+import asyncio
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -274,6 +276,27 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
              ]):
             with self.assertRaisesRegex(RuntimeError, "overwriting local files"):
                 await self.service.preflight_local("main", "b" * 40)
+
+    async def test_preflight_keeps_event_loop_responsive_during_local_checks(self):
+        check_started = threading.Event()
+        event_loop_progressed = threading.Event()
+
+        def blocking_local_check(_root):
+            check_started.set()
+            if not event_loop_progressed.wait(timeout=1):
+                return ["event loop stalled during local installation checks"]
+            return ["expected local blocker"]
+
+        async def prove_event_loop_progress():
+            while not check_started.is_set():
+                await asyncio.sleep(0)
+            event_loop_progressed.set()
+
+        with patch("sparkdeck.updater.local_blockers", side_effect=blocking_local_check):
+            progress = asyncio.create_task(prove_event_loop_progress())
+            with self.assertRaisesRegex(RuntimeError, "expected local blocker"):
+                await self.service.preflight_local("main", "b" * 40)
+            await progress
 
     async def test_interrupted_local_helper_becomes_retryable(self):
         self.service._write(self.service.agent_path, {

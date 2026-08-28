@@ -356,15 +356,31 @@ class UpdateService:
                 return changed
         return False
 
-    def agent_status(self) -> dict:
-        revision = current_revision(self.root)
+    def _reconciled_agent_state(self, revision: str | None = None) -> dict:
         state = self._read(self.agent_path)
         if state.get("phase") in {"accepted", "staging", "restarting"}:
             if not _helper_alive(state):
-                state["phase"] = "failed"
-                state["error"] = "The local update helper was interrupted"
-                state["message"] = "Interrupted update can be retried"
+                installed_after_restart = bool(
+                    state.get("phase") == "restarting"
+                    and revision
+                    and state.get("target_revision") == revision
+                )
+                state["phase"] = "succeeded" if installed_after_restart else "failed"
+                state["message"] = (
+                    "Update installed and verified after restart"
+                    if installed_after_restart
+                    else "Interrupted update can be retried"
+                )
+                if installed_after_restart:
+                    state.pop("error", None)
+                else:
+                    state["error"] = "The local update helper was interrupted"
                 self._write(self.agent_path, state)
+        return state
+
+    def agent_status(self) -> dict:
+        revision = current_revision(self.root)
+        state = self._reconciled_agent_state(revision)
         return {
             "capability": CAPABILITY,
             "current_revision": revision,
@@ -775,11 +791,12 @@ class UpdateService:
         async with self._agent_lock:
             if not branch or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
                 raise ValueError("A valid update target and immutable commit are required")
-            await self.preflight_local(branch, revision)
-            state = self._read(self.agent_path)
+            installed_revision = current_revision(self.root)
+            state = self._reconciled_agent_state(installed_revision)
             if state.get("phase") in {"accepted", "staging", "restarting"}:
                 raise RuntimeError("This node is already updating")
-            if current_revision(self.root) == revision.lower():
+            await self.preflight_local(branch, revision)
+            if installed_revision == revision.lower():
                 state = {
                     "phase": "succeeded", "target_branch": branch,
                     "target_revision": revision.lower(), "message": "Already up to date",

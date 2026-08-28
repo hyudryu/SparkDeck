@@ -231,6 +231,7 @@ export function ModelsPage() {
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
+  const catalogShardedLayout = useRef(false)
 
   useEffect(() => {
     if (!recipeDeployment) return
@@ -320,10 +321,13 @@ export function ModelsPage() {
   useEffect(() => {
     const modelId = searchParams.get('model')?.trim()
     if (!modelId) return
+    const sharded = searchParams.get('layout') === 'sharded'
+    catalogShardedLayout.current = sharded
     setForm((current) => ({
       ...current,
       model_id: modelId,
       alias: current.alias || modelId.split('/').at(-1) || modelId,
+      deployment_mode: sharded ? 'sharded' : current.deployment_mode,
     }))
     setCreating(true)
     setSearchParams({}, { replace: true })
@@ -336,12 +340,27 @@ export function ModelsPage() {
       const local = inventory.find((node) => node.local)
       const available = (current.node_ids ?? []).filter((id) => inventory.some((node) => node.id === id && isNodeSelectable(node)))
       const fallback = local && isNodeSelectable(local) ? local : inventory.find(isNodeSelectable)
-      const nodeIds = available.length ? available : fallback ? [fallback.id] : []
-      return { ...current, node_ids: nodeIds, deployment_mode: nodeIds.length > 1 ? 'replicated' : 'single' }
+      const sharded = (current.deployment_mode === 'sharded' || catalogShardedLayout.current)
+        && Boolean(local && isNodeSelectable(local))
+      const nodeIds = sharded
+        ? [local!.id, ...inventory.filter((node) => node.id !== local!.id && isNodeSelectable(node)).map((node) => node.id)]
+        : available.length ? available : fallback ? [fallback.id] : []
+      const deploymentMode = sharded && nodeIds.length > 1 ? 'sharded' : nodeIds.length > 1 ? 'replicated' : 'single'
+      catalogShardedLayout.current = false
+      return {
+        ...current,
+        node_ids: nodeIds,
+        deployment_mode: deploymentMode,
+        settings: current.runtime === 'llama.cpp' ? current.settings : {
+          ...current.settings,
+          tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds.length : 1,
+        },
+      }
     })
   }, [nodes.data])
 
   const localNodeId = nodes.data?.find((node) => node.local)?.id
+  const shardedAvailable = nodes.data?.some((node) => node.id === localNodeId && isNodeSelectable(node)) ?? false
 
   useEffect(() => {
     if (!appSettings.data || defaultsApplied.current) return
@@ -355,14 +374,19 @@ export function ModelsPage() {
       const nodeIds = runtime === 'llama.cpp'
         ? [localNodeId ?? current.node_ids?.[0] ?? 'local']
         : current.node_ids
+      const deploymentMode = runtime !== 'llama.cpp'
+        && current.deployment_mode === 'sharded'
+        && (nodeIds?.length ?? 0) > 1
+        ? 'sharded'
+        : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
       return {
         ...current,
         runtime,
         node_ids: nodeIds,
-        deployment_mode: (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single',
+        deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
           ? { context_length: contextLength, parallel_slots: current.settings.parallel_slots ?? 1, gpu_layers: current.settings.gpu_layers ?? 99 }
-          : { context_length: contextLength, tensor_parallel_size: current.settings.tensor_parallel_size ?? 1 },
+          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1 },
       }
     })
   }, [appSettings.data, localNodeId])
@@ -370,7 +394,42 @@ export function ModelsPage() {
   const selectionReady = !nodes.loading && !nodes.error && (form.node_ids?.length ?? 0) > 0
     && (form.node_ids ?? []).every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
     && (form.runtime !== 'llama.cpp' || (form.node_ids?.length === 1 && form.node_ids[0] === localNodeId))
+    && (form.deployment_mode !== 'sharded' || (
+      (form.node_ids?.length ?? 0) > 1
+      && form.node_ids?.[0] === localNodeId
+      && form.settings.tensor_parallel_size === (form.node_ids?.length ?? 0)
+    ))
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
+
+  const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
+    const sharded = current.deployment_mode === 'sharded'
+    const nodeIds = sharded && localNodeId
+      ? [localNodeId, ...selectedIds.filter((id) => id !== localNodeId)]
+      : selectedIds
+    const deploymentMode = nodeIds.length > 1 ? (sharded ? 'sharded' : 'replicated') : 'single'
+    return {
+      ...current,
+      node_ids: nodeIds,
+      deployment_mode: deploymentMode,
+      settings: current.runtime === 'llama.cpp' ? current.settings : {
+        ...current.settings,
+        tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds.length : 1,
+      },
+    }
+  })
+
+  const updateDeploymentMode = (mode: 'replicated' | 'sharded') => setForm((current) => {
+    const selectedIds = current.node_ids ?? []
+    const nodeIds = mode === 'sharded' && localNodeId
+      ? [localNodeId, ...selectedIds.filter((id) => id !== localNodeId)]
+      : selectedIds
+    return {
+      ...current,
+      node_ids: nodeIds,
+      deployment_mode: mode,
+      settings: { ...current.settings, tensor_parallel_size: mode === 'sharded' ? nodeIds.length : 1 },
+    }
+  })
 
   const openCreator = () => {
     setCreating(true)
@@ -804,14 +863,19 @@ export function ModelsPage() {
       const contextLength = current.settings.context_length ?? 8192
       const localId = localNodeId ?? 'local'
       const nodeIds = runtime === 'llama.cpp' ? [localId] : current.node_ids
+      const deploymentMode = runtime !== 'llama.cpp'
+        && current.deployment_mode === 'sharded'
+        && (nodeIds?.length ?? 0) > 1
+        ? 'sharded'
+        : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
       return {
         ...current,
         runtime,
         node_ids: nodeIds,
-        deployment_mode: (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single',
+        deployment_mode: deploymentMode,
         settings: runtime === 'llama.cpp'
           ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-          : { context_length: contextLength, tensor_parallel_size: 1 },
+          : { context_length: contextLength, tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1 },
       }
     })
   }
@@ -1131,18 +1195,19 @@ export function ModelsPage() {
               {form.managed && <NodeSelector
                 nodes={nodes.data ?? []}
                 selectedIds={form.node_ids ?? []}
-                onChange={(nodeIds) => setForm({ ...form, node_ids: nodeIds, deployment_mode: nodeIds.length > 1 ? 'replicated' : 'single' })}
+                onChange={updateNodeSelection}
                 loading={nodes.loading}
                 error={nodes.error}
                 onRetry={nodes.reload}
                 multiple={form.runtime !== 'llama.cpp'}
                 disabled={busy === 'create'}
-                requiredIds={form.runtime === 'llama.cpp' && localNodeId ? [localNodeId] : []}
+                requiredIds={(form.runtime === 'llama.cpp' || form.deployment_mode === 'sharded') && localNodeId ? [localNodeId] : []}
                 allowedIds={form.runtime === 'llama.cpp' && localNodeId ? [localNodeId] : undefined}
                 localLabel={localLabel}
-                primaryId={(form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
+                primaryId={form.deployment_mode === 'sharded' ? localNodeId : (form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">llama.cpp deployments use the local node because GGUF artifacts are local to this device.</p>}
+              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Replicated (full weights per node)</option><option value="sharded" disabled={!shardedAvailable}>Sharded (split one model across nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The controller is required as the primary node, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
                   contextLengthTouched.current = true
@@ -1151,7 +1216,7 @@ export function ModelsPage() {
                 {form.runtime === 'llama.cpp' ? (
                   <label className="field"><span>Parallel slots</span><input type="number" min="1" value={form.settings.parallel_slots} onChange={(event) => setForm({ ...form, settings: { ...form.settings, parallel_slots: Number(event.target.value) } })} /></label>
                 ) : (
-                  <label className="field"><span>Tensor parallel size</span><input type="number" min="1" value={form.settings.tensor_parallel_size} onChange={(event) => setForm({ ...form, settings: { ...form.settings, tensor_parallel_size: Number(event.target.value) } })} /></label>
+                  <label className="field"><span>Tensor parallel size</span><input type="number" min="1" readOnly={form.deployment_mode === 'sharded'} value={form.settings.tensor_parallel_size} onChange={(event) => setForm({ ...form, settings: { ...form.settings, tensor_parallel_size: Number(event.target.value) } })} />{form.deployment_mode === 'sharded' && <small>Derived from the {form.node_ids?.length ?? 0} selected nodes.</small>}</label>
                 )}
               </div>
               {form.managed && <>

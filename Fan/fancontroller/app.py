@@ -49,6 +49,7 @@ log = logging.getLogger("fancontroller")
 # Held open for the process lifetime by the primary instance (see
 # _acquire_single_instance); a second instance must not fight over the port.
 LOCK_PATH = STATE_DIR / "app.lock"
+STALE_CONFIG_MTIME_NS = -1
 
 MODES = [
     ("curve", "Curve"),
@@ -584,8 +585,12 @@ class FanApp:
         # still detected on the next poll.
         self.settings_mtime_ns = observed_mtime_ns
 
-        self.sources = discover()
-        self.source_map = {source.key: source for source in self.sources}
+        discovered_sources = discover()
+        if discovered_sources:
+            self.sources = discovered_sources
+            self.source_map = {
+                source.key: source for source in discovered_sources
+            }
         self.settings.sources = [
             key for key in self.settings.sources if key in self.source_map
         ]
@@ -608,7 +613,7 @@ class FanApp:
             off_temp=self.settings.hyst_off_temp,
         )
         self.temp_smoother.reset()
-        self.slew.reset()
+        self.slew.sync(byte_to_pct(self.current_duty_byte), time.monotonic())
 
         port_changed = old_port != self.settings.serial_port
         if port_changed:
@@ -923,7 +928,17 @@ class FanApp:
     def _save(self) -> None:
         try:
             self.settings.save()
-            self.settings_mtime_ns = self._config_mtime()
+            written_mtime_ns = self._config_mtime()
+            saved_settings = Settings.load()
+            verified_mtime_ns = self._config_mtime()
+            if (
+                written_mtime_ns == verified_mtime_ns
+                and saved_settings == self.settings
+            ):
+                self.settings_mtime_ns = written_mtime_ns
+            else:
+                # Force the next poll to reload whichever writer won the race.
+                self.settings_mtime_ns = STALE_CONFIG_MTIME_NS
         except OSError as e:
             log.error("settings save failed: %s", e)
 

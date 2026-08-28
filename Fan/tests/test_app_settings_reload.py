@@ -53,15 +53,20 @@ class ForegroundSettingsReloadTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         sys.modules.pop("fancontroller.app", None)
 
+    def setUp(self) -> None:
+        self.app_module.GLib.idle_add.reset_mock()
+
     def test_external_config_rebuilds_publishing_controllers(self) -> None:
         instance = self.app_module.FanApp.__new__(self.app_module.FanApp)
         instance.settings = Settings(mode="pid", poll_interval_s=1.0)
         instance.settings_mtime_ns = 100
         instance._config_mtime = mock.Mock(return_value=200)
-        instance.sources = []
-        instance.source_map = {}
+        existing_source = types.SimpleNamespace(key="gpu")
+        instance.sources = [existing_source]
+        instance.source_map = {"gpu": existing_source}
         instance.temp_smoother = mock.Mock()
         instance.slew = mock.Mock()
+        instance.current_duty_byte = 128
         instance.link = None
         instance._replace_serial_link = mock.Mock()
         instance._sync_settings_widgets = mock.Mock()
@@ -72,10 +77,12 @@ class ForegroundSettingsReloadTests(unittest.TestCase):
             curve_points=[[35.5, 15.25], [70.5, 88.75]],
             min_floor_pct=12.5,
             poll_interval_s=2.0,
+            sources=["gpu"],
         )
         with (
             mock.patch.object(self.app_module.Settings, "load", return_value=updated),
             mock.patch.object(self.app_module, "discover", return_value=[]),
+            mock.patch.object(self.app_module.time, "monotonic", return_value=50.0),
         ):
             instance._reload_settings_if_changed()
 
@@ -84,8 +91,14 @@ class ForegroundSettingsReloadTests(unittest.TestCase):
         self.assertEqual(instance.curve.points, [(35.5, 15.25), (70.5, 88.75)])
         self.assertEqual(instance.curve.min_floor_pct, 12.5)
         self.assertEqual(instance.pid.min_floor_pct, 12.5)
+        self.assertEqual(instance.sources, [existing_source])
+        self.assertEqual(instance.source_map, {"gpu": existing_source})
+        self.assertEqual(instance.settings.sources, ["gpu"])
         instance.temp_smoother.reset.assert_called_once_with()
-        instance.slew.reset.assert_called_once_with()
+        instance.slew.sync.assert_called_once_with(
+            self.app_module.byte_to_pct(128), 50.0,
+        )
+        instance.slew.reset.assert_not_called()
         instance._sync_settings_widgets.assert_called_once_with(False)
         self.app_module.GLib.idle_add.assert_called_with(instance._schedule_poll)
 
@@ -105,12 +118,31 @@ class ForegroundSettingsReloadTests(unittest.TestCase):
         instance = self.app_module.FanApp.__new__(self.app_module.FanApp)
         instance.settings = mock.Mock()
         instance.settings_mtime_ns = 100
-        instance._config_mtime = mock.Mock(return_value=300)
+        instance._config_mtime = mock.Mock(side_effect=[300, 300])
 
-        instance._save()
+        with mock.patch.object(
+            self.app_module.Settings, "load", return_value=instance.settings,
+        ):
+            instance._save()
 
         instance.settings.save.assert_called_once_with()
         self.assertEqual(instance.settings_mtime_ns, 300)
+
+    def test_racing_external_write_forces_a_reload_after_local_save(self) -> None:
+        instance = self.app_module.FanApp.__new__(self.app_module.FanApp)
+        instance.settings = mock.Mock()
+        instance.settings_mtime_ns = 100
+        instance._config_mtime = mock.Mock(side_effect=[300, 400])
+
+        with mock.patch.object(
+            self.app_module.Settings, "load", return_value=instance.settings,
+        ):
+            instance._save()
+
+        self.assertEqual(
+            instance.settings_mtime_ns,
+            self.app_module.STALE_CONFIG_MTIME_NS,
+        )
 
 
 if __name__ == "__main__":

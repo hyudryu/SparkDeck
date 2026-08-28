@@ -322,6 +322,36 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(overview["job"]["active"])
         self.assertEqual(overview["job"]["phase"], "failed")
 
+    async def test_restarted_controller_reconciles_local_node_success(self):
+        self.service._write(self.service.cluster_path, {
+            "id": "stale", "active": True, "phase": "updating_controller",
+            "target_revision": "b" * 40,
+            "nodes": [
+                {
+                    "id": "local", "name": "Controller", "local": True,
+                    "phase": "updating", "current_revision": "a" * 40,
+                    "error": "stale error",
+                },
+                {
+                    "id": "worker", "name": "Worker", "local": False,
+                    "phase": "succeeded", "current_revision": "b" * 40,
+                },
+            ],
+        })
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+
+        with patch("sparkdeck.updater.current_revision", return_value="b" * 40), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+
+        local = next(node for node in overview["job"]["nodes"] if node["local"])
+        self.assertFalse(overview["job"]["active"])
+        self.assertEqual(overview["job"]["phase"], "succeeded")
+        self.assertEqual(local["phase"], "succeeded")
+        self.assertEqual(local["current_revision"], "b" * 40)
+        self.assertNotIn("error", local)
+        self.assertEqual(self.service._read(self.service.cluster_path), overview["job"])
+
     async def test_windows_start_records_verified_helper_identity(self):
         self.service.preflight_local = AsyncMock(return_value={"ok": True})
         with patch("sparkdeck.updater.current_revision", return_value="a" * 40), \

@@ -477,7 +477,35 @@ export interface ChatMessage {
 
 export interface ChatCompletionResponse {
   choices: Array<{ message: ChatMessage }>
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  usage?: ChatUsage
+}
+
+export interface ChatUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+}
+
+export interface ChatResponseMetrics {
+  prompt_tokens_per_second?: number
+  ttft_ms?: number
+  output_tokens_per_second?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+}
+
+export interface ChatStreamUpdate {
+  content?: string
+  reasoning?: string
+  metrics?: ChatResponseMetrics
+}
+
+export interface ChatStreamResult {
+  message: ChatMessage
+  reasoning: string
+  usage?: ChatUsage
+  metrics: ChatResponseMetrics
 }
 
 export interface GpuStats {

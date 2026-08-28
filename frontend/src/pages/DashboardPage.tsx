@@ -65,7 +65,7 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
   const telemetry = nodes.length
     ? visibleOnline.flatMap((node) => node.stats ? [{ id: node.id, stats: node.stats }] : [])
     : fallbackStats ? [{ id: 'entry-node', stats: fallbackStats }] : []
-  let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let cpuNodesWithKnownProcessors = 0
+  let cpuTotal = 0; let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let allCpuCountsKnown = true
   let ramUsed = 0; let ramTotal = 0; let ramNodes = 0
   let gpuUtilTotal = 0; let measuredGpus = 0; let gpuCount = 0; const gpuNodes = new Set<string>()
 
@@ -73,9 +73,12 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
     const cpuPct = finiteNumber(stats.cpu_pct)
     if (cpuPct !== undefined) {
       const knownProcessors = finiteNumber(stats.cpu_logical_count)
-      const weight = knownProcessors && knownProcessors > 0 ? knownProcessors : 1
-      cpuWeightedTotal += cpuPct * weight; cpuWeight += weight; cpuNodes += 1
-      if (knownProcessors && knownProcessors > 0) { logicalProcessors += knownProcessors; cpuNodesWithKnownProcessors += 1 }
+      cpuTotal += cpuPct; cpuNodes += 1
+      if (knownProcessors && knownProcessors > 0) {
+        cpuWeightedTotal += cpuPct * knownProcessors; cpuWeight += knownProcessors; logicalProcessors += knownProcessors
+      } else {
+        allCpuCountsKnown = false
+      }
     }
     const used = finiteNumber(stats.mem?.used); const total = finiteNumber(stats.mem?.total)
     if (used !== undefined && total !== undefined && total > 0) {
@@ -91,11 +94,12 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
   })
 
   return {
-    cpuPct: cpuWeight ? cpuWeightedTotal / cpuWeight : undefined,
+    cpuPct: cpuNodes ? (allCpuCountsKnown ? cpuWeightedTotal / cpuWeight : cpuTotal / cpuNodes) : undefined,
     cpuNodes,
-    logicalProcessors: cpuNodes && cpuNodesWithKnownProcessors === cpuNodes ? logicalProcessors : undefined,
+    logicalProcessors: cpuNodes && allCpuCountsKnown ? logicalProcessors : undefined,
     gpuPct: measuredGpus ? gpuUtilTotal / measuredGpus : undefined,
     gpuCount,
+    measuredGpus,
     gpuNodes: gpuNodes.size,
     ramUsed,
     ramTotal,
@@ -155,7 +159,7 @@ export function DashboardPage() {
             <Panel className="metric-panel">
               <div className="metric-label"><Gauge size={16} /><span>Pooled GPU</span></div>
               <strong>{displayValue(pooled.gpuPct, '%', 1)}</strong>
-              <p className="metric-context">{pooled.gpuCount ? `${pooled.gpuCount} ${pooled.gpuCount === 1 ? 'GPU' : 'GPUs'} across ${pooled.gpuNodes} ${pooled.gpuNodes === 1 ? 'node' : 'nodes'}` : 'GPU telemetry unavailable'}</p>
+              <p className="metric-context">{pooled.gpuCount ? `${pooled.gpuCount} ${pooled.gpuCount === 1 ? 'GPU' : 'GPUs'} across ${pooled.gpuNodes} ${pooled.gpuNodes === 1 ? 'node' : 'nodes'}${pooled.measuredGpus === pooled.gpuCount ? '' : ` · ${pooled.measuredGpus} measured`}` : 'GPU telemetry unavailable'}</p>
               <MetricBar value={pooled.gpuPct} label="Pooled GPU utilization" />
             </Panel>
             <Panel className="metric-panel">
@@ -175,7 +179,8 @@ export function DashboardPage() {
           <section className="cluster-health" aria-labelledby="cluster-health-title">
             <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{clusterNodes.filter((node) => node.online).length} of {clusterNodes.length} visible nodes online · pooled above, telemetry per machine{hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
             <div className="cluster-health-grid">
-              {!clusterNodes.length && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
+              {!clusterNodes.length && hiddenNodeCount > 0 && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
+              {!clusterNodes.length && hiddenNodeCount === 0 && <EmptyState title="Cluster inventory unavailable" description="Refresh to retry loading per-machine telemetry." />}
               {clusterNodes.map((node) => {
                 const nodeStats = node.stats
                 const nodeGpu = nodeStats?.gpus?.find((item) => !item.error)

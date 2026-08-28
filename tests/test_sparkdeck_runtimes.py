@@ -46,6 +46,37 @@ class RuntimeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "existing local GGUF artifact"):
             LlamaCppAdapter().launch_spec("org/model", {})
 
+    def test_llama_server_mounts_complete_shard_directory(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "model-Q4_K_M-00001-of-00002.gguf"
+            second = root / "model-Q4_K_M-00002-of-00002.gguf"
+            first.touch()
+            second.touch()
+
+            spec = LlamaCppAdapter().launch_spec(
+                "org/model", {"artifact": str(second)},
+            )
+
+        self.assertEqual(
+            spec.command[spec.command.index("--model") + 1],
+            "/models/model-Q4_K_M-00001-of-00002.gguf",
+        )
+        self.assertEqual(
+            spec.volumes,
+            {str(root.resolve()): {"bind": "/models", "mode": "ro"}},
+        )
+
+    def test_llama_server_rejects_incomplete_shard_set(self):
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "model-Q4_K_M-00001-of-00002.gguf"
+            artifact.touch()
+
+            with self.assertRaisesRegex(ValueError, "every GGUF shard"):
+                LlamaCppAdapter().launch_spec(
+                    "org/model", {"artifact": str(artifact)},
+                )
+
     def test_sglang_uses_runtime_native_parallel_flags(self):
         command = SglangAdapter().launch_spec("org/model", {
             "tensor_parallel_size": 2, "data_parallel_size": 3,

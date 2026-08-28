@@ -252,7 +252,7 @@ describe('model discovery', () => {
     await user.click(row)
     expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
     expect(screen.getByText('Local')).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')
+    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
   })
 
   it('sends the search term and runtime filter to the versioned catalog API', async () => {
@@ -291,14 +291,14 @@ describe('model discovery', () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
       const body = path.includes('/api/v1/settings')
-        ? { default_runtime: 'sglang', default_context_length: 24576 }
+        ? { default_runtime: 'vllm', default_context_length: 24576 }
         : path.includes('/api/v1/nodes')
         ? { items: [{ id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true }] }
         : { items: [] }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
-    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model']}><ModelsPage /></MemoryRouter>)
+    render(<MemoryRouter initialEntries={['/models?model=org/chosen-model&runtime=sglang']}><ModelsPage /></MemoryRouter>)
 
     expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
@@ -337,7 +337,7 @@ describe('model discovery', () => {
     })
 
     render(<MemoryRouter initialEntries={[
-      '/models?model=RadixArk%2FQwen3.8-27B&quantization=Q4_K_M&artifact=artifacts%2Fqwen3.8-q4_k_m.gguf',
+      '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=artifacts%2Fqwen3.8-q4_k_m.gguf',
     ]}><ModelsPage /></MemoryRouter>)
 
     const dialog = await screen.findByRole('dialog', { name: 'Add a model server' })

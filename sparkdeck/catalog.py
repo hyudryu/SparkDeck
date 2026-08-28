@@ -235,8 +235,20 @@ class HuggingFaceCatalog:
         repository = str(item.get("id") or item.get("modelId") or "").strip()
         tags = [str(tag)[:100] for tag in item.get("tags", []) if isinstance(tag, str)][:100]
         folded_tags = {tag.casefold() for tag in tags}
+        siblings = item.get("siblings")
+        has_gguf_sibling = isinstance(siblings, list) and any(
+            isinstance(sibling, dict)
+            and str(sibling.get("rfilename") or sibling.get("path") or "")
+            .casefold().endswith(".gguf")
+            for sibling in siblings
+        )
         formats = []
-        if "gguf" in folded_tags:
+        gguf_metadata = item.get("gguf")
+        if (
+            "gguf" in folded_tags
+            or (isinstance(gguf_metadata, dict) and bool(gguf_metadata))
+            or has_gguf_sibling
+        ):
             formats.append("gguf")
         transformer_model = bool(folded_tags & {"transformers", "safetensors"})
         runtime_compatibility = [
@@ -394,6 +406,8 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
                 or group["shard_indexes"]
                 == set(range(1, group["shard_count"] + 1))
             )
+            if not verified:
+                continue
             artifacts.append({
                 "filename": group["files"][0]["filename"],
                 "files": group["files"],
@@ -403,6 +417,8 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
                 ),
                 "sharded": group["shard_count"] > 1,
             })
+        if not artifacts:
+            continue
         artifacts.sort(key=lambda item: (
             item["weight_size_bytes"] is None,
             item["weight_size_bytes"] or math.inf,

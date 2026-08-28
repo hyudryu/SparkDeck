@@ -14,9 +14,17 @@ type DisplayCatalogModel = CatalogModel & {
   communityEvidenceSource?: 'community' | 'local'
   communityVariantKey?: string
 }
+type GgufArtifactOption = {
+  key: string
+  filename: string
+  quantization: string
+  weightSize?: number | null
+}
 
 const MIB = 1024 ** 2
 const COMMUNITY_PAGE_SIZE = 50
+const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
+const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 
 function formatParameters(value?: number | null) {
   if (!Number.isFinite(value) || Number(value) <= 0) return '—'
@@ -77,16 +85,40 @@ function communityVariantKey(item: BenchmarkAggregate) {
   return `${item.model_id}::${aggregateQuantization(item)}::${item.prompt_tokens_bucket}`
 }
 
-function deployHref(model: DisplayCatalogModel, quantizations: NonNullable<CatalogModel['quantizations']>, sharded: boolean, communityMode: boolean) {
-  const params = new URLSearchParams({ model: model.id })
-  const quantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
+function ggufArtifactOptions(quantizations: NonNullable<CatalogModel['quantizations']>): GgufArtifactOption[] {
+  return quantizations.flatMap((variant) => {
+    const artifacts = variant.artifacts?.length
+      ? variant.artifacts
+      : variant.files.some((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))
+        ? [{
+          filename: variant.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))!.filename,
+          files: variant.files,
+          weight_size_bytes: variant.weight_size_bytes,
+        }]
+        : []
+    return artifacts.map((artifact) => ({
+      key: `${variant.name}\u0000${artifact.filename}`,
+      filename: artifact.filename,
+      quantization: variant.name,
+      weightSize: artifact.weight_size_bytes,
+    }))
+  })
+}
+
+function deployHref(
+  model: DisplayCatalogModel,
+  runtime: RuntimeKind,
+  artifact: GgufArtifactOption | undefined,
+  sharded: boolean,
+  communityMode: boolean,
+) {
+  const params = new URLSearchParams({ model: model.id, runtime })
+  const quantization = runtime === 'llama.cpp'
+    ? artifact?.quantization
+    : communityMode && model.community ? aggregateQuantization(model.community) : undefined
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
-  const variant = quantization
-    ? quantizations.find((item) => item.name.toLocaleLowerCase() === quantization.toLocaleLowerCase())
-    : undefined
-  const artifact = variant?.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))?.filename
-  if (artifact) params.set('artifact', artifact)
-  else if (sharded) params.set('layout', 'sharded')
+  if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
+  else if (runtime !== 'llama.cpp' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
@@ -98,6 +130,7 @@ function ModelRow({
   expanded,
   communityEnabled,
   communityMode,
+  requestedRuntime,
   onToggle,
 }: {
   model: DisplayCatalogModel
@@ -107,18 +140,58 @@ function ModelRow({
   expanded: boolean
   communityEnabled: boolean
   communityMode: boolean
+  requestedRuntime: RuntimeKind | ''
   onToggle: () => void
 }) {
   const rowKey = model.communityVariantKey ?? model.id
   const panelId = `model-details-${rowKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
   const modelName = model.name ?? model.id.split('/').at(-1) ?? model.id
-  const supportedRuntimes = (model.runtime_compatibility ?? []).filter((item) => item.supported)
   const details = useResource(
     (signal) => api.catalog.details(model.id, signal),
     [model.id],
     expanded,
   )
-  const quantizations = details.data?.model?.quantizations ?? model.quantizations ?? []
+  const detailedModel = details.data?.model
+  const compatibility = detailedModel?.runtime_compatibility ?? model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const supportedRuntimes = useMemo(
+    () => compatibility.filter((item) => item.supported),
+    [compatibility],
+  )
+  const compatibilityByRuntime = useMemo(
+    () => new Map(compatibility.map((item) => [item.runtime, item.supported])),
+    [compatibility],
+  )
+  const quantizations = detailedModel?.quantizations ?? model.quantizations ?? EMPTY_QUANTIZATIONS
+  const artifactOptions = useMemo(() => ggufArtifactOptions(quantizations), [quantizations])
+  const initiallySupported = (candidate: RuntimeKind) => compatibilityByRuntime.get(candidate) !== false
+  const initialRuntime = requestedRuntime && initiallySupported(requestedRuntime)
+    ? requestedRuntime
+    : supportedRuntimes.length === 1
+      ? supportedRuntimes[0].runtime
+      : initiallySupported('vllm') ? 'vllm' : initiallySupported('sglang') ? 'sglang' : 'llama.cpp'
+  const [deploymentRuntime, setDeploymentRuntime] = useState<RuntimeKind>(initialRuntime)
+  const communityQuantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
+  const preferredArtifact = artifactOptions.find((item) => (
+    communityQuantization && item.quantization.toLocaleLowerCase() === communityQuantization.toLocaleLowerCase()
+  )) ?? artifactOptions[0]
+  const [artifactKey, setArtifactKey] = useState(preferredArtifact?.key ?? '')
+  const selectedArtifact = artifactOptions.find((item) => item.key === artifactKey) ?? preferredArtifact
+  const llamaSupported = compatibilityByRuntime.get('llama.cpp') !== false && artifactOptions.length > 0
+  const deploymentReady = deploymentRuntime !== 'llama.cpp' || Boolean(selectedArtifact)
+
+  useEffect(() => {
+    if (requestedRuntime && compatibilityByRuntime.get(requestedRuntime) !== false) {
+      setDeploymentRuntime(requestedRuntime)
+    } else if (compatibilityByRuntime.get(deploymentRuntime) === false) {
+      setDeploymentRuntime(supportedRuntimes[0]?.runtime ?? 'vllm')
+    }
+  }, [compatibilityByRuntime, deploymentRuntime, requestedRuntime, supportedRuntimes])
+
+  useEffect(() => {
+    if (!artifactOptions.some((item) => item.key === artifactKey)) {
+      setArtifactKey(preferredArtifact?.key ?? '')
+    }
+  }, [artifactKey, artifactOptions, preferredArtifact?.key])
   const rowLabel = communityMode && model.community
     ? `${model.id} (${aggregateQuantization(model.community)}, ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket)`
     : model.id
@@ -183,7 +256,17 @@ function ModelRow({
       </div>}
       <div className="catalog-model-actions">
         <a className="button" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Hugging Face</a>
-        <Link className="button button-primary" aria-label={`Deploy ${model.id}`} to={deployHref(model, quantizations, aggregate, communityMode)}>Deploy</Link>
+        <label className="catalog-deployment-type"><span>Deployment type</span><select aria-label={`Deployment type for ${model.id}`} value={deploymentRuntime} onChange={(event) => setDeploymentRuntime(event.target.value as RuntimeKind)}>
+          <option value="vllm" disabled={compatibilityByRuntime.get('vllm') === false}>vLLM</option>
+          <option value="sglang" disabled={compatibilityByRuntime.get('sglang') === false}>SGLang</option>
+          <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
+        </select></label>
+        {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
+          {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
+        </select></label>}
+        {deploymentReady
+          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${deploymentRuntime === 'llama.cpp' ? 'Llama server' : deploymentRuntime === 'vllm' ? 'vLLM' : 'SGLang'}`} to={deployHref(model, deploymentRuntime, selectedArtifact, aggregate, communityMode)}>Deploy</Link>
+          : <button className="button button-primary" type="button" disabled title={details.loading ? 'Loading GGUF artifacts' : 'No deployable GGUF artifact was found'}>Deploy</button>}
       </div>
     </div>}
   </article>
@@ -322,7 +405,7 @@ export function ExplorePage() {
             <select value={runtime} onChange={(event) => setRuntime(event.target.value as RuntimeKind | '')}>
               <option value="">All runtimes</option>
               <option value="vllm">vLLM</option>
-              <option value="llama.cpp">llama.cpp</option>
+              <option value="llama.cpp">Llama server</option>
               <option value="sglang">SGLang</option>
             </select>
           </label>}
@@ -356,7 +439,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Unique clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = model.communityVariantKey ?? model.id
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} onToggle={() => toggleExpanded(rowKey)} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={runtime} onToggle={() => toggleExpanded(rowKey)} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

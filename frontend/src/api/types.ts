@@ -48,6 +48,12 @@ export interface CatalogModel {
     name: string
     files: Array<{ filename: string; size_bytes?: number | null }>
     weight_size_bytes?: number | null
+    artifacts?: Array<{
+      filename: string
+      files: Array<{ filename: string; size_bytes?: number | null }>
+      weight_size_bytes?: number | null
+      sharded?: boolean
+    }>
   }>
 }
 

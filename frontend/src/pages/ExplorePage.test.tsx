@@ -63,7 +63,55 @@ describe('ExplorePage model rows', () => {
     expect(within(estimate).getByText('31.3 tok/s')).toBeInTheDocument()
     expect(within(estimate).getByText(/1,000-token prompt-length bucket/)).toBeInTheDocument()
     expect(within(estimate).getByText(/estimate, not a guarantee/)).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel')
+    expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
+  })
+
+  it('offers a verified Hugging Face GGUF as a Llama server deployment', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({
+        items: [{
+          id: 'org/model-GGUF', name: 'model-GGUF', downloads: 100, likes: 5,
+          runtime_compatibility: [
+            { runtime: 'vllm', supported: false },
+            { runtime: 'llama.cpp', supported: true },
+            { runtime: 'sglang', supported: false },
+          ],
+        }],
+        total: 1,
+      })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'org/model-GGUF', name: 'model-GGUF',
+        runtime_compatibility: [
+          { runtime: 'vllm', supported: false },
+          { runtime: 'llama.cpp', supported: true },
+          { runtime: 'sglang', supported: false },
+        ],
+        quantizations: [{
+          name: 'Q4_K_M', files: [{ filename: 'model-Q4_K_M.gguf', size_bytes: 12 * gib }],
+          artifacts: [{
+            filename: 'model-Q4_K_M.gguf',
+            files: [{ filename: 'model-Q4_K_M.gguf', size_bytes: 12 * gib }],
+            weight_size_bytes: 12 * gib,
+            sharded: false,
+          }],
+        }],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Expand org/model-GGUF' }))
+
+    const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
+    expect(deploymentType).toHaveValue('llama.cpp')
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('Q4_K_M\u0000model-Q4_K_M.gguf')
+    expect(screen.getByRole('link', { name: 'Deploy org/model-GGUF' })).toHaveAttribute(
+      'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&quantization=Q4_K_M&artifact=model-Q4_K_M.gguf',
+    )
   })
 
   it('color codes cluster fit and filters fitting models largest first', async () => {
@@ -101,7 +149,7 @@ describe('ExplorePage model rows', () => {
     expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
     expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
     expect(screen.getByRole('link', { name: 'Deploy zai-org/GLM-5.3-Flash' })).toHaveAttribute(
-      'href', '/models?model=zai-org%2FGLM-5.3-Flash&layout=sharded',
+      'href', '/models?model=zai-org%2FGLM-5.3-Flash&runtime=vllm&layout=sharded',
     )
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
@@ -143,7 +191,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
     await user.click(expand)
     expect(screen.getByRole('link', { name: 'Deploy org/worker-pool-only' })).toHaveAttribute(
-      'href', '/models?model=org%2Fworker-pool-only',
+      'href', '/models?model=org%2Fworker-pool-only&runtime=vllm',
     )
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
@@ -250,13 +298,18 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
     expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
     expect(within(nvfp4.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
-      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=NVFP4',
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=vllm&quantization=NVFP4',
     )
 
     await user.click(gguf)
-    expect(await within(gguf.closest('article')!).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    const ggufRow = gguf.closest('article')!
+    expect(await within(ggufRow).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    const deploymentType = within(ggufRow).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    await user.selectOptions(deploymentType, 'llama.cpp')
+    expect(within(ggufRow).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')
     expect(within(gguf.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
-      'href', '/models?model=RadixArk%2FQwen3.8-27B&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
+      'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
     )
   })
 

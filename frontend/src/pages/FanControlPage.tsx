@@ -6,6 +6,14 @@ import { useResource } from '../hooks/useResource'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 
 const presenceEvent = 'sparkdeck:fan-control-presence-changed'
+const pollDelayMs = 2_000
+const pendingOverrideMismatchLimit = 2
+
+interface PendingFanOverride {
+  enabled: boolean
+  lastTelemetryTs: number
+  mismatches: number
+}
 
 function valueOrDash(value: number | null | undefined, suffix = '') {
   return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value)}${suffix}` : '--'
@@ -50,11 +58,13 @@ function ModeSettings({ node }: { node: FanControlNode }) {
 
 function CurveChart({ curve, node }: { curve: FanCurveSettings; node: FanControlNode }) {
   const chartId = node.node_id.replace(/[^a-zA-Z0-9_-]/g, '-')
-  const points = curve.curve_points
+  const configuredPoints = curve.curve_points
     .filter((point) => point.length >= 2 && Number.isFinite(point[0]) && Number.isFinite(point[1]))
     .map((point) => [point[0], point[1]] as const)
   const minTemp = Number.isFinite(curve.curve_min_temp) ? curve.curve_min_temp : 0
   const maxTemp = Number.isFinite(curve.curve_max_temp) && curve.curve_max_temp > minTemp ? curve.curve_max_temp : minTemp + 1
+  const points = configuredPoints.filter(([temp]) => temp >= minTemp && temp <= maxTemp)
+  const omittedPointCount = configuredPoints.length - points.length
   const x = (temp: number) => 48 + ((temp - minTemp) / (maxTemp - minTemp)) * 432
   const y = (duty: number) => 18 + ((100 - Math.max(0, Math.min(100, duty))) / 100) * 172
   const line = points.map(([temp, duty]) => `${x(temp)},${y(duty)}`).join(' ')
@@ -84,10 +94,11 @@ function CurveChart({ curve, node }: { curve: FanCurveSettings; node: FanControl
         <circle className="fan-chart-live" cx={x(liveTemp)} cy={y(liveDuty)} r="4" />
       </g>}
     </svg>
+    {omittedPointCount > 0 && <p className="muted">{omittedPointCount} configured {omittedPointCount === 1 ? 'point is' : 'points are'} outside this temperature range and not plotted.</p>}
     <table className="sr-only">
       <caption>Fan curve points for {node.node_name}</caption>
       <thead><tr><th>Temperature Celsius</th><th>Fan duty percent</th></tr></thead>
-      <tbody>{points.map(([temp, duty], index) => <tr key={index}><td>{temp}</td><td>{duty}</td></tr>)}</tbody>
+      <tbody>{configuredPoints.map(([temp, duty], index) => <tr key={index}><td>{temp}</td><td>{duty}</td></tr>)}</tbody>
     </table>
   </div>
 }
@@ -98,12 +109,13 @@ export function FanControlPage() {
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [saveStatus, setSaveStatus] = useState('')
-  const [pendingOverrides, setPendingOverrides] = useState<Record<string, boolean>>({})
+  const [pendingOverrides, setPendingOverrides] = useState<Record<string, PendingFanOverride>>({})
 
   useEffect(() => {
-    const interval = window.setInterval(resource.reload, 2_000)
-    return () => window.clearInterval(interval)
-  }, [resource.reload])
+    if (resource.loading) return
+    const timeout = window.setTimeout(resource.reload, pollDelayMs)
+    return () => window.clearTimeout(timeout)
+  }, [resource.loading, resource.reload])
 
   useEffect(() => {
     const nodes = resource.data?.nodes ?? []
@@ -117,8 +129,22 @@ export function FanControlPage() {
       const next = { ...current }
       let changed = false
       for (const item of overview.nodes) {
-        if (Object.hasOwn(next, item.node_id) && next[item.node_id] === item.fan.max_speed) {
+        const pending = next[item.node_id]
+        if (!pending) continue
+        if (pending.enabled === item.fan.max_speed) {
           delete next[item.node_id]
+          changed = true
+        } else if (item.fan.ts > pending.lastTelemetryTs) {
+          const mismatches = pending.mismatches + 1
+          if (mismatches >= pendingOverrideMismatchLimit) {
+            delete next[item.node_id]
+          } else {
+            next[item.node_id] = {
+              ...pending,
+              lastTelemetryTs: item.fan.ts,
+              mismatches,
+            }
+          }
           changed = true
         }
       }
@@ -143,7 +169,14 @@ export function FanControlPage() {
     setSaveStatus('')
     try {
       await api.fanControl.setMaxSpeed(node.node_id, enabled)
-      setPendingOverrides((current) => ({ ...current, [node.node_id]: enabled }))
+      setPendingOverrides((current) => ({
+        ...current,
+        [node.node_id]: {
+          enabled,
+          lastTelemetryTs: node.fan.ts,
+          mismatches: 0,
+        },
+      }))
       setSaveStatus(enabled ? 'Max fan speed enabled.' : 'Automatic fan control enabled.')
       window.dispatchEvent(new Event(presenceEvent))
     } catch (reason) {
@@ -154,7 +187,7 @@ export function FanControlPage() {
   }
 
   const curve = node?.settings.settings.curve
-  const maxSpeed = node ? pendingOverrides[node.node_id] ?? node.fan.max_speed : false
+  const maxSpeed = node ? pendingOverrides[node.node_id]?.enabled ?? node.fan.max_speed : false
 
   return <div className="page fan-control-page">
     <PageHeader

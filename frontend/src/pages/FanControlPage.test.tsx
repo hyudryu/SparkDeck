@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FanControlPage } from './FanControlPage'
@@ -30,7 +30,7 @@ const overview = {
   }],
 }
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('FanControlPage', () => {
   it('renders live telemetry, the saved curve, and active settings', async () => {
@@ -45,6 +45,53 @@ describe('FanControlPage', () => {
     expect(screen.getByRole('table', { name: 'Fan curve points for Rack Spark' })).toBeInTheDocument()
     expect(screen.getByText('30 - 80 °C')).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: 'Fan speed override' })).not.toBeChecked()
+  })
+
+  it('waits for a slow overview to settle before scheduling the next poll', async () => {
+    vi.useFakeTimers()
+    let resolveFirst!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveFirst = resolve }))
+      .mockImplementation(() => new Promise<Response>(() => undefined))
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<FanControlPage />)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    await act(() => vi.advanceTimersByTimeAsync(6_000))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveFirst(json(overview))
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Rack Spark (local)')).toBeInTheDocument()
+
+    await act(() => vi.advanceTimersByTimeAsync(1_999))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await act(() => vi.advanceTimersByTimeAsync(1))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('omits configured curve points outside the displayed temperature range', async () => {
+    const curve = { ...settings.settings.curve, curve_points: [[-500, 10], [55, 50], [500, 90]] }
+    const rangedOverview = {
+      available: true,
+      nodes: [{
+        ...overview.nodes[0],
+        settings: { ...settings, settings: { ...settings.settings, curve } },
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(rangedOverview)))
+
+    render(<FanControlPage />)
+
+    const chart = await screen.findByRole('img', { name: 'Fan curve for Rack Spark' })
+    expect(chart.querySelectorAll('.fan-chart-point')).toHaveLength(1)
+    expect(within(chart).queryByText('-500Â° / 10%')).not.toBeInTheDocument()
+    expect(within(chart).queryByText('500Â° / 90%')).not.toBeInTheDocument()
+    expect(screen.getByText('2 configured points are outside this temperature range and not plotted.')).toBeInTheDocument()
+    expect(within(screen.getByRole('table', { name: 'Fan curve points for Rack Spark' })).getByText('-500')).toBeInTheDocument()
   })
 
   it('selects another controller node and enables max speed with the exact request', async () => {
@@ -85,6 +132,36 @@ describe('FanControlPage', () => {
     await user.click(toggle)
     expect(await screen.findByRole('alert')).toHaveTextContent('FanController stopped')
     expect(toggle).not.toBeChecked()
+  })
+
+  it('returns to authoritative telemetry after two newer heartbeats disagree', async () => {
+    let overviewRequests = 0
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'PATCH') return json({ node_id: 'node/1', enabled: true })
+      overviewRequests += 1
+      return json({
+        available: true,
+        nodes: [{
+          ...overview.nodes[0],
+          fan: { ...overview.nodes[0].fan, max_speed: false, ts: 100 + overviewRequests },
+        }],
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<FanControlPage />)
+
+    const toggle = await screen.findByRole('switch', { name: 'Fan speed override' })
+    await user.click(toggle)
+    await waitFor(() => expect(toggle).toBeChecked())
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(overviewRequests).toBe(2))
+    expect(toggle).toBeChecked()
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(overviewRequests).toBe(3))
+    await waitFor(() => expect(toggle).not.toBeChecked())
   })
 
   it('explains why the view is unavailable when no heartbeat is fresh', async () => {

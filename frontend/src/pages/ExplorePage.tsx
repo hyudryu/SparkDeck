@@ -74,7 +74,20 @@ function aggregateQuantization(item: BenchmarkAggregate) {
 }
 
 function communityVariantKey(item: BenchmarkAggregate) {
-  return `${item.model_id}::${aggregateQuantization(item)}::${item.context_window_size}`
+  return `${item.model_id}::${aggregateQuantization(item)}::${item.prompt_tokens_bucket}`
+}
+
+function deployHref(model: DisplayCatalogModel, quantizations: NonNullable<CatalogModel['quantizations']>, sharded: boolean, communityMode: boolean) {
+  const params = new URLSearchParams({ model: model.id })
+  const quantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
+  if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
+  const variant = quantization
+    ? quantizations.find((item) => item.name.toLocaleLowerCase() === quantization.toLocaleLowerCase())
+    : undefined
+  const artifact = variant?.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))?.filename
+  if (artifact) params.set('artifact', artifact)
+  else if (sharded) params.set('layout', 'sharded')
+  return `/models?${params.toString()}`
 }
 
 function ModelRow({
@@ -107,7 +120,7 @@ function ModelRow({
   )
   const quantizations = details.data?.model?.quantizations ?? model.quantizations ?? []
   const rowLabel = communityMode && model.community
-    ? `${model.id} (${aggregateQuantization(model.community)}, ${formatNumber(model.community.context_window_size)} tokens)`
+    ? `${model.id} (${aggregateQuantization(model.community)}, ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket)`
     : model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
@@ -121,7 +134,7 @@ function ModelRow({
       aria-label={`${expanded ? 'Collapse' : 'Expand'} ${rowLabel}`}
       onClick={onToggle}
     >
-      <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.context_window_size)}-token context` : ''}</small></span>
+      <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket` : ''}</small></span>
       <span className="catalog-model-stat"><small>Parameters</small><strong>{formatParameters(parameterCount)}</strong></span>
       <span className={`catalog-model-stat catalog-model-size fit-${fitTone(weightSize, capacity)}`}><small>Weights</small><strong>{weightSize ? formatBytes(weightSize) : '—'}</strong><em>{fitLabel(fitTone(weightSize, capacity))}</em></span>
       {communityMode
@@ -165,12 +178,12 @@ function ModelRow({
       </div>}
       {model.community && communityEnabled && <div className="community-estimate" aria-label={`Community inference-speed estimate for ${rowLabel}`}>
         <div><span>{model.communityEvidenceSource === 'local' ? 'Aggregated from benchmarks on this controller' : 'Sampled from other SparkDeck users'}</span><strong>{formatRate(model.community.inference_tokens_per_second)}</strong></div>
-        <p>{aggregateQuantization(model.community)} · inference-speed estimate at a {formatNumber(model.community.context_window_size)}-token context window · {formatNumber(model.community.sample_count)} {model.communityEvidenceSource === 'local' ? 'local' : 'shared'} samples</p>
+        <p>{aggregateQuantization(model.community)} · inference-speed estimate for the {formatNumber(model.community.prompt_tokens_bucket)}-token prompt-length bucket · {formatNumber(model.community.sample_count)} {model.communityEvidenceSource === 'local' ? 'local' : 'shared'} samples</p>
         <small>{model.communityEvidenceSource === 'local' ? 'Local benchmark evidence only' : 'Aggregated community benchmark evidence only'} — an estimate, not a guarantee for your system.</small>
       </div>}
       <div className="catalog-model-actions">
         <a className="button" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Hugging Face</a>
-        <Link className="button button-primary" aria-label={`Deploy ${model.id}`} to={`/models?model=${encodeURIComponent(model.id)}${aggregate ? '&layout=sharded' : ''}`}>Deploy</Link>
+        <Link className="button button-primary" aria-label={`Deploy ${model.id}`} to={deployHref(model, quantizations, aggregate, communityMode)}>Deploy</Link>
       </div>
     </div>}
   </article>

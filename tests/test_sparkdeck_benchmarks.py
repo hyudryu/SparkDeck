@@ -98,7 +98,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.store.outbox_batch(), [{
             "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
             "quantization": "NVFP4",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
             "telemetry_cluster_id": self.service.store.get_setting(
                 "telemetry_cluster_id"
@@ -141,7 +141,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         opted_out = self.service._community_observation_start()
         self.assertFalse(opted_out["enabled"])
         self.assertEqual(
-            set(opted_out), {"id", "enabled", "generation", "contaminated"},
+            set(opted_out), {
+                "id", "enabled", "generation", "scopes", "contaminated",
+            },
         )
 
         self.service.store.set_community_consent(True)
@@ -166,6 +168,81 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.service.store.benchmarks()[1], 0)
         self.assertEqual(self.service._community_active_observations, {})
+
+    async def test_overlap_detection_is_scoped_to_shared_inference_hardware(self):
+        first = self.service._community_observation_start(frozenset({"node:one"}))
+        independent = self.service._community_observation_start(
+            frozenset({"node:two"})
+        )
+        shared = self.service._community_observation_start(frozenset({"node:one"}))
+
+        self.assertTrue(first["contaminated"])
+        self.assertTrue(shared["contaminated"])
+        self.assertFalse(independent["contaminated"])
+        for observation in (first, independent, shared):
+            self.service._community_observation_end(observation)
+
+    async def test_observation_scopes_use_persisted_deployment_members(self):
+        deployment = {
+            "id": "deployment-one",
+            "kind": DeploymentKind.MANAGED.value,
+            "settings": {
+                "manager_deployment_id": "manager-one",
+                "node_ids": ["node-one", "node-two"],
+            },
+        }
+        self.manager.deployments = [{
+            "id": "manager-one",
+            "node_ids": ["node-two", "node-three"],
+            "members": [{"node_id": "node-four"}],
+        }]
+
+        self.assertEqual(
+            self.service._community_observation_scopes(deployment, "alias"),
+            frozenset({
+                "node:node-one", "node:node-two",
+                "node:node-three", "node:node-four",
+            }),
+        )
+
+    async def test_streamed_usage_is_rejected_before_backpressure_can_consume_cooldown(self):
+        self.service.store.set_community_consent(True)
+        observation = self.service._community_observation_start()
+        token = self.service._community_observation.set(observation)
+
+        async def upstream():
+            yield 'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+            yield (
+                'data: {"choices":[],"usage":{"prompt_tokens":400,'
+                '"completion_tokens":320}}\n\n'
+            )
+
+        try:
+            stream = self.service._observe_stream(
+                upstream(), "dep-1", "org/model", "vllm", {},
+                time.monotonic() - 4,
+                hardware={"hardware_class": "dgx-spark"},
+                hardware_verified=True,
+            )
+            async for _chunk in stream:
+                await asyncio.sleep(0.01)
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+        self.assertTrue(self.service._community_sample_due("org/model", "UNKNOWN"))
+
+    async def test_equivalent_explicit_quantizations_share_upload_and_cooldown_key(self):
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(settings={"quantization": "F16"})
+        self._record_passive_sample(settings={"quantization": "fp16"})
+
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(samples[0]["model"]["quantization"], "FP16")
+        self.assertEqual(self.service.store.outbox_batch()[0]["quantization"], "FP16")
 
     def _record_passive_sample(
         self, *, model="org/model", settings=None, input_tokens=400,
@@ -205,7 +282,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.store.outbox_batch(), [{
             "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
             "quantization": "NVFP4",
-            "context_window_size": 400,
+            "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
             "telemetry_cluster_id": self.service.store.get_setting(
                 "telemetry_cluster_id"
@@ -672,7 +749,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             requested.append(request)
             return httpx.Response(200, json={"items": [{
                 "model_id": "org/community-model",
-                "context_window_size": 8192,
+                "quantization": "F16",
+                "prompt_tokens_bucket": 2000,
                 "inference_tokens_per_second": 42.5,
                 "sample_count": 12,
                 "private_remote_field": "discard-me",
@@ -698,15 +776,15 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["availability"], "available")
         self.assertEqual(result["items"], [{
             "model_id": "org/community-model",
-            "quantization": "UNKNOWN",
-            "context_window_size": 8192,
+            "quantization": "FP16",
+            "prompt_tokens_bucket": 2000,
             "inference_tokens_per_second": 42.5,
             "sample_count": 12,
             "unique_cluster_count": 1,
         }])
         self.assertEqual(
             result["evidence_policy"]["exact_match_dimensions"],
-            ["model_id", "quantization"],
+            ["model_id", "quantization", "prompt_tokens_bucket"],
         )
 
     async def test_local_community_database_work_runs_off_event_loop(self):
@@ -737,7 +815,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         def respond(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"items": [{
                 "model_id": "org/model",
-                "context_window_size": 4096,
+                "prompt_tokens_bucket": 400,
                 "inference_tokens_per_second": float("nan"),
                 "sample_count": 10,
             }]}, request=request)

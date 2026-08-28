@@ -7,6 +7,7 @@ import hashlib
 import math
 import re
 import time
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 from typing import Any, Callable
 
@@ -27,6 +28,27 @@ _QUANTIZATION_PATTERN = re.compile(
     r"(?:^|[/_.-])((?:UD-)?(?:IQ|Q)\d(?:_[A-Z0-9]+)*|NVFP4|FP8|BF16|FP16|F16|AWQ|GPTQ)(?=$|[/_.-])",
     re.IGNORECASE,
 )
+_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+
+
+@asynccontextmanager
+async def _keyed_lock(pool: dict[Any, dict[str, Any]], key: Any):
+    """Hold one keyed lock and evict it after its last waiter exits."""
+    entry = pool.get(key)
+    if entry is None:
+        entry = {"lock": asyncio.Lock(), "users": 0}
+        pool[key] = entry
+    entry["users"] += 1
+    try:
+        async with entry["lock"]:
+            yield
+    finally:
+        entry["users"] -= 1
+        if entry["users"] == 0 and pool.get(key) is entry:
+            pool.pop(key, None)
 
 
 class HuggingFaceCatalog:
@@ -43,8 +65,8 @@ class HuggingFaceCatalog:
         self._detail_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
         # Deduplicate only identical requests. Different repositories must be
         # able to fetch concurrently during bulk community enrichment.
-        self._search_locks: dict[tuple[str, int, str], asyncio.Lock] = {}
-        self._detail_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._search_locks: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self._detail_locks: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def search(self, query: str, limit: int = 24) -> list[dict[str, Any]]:
         query = query.strip()
@@ -56,7 +78,7 @@ class HuggingFaceCatalog:
         cached = self._cache.get(key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
-        async with self._search_locks.setdefault(key, asyncio.Lock()):
+        async with _keyed_lock(self._search_locks, key):
             cached = self._cache.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
                 return cached[1]
@@ -100,7 +122,7 @@ class HuggingFaceCatalog:
         cached = self._detail_cache.get(key)
         if cached and now - cached[0] < self.ttl_seconds:
             return cached[1]
-        async with self._detail_locks.setdefault(key, asyncio.Lock()):
+        async with _keyed_lock(self._detail_locks, key):
             cached = self._detail_cache.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
                 return cached[1]
@@ -297,13 +319,23 @@ def quantization_from_text(*values: Any) -> str | None:
             continue
         match = _QUANTIZATION_PATTERN.search(text)
         if match:
-            value = match.group(1).upper()
-            return "FP16" if value == "F16" else value
+            return canonical_quantization(match.group(1))
     return None
 
 
+def canonical_quantization(value: Any) -> str | None:
+    """Canonicalize one explicit or inferred public quantization label."""
+    normalized = str(value or "").strip().upper()
+    if (
+        not normalized or len(normalized) > 100
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        return None
+    return {"F16": "FP16"}.get(normalized, normalized)
+
+
 def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
     if not isinstance(raw_siblings, list):
         return []
     for sibling in raw_siblings:
@@ -327,21 +359,63 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
         lfs = sibling.get("lfs")
         if size is None and isinstance(lfs, dict):
             size = _positive_int(lfs.get("size"))
-        group = grouped.setdefault(quantization, {
-            "name": quantization,
+        path = filename.replace("\\", "/")
+        parent, _, basename = path.rpartition("/")
+        shard = _GGUF_SHARD_PATTERN.match(basename)
+        artifact_key = (
+            f"{parent}/{shard.group('stem')}" if parent and shard
+            else shard.group("stem") if shard
+            else path
+        )
+        artifacts = grouped.setdefault(quantization, {})
+        group = artifacts.setdefault(artifact_key, {
+            "filename": filename,
             "files": [],
             "weight_size_bytes": 0,
+            "shard_count": int(shard.group("count")) if shard else 1,
+            "shard_indexes": set(),
         })
+        if shard:
+            group["shard_indexes"].add(int(shard.group("index")))
+            if int(shard.group("count")) != group["shard_count"]:
+                group["shard_count"] = 0
         file_item: dict[str, Any] = {"filename": filename}
         if size is not None:
             file_item["size_bytes"] = size
             group["weight_size_bytes"] += size
         group["files"].append(file_item)
-    for group in grouped.values():
-        if not group["weight_size_bytes"]:
-            group["weight_size_bytes"] = None
-        group["files"].sort(key=lambda item: item["filename"].casefold())
-    return sorted(grouped.values(), key=lambda item: item["name"].casefold())
+    result = []
+    for quantization, artifact_groups in grouped.items():
+        artifacts = []
+        for group in artifact_groups.values():
+            group["files"].sort(key=lambda item: item["filename"].casefold())
+            verified = (
+                group["shard_count"] == 1
+                or group["shard_indexes"]
+                == set(range(1, group["shard_count"] + 1))
+            )
+            artifacts.append({
+                "filename": group["files"][0]["filename"],
+                "files": group["files"],
+                "weight_size_bytes": (
+                    group["weight_size_bytes"]
+                    if verified and group["weight_size_bytes"] else None
+                ),
+                "sharded": group["shard_count"] > 1,
+            })
+        artifacts.sort(key=lambda item: (
+            item["weight_size_bytes"] is None,
+            item["weight_size_bytes"] or math.inf,
+            item["filename"].casefold(),
+        ))
+        preferred = artifacts[0]
+        result.append({
+            "name": quantization,
+            "files": preferred["files"],
+            "weight_size_bytes": preferred["weight_size_bytes"],
+            "artifacts": artifacts,
+        })
+    return sorted(result, key=lambda item: item["name"].casefold())
 
 
 def _gguf_sizes_missing(raw_siblings: Any) -> bool:

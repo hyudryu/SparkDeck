@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Check, ChevronDown, ChevronRight, Download, ExternalLink, Heart, Search } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
@@ -133,8 +133,22 @@ function requiresControllerCapacity(model: DisplayCatalogModel) {
   return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
 }
 
-function defaultGgufWeightSize(model: DisplayCatalogModel) {
-  const defaultArtifact = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)[0]
+function preferredGgufArtifact(
+  artifactOptions: GgufArtifactOption[],
+  communityQuantization?: string,
+) {
+  return artifactOptions.find((item) => (
+    communityQuantization
+    && item.quantization.toLocaleLowerCase() === communityQuantization.toLocaleLowerCase()
+  )) ?? artifactOptions[0]
+}
+
+function defaultGgufWeightSize(model: DisplayCatalogModel, communityMode: boolean) {
+  const artifactOptions = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)
+  const communityQuantization = communityMode && model.community
+    ? aggregateQuantization(model.community)
+    : undefined
+  const defaultArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
   return defaultArtifact?.weightSize ?? model.weight_size_bytes ?? model.community?.weight_size_bytes
 }
 
@@ -209,17 +223,18 @@ function ModelRow({
       : initiallySupported('vllm') ? 'vllm' : initiallySupported('sglang') ? 'sglang' : 'llama.cpp'
   const [deploymentRuntime, setDeploymentRuntime] = useState<RuntimeKind>(initialRuntime)
   const communityQuantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
-  const preferredArtifact = artifactOptions.find((item) => (
-    communityQuantization && item.quantization.toLocaleLowerCase() === communityQuantization.toLocaleLowerCase()
-  )) ?? artifactOptions[0]
+  const preferredArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
   const [artifactKey, setArtifactKey] = useState(preferredArtifact?.key ?? '')
   const selectedArtifact = artifactOptions.find((item) => item.key === artifactKey) ?? preferredArtifact
   const llamaSupported = compatibilityByRuntime.get('llama.cpp') !== false && artifactOptions.length > 0
   const deploymentReady = deploymentRuntime !== 'llama.cpp' || Boolean(selectedArtifact)
+  const previousRequestedRuntime = useRef(requestedRuntime)
 
   useEffect(() => {
+    const requestedRuntimeChanged = previousRequestedRuntime.current !== requestedRuntime
+    previousRequestedRuntime.current = requestedRuntime
     setDeploymentRuntime((current) => {
-      if (requestedRuntime && compatibilityByRuntime.get(requestedRuntime) !== false) {
+      if (requestedRuntimeChanged && requestedRuntime && compatibilityByRuntime.get(requestedRuntime) !== false) {
         return requestedRuntime
       }
       return compatibilityByRuntime.get(current) === false
@@ -411,7 +426,7 @@ export function ExplorePage() {
         ? memory.localCapacity
         : memory.capacity
       const applicableWeightSize = usesControllerCapacity
-        ? defaultGgufWeightSize(model)
+        ? defaultGgufWeightSize(model, tab === 'community')
         : model.weight_size_bytes
       return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity))
     })

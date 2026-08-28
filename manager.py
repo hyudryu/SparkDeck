@@ -1884,7 +1884,9 @@ class Manager:
             # Generic node-disk telemetry is display-only and must never make
             # a transfer eligible when the cache mount did not report space.
             free_bytes = self._byte_count(node.get("cache_free_size"))
-            cached_bytes = partial_download_size_bytes(existing)
+            cached_bytes = partial_download_size_bytes(
+                existing, resolved_revision,
+            )
             if (
                 resolved_download
                 and resolved_download.get("resume_node_id") == node_id

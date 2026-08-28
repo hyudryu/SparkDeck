@@ -234,6 +234,14 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 (next_snapshot / "config.json").symlink_to(completed_blob)
             except OSError:
                 (next_snapshot / "config.json").write_bytes(b"completed")
+            older_snapshot = complete / "snapshots" / "revision-3"
+            older_snapshot.mkdir()
+            older_blob = complete / "blobs" / "older-complete"
+            older_blob.write_bytes(b"older")
+            try:
+                (older_snapshot / "config.json").symlink_to(older_blob)
+            except OSError:
+                (older_snapshot / "config.json").write_bytes(b"older")
             (complete / "refs").mkdir()
             (complete / "refs" / "main").write_text("revision-1")
             (complete / "refs" / "stale").write_text("missing-revision")
@@ -254,8 +262,12 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(models[0]["has_partial_download"])
             self.assertEqual(
                 models[0]["partial_size_bytes"],
-                len(b"partial") + len(b"completed"),
+                len(b"partial") + len(b"completed") + len(b"older"),
             )
+            self.assertEqual(models[0]["partial_revision_size_bytes"], {
+                "revision-2": len(b"completed"),
+                "revision-3": len(b"older"),
+            })
             self.assertTrue(models[1]["partial"])
             self.assertEqual(models[1]["revisions"], [])
             self.assertGreater(models[0]["size_bytes"], 0)
@@ -823,6 +835,10 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "model_id": "org/model", "size_bytes": 125,
                 "partial": False, "has_partial_download": True,
                 "partial_size_bytes": cached,
+                "partial_revision_size_bytes": {
+                    RESOLVED_REVISION: cached,
+                    "b" * 40: 90,
+                },
                 "revisions": ["old-revision"],
             }],
         }])
@@ -833,7 +849,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": RESOLVED_REVISION,
             "size_bytes": expected,
             "resume_node_id": "worker-a",
-            "download_cache_baseline_bytes": 100,
+            "download_cache_baseline_bytes": None,
         }
 
         result = await manager.virtual_nas_transfer_preflight(

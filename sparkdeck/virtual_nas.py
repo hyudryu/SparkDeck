@@ -323,6 +323,8 @@ class VirtualNAS:
                 "depends_on_job_id": raw.get("depends_on_job_id"),
                 "workflow_id": raw.get("workflow_id"),
                 "workflow_node_ids": list(raw.get("workflow_node_ids") or []),
+                "require_partial_cache": bool(raw.get("require_partial_cache")),
+                "download_attempted_at": raw.get("download_attempted_at"),
                 "status": status,
                 "bytes_total": _nonnegative_int(raw.get("bytes_total")),
                 "bytes_transferred": _nonnegative_int(raw.get("bytes_transferred")),
@@ -890,13 +892,14 @@ class VirtualNAS:
         additional_download_node_ids: list[str] | None = None,
         source_node_id: str | None = None,
         requested_revision: str | None = None,
+        require_partial_cache: bool = False,
     ) -> dict[str, Any]:
         async with self._queue_lock:
             return await self._queue_download_and_transfer(
                 model_id, revision, download_node_id,
                 transfer_target_node_ids, expected_bytes, workflow_id,
                 workflow_node_ids, additional_download_node_ids,
-                source_node_id, requested_revision,
+                source_node_id, requested_revision, require_partial_cache,
             )
 
     async def _queue_download_and_transfer(
@@ -911,6 +914,7 @@ class VirtualNAS:
         additional_download_node_ids: list[str] | None = None,
         source_node_id: str | None = None,
         requested_revision: str | None = None,
+        require_partial_cache: bool = False,
     ) -> dict[str, Any]:
         """Persist resumable Hub downloads and any dependent NAS fan-out."""
         if not self.enabled:
@@ -965,6 +969,13 @@ class VirtualNAS:
         download_required = expected_bytes * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
         for node_id in download_nodes:
             download_storage = await self._node_storage(node_id)
+            if require_partial_cache and not any(
+                item.get("model_id") == model_id and item.get("partial")
+                for item in download_storage["models"]
+            ):
+                raise LookupError(
+                    f"partial model cache no longer exists on node '{node_id}'"
+                )
             download_free = _optional_nonnegative_int(download_storage.get("free_size"))
             if download_free is None:
                 raise RuntimeError(
@@ -1013,6 +1024,8 @@ class VirtualNAS:
             "source_node_id": "huggingface", "target_node_id": node_id,
             "revision": revision, "depends_on_job_id": None,
             "requested_revision": requested_revision,
+            "require_partial_cache": bool(require_partial_cache),
+            "download_attempted_at": None,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
             "status": "queued", "bytes_total": expected_bytes,
@@ -1198,6 +1211,11 @@ class VirtualNAS:
                     job.get("requested_revision") or job.get("revision") or "main",
                 )
             ), None)
+            if job.get("require_partial_cache") and already_complete is None and not any(
+                item.get("model_id") == job["model_id"] and item.get("partial")
+                for item in storage["models"]
+            ):
+                raise LookupError("partial model cache no longer exists")
             if already_complete is None:
                 current_size = await self.estimate_download_size(
                     job["model_id"], job.get("revision") or "main", token,
@@ -1239,6 +1257,8 @@ class VirtualNAS:
                     },
                     timeout=24 * 60 * 60,
                 )
+            job["download_attempted_at"] = time.time()
+            self._save()
             # Neither a local snapshot_download worker nor a remote agent's
             # snapshot worker can be safely canceled once it begins. Retain
             # ownership until it finishes so stop/restart cannot duplicate it.

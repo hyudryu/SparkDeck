@@ -561,6 +561,20 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
 
+    async def test_finish_download_never_starts_without_the_partial_cache(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+
+        with self.assertRaisesRegex(LookupError, "partial model cache no longer exists"):
+            await nas.queue_download_and_transfer(
+                "other/model", RESOLVED_REVISION, "local", [], 100,
+                requested_revision="release-1", require_partial_cache=True,
+            )
+
+        self.assertEqual(nas.jobs, [])
+
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_requested_ref_cannot_seed_pinned_workflow(self):
@@ -610,6 +624,79 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["targets"][0]["download_eligible"])
         self.assertIn("updated", result["targets"][0]["download_reason"])
+
+    async def test_manager_queues_resumable_download_for_partial_cache(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {}
+        manager.node_registry = FakeRegistry()
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [
+            {
+                "id": "failed-download", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-1", "revision": RESOLVED_REVISION,
+                "status": "failed", "started_at": 4, "created_at": 5,
+            },
+            {
+                "id": "canceled-before-start", "kind": "download",
+                "model_id": "org/model", "target_node_id": "worker-a",
+                "requested_revision": "release-2", "revision": "b" * 40,
+                "status": "canceled", "started_at": None, "created_at": 6,
+            },
+        ]}
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "release-1",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a",
+                "has_partial_model_cache": True,
+                "download_eligible": True,
+            }],
+        })
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["download-1"],
+            "jobs": [{
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "worker-a",
+                "status": "queued", "bytes_total": 20, "bytes_transferred": 0,
+                "created_at": 1,
+            }],
+        })
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "worker-a",
+        )
+
+        self.assertEqual(result["job_ids"], ["download-1"])
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "worker-a", [], 20,
+            requested_revision="release-1", require_partial_cache=True,
+        )
+        manager.virtual_nas.resolve_download_revision.assert_awaited_once_with(
+            "org/model", "release-1",
+        )
+
+        manager.virtual_nas_transfer_preflight.return_value = {
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a",
+                "has_partial_model_cache": False,
+                "download_eligible": False,
+            }],
+        }
+        with self.assertRaisesRegex(LookupError, "partial model cache not found"):
+            await manager.queue_virtual_nas_download(
+                "org/model", "worker-a",
+            )
+        self.assertEqual(
+            manager.virtual_nas.queue_download_and_transfer.await_count, 1,
+        )
 
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
         manager = Manager.__new__(Manager)

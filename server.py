@@ -2314,6 +2314,31 @@ async def v1_storage_delete_model(node_id: str, model_id: str):
         raise _storage_error(exc) from exc
 
 
+@app.post(
+    "/api/v1/storage/nodes/{node_id}/models/{model_id:path}/download",
+    status_code=202,
+)
+async def v1_storage_finish_model_download(node_id: str, model_id: str, req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) - {"revision"}:
+            raise ValueError("request may contain only revision")
+        revision = body.get("revision")
+        if revision is not None and not isinstance(revision, str):
+            raise ValueError("revision must be a string")
+        return _public_storage_payload(
+            await manager.queue_virtual_nas_download(
+                model_id.strip(), node_id.strip(), revision,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
 @app.post("/api/v1/deployments", status_code=201)
 async def v1_create_deployment(req: Request):
     try:

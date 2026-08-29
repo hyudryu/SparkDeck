@@ -8,6 +8,7 @@ import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
 import { formatBytes } from '../utils/format'
+import { artifactFilesDownloaded, ggufArtifactOptions, type GgufArtifactOption, type GgufQuantization } from '../utils/gguf'
 
 const initialForm: CreateDeploymentInput = {
   alias: '',
@@ -21,6 +22,22 @@ const initialForm: CreateDeploymentInput = {
 }
 
 const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
+
+const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
+const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
+
+// Sentinel option in the GGUF artifact dropdown: switching to it reveals
+// the text field so a controller-local artifact path can be entered.
+const MANUAL_ARTIFACT_OPTION = '__enter-local-path__'
+
+// Dropdown option labels state the download size and whether the weights
+// already sit in the cluster cache, so the badge travels with the text.
+const quantizationOptionLabel = (variant: GgufQuantization, downloaded: boolean) => (
+  `${variant.name}${variant.weight_size_bytes ? ` · ${formatBytes(variant.weight_size_bytes)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
+)
+const artifactOptionLabel = (option: GgufArtifactOption, downloaded: boolean) => (
+  `${option.filename}${option.weightSize ? ` · ${formatBytes(option.weightSize)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
+)
 
 function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): CreateDeploymentInput {
   const runtime = isRuntimeKind(settings?.default_runtime) ? settings.default_runtime : initialForm.runtime
@@ -327,6 +344,14 @@ export function ModelsPage() {
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
   const catalogShardedLayout = useRef(false)
+  // Provenance refs for the deployment creator: which quantization/artifact
+  // values were derived from a repository listing rather than typed by
+  // hand, plus the last model id seen for invalidating them. (The retained
+  // catalog listing's provenance lives in state, see catalogResponseQuery
+  // below.)
+  const linkedQuantizationRef = useRef<string | undefined>(undefined)
+  const linkedArtifactRef = useRef<string | undefined>(undefined)
+  const previousModelIdRef = useRef('')
   const reloadDeployments = resource.reload
 
   useEffect(() => {
@@ -450,6 +475,14 @@ export function ModelsPage() {
           quantization: quantization || current.settings.quantization,
         },
     }))
+    // A deep link names repository artifacts, so record them as
+    // listing-derived for the stale-selection cleanup above, and treat the
+    // model id as already observed so the linked picks are not wiped.
+    if (ggufArtifact && artifact) {
+      linkedArtifactRef.current = artifact
+      linkedQuantizationRef.current = quantization || undefined
+    }
+    previousModelIdRef.current = modelId
     setCreating(true)
     setSearchParams({}, { replace: true })
   }, [searchParams, setSearchParams])
@@ -532,12 +565,20 @@ export function ModelsPage() {
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   // Models already present on any node's Virtual NAS cache, for the
-  // "already have it" picker in the deployment creator.
+  // "already have it" picker in the deployment creator. Externally managed
+  // bundles (for example installed ComfyUI weights) live outside the cache
+  // and cannot back or transfer a runtime deployment, so only models with
+  // a normal cache entry are offered.
   const cachedModels = useMemo(() => {
     const byModel = new Map<string, { modelId: string; nodeCount: number; sizeBytes: number }>()
+    const externallyManaged = new Set<string>()
     for (const node of modelCache.data?.nodes ?? []) {
       for (const model of node.models) {
         if (model.partial) continue
+        if (model.externally_managed || model.transferable === false) {
+          externallyManaged.add(model.model_id)
+          continue
+        }
         const entry = byModel.get(model.model_id)
           ?? { modelId: model.model_id, nodeCount: 0, sizeBytes: 0 }
         entry.nodeCount += 1
@@ -545,14 +586,20 @@ export function ModelsPage() {
         byModel.set(model.model_id, entry)
       }
     }
-    return [...byModel.values()].sort((a, b) => a.modelId.localeCompare(b.modelId))
+    return [...byModel.values()]
+      .filter((entry) => !externallyManaged.has(entry.modelId) || byModel.has(entry.modelId))
+      .sort((a, b) => a.modelId.localeCompare(b.modelId))
   }, [modelCache.data])
 
   // Which of the creator's selected nodes already hold the chosen model.
+  // Externally managed bundles cannot seed a runtime deployment, so they
+  // do not count as cached weights here either.
   const createModelCacheInfo = useMemo(() => {
     if (!form.managed || !form.model_id || isLocalModelPath(form.model_id)) return undefined
     const cachedIds = new Set((modelCache.data?.nodes ?? [])
       .filter((node) => node.models.some((model) => !model.partial
+        && !model.externally_managed
+        && model.transferable !== false
         && model.model_id === form.model_id))
       .map((node) => node.id))
     const nameOf = (id: string) => id === 'local'
@@ -564,6 +611,236 @@ export function ModelsPage() {
       missing: selected.filter((id) => !cachedIds.has(id)).map(nameOf),
     }
   }, [form.managed, form.model_id, form.node_ids, modelCache.data, nodes.data, localLabel])
+
+  // Cached snapshot files per model, keyed by revision commit and kept
+  // per node, with each repository's main ref target. Downloaded marks
+  // must compare the revision a listing resolved to — never the union of
+  // every cached snapshot — and per node, because a sharded artifact is
+  // only usable from a single node that holds all of its files.
+  const cachedModelSnapshots = useMemo(() => {
+    const byModel = new Map<string, {
+      mainSha?: string
+      nodeFileSets: Array<Map<string, Set<string>>>
+    }>()
+    for (const node of modelCache.data?.nodes ?? []) {
+      for (const model of node.models) {
+        if (!model.snapshot_files) continue
+        let entry = byModel.get(model.model_id)
+        if (!entry) {
+          entry = { mainSha: model.revision_refs?.main, nodeFileSets: [] }
+          byModel.set(model.model_id, entry)
+        }
+        if (!entry.mainSha && model.revision_refs?.main) entry.mainSha = model.revision_refs.main
+        const revisions = new Map<string, Set<string>>()
+        for (const [revision, files] of Object.entries(model.snapshot_files)) {
+          if (!files.length) continue
+          revisions.set(revision, new Set(files))
+        }
+        entry.nodeFileSets.push(revisions)
+      }
+    }
+    return byModel
+  }, [modelCache.data])
+
+  // Repository file listing for the model id being configured, so the
+  // creator offers the repository's real quantizations and GGUF artifacts
+  // instead of free-text guesses. Debounced because the id is typed by hand.
+  const [catalogModelQuery, setCatalogModelQuery] = useState('')
+  // When the repository lists GGUF artifacts, the artifact field becomes a
+  // dropdown; this flag brings back the text field so a controller-local
+  // path can still be entered.
+  const [artifactManualEntry, setArtifactManualEntry] = useState(false)
+  useEffect(() => {
+    if (!creating) setArtifactManualEntry(false)
+  }, [creating])
+  useEffect(() => {
+    const modelId = form.model_id.trim()
+    if (!creating || !modelId.includes('/') || isLocalModelPath(modelId)) {
+      setCatalogModelQuery('')
+      return
+    }
+    const timer = window.setTimeout(() => setCatalogModelQuery(modelId), 350)
+    return () => window.clearTimeout(timer)
+  }, [creating, form.model_id])
+  // Provenance for the retained listing: useResource keeps the previous
+  // response while a new request is in flight or after it fails, so every
+  // consumer must be able to tell which query the data answers.
+  const [catalogResponseQuery, setCatalogResponseQuery] = useState<string>()
+  const createCatalogModel = useResource(
+    async (signal) => {
+      const data = await api.catalog.details(catalogModelQuery, signal)
+      setCatalogResponseQuery(catalogModelQuery)
+      return data
+    },
+    [catalogModelQuery],
+    Boolean(catalogModelQuery),
+  )
+  const trimmedModelId = form.model_id.trim()
+  const createCatalogData = createCatalogModel.data?.model
+  // Trust the listing only while it answers the model id currently in the
+  // form: an exact id match, or a listing resolved for this very query
+  // (the Hub follows repository renames and answers with the canonical id).
+  const createCatalogUsable = Boolean(
+    trimmedModelId
+    && createCatalogData?.id
+    && (createCatalogData.id === trimmedModelId || catalogResponseQuery === trimmedModelId),
+  )
+
+  // Adopt the canonical repository id after a rename redirect — but only
+  // from the response produced by the current query; retained data from an
+  // earlier repository must never canonicalize the field. The previous id
+  // is synced so the model-change cleanup treats a verified rename of the
+  // same repository differently from a switch to a different repository.
+  useEffect(() => {
+    const canonicalId = createCatalogModel.data?.model?.id
+    if (!canonicalId || !catalogModelQuery || canonicalId === catalogModelQuery) return
+    if (catalogResponseQuery !== catalogModelQuery) return
+    previousModelIdRef.current = canonicalId
+    setForm((current) => (
+      current.model_id.trim() === catalogModelQuery ? { ...current, model_id: canonicalId } : current
+    ))
+  }, [createCatalogModel.data, catalogModelQuery, catalogResponseQuery])
+
+  const createQuantizations = createCatalogUsable
+    ? (createCatalogData?.quantizations ?? EMPTY_QUANTIZATIONS)
+    : EMPTY_QUANTIZATIONS
+  const createArtifactOptions = useMemo(
+    () => ggufArtifactOptions(createQuantizations),
+    [createQuantizations],
+  )
+  // Provenance for quantization/artifact values the UI derived from a
+  // listing: an empty successful listing must be able to clear them while
+  // genuinely manual (or local-path) input survives.
+  const createCachedFileSets = useMemo(() => {
+    const entry = cachedModelSnapshots.get(form.model_id)
+    if (!entry) return EMPTY_FILE_SETS
+    // When the listing resolved a commit, only that exact revision's cached
+    // files count — an older snapshot must not mark current files as
+    // present. The node's own main ref is the fallback for cache-only data
+    // with no resolved revision (for example when the Hub is unreachable).
+    const resolvedRevision = createCatalogUsable ? createCatalogData?.revision : undefined
+    const revision = resolvedRevision ?? entry.mainSha
+    if (!revision) return EMPTY_FILE_SETS
+    const sets: Array<Set<string>> = []
+    for (const revisions of entry.nodeFileSets) {
+      const files = revisions.get(revision)
+      if (files?.size) sets.push(files)
+    }
+    return sets
+  }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
+
+  // Drop quantization and artifact selections that the current listing does
+  // not offer (picked from a previous repository, or renamed away
+  // upstream): they would fail at launch while looking valid in the form.
+  // Free-text quantization for vLLM/SGLang and local artifact paths are not
+  // repository-derived and stay untouched.
+  useEffect(() => {
+    if (!createCatalogUsable) return
+    setForm((current) => {
+      if (current.runtime !== 'llama.cpp') return current
+      const quantization = current.settings.quantization
+      const artifact = current.settings.artifact
+      const staleQuantization = quantization && (
+        (createQuantizations.length > 0 && !createQuantizations.some((variant) => variant.name === quantization))
+        || (createQuantizations.length === 0 && linkedQuantizationRef.current === quantization)
+      )
+      const staleArtifact = artifact && !isLocalArtifact(artifact) && (
+        (createArtifactOptions.length > 0 && !createArtifactOptions.some((option) => option.filename === artifact))
+        || (createArtifactOptions.length === 0 && linkedArtifactRef.current === artifact)
+      )
+      if (!staleQuantization && !staleArtifact) return current
+      if (staleQuantization) linkedQuantizationRef.current = undefined
+      if (staleArtifact) linkedArtifactRef.current = undefined
+      return {
+        ...current,
+        settings: {
+          ...current.settings,
+          quantization: staleQuantization ? undefined : quantization,
+          artifact: staleArtifact ? undefined : artifact,
+        },
+      }
+    })
+  }, [createCatalogUsable, createQuantizations, createArtifactOptions])
+
+  // Changing the model id invalidates listing-derived selections right
+  // away — the replacement lookup may be slow or fail entirely, and the
+  // old repository's artifact must not survive in the fallback text fields
+  // until (or regardless of whether) the new listing arrives. The previous
+  // id is compared against the form value inside the updater so a deep
+  // link setting model and artifacts together is not treated as a change.
+  useEffect(() => {
+    setForm((current) => {
+      const currentModelId = current.model_id.trim()
+      if (previousModelIdRef.current === currentModelId) return current
+      previousModelIdRef.current = currentModelId
+      if (current.runtime !== 'llama.cpp') return current
+      const quantization = current.settings.quantization
+      const artifact = current.settings.artifact
+      const staleQuantization = Boolean(quantization) && linkedQuantizationRef.current === quantization
+      const staleArtifact = Boolean(artifact) && !isLocalArtifact(artifact) && linkedArtifactRef.current === artifact
+      if (!staleQuantization && !staleArtifact) return current
+      linkedQuantizationRef.current = undefined
+      linkedArtifactRef.current = undefined
+      return {
+        ...current,
+        settings: {
+          ...current.settings,
+          quantization: staleQuantization ? undefined : quantization,
+          artifact: staleArtifact ? undefined : artifact,
+        },
+      }
+    })
+  }, [trimmedModelId])
+
+  const updateCreateQuantization = (name: string) => setForm((current) => {
+    if (current.runtime !== 'llama.cpp') {
+      return { ...current, settings: { ...current.settings, quantization: name || undefined } }
+    }
+    const variant = createQuantizations.find((entry) => entry.name === name)
+    const linkedArtifact = Boolean(current.settings.artifact
+      && createArtifactOptions.some((option) => option.filename === current.settings.artifact))
+    // The artifact carries the actual weights for llama.cpp, so keep it in
+    // lockstep with the quantization pick: a variant selects its artifact,
+    // and clearing the quantization clears a previously linked artifact so
+    // a compatible file must be chosen again. Manually entered artifacts
+    // are left untouched.
+    const variantArtifact = variant ? ggufArtifactOptions([variant])[0]?.filename : undefined
+    linkedQuantizationRef.current = variant?.name
+    linkedArtifactRef.current = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
+    const artifact = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
+    return {
+      ...current,
+      settings: { ...current.settings, quantization: name || undefined, artifact },
+    }
+  })
+
+  const updateCreateArtifact = (filename: string) => {
+    const option = createArtifactOptions.find((entry) => entry.filename === filename)
+    linkedArtifactRef.current = option?.filename
+    if (option) linkedQuantizationRef.current = option.quantization
+    setForm((current) => ({
+      ...current,
+      settings: {
+        ...current.settings,
+        artifact: filename || undefined,
+        ...(option ? { quantization: option.quantization } : {}),
+      },
+    }))
+  }
+
+  const updateManualArtifact = (artifact: string) => {
+    linkedArtifactRef.current = undefined
+    setForm((current) => ({ ...current, settings: { ...current.settings, artifact: artifact || undefined } }))
+  }
+
+  // Fresh form sessions (a new creator, or an editor loading saved
+  // settings) start without any listing-derived provenance.
+  const resetSelectionProvenance = (modelId?: string) => {
+    linkedQuantizationRef.current = undefined
+    linkedArtifactRef.current = undefined
+    previousModelIdRef.current = modelId ?? ''
+    setArtifactManualEntry(false)
+  }
 
   const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
     const sharded = current.deployment_mode === 'sharded'
@@ -602,6 +879,7 @@ export function ModelsPage() {
     setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
     setExtraFlags('')
     setGpuMemoryUtil('')
+    resetSelectionProvenance()
     setFormError(undefined)
     setCreating(true)
   }
@@ -624,6 +902,10 @@ export function ModelsPage() {
       node_ids: deployment.node_ids?.length ? deployment.node_ids : (localNodeId ? [localNodeId] : []),
       deployment_mode: (deployment.deployment_mode as CreateDeploymentInput['deployment_mode']) ?? 'single',
     })
+    // The saved settings were not derived from the current listing, so a
+    // stale provenance from a previous creator session must not treat them
+    // as leftovers and clear them before display.
+    resetSelectionProvenance(deployment.model_id)
     setFormError(undefined)
     setCreating(true)
   }
@@ -1707,7 +1989,7 @@ export function ModelsPage() {
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select
-                  value=""
+                  value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
                   onChange={(event) => {
                     const modelId = event.target.value
                     if (!modelId) return
@@ -1726,8 +2008,49 @@ export function ModelsPage() {
                   ))}
                 </select>
               </label>}
-              <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>
-              {form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>}
+              {form.runtime === 'llama.cpp' && createQuantizations.length > 0 ? <label className="field"><span>Quantization (optional)</span>
+                <select
+                  value={form.settings.quantization ?? ''}
+                  onChange={(event) => updateCreateQuantization(event.target.value)}
+                >
+                  <option value="">Full precision (no quantization)</option>
+                  {createQuantizations.map((variant) => (
+                    <option key={variant.name} value={variant.name}>
+                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFileSets))}
+                    </option>
+                  ))}
+                </select>
+                <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
+              </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
+              {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) && !artifactManualEntry ? <label className="field"><span>GGUF artifact</span>
+                <select
+                  required
+                  value={form.settings.artifact ?? ''}
+                  onChange={(event) => {
+                    if (event.target.value === MANUAL_ARTIFACT_OPTION) {
+                      // Entering local-path mode starts from an empty field:
+                      // a previously linked repository artifact must not
+                      // stay prefilled and silently keep being used.
+                      setArtifactManualEntry(true)
+                      updateManualArtifact('')
+                      return
+                    }
+                    updateCreateArtifact(event.target.value)
+                  }}
+                >
+                  <option value="">Choose from the repository files…</option>
+                  {createArtifactOptions.map((option) => (
+                    <option key={option.key} value={option.filename}>
+                      {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFileSets))}
+                    </option>
+                  ))}
+                  <option value={MANUAL_ARTIFACT_OPTION}>Use a local file path on this device…</option>
+                </select>
+                <small>The repository publishes one GGUF file per quantization; the chosen file is what nodes download from {form.model_id}. An absolute local path runs on this device only.</small>
+              </label> : form.runtime === 'llama.cpp' && <>
+                <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => updateManualArtifact(event.target.value)} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>
+                {artifactManualEntry && createArtifactOptions.length > 0 && <Button type="button" variant="tertiary" onClick={() => { setArtifactManualEntry(false); updateManualArtifact('') }}>Choose from the repository files…</Button>}
+              </>}
               {createModelCacheInfo && (createModelCacheInfo.cached.length > 0 || createModelCacheInfo.missing.length > 0) && <p className="field-note">
                 {createModelCacheInfo.cached.length
                   ? `Weights cached on ${createModelCacheInfo.cached.join(', ')}.`

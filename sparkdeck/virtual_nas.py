@@ -255,21 +255,34 @@ class _TarQueueWriter:
     def __init__(self, chunks: queue.Queue, stopped: threading.Event):
         self.chunks = chunks
         self.stopped = stopped
+        self.buffer = bytearray()
 
-    def write(self, value: bytes) -> int:
-        data = bytes(value)
+    def _publish(self, data: bytes) -> None:
         while data and not self.stopped.is_set():
             try:
                 self.chunks.put(data, timeout=0.1)
-                return len(data)
+                return
             except queue.Full:
                 continue
         if data:
             raise BrokenPipeError("archive consumer closed")
-        return 0
+
+    def write(self, value: bytes) -> int:
+        data = bytes(value)
+        if data and self.stopped.is_set():
+            raise BrokenPipeError("archive consumer closed")
+        self.buffer.extend(data)
+        while len(self.buffer) >= ARCHIVE_STREAM_CHUNK_BYTES:
+            chunk = bytes(self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES])
+            del self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES]
+            self._publish(chunk)
+        return len(data)
 
     def flush(self) -> None:
-        return None
+        if self.buffer:
+            chunk = bytes(self.buffer)
+            self.buffer.clear()
+            self._publish(chunk)
 
 
 class _TrackedExport:
@@ -1170,20 +1183,18 @@ class VirtualNAS:
 
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
-                    # tarfile's streaming default is only 10 KiB. Each write
-                    # crosses a thread queue, the event loop, ASGI, and HTTP,
-                    # which starves high-bandwidth ConnectX links. Buffer full
-                    # multi-megabyte archive chunks before yielding them.
-                    with tarfile.open(
-                        fileobj=writer, mode="w|",
-                        bufsize=ARCHIVE_STREAM_CHUNK_BYTES,
-                    ) as archive:
+                    # tarfile writes small blocks efficiently. Coalesce them in
+                    # the mutable queue writer so each network yield is large
+                    # without tarfile quadratically rebuilding a huge immutable
+                    # internal buffer.
+                    with tarfile.open(fileobj=writer, mode="w|") as archive:
                         if external_files is None:
                             archive.add(repository, arcname=repository.name, recursive=True)
                         else:
                             _write_external_bundle_archive(
                                 archive, model_id, external_files,
                             )
+                    writer.flush()
                 except BrokenPipeError:
                     pass
                 except BaseException as exc:
@@ -1529,10 +1540,7 @@ class VirtualNAS:
 
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
-                    with tarfile.open(
-                        fileobj=writer, mode="w|",
-                        bufsize=ARCHIVE_STREAM_CHUNK_BYTES,
-                    ) as archive:
+                    with tarfile.open(fileobj=writer, mode="w|") as archive:
                         for path, arcname in zip(paths, arcnames):
                             archive.add(
                                 path, arcname=arcname, recursive=False,
@@ -1546,6 +1554,7 @@ class VirtualNAS:
                             archive.addfile(
                                 info, io.BytesIO(_SELECTIVE_MARKER_CONTENT),
                             )
+                    writer.flush()
                 except BrokenPipeError:
                     pass
                 except BaseException as exc:

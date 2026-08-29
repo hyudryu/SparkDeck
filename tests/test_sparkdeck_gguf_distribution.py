@@ -25,6 +25,15 @@ class FakeManager:
     async def selected_cluster_nodes(self, node_ids):
         return [{"id": node_id, "name": node_id, "online": True} for node_id in node_ids]
 
+    def public_target_node(self, node):
+        return {"id": node["id"], "name": node["name"]}
+
+    @property
+    def settings(self):
+        if not hasattr(self, "_settings"):
+            self._settings = {"cluster_node_name": "Coordinator"}
+        return self._settings
+
 
 class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
     """The controller-first GGUF homes flow: one Hub seed, file-scoped fan-out."""
@@ -139,6 +148,34 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Virtual NAS is required"):
             await self.prepare(home_node_ids=["local", "worker-1"])
+
+    async def test_background_failure_keeps_a_visible_error_card(self):
+        self.manager.node_has_model_files = AsyncMock(return_value=False)
+        self.manager.node_download_model_files = AsyncMock(
+            side_effect=RuntimeError("hub unreachable")
+        )
+        prepared = str(self.artifact)
+        with (
+            patch("sparkdeck.service.launch_managed_container", AsyncMock()),
+        ):
+            created = await self.service.create_deployment({
+                "model": "org/model", "alias": "failed-pull",
+                "runtime": "llama.cpp", "revision": "release-gguf",
+                "settings": {"artifact": "UD/model-Q8.gguf"},
+                "node_ids": ["local", "worker-1"],
+            })
+
+        self.assertEqual(created["status"], "starting")
+        await self.service._deployment_launch_tasks[created["id"]]
+
+        stored = self.service.store.deployment("failed-pull")
+        self.assertIn("hub unreachable", stored["settings"]["launch_error"])
+        listed = next(
+            item for item in await self.service.deployments()
+            if item["id"] == created["id"]
+        )
+        self.assertEqual(listed["status"], "error")
+        self.assertIn("hub unreachable", listed["last_error"])
 
     async def test_remote_homes_are_rejected_for_absolute_local_artifacts(self):
         artifact = Path(self.temp.name) / "controller.gguf"

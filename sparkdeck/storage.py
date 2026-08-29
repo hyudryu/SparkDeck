@@ -350,6 +350,14 @@ class SparkDeckStore:
                 (container_name, deployment_id),
             )
 
+    def update_artifact(self, deployment_id: str, artifact: str) -> None:
+        """Persist the resolved artifact path once background preparation ends."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET artifact = ? WHERE id = ?",
+                (artifact, deployment_id),
+            )
+
     def update_alias(self, deployment_id: str, alias: str) -> None:
         with self._lock, self._connection:
             self._connection.execute(

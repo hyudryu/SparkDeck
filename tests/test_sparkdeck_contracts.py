@@ -20,6 +20,13 @@ class FakeManager:
         self.stop_container = AsyncMock(return_value={"status": "exited"})
         self._vllm_chat = AsyncMock()
         self._vllm_completions = AsyncMock()
+        self.settings = {"cluster_node_name": "Coordinator"}
+
+    async def selected_cluster_nodes(self, node_ids):
+        return [{"id": node_id, "name": node_id, "online": True} for node_id in node_ids]
+
+    def public_target_node(self, node):
+        return {"id": node["id"], "name": node["name"]}
 
 
 class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +166,9 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 "quantization": "f16",
                 "settings": {"artifact": "FP16/model-F16.gguf"},
             })
+            self.assertEqual(created["status"], "starting")
+            self.assertEqual(created["launch_phase"], "queued")
+            await self.service._deployment_launch_tasks[created["id"]]
 
         virtual_nas.resolve_download_revision.assert_awaited_once_with(
             "org/model", "release-gguf",
@@ -170,12 +180,16 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         launch_settings = launch.await_args.args[5]
         self.assertEqual(launch_settings["artifact"], str(artifact.resolve()))
         self.assertEqual(launch_settings["model_source"], "public_repository")
+        stored = self.service.store.deployment("prepared-gguf")
+        self.assertEqual(stored["model"]["artifact"], str(artifact.resolve()))
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+        self.assertIsNotNone(stored["container_name"])
         self.assertEqual(created["model"]["repository"], "org/model")
         self.assertEqual(created["model"]["quantization"], "FP16")
-        self.assertEqual(created["model"]["artifact"], str(artifact.resolve()))
-        self.assertEqual(created["settings"]["model_source"], "public_repository")
-        stored = self.service.store.deployment(created["id"], include_private=True)
-        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+        # The create response carries the raw artifact; the resolved snapshot
+        # path lands on the stored record once preparation completes.
+        self.assertEqual(created["model"]["artifact"], "FP16/model-F16.gguf")
+        self.assertNotIn("model_source", created["settings"])
 
     async def test_repo_relative_gguf_ignores_coincidental_cwd_file(self):
         prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
@@ -200,15 +214,18 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                     "runtime": "llama.cpp", "revision": "release-1",
                     "settings": {"artifact": "model.gguf"},
                 })
+                await self.service._deployment_launch_tasks[created["id"]]
         finally:
             os.chdir(original_cwd)
 
         prepare.assert_awaited_once_with(
             "org/model", "model.gguf", "release-1", None,
-            home_node_ids=None, download_node_id=None,
+            home_node_ids=None, download_node_id=None, progress=prepare.await_args.kwargs["progress"],
         )
-        self.assertEqual(created["model"]["artifact"], prepared)
-        self.assertEqual(created["settings"]["model_source"], "public_repository")
+        stored = self.service.store.deployment("coincidental")
+        self.assertEqual(stored["model"]["artifact"], prepared)
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
 
     async def test_repo_relative_tilde_gguf_is_not_expanded_to_controller_home(self):
         prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
@@ -232,13 +249,14 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 "runtime": "llama.cpp", "revision": "release-1",
                 "settings": {"artifact": "~/model.gguf"},
             })
-
+            await self.service._deployment_launch_tasks[created["id"]]
         prepare.assert_awaited_once_with(
             "org/model", "~/model.gguf", "release-1", None,
-            home_node_ids=None, download_node_id=None,
+            home_node_ids=None, download_node_id=None, progress=prepare.await_args.kwargs["progress"],
         )
-        self.assertEqual(created["model"]["artifact"], prepared)
-        self.assertEqual(created["settings"]["model_source"], "public_repository")
+        stored = self.service.store.deployment("tilde-repository-path")
+        self.assertEqual(stored["model"]["artifact"], prepared)
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
 
     async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
         self.service.store.add_deployment(Deployment(

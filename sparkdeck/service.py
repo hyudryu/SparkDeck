@@ -17,7 +17,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -52,6 +52,8 @@ _SAFE_CONFIGURATION_KEYS = {
 }
 _LOCAL_ROUTING_KEYS = {
     "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
+    # Durable failure message for a background llama.cpp launch.
+    "launch_error",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -329,6 +331,7 @@ class SparkDeckService:
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        self._deployment_launch_messages: dict[str, str] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
@@ -938,7 +941,19 @@ class SparkDeckService:
                     deployment.update({
                         "status": "starting",
                         "launch_phase": "queued",
-                        "launch_message": "Preparing deployment launch",
+                        "launch_message": (
+                            self._deployment_launch_messages.get(deployment["id"])
+                            or "Preparing deployment launch"
+                        ),
+                    })
+                elif (stored.get("settings") or {}).get("launch_error"):
+                    # A background llama.cpp launch failed after the card was
+                    # already visible; keep the failure durable and legible.
+                    deployment.update({
+                        "status": "error",
+                        "last_error": str(
+                            stored["settings"]["launch_error"]
+                        )[:500],
                     })
                 else:
                     deployment["status"] = "missing"
@@ -1230,6 +1245,7 @@ class SparkDeckService:
         quantization: str | None,
         home_node_ids: list[str] | None = None,
         download_node_id: str | None = None,
+        progress: Callable[[str], None] | None = None,
     ) -> str:
         """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
         if _public_model_id(repository) != repository:
@@ -1270,8 +1286,11 @@ class SparkDeckService:
             await self._distribute_gguf_artifact(
                 repository, resolved_revision, selected_files,
                 home_node_ids, download_node_id, revision,
+                progress,
             )
         else:
+            if progress:
+                progress("Downloading GGUF from Hugging Face")
             await virtual_nas.download_model_files_checked(
                 repository, resolved_revision, selected_files,
                 requested_revision=revision,
@@ -1317,6 +1336,7 @@ class SparkDeckService:
         self, repository: str, resolved_revision: str, selected_files: list[str],
         home_node_ids: list[str], download_node_id: str | None,
         requested_revision: str,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         """Place the selected GGUF files on every home node with one Hub pull.
 
@@ -1366,6 +1386,8 @@ class SparkDeckService:
         if sources:
             source = download_node_id if download_node_id in sources else sources[0]
             for node_id in targets:
+                if progress:
+                    progress(f"Transferring GGUF to {self._node_label(node_id)}")
                 await self.manager.node_transfer_model_files(
                     source, node_id, repository, resolved_revision,
                     selected_files, requested_revision,
@@ -1378,6 +1400,11 @@ class SparkDeckService:
         failures: list[str] = []
         for candidate in candidates:
             try:
+                if progress:
+                    progress(
+                        f"Downloading GGUF from Hugging Face onto "
+                        f"{self._node_label(candidate)}"
+                    )
                 await self.manager.node_download_model_files(
                     candidate, repository, resolved_revision, selected_files,
                     requested_revision,
@@ -1388,6 +1415,8 @@ class SparkDeckService:
             for node_id in targets:
                 if node_id == candidate:
                     continue
+                if progress:
+                    progress(f"Transferring GGUF to {self._node_label(node_id)}")
                 await self.manager.node_transfer_model_files(
                     candidate, node_id, repository, resolved_revision,
                     selected_files, requested_revision,
@@ -1398,6 +1427,129 @@ class SparkDeckService:
             + "; ".join(failures)
         )
 
+    def _node_label(self, node_id: str) -> str:
+        if node_id == LOCAL_NODE_ID:
+            return str(self.manager.settings.get("cluster_node_name") or "this device")
+        node = getattr(self.manager, "node_registry", None)
+        record = node.get(node_id) if node is not None else None
+        return str((record or {}).get("name") or node_id)
+
+    async def _begin_llama_cpp_launch(
+        self, deployment: Deployment, settings: dict[str, Any], model: str,
+        home_node_ids: list[str] | None, requested_seed: str | None,
+        selected: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist a public card, then prepare and launch in the background.
+
+        The GGUF seed download and Virtual NAS fan-out can run for hours, so
+        the create request returns immediately and the Deployments card
+        carries the live preparation message until the container starts.
+        """
+        launch_complete = asyncio.Event()
+        self.store.add_deployment(deployment, None, None)
+        self._deployment_launches[deployment.id] = launch_complete
+        self._deployment_launch_messages[deployment.id] = "Preparing GGUF artifact"
+
+        async def launch() -> None:
+            try:
+                await self._finish_llama_cpp_launch(
+                    deployment, settings, model,
+                    home_node_ids, requested_seed,
+                )
+            finally:
+                launch_complete.set()
+                self._deployment_launches.pop(deployment.id, None)
+                self._deployment_launch_tasks.pop(deployment.id, None)
+                self._deployment_launch_messages.pop(deployment.id, None)
+
+        task = asyncio.create_task(
+            launch(), name=f"sparkdeck-deploy-{deployment.id}",
+        )
+        self._deployment_launch_tasks[deployment.id] = task
+        result = self.store.deployment(deployment.id) or deployment.to_dict()
+        result.update({
+            "status": "starting",
+            "launch_phase": "queued",
+            "launch_message": self._deployment_launch_messages[deployment.id],
+            "node_ids": list(home_node_ids or [LOCAL_NODE_ID]),
+            "selected_nodes": [
+                self.manager.public_target_node(node) for node in selected
+            ],
+        })
+        return result
+
+    async def _finish_llama_cpp_launch(
+        self, deployment: Deployment, settings: dict[str, Any], model: str,
+        home_node_ids: list[str] | None, requested_seed: str | None,
+    ) -> None:
+        def message(text: str) -> None:
+            self._deployment_launch_messages[deployment.id] = text
+
+        adapter = self.registry.get(deployment.runtime)
+        cleanup_name = safe_container_name(deployment.alias, deployment.id)
+        deployment.container_name = cleanup_name
+        self.store.update_container(deployment.id, cleanup_name)
+        try:
+            artifact = await self._prepare_public_gguf_artifact(
+                model, str(settings.get("artifact") or ""),
+                deployment.model.revision or "main",
+                deployment.model.quantization,
+                home_node_ids=home_node_ids,
+                download_node_id=requested_seed,
+                progress=message,
+            )
+            settings = {
+                **settings,
+                "artifact": artifact,
+                "model_source": "public_repository",
+            }
+            message("Launching llama server")
+            launched = await launch_managed_container(
+                self.manager, adapter, deployment.id, deployment.alias, model,
+                {
+                    **settings,
+                    "artifact": artifact,
+                    "revision": deployment.model.revision,
+                },
+            )
+            container_name = launched.get("name")
+            port = launched.get("port")
+            if not container_name or not port:
+                raise RuntimeError(
+                    "runtime launched without a discoverable container endpoint"
+                )
+            self.store.update_artifact(deployment.id, artifact)
+            self.store.update_managed_routing(
+                deployment.id,
+                self._local_configuration({
+                    **settings,
+                    "model_source": (
+                        settings.get("model_source")
+                        or launched.get("model_source")
+                        or "unknown"
+                    ),
+                }),
+                container_name,
+                f"http://127.0.0.1:{int(port)}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            try:
+                await self.manager.remove_container(cleanup_name)
+            except Exception as cleanup_error:
+                if not _is_missing_container_error(cleanup_error):
+                    pass
+            # Keep the visible card and persist the failure on it so the
+            # operator can see why the launch died and remove the record.
+            self.store.update_managed_routing(
+                deployment.id,
+                self._local_configuration({
+                    **settings,
+                    "launch_error": str(exc)[:400],
+                }),
+                None, None,
+            )
     async def create_deployment(
         self, body: dict[str, Any], *, background: bool = False,
     ) -> dict[str, Any]:
@@ -1452,17 +1604,36 @@ class SparkDeckService:
                         )
                     settings["model_source"] = "local"
                 else:
+                    # A public GGUF may need a long Hub download and Virtual
+                    # NAS fan-out before the container can launch. Persist a
+                    # visible card now and run the preparation in the
+                    # background so the create request returns immediately.
                     home_node_ids, requested_seed = self._llama_cpp_artifact_homes(
                         requested_node_ids, body,
                     )
-                    artifact = await self._prepare_public_gguf_artifact(
-                        model, artifact,
-                        _optional_string(body.get("revision")) or "main",
-                        quantization,
-                        home_node_ids=home_node_ids,
-                        download_node_id=requested_seed,
+                    if quantization:
+                        settings["quantization"] = quantization
+                    settings["artifact"] = artifact
+                    identity = ModelIdentity(
+                        repository=model,
+                        revision=_optional_string(body.get("revision")),
+                        artifact=artifact,
+                        quantization=quantization,
                     )
-                    settings["model_source"] = "public_repository"
+                    deployment = Deployment(
+                        id=deployment_id, alias=alias, runtime=runtime, kind=kind,
+                        model=identity, settings=self._local_configuration(settings),
+                        base_url_set=bool(body.get("base_url")),
+                    )
+                    selected = (
+                        await self.manager.selected_cluster_nodes(
+                            home_node_ids or [LOCAL_NODE_ID],
+                        )
+                    )
+                    return await self._begin_llama_cpp_launch(
+                        deployment, dict(settings), model,
+                        home_node_ids, requested_seed, selected,
+                    )
                 settings["artifact"] = artifact
                 if quantization:
                     settings["quantization"] = quantization

@@ -540,9 +540,18 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         })
 
         # The DeploymentPage editor submits the manager-backed contract; a
-        # saved bookmark must translate it instead of rejecting the save.
+        # saved bookmark must translate it instead of rejecting the save, and
+        # the complete structured controls persist for Manager to merge.
         detail = await self.service.update_deployment_settings("bookmark", {
-            "launch_controls": {"context_window": 16384, "max_concurrency": 8},
+            "launch_controls": {
+                "context_window": 16384,
+                "max_concurrency": 8,
+                "kv_cache_dtype": "fp8",
+                "thinking_mode": "default",
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+            },
             "gpu_memory_gb": 24,
             "sg_tp_size": None,
             "sg_mem_fraction": None,
@@ -555,7 +564,30 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["max_running_requests"], 8)
         self.assertEqual(stored["settings"]["gpu_memory_gb"], 24)
         self.assertEqual(stored["settings"]["extra_args"], ["--enable-prefix-caching"])
+        self.assertEqual(stored["settings"]["launch_controls"]["kv_cache_dtype"], "fp8")
         self.assertEqual(detail["status"], "saved")
+
+        # Alias changes save atomically with the settings in one request.
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "alias": "renamed-bookmark",
+            "context_length": 32768,
+        })
+        self.assertEqual(detail["alias"], "renamed-bookmark")
+        self.assertIsNone(self.service.store.deployment("bookmark"))
+        self.assertIsNotNone(self.service.store.deployment("renamed-bookmark"))
+        # A second deployment's alias cannot be taken.
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "other", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        with self.assertRaisesRegex(ValueError, "already in use"):
+            await self.service.update_deployment_settings("renamed-bookmark", {
+                "alias": "other",
+            })
+        self.assertEqual(
+            self.service.store.deployment("renamed-bookmark")["settings"]["context_length"],
+            32768,
+        )
 
     async def test_quantization_only_change_is_revalidated_against_the_artifact(self):
         await self.service.create_deployment({

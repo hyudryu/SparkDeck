@@ -643,11 +643,10 @@ export function ModelsPage() {
       if (editing) {
         // Saved deployments are editable bookmarks: the same form updates the
         // recorded runtime settings and node preferences without launching.
-        // Runtime and model are fixed once saved; only the name can change.
-        // Settings apply before the rename so a rejected edit never leaves a
-        // partially applied rename behind.
+        // Runtime and model are fixed once saved. The alias travels in the
+        // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
-          context_length: settings.context_length ?? null,
+          alias: form.alias,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,
@@ -658,9 +657,6 @@ export function ModelsPage() {
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
         })
-        if (form.alias !== editing.alias) {
-          await api.deployments.rename(editing.id, form.alias)
-        }
         setActionNotice(`Updated ${form.alias}. Launch it from the deployments list when ready.`)
       } else {
         const deployment = await api.deployments.create({ ...form, settings })

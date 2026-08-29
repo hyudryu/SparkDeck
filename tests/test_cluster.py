@@ -698,17 +698,46 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                     "enabled": True,
                 }
                 registry.nodes = [node]
-                online = await registry.probe(node, force=True)
+                online = await registry.probe(node, force=True, details=True)
                 self.assertEqual(online["status"], "online")
 
                 docker_ready = False
-                degraded = await registry.probe(node, force=True)
+                degraded = await registry.probe(node, force=True, details=True)
                 self.assertEqual(degraded["status"], "degraded")
                 self.assertTrue(degraded["online"])
                 self.assertIn(
                     "service user cannot access Docker",
                     degraded["status_message"],
                 )
+            finally:
+                await client.aclose()
+
+    async def test_health_probe_keeps_node_online_when_telemetry_times_out(self) -> None:
+        requests = []
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            if path == "/api/agent/health":
+                return {"protocol_version": AGENT_PROTOCOL_VERSION, "online": True}
+            raise RuntimeError("could not contact Spark 2: timed out")
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient()
+            try:
+                registry = NodeRegistry(Path(directory), client, "controller")
+                node = {
+                    "id": "remote-1", "name": "Spark 2",
+                    "agent_url": "http://spark-2:7878", "agent_token": "secret",
+                    "enabled": True,
+                }
+                registry.nodes = [node]
+                registry.request = request
+
+                result = await registry.probe(node, force=True)
+
+                self.assertTrue(result["online"])
+                self.assertEqual(result["status"], "online")
+                self.assertEqual(requests, ["/api/agent/health"])
             finally:
                 await client.aclose()
 

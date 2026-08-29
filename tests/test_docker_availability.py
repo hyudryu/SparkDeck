@@ -41,6 +41,17 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
 
         negotiate.assert_not_called()
 
+    async def test_agent_health_does_not_touch_docker_or_telemetry(self):
+        manager = self.manager_without_docker()
+        manager.app_revision = "a" * 40
+
+        health = manager.agent_health()
+
+        self.assertTrue(health["online"])
+        self.assertEqual(health["app_revision"], "a" * 40)
+        self.assertNotIn("docker_ready", health)
+        self.assertNotIn("stats", health)
+
     async def test_controller_starts_with_explicitly_unavailable_docker_inventory(self):
         manager = self.manager_without_docker()
         unavailable = docker.errors.DockerException("daemon is not running")

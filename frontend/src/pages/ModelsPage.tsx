@@ -578,19 +578,31 @@ export function ModelsPage() {
     }
   }, [form.managed, form.model_id, form.node_ids, modelCache.data, nodes.data, localLabel])
 
-  // Repo-relative file names cached on any node, per model: the "already
-  // downloaded" marks in the quantization and GGUF artifact pickers.
-  const cachedModelFiles = useMemo(() => {
-    const filesByModel = new Map<string, Set<string>>()
+  // Cached snapshot files per model, keyed by revision commit, with each
+  // repository's main ref target. Downloaded marks must compare the
+  // revision a listing resolved to — never the union of every cached
+  // snapshot — so an obsolete revision cannot mark current files as present.
+  const cachedModelSnapshots = useMemo(() => {
+    const byModel = new Map<string, {
+      mainSha?: string
+      filesByRevision: Map<string, Set<string>>
+    }>()
     for (const node of modelCache.data?.nodes ?? []) {
       for (const model of node.models) {
-        if (!model.files?.length) continue
-        const files = filesByModel.get(model.model_id) ?? new Set<string>()
-        for (const name of model.files) files.add(name)
-        filesByModel.set(model.model_id, files)
+        if (!model.snapshot_files) continue
+        const entry = byModel.get(model.model_id)
+          ?? { mainSha: model.revision_refs?.main, filesByRevision: new Map() }
+        if (!entry.mainSha && model.revision_refs?.main) entry.mainSha = model.revision_refs.main
+        for (const [revision, files] of Object.entries(model.snapshot_files)) {
+          if (!files.length) continue
+          const names = entry.filesByRevision.get(revision) ?? new Set<string>()
+          for (const name of files) names.add(name)
+          entry.filesByRevision.set(revision, names)
+        }
+        byModel.set(model.model_id, entry)
       }
     }
-    return filesByModel
+    return byModel
   }, [modelCache.data])
 
   // Repository file listing for the model id being configured, so the
@@ -611,25 +623,49 @@ export function ModelsPage() {
     [catalogModelQuery],
     Boolean(catalogModelQuery),
   )
-  const createQuantizations = createCatalogModel.data?.model?.quantizations ?? EMPTY_QUANTIZATIONS
+  const trimmedModelId = form.model_id.trim()
+  const createCatalogData = createCatalogModel.data?.model
+  // Only trust the listing while it still describes the model id currently
+  // in the form; a failed lookup for a new id must not keep showing the
+  // previous repository's files.
+  const createCatalogUsable = Boolean(trimmedModelId && createCatalogData?.id === trimmedModelId)
+  const createQuantizations = createCatalogUsable
+    ? (createCatalogData?.quantizations ?? EMPTY_QUANTIZATIONS)
+    : EMPTY_QUANTIZATIONS
   const createArtifactOptions = useMemo(
     () => ggufArtifactOptions(createQuantizations),
     [createQuantizations],
   )
-  const createCachedFiles = cachedModelFiles.get(form.model_id) ?? EMPTY_CACHED_FILES
+  const createCachedFiles = useMemo(() => {
+    const entry = cachedModelSnapshots.get(form.model_id)
+    if (!entry) return EMPTY_CACHED_FILES
+    // When the listing resolved a commit, only that exact revision's cached
+    // files count — an older snapshot must not mark current files as
+    // present. The node's own main ref is the fallback for cache-only data
+    // with no resolved revision (for example when the Hub is unreachable).
+    const resolvedRevision = createCatalogUsable ? createCatalogData?.revision : undefined
+    const revision = resolvedRevision ?? entry.mainSha
+    const files = revision ? entry.filesByRevision.get(revision) : undefined
+    return files?.size ? files : EMPTY_CACHED_FILES
+  }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
 
   const updateCreateQuantization = (name: string) => setForm((current) => {
+    if (current.runtime !== 'llama.cpp') {
+      return { ...current, settings: { ...current.settings, quantization: name || undefined } }
+    }
     const variant = createQuantizations.find((entry) => entry.name === name)
-    const artifact = current.runtime === 'llama.cpp' && variant
-      ? ggufArtifactOptions([variant])[0]
-      : undefined
+    const linkedArtifact = Boolean(current.settings.artifact
+      && createArtifactOptions.some((option) => option.filename === current.settings.artifact))
+    // The artifact carries the actual weights for llama.cpp, so keep it in
+    // lockstep with the quantization pick: a variant selects its artifact,
+    // and clearing the quantization clears a previously linked artifact so
+    // a compatible file must be chosen again. Manually entered artifacts
+    // are left untouched.
+    const variantArtifact = variant ? ggufArtifactOptions([variant])[0]?.filename : undefined
+    const artifact = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
     return {
       ...current,
-      settings: {
-        ...current.settings,
-        quantization: name || undefined,
-        ...(current.runtime === 'llama.cpp' && artifact ? { artifact: artifact.filename } : {}),
-      },
+      settings: { ...current.settings, quantization: name || undefined, artifact },
     }
   })
 

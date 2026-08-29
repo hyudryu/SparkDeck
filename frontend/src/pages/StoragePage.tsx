@@ -131,9 +131,9 @@ export function StoragePage() {
     }))
     return [...models.values()].sort((left, right) => compareModels(left.model, right.model))
   }, [visibleNodes])
-  const normalizedModelSearch = modelSearch.trim().toLocaleLowerCase()
+  const normalizedModelSearch = modelSearch.trim().toLowerCase()
   const matchesModelSearch = (modelId: string) => (
-    !normalizedModelSearch || modelId.toLocaleLowerCase().includes(normalizedModelSearch)
+    !normalizedModelSearch || modelId.toLowerCase().includes(normalizedModelSearch)
   )
   const filteredInventory = inventory.filter(({ model }) => matchesModelSearch(model.model_id))
   const transferJobs = useMemo(() => {

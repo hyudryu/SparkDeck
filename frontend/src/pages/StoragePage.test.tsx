@@ -235,6 +235,11 @@ describe('StoragePage', () => {
                 partial: false, has_partial_download: true,
                 partial_size_bytes: 50_000_000, revision: 'complete-a',
               },
+              {
+                model_id: 'Lightricks/LTX-2.5', size_bytes: 68_000_000_000,
+                partial: false, revision: 'ComfyUI', source: 'ComfyUI',
+                externally_managed: true, transferable: false, deletable: false,
+              },
             ],
           }
         : node),
@@ -268,6 +273,11 @@ describe('StoragePage', () => {
     expect(mixed).toHaveAttribute('draggable', 'true')
     expect(screen.queryByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).not.toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'org/mixed-model' })).toBeInTheDocument()
+    const external = screen.getByLabelText('Installed external weights Lightricks/LTX-2.5 on Studio Spark')
+    expect(external).toHaveTextContent('ComfyUI · Externally managed')
+    expect(external).toHaveAttribute('draggable', 'false')
+    expect(screen.queryByRole('button', { name: 'Delete Lightricks/LTX-2.5 from Studio Spark' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Lightricks/LTX-2.5' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
     let dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))

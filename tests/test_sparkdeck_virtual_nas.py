@@ -565,6 +565,126 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model["has_partial_download"])
             self.assertEqual(model["revisions"], ["revision-1"])
 
+    async def test_inventory_accepts_complete_diffusers_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = (
+                hub / "models--Tongyi-MAI--Z-Image-Turbo"
+                / "snapshots" / RESOLVED_REVISION
+            )
+            (snapshot / "transformer").mkdir(parents=True)
+            (snapshot / "tokenizer").mkdir()
+            (snapshot / "scheduler").mkdir()
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ZImagePipeline",
+                "transformer": ["diffusers", "ZImageTransformer2DModel"],
+                "tokenizer": ["transformers", "Qwen2Tokenizer"],
+                "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            }), encoding="utf-8")
+            (snapshot / "transformer" / "config.json").write_text("{}")
+            (snapshot / "transformer" / "diffusion_pytorch_model.safetensors").write_bytes(b"weights")
+            (snapshot / "tokenizer" / "tokenizer.json").write_text("{}")
+            (snapshot / "scheduler" / "scheduler_config.json").write_text("{}")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "Tongyi-MAI/Z-Image-Turbo")
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["has_partial_download"])
+            self.assertEqual(model["revisions"], [RESOLVED_REVISION])
+
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ZImagePipeline",
+                "missing_component": ["diffusers", "MissingModel"],
+            }), encoding="utf-8")
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+    async def test_inventory_reports_complete_external_comfyui_bundle_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            )
+            for relative in files:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            models = nas.inventory()
+            self.assertEqual(models, [{
+                "model_id": "Comfy-Org/MiniMax-Music-3",
+                "size_bytes": 21,
+                "file_count": 3,
+                "partial": False,
+                "has_partial_download": False,
+                "partial_size_bytes": 0,
+                "partial_revision_size_bytes": {},
+                "partial_revisions": [],
+                "partial_revision_refs": {},
+                "revision": "ComfyUI",
+                "revisions": [],
+                "revision_refs": {},
+                "last_modified": models[0]["last_modified"],
+                "source": "ComfyUI",
+                "externally_managed": True,
+                "transferable": False,
+                "deletable": False,
+            }])
+
+    async def test_inventory_counts_installed_ltx_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            files = (
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                "text_encoders/gemma4_e2b_it_bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+                "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            )
+            for relative in files:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "Lightricks/LTX-2.5")
+            self.assertEqual(model["file_count"], 6)
+            self.assertEqual(model["size_bytes"], 42)
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["transferable"])
+            self.assertFalse(model["deletable"])
+
+    async def test_inventory_ignores_incomplete_external_comfyui_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            target = root / "vae" / "minimax_music3_dav.safetensors"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

@@ -37,6 +37,7 @@ import type {
   StorageTransferResult,
   RecipePreparationPlan,
   RecipePreparationResult,
+  SavedDeploymentUpdateInput,
   ModelCacheState,
   SavedConfiguration,
   SavedConfigurationDetail,
@@ -57,11 +58,11 @@ import type {
   FanMaxSpeedResult,
   FanPidSettings,
   FanSettingsUpdateResult,
-  BenchyStatus,
-  BenchyServedModel,
-  BenchyRunConfig,
-  BenchyRunSummary,
-  BenchyRunDetail,
+  BenchmarkRunnerStatus,
+  BenchmarkRunnerModel,
+  BenchmarkRunnerRunConfig,
+  BenchmarkRunnerRunSummary,
+  BenchmarkRunnerRunDetail,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -395,7 +396,12 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
-    settings: { ...item.settings, port: item.port, quantization: item.model.quantization },
+    settings: {
+      ...item.settings,
+      port: item.port,
+      quantization: item.model.quantization,
+      artifact: item.settings?.artifact || item.model.artifact,
+    },
     deployment_mode: item.deployment_mode,
     required_node_count: item.required_node_count,
     node_ids: item.node_ids,
@@ -491,7 +497,7 @@ export const api = {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}`, { signal })
       return deploymentDetailFromWire(data)
     },
-    update: async (id: string, input: DeploymentUpdateInput) => {
+    update: async (id: string, input: DeploymentUpdateInput | SavedDeploymentUpdateInput) => {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}/settings`, {
         method: 'PUT',
         body: JSON.stringify(input),
@@ -510,12 +516,29 @@ export const api = {
           api_key: input.api_key || undefined,
           settings: input.settings,
           quantization: input.settings.quantization,
-          node_ids: input.managed && input.runtime !== 'llama.cpp' ? input.node_ids : undefined,
-          deployment_mode: input.managed && input.runtime !== 'llama.cpp' ? input.deployment_mode : undefined,
+          // Saved deployments record node preferences for every managed
+          // runtime (Llama server included); launch honours or overrides them.
+          node_ids: input.managed ? input.node_ids : undefined,
+          deployment_mode: input.managed ? input.deployment_mode : undefined,
         }),
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
+    preparePreflight: (id: string, nodeIds: string[], signal?: AbortSignal) => request<RecipePreparationPlan>(
+      `/api/v1/deployments/${encodeURIComponent(id)}/prepare/preflight`,
+      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }), signal },
+    ),
+    prepare: (id: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>(
+      `/api/v1/deployments/${encodeURIComponent(id)}/prepare`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          node_ids: nodeIds,
+          download_node_id: downloadNodeId || undefined,
+        }),
+      },
+      NO_REQUEST_TIMEOUT,
+    ),
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[]) => {
       if (action === 'remove') {
         return request<void>(
@@ -640,32 +663,32 @@ export const api = {
       signal,
     }, NO_REQUEST_TIMEOUT),
   chatStream: streamChat,
-  benchy: {
-    status: (signal?: AbortSignal) => request<BenchyStatus>('/api/v1/benchy/status', { signal }),
-    install: () => request<BenchyStatus>('/api/v1/benchy/install', { method: 'POST' }, NO_REQUEST_TIMEOUT),
-    models: async (signal?: AbortSignal): Promise<BenchyServedModel[]> => {
-      const data = await request<{ items: BenchyServedModel[] }>('/api/v1/benchy/models', { signal })
+  benchmarkRunner: {
+    status: (signal?: AbortSignal) => request<BenchmarkRunnerStatus>('/api/v1/benchmark-runner/status', { signal }),
+    install: () => request<BenchmarkRunnerStatus>('/api/v1/benchmark-runner/install', { method: 'POST' }, NO_REQUEST_TIMEOUT),
+    models: async (signal?: AbortSignal): Promise<BenchmarkRunnerModel[]> => {
+      const data = await request<{ items: BenchmarkRunnerModel[] }>('/api/v1/benchmark-runner/models', { signal })
       return data.items
     },
-    start: (config: BenchyRunConfig) => request<BenchyRunDetail>('/api/v1/benchy/runs', {
+    start: (config: BenchmarkRunnerRunConfig) => request<BenchmarkRunnerRunDetail>('/api/v1/benchmark-runner/runs', {
       method: 'POST',
       body: JSON.stringify(config),
     }, NO_REQUEST_TIMEOUT),
-    list: async (signal?: AbortSignal): Promise<BenchyRunSummary[]> => {
-      const data = await request<{ items: BenchyRunSummary[] }>('/api/v1/benchy/runs', { signal })
+    list: async (signal?: AbortSignal): Promise<BenchmarkRunnerRunSummary[]> => {
+      const data = await request<{ items: BenchmarkRunnerRunSummary[] }>('/api/v1/benchmark-runner/runs', { signal })
       return data.items
     },
     get: (id: string, signal?: AbortSignal) =>
-      request<BenchyRunDetail>(`/api/v1/benchy/runs/${encodeURIComponent(id)}`, { signal }),
-    cancel: (id: string) => request<BenchyRunDetail>(
-      `/api/v1/benchy/runs/${encodeURIComponent(id)}/cancel`,
+      request<BenchmarkRunnerRunDetail>(`/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}`, { signal }),
+    cancel: (id: string) => request<BenchmarkRunnerRunDetail>(
+      `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}/cancel`,
       { method: 'POST' },
     ),
     remove: (id: string) => request<void>(
-      `/api/v1/benchy/runs/${encodeURIComponent(id)}`,
+      `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}`,
       { method: 'DELETE' },
     ),
-    csvUrl: (id: string) => `/api/v1/benchy/runs/${encodeURIComponent(id)}/csv`,
+    csvUrl: (id: string) => `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}/csv`,
   },
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {
@@ -798,13 +821,31 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    preparationPreflight: (recipeId: string, nodeIds: string[]) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
+    preparationPreflight: (recipeId: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare/preflight`, {
       method: 'POST',
-      body: JSON.stringify({ node_ids: nodeIds }),
+      body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
     }),
-    prepareRecipe: (recipeId: string, nodeIds: string[]) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
+    prepareRecipe: (recipeId: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
       method: 'POST',
-      body: JSON.stringify({ node_ids: nodeIds }),
+      body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
+    }),
+    preparationPreflightModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>('/api/v1/storage/preparations/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        model_id: modelId,
+        revision: revision || undefined,
+        node_ids: nodeIds,
+        download_node_id: downloadNodeId || undefined,
+      }),
+    }),
+    prepareModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>('/api/v1/storage/preparations', {
+      method: 'POST',
+      body: JSON.stringify({
+        model_id: modelId,
+        revision: revision || undefined,
+        node_ids: nodeIds,
+        download_node_id: downloadNodeId || undefined,
+      }),
     }),
     cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
       method: 'DELETE',

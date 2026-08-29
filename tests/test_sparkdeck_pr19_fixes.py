@@ -523,8 +523,8 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         body = {"model": "org/model", "alias": "shared", "runtime": "vllm"}
         with patch("sparkdeck.service.launch_managed_container", launch_mock):
             results = await asyncio.gather(
-                self.service.create_deployment(body),
-                self.service.create_deployment(body),
+                self.service.create_deployment(body, launch=True),
+                self.service.create_deployment(body, launch=True),
                 return_exceptions=True,
             )
 
@@ -575,7 +575,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         created = await self.service.create_deployment({
             "model": "org/model", "alias": "model", "runtime": "vllm",
             "node_ids": ["local"], "deployment_mode": "single",
-        }, background=True)
+        }, launch=True, background=True)
 
         self.assertEqual(created["status"], "starting")
         self.assertEqual(created["launch_phase"], "pulling_image")
@@ -616,7 +616,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             await self.service.create_deployment({
                 "model": "org/model", "alias": "model", "runtime": "vllm",
                 "node_ids": ["local"], "deployment_mode": "single",
-            }, background=True)
+            }, launch=True, background=True)
 
         self.assertIsNone(self.service.store.deployment("model"))
 
@@ -648,7 +648,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         request = asyncio.create_task(self.service.create_deployment({
             "model": "org/model", "alias": "model", "runtime": "vllm",
             "node_ids": ["local"], "deployment_mode": "single",
-        }, background=True))
+        }, launch=True, background=True))
         await asyncio.wait_for(entered.wait(), 1)
 
         request.cancel()
@@ -690,7 +690,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             request = asyncio.create_task(service.create_deployment({
                 "model": "org/model", "alias": "model", "runtime": "vllm",
                 "node_ids": ["local"], "deployment_mode": "single",
-            }, background=True))
+            }, launch=True, background=True))
             await asyncio.wait_for(entered.wait(), 1)
             with patch.object(
                 service.store, "delete_deployment",
@@ -718,7 +718,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(OSError, "disk full"):
                 await self.service.create_deployment({
                     "model": "org/model", "alias": "model", "runtime": "vllm",
-                })
+                }, launch=True)
 
         self.manager.remove_container.assert_awaited_once_with(launched["name"])
         self.assertIsNone(self.service.store.deployment("model"))
@@ -734,7 +734,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(OSError, "disk full"):
                 await self.service.create_deployment({
                     "model": "org/model", "alias": "model", "runtime": "vllm",
-                })
+                }, launch=True)
 
         launch.assert_not_awaited()
         self.manager.remove_container.assert_not_awaited()
@@ -758,7 +758,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         ):
             create_task = asyncio.create_task(self.service.create_deployment({
                 "model": "org/model", "alias": "model", "runtime": "vllm",
-            }))
+            }, launch=True))
             await asyncio.wait_for(launch_started.wait(), 1)
             provisional = self.service.store.deployment("model")
             self.assertIsNotNone(provisional)
@@ -806,7 +806,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         ):
             create_task = asyncio.create_task(self.service.create_deployment({
                 "model": "org/new", "alias": "new", "runtime": "vllm",
-            }))
+            }, launch=True))
             await asyncio.wait_for(launch_started.wait(), 1)
 
             removed = await asyncio.wait_for(

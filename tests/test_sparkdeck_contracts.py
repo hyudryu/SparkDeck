@@ -130,7 +130,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             await self.service.create_deployment({
                 "model": "org/model", "alias": "revision-model", "runtime": "vllm",
                 "revision": "revision-abc",
-            })
+            }, launch=True)
 
         self.assertEqual(launch.await_args.args[5]["revision"], "revision-abc")
 
@@ -158,7 +158,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 "runtime": "llama.cpp", "revision": "release-gguf",
                 "quantization": "f16",
                 "settings": {"artifact": "FP16/model-F16.gguf"},
-            })
+            }, launch=True)
 
         virtual_nas.resolve_download_revision.assert_awaited_once_with(
             "org/model", "release-gguf",
@@ -199,12 +199,13 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                     "model": "org/model", "alias": "coincidental",
                     "runtime": "llama.cpp", "revision": "release-1",
                     "settings": {"artifact": "model.gguf"},
-                })
+                }, launch=True)
         finally:
             os.chdir(original_cwd)
 
         prepare.assert_awaited_once_with(
             "org/model", "model.gguf", "release-1", None,
+            home_node_ids=None, download_node_id=None,
         )
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
@@ -219,8 +220,8 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             "name": "sparkdeck-tilde", "port": 8080, "status": "running",
         })
 
+        self.assertTrue(coincidental_home_artifact.exists())
         with (
-            patch.object(Path, "expanduser", return_value=coincidental_home_artifact),
             patch.object(
                 self.service, "_prepare_public_gguf_artifact", prepare,
             ),
@@ -230,10 +231,11 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 "model": "org/model", "alias": "tilde-repository-path",
                 "runtime": "llama.cpp", "revision": "release-1",
                 "settings": {"artifact": "~/model.gguf"},
-            })
+            }, launch=True)
 
         prepare.assert_awaited_once_with(
             "org/model", "~/model.gguf", "release-1", None,
+            home_node_ids=None, download_node_id=None,
         )
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
@@ -366,7 +368,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.create_deployment({
                     "model": "org/model", "alias": "durable-launch",
                     "runtime": "vllm",
-                })
+                }, launch=True)
 
         self.manager.remove_container.assert_awaited_once()
         self.assertIsNone(self.service.store.deployment("durable-launch"))
@@ -381,7 +383,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.create_deployment({
                     "model": "org/model", "alias": "retained-launch",
                     "runtime": "vllm",
-                })
+                }, launch=True)
 
         stored = self.service.store.deployment("retained-launch")
         self.assertIsNotNone(stored)

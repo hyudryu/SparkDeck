@@ -601,18 +601,21 @@ class VirtualNASInventoryTests(unittest.TestCase):
             self.assertEqual(models[0]["revisions"], ["revision-1"])
 
     def test_inventory_marks_missing_runtime_requirements_partial(self):
+        # A snapshot with config but no tokenizer is unusable by Transformers
+        # runtimes and stays partial; a weights-only snapshot ships neither by
+        # design and counts as complete.
         cases = {
-            "configuration": {"tokenizer.json", "model.safetensors"},
-            "tokenizer": {"config.json", "model.safetensors"},
+            "configuration": ({"tokenizer.json", "model.safetensors"}, False),
+            "tokenizer": ({"config.json", "model.safetensors"}, True),
         }
-        for missing, filenames in cases.items():
+        for missing, (filenames, partial) in cases.items():
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 nas, hub = self._nas(Path(directory))
                 snapshot, _ = self._snapshot(hub)
                 for filename in filenames:
                     (snapshot / filename).write_bytes(b"content")
 
-                self.assertTrue(nas.inventory()[0]["partial"])
+                self.assertIs(nas.inventory()[0]["partial"], partial)
 
     def test_inventory_marks_weight_index_with_missing_file_partial(self):
         with tempfile.TemporaryDirectory() as directory:

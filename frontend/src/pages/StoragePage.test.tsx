@@ -382,4 +382,75 @@ describe('StoragePage', () => {
     expect(within(nodePanel).getByRole('button', { name: 'Cancel org/copy transfer' })).toBeInTheDocument()
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
+
+  it('hides dashboard-hidden nodes from cards, the transfer form, and availability', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: [
+        {
+          id: 'node-a', name: 'Studio Spark', online: true, total_size: 2_000_000_000,
+          models: [{ model_id: 'org/model', size_bytes: 1_000_000_000, revision: 'main', file_count: 4 }],
+        },
+        {
+          id: 'node-h', name: 'Secret Spark', online: true, total_size: 8_000_000_000,
+          hidden_from_dashboard: true,
+          models: [{ model_id: 'org/hidden-model', size_bytes: 5_000_000_000 }],
+        },
+      ],
+      jobs: [],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    expect(await screen.findByRole('region', { name: 'Storage on Studio Spark' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Storage on Secret Spark' })).not.toBeInTheDocument()
+
+    const sourceSelect = screen.getByRole('combobox', { name: 'Source node' })
+    expect(within(sourceSelect).queryByRole('option', { name: /Secret Spark/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Secret Spark/ })).not.toBeInTheDocument()
+    expect(await screen.findByText('No other nodes are available.')).toBeInTheDocument()
+
+    // Weights stored only on hidden nodes never enter the inventory, and the
+    // availability matrix lists visible nodes only.
+    expect(screen.queryByText('org/hidden-model')).not.toBeInTheDocument()
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    expect(within(inventory).getByText('org/model')).toBeInTheDocument()
+    expect(within(inventory).queryByText(/Secret Spark/)).not.toBeInTheDocument()
+  })
+
+  it('renders expected totals for partial caches and titles on truncated names', async () => {
+    const gib = 1024 ** 3
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: [
+        {
+          id: 'node-a', name: 'Studio Spark', online: true, total_size: 50 * gib,
+          models: [
+            {
+              model_id: 'org/partial-model', size_bytes: 12 * gib,
+              partial: true, expected_size_bytes: 40 * gib, revision: 'main',
+            },
+            { model_id: 'org/plain-partial', size_bytes: 1 * gib, partial: true },
+          ],
+        },
+      ],
+      jobs: [],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const partial = await screen.findByLabelText('Partial cache org/partial-model on Studio Spark')
+    expect(partial).toHaveTextContent('12 GB of 40 GB')
+    const plain = screen.getByLabelText('Partial cache org/plain-partial on Studio Spark')
+    expect(plain).toHaveTextContent('1.0 GB')
+    expect(plain).not.toHaveTextContent(' of ')
+
+    expect(within(partial).getByText('org/partial-model')).toHaveAttribute('title', 'org/partial-model')
+    expect(screen.getByRole('heading', { name: 'Studio Spark' })).toHaveAttribute('title', 'Studio Spark')
+
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    const row = within(inventory).getByText('org/partial-model').closest('.table-row') as HTMLElement
+    expect(within(row).getByText('12 GB of 40 GB')).toBeInTheDocument()
+    expect(within(row).getByText('org/partial-model')).toHaveAttribute('title', 'org/partial-model')
+  })
 })

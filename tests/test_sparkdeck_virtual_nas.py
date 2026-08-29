@@ -893,6 +893,75 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(nas.inventory(), [])
 
+    async def test_inventory_accepts_weights_only_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = hub / "models--org--raw" / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True)
+            (snapshot / "model.safetensors").write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "org/raw")
+            self.assertFalse(model["partial"])
+
+    async def test_inventory_marks_config_without_tokenizer_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = hub / "models--org--raw" / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "model.safetensors").write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+    async def test_inventory_reports_unrecognized_comfyui_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            bundle_files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            )
+            extra_files = (
+                "checkpoints/Minimax Video/minimax_video.safetensors",
+                "loras/foo.safetensors",
+            )
+            for relative in (*bundle_files, *extra_files):
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            models = nas.inventory()
+            by_id = {model["model_id"]: model for model in models}
+
+            self.assertEqual(
+                [m["model_id"] for m in models].count("Comfy-Org/MiniMax-Music-3"),
+                1,
+            )
+            self.assertEqual(by_id["Comfy-Org/MiniMax-Music-3"]["file_count"], 3)
+            for name in ("Minimax Video", "foo"):
+                entry = by_id[name]
+                self.assertEqual(entry["size_bytes"], 7)
+                self.assertEqual(entry["file_count"], 1)
+                self.assertFalse(entry["partial"])
+                self.assertEqual(entry["revision"], "ComfyUI")
+                self.assertEqual(entry["source"], "ComfyUI")
+                self.assertTrue(entry["externally_managed"])
+                self.assertFalse(entry["transferable"])
+                self.assertFalse(entry["deletable"])
+
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

@@ -1552,7 +1552,8 @@ export function ModelsPage() {
         description="Manage model servers across vLLM, SGLang, and Llama server from one place."
         actions={<Button variant="primary" onClick={openCreator}><Plus size={16} /> Create deployment</Button>}
       />
-      {resource.loading && <LoadingState label="Loading deployments" />}
+      {resource.loading && !resource.data && <LoadingState label="Loading deployments" />}
+      {resource.loading && resource.data && <p className="field-note" role="status">Refreshing deployments…</p>}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
@@ -1886,6 +1887,12 @@ export function ModelsPage() {
         const planReady = !savedLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
         const ready = !nodes.loading && !nodes.error && planReady && exactCount && allEligible && coordinatorReady
         const needsPrep = savedLaunch && !controllerArtifact && nodeIds.some((id) => !weighted.has(id))
+        const transferTargets = nodeIds
+          .filter((id) => !weighted.has(id))
+          .map((id) => nodes.data?.find((node) => node.id === id)?.name ?? id)
+        const transferNotice = needsPrep && plan?.action === 'transfer' && plan.source && transferTargets.length
+          ? `Weights will be transferred from ${plan.source.node_name} to ${transferTargets.join(', ')} via Virtual NAS before launch.`
+          : undefined
         const startBusy = busy === deployment.id
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
@@ -1893,6 +1900,7 @@ export function ModelsPage() {
             <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
+            {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
             {!controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             {savedLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
             <NodeSelector

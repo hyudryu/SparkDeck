@@ -418,6 +418,29 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('80 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 1 node')
   })
 
+  it('always counts the controller toward the sharded minimum node count', async () => {
+    // 200 GB of weights fit on two 128 GB workers alone, but every sharded
+    // deployment includes the 8 GB controller, so three nodes are required.
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/small-controller', name: 'small-controller', weight_size_bytes: 200 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 8 * 1024 }] } },
+        { id: 'node-2', name: 'Worker Two', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+        { id: 'node-3', name: 'Worker Three', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    expect(await screen.findByRole('button', { name: 'Expand org/small-controller' })).toBeInTheDocument()
+    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 3+ nodes')
+  })
+
   it('does not pool worker memory when the controller cannot join a sharded deployment', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

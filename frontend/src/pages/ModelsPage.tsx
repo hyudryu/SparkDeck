@@ -24,7 +24,7 @@ const initialForm: CreateDeploymentInput = {
 const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
 
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
-const EMPTY_CACHED_FILES: ReadonlySet<string> = new Set()
+const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
 
 // Dropdown option labels state the download size and whether the weights
 // already sit in the cluster cache, so the badge travels with the text.
@@ -342,10 +342,12 @@ export function ModelsPage() {
   const catalogShardedLayout = useRef(false)
   // Provenance refs for the deployment creator: which quantization/artifact
   // values were derived from a repository listing rather than typed by
-  // hand. (The retained catalog listing's provenance lives in state, see
-  // catalogResponseQuery below.)
+  // hand, plus the last model id seen for invalidating them. (The retained
+  // catalog listing's provenance lives in state, see catalogResponseQuery
+  // below.)
   const linkedQuantizationRef = useRef<string | undefined>(undefined)
   const linkedArtifactRef = useRef<string | undefined>(undefined)
+  const previousModelIdRef = useRef('')
   const reloadDeployments = resource.reload
 
   useEffect(() => {
@@ -470,11 +472,13 @@ export function ModelsPage() {
         },
     }))
     // A deep link names repository artifacts, so record them as
-    // listing-derived for the stale-selection cleanup above.
+    // listing-derived for the stale-selection cleanup above, and treat the
+    // model id as already observed so the linked picks are not wiped.
     if (ggufArtifact && artifact) {
       linkedArtifactRef.current = artifact
       linkedQuantizationRef.current = quantization || undefined
     }
+    previousModelIdRef.current = modelId
     setCreating(true)
     setSearchParams({}, { replace: true })
   }, [searchParams, setSearchParams])
@@ -590,28 +594,31 @@ export function ModelsPage() {
     }
   }, [form.managed, form.model_id, form.node_ids, modelCache.data, nodes.data, localLabel])
 
-  // Cached snapshot files per model, keyed by revision commit, with each
-  // repository's main ref target. Downloaded marks must compare the
-  // revision a listing resolved to — never the union of every cached
-  // snapshot — so an obsolete revision cannot mark current files as present.
+  // Cached snapshot files per model, keyed by revision commit and kept
+  // per node, with each repository's main ref target. Downloaded marks
+  // must compare the revision a listing resolved to — never the union of
+  // every cached snapshot — and per node, because a sharded artifact is
+  // only usable from a single node that holds all of its files.
   const cachedModelSnapshots = useMemo(() => {
     const byModel = new Map<string, {
       mainSha?: string
-      filesByRevision: Map<string, Set<string>>
+      nodeFileSets: Array<Map<string, Set<string>>>
     }>()
     for (const node of modelCache.data?.nodes ?? []) {
       for (const model of node.models) {
         if (!model.snapshot_files) continue
-        const entry = byModel.get(model.model_id)
-          ?? { mainSha: model.revision_refs?.main, filesByRevision: new Map() }
+        let entry = byModel.get(model.model_id)
+        if (!entry) {
+          entry = { mainSha: model.revision_refs?.main, nodeFileSets: [] }
+          byModel.set(model.model_id, entry)
+        }
         if (!entry.mainSha && model.revision_refs?.main) entry.mainSha = model.revision_refs.main
+        const revisions = new Map<string, Set<string>>()
         for (const [revision, files] of Object.entries(model.snapshot_files)) {
           if (!files.length) continue
-          const names = entry.filesByRevision.get(revision) ?? new Set<string>()
-          for (const name of files) names.add(name)
-          entry.filesByRevision.set(revision, names)
+          revisions.set(revision, new Set(files))
         }
-        byModel.set(model.model_id, entry)
+        entry.nodeFileSets.push(revisions)
       }
     }
     return byModel
@@ -676,17 +683,22 @@ export function ModelsPage() {
   // Provenance for quantization/artifact values the UI derived from a
   // listing: an empty successful listing must be able to clear them while
   // genuinely manual (or local-path) input survives.
-  const createCachedFiles = useMemo(() => {
+  const createCachedFileSets = useMemo(() => {
     const entry = cachedModelSnapshots.get(form.model_id)
-    if (!entry) return EMPTY_CACHED_FILES
+    if (!entry) return EMPTY_FILE_SETS
     // When the listing resolved a commit, only that exact revision's cached
     // files count — an older snapshot must not mark current files as
     // present. The node's own main ref is the fallback for cache-only data
     // with no resolved revision (for example when the Hub is unreachable).
     const resolvedRevision = createCatalogUsable ? createCatalogData?.revision : undefined
     const revision = resolvedRevision ?? entry.mainSha
-    const files = revision ? entry.filesByRevision.get(revision) : undefined
-    return files?.size ? files : EMPTY_CACHED_FILES
+    if (!revision) return EMPTY_FILE_SETS
+    const sets: Array<Set<string>> = []
+    for (const revisions of entry.nodeFileSets) {
+      const files = revisions.get(revision)
+      if (files?.size) sets.push(files)
+    }
+    return sets
   }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
 
   // Drop quantization and artifact selections that the current listing does
@@ -721,6 +733,36 @@ export function ModelsPage() {
       }
     })
   }, [createCatalogUsable, createQuantizations, createArtifactOptions])
+
+  // Changing the model id invalidates listing-derived selections right
+  // away — the replacement lookup may be slow or fail entirely, and the
+  // old repository's artifact must not survive in the fallback text fields
+  // until (or regardless of whether) the new listing arrives. The previous
+  // id is compared against the form value inside the updater so a deep
+  // link setting model and artifacts together is not treated as a change.
+  useEffect(() => {
+    setForm((current) => {
+      const currentModelId = current.model_id.trim()
+      if (previousModelIdRef.current === currentModelId) return current
+      previousModelIdRef.current = currentModelId
+      if (current.runtime !== 'llama.cpp') return current
+      const quantization = current.settings.quantization
+      const artifact = current.settings.artifact
+      const staleQuantization = Boolean(quantization) && linkedQuantizationRef.current === quantization
+      const staleArtifact = Boolean(artifact) && !isLocalArtifact(artifact) && linkedArtifactRef.current === artifact
+      if (!staleQuantization && !staleArtifact) return current
+      linkedQuantizationRef.current = undefined
+      linkedArtifactRef.current = undefined
+      return {
+        ...current,
+        settings: {
+          ...current.settings,
+          quantization: staleQuantization ? undefined : quantization,
+          artifact: staleArtifact ? undefined : artifact,
+        },
+      }
+    })
+  }, [trimmedModelId])
 
   const updateCreateQuantization = (name: string) => setForm((current) => {
     if (current.runtime !== 'llama.cpp') {
@@ -1932,7 +1974,7 @@ export function ModelsPage() {
                   <option value="">Full precision (no quantization)</option>
                   {createQuantizations.map((variant) => (
                     <option key={variant.name} value={variant.name}>
-                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFiles))}
+                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFileSets))}
                     </option>
                   ))}
                 </select>
@@ -1947,7 +1989,7 @@ export function ModelsPage() {
                   <option value="">Choose from the repository files…</option>
                   {createArtifactOptions.map((option) => (
                     <option key={option.key} value={option.filename}>
-                      {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFiles))}
+                      {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFileSets))}
                     </option>
                   ))}
                 </select>

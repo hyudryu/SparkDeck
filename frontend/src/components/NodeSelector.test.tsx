@@ -69,7 +69,9 @@ describe('NodeSelector', () => {
       status_message: "SparkDeck's service user cannot access Docker. Add this user to the docker group, then restart the user session.",
     }]} selectedIds={[]} onChange={() => undefined} />)
 
-    expect(screen.getByRole('checkbox', { name: /Spark Four/ })).toBeDisabled()
+    const checkbox = screen.getByRole('checkbox', { name: /Spark Four/ })
+    expect(checkbox).toBeDisabled()
+    expect(checkbox.closest('label')).toHaveAttribute('title', expect.stringContaining('service user cannot access Docker'))
     expect(screen.getByText(/service user cannot access Docker/)).toBeInTheDocument()
   })
 })

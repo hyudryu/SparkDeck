@@ -806,7 +806,15 @@ class SparkDeckService:
             if isinstance(member, dict) and member.get("container_name")
         }
         cluster_nodes: dict[str, dict[str, Any]] = {}
-        if any(
+        if cluster_state.get("nodes"):
+            # get_state already collected the authoritative node inventory.
+            # Reusing it avoids a second round of local Docker and remote node
+            # requests on every Models-page poll.
+            cluster_nodes = {
+                node["id"]: node for node in cluster_state["nodes"]
+                if isinstance(node, dict) and node.get("id")
+            }
+        elif any(
             item.get("settings", {}).get("manager_deployment_id") for item in registered
         ) or cluster_by_container:
             try:
@@ -815,12 +823,19 @@ class SparkDeckService:
                 }
             except Exception:
                 cluster_nodes = {}
-        docker_unavailable = False
-        try:
-            containers = await self.manager.list_containers()
-        except Exception:
-            containers = []
-            docker_unavailable = True
+        if cluster_state:
+            # get_state also includes the container inventory. Do not call
+            # list_containers a second time; on Windows a Docker Desktop
+            # request can otherwise block the polling endpoint.
+            containers = cluster_state.get("containers") or []
+            docker_unavailable = not bool(cluster_state.get("docker_ready"))
+        else:
+            docker_unavailable = False
+            try:
+                containers = await self.manager.list_containers()
+            except Exception:
+                containers = []
+                docker_unavailable = True
         seen: set[str] = set()
         local_cluster_members: dict[str, dict[str, Any]] = {}
         for stored in registered:

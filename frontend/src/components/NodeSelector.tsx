@@ -1,6 +1,6 @@
 import { HardDrive, RotateCw } from 'lucide-react'
 import type { NodeInventoryItem } from '../api/types'
-import { Button } from './ui'
+import { Button, Tooltip } from './ui'
 
 function nodeLabel(node: NodeInventoryItem | undefined, id: string, localLabel?: string) {
   if (id === 'local' && localLabel) return localLabel
@@ -77,7 +77,8 @@ export function NodeSelector({
             const displayName = nodeLabel(node, node.id, localLabel)
             const primary = primaryId === node.id
             return (
-              <label className={`node-option${selectedIds.includes(node.id) ? ' selected' : ''}${!ready ? ' unavailable' : ''}`} key={node.id}>
+              <Tooltip label={status} key={node.id}>
+              <label title={status} className={`node-option${selectedIds.includes(node.id) ? ' selected' : ''}${!ready ? ' unavailable' : ''}`}>
                 <input
                   type={multiple ? 'checkbox' : 'radio'}
                   name={multiple ? undefined : 'target-node'}
@@ -88,6 +89,7 @@ export function NodeSelector({
                 <HardDrive size={17} aria-hidden="true" />
                 <span><strong>{displayName}</strong><small>{displayName !== node.name ? `${node.name} · ` : node.local ? 'This device · ' : `${node.id} · `}{status}{required ? ' · Required' : ''}{primary ? ' · Primary' : ''}</small></span>
               </label>
+              </Tooltip>
             )
           })}
         </div>

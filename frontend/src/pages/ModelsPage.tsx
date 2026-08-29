@@ -8,6 +8,7 @@ import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
 import { formatBytes } from '../utils/format'
+import { artifactFilesDownloaded, ggufArtifactOptions, type GgufArtifactOption, type GgufQuantization } from '../utils/gguf'
 
 const initialForm: CreateDeploymentInput = {
   alias: '',
@@ -21,6 +22,18 @@ const initialForm: CreateDeploymentInput = {
 }
 
 const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
+
+const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
+const EMPTY_CACHED_FILES: ReadonlySet<string> = new Set()
+
+// Dropdown option labels state the download size and whether the weights
+// already sit in the cluster cache, so the badge travels with the text.
+const quantizationOptionLabel = (variant: GgufQuantization, downloaded: boolean) => (
+  `${variant.name}${variant.weight_size_bytes ? ` · ${formatBytes(variant.weight_size_bytes)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
+)
+const artifactOptionLabel = (option: GgufArtifactOption, downloaded: boolean) => (
+  `${option.filename}${option.weightSize ? ` · ${formatBytes(option.weightSize)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
+)
 
 function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): CreateDeploymentInput {
   const runtime = isRuntimeKind(settings?.default_runtime) ? settings.default_runtime : initialForm.runtime
@@ -564,6 +577,73 @@ export function ModelsPage() {
       missing: selected.filter((id) => !cachedIds.has(id)).map(nameOf),
     }
   }, [form.managed, form.model_id, form.node_ids, modelCache.data, nodes.data, localLabel])
+
+  // Repo-relative file names cached on any node, per model: the "already
+  // downloaded" marks in the quantization and GGUF artifact pickers.
+  const cachedModelFiles = useMemo(() => {
+    const filesByModel = new Map<string, Set<string>>()
+    for (const node of modelCache.data?.nodes ?? []) {
+      for (const model of node.models) {
+        if (!model.files?.length) continue
+        const files = filesByModel.get(model.model_id) ?? new Set<string>()
+        for (const name of model.files) files.add(name)
+        filesByModel.set(model.model_id, files)
+      }
+    }
+    return filesByModel
+  }, [modelCache.data])
+
+  // Repository file listing for the model id being configured, so the
+  // creator offers the repository's real quantizations and GGUF artifacts
+  // instead of free-text guesses. Debounced because the id is typed by hand.
+  const [catalogModelQuery, setCatalogModelQuery] = useState('')
+  useEffect(() => {
+    const modelId = form.model_id.trim()
+    if (!creating || !modelId.includes('/') || isLocalModelPath(modelId)) {
+      setCatalogModelQuery('')
+      return
+    }
+    const timer = window.setTimeout(() => setCatalogModelQuery(modelId), 350)
+    return () => window.clearTimeout(timer)
+  }, [creating, form.model_id])
+  const createCatalogModel = useResource(
+    (signal) => api.catalog.details(catalogModelQuery, signal),
+    [catalogModelQuery],
+    Boolean(catalogModelQuery),
+  )
+  const createQuantizations = createCatalogModel.data?.model?.quantizations ?? EMPTY_QUANTIZATIONS
+  const createArtifactOptions = useMemo(
+    () => ggufArtifactOptions(createQuantizations),
+    [createQuantizations],
+  )
+  const createCachedFiles = cachedModelFiles.get(form.model_id) ?? EMPTY_CACHED_FILES
+
+  const updateCreateQuantization = (name: string) => setForm((current) => {
+    const variant = createQuantizations.find((entry) => entry.name === name)
+    const artifact = current.runtime === 'llama.cpp' && variant
+      ? ggufArtifactOptions([variant])[0]
+      : undefined
+    return {
+      ...current,
+      settings: {
+        ...current.settings,
+        quantization: name || undefined,
+        ...(current.runtime === 'llama.cpp' && artifact ? { artifact: artifact.filename } : {}),
+      },
+    }
+  })
+
+  const updateCreateArtifact = (filename: string) => setForm((current) => {
+    const option = createArtifactOptions.find((entry) => entry.filename === filename)
+    return {
+      ...current,
+      settings: {
+        ...current.settings,
+        artifact: filename || undefined,
+        ...(option ? { quantization: option.quantization } : {}),
+      },
+    }
+  })
 
   const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
     const sharded = current.deployment_mode === 'sharded'
@@ -1707,7 +1787,7 @@ export function ModelsPage() {
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select
-                  value=""
+                  value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
                   onChange={(event) => {
                     const modelId = event.target.value
                     if (!modelId) return
@@ -1726,8 +1806,39 @@ export function ModelsPage() {
                   ))}
                 </select>
               </label>}
-              <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>
-              {form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>}
+              {form.runtime === 'llama.cpp' && createQuantizations.length > 0 ? <label className="field"><span>Quantization (optional)</span>
+                <select
+                  value={form.settings.quantization ?? ''}
+                  onChange={(event) => updateCreateQuantization(event.target.value)}
+                >
+                  <option value="">Full precision (no quantization)</option>
+                  {createQuantizations.map((variant) => (
+                    <option key={variant.name} value={variant.name}>
+                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFiles))}
+                    </option>
+                  ))}
+                  {form.settings.quantization && !createQuantizations.some((variant) => variant.name === form.settings.quantization)
+                    && <option value={form.settings.quantization}>{form.settings.quantization} (manual)</option>}
+                </select>
+                <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
+              </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
+              {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) ? <label className="field"><span>GGUF artifact</span>
+                <select
+                  required
+                  value={form.settings.artifact ?? ''}
+                  onChange={(event) => updateCreateArtifact(event.target.value)}
+                >
+                  <option value="">Choose from the repository files…</option>
+                  {createArtifactOptions.map((option) => (
+                    <option key={option.key} value={option.filename}>
+                      {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFiles))}
+                    </option>
+                  ))}
+                  {form.settings.artifact && !createArtifactOptions.some((option) => option.filename === form.settings.artifact)
+                    && <option value={form.settings.artifact}>{form.settings.artifact} (manual)</option>}
+                </select>
+                <small>The repository publishes one GGUF file per quantization; the chosen file is what nodes download from {form.model_id}. An absolute local path runs on this device only.</small>
+              </label> : form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>}
               {createModelCacheInfo && (createModelCacheInfo.cached.length > 0 || createModelCacheInfo.missing.length > 0) && <p className="field-note">
                 {createModelCacheInfo.cached.length
                   ? `Weights cached on ${createModelCacheInfo.cached.join(', ')}.`

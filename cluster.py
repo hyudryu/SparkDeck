@@ -400,7 +400,7 @@ class NodeRegistry:
                 )
             return endpoint
 
-        status = await self.probe(node)
+        status = await self.probe(node, details=True)
         configured_interface = str(node.get("fabric_interface") or "").strip()
         rdma_interfaces = [
             interface for interface in (status.get("interfaces") or [])
@@ -568,10 +568,16 @@ class NodeRegistry:
             f"could not contact {node.get('name', node_id)}: {last_error}"
         ) from last_error
 
-    async def probe(self, node: dict, *, force: bool = False) -> dict:
+    async def probe(
+        self, node: dict, *, force: bool = False, details: bool = True,
+    ) -> dict:
         node_id = node["id"]
         cached = self._status_cache.get(node_id)
-        if not force and cached and time.monotonic() - cached[0] < 4.0:
+        cached_has_details = bool(cached and "docker_ready" in cached[1])
+        if (
+            not force and cached and time.monotonic() - cached[0] < 4.0
+            and (not details or cached_has_details)
+        ):
             return cached[1]
         started = time.monotonic()
         public = self.public_config(node)
@@ -579,32 +585,50 @@ class NodeRegistry:
             result = {**public, "status": "disabled", "online": False}
         else:
             try:
-                status = await self.request(
-                    node_id, "GET", "/api/agent/status", timeout=3
-                )
+                status_has_details = False
+                try:
+                    status = await self.request(
+                        node_id, "GET", "/api/agent/health", timeout=3,
+                    )
+                except NodeAgentResponseError as exc:
+                    # Keep older paired agents compatible. Only a genuine
+                    # missing endpoint falls back to the expensive status API.
+                    if exc.status_code != 404:
+                        raise
+                    status = await self.request(
+                        node_id, "GET", "/api/agent/status", timeout=3,
+                    )
+                    status_has_details = True
                 compatible = status.get("protocol_version") == AGENT_PROTOCOL_VERSION
                 issues = []
                 if not compatible:
                     issues.append("agent protocol version mismatch")
-                if not status.get("docker_ready"):
+                if status.get("docker_ready") is False:
+                    issues.append(
+                        str(status.get("status_message") or "").strip()
+                        or "Docker is unavailable"
+                    )
+                if details and not status_has_details:
+                    try:
+                        details_status = await self.request(
+                            node_id, "GET", "/api/agent/status", timeout=15,
+                        )
+                        status = {**status, **details_status}
+                    except Exception as exc:
+                        issues.append(f"agent telemetry unavailable: {exc}")
+                        if cached:
+                            status = {**cached[1], **status}
+                if status.get("docker_ready") is False:
                     issues.append(
                         str(status.get("status_message") or "").strip()
                         or "Docker is unavailable"
                     )
                 authoritative_name = str(public.get("name") or "").strip()
-                if (
-                    authoritative_name
-                    and str(status.get("name") or "").strip() != authoritative_name
-                ):
+                if details and authoritative_name and str(status.get("name") or "").strip() != authoritative_name:
                     try:
-                        await self.request(
-                            node_id, "PATCH", "/api/agent/node",
-                            json_body={"name": authoritative_name}, timeout=10,
-                        )
+                        await self.request(node_id, "PATCH", "/api/agent/node", json_body={"name": authoritative_name}, timeout=10)
                         status["name"] = authoritative_name
                     except Exception:
-                        # The registry alias remains authoritative in the
-                        # controller UI and a later probe retries convergence.
                         issues.append("node name synchronization pending")
                 result = {
                     **public,

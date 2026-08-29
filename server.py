@@ -589,6 +589,12 @@ async def agent_status(req: Request):
     return await manager.agent_status()
 
 
+@app.get("/api/agent/health")
+async def agent_health(req: Request):
+    _require_agent(req)
+    return manager.agent_health()
+
+
 @app.get("/api/agent/system-update")
 async def agent_system_update(req: Request):
     _require_agent(req)

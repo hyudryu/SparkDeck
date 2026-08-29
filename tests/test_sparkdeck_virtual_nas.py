@@ -199,6 +199,22 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PermissionError, "invalid or expired"):
                 nas.export_model_with_capability("org/model", capability)
 
+    async def test_import_reports_each_durable_finalization_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            source_hub = Path(directory) / "source-hub"
+            create_cached_model(source_hub)
+            source = VirtualNAS(Path(directory) / "source", lambda: source_hub, FakeRegistry(), lambda: True)
+            target = VirtualNAS(Path(directory) / "target", lambda: hub, FakeRegistry(), lambda: True)
+            phases: list[str] = []
+
+            result = await target.import_model(
+                "org/model", source.export_model("org/model"), phase=phases.append,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(phases, ["receiving", "syncing", "extracting", "validating", "registering"])
+
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 
@@ -2667,13 +2683,16 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.model_cache_inventory = AsyncMock(return_value=[inventory])
 
-        with patch("manager.time.monotonic", side_effect=[100, 102]):
+        with patch("manager._monotonic", side_effect=[100, 102]):
             first = await manager.virtual_nas_inventory()
             inventory["models"][0]["size_bytes"] = 1975
             inventory["models"][0]["partial_revision_size_bytes"][RESOLVED_REVISION] = 975
+            cached = await manager.virtual_nas_inventory()
+            manager._invalidate_virtual_nas_nodes()
             result = await manager.virtual_nas_inventory()
 
         self.assertIsNone(first["jobs"][0]["bytes_per_second"])
+        self.assertIsNone(cached["jobs"][0]["bytes_per_second"])
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
         self.assertEqual(result["jobs"][0]["bytes_per_second"], 2.5)

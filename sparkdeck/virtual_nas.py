@@ -1224,6 +1224,7 @@ class VirtualNAS:
         expected_bytes: int | None = None,
         required_model_bytes: int | None = None,
         progress: Callable[[int], None] | None = None,
+        phase: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         self._reserve_stream(model_id)
@@ -1248,6 +1249,8 @@ class VirtualNAS:
             archive_path = Path(archive_path_value)
             received = 0
             try:
+                if phase:
+                    phase("receiving")
                 with os.fdopen(descriptor, "wb") as output:
                     async for chunk in chunks:
                         if not isinstance(chunk, (bytes, bytearray, memoryview)):
@@ -1257,12 +1260,14 @@ class VirtualNAS:
                         output.write(data)
                         if progress:
                             progress(received)
+                    if phase:
+                        phase("syncing")
                     output.flush()
                     os.fsync(output.fileno())
                 if expected_bytes is not None and received != int(expected_bytes):
                     raise ValueError("archive byte count does not match expected size")
                 await asyncio.to_thread(
-                    self._extract_and_finalize, archive_path, stage, archive_name,
+                    self._extract_and_finalize, archive_path, stage, archive_name, phase,
                 )
                 return {"ok": True, "model_id": model_id, "bytes_received": received}
             finally:
@@ -1288,7 +1293,11 @@ class VirtualNAS:
         coordinator_id = str(coordinator_id or "").strip()
         if not source_agent_url.startswith("http://") or not source_capability or not coordinator_id or not transfer_id:
             raise ValueError("direct transfer requires an authenticated HTTP peer endpoint")
-        record = {"status": "running", "bytes_transferred": 0, "cancel": asyncio.Event()}
+        record = {
+            "status": "running", "phase": "receiving",
+            "phase_started_at": time.time(), "bytes_transferred": 0,
+            "cancel": asyncio.Event(),
+        }
         self._peer_imports[transfer_id] = record
         url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
         try:
@@ -1309,8 +1318,10 @@ class VirtualNAS:
                             yield chunk
                     result = await self.import_model(
                         model_id, tracked(), required_model_bytes=required_model_bytes,
+                        phase=lambda value: self._set_peer_import_phase(record, value),
                     )
                     record["status"] = "completed"
+                    self._set_peer_import_phase(record, "completed")
                     return result
         except TransferCanceled:
             record["status"] = "canceled"
@@ -1329,7 +1340,16 @@ class VirtualNAS:
         record = self._peer_imports.get(str(transfer_id or ""))
         if record is None:
             raise LookupError("direct transfer is not active")
-        return {"status": record["status"], "bytes_transferred": record["bytes_transferred"]}
+        return {
+            "status": record["status"], "bytes_transferred": record["bytes_transferred"],
+            "phase": record.get("phase"), "phase_started_at": record.get("phase_started_at"),
+        }
+
+    @staticmethod
+    def _set_peer_import_phase(record: dict[str, Any], phase: str) -> None:
+        if record.get("phase") != phase:
+            record["phase"] = phase
+            record["phase_started_at"] = time.time()
 
     def cancel_peer_import(self, transfer_id: str) -> dict[str, Any]:
         record = self._peer_imports.get(str(transfer_id or ""))
@@ -1365,8 +1385,11 @@ class VirtualNAS:
         return self.export_model(model_id)
 
     def _extract_and_finalize(
-        self, archive_path: Path, stage: Path, archive_name: str
+        self, archive_path: Path, stage: Path, archive_name: str,
+        phase: Callable[[str], None] | None = None,
     ) -> None:
+        if phase:
+            phase("extracting")
         with tarfile.open(archive_path, mode="r:*") as archive:
             members = archive.getmembers()
             if not members:
@@ -1375,6 +1398,8 @@ class VirtualNAS:
                 _validate_tar_member(member, archive_name)
             archive.extractall(stage, members=members, filter="data")
         extracted = stage / archive_name
+        if phase:
+            phase("validating")
         if not extracted.is_dir() or extracted.is_symlink():
             raise ValueError("model archive does not contain the expected repository")
         if not _is_complete_repository(extracted):
@@ -1382,6 +1407,8 @@ class VirtualNAS:
         destination = self._hub() / archive_name
         if destination.exists():
             raise FileExistsError("cached model already exists on target node")
+        if phase:
+            phase("registering")
         os.replace(extracted, destination)
 
     def _selected_snapshot_entries(
@@ -2439,6 +2466,7 @@ class VirtualNAS:
         self._cancel_events[job["id"]] = event
         job.update({
             "status": "running", "started_at": time.time(),
+            "phase": "preparing", "phase_started_at": time.time(),
             "completed_at": None, "error": None,
         })
         self._save()
@@ -2739,6 +2767,10 @@ class VirtualNAS:
                         try:
                             status = await self.node_registry.request(job["target_node_id"], "GET", self._model_agent_path(job["model_id"], f"peer-imports/{job['id']}"), timeout=5)
                             job["bytes_transferred"] = min(actual_size, _nonnegative_int((status or {}).get("bytes_transferred")))
+                            phase = str((status or {}).get("phase") or "")
+                            if phase and phase != job.get("phase"):
+                                job["phase"] = phase
+                                job["phase_started_at"] = (status or {}).get("phase_started_at") or time.time()
                             self._save_progress(job)
                         except Exception:
                             pass
@@ -2752,6 +2784,8 @@ class VirtualNAS:
                     if received <= 0:
                         raise RuntimeError("target did not receive a model archive")
                     job["bytes_transferred"] = actual_size
+                    job["phase"] = "verifying"
+                    job["phase_started_at"] = time.time()
                     source = None
                 else:
                     source_response = await self.node_registry.open_stream(
@@ -2769,8 +2803,14 @@ class VirtualNAS:
                     if event.is_set():
                         raise TransferCanceled()
                     job["bytes_transferred"] += len(chunk)
+                    job["phase"] = "transferring"
                     self._save_progress(job)
                     yield chunk
+                # The receiver still has to fsync, unpack, validate, and register
+                # the archive before its HTTP response can complete.
+                job["phase"] = "finalizing"
+                job["phase_started_at"] = time.time()
+                self._save_progress(job)
 
             if source is None:
                 tracked_stream = None
@@ -2796,6 +2836,9 @@ class VirtualNAS:
                 )
                 await _raise_remote_status(target_response, "target")
                 await target_response.aread()
+            job["phase"] = "verifying"
+            job["phase_started_at"] = time.time()
+            self._save()
             imported_storage = await self._node_storage(job["target_node_id"])
             imported_model = next((
                 item for item in imported_storage["models"]
@@ -2810,6 +2853,8 @@ class VirtualNAS:
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             job["status"] = "completed"
+            job["phase"] = "completed"
+            job["phase_started_at"] = time.time()
             job["bytes_total"] = job["bytes_transferred"]
             job["completed_at"] = time.time()
         except TransferCanceled:
@@ -2821,6 +2866,8 @@ class VirtualNAS:
                 job["status"] = "queued"
                 job["started_at"] = None
                 job["error"] = None
+                job.pop("phase", None)
+                job.pop("phase_started_at", None)
             raise
         except Exception as exc:
             job["status"] = "failed"

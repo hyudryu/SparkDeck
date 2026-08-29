@@ -565,12 +565,20 @@ export function ModelsPage() {
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   // Models already present on any node's Virtual NAS cache, for the
-  // "already have it" picker in the deployment creator.
+  // "already have it" picker in the deployment creator. Externally managed
+  // bundles (for example installed ComfyUI weights) live outside the cache
+  // and cannot back or transfer a runtime deployment, so only models with
+  // a normal cache entry are offered.
   const cachedModels = useMemo(() => {
     const byModel = new Map<string, { modelId: string; nodeCount: number; sizeBytes: number }>()
+    const externallyManaged = new Set<string>()
     for (const node of modelCache.data?.nodes ?? []) {
       for (const model of node.models) {
         if (model.partial) continue
+        if (model.externally_managed || model.transferable === false) {
+          externallyManaged.add(model.model_id)
+          continue
+        }
         const entry = byModel.get(model.model_id)
           ?? { modelId: model.model_id, nodeCount: 0, sizeBytes: 0 }
         entry.nodeCount += 1
@@ -578,14 +586,20 @@ export function ModelsPage() {
         byModel.set(model.model_id, entry)
       }
     }
-    return [...byModel.values()].sort((a, b) => a.modelId.localeCompare(b.modelId))
+    return [...byModel.values()]
+      .filter((entry) => !externallyManaged.has(entry.modelId) || byModel.has(entry.modelId))
+      .sort((a, b) => a.modelId.localeCompare(b.modelId))
   }, [modelCache.data])
 
   // Which of the creator's selected nodes already hold the chosen model.
+  // Externally managed bundles cannot seed a runtime deployment, so they
+  // do not count as cached weights here either.
   const createModelCacheInfo = useMemo(() => {
     if (!form.managed || !form.model_id || isLocalModelPath(form.model_id)) return undefined
     const cachedIds = new Set((modelCache.data?.nodes ?? [])
       .filter((node) => node.models.some((model) => !model.partial
+        && !model.externally_managed
+        && model.transferable !== false
         && model.model_id === form.model_id))
       .map((node) => node.id))
     const nameOf = (id: string) => id === 'local'

@@ -629,6 +629,61 @@ describe('deployment creator model and quantization pickers', () => {
     expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
   })
 
+  it('hides externally managed bundles from the cached-model picker', async () => {
+    const user = userEvent.setup()
+    const cacheWithBundle = {
+      nodes: [
+        {
+          id: 'local', name: 'Controller', online: true,
+          models: [
+            { model_id: 'org/model', size_bytes: 10 },
+            { model_id: 'comfy/bundle', size_bytes: 999, externally_managed: true, transferable: false },
+            { model_id: 'org/both', size_bytes: 999, externally_managed: true, transferable: false },
+          ],
+        },
+        {
+          id: 'worker-1', name: 'Node 4', online: true,
+          models: [
+            { model_id: 'org/both', size_bytes: 10 },
+          ],
+        },
+      ],
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(cacheWithBundle), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Create deployment')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    const picker = await screen.findByLabelText('Or pick a model already on the cluster')
+    // Normal cache entries are offered (including one that also exists as
+    // an external bundle), while external-only bundles are not.
+    expect(within(picker).getByRole('option', { name: /org\/model/ })).toBeInTheDocument()
+    expect(within(picker).getByRole('option', { name: /org\/both/ })).toBeInTheDocument()
+    expect(within(picker).queryByRole('option', { name: /comfy\/bundle/ })).not.toBeInTheDocument()
+  })
+
   it('keeps saved artifact settings when opening the editor after a creator pick', async () => {
     const user = userEvent.setup()
     const savedLlama = {

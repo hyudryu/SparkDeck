@@ -108,6 +108,21 @@ class SparkRunReferenceTests(unittest.TestCase):
 
 
 class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
+    def test_direct_transfer_source_uses_only_literal_fabric_http_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878/sparkdeck",
+                "agent_token": "agent-secret", "fabric_ip": "169.254.10.2",
+            }]
+            self.assertEqual(
+                registry.direct_transfer_source("remote-1"),
+                "http://169.254.10.2:7878/sparkdeck",
+            )
+            registry.nodes[0]["fabric_ip"] = "not-an-ip"
+            self.assertIsNone(registry.direct_transfer_source("remote-1"))
+
     async def test_authenticated_request_preserves_agent_response_status(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

@@ -6,13 +6,14 @@ tokens server-side and exposes sanitized node state for the UI.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import secrets
 import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -360,6 +361,23 @@ class NodeRegistry:
             and token
             and secrets.compare_digest(candidate, str(node.get("forward_token_hash") or ""))
         )
+
+    def direct_transfer_source(self, node_id: str) -> str | None:
+        """Return a fabric-reachable source endpoint for a direct archive pull."""
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID or not node.get("enabled", True):
+            return None
+        try:
+            fabric_ip = str(ipaddress.ip_address(str(node.get("fabric_ip") or "")))
+            parsed = urlparse(str(node["agent_url"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if parsed.scheme != "http" or not parsed.port:
+            return None
+        host = f"[{fabric_ip}]" if ":" in fabric_ip else fabric_ip
+        return urlunparse((
+            "http", f"{host}:{parsed.port}", parsed.path.rstrip("/"), "", "", "",
+        ))
 
     async def request(
         self,

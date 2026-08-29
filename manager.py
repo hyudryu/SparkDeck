@@ -80,6 +80,9 @@ DEFAULT_SETTINGS = {
     "vllm_auto_adjust_concurrency": True,
     # Opt-in model cache replication across authenticated cluster nodes.
     "virtual_nas_enabled": False,
+    # The only SparkDeck node expected to have a direct Ethernet path to the
+    # RouterOS management interface. Credentials remain on that selected node.
+    "routeros_gateway_node_id": "",
     # Cluster management uses the normal LAN/Tailscale address while model
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
@@ -1267,75 +1270,154 @@ class Manager:
         return [available[node_id] for node_id in requested]
 
     # ---------- RouterOS switch management ----------
+    @staticmethod
+    def _routeros_node_summary(node: dict) -> dict:
+        state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
+        discovery = state.get("discovery")
+        return {
+            "node_id": str(node.get("id") or ""),
+            "node_name": str(node.get("name") or node.get("id") or ""),
+            "online": bool(node.get("online")),
+            "detected": bool(state.get("detected")),
+            "configured": bool(state.get("configured")),
+            "discovery": discovery if isinstance(discovery, list) else [],
+            "discovery_error": state.get("discovery_error"),
+        }
+
+    def _routeros_gateway_node_id(self, summaries: list[dict]) -> str:
+        available = {str(item.get("node_id") or ""): item for item in summaries}
+        selected = str(
+            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
+        ).strip()
+        if selected in available:
+            return selected
+        for key in ("configured", "detected"):
+            candidate = next(
+                (item for item in summaries if item.get(key) and item.get("online")),
+                None,
+            )
+            if candidate:
+                return str(candidate["node_id"])
+        return ""
+
+    def _save_routeros_gateway_node_id(self, node_id: str) -> None:
+        settings = getattr(self, "settings", None)
+        if not isinstance(settings, dict):
+            return
+        settings["routeros_gateway_node_id"] = str(node_id or "")
+        self._save_settings()
+
     async def routeros_cluster_presence(self) -> dict:
         nodes = await self.cluster_nodes()
-        summaries = []
-        for node in nodes:
-            state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
-            # Presence is intentionally local and lightweight. Connectivity is
-            # unknown until routeros_cluster_overview authenticates to the switch.
-            summaries.append({
-                "node_id": node.get("id"),
-                "node_name": node.get("name"),
-                "online": bool(node.get("online")),
-                "detected": bool(state.get("detected")),
-                "configured": bool(state.get("configured")),
-            })
+        summaries = [self._routeros_node_summary(node) for node in nodes]
         return {
             "detected": any(item["detected"] for item in summaries),
+            "gateway_node_id": self._routeros_gateway_node_id(summaries) or None,
             "nodes": summaries,
         }
 
     async def routeros_cluster_overview(self) -> dict:
         nodes = await self.cluster_nodes()
-
-        async def load(node: dict) -> dict:
-            node_id = str(node.get("id") or "")
-            node_name = str(node.get("name") or node_id)
-            presence = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
-            if not node.get("online"):
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
+        summaries = [self._routeros_node_summary(node) for node in nodes]
+        gateway_node_id = self._routeros_gateway_node_id(summaries)
+        gateway_node = next(
+            (node for node in nodes if str(node.get("id") or "") == gateway_node_id),
+            None,
+        )
+        gateway = None
+        if gateway_node is not None:
+            summary = self._routeros_node_summary(gateway_node)
+            gateway_check = {
+                "id": "ethernet-gateway",
+                "label": "Ethernet gateway node",
+                "status": "passed" if summary["online"] else "failed",
+                "detail": (
+                    f"{summary['node_name']} is online and selected for the RouterOS Ethernet link."
+                    if summary["online"]
+                    else f"{summary['node_name']} is selected but currently offline."
+                ),
+            }
+            if not summary["online"]:
+                result = {
+                    **summary,
                     "connected": False,
-                    "error": node.get("status_message") or "SparkDeck node is offline",
+                    "error": gateway_node.get("status_message") or "SparkDeck node is offline",
                     "health": [],
                     "interfaces": [],
+                    "network": {
+                        "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                        "active_interfaces": 0, "total_interfaces": 0,
+                    },
+                    "configuration_checks": [],
                 }
-            if not presence.get("detected") and not presence.get("configured"):
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
+            elif not summary["detected"] and not summary["configured"]:
+                result = {
+                    **summary,
                     "connected": False,
                     "health": [],
                     "interfaces": [],
+                    "network": {
+                        "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                        "active_interfaces": 0, "total_interfaces": 0,
+                    },
+                    "configuration_checks": [{
+                        "id": "routeros-authentication",
+                        "label": "RouterOS authentication",
+                        "status": "warning",
+                        "detail": "Enter RouterOS credentials to validate this connection.",
+                    }],
                 }
-            try:
-                if node_id == LOCAL_NODE_ID:
-                    result = await self.routeros.overview()
-                else:
-                    result = await self.node_registry.request(
-                        node_id, "GET", "/api/agent/routeros",
-                        timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
-                    )
-                return {**result, "node_id": node_id, "node_name": node_name}
-            except Exception as exc:
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
-                    "connected": False,
-                    "error": str(exc),
-                    "health": [],
-                    "interfaces": [],
-                }
-
-        overviews = await asyncio.gather(*(load(node) for node in nodes))
+            else:
+                try:
+                    if gateway_node_id == LOCAL_NODE_ID:
+                        loaded = await self.routeros.overview()
+                    else:
+                        loaded = await self.node_registry.request(
+                            gateway_node_id, "GET", "/api/agent/routeros",
+                            timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
+                        )
+                    result = {**summary, **loaded}
+                    result.setdefault("health", [])
+                    result.setdefault("interfaces", [])
+                    result.setdefault("configuration_checks", [])
+                    result.setdefault("network", {
+                        "rx_bits_per_second": 0,
+                        "tx_bits_per_second": 0,
+                        "active_interfaces": 0,
+                        "total_interfaces": len(result["interfaces"]),
+                    })
+                except Exception as exc:
+                    result = {
+                        **summary,
+                        "connected": False,
+                        "error": str(exc),
+                        "health": [],
+                        "interfaces": [],
+                        "network": {
+                            "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                            "active_interfaces": 0, "total_interfaces": 0,
+                        },
+                        "configuration_checks": [{
+                            "id": "routeros-authentication",
+                            "label": "RouterOS authentication",
+                            "status": "failed",
+                            "detail": str(exc),
+                        }],
+                    }
+            gateway = {
+                **result,
+                "node_id": gateway_node_id,
+                "node_name": summary["node_name"],
+                "configuration_checks": [
+                    gateway_check,
+                    *(result.get("configuration_checks") or []),
+                ],
+            }
         return {
-            "detected": any(bool(item.get("detected")) for item in overviews),
-            "nodes": overviews,
+            "detected": any(bool(item.get("detected")) for item in summaries),
+            "gateway_node_id": gateway_node_id or None,
+            "nodes": summaries,
+            "gateway": gateway,
         }
 
     async def _routeros_target(self, node_id: str) -> dict:
@@ -1351,27 +1433,41 @@ class Manager:
     async def connect_routeros(self, node_id: str, body: dict) -> dict:
         node = await self._routeros_target(node_id)
         if node["id"] == LOCAL_NODE_ID:
-            return await self.routeros.connect(body)
-        result = await self.node_registry.request(
-            node["id"], "PUT", "/api/agent/routeros/connection",
-            json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
-        )
-        # _routeros_target() just populated the four-second agent-status cache.
-        # Drop that pre-connection snapshot so the immediate UI reload probes
-        # the worker and observes its newly configured RouterOS state.
-        self.node_registry._status_cache.pop(node["id"], None)
+            result = await self.routeros.connect(body)
+        else:
+            result = await self.node_registry.request(
+                node["id"], "PUT", "/api/agent/routeros/connection",
+                json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
+            )
+            # _routeros_target() just populated the four-second agent-status cache.
+            # Drop that pre-connection snapshot so the immediate UI reload probes
+            # the worker and observes its newly configured RouterOS state.
+            self.node_registry._status_cache.pop(node["id"], None)
+        self._save_routeros_gateway_node_id(node["id"])
         return result
 
     async def disconnect_routeros(self, node_id: str) -> dict:
         node = await self._routeros_target(node_id)
         if node["id"] == LOCAL_NODE_ID:
-            return self.routeros.disconnect()
-        return await self.node_registry.request(
-            node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+            result = self.routeros.disconnect()
+        else:
+            result = await self.node_registry.request(
+                node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+            )
+        selected = str(
+            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
         )
+        if selected == node["id"]:
+            self._save_routeros_gateway_node_id("")
+        return result
 
     async def update_routeros_fan_settings(self, node_id: str, body: dict) -> dict:
         node = await self._routeros_target(node_id)
+        selected = str(
+            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
+        )
+        if selected and node["id"] != selected:
+            raise ValueError("fan settings can only be changed through the selected RouterOS gateway node")
         if node["id"] == LOCAL_NODE_ID:
             return await self.routeros.update_fan_settings(body)
         return await self.node_registry.request(
@@ -6526,7 +6622,10 @@ class Manager:
             for k, v in data.items():
                 # Dashboard visibility is presentation-only node state. Keep
                 # its strictly typed node endpoint as the sole write path.
-                if k in DEFAULT_SETTINGS and k != "cluster_node_hidden_from_dashboard":
+                if k in DEFAULT_SETTINGS and k not in {
+                    "cluster_node_hidden_from_dashboard",
+                    "routeros_gateway_node_id",
+                }:
                     # The UI sends an empty password field when an existing
                     # token should remain unchanged.
                     if k == "hf_token" and not str(v or "").strip():

@@ -130,13 +130,20 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
                 }])
             if path == "/rest/interface/print":
                 return httpx.Response(200, json=[{
-                    ".id": "*1", "name": "sfp-sfpplus1", "running": "true",
+                    ".id": "*1", "name": "sfp-sfpplus1", "type": "ether",
+                    "running": "true",
                     "rx-byte": "1200", "tx-byte": "3400", "comment": "private note",
                 }])
             if path == "/rest/interface/monitor-traffic":
                 return httpx.Response(200, json=[{
                     "name": "sfp-sfpplus1", "rx-bits-per-second": "9800000000",
                     "tx-bits-per-second": "8600000000", ".section": "0",
+                }])
+            if path == "/rest/interface/ethernet/monitor":
+                return httpx.Response(200, json=[{
+                    "name": "sfp-sfpplus1", "status": "link-ok",
+                    "rate": "10Gbps", "full-duplex": "true",
+                    "sfp-module-present": "true", "private": "hidden",
                 }])
             if path == "/rest/system/health/settings/set":
                 return httpx.Response(200, json=[])
@@ -163,6 +170,10 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("comment", result["interfaces"][0])
         self.assertNotIn(".section", result["interfaces"][0])
         self.assertEqual(result["interfaces"][0]["rx-bits-per-second"], "9800000000")
+        self.assertEqual(result["interfaces"][0]["rate"], "10Gbps")
+        self.assertNotIn("private", result["interfaces"][0])
+        self.assertEqual(result["network"]["rx_bits_per_second"], 9_800_000_000)
+        self.assertTrue(all(check["status"] == "passed" for check in result["configuration_checks"]))
         serialized = json.dumps(result)
         self.assertNotIn("very-secret", serialized)
         self.assertNotIn("sparkdeck", serialized)
@@ -193,6 +204,24 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
             "cpu-overtemp-check": "yes",
         })
         self.assertTrue(result["connected"])
+
+    async def test_fan_update_rejects_an_inverted_temperature_curve(self) -> None:
+        await self.service.connect({
+            "base_url": "https://192.168.88.1",
+            "username": "sparkdeck", "password": "secret", "verify_tls": True,
+        })
+        self.requests.clear()
+
+        with self.assertRaisesRegex(ValueError, "must be below"):
+            await self.service.update_fan_settings({
+                "fan-target-temp": 65,
+                "fan-full-speed-temp": 55,
+            })
+
+        self.assertFalse(any(
+            request.url.path == "/rest/system/health/settings/set"
+            for request in self.requests
+        ))
 
     async def test_fan_update_uses_one_config_snapshot_when_file_changes(self) -> None:
         config_a = {
@@ -545,6 +574,31 @@ class RouterOSServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_overview_queries_only_the_selected_ethernet_gateway(self) -> None:
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = mock.AsyncMock(return_value=[
+            {"id": "worker-1", "name": "First", "online": True,
+             "routeros": {"detected": True, "configured": True}},
+            {"id": "worker-2", "name": "Second", "online": True,
+             "routeros": {"detected": True, "configured": True}},
+        ])
+        manager.settings = {"routeros_gateway_node_id": "worker-2"}
+        manager.node_registry = mock.Mock()
+        manager.node_registry.request = mock.AsyncMock(return_value={
+            "connected": True, "health": [], "interfaces": [],
+            "configuration_checks": [],
+        })
+
+        result = await manager.routeros_cluster_overview()
+
+        self.assertEqual(result["gateway_node_id"], "worker-2")
+        self.assertEqual(result["gateway"]["node_name"], "Second")
+        self.assertEqual(result["gateway"]["network"]["rx_bits_per_second"], 0)
+        manager.node_registry.request.assert_awaited_once_with(
+            "worker-2", "GET", "/api/agent/routeros",
+            timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
+        )
+
     async def test_remote_overview_timeout_covers_worker_request_budget(self) -> None:
         manager = Manager.__new__(Manager)
         manager.cluster_nodes = mock.AsyncMock(return_value=[{
@@ -555,10 +609,12 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         }])
         manager.node_registry = mock.Mock()
         manager.node_registry.request = mock.AsyncMock(return_value={"connected": True})
+        manager.settings = {"routeros_gateway_node_id": "worker-1"}
 
         result = await manager.routeros_cluster_overview()
 
-        self.assertTrue(result["nodes"][0]["connected"])
+        self.assertTrue(result["gateway"]["connected"])
+        self.assertEqual(result["gateway_node_id"], "worker-1")
         manager.node_registry.request.assert_awaited_once_with(
             "worker-1",
             "GET",
@@ -583,6 +639,8 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
             "routeros": {"detected": True, "configured": True},
         }
         manager.node_registry = mock.Mock()
+        manager.settings = {}
+        manager._save_settings = mock.Mock()
         manager.node_registry._status_cache = {
             "worker-1": (1.0, cached_absence),
             "worker-2": (1.0, {}),
@@ -609,7 +667,9 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         reloaded = await manager.routeros_cluster_overview()
 
         self.assertTrue(connected["connected"])
-        self.assertTrue(reloaded["nodes"][0]["connected"])
+        self.assertTrue(reloaded["gateway"]["connected"])
+        self.assertEqual(manager.settings["routeros_gateway_node_id"], "worker-1")
+        manager._save_settings.assert_called_once_with()
         self.assertNotIn("worker-1", manager.node_registry._status_cache)
         self.assertIn("worker-2", manager.node_registry._status_cache)
         self.assertEqual(manager.node_registry.request.await_args_list, [
@@ -637,6 +697,7 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         manager._routeros_target = mock.AsyncMock(return_value={"id": "worker-1"})
         manager.node_registry = mock.Mock()
         manager.node_registry.request = mock.AsyncMock(return_value={"connected": True})
+        manager.settings = {"routeros_gateway_node_id": "worker-1"}
         body = {"fan-target-temp": 55}
 
         result = await manager.update_routeros_fan_settings("worker-1", body)
@@ -655,6 +716,20 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
             ROUTEROS_TIMEOUT_SECONDS * 7,
         )
 
+    async def test_fan_update_rejects_a_non_gateway_node(self) -> None:
+        manager = Manager.__new__(Manager)
+        manager._routeros_target = mock.AsyncMock(return_value={"id": "worker-2"})
+        manager.settings = {"routeros_gateway_node_id": "worker-1"}
+        manager.node_registry = mock.Mock()
+        manager.node_registry.request = mock.AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "selected RouterOS gateway"):
+            await manager.update_routeros_fan_settings(
+                "worker-2", {"fan-target-temp": 55},
+            )
+
+        manager.node_registry.request.assert_not_awaited()
+
     async def test_remote_only_discovery_enables_cluster_presence(self) -> None:
         manager = Manager.__new__(Manager)
         manager.cluster_nodes = mock.AsyncMock(return_value=[
@@ -662,11 +737,13 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
             {"id": "worker-1", "name": "Rack node", "online": True,
              "routeros": {"detected": True, "configured": False}},
         ])
+        manager.settings = {}
 
         result = await manager.routeros_cluster_presence()
 
         self.assertTrue(result["detected"])
         self.assertTrue(result["nodes"][1]["detected"])
+        self.assertEqual(result["gateway_node_id"], "worker-1")
 
     async def test_lightweight_presence_does_not_infer_switch_connectivity(self) -> None:
         manager = Manager.__new__(Manager)
@@ -676,6 +753,7 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
             "online": True,
             "routeros": {"detected": True, "configured": True},
         }])
+        manager.settings = {"routeros_gateway_node_id": "worker-1"}
 
         result = await manager.routeros_cluster_presence()
 
@@ -684,7 +762,7 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["nodes"][0]["configured"])
         self.assertNotIn("connected", result["nodes"][0])
 
-    async def test_remote_failure_does_not_hide_other_switch_nodes(self) -> None:
+    async def test_remote_failure_is_reported_for_only_the_selected_gateway(self) -> None:
         manager = Manager.__new__(Manager)
         manager.cluster_nodes = mock.AsyncMock(return_value=[
             {"id": "local", "name": "Controller", "online": True, "routeros": {"detected": False}},
@@ -694,9 +772,11 @@ class RouterOSClusterTests(unittest.IsolatedAsyncioTestCase):
         manager.routeros = mock.Mock()
         manager.node_registry = mock.Mock()
         manager.node_registry.request = mock.AsyncMock(side_effect=RuntimeError("agent unavailable"))
+        manager.settings = {"routeros_gateway_node_id": "worker-1"}
 
         result = await manager.routeros_cluster_overview()
 
         self.assertTrue(result["detected"])
-        self.assertFalse(result["nodes"][1]["connected"])
-        self.assertIn("agent unavailable", result["nodes"][1]["error"])
+        self.assertEqual(len(result["nodes"]), 2)
+        self.assertFalse(result["gateway"]["connected"])
+        self.assertIn("agent unavailable", result["gateway"]["error"])

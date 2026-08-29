@@ -685,7 +685,7 @@ describe('deployment creator model and quantization pickers', () => {
     expect(dialogArtifact).toHaveValue('Llama-3.2-1B-Q4_K_M.gguf')
   })
 
-  it('offers a local file path entry for repositories that list GGUF artifacts', async () => {
+  it('starts local-path entry from an empty field after a repository pick', async () => {
     const user = userEvent.setup()
     mockGgufCluster()
     renderPage()
@@ -695,16 +695,72 @@ describe('deployment creator model and quantization pickers', () => {
 
     await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
     await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
-    const artifactSelect = await screen.findByRole('combobox', { name: /^GGUF artifact/ })
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    await user.selectOptions(quantSelect, 'Q8_0')
+    const artifactSelect = screen.getByRole('combobox', { name: /^GGUF artifact/ })
+    expect(artifactSelect).toHaveValue('Llama-3.2-1B-Q8_0.gguf')
+
     await user.selectOptions(artifactSelect, '__enter-local-path__')
 
+    // The revealed text field starts empty: the repository artifact must
+    // not stay prefilled and silently keep being used.
     const artifactInput = screen.getByLabelText(/^GGUF artifact/)
+    expect(artifactInput).toHaveValue('')
     await user.type(artifactInput, '/tmp/local-model.gguf')
     expect(artifactInput).toHaveValue('/tmp/local-model.gguf')
 
     // Switching back returns to the repository dropdown.
     await user.click(screen.getByRole('button', { name: 'Choose from the repository files…' }))
     expect(screen.getByRole('combobox', { name: /^GGUF artifact/ })).toBeInTheDocument()
+  })
+
+  it('keeps deep-link artifact picks across a canonical repository redirect', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fold-gguf') {
+        return new Response(JSON.stringify({
+          model: { ...ggufCatalog(CACHED_SHA).model, id: 'org/new-gguf' },
+          aggregates: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    render(
+      <MemoryRouter initialEntries={['/models?model=org/old-gguf&runtime=llama.cpp&quantization=Q4_K_M&artifact=Llama-3.2-1B-Q4_K_M.gguf']}>
+        <ModelsPage />
+      </MemoryRouter>,
+    )
+
+    const dialog = await screen.findByRole('dialog', { name: 'Create deployment' })
+    const modelInput = await within(dialog).findByLabelText('Model repository or GGUF artifact')
+
+    // The Hub answers the old id with its canonical name; the form adopts
+    // it, but the prepopulated artifact and quantization must survive the
+    // rename because the listing still describes the same files.
+    await waitFor(() => {
+      expect(modelInput).toHaveValue('org/new-gguf')
+    })
+    const artifactSelect = await within(dialog).findByRole('combobox', { name: /^GGUF artifact/ })
+    expect(artifactSelect).toHaveValue('Llama-3.2-1B-Q4_K_M.gguf')
+    expect(within(dialog).getByRole('combobox', { name: /Quantization/ })).toHaveValue('Q4_K_M')
   })
 
   it('withholds downloaded marks when the listing resolves a newer revision', async () => {

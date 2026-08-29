@@ -309,7 +309,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .storage-partial-action:focus-visible { outline: 2px solid var(--warning, #d6a400); outline-offset: 2px; }
 .storage-partial-action:disabled { cursor: not-allowed; opacity: .45; }
 .storage-weight-list li:has(.storage-partial-action) { cursor: default; }
-.storage-weight-list li.storage-active-weight { height: auto; min-height: 64px; cursor: default; }.storage-active-weight .storage-progress { margin: 5px 0 2px; }.storage-active-weight > svg { color: var(--accent) !important; }
+.storage-weight-list li.storage-active-weight { position: relative; isolation: isolate; height: auto; min-height: 64px; overflow: hidden; color: var(--text-secondary); background: color-mix(in srgb, var(--text-tertiary) 12%, var(--bg-subtle)); border-color: var(--border-subtle); cursor: default; }
+.storage-active-weight::before { content: ""; position: absolute; z-index: 0; inset: 0 auto 0 0; width: var(--storage-active-progress, 0%); background: color-mix(in srgb, var(--accent) 18%, transparent); border-right: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); transition: width 2.8s linear; }
+.storage-active-weight > * { position: relative; z-index: 1; }
+.storage-active-weight .storage-progress { margin: 5px 0 2px; }.storage-active-weight > svg { color: var(--text-tertiary) !important; }
 .storage-transfer-panel { display: grid; grid-template-columns: minmax(190px, .7fr) minmax(400px, 1.5fr); gap: 24px; margin-top: 14px; padding: 18px; }.storage-transfer-panel > div > p { margin-top: 5px; color: var(--text-secondary); font-size: 12px; }.storage-transfer-panel form { display: grid; gap: 14px; }
 .storage-targets { min-width: 0; padding: 0; border: 0; }.storage-targets legend { padding: 0; font-size: 12px; font-weight: 600; }.storage-targets > p { margin: 3px 0 8px; color: var(--text-secondary); font-size: 12px; }.storage-targets > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }.storage-targets .check-field { min-width: 0; padding: 9px; }.storage-targets .check-field.unavailable { opacity: .52; cursor: not-allowed; }.storage-target-empty { color: var(--text-secondary); font-size: 12px; }
 .storage-transfer-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; }.storage-transfer-actions > span { color: var(--text-secondary); font-size: 12px; }
@@ -321,7 +324,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .storage-job-table .table-row { grid-template-columns: minmax(160px, 1.2fr) minmax(130px, 1fr) 90px minmax(160px, 1.2fr) 72px; }
 .storage-route { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 12px; }.storage-route svg { flex: 0 0 auto; }.storage-route span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .storage-job-error { color: var(--danger) !important; }.storage-job-progress { gap: 4px; }.storage-progress { width: 100%; height: 6px; overflow: hidden; border-radius: 999px; background: var(--border-subtle); }.storage-progress > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: var(--accent); transform-origin: left center; transition: transform 2.8s linear; will-change: transform; }.storage-job-progress > span { color: var(--text-secondary); font-size: 10px; }
-@media (prefers-reduced-motion: reduce) { .storage-progress > span { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .storage-progress > span, .storage-active-weight::before { transition: none; } }
 .storage-guidance { margin-top: 18px; padding: 17px; }.storage-guidance h2 { font-size: 14px; }.storage-guidance ol { display: grid; gap: 6px; padding-left: 20px; margin: 10px 0 0; color: var(--text-secondary); font-size: 12px; }
 
 .usage-page > .inline-error, .usage-page > .inline-success { margin-bottom: 14px; }

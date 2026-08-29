@@ -2613,11 +2613,26 @@ class Manager:
             min(1.0, transferred / total) if total
             else (1.0 if job.get("status") == "completed" else 0.0)
         )
+        started_at = job.get("started_at")
+        completed_at = job.get("completed_at")
+        bytes_per_second = None
+        # Download progress includes bytes already present in a resumable cache,
+        # so only node-to-node copies have an honest elapsed-time transfer rate.
+        if job.get("kind") == "transfer":
+            try:
+                started = float(started_at)
+                ended = float(completed_at) if completed_at is not None else time.time()
+                elapsed = ended - started
+                if transferred > 0 and elapsed > 0:
+                    bytes_per_second = transferred / elapsed
+            except (TypeError, ValueError):
+                pass
         return {
             **job,
             "source_node_name": node_name(job["source_node_id"]),
             "target_node_name": node_name(job["target_node_id"]),
             "progress": progress,
+            "bytes_per_second": bytes_per_second,
             "finished_at": job.get("completed_at"),
         }
 

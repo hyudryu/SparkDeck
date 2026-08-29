@@ -638,6 +638,7 @@ export interface StorageTransferJob {
   workflow_node_ids?: string[]
   bytes_total: number
   bytes_transferred: number
+  bytes_per_second?: number | null
   progress?: number
   created_at: string | number
   started_at?: string | number

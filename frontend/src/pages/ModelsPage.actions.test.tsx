@@ -444,6 +444,115 @@ describe('deployment creator model and quantization pickers', () => {
     expect(within(dialog).getByRole('combobox', { name: /GGUF artifact/ })).toHaveValue('')
   })
 
+  it('keeps a failed repository lookup without resurrecting the previous one', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fgguf') {
+        return new Response(JSON.stringify(ggufCatalog(CACHED_SHA)), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fbroken') {
+        return new Response(JSON.stringify({ detail: 'boom' }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+    await screen.findByRole('combobox', { name: /Quantization/ })
+
+    // The failed lookup for the new repository must keep the new id in the
+    // field, must not rewrite it back to the previous repository via the
+    // redirect adoption, and must not keep showing the old dropdowns.
+    await user.clear(screen.getByLabelText('Model repository or GGUF artifact'))
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/broken')
+    await waitFor(() => {
+      expect(screen.getByLabelText('Model repository or GGUF artifact')).toHaveValue('org/broken')
+    })
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    expect(screen.getByLabelText('Model repository or GGUF artifact')).toHaveValue('org/broken')
+    expect(screen.queryByRole('combobox', { name: /Quantization/ })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Quantization (optional)')).toHaveValue('')
+  })
+
+  it('clears linked artifact picks when a repository lists no GGUF files', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fgguf') {
+        return new Response(JSON.stringify(ggufCatalog(CACHED_SHA)), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fplain') {
+        return new Response(JSON.stringify({
+          model: { id: 'org/plain', revision: 'c'.repeat(40), quantizations: [] },
+          aggregates: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    await user.selectOptions(quantSelect, 'Q8_0')
+
+    // The new repository lists no GGUF artifacts at all, so the artifact
+    // picked from the previous repository is cleared instead of being
+    // exposed through the manual fallback input.
+    await user.clear(screen.getByLabelText('Model repository or GGUF artifact'))
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/plain')
+    // The help text inside the label extends the accessible name, so match
+    // by a name prefix (anchored to skip the repository field's label).
+    await waitFor(() => {
+      expect(screen.getByLabelText(/^GGUF artifact/)).toHaveValue('')
+    })
+    expect(screen.getByLabelText('Quantization (optional)')).toHaveValue('')
+  })
+
   it('withholds downloaded marks when the listing resolves a newer revision', async () => {
     const user = userEvent.setup()
     mockGgufCluster(NEW_SHA)

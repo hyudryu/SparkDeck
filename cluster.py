@@ -380,6 +380,58 @@ class NodeRegistry:
             "http", f"{host}:{port}", parsed.path.rstrip("/"), "", "", "",
         ))
 
+    async def resolve_direct_transfer_source(self, node_id: str) -> str | None:
+        """Resolve a data-plane endpoint without ever selecting Wi-Fi.
+
+        An explicitly paired fabric IP remains authoritative.  When it has not
+        been recorded, obtain the agent's cached/live status and select only a
+        literal IPv4 address from an UP RDMA interface.  A node that reports a
+        fabric but cannot expose a usable endpoint must fail loudly; a node
+        without any RDMA fabric remains compatible with management routing.
+        """
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID or not node.get("enabled", True):
+            return None
+        if node.get("fabric_ip"):
+            endpoint = self.direct_transfer_source(node_id)
+            if endpoint is None:
+                raise RuntimeError(
+                    f"{node.get('name', node_id)} has no valid HTTP fabric endpoint"
+                )
+            return endpoint
+
+        status = await self.probe(node)
+        configured_interface = str(node.get("fabric_interface") or "").strip()
+        interfaces = status.get("interfaces") or []
+        for interface in interfaces:
+            if not isinstance(interface, dict):
+                continue
+            if not interface.get("up") or not interface.get("rdma"):
+                continue
+            if configured_interface and interface.get("name") != configured_interface:
+                continue
+            for value in interface.get("ipv4") or []:
+                try:
+                    address = ipaddress.ip_address(str(value))
+                except ValueError:
+                    continue
+                if address.version != 4:
+                    continue
+                parsed = urlparse(str(node.get("agent_url") or ""))
+                if parsed.scheme != "http":
+                    raise RuntimeError(
+                        f"{node.get('name', node_id)} does not expose an HTTP fabric endpoint"
+                    )
+                port = parsed.port or 80
+                return urlunparse((
+                    "http", f"{address}:{port}", parsed.path.rstrip("/"), "", "", "",
+                ))
+        if status.get("fabric_ready") is True:
+            raise RuntimeError(
+                f"{node.get('name', node_id)} reports a fabric but no usable UP RDMA IPv4 endpoint"
+            )
+        return None
+
     async def request(
         self,
         node_id: str,
@@ -448,8 +500,15 @@ class NodeRegistry:
         content: AsyncIterator[bytes] | None = None,
         headers: dict[str, str] | None = None,
         timeout: float = 600,
+        use_fabric: bool = False,
     ) -> httpx.Response:
-        """Open an authenticated agent stream; the caller must close it."""
+        """Open an authenticated agent stream; the caller must close it.
+
+        ``use_fabric`` is reserved for high-volume data-plane streams.  Once a
+        node has a fabric endpoint configured, do not fall back to its
+        management URL: doing so would silently put the archive back on the
+        controller's Tailscale/Wi-Fi path.
+        """
         node = self.get(node_id)
         if not node or node_id == LOCAL_NODE_ID:
             raise ValueError("remote node not found")
@@ -458,9 +517,16 @@ class NodeRegistry:
         request_headers = dict(headers or {})
         request_headers["Authorization"] = f"Bearer {node['agent_token']}"
         request_headers[COORDINATOR_ID_HEADER] = self.controller_id
-        targets = await self._connection_targets(
-            node["agent_url"], path,
+        fabric_endpoint = (
+            await self.resolve_direct_transfer_source(node_id)
+            if use_fabric else None
         )
+        if use_fabric and fabric_endpoint is not None:
+            targets = [(f"{fabric_endpoint}{path}", {}, {})]
+        else:
+            targets = await self._connection_targets(
+                node["agent_url"], path,
+            )
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content

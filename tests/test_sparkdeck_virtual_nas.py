@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import os
 import tarfile
 import tempfile
 import unittest
@@ -908,25 +909,38 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["model_id"], "org/raw")
             self.assertFalse(model["partial"])
 
-    async def test_inventory_marks_weights_only_snapshot_with_inflight_blob_partial(self):
+    async def test_inventory_scopes_inflight_blobs_to_the_snapshot(self):
         # An interrupted snapshot_download links the weights first; the
         # unfinished config/tokenizer blobs sit in blobs/ outside the
-        # snapshot, so a weights-only snapshot is complete only when the
-        # repository has no in-progress download evidence.
-        for marker in ("stale.incomplete", "stale.lock"):
-            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
-                hub = Path(directory) / "hub"
-                repository = hub / "models--org--raw"
-                snapshot = repository / "snapshots" / RESOLVED_REVISION
-                snapshot.mkdir(parents=True)
-                (repository / "blobs").mkdir()
-                (repository / "blobs" / marker).write_bytes(b"partial")
-                (snapshot / "model.safetensors").write_bytes(b"weights")
-                nas = VirtualNAS(
-                    Path(directory), lambda: hub, FakeRegistry(), lambda: False,
-                )
+        # snapshot. Blobs carry no revision attribution, so only non-stale
+        # in-flight blobs (touched at or after the snapshot's newest file)
+        # count as evidence against a weights-only snapshot.
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--raw"
+            snapshot = repository / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True)
+            blobs = repository / "blobs"
+            blobs.mkdir()
+            weights = snapshot / "model.safetensors"
+            weights.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
 
-                self.assertTrue(nas.inventory()[0]["partial"])
+            # Stale residue from an older unrelated download does not flip a
+            # complete weights-only snapshot back to partial.
+            stale = blobs / "stale.incomplete"
+            stale.write_bytes(b"partial")
+            old = weights.stat().st_mtime - 60
+            os.utime(stale, (old, old))
+            self.assertFalse(nas.inventory()[0]["partial"])
+
+            # A fresh in-flight blob is evidence of an interrupted
+            # weight-first download of this revision.
+            fresh = blobs / "fresh.lock"
+            fresh.write_bytes(b"partial")
+            self.assertTrue(nas.inventory()[0]["partial"])
 
     async def test_inventory_marks_config_without_tokenizer_partial(self):
         with tempfile.TemporaryDirectory() as directory:

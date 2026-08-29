@@ -166,7 +166,10 @@ export function StoragePage() {
     setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && visibleNodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
   }, [modelId, visibleNodes, sourceNodeId])
 
-  const hasActiveJobs = Boolean(resource.data?.enabled && visibleTransferJobs.some(isActive))
+  // Polling follows every active job — even one hidden from the queue
+  // because its source node is hidden — so the visible target's inventory
+  // refreshes when that transfer completes.
+  const hasActiveJobs = Boolean(resource.data?.enabled && transferJobs.some(isActive))
   useEffect(() => {
     if (!hasActiveJobs) return
     const timer = window.setInterval(resource.reload, 3000)

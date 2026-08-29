@@ -20,7 +20,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import docker
 import httpx
@@ -1971,7 +1971,7 @@ class Manager:
             if (
                 next_url.scheme != "https"
                 or next_url.host != "huggingface.co"
-                or not next_url.path.startswith(tree_path)
+                or not unquote(next_url.path).startswith(unquote(tree_path))
             ):
                 raise ValueError("Hugging Face returned an unsafe model tree page")
             tree_url = next_url

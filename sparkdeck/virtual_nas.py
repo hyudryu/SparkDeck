@@ -3084,18 +3084,29 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
     config = lowered.get("config.json")
     if config is None:
-        # A raw weights-only repository is complete only when the cache has
-        # no unfinished Hub blobs. Those blobs live outside the snapshot, so
-        # checking the snapshot alone would misclassify an interrupted pull.
+        # A raw weights-only repository is complete only when the cache shows
+        # no unfinished download that could belong to this snapshot. Blobs
+        # are named by etag with no revision attribution, so exact scoping is
+        # impossible: an interrupted weight-first download (weights linked,
+        # config/tokenizer never arrived) leaves FRESH .incomplete/.lock
+        # blobs, touched at or after the snapshot's newest linked file, while
+        # residue from an older or unrelated download is stale by comparison.
+        # Only non-stale in-flight blobs count as evidence; a concurrent
+        # download of a different revision is an accepted false positive in
+        # favor of keeping the finish-download path available.
         if blob_root is None:
             # Minimal test/portable caches may not materialize a blobs mount;
             # there is then no external unfinished-blob evidence to reject.
             return True
         try:
+            newest_linked = max(
+                path.stat().st_mtime for path in files.values()
+            )
             inflight = (
-                blob.is_file()
+                blob.stat().st_mtime >= newest_linked
                 for pattern in ("*.incomplete", "*.lock")
                 for blob in blob_root.rglob(pattern)
+                if blob.is_file()
             )
             if any(inflight):
                 return False

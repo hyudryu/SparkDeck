@@ -229,6 +229,52 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
             state["nodes"][0]["models"][0]["expected_size_bytes"], 1000,
         )
 
+    async def test_expected_size_sums_paginated_tree_for_slashed_revision(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True},
+        ])
+        manager.settings = {}
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{
+            "model_id": "org/model", "size_bytes": 10,
+            "partial": True, "revision": "refs/pr/1",
+        }]
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.virtual_nas.list_transfers.return_value = {"items": []}
+        manager.virtual_nas_enabled = lambda: True
+        manager.node_registry = Mock()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.host, "huggingface.co")
+            self.assertEqual(
+                request.url.path, "/api/models/org/model/tree/refs/pr/1",
+            )
+            if "cursor" not in request.url.params:
+                return httpx.Response(
+                    200,
+                    json=[{"path": "model-00001.safetensors", "size": 1000}],
+                    headers={
+                        "Link": (
+                            "<https://huggingface.co/api/models/org/model"
+                            "/tree/refs%2Fpr%2F1?cursor=next-page>; rel=\"next\""
+                        ),
+                    },
+                )
+            return httpx.Response(
+                200, json=[{"path": "model-00002.safetensors", "size": 500}],
+            )
+
+        manager.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            state = await manager.virtual_nas_inventory()
+        finally:
+            await manager.http.aclose()
+
+        self.assertEqual(
+            state["nodes"][0]["models"][0]["expected_size_bytes"], 1500,
+        )
+
 
 class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_with_node_selection_relaunches_on_chosen_nodes(self):

@@ -487,7 +487,7 @@ describe('StoragePage', () => {
           id: 'node-a', name: 'Studio Spark', online: true, total_size: 3_000_000_000,
           models: [
             { model_id: 'Qwen/Qwen3.8-Flash-Next-FP8', size_bytes: 2_000_000_000 },
-            { model_id: 'org/other-model', size_bytes: 1_000_000_000 },
+            { model_id: 'IBM/granite', size_bytes: 1_000_000_000 },
           ],
         },
         {
@@ -512,14 +512,18 @@ describe('StoragePage', () => {
     const studio = screen.getByRole('region', { name: 'Storage on Studio Spark' })
     const backup = screen.getByRole('region', { name: 'Storage on Backup Spark' })
     expect(within(studio).getByText('Qwen/Qwen3.8-Flash-Next-FP8')).toBeInTheDocument()
-    expect(within(studio).queryByText('org/other-model')).not.toBeInTheDocument()
+    expect(within(studio).queryByText('IBM/granite')).not.toBeInTheDocument()
     expect(within(backup).getByText('community/qwen-small')).toBeInTheDocument()
     expect(within(backup).queryByText('team/unrelated')).not.toBeInTheDocument()
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     expect(within(inventory).getByText('Qwen/Qwen3.8-Flash-Next-FP8')).toBeInTheDocument()
     expect(within(inventory).getByText('community/qwen-small')).toBeInTheDocument()
-    expect(within(inventory).queryByText('org/other-model')).not.toBeInTheDocument()
+    expect(within(inventory).queryByText('IBM/granite')).not.toBeInTheDocument()
+
+    await user.clear(screen.getByRole('searchbox', { name: 'Search models across all storage nodes' }))
+    await user.type(screen.getByRole('searchbox', { name: 'Search models across all storage nodes' }), 'ibm')
+    expect(within(studio).getByText('IBM/granite')).toBeInTheDocument()
   })
 
   it('uses MB/s for sub-gigabyte transfer rates and truncates failed-job errors with a tooltip', async () => {

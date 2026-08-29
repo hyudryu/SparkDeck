@@ -2683,7 +2683,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.model_cache_inventory = AsyncMock(return_value=[inventory])
 
-        with patch("manager.time.monotonic", side_effect=[100, 102]):
+        with patch("manager._monotonic", side_effect=[100, 102]):
             first = await manager.virtual_nas_inventory()
             inventory["models"][0]["size_bytes"] = 1975
             inventory["models"][0]["partial_revision_size_bytes"][RESOLVED_REVISION] = 975

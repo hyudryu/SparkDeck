@@ -205,6 +205,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
 
         prepare.assert_awaited_once_with(
             "org/model", "model.gguf", "release-1", None,
+            home_node_ids=None, download_node_id=None,
         )
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
@@ -234,6 +235,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
 
         prepare.assert_awaited_once_with(
             "org/model", "~/model.gguf", "release-1", None,
+            home_node_ids=None, download_node_id=None,
         )
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")

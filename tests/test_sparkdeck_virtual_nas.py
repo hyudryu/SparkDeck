@@ -121,6 +121,36 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 
+    def test_has_model_files_reports_presence_per_selected_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            create_cached_model(hub)
+            revision_sha = "a" * 40
+            snapshot = hub / "models--org--model" / "snapshots" / revision_sha
+            snapshot.mkdir(parents=True)
+            (snapshot / "q4" / "model.gguf").parent.mkdir()
+            (snapshot / "q4" / "model.gguf").write_bytes(b"gguf")
+
+            complete = nas.has_model_files(
+                "org/model", revision_sha, ["q4/model.gguf"],
+            )
+            partial = nas.has_model_files(
+                "org/model", revision_sha, ["q4/model.gguf", "missing.gguf"],
+            )
+            absent = nas.has_model_files(
+                "org/model", "b" * 40, ["q4/model.gguf"],
+            )
+
+            self.assertTrue(complete["complete"])
+            self.assertEqual(complete["missing_files"], [])
+            self.assertEqual(partial["present_files"], ["q4/model.gguf"])
+            self.assertEqual(partial["missing_files"], ["missing.gguf"])
+            self.assertFalse(partial["complete"])
+            self.assertFalse(absent["complete"])
+
     def test_download_uses_the_configured_hub_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "configured-cache" / "hub"

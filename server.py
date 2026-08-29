@@ -12,7 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -705,6 +705,34 @@ async def agent_virtual_nas_inventory(req: Request):
     return _public_storage_payload({"models": models, "free_size": free_size})
 
 
+@app.post("/api/agent/virtual-nas/models/{model_id:path}/files/check")
+async def agent_virtual_nas_files_check(model_id: str, req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) - {"revision", "files"}:
+            raise ValueError("request may contain only revision and files")
+        revision = body.get("revision")
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError("revision must be a non-empty string")
+        files = body.get("files")
+        if (
+            not isinstance(files, list)
+            or not files
+            or any(not isinstance(item, str) or not item.strip() for item in files)
+        ):
+            raise ValueError("files must contain at least one repository file")
+        result = await asyncio.to_thread(
+            manager.virtual_nas.has_model_files,
+            model_id, revision.strip(), files,
+        )
+        return _public_storage_payload(result)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
 @app.post("/api/agent/virtual-nas/models/{model_id:path}/download")
 async def agent_virtual_nas_download(model_id: str, req: Request):
     _require_agent(req)
@@ -728,17 +756,18 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             raise ValueError("hf_token must be a string")
         if requested_revision is not None and not isinstance(requested_revision, str):
             raise ValueError("requested_revision must be a string")
+        if files is not None and (
+            not isinstance(files, list)
+            or not files
+            or any(not isinstance(item, str) or not item.strip() for item in files)
+        ):
+            raise ValueError("files must contain at least one repository file")
         baseline = body.get("download_cache_baseline_bytes")
         if baseline is not None and (
             isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
         ):
             raise ValueError("download_cache_baseline_bytes must be a non-negative integer")
         if files is not None:
-            if (
-                not isinstance(files, list) or not files
-                or any(not isinstance(item, str) or not item.strip() for item in files)
-            ):
-                raise ValueError("files must contain repo-relative filenames")
             if baseline is not None:
                 raise ValueError(
                     "download_cache_baseline_bytes cannot be combined with files"
@@ -761,6 +790,60 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/files/size")
+async def agent_virtual_nas_files_size(
+    req: Request,
+    model_id: str,
+    revision: str,
+    files: list[str] = Query(min_length=1),
+):
+    _require_agent(req)
+    result = await asyncio.to_thread(
+        manager.virtual_nas.estimate_model_files_bytes,
+        model_id, revision, files,
+    )
+    return _public_storage_payload(result)
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/files/export")
+async def agent_virtual_nas_files_export(
+    req: Request,
+    model_id: str,
+    revision: str,
+    requested_revision: str | None = None,
+    files: list[str] = Query(min_length=1),
+):
+    _require_agent(req)
+    try:
+        stream = manager.virtual_nas.export_model_files(
+            model_id, revision, files, requested_revision,
+        )
+        return StreamingResponse(stream, media_type="application/x-tar")
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.put("/api/agent/virtual-nas/models/{model_id:path}/files/import")
+async def agent_virtual_nas_files_import(model_id: str, req: Request):
+    _require_agent(req)
+    expected_header = req.headers.get("x-sparkdeck-expected-bytes")
+    model_bytes_header = req.headers.get("x-sparkdeck-model-bytes")
+    try:
+        expected_bytes = int(expected_header) if expected_header is not None else None
+        model_bytes = int(model_bytes_header) if model_bytes_header is not None else None
+        if expected_bytes is not None and expected_bytes < 0:
+            raise ValueError("X-SparkDeck-Expected-Bytes must not be negative")
+        if model_bytes is not None and model_bytes <= 0:
+            raise ValueError("X-SparkDeck-Model-Bytes must be positive")
+        result = await manager.virtual_nas.import_model_files(
+            model_id, req.stream(), expected_bytes=expected_bytes,
+            required_model_bytes=model_bytes,
+        )
+        return _public_storage_payload(result)
+    except (TypeError, ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 
 
@@ -2384,8 +2467,8 @@ async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dic
     if manager._resolve_local_path(str(recipe.get("model") or "")):
         raise ValueError("local-path recipes do not use model preparation")
     body = await req.json()
-    if not isinstance(body, dict) or set(body) != {"node_ids"}:
-        raise ValueError("request must contain only node_ids")
+    if not isinstance(body, dict) or set(body) - {"node_ids", "download_node_id"}:
+        raise ValueError("request may contain only node_ids and download_node_id")
     node_ids = body.get("node_ids")
     if not isinstance(node_ids, list) or not node_ids or any(
         not isinstance(item, str) or not item.strip() for item in node_ids
@@ -2394,6 +2477,12 @@ async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dic
     selected = [item.strip() for item in node_ids]
     if len(set(selected)) != len(selected):
         raise ValueError("node_ids must not contain duplicates")
+    raw_seed = body.get("download_node_id")
+    if raw_seed is not None and (not isinstance(raw_seed, str) or not raw_seed.strip()):
+        raise ValueError("download_node_id must be a non-empty node ID")
+    download_node_id = raw_seed.strip() if isinstance(raw_seed, str) else None
+    if download_node_id and download_node_id not in selected:
+        raise ValueError("download_node_id must be one of the selected nodes")
     if len(selected) != contract["required_node_count"]:
         raise ValueError(
             f"this saved configuration requires exactly {contract['required_node_count']} node(s)"
@@ -2403,16 +2492,90 @@ async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dic
             raise ValueError("sharded deployments must include the controller node")
         selected = [LOCAL_NODE_ID, *(item for item in selected if item != LOCAL_NODE_ID)]
     await manager.selected_cluster_nodes(selected)
-    return recipe, contract, selected
+    return recipe, contract, selected, download_node_id
+
+
+async def _async_model_preparation_request(
+    req: Request,
+) -> tuple[str, str | None, list[str], str | None]:
+    """Parse a generic model preparation request body."""
+    body = await req.json()
+    if not isinstance(body, dict) or set(body) - {
+        "model_id", "revision", "node_ids", "download_node_id",
+    }:
+        raise ValueError(
+            "request may contain only model_id, revision, node_ids, and download_node_id"
+        )
+    model_id = body.get("model_id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("model_id must be a non-empty model ID")
+    revision = body.get("revision")
+    if revision is not None and not isinstance(revision, str):
+        raise ValueError("revision must be a string")
+    node_ids = body.get("node_ids")
+    if not isinstance(node_ids, list) or not node_ids or any(
+        not isinstance(item, str) or not item.strip() for item in node_ids
+    ):
+        raise ValueError("node_ids must contain at least one node ID")
+    selected = [item.strip() for item in node_ids]
+    if len(set(selected)) != len(selected):
+        raise ValueError("node_ids must not contain duplicates")
+    raw_seed = body.get("download_node_id")
+    if raw_seed is not None and (not isinstance(raw_seed, str) or not raw_seed.strip()):
+        raise ValueError("download_node_id must be a non-empty node ID")
+    download_node_id = raw_seed.strip() if isinstance(raw_seed, str) else None
+    if download_node_id and download_node_id not in selected:
+        raise ValueError("download_node_id must be one of the selected nodes")
+    await manager.selected_cluster_nodes(selected)
+    return model_id.strip(), revision, selected, download_node_id
+
+
+@app.post("/api/v1/storage/preparations/preflight")
+async def v1_model_preparation_preflight(req: Request):
+    try:
+        model_id, revision, node_ids, download_node_id = (
+            await _async_model_preparation_request(req)
+        )
+        return _public_storage_payload(
+            await manager.recipe_model_preparation_preflight(
+                model_id, revision, node_ids, download_node_id=download_node_id,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.post("/api/v1/storage/preparations", status_code=202)
+async def v1_model_preparation(req: Request):
+    _require_virtual_nas_enabled()
+    _require_same_origin_or_forwarded(req)
+    try:
+        model_id, revision, node_ids, download_node_id = (
+            await _async_model_preparation_request(req)
+        )
+        return _public_storage_payload(
+            await manager.queue_recipe_model_preparation(
+                model_id, revision, node_ids, download_node_id,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
 
 
 @app.post("/api/v1/recipes/{recipe_id}/prepare/preflight")
 async def v1_recipe_preparation_preflight(recipe_id: str, req: Request):
     try:
-        recipe, contract, node_ids = await _recipe_preparation_request(recipe_id, req)
+        recipe, contract, node_ids, download_node_id = (
+            await _recipe_preparation_request(recipe_id, req)
+        )
         return _public_storage_payload(
             await manager.recipe_model_preparation_preflight(
                 str(recipe.get("model") or ""), contract.get("model_revision"), node_ids,
+                download_node_id=download_node_id,
             )
         )
     except json.JSONDecodeError as exc:
@@ -2426,10 +2589,13 @@ async def v1_recipe_preparation(recipe_id: str, req: Request):
     _require_virtual_nas_enabled()
     _require_same_origin_or_forwarded(req)
     try:
-        recipe, contract, node_ids = await _recipe_preparation_request(recipe_id, req)
+        recipe, contract, node_ids, download_node_id = (
+            await _recipe_preparation_request(recipe_id, req)
+        )
         return _public_storage_payload(
             await manager.queue_recipe_model_preparation(
-                str(recipe.get("model") or ""), contract.get("model_revision"), node_ids,
+                str(recipe.get("model") or ""), contract.get("model_revision"),
+                node_ids, download_node_id,
             )
         )
     except json.JSONDecodeError as exc:

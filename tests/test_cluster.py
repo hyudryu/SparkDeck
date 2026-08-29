@@ -118,10 +118,213 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             }]
             self.assertEqual(
                 registry.direct_transfer_source("remote-1"),
-                "http://169.254.10.2:7878/sparkdeck",
+                "http://169.254.10.2:7878",
             )
             registry.nodes[0]["fabric_ip"] = "not-an-ip"
             self.assertIsNone(registry.direct_transfer_source("remote-1"))
+
+    async def test_authenticated_stream_uses_configured_fabric_endpoint(self) -> None:
+        management_requests = []
+        fabric_requests = []
+
+        def management_handler(request: httpx.Request) -> httpx.Response:
+            management_requests.append(request)
+            return httpx.Response(500, request=request)
+
+        def fabric_handler(request: httpx.Request) -> httpx.Response:
+            fabric_requests.append(request)
+            return httpx.Response(200, content=b"archive", request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(management_handler))
+            fabric_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(fabric_handler), trust_env=False,
+            )
+            registry = NodeRegistry(
+                Path(directory), client, "controller", fabric_http=fabric_client,
+            )
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "https://worker.tail.example:9443/sparkdeck",
+                "agent_token": "agent-secret", "fabric_ip": "169.254.10.2",
+            }]
+            registry._connection_targets = mock.AsyncMock()
+            try:
+                response = await registry.open_stream(
+                    "remote-1", "GET", "/api/agent/virtual-nas/models/org%2Fmodel/export",
+                    use_fabric=True,
+                )
+                self.assertEqual(b"archive", b"".join([chunk async for chunk in response.aiter_bytes()]))
+                await response.aclose()
+            finally:
+                await fabric_client.aclose()
+                await client.aclose()
+
+        self.assertEqual(
+            str(fabric_requests[0].url),
+            "http://169.254.10.2:7878/api/agent/virtual-nas/models/org%2Fmodel/export",
+        )
+        self.assertEqual(fabric_requests[0].headers["authorization"], "Bearer agent-secret")
+        self.assertFalse(getattr(fabric_client, "_trust_env"))
+        self.assertEqual(management_requests, [])
+        registry._connection_targets.assert_not_awaited()
+
+    async def test_fabric_stream_infers_configured_rdma_interface_from_agent_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878/sparkdeck",
+                "agent_token": "agent-secret", "fabric_interface": "cx7b",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": True,
+                "interfaces": [
+                    {"name": "wifi", "up": True, "rdma": False, "ipv4": ["10.0.0.5"]},
+                    {"name": "cx7a", "up": True, "rdma": True, "ipv4": ["169.254.10.2"]},
+                    {"name": "cx7b", "up": True, "rdma": True, "ipv4": ["169.254.10.3"]},
+                ],
+            })
+            try:
+                endpoint = await registry.resolve_direct_transfer_source("remote-1")
+            finally:
+                await registry.http.aclose()
+
+        self.assertEqual(endpoint, "http://169.254.10.3:7878")
+
+    async def test_fabric_stream_rejects_configured_rdma_interface_that_is_down(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878",
+                "agent_token": "agent-secret", "fabric_interface": "cx7",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": False,
+                "interfaces": [{"name": "cx7", "up": False, "rdma": True, "ipv4": []}],
+            })
+            try:
+                with self.assertRaisesRegex(RuntimeError, "RDMA interface cx7 is down"):
+                    await registry.resolve_direct_transfer_source("remote-1")
+            finally:
+                await registry.http.aclose()
+
+    async def test_fabric_stream_uses_healthy_rdma_when_another_port_is_down(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "https://worker.tail.example",
+                "agent_token": "agent-secret",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": True,
+                "interfaces": [
+                    {"name": "cx7a", "up": False, "rdma": True, "ipv4": ["169.254.10.2"]},
+                    {"name": "cx7b", "up": True, "rdma": True, "ipv4": ["169.254.10.3"]},
+                ],
+            })
+            try:
+                endpoint = await registry.resolve_direct_transfer_source("remote-1")
+            finally:
+                await registry.http.aclose()
+
+        self.assertEqual(endpoint, "http://169.254.10.3:7878")
+
+    async def test_fabric_stream_rejects_reported_rdma_interface_without_ipv4(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878",
+                "agent_token": "agent-secret",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": False,
+                "interfaces": [{"name": "cx7", "up": True, "rdma": True, "ipv4": []}],
+            })
+            try:
+                with self.assertRaisesRegex(RuntimeError, "RDMA interfaces but none has a usable UP IPv4 endpoint"):
+                    await registry.resolve_direct_transfer_source("remote-1")
+            finally:
+                await registry.http.aclose()
+
+    async def test_fabric_stream_rejects_ready_fabric_without_rdma_ipv4_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = NodeRegistry(Path(directory), httpx.AsyncClient(), "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878",
+                "agent_token": "agent-secret",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": True,
+                "interfaces": [{
+                    "name": "wifi", "up": True, "rdma": False, "ipv4": ["10.0.0.5"],
+                }],
+            })
+            try:
+                with self.assertRaisesRegex(RuntimeError, "no usable UP RDMA IPv4 endpoint"):
+                    await registry.resolve_direct_transfer_source("remote-1")
+            finally:
+                await registry.http.aclose()
+
+    async def test_fabric_stream_does_not_fallback_when_configured_endpoint_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient()
+            registry = NodeRegistry(Path(directory), client, "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878",
+                "agent_token": "agent-secret", "fabric_ip": "not-an-ip",
+            }]
+            registry._connection_targets = mock.AsyncMock()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "no valid HTTP fabric endpoint"):
+                    await registry.open_stream(
+                        "remote-1", "GET", "/api/agent/virtual-nas/models/org%2Fmodel/export",
+                        use_fabric=True,
+                    )
+            finally:
+                await client.aclose()
+
+        registry._connection_targets.assert_not_awaited()
+
+    async def test_fabric_stream_uses_management_endpoint_only_without_fabric_configuration(self) -> None:
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=b"archive", request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            registry = NodeRegistry(Path(directory), client, "controller")
+            registry.nodes = [{
+                "id": "remote-1", "name": "Spark 2", "enabled": True,
+                "agent_url": "http://100.100.20.30:7878/sparkdeck",
+                "agent_token": "agent-secret",
+            }]
+            registry.probe = mock.AsyncMock(return_value={
+                "fabric_ready": False,
+                "interfaces": [{
+                    "name": "wifi", "up": True, "rdma": False, "ipv4": ["10.0.0.5"],
+                }],
+            })
+            try:
+                response = await registry.open_stream(
+                    "remote-1", "GET", "/api/agent/virtual-nas/models/org%2Fmodel/export",
+                    use_fabric=True,
+                )
+                await response.aclose()
+            finally:
+                await client.aclose()
+
+        self.assertEqual(
+            str(requests[0].url),
+            "http://100.100.20.30:7878/sparkdeck/api/agent/virtual-nas/models/org%2Fmodel/export",
+        )
 
     async def test_authenticated_request_preserves_agent_response_status(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3734,6 +3937,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._stop_mem_bw_monitor = mock.Mock()
             instance.http = mock.Mock()
             instance.http.aclose = mock.AsyncMock()
+            instance.fabric_http = mock.Mock()
+            instance.fabric_http.aclose = mock.AsyncMock()
 
             await instance.start()
             resume_task = instance.deployment_resume_task
@@ -3753,6 +3958,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 instance.deployments[0]["sparkdeck_record_id"], "public-1",
             )
             self.assertEqual(probes, 2)
+            instance.fabric_http.aclose.assert_awaited_once_with()
             instance.http.aclose.assert_awaited_once_with()
 
     async def test_resume_retries_transient_failed_replacement(self) -> None:

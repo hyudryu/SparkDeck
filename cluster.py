@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 
@@ -23,6 +23,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_json_wri
 LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 1
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
+AGENT_FABRIC_PORT = 7878
 
 
 class NodeAgentResponseError(RuntimeError):
@@ -188,9 +189,13 @@ class NodeRegistry:
         self, data_dir: Path, http: httpx.AsyncClient,
         controller_id: str = "",
         connection_resolver: Callable[[Any], Awaitable[Any]] | None = None,
+        fabric_http: httpx.AsyncClient | None = None,
     ):
         self.path = Path(data_dir) / "nodes.json"
         self.http = http
+        # Manager provides a dedicated client with trust_env=False.  Falling
+        # back to ``http`` keeps lightweight test callers source-compatible.
+        self.fabric_http = fabric_http or http
         self.controller_id = str(controller_id or "")
         self.connection_resolver = connection_resolver
         self.nodes = self._load()
@@ -369,16 +374,73 @@ class NodeRegistry:
             return None
         try:
             fabric_ip = str(ipaddress.ip_address(str(node.get("fabric_ip") or "")))
-            parsed = urlparse(str(node["agent_url"]))
+            urlparse(str(node["agent_url"]))
         except (KeyError, TypeError, ValueError):
             return None
-        if parsed.scheme != "http":
-            return None
-        port = parsed.port or 80
         host = f"[{fabric_ip}]" if ":" in fabric_ip else fabric_ip
-        return urlunparse((
-            "http", f"{host}:{port}", parsed.path.rstrip("/"), "", "", "",
-        ))
+        return f"http://{host}:{AGENT_FABRIC_PORT}"
+
+    async def resolve_direct_transfer_source(self, node_id: str) -> str | None:
+        """Resolve a data-plane endpoint without ever selecting Wi-Fi.
+
+        An explicitly paired fabric IP remains authoritative.  When it has not
+        been recorded, obtain the agent's cached/live status and select only a
+        literal IPv4 address from an UP RDMA interface.  A node that reports a
+        fabric but cannot expose a usable endpoint must fail loudly; a node
+        without any RDMA fabric remains compatible with management routing.
+        """
+        node = self.get(node_id)
+        if not node or node_id == LOCAL_NODE_ID or not node.get("enabled", True):
+            return None
+        if node.get("fabric_ip"):
+            endpoint = self.direct_transfer_source(node_id)
+            if endpoint is None:
+                raise RuntimeError(
+                    f"{node.get('name', node_id)} has no valid HTTP fabric endpoint"
+                )
+            return endpoint
+
+        status = await self.probe(node)
+        configured_interface = str(node.get("fabric_interface") or "").strip()
+        rdma_interfaces = [
+            interface for interface in (status.get("interfaces") or [])
+            if isinstance(interface, dict) and interface.get("rdma")
+        ]
+        candidates = [
+            interface for interface in rdma_interfaces
+            if not configured_interface or interface.get("name") == configured_interface
+        ]
+        if configured_interface and not candidates:
+            raise RuntimeError(
+                f"{node.get('name', node_id)} has no reported RDMA interface named {configured_interface}"
+            )
+        if candidates:
+            for interface in candidates:
+                if not interface.get("up"):
+                    if configured_interface:
+                        raise RuntimeError(
+                            f"{node.get('name', node_id)} RDMA interface {interface.get('name')} is down"
+                        )
+                    continue
+                for value in interface.get("ipv4") or []:
+                    try:
+                        address = ipaddress.ip_address(str(value))
+                    except ValueError:
+                        continue
+                    if address.version == 4:
+                        return f"http://{address}:{AGENT_FABRIC_PORT}"
+                if configured_interface:
+                    raise RuntimeError(
+                        f"{node.get('name', node_id)} RDMA interface {interface.get('name')} has no usable IPv4 address"
+                    )
+            raise RuntimeError(
+                f"{node.get('name', node_id)} reports RDMA interfaces but none has a usable UP IPv4 endpoint"
+            )
+        if status.get("fabric_ready") is True:
+            raise RuntimeError(
+                f"{node.get('name', node_id)} reports a fabric but no usable UP RDMA IPv4 endpoint"
+            )
+        return None
 
     async def request(
         self,
@@ -448,8 +510,15 @@ class NodeRegistry:
         content: AsyncIterator[bytes] | None = None,
         headers: dict[str, str] | None = None,
         timeout: float = 600,
+        use_fabric: bool = False,
     ) -> httpx.Response:
-        """Open an authenticated agent stream; the caller must close it."""
+        """Open an authenticated agent stream; the caller must close it.
+
+        ``use_fabric`` is reserved for high-volume data-plane streams.  Once a
+        node has a fabric endpoint configured, do not fall back to its
+        management URL: doing so would silently put the archive back on the
+        controller's Tailscale/Wi-Fi path.
+        """
         node = self.get(node_id)
         if not node or node_id == LOCAL_NODE_ID:
             raise ValueError("remote node not found")
@@ -458,23 +527,31 @@ class NodeRegistry:
         request_headers = dict(headers or {})
         request_headers["Authorization"] = f"Bearer {node['agent_token']}"
         request_headers[COORDINATOR_ID_HEADER] = self.controller_id
-        targets = await self._connection_targets(
-            node["agent_url"], path,
+        fabric_endpoint = (
+            await self.resolve_direct_transfer_source(node_id)
+            if use_fabric else None
         )
+        if use_fabric and fabric_endpoint is not None:
+            targets = [(f"{fabric_endpoint}{path}", {}, {})]
+        else:
+            targets = await self._connection_targets(
+                node["agent_url"], path,
+            )
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content
         elif json_body is not None:
             payload["json"] = json_body
         last_error: httpx.HTTPError | None = None
+        stream_client = self.fabric_http if use_fabric and fabric_endpoint is not None else self.http
         for target, pinned_headers, extensions in targets:
             candidate_headers = {**request_headers, **pinned_headers}
-            request = self.http.build_request(
+            request = stream_client.build_request(
                 method, target, headers=candidate_headers,
                 timeout=timeout, extensions=extensions, **payload,
             )
             try:
-                return await self.http.send(
+                return await stream_client.send(
                     request, stream=True, follow_redirects=False,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

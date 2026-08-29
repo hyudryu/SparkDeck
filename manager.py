@@ -678,10 +678,12 @@ class Manager:
         self._capacity_deep_scan_attempted: set[str] = set()
         self._capacity_redeploying_models: set[str] = set()
         self.http = httpx.AsyncClient(timeout=600)
+        self.fabric_http = httpx.AsyncClient(timeout=600, trust_env=False)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(
             self.data_dir, self.http, self.agent_credentials.node_id,
             connection_resolver=resolve_agent_connection,
+            fabric_http=self.fabric_http,
         )
         self.routeros = RouterOSService(self.data_dir)
         self.virtual_nas = VirtualNAS(
@@ -911,6 +913,9 @@ class Manager:
         self._active_temperature_run_id = None
         self.temperature_recording_task = None
         self._stop_mem_bw_monitor()
+        fabric_http = getattr(self, "fabric_http", None)
+        if fabric_http is not None:
+            await fabric_http.aclose()
         await self.http.aclose()
 
     # ---------- cluster agent / node discovery ----------

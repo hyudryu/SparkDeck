@@ -674,11 +674,14 @@ export function ModelsPage() {
 
   // Adopt the canonical repository id after a rename redirect — but only
   // from the response produced by the current query; retained data from an
-  // earlier repository must never canonicalize the field.
+  // earlier repository must never canonicalize the field. The previous id
+  // is synced so the model-change cleanup treats a verified rename of the
+  // same repository differently from a switch to a different repository.
   useEffect(() => {
     const canonicalId = createCatalogModel.data?.model?.id
     if (!canonicalId || !catalogModelQuery || canonicalId === catalogModelQuery) return
     if (catalogResponseQuery !== catalogModelQuery) return
+    previousModelIdRef.current = canonicalId
     setForm((current) => (
       current.model_id.trim() === catalogModelQuery ? { ...current, model_id: canonicalId } : current
     ))
@@ -2011,7 +2014,11 @@ export function ModelsPage() {
                   value={form.settings.artifact ?? ''}
                   onChange={(event) => {
                     if (event.target.value === MANUAL_ARTIFACT_OPTION) {
+                      // Entering local-path mode starts from an empty field:
+                      // a previously linked repository artifact must not
+                      // stay prefilled and silently keep being used.
                       setArtifactManualEntry(true)
+                      updateManualArtifact('')
                       return
                     }
                     updateCreateArtifact(event.target.value)

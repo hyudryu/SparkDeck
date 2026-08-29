@@ -2836,10 +2836,10 @@ class VirtualNAS:
                 )
                 await _raise_remote_status(target_response, "target")
                 await target_response.aread()
-            imported_storage = await self._node_storage(job["target_node_id"])
             job["phase"] = "verifying"
             job["phase_started_at"] = time.time()
-            self._save_progress(job)
+            self._save()
+            imported_storage = await self._node_storage(job["target_node_id"])
             imported_model = next((
                 item for item in imported_storage["models"]
                 if item.get("model_id") == job["model_id"]
@@ -2866,6 +2866,8 @@ class VirtualNAS:
                 job["status"] = "queued"
                 job["started_at"] = None
                 job["error"] = None
+                job.pop("phase", None)
+                job.pop("phase_started_at", None)
             raise
         except Exception as exc:
             job["status"] = "failed"

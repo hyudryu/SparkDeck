@@ -693,6 +693,11 @@ class Manager:
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
             self._resolved_hf_token,
         )
+        # Storage inventory combines remote cache scans with best-effort Hub
+        # metadata. Coalesce concurrent page refreshes and retain it briefly;
+        # transfer job progress remains live and is merged separately.
+        self._virtual_nas_nodes_cache: tuple[float, list[dict]] | None = None
+        self._virtual_nas_nodes_task: asyncio.Task | None = None
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
@@ -1761,7 +1766,7 @@ class Manager:
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
-        nodes = await self.model_cache_inventory(enrich_expected_sizes=True)
+        nodes = await self._virtual_nas_nodes()
         models_by_node = {
             str(node.get("id")): {
                 str(model.get("model_id")): model
@@ -1796,6 +1801,24 @@ class Manager:
             "jobs": jobs,
             "instructions": instructions,
         }
+
+    async def _virtual_nas_nodes(self) -> list[dict]:
+        cached = getattr(self, "_virtual_nas_nodes_cache", None)
+        if cached and time.monotonic() - cached[0] < 10.0:
+            return cached[1]
+        task = getattr(self, "_virtual_nas_nodes_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.model_cache_inventory(enrich_expected_sizes=True)
+            )
+            self._virtual_nas_nodes_task = task
+        try:
+            nodes = await asyncio.shield(task)
+        finally:
+            if task.done() and self._virtual_nas_nodes_task is task:
+                self._virtual_nas_nodes_task = None
+        self._virtual_nas_nodes_cache = (time.monotonic(), nodes)
+        return nodes
 
     @staticmethod
     def _byte_count(value: Any) -> int | None:

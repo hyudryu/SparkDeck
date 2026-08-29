@@ -59,7 +59,9 @@ function finalizationLabel(job: StorageTransferJob) {
 
 function isFinalizing(job: StorageTransferJob) {
   if (job.status.toLowerCase() !== 'running' || job.kind === 'download') return false
-  if (['syncing', 'extracting', 'validating', 'registering', 'verifying', 'finalizing'].includes(job.phase ?? '')) return true
+  if (job.phase) return ['syncing', 'extracting', 'validating', 'registering', 'verifying', 'finalizing'].includes(job.phase)
+  // Older agents do not report a phase. Only their full byte count can tell
+  // us that the receiver has moved beyond the copy stage.
   return job.bytes_total > 0 && job.bytes_transferred >= job.bytes_total
 }
 
@@ -199,10 +201,12 @@ export function StoragePage() {
 
   const hasActiveJobs = Boolean(resource.data?.enabled && visibleTransferJobs.some(isActive))
   useEffect(() => {
-    if (!hasActiveJobs) return
-    const timer = window.setInterval(resource.reload, 3000)
+    if (!hasActiveJobs || resource.loading) return
+    // Do not abort and restart an expensive cluster inventory every three
+    // seconds. Wait for the last response to settle before scheduling another.
+    const timer = window.setTimeout(resource.reload, 3000)
     return () => window.clearInterval(timer)
-  }, [hasActiveJobs, resource.reload])
+  }, [hasActiveJobs, resource.loading, resource.reload])
 
   const enable = async (enabled: boolean) => {
     setBusy('settings')

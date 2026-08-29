@@ -1593,6 +1593,7 @@ class Manager:
         instructions = [
             "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
             "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
+            "Complete externally managed ComfyUI bundles are inventoried read-only and cannot be transferred or deleted here.",
         ]
         if not self.virtual_nas_enabled():
             return {

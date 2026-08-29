@@ -402,6 +402,22 @@ class SparkDeckStore:
                 (json.dumps(settings), container_name, base_url, deployment_id),
             )
 
+    def update_saved_deployment_settings(
+        self, deployment_id: str, settings: dict[str, Any],
+        alias: str | None = None,
+    ) -> None:
+        """Persist a bookmark's settings and optional rename atomically."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET settings_json = ? WHERE id = ?",
+                (json.dumps(settings), deployment_id),
+            )
+            if alias is not None:
+                self._connection.execute(
+                    "UPDATE deployments SET alias = ? WHERE id = ?",
+                    (alias, deployment_id),
+                )
+
     def delete_deployment(self, deployment_id: str) -> None:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM deployments WHERE id = ?", (deployment_id,))

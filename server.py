@@ -2003,6 +2003,10 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         "extra_args", "launch_controls",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_mem_fraction",
+        # Saved-deployment bookmarks (never launched) accept the creator-form
+        # contract; which keys apply is decided per record in the service.
+        "alias", "context_length", "tensor_parallel_size", "parallel_slots",
+        "gpu_layers", "quantization", "artifact", "node_ids", "deployment_mode",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:

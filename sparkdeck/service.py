@@ -1103,16 +1103,9 @@ class SparkDeckService:
                     "extra_args": extra_args,
                 })
                 if launch_settings is not None
-                else {
-                    **self.manager._deployment_launch_controls({
-                        "engine": str(public.get("runtime") or "vllm"),
-                        "extra_args": extra_args,
-                    }),
-                    # Structured controls saved through this editor are the
-                    # authoritative round-trip source; the argv parse only
-                    # fills controls the bookmark has never stored.
-                    **(saved_settings.get("launch_controls") or {}),
-                } if saved_only else {}
+                else self._saved_bookmark_launch_controls(
+                    str(public.get("runtime") or "vllm"), extra_args, saved_settings,
+                ) if saved_only else {}
             )
 
         raw_status = str(
@@ -1175,6 +1168,15 @@ class SparkDeckService:
         gpu_memory_utilization = (launch_settings or {}).get("gpu_memory_utilization")
         sg_tp_size = (launch_settings or {}).get("sg_tp_size")
         sg_mem_fraction = (launch_settings or {}).get("sg_mem_fraction")
+        gpu_memory_gb = (launch_settings or {}).get("gpu_memory_gb")
+        if saved_only:
+            # Before the first launch the bookmark's own scalars are the only
+            # source, so an unchanged editor save cannot erase them with null.
+            sg_tp_size = saved_settings.get("tensor_parallel_size", sg_tp_size)
+            sg_mem_fraction = saved_settings.get(
+                "mem_fraction_static", sg_mem_fraction,
+            )
+            gpu_memory_gb = saved_settings.get("gpu_memory_gb", gpu_memory_gb)
         image = (launch_settings or {}).get("image")
         if discovered_settings is not None:
             engine = str(public.get("runtime") or "vllm")
@@ -1195,7 +1197,7 @@ class SparkDeckService:
             "extra_args": extra_args,
             "launch_controls": launch_controls,
             "gpu_memory_utilization": gpu_memory_utilization,
-            "gpu_memory_gb": (launch_settings or {}).get("gpu_memory_gb"),
+            "gpu_memory_gb": gpu_memory_gb,
             "sg_tp_size": sg_tp_size,
             "sg_mem_fraction": sg_mem_fraction,
             "image": image,
@@ -1216,6 +1218,17 @@ class SparkDeckService:
             "manager_deployment_id"
         )
         if not manager_id:
+            saved_only = bool(
+                stored.get("kind") == DeploymentKind.MANAGED.value
+                and not stored.get("container_name")
+            )
+            if not saved_only:
+                # Launched standalone deployments and external endpoints have
+                # a live runtime or endpoint contract; their creator-form
+                # identity fields must not change behind it.
+                raise ValueError(
+                    "deployment does not have editable saved launch settings"
+                )
             return await self._update_saved_deployment(stored, changes)
 
         allowed = {
@@ -1278,23 +1291,83 @@ class SparkDeckService:
                 raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
-        numeric_fields = (
+        integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
-            "gpu_layers", "gpu_memory_utilization", "gpu_memory_gb",
         )
-        for field in numeric_fields:
+        for field in integer_fields:
             if field not in changes:
                 continue
             value = changes.get(field)
-            if value is None or (
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-            ):
-                settings[field] = value
+            if value is None:
+                settings[field] = None
                 continue
-            try:
-                settings[field] = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field} must be a number") from exc
+            settings[field] = self._validated_positive_int_setting(
+                field, value, minimum=256 if field == "context_length" else 1,
+            )
+        if "gpu_layers" in changes:
+            value = changes.get("gpu_layers")
+            if value is None:
+                settings["gpu_layers"] = None
+            else:
+                number = self._validated_number("gpu_layers", value)
+                if number != int(number):
+                    raise ValueError("gpu_layers must be a whole number")
+                if number < 0:
+                    raise ValueError(
+                        "gpu_layers must be zero or a positive integer"
+                    )
+                settings["gpu_layers"] = int(number)
+        if "gpu_memory_gb" in changes:
+            value = changes.get("gpu_memory_gb")
+            if value is None:
+                settings["gpu_memory_gb"] = None
+            else:
+                # Fractional reservations are valid: DeploymentPage edits this
+                # field in tenths and Manager consumes it as a float.
+                number = self._validated_number("gpu_memory_gb", value)
+                if number <= 0:
+                    raise ValueError("gpu_memory_gb must be positive")
+                settings["gpu_memory_gb"] = number
+        # Stored values created through the raw API can be numeric strings or
+        # other shapes; normalize them through the same validator so the
+        # minimum comparisons below never raise a TypeError-shaped 500.
+        for field, minimum in (
+            ("context_length", 256),
+            ("tensor_parallel_size", 1),
+            ("parallel_slots", 1),
+        ):
+            stored_value = settings.get(field)
+            if stored_value is None:
+                continue
+            if self._validated_number(field, stored_value) < minimum:
+                raise ValueError(f"{field} must be at least {minimum}")
+        gpu_layers = settings.get("gpu_layers")
+        if gpu_layers is not None:
+            normalized_layers = self._validated_number("gpu_layers", gpu_layers)
+            if normalized_layers != int(normalized_layers):
+                raise ValueError("gpu_layers must be a whole number")
+            if normalized_layers < 0:
+                raise ValueError(
+                    "gpu_layers must be zero or a positive integer"
+                )
+        gpu_memory_gb = settings.get("gpu_memory_gb")
+        if gpu_memory_gb is not None and self._validated_number(
+            "gpu_memory_gb", gpu_memory_gb,
+        ) <= 0:
+            raise ValueError("gpu_memory_gb must be positive")
+        if "gpu_memory_utilization" in changes:
+            value = changes.get("gpu_memory_utilization")
+            if value is None:
+                settings["gpu_memory_utilization"] = None
+            elif (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0 < float(value) <= 1
+            ):
+                settings["gpu_memory_utilization"] = float(value)
+            else:
+                raise ValueError(
+                    "gpu_memory_utilization must be between 0 and 1"
+                )
         if "quantization" in changes:
             settings["quantization"] = canonical_quantization(
                 changes.get("quantization")
@@ -1302,7 +1375,12 @@ class SparkDeckService:
         if "artifact" in changes:
             artifact = _optional_string(changes.get("artifact"))
             if artifact and runtime_is_llama:
-                artifact_path = Path(artifact).expanduser()
+                try:
+                    artifact_path = Path(artifact).expanduser()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        "llama.cpp managed deployments require an existing local GGUF artifact"
+                    ) from exc
                 if artifact_path.is_absolute():
                     # Controller-local artifacts keep the same rule as
                     # creation: the file must already exist on the controller.
@@ -1327,6 +1405,10 @@ class SparkDeckService:
                     settings["context_length"] = int(context_window)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("context_window must be an integer") from exc
+            elif "context_window" in controls:
+                # An explicit clear must also drop the saved scalar, or the
+                # launch keeps the stale context length the editor removed.
+                settings["context_length"] = None
             max_concurrency = controls.get("max_concurrency")
             if max_concurrency not in (None, ""):
                 target = "parallel_slots" if runtime_is_llama else "max_running_requests"
@@ -1334,6 +1416,8 @@ class SparkDeckService:
                     settings[target] = int(max_concurrency)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("max_concurrency must be an integer") from exc
+            elif "max_concurrency" in controls:
+                settings["parallel_slots" if runtime_is_llama else "max_running_requests"] = None
             # Persist the complete structured contract: Manager's preflight
             # merges every control (KV dtype, thinking, speculative tokens,
             # cudagraph size, batched tokens) into the launch argv for vLLM
@@ -1409,14 +1493,17 @@ class SparkDeckService:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
             raise ValueError("sharded deployment requires at least two nodes")
-        self.store.update_managed_routing(
-            stored["id"],
-            self._local_configuration(settings),
-            stored.get("container_name"),
-            stored.get("_base_url"),
-        )
         if alias != stored.get("alias"):
-            self.store.update_alias(stored["id"], alias)
+            self.store.update_saved_deployment_settings(
+                stored["id"], self._local_configuration(settings), alias,
+            )
+        else:
+            self.store.update_managed_routing(
+                stored["id"],
+                self._local_configuration(settings),
+                stored.get("container_name"),
+                stored.get("_base_url"),
+            )
         model = dict(stored.get("model") or {})
         if "quantization" in changes:
             model["quantization"] = settings.get("quantization")
@@ -1571,6 +1658,60 @@ class SparkDeckService:
         # are normally symlinks into blobs/, whose content-addressed targets
         # have no .gguf suffix and do not retain multi-shard names.
         return str(candidate)
+
+    @staticmethod
+    def _validated_number(field: str, value: Any) -> float:
+        """Coerce editor/API numeric input to a finite float or raise 400."""
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field} must be a finite number")
+        return number
+
+    def _validated_positive_int_setting(
+        self, field: str, value: Any, minimum: int = 1,
+    ) -> int:
+        number = self._validated_number(field, value)
+        if number != int(number):
+            raise ValueError(f"{field} must be a whole number")
+        integer = int(number)
+        if integer < minimum:
+            raise ValueError(f"{field} must be at least {minimum}")
+        return integer
+
+    def _saved_bookmark_launch_controls(
+        self, runtime: str, extra_args: list[str],
+        saved_settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Round-trip controls for a saved bookmark's editor.
+
+        Order matters: controls parsed from the saved argv are authoritative,
+        the structured controls saved through this editor come next, and the
+        bookmark's scalar settings only seed keys nothing else provides — an
+        unconditional seed would blank parsed values like --max-model-len and
+        strip them from the next launch.
+        """
+        controls = self.manager._deployment_launch_controls({
+            "engine": runtime,
+            "extra_args": extra_args,
+        })
+        controls.update(saved_settings.get("launch_controls") or {})
+        scalar_seeds = {
+            "context_window": saved_settings.get("context_length"),
+            "max_concurrency": (
+                saved_settings.get("parallel_slots")
+                if runtime == RuntimeKind.LLAMA_CPP.value
+                else saved_settings.get("max_running_requests")
+            ),
+        }
+        for key, value in scalar_seeds.items():
+            if controls.get(key) is None and value is not None:
+                controls[key] = value
+        return controls
 
     @staticmethod
     def _saved_layout_contract(settings: dict[str, Any]) -> dict[str, Any]:
@@ -1748,7 +1889,12 @@ class SparkDeckService:
                 # local merely because the same path exists under its home,
                 # while a genuine tilde reference is expanded and must name a
                 # real file to count as controller-local.
-                artifact_path = Path(artifact).expanduser()
+                try:
+                    artifact_path = Path(artifact).expanduser()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        "llama.cpp managed deployments require an existing local GGUF artifact"
+                    ) from exc
                 if artifact_path.is_absolute():
                     if not artifact_path.is_file():
                         raise ValueError(
@@ -4192,7 +4338,10 @@ def _artifact_is_controller_local(artifact: str | None) -> bool:
         return False
     try:
         return Path(artifact).expanduser().is_absolute()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
+        # An unresolvable "~user" home makes the reference unusable; callers
+        # treat this as "not controller-local" and repo-relative validation
+        # rejects it as a malformed artifact.
         return False
 
 

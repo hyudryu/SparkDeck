@@ -296,6 +296,7 @@ export function ModelsPage() {
   const [startError, setStartError] = useState<string>()
   const [startNotice, setStartNotice] = useState<string>()
   const [editingDeployment, setEditingDeployment] = useState<Deployment>()
+  const [launchSeed, setLaunchSeed] = useState<string>()
   // Per-node preparation plan for launching a saved deployment: which nodes
   // hold the weights, which can receive them, and which are blocked (for
   // example by free disk space on the model-cache volume).
@@ -762,7 +763,11 @@ export function ModelsPage() {
             message: `${message}\n\nCapacity was verified on each selected node's model-cache volume.`,
             confirmLabel: 'Transfer & launch',
           })) return
-          const result = await api.deployments.prepare(deployment.id, nodeIds)
+          const result = await api.deployments.prepare(
+            deployment.id,
+            nodeIds,
+            launchSeed && nodeIds.includes(launchSeed) ? launchSeed : undefined,
+          )
           if (result.jobs.length) {
             setStartNotice('Preparing model weights…')
             const failure = await waitForPreparationJobs(result.jobs.map((job) => job.id))
@@ -811,6 +816,7 @@ export function ModelsPage() {
     }
     setStartError(undefined)
     setStartNotice(undefined)
+    setLaunchSeed(undefined)
     setStartSelection({ deployment, nodeIds })
   }
 
@@ -1621,6 +1627,19 @@ export function ModelsPage() {
               legend={layoutLegend(deployment.deployment_mode, required)}
               help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />
+            {needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
+              <select
+                value={launchSeed && nodeIds.includes(launchSeed) ? launchSeed : ''}
+                onChange={(event) => setLaunchSeed(event.target.value || undefined)}
+              >
+                <option value="">Automatic</option>
+                {nodeIds.map((id) => {
+                  const node = nodes.data?.find((item) => item.id === id)
+                  return <option key={id} value={id}>{id === 'local' ? localLabel : node?.name ?? id}</option>
+                })}
+              </select>
+              <small>One selected node downloads the GGUF from Hugging Face and the rest receive copies over the cluster network. Pick a node to control where that download runs.</small>
+            </label>}
             {sharded && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}

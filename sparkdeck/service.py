@@ -63,6 +63,8 @@ _LOCAL_ROUTING_KEYS = {
     # The immutable revision weight preparation resolved, so the launch uses
     # exactly the prepared snapshot instead of re-resolving a mutable name.
     "prepared_revision",
+    # Preferred Hub seed node for distributing a saved GGUF artifact.
+    "download_node_id",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -1420,6 +1422,26 @@ class SparkDeckService:
         first_file = self._expand_gguf_shard_files(relative)[0]
         return f"{encoded}/snapshots/{resolved_revision}/{first_file}"
 
+    def _llama_cpp_artifact_homes(
+        self, requested_node_ids: list[str] | None, body: dict[str, Any],
+    ) -> tuple[list[str] | None, str | None]:
+        """Resolve GGUF home nodes and the optional Hub seed for a launch.
+
+        Every selected node becomes a home that will hold the artifact (this
+        PR generalizes llama.cpp beyond the controller, so a remote-only set
+        is valid). The seed is validated here so the controller-only fast
+        path cannot silently ignore a seed that names a node outside the
+        selection.
+        """
+        requested_seed = _optional_string(body.get("download_node_id"))
+        if requested_node_ids is None:
+            if requested_seed is not None and requested_seed != LOCAL_NODE_ID:
+                raise ValueError("download_node_id must be one of the selected nodes")
+            return None, requested_seed
+        if requested_seed is not None and requested_seed not in requested_node_ids:
+            raise ValueError("download_node_id must be one of the selected nodes")
+        return list(requested_node_ids), requested_seed
+
     async def _prepare_public_gguf_artifact(
         self, repository: str, artifact: str, revision: str,
         quantization: str | None,
@@ -1634,6 +1656,12 @@ class SparkDeckService:
             if self.store.deployment(alias):
                 raise ValueError(f"deployment alias '{alias}' is already in use")
             artifact_is_local = False
+            artifact_homes: list[str] | None = None
+            artifact_seed: str | None = None
+            if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED:
+                artifact_homes, artifact_seed = self._llama_cpp_artifact_homes(
+                    requested_node_ids, body,
+                )
             if (
                 runtime is RuntimeKind.LLAMA_CPP
                 and kind is DeploymentKind.MANAGED
@@ -1648,6 +1676,14 @@ class SparkDeckService:
                         raise ValueError(
                             "llama.cpp managed deployments require an existing local GGUF artifact"
                         )
+                    if artifact_homes and any(
+                        node_id != LOCAL_NODE_ID for node_id in artifact_homes
+                    ):
+                        raise ValueError(
+                            "local GGUF artifact files live outside the cluster cache "
+                            "and cannot be distributed; select the controller only or "
+                            "use a repo-relative Hub artifact"
+                        )
                     artifact_is_local = True
                     settings["model_source"] = "local"
                 else:
@@ -1659,9 +1695,12 @@ class SparkDeckService:
                             model, artifact,
                             _optional_string(body.get("revision")) or "main",
                             quantization,
-                            home_node_ids=requested_node_ids,
+                            home_node_ids=artifact_homes,
+                            download_node_id=artifact_seed,
                         )
                         settings["model_source"] = "public_repository"
+                if artifact_seed is not None:
+                    settings["download_node_id"] = artifact_seed
                 settings["artifact"] = artifact
                 if quantization:
                     settings["quantization"] = quantization
@@ -2794,48 +2833,22 @@ class SparkDeckService:
     async def _prepare_llama_files(
         self, deployment: dict[str, Any], model: str, revision: str,
         files: list[str], node_ids: list[str],
+        download_node_id: str | None = None,
     ) -> dict[str, Any]:
-        """Download only the selected GGUF files onto each selected node."""
-        virtual_nas = getattr(self.manager, "virtual_nas", None)
-        if virtual_nas is None:
-            raise RuntimeError("model preparation is unavailable")
+        """Place the selected GGUF files on every selected node.
+
+        One node seeds from Hugging Face (the saved or request-provided seed
+        preference when set) and the rest receive file-scoped Virtual NAS
+        streams, so duplicate Hub bandwidth is never paid for the same
+        artifact.
+        """
         resolved = await self._resolved_model_revision(model, revision)
-        token = getattr(self.manager, "_resolved_hf_token", lambda: "")()
-
-        async def run(node_id: str) -> None:
-            if node_id == "local":
-                await virtual_nas.download_model_files_checked(
-                    model, resolved, files,
-                    explicit_token=token, requested_revision=revision,
-                )
-                return
-            request = getattr(self.manager.node_registry, "request", None)
-            if request is None:
-                raise RuntimeError(f"node {node_id} cannot download model files")
-            await request(
-                node_id, "POST",
-                f"/api/agent/virtual-nas/models/{model}/download",
-                json_body={
-                    "revision": resolved,
-                    "requested_revision": revision,
-                    "hf_token": token,
-                    "files": files,
-                },
-                timeout=3600,
-            )
-
-        results = await asyncio.gather(
-            *(run(node_id) for node_id in node_ids), return_exceptions=True,
+        seed = download_node_id or _optional_string(
+            (deployment.get("settings") or {}).get("download_node_id")
         )
-        failures = [
-            f"{node_id}: {result}"
-            for node_id, result in zip(node_ids, results, strict=True)
-            if isinstance(result, BaseException)
-        ]
-        if failures:
-            raise RuntimeError(
-                "model preparation failed: " + "; ".join(failures)
-            )
+        await self._distribute_gguf_artifact(
+            model, resolved, files, node_ids, seed, revision,
+        )
         plan = await self._llama_preparation_plan(model, revision, files, node_ids)
         return {"workflow_id": None, "job_ids": [], "jobs": [], "plan": plan}
 
@@ -2874,13 +2887,14 @@ class SparkDeckService:
 
     async def deployment_prepare(
         self, deployment_id: str, node_ids: list[str],
+        download_node_id: str | None = None,
     ) -> dict[str, Any]:
         """Queue Virtual NAS weight preparation for a saved deployment."""
         deployment, model, revision = self._preparable_deployment_model(deployment_id)
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             result = await self._prepare_llama_files(
-                deployment, model, revision, files, node_ids,
+                deployment, model, revision, files, node_ids, download_node_id,
             )
         else:
             result = await self.manager.queue_recipe_model_preparation(

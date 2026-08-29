@@ -264,7 +264,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created["status"], "saved")
         self.assertEqual(created["node_ids"], ["local"])
 
-        with self.assertRaisesRegex(ValueError, "controller node"):
+        with self.assertRaisesRegex(ValueError, "cannot be distributed"):
             await self.service.create_deployment({
                 "model": "org/model", "alias": "remote-local",
                 "runtime": "llama.cpp",
@@ -372,9 +372,14 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": revision,
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas.enabled = True
         self.manager.virtual_nas = virtual_nas
         self.manager.node_registry = Mock()
         self.manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        self.manager.node_supports_selective_downloads = AsyncMock(return_value=True)
+        self.manager.node_has_model_files = AsyncMock(return_value=False)
+        self.manager.node_download_model_files = AsyncMock(return_value={"ok": True})
+        self.manager.node_transfer_model_files = AsyncMock(return_value={"ok": True})
         self.manager.model_cache_inventory = AsyncMock(return_value=[
             {"id": "local", "models": []},
             {"id": "remote-1", "models": []},
@@ -394,15 +399,15 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
 
         await self.service.deployment_prepare("llama-bookmark", ["local", "remote-1"])
 
-        virtual_nas.download_model_files_checked.assert_awaited_once_with(
-            "org/model", revision, ["FP16/model-F16.gguf"],
-            explicit_token="", requested_revision="main",
+        # One selected node seeds the artifact from Hugging Face and the rest
+        # receive file-scoped Virtual NAS streams.
+        self.manager.node_download_model_files.assert_awaited_once_with(
+            "local", "org/model", revision, ["FP16/model-F16.gguf"], "main",
         )
-        agent_call = self.manager.node_registry.request.await_args
-        self.assertEqual(agent_call.args[0], "remote-1")
-        self.assertEqual(agent_call.args[1], "POST")
-        self.assertEqual(agent_call.args[2], "/api/agent/virtual-nas/models/org/model/download")
-        self.assertEqual(agent_call.kwargs["json_body"]["files"], ["FP16/model-F16.gguf"])
+        self.manager.node_transfer_model_files.assert_awaited_once_with(
+            "local", "remote-1", "org/model", revision,
+            ["FP16/model-F16.gguf"], "main",
+        )
         stored = self.service.store.deployment("llama-bookmark", include_private=True)
         self.assertEqual(stored["settings"]["prepared_revision"], revision)
 

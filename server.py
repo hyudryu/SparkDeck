@@ -421,20 +421,47 @@ DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
 # Stats and admission stream every tick; the slower inventories (deployments,
 # community sync, nodes) only refresh every Nth tick and repeat in between.
 DASHBOARD_STREAM_SLOW_TICKS = 5
-# Bound each source read (a couple of ticks) so one hung await, e.g. a Docker
-# API call that never resolves, cannot stall the whole stream.
+# How long a tick waits for a source read before repeating the last value.
 DASHBOARD_SOURCE_TIMEOUT_SECONDS = 5.0
 
+_DASHBOARD_PENDING = object()
 
-async def _dashboard_source(source):
-    """Evaluate one dashboard source; a failure must not kill the stream."""
-    try:
-        result = source()
-        if not asyncio.iscoroutine(result):
-            return result
-        return await asyncio.wait_for(result, DASHBOARD_SOURCE_TIMEOUT_SECONDS)
-    except Exception:
-        return None
+
+class _DashboardStreamSource:
+    """One dashboard source with at most one in-flight read.
+
+    Cancelling a timed-out await would leave the underlying
+    asyncio.to_thread work running, so a still-running read is reused
+    instead: the stream repeats the last value (None until the first read
+    finishes) and never stacks another call on top of a stuck one.
+    """
+
+    def __init__(self, source):
+        self._source = source
+        self._task: asyncio.Task | None = None
+        self.last = None
+
+    async def _run(self):
+        # A failure must not kill the stream; it surfaces as None, which
+        # the client maps to that source's REST polling fallback.
+        try:
+            result = self._source()
+            return await result if asyncio.iscoroutine(result) else result
+        except Exception:
+            return None
+
+    async def collect(self):
+        """Refresh the value; _DASHBOARD_PENDING means the read continues."""
+        if self._task is None:
+            self._task = asyncio.ensure_future(self._run())
+        done, _ = await asyncio.wait(
+            {self._task}, timeout=DASHBOARD_SOURCE_TIMEOUT_SECONDS,
+        )
+        if not done:
+            return _DASHBOARD_PENDING
+        self.last = self._task.result()
+        self._task = None
+        return self.last
 
 
 async def _dashboard_nodes() -> list[dict]:
@@ -468,29 +495,36 @@ async def dashboard_stream(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    deployments = community_sync = nodes = None
+    stats = _DashboardStreamSource(manager.get_stats)
+    admission = _DashboardStreamSource(manager.inference_admission)
+    deployments = _DashboardStreamSource(sparkdeck.deployments)
+    community_sync = _DashboardStreamSource(_community_sync_status)
+    nodes = _DashboardStreamSource(_dashboard_nodes)
     tick = 0
     try:
         while True:
-            stats, admission = await asyncio.gather(
-                _dashboard_source(manager.get_stats),
-                _dashboard_source(manager.inference_admission),
-            )
+            # A node can join a controller while a socket is open; REST
+            # requests start forwarding then, so the local stream stops too.
+            if onboarding.assignment.load():
+                await websocket.close(code=1008)
+                return
+            await asyncio.gather(stats.collect(), admission.collect())
             if tick % DASHBOARD_STREAM_SLOW_TICKS == 0:
-                deployments, community_sync, nodes = await asyncio.gather(
-                    _dashboard_source(sparkdeck.deployments),
-                    _dashboard_source(_community_sync_status),
-                    _dashboard_source(_dashboard_nodes),
+                await asyncio.gather(
+                    deployments.collect(),
+                    community_sync.collect(),
+                    nodes.collect(),
                 )
             await websocket.send_json({
                 "type": "snapshot",
-                "stats": stats,
-                "admission": admission,
+                "stats": stats.last,
+                "admission": admission.last,
                 "deployments": (
-                    None if deployments is None else {"items": deployments}
+                    None if deployments.last is None
+                    else {"items": deployments.last}
                 ),
-                "community_sync": community_sync,
-                "nodes": None if nodes is None else {"items": nodes},
+                "community_sync": community_sync.last,
+                "nodes": None if nodes.last is None else {"items": nodes.last},
             })
             tick += 1
             await asyncio.sleep(DASHBOARD_STREAM_INTERVAL_SECONDS)

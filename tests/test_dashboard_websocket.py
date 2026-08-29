@@ -158,6 +158,49 @@ class DashboardWebSocketTests(unittest.TestCase):
         self.assertIsNone(snapshot["stats"])
         self.assertEqual(snapshot["admission"], ADMISSION)
 
+    def test_timed_out_source_is_not_relaunched(self):
+        calls = 0
+
+        async def hang_forever():
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(60)
+
+        client = TestClient(server.app)
+        with ExitStack() as stack:
+            _patch_sources(stack, stats_override=hang_forever)
+            stack.enter_context(patch.object(
+                server, "DASHBOARD_SOURCE_TIMEOUT_SECONDS", 0.1))
+            stack.enter_context(patch.object(
+                server, "DASHBOARD_STREAM_INTERVAL_SECONDS", 0.05))
+            with client.websocket_connect("/api/ws/dashboard") as websocket:
+                for _ in range(3):
+                    self.assertIsNone(websocket.receive_json()["stats"])
+
+        # The stuck read is reused across ticks, never stacked.
+        self.assertEqual(calls, 1)
+
+    def test_stream_closes_when_node_joins_mid_stream(self):
+        client = TestClient(server.app)
+        with ExitStack() as stack:
+            _patch_sources(stack)
+            # Handshake allows, the first tick allows, then the assignment
+            # appears and the stream must close so REST forwarding wins.
+            stack.enter_context(patch.object(
+                server.onboarding.assignment, "load",
+                Mock(side_effect=[
+                    None, None, {"controller_url": "http://controller:8080"},
+                ]),
+            ))
+            stack.enter_context(patch.object(
+                server, "DASHBOARD_STREAM_INTERVAL_SECONDS", 0.05))
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                with client.websocket_connect("/api/ws/dashboard") as websocket:
+                    self.assertEqual(
+                        websocket.receive_json()["type"], "snapshot")
+                    websocket.receive_json()
+        self.assertEqual(raised.exception.code, 1008)
+
     def test_csp_permits_same_host_websockets(self):
         client = TestClient(server.app)
         with patch.object(

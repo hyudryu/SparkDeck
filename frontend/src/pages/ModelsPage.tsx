@@ -1552,7 +1552,7 @@ export function ModelsPage() {
         description="Manage model servers across vLLM, SGLang, and Llama server from one place."
         actions={<Button variant="primary" onClick={openCreator}><Plus size={16} /> Create deployment</Button>}
       />
-      {resource.loading && <LoadingState label="Loading deployments" />}
+      {resource.loading && !resource.data && <LoadingState label="Loading deployments" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}

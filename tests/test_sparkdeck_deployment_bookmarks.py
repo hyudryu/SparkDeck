@@ -722,6 +722,18 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertEqual(stored["settings"]["gpu_memory_gb"], 24.5)
 
+    async def test_gpu_layers_fractional_value_is_rejected(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": "model.gguf"},
+        })
+
+        with self.assertRaisesRegex(ValueError, "whole number"):
+            await self.service.update_deployment_settings("bookmark", {
+                "gpu_layers": 1.5,
+            })
+
     async def test_alias_only_edit_survives_string_scalars_from_raw_api(self):
         # A raw-API create can persist numeric scalars as strings; a later
         # alias-only edit must still succeed (or cleanly reject), never 500.

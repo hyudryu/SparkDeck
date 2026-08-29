@@ -407,6 +407,49 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["ok"])
             hf_hub_download.assert_called_once()
 
+    async def test_selective_download_merges_prior_selected_files_into_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            resolved = "c" * 40
+            first = "model-Q4_K_M.gguf"
+            second = "model-Q8_K_XL.gguf"
+            snapshot = repository / "snapshots" / resolved
+
+            def download_file_into_cache(**kwargs):
+                filename = kwargs["filename"]
+                snapshot.mkdir(parents=True, exist_ok=True)
+                (snapshot / filename).write_bytes(b"weights")
+                return str(snapshot / filename)
+
+            api = Mock()
+            api.model_info.return_value = Mock(
+                sha=resolved,
+                siblings=[
+                    Mock(rfilename=first, size=7),
+                    Mock(rfilename=second, size=7),
+                    Mock(rfilename="README.md", size=1),
+                ],
+            )
+            huggingface_hub = Mock(
+                HfApi=Mock(return_value=api),
+                hf_hub_download=Mock(side_effect=download_file_into_cache),
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            nas.free_bytes = Mock(return_value=10 * 1024 * 1024 * 1024)
+
+            with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                await nas.download_model_files_checked("org/model", resolved, [first])
+                await nas.download_model_files_checked("org/model", resolved, [second])
+
+            marker = json.loads((snapshot / ".sparkdeck-selective.incomplete").read_text())
+            self.assertEqual(marker, {"files": [first, second]})
+            self.assertEqual(nas.inventory()[0]["selective_files_by_revision"], {
+                resolved: [first, second],
+            })
+
     async def test_selective_download_does_not_credit_unrelated_resumable_blob(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

@@ -1033,6 +1033,27 @@ class Manager:
             })
         return environment
 
+    def agent_health(self) -> dict:
+        """Return agent liveness without touching telemetry, Docker, or storage.
+
+        This endpoint backs controller liveness probes, so it must remain safe
+        to answer while the node is unpacking a large model archive.
+        """
+        return {
+            "node_id": self.agent_credentials.node_id,
+            "name": self.settings.get("cluster_node_name") or socket.gethostname(),
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+            "capabilities": [
+                CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+                VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+                VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
+            ],
+            "app_revision": getattr(self, "app_revision", None),
+            "online": True,
+        }
+
     async def agent_status(self, stats: dict | None = None) -> dict:
         if stats is None:
             stats = await self.get_stats()
@@ -1084,17 +1105,8 @@ class Manager:
             for i in interfaces
         )
         return {
-            "node_id": self.agent_credentials.node_id,
-            "name": self.settings.get("cluster_node_name") or socket.gethostname(),
+            **self.agent_health(),
             "hostname": socket.gethostname(),
-            "protocol_version": AGENT_PROTOCOL_VERSION,
-            "capabilities": [
-                CAPABILITY,
-                VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
-                VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
-                VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
-                VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
-            ],
             "update_protocol": 1,
             "app_revision": getattr(self, "app_revision", None),
             "status": "online" if docker_ready else "degraded",

@@ -1,19 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, Gauge, Play, Square, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
-import type { BenchyRunSummary } from '../api/types'
+import type { BenchmarkRunnerRunSummary } from '../api/types'
 import {
   Button,
   EmptyState,
   ErrorState,
   LoadingState,
-  PageHeader,
   Panel,
   Status,
   formatRate,
-} from '../components/ui'
+} from './ui'
 import { useResource } from '../hooks/useResource'
-import { BenchyChart } from '../components/BenchyChart'
+import { BenchmarkRunChart } from './BenchmarkRunChart'
 
 function parseNumberList(text: string): { values: number[]; invalid: string[] } {
   const values: number[] = []
@@ -38,7 +37,7 @@ function formatSeconds(value?: number | null) {
   return `${Math.floor(value / 60)} min ${Math.round(value % 60)} s`
 }
 
-function configSummary(run: BenchyRunSummary) {
+function configSummary(run: BenchmarkRunnerRunSummary) {
   const config = run.config
   const concurrency = config.concurrency_levels.map((level) => `C${level}`).join(' ')
   const prompt = config.prompt_sizes.map((size) => size.toLocaleString()).join(', ')
@@ -54,11 +53,11 @@ const RUN_STATUS_LABEL: Record<string, string> = {
   cancelled: 'Cancelled',
 }
 
-export function BenchyPage() {
-  const status = useResource((signal) => api.benchy.status(signal))
+export function BenchmarkRunner() {
+  const status = useResource((signal) => api.benchmarkRunner.status(signal))
   const installed = status.data?.installed ?? false
-  const models = useResource((signal) => api.benchy.models(signal), [installed], installed)
-  const runs = useResource((signal) => api.benchy.list(signal))
+  const models = useResource((signal) => api.benchmarkRunner.models(signal), [installed], installed)
+  const runs = useResource((signal) => api.benchmarkRunner.list(signal))
 
   const [modelId, setModelId] = useState('')
   const [concurrencyText, setConcurrencyText] = useState('1, 2')
@@ -74,12 +73,12 @@ export function BenchyPage() {
 
   const activeRunId = status.data?.active_run_id
   const activeRun = useResource(
-    (signal) => api.benchy.get(activeRunId ?? '', signal),
+    (signal) => api.benchmarkRunner.get(activeRunId ?? '', signal),
     [activeRunId],
     Boolean(activeRunId),
   )
   const detail = useResource(
-    (signal) => api.benchy.get(selectedRunId ?? '', signal),
+    (signal) => api.benchmarkRunner.get(selectedRunId ?? '', signal),
     [selectedRunId],
     Boolean(selectedRunId),
   )
@@ -114,7 +113,7 @@ export function BenchyPage() {
     setInstalling(true)
     setActionError(undefined)
     try {
-      status.setData(await api.benchy.install())
+      status.setData(await api.benchmarkRunner.install())
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'llama-benchy installation failed')
     } finally {
@@ -139,7 +138,7 @@ export function BenchyPage() {
     setActionError(undefined)
     setStarting(true)
     try {
-      await api.benchy.start({
+      await api.benchmarkRunner.start({
         model_id: modelId,
         prompt_sizes: promptSizes.values,
         response_sizes: responseSizes.values,
@@ -161,7 +160,7 @@ export function BenchyPage() {
   const cancel = async () => {
     if (!activeRunId) return
     try {
-      await api.benchy.cancel(activeRunId)
+      await api.benchmarkRunner.cancel(activeRunId)
       activeRun.reload()
       status.reload()
     } catch (reason) {
@@ -170,7 +169,7 @@ export function BenchyPage() {
   }
 
   const remove = async (id: string) => {
-    await api.benchy.remove(id)
+    await api.benchmarkRunner.remove(id)
     if (selectedRunId === id) setSelectedRunId(undefined)
     runs.reload()
     status.reload()
@@ -182,21 +181,15 @@ export function BenchyPage() {
 
   return (
     <div className="page">
-      <PageHeader
-        eyebrow="Performance measurement"
-        title="Benchy"
-        description="Run llama-benchy against the models SparkDeck is currently serving, keep the CSV results, and compare prompt processing and generation speed across concurrency levels."
-      />
-
-      <Panel className="benchy-tool-panel">
-        <div className="benchy-tool-row">
-          <span className="benchy-tool-icon"><Gauge size={19} aria-hidden="true" /></span>
-          <div className="benchy-tool-info">
+      <Panel className="runner-tool-panel">
+        <div className="runner-tool-row">
+          <span className="runner-tool-icon"><Gauge size={19} aria-hidden="true" /></span>
+          <div className="runner-tool-info">
             <h2>llama-benchy</h2>
             {status.loading && <p className="muted">Checking for llama-benchy…</p>}
             {status.data && (status.data.installed
               ? <p>Installed{status.data.version ? ` · v${status.data.version}` : ''}{status.data.launch_mode === 'python_module' ? ' · Python module' : ''}</p>
-              : <p>Not installed. llama-benchy drives benchmark requests against a running model endpoint and reports llama-bench style statistics. Install it to enable this page.</p>)}
+              : <p>Not installed. llama-benchy drives benchmark requests against a running model endpoint and reports llama-bench style statistics. Install it to enable the runner below.</p>)}
             {status.error && <p className="inline-error">{status.error}</p>}
           </div>
           {status.data && !status.data.installed && (
@@ -212,10 +205,10 @@ export function BenchyPage() {
         <div className="section-heading"><div><h2>New benchmark run</h2><p>Pick a served model, then sweep prompt sizes and concurrency levels. Each combination runs {runsPerTest || 3} measured passes after a warm-up.</p></div></div>
         <Panel>
           <div className="field-grid">
-            <label className="field" htmlFor="benchy-model">
+            <label className="field" htmlFor="runner-model">
               <span>Served model</span>
               <select
-                id="benchy-model"
+                id="runner-model"
                 value={modelId}
                 onChange={(event) => setModelId(event.target.value)}
                 disabled={models.loading || !models.data?.length || Boolean(activeRunId)}
@@ -231,10 +224,10 @@ export function BenchyPage() {
                 ? 'Benchmarks run against the model endpoint over HTTP.'
                 : 'Load a model on the Models page first — the list fills with currently served models.'}</small>
             </label>
-            <label className="field" htmlFor="benchy-concurrency">
+            <label className="field" htmlFor="runner-concurrency">
               <span>Concurrency levels</span>
               <input
-                id="benchy-concurrency"
+                id="runner-concurrency"
                 inputMode="numeric"
                 value={concurrencyText}
                 disabled={Boolean(activeRunId)}
@@ -242,10 +235,10 @@ export function BenchyPage() {
               />
               <small>Concurrent requests per test, e.g. “1, 2, 4”.</small>
             </label>
-            <label className="field" htmlFor="benchy-prompt">
+            <label className="field" htmlFor="runner-prompt">
               <span>Prompt sizes (context)</span>
               <input
-                id="benchy-prompt"
+                id="runner-prompt"
                 inputMode="numeric"
                 value={promptText}
                 disabled={Boolean(activeRunId)}
@@ -253,10 +246,10 @@ export function BenchyPage() {
               />
               <small>Prompt token counts to sweep, e.g. “512, 2048”.</small>
             </label>
-            <label className="field" htmlFor="benchy-response">
+            <label className="field" htmlFor="runner-response">
               <span>Output tokens</span>
               <input
-                id="benchy-response"
+                id="runner-response"
                 inputMode="numeric"
                 value={responseText}
                 disabled={Boolean(activeRunId)}
@@ -264,10 +257,10 @@ export function BenchyPage() {
               />
               <small>Generated tokens per test, e.g. “128”.</small>
             </label>
-            <label className="field" htmlFor="benchy-runs">
+            <label className="field" htmlFor="runner-runs">
               <span>Runs per test</span>
               <input
-                id="benchy-runs"
+                id="runner-runs"
                 type="number"
                 min={1}
                 max={10}
@@ -277,11 +270,11 @@ export function BenchyPage() {
               />
               <small>Measured passes per combination (1–10).</small>
             </label>
-            <label className="field benchy-checkbox-field" htmlFor="benchy-exact-tg">
+            <label className="field runner-checkbox-field" htmlFor="runner-exact-tg">
               <span>Force exact output length</span>
-              <span className="benchy-checkbox">
+              <span className="runner-checkbox">
                 <input
-                  id="benchy-exact-tg"
+                  id="runner-exact-tg"
                   type="checkbox"
                   checked={exactTg}
                   disabled={Boolean(activeRunId)}
@@ -292,7 +285,7 @@ export function BenchyPage() {
             </label>
           </div>
           {formError && <p className="inline-error" role="alert">{formError}</p>}
-          <div className="benchy-run-actions">
+          <div className="runner-run-actions">
             <Button variant="primary" disabled={starting || Boolean(activeRunId)} onClick={() => void start()}>
               <Play size={15} aria-hidden="true" /> {activeRunId ? 'Benchmark running…' : 'Start benchmark'}
             </Button>
@@ -300,13 +293,13 @@ export function BenchyPage() {
         </Panel>
 
         {activeRunId && (activeRun.loading || activeData) && (
-          <Panel className="benchy-active-panel" aria-live="polite">
-            <div className="benchy-active-head">
+          <Panel className="runner-active-panel" aria-live="polite">
+            <div className="runner-active-head">
               <Status status="running">{activeData ? 'Benchmark running' : 'Benchmark queued'}</Status>
               <Button variant="secondary" onClick={() => void cancel()}><Square size={14} aria-hidden="true" /> Cancel</Button>
             </div>
             {activeData && <>
-              <p className="benchy-active-shape">
+              <p className="runner-active-shape">
                 {activeData.progress?.current
                   ? <>Testing {activeData.progress.current.prompt_size?.toLocaleString()} → {activeData.progress.current.response_size} tok at C{activeData.progress.current.concurrency}</>
                   : 'Starting benchmark…'}
@@ -330,7 +323,7 @@ export function BenchyPage() {
         />
       )}
       {runs.data && runs.data.length > 0 && (
-        <Panel className="table-panel"><div className="responsive-table benchy-history-table" role="table" aria-label="Benchmark run history">
+        <Panel className="table-panel"><div className="responsive-table runner-history-table" role="table" aria-label="Benchmark run history">
           <div className="table-row table-header" role="row">
             <div role="columnheader">Run</div><div role="columnheader">Model</div>
             <div role="columnheader">Quantization</div><div role="columnheader">Configuration</div>
@@ -340,7 +333,7 @@ export function BenchyPage() {
           {runs.data.map((run) => (
             <div
               key={run.id}
-              className={`table-row benchy-run-row ${selectedRunId === run.id ? 'benchy-run-row-selected' : ''}`}
+              className={`table-row runner-run-row ${selectedRunId === run.id ? 'runner-run-row-selected' : ''}`}
               role="row"
               tabIndex={0}
               aria-pressed={selectedRunId === run.id}
@@ -363,12 +356,12 @@ export function BenchyPage() {
                   {RUN_STATUS_LABEL[run.status] ?? run.status}
                 </Status>
               </div>
-              <div role="cell" data-label="Actions" className="benchy-run-actions-cell">
+              <div role="cell" data-label="Actions" className="runner-run-actions-cell">
                 {run.status === 'completed' && (
                   <a
                     className="icon-button"
-                    href={api.benchy.csvUrl(run.id)}
-                    download={`benchy-${run.id}.csv`}
+                    href={api.benchmarkRunner.csvUrl(run.id)}
+                    download={`runner-${run.id}.csv`}
                     aria-label={`Download CSV for run ${run.id}`}
                     onClick={(event) => event.stopPropagation()}
                   ><Download size={15} /></a>
@@ -389,8 +382,8 @@ export function BenchyPage() {
       {selectedRunId && detail.loading && <LoadingState label="Loading run results" />}
       {selectedRunId && detail.error && <ErrorState message={detail.error} onRetry={detail.reload} />}
       {activeDetail && (
-        <section className="benchy-detail" aria-label={`Results for run ${activeDetail.id}`}>
-          <div className="benchy-detail-head">
+        <section className="runner-detail" aria-label={`Results for run ${activeDetail.id}`}>
+          <div className="runner-detail-head">
             <div>
               <h3>{activeDetail.model}</h3>
               <p className="muted">
@@ -402,7 +395,7 @@ export function BenchyPage() {
               </p>
             </div>
             {activeDetail.csv_filename && (
-              <a className="button button-secondary" href={api.benchy.csvUrl(activeDetail.id)} download={`benchy-${activeDetail.id}.csv`}>
+              <a className="button button-secondary" href={api.benchmarkRunner.csvUrl(activeDetail.id)} download={`runner-${activeDetail.id}.csv`}>
                 <Download size={15} aria-hidden="true" /> Download CSV
               </a>
             )}
@@ -411,26 +404,26 @@ export function BenchyPage() {
           {activeDetail.results.length === 0 && <p className="muted">This run produced no measurements.</p>}
           {activeDetail.results.length > 0 && <>
             <div className="benchmark-chart-stack">
-              <BenchyChart
+              <BenchmarkRunChart
                 title="Processing speed (generation)"
                 subtitle="Output tokens per second, all concurrent requests combined."
                 rows={activeDetail.results}
                 metric="tg_tokens_per_second"
               />
-              <BenchyChart
+              <BenchmarkRunChart
                 title="Prompt processing speed"
                 subtitle="Prompt tokens per second per concurrency level."
                 rows={activeDetail.results}
                 metric="pp_tokens_per_second"
               />
-              <BenchyChart
+              <BenchmarkRunChart
                 title="Tokens per output"
                 subtitle="Generation speed per request at each concurrency level."
                 rows={activeDetail.results}
                 metric="tg_tokens_per_second_request"
               />
             </div>
-            <Panel className="table-panel"><div className="responsive-table benchy-measure-table" role="table" aria-label="Run measurements">
+            <Panel className="table-panel"><div className="responsive-table runner-measure-table" role="table" aria-label="Run measurements">
               <div className="table-row table-header" role="row">
                 <div role="columnheader">Prompt</div><div role="columnheader">Output</div>
                 <div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>

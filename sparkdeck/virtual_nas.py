@@ -1733,23 +1733,35 @@ class VirtualNAS:
         if self.model_in_transfer(model_id, LOCAL_NODE_ID):
             raise RuntimeError("model is in use by a virtual NAS transfer")
         repository = self._model_path(model_id)
-        if not repository.exists():
-            return self._delete_external_model(model_id)
-        if repository.is_symlink() or not repository.is_dir():
-            raise ValueError("cached model repository is not a safe directory")
-        hub = self._hub()
-        if repository.resolve().parent != hub:
-            raise ValueError("model cache path escapes the Hugging Face hub")
-        shutil.rmtree(repository)
-        return {"ok": True, "model_id": model_id}
+        if repository.exists():
+            if repository.is_symlink() or not repository.is_dir():
+                raise ValueError("cached model repository is not a safe directory")
+            hub = self._hub()
+            if repository.resolve().parent != hub:
+                raise ValueError("model cache path escapes the Hugging Face hub")
+            if (
+                _is_complete_repository(repository)
+                or _external_comfyui_bundle_files(
+                    self._external_model_roots_provider(), model_id,
+                ) is None
+            ):
+                shutil.rmtree(repository)
+                return {"ok": True, "model_id": model_id}
+            # The hub copy is partial residue while inventory displays the
+            # complete external install: delete the externally managed files.
+        return self._delete_external_model(model_id)
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.
 
-        The bundle is re-resolved at delete time and every path is re-verified
-        before anything is removed: regular files only, never symlinks, and
-        always inside one of the currently configured, resolved ComfyUI model
-        roots. Directories and unrelated files are left untouched.
+        Every complete copy across the configured roots is re-resolved at
+        delete time and every path is re-verified before anything is
+        removed: regular files only, never symlinks, and always inside one
+        of the currently configured, resolved ComfyUI model roots. Files are
+        then staged by an in-directory rename and only unlinked once every
+        copy staged successfully, so a mid-delete failure rolls back instead
+        of leaving a half-deleted bundle. Directories and unrelated files
+        are left untouched.
         """
         raw_roots = self._external_model_roots_provider()
         roots = []
@@ -1760,16 +1772,32 @@ class VirtualNAS:
                 roots.append(raw_root.resolve(strict=True))
             except OSError:
                 continue
-        files = _external_comfyui_bundle_files(raw_roots, model_id)
-        if files is None:
+        copies = _external_comfyui_bundle_copies(raw_roots, model_id)
+        if not copies:
             raise LookupError("cached model not found")
-        for path in files.values():
+        paths = [path for files in copies for path in files.values()]
+        for path in paths:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("external model file is not a safe regular file")
             if not any(path.is_relative_to(root) for root in roots):
                 raise ValueError("external model file escapes the ComfyUI model roots")
-        for path in files.values():
-            path.unlink()
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for path in paths:
+                staged_path = path.with_name(f"{path.name}.sparkdeck-deleting")
+                os.replace(path, staged_path)
+                staged.append((staged_path, path))
+        except OSError as exc:
+            for staged_path, original in reversed(staged):
+                try:
+                    os.replace(staged_path, original)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                "could not stage external model files for deletion"
+            ) from exc
+        for staged_path, _ in staged:
+            staged_path.unlink()
         return {"ok": True, "model_id": model_id}
 
     async def queue_transfer(
@@ -1830,7 +1858,10 @@ class VirtualNAS:
             raise RuntimeError(
                 "model weights cannot be transferred from their current storage location"
             )
-        model_size = _nonnegative_int(source_model.get("size_bytes"))
+        model_size = _nonnegative_int(
+            source_model.get("transfer_size_bytes")
+            or source_model.get("size_bytes")
+        )
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")
         existing_targets: list[str] = []
@@ -2459,7 +2490,10 @@ class VirtualNAS:
                 raise RuntimeError(
                     "model weights cannot be transferred from their current storage location"
                 )
-            actual_size = _nonnegative_int(source_model.get("size_bytes"))
+            actual_size = _nonnegative_int(
+                source_model.get("transfer_size_bytes")
+                or source_model.get("size_bytes")
+            )
             if actual_size <= 0:
                 raise RuntimeError("source node did not report a usable cached model size")
             job["bytes_total"] = actual_size
@@ -2847,22 +2881,24 @@ def _resolve_comfyui_bundle_files(
     return files
 
 
-def _external_comfyui_bundle_files(
+def _external_comfyui_bundle_copies(
     roots: list[Path], model_id: str,
-) -> dict[str, Path] | None:
-    """Resolve a known ComfyUI bundle's installed files, freshly at call time.
+) -> list[dict[str, Path]]:
+    """Resolve every complete installation of a known ComfyUI bundle.
 
-    Returns relative POSIX name -> resolved absolute path from the first root
-    holding a complete, safe installation, or None when the model is not a
-    known bundle or no root has it fully installed. Never trust a stale
+    Returns one relative POSIX name -> resolved absolute path mapping per
+    root holding a complete, safe installation; empty when the model is not
+    a known bundle or no root has it fully installed. Never trust a stale
     inventory snapshot: callers re-resolve at operation time.
     """
     bundle = next(
         (entry for entry in _COMFYUI_MODEL_BUNDLES if entry[0] == model_id), None,
     )
     if bundle is None:
-        return None
+        return []
     _, required_files, alternative_groups, optional_files = bundle
+    copies: list[dict[str, Path]] = []
+    seen: set[str] = set()
     for raw_root in roots:
         try:
             if raw_root.is_symlink() or not raw_root.is_dir():
@@ -2870,12 +2906,38 @@ def _external_comfyui_bundle_files(
             root = raw_root.resolve(strict=True)
         except OSError:
             continue
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
         files = _resolve_comfyui_bundle_files(
             root, required_files, alternative_groups, optional_files,
         )
         if files is not None:
-            return files
-    return None
+            copies.append(files)
+    return copies
+
+
+def _external_comfyui_bundle_files(
+    roots: list[Path], model_id: str,
+) -> dict[str, Path] | None:
+    """Resolve the copy of a known bundle that inventory would report.
+
+    Inventory keeps the largest complete installation across roots, so
+    export and transfer read from the largest copy too; otherwise the
+    streamed bytes could differ from the reported inventory entry.
+    """
+    best: dict[str, Path] | None = None
+    best_size = 0
+    for files in _external_comfyui_bundle_copies(roots, model_id):
+        try:
+            size = sum(path.stat().st_size for path in files.values())
+        except OSError:
+            continue
+        if best is None or size > best_size:
+            best = files
+            best_size = size
+    return best
 
 
 def _write_external_bundle_archive(
@@ -2886,7 +2948,9 @@ def _write_external_bundle_archive(
     The layout matches a regular whole-model export so targets import a
     normal SparkDeck-managed copy: bundle files land under
     ``snapshots/<pseudo-revision>/`` alongside a marker that relaxes the
-    config/tokenizer completeness requirement for bare weight bundles.
+    config/tokenizer completeness requirement for bare weight bundles, and
+    ``refs/main`` points at the pseudo-revision so consumers resolving the
+    default revision find the snapshot.
     """
     root = _cache_name(model_id)
     snapshot = f"{root}/snapshots/{_EXTERNAL_PSEUDO_REVISION}"
@@ -2896,6 +2960,11 @@ def _write_external_bundle_archive(
         info.type = tarfile.DIRTYPE
         info.mode = 0o755
         archive.addfile(info)
+
+    def add_file(name: str, content: bytes) -> None:
+        info = tarfile.TarInfo(name)
+        info.size = len(content)
+        archive.addfile(info, io.BytesIO(content))
 
     add_directory(root)
     add_directory(f"{root}/snapshots")
@@ -2910,9 +2979,9 @@ def _write_external_bundle_archive(
                 add_directory(f"{snapshot}/{directory}")
     for relative, resolved in files.items():
         archive.add(resolved, arcname=f"{snapshot}/{relative}", recursive=False)
-    marker = tarfile.TarInfo(f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}")
-    marker.size = len(_EXTERNAL_MARKER_CONTENT)
-    archive.addfile(marker, io.BytesIO(_EXTERNAL_MARKER_CONTENT))
+    add_file(f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}", _EXTERNAL_MARKER_CONTENT)
+    add_directory(f"{root}/refs")
+    add_file(f"{root}/refs/main", _EXTERNAL_PSEUDO_REVISION.encode("utf-8"))
 
 
 def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
@@ -2941,6 +3010,9 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             candidate = {
                 "model_id": model_id,
                 "size_bytes": size_bytes,
+                # The transferable payload is the external bundle alone, even
+                # when inventory merges in partial Hugging Face cache residue.
+                "transfer_size_bytes": size_bytes,
                 "file_count": len(files),
                 "partial": False,
                 "has_partial_download": False,

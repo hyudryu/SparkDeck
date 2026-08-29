@@ -1103,28 +1103,9 @@ class SparkDeckService:
                     "extra_args": extra_args,
                 })
                 if launch_settings is not None
-                else {
-                    # Seed from the scalar bookmark settings so first use of
-                    # the editor shows the values the bookmark will launch
-                    # with; an unchanged save round-trips them instead of
-                    # submitting nulls that would strip launch arguments.
-                    **self.manager._deployment_launch_controls({
-                        "engine": str(public.get("runtime") or "vllm"),
-                        "extra_args": extra_args,
-                    }),
-                    **{
-                        "context_window": saved_settings.get("context_length"),
-                        "max_concurrency": (
-                            saved_settings.get("parallel_slots")
-                            if str(public.get("runtime")) == RuntimeKind.LLAMA_CPP.value
-                            else saved_settings.get("max_running_requests")
-                        ),
-                    },
-                    # Structured controls saved through this editor are the
-                    # authoritative round-trip source; the argv parse only
-                    # fills controls the bookmark has never stored.
-                    **(saved_settings.get("launch_controls") or {}),
-                } if saved_only else {}
+                else self._saved_bookmark_launch_controls(
+                    str(public.get("runtime") or "vllm"), extra_args, saved_settings,
+                ) if saved_only else {}
             )
 
         raw_status = str(
@@ -1235,6 +1216,17 @@ class SparkDeckService:
             "manager_deployment_id"
         )
         if not manager_id:
+            saved_only = bool(
+                stored.get("kind") == DeploymentKind.MANAGED.value
+                and not stored.get("container_name")
+            )
+            if not saved_only:
+                # Launched standalone deployments and external endpoints have
+                # a live runtime or endpoint contract; their creator-form
+                # identity fields must not change behind it.
+                raise ValueError(
+                    "deployment does not have editable saved launch settings"
+                )
             return await self._update_saved_deployment(stored, changes)
 
         allowed = {
@@ -1297,23 +1289,46 @@ class SparkDeckService:
                 raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
-        numeric_fields = (
+        integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
-            "gpu_layers", "gpu_memory_utilization", "gpu_memory_gb",
+            "gpu_layers", "gpu_memory_gb",
         )
-        for field in numeric_fields:
+        for field in integer_fields:
             if field not in changes:
                 continue
             value = changes.get(field)
-            if value is None or (
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-            ):
-                settings[field] = value
+            if value is None:
+                settings[field] = None
                 continue
-            try:
-                settings[field] = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field} must be a number") from exc
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{field} must be a number")
+            if value != int(value):
+                raise ValueError(f"{field} must be a whole number")
+            settings[field] = int(value)
+        minimums = {
+            "context_length": 256, "tensor_parallel_size": 1,
+            "parallel_slots": 1, "gpu_memory_gb": 1,
+        }
+        for field, minimum in minimums.items():
+            value = settings.get(field)
+            if value is not None and value < minimum:
+                raise ValueError(f"{field} must be at least {minimum}")
+        gpu_layers = settings.get("gpu_layers")
+        if gpu_layers is not None and gpu_layers < 0:
+            raise ValueError("gpu_layers must be zero or a positive integer")
+        if "gpu_memory_utilization" in changes:
+            value = changes.get("gpu_memory_utilization")
+            if value is None:
+                settings["gpu_memory_utilization"] = None
+            elif (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0 < float(value) <= 1
+            ):
+                settings["gpu_memory_utilization"] = float(value)
+            else:
+                raise ValueError(
+                    "gpu_memory_utilization must be between 0 and 1"
+                )
         if "quantization" in changes:
             settings["quantization"] = canonical_quantization(
                 changes.get("quantization")
@@ -1604,6 +1619,36 @@ class SparkDeckService:
         # are normally symlinks into blobs/, whose content-addressed targets
         # have no .gguf suffix and do not retain multi-shard names.
         return str(candidate)
+
+    def _saved_bookmark_launch_controls(
+        self, runtime: str, extra_args: list[str],
+        saved_settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Round-trip controls for a saved bookmark's editor.
+
+        Order matters: controls parsed from the saved argv are authoritative,
+        the structured controls saved through this editor come next, and the
+        bookmark's scalar settings only seed keys nothing else provides — an
+        unconditional seed would blank parsed values like --max-model-len and
+        strip them from the next launch.
+        """
+        controls = self.manager._deployment_launch_controls({
+            "engine": runtime,
+            "extra_args": extra_args,
+        })
+        controls.update(saved_settings.get("launch_controls") or {})
+        scalar_seeds = {
+            "context_window": saved_settings.get("context_length"),
+            "max_concurrency": (
+                saved_settings.get("parallel_slots")
+                if runtime == RuntimeKind.LLAMA_CPP.value
+                else saved_settings.get("max_running_requests")
+            ),
+        }
+        for key, value in scalar_seeds.items():
+            if controls.get(key) is None and value is not None:
+                controls[key] = value
+        return controls
 
     @staticmethod
     def _saved_layout_contract(settings: dict[str, Any]) -> dict[str, Any]:

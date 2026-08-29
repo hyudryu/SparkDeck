@@ -333,7 +333,7 @@ function normalizeLegacyLog(message: string): LogEntry {
   }
 }
 
-interface WireDeployment {
+export interface WireDeployment {
   id: string
   alias: string
   runtime: RuntimeKind
@@ -386,7 +386,7 @@ interface WireBenchmark {
   sync_state?: BenchmarkSample['sync_state']
 }
 
-function deploymentFromWire(item: WireDeployment): Deployment {
+export function deploymentFromWire(item: WireDeployment): Deployment {
   return {
     id: item.id,
     alias: item.alias,
@@ -420,6 +420,25 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     sg_tp_size: item.sg_tp_size,
     sg_mem_fraction: item.sg_mem_fraction,
     image: item.image ?? undefined,
+  }
+}
+
+interface WireSyncStatus {
+  consent: boolean
+  pairing?: { status?: string; token_invalid?: boolean }
+  outbox?: Record<string, number>
+  upload_configured?: boolean
+}
+
+export function syncStatusFromWire(data: WireSyncStatus): SyncStatus {
+  return {
+    sharing_enabled: data.consent,
+    account_paired: data.pairing?.status === 'paired',
+    token_invalid: Boolean(data.pairing?.token_invalid),
+    upload_configured: Boolean(data.upload_configured),
+    pending_count: (data.outbox?.pending ?? 0) + (data.outbox?.waiting_for_account ?? 0),
+    synced_count: data.outbox?.synced ?? 0,
+    failed_count: data.outbox?.failed ?? 0,
   }
 }
 
@@ -687,16 +706,8 @@ export const api = {
       }
     },
     syncStatus: async (signal?: AbortSignal): Promise<SyncStatus> => {
-      const data = await request<{ consent: boolean; pairing?: { status?: string; token_invalid?: boolean }; outbox?: Record<string, number>; upload_configured?: boolean }>('/api/v1/community/sync', { signal })
-      return {
-        sharing_enabled: data.consent,
-        account_paired: data.pairing?.status === 'paired',
-        token_invalid: Boolean(data.pairing?.token_invalid),
-        upload_configured: Boolean(data.upload_configured),
-        pending_count: (data.outbox?.pending ?? 0) + (data.outbox?.waiting_for_account ?? 0),
-        synced_count: data.outbox?.synced ?? 0,
-        failed_count: data.outbox?.failed ?? 0,
-      }
+      const data = await request<WireSyncStatus>('/api/v1/community/sync', { signal })
+      return syncStatusFromWire(data)
     },
     setConsent: async (sharing_enabled: boolean) => {
       const result = await request<{ cluster?: CommunityClusterSync }>('/api/v1/community/consent', {

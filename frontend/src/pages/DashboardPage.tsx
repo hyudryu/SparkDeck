@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import {
   Activity,
   Cloud,
@@ -15,6 +15,8 @@ import type { ActiveRequestStats, GpuStats, NodeInventoryItem, SystemStats } fro
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
+import { useDashboardStream } from '../hooks/useDashboardStream'
+import type { DashboardStreamResources } from '../hooks/useDashboardStream'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
   return value === null || value === undefined ? '—' : `${value.toFixed(digits)}${suffix}`
@@ -114,11 +116,23 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
 }
 
 export function DashboardPage() {
-  const statsResource = useDashboardResource((signal) => api.dashboard.stats(signal))
-  const admissionResource = useDashboardResource((signal) => api.dashboard.admission(signal))
-  const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal))
-  const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal))
-  const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal))
+  const resourcesRef = useRef<DashboardStreamResources | null>(null)
+  const stream = useDashboardStream(resourcesRef)
+  const polling = !stream.live
+  const statsResource = useDashboardResource((signal) => api.dashboard.stats(signal), polling)
+  const admissionResource = useDashboardResource((signal) => api.dashboard.admission(signal), polling)
+  const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal), polling)
+  const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal), polling)
+  const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal), polling)
+  useEffect(() => {
+    resourcesRef.current = {
+      stats: statsResource,
+      admission: admissionResource,
+      deployments: deploymentsResource,
+      sync: syncResource,
+      nodes: nodesResource,
+    }
+  })
   const communityAccess = useCommunityAccess()
   const accessHint = communityAccessHint(communityAccess.signedIn)
 
@@ -163,7 +177,7 @@ export function DashboardPage() {
         description="Live pooled resource health and per-machine telemetry for the SparkDeck cluster."
         actions={
           <div className="dashboard-refresh">
-            <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : statsResource.loading ? 'Loading local telemetry' : 'Telemetry unavailable'}</span>
+            <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}${stream.live ? ' · live' : ''}` : statsResource.loading ? 'Loading local telemetry' : 'Telemetry unavailable'}</span>
             <Button onClick={reload} disabled={loading}><RefreshCw size={15} /> Refresh</Button>
           </div>
         }
@@ -289,13 +303,13 @@ export function DashboardPage() {
   )
 }
 
-function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>) {
+function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, pollingActive = true) {
   const resource = useResource(loader)
   useEffect(() => {
-    if (resource.loading) return
+    if (!pollingActive || resource.loading) return
     const timer = window.setTimeout(resource.reload, 10_000)
     return () => window.clearTimeout(timer)
-  }, [resource.loading, resource.reload])
+  }, [pollingActive, resource.loading, resource.reload])
   return resource
 }
 

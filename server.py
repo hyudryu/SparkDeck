@@ -12,7 +12,9 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import (
+    FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -407,6 +409,53 @@ async def get_stats():
 async def get_inference_queue():
     """Controller-side vLLM admission state, keyed by deployment/container."""
     return manager.inference_admission()
+
+
+DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
+
+
+async def _dashboard_source(source):
+    """Evaluate one dashboard source; a failure must not kill the stream."""
+    try:
+        result = source()
+        return await result if asyncio.iscoroutine(result) else result
+    except Exception:
+        return None
+
+
+async def _dashboard_nodes() -> list[dict]:
+    nodes = await manager.cluster_nodes()
+    return [manager.public_target_node(node) for node in nodes]
+
+
+@app.websocket("/api/ws/dashboard")
+async def dashboard_stream(websocket: WebSocket):
+    """Push the dashboard's five data sources as periodic full snapshots."""
+    await websocket.accept()
+    try:
+        while True:
+            stats, admission, deployments, community_sync, nodes = (
+                await asyncio.gather(
+                    _dashboard_source(manager.get_stats),
+                    _dashboard_source(manager.inference_admission),
+                    _dashboard_source(sparkdeck.deployments),
+                    _dashboard_source(_community_sync_status),
+                    _dashboard_source(_dashboard_nodes),
+                )
+            )
+            await websocket.send_json({
+                "type": "snapshot",
+                "stats": stats,
+                "admission": admission,
+                "deployments": (
+                    None if deployments is None else {"items": deployments}
+                ),
+                "community_sync": community_sync,
+                "nodes": None if nodes is None else {"items": nodes},
+            })
+            await asyncio.sleep(DASHBOARD_STREAM_INTERVAL_SECONDS)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
 
 
 @app.get("/api/temperature-history")

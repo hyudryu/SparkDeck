@@ -733,7 +733,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 registry.nodes = [node]
                 registry.request = request
 
-                result = await registry.probe(node, force=True)
+                result = await registry.probe(node, force=True, details=False)
 
                 self.assertTrue(result["online"])
                 self.assertEqual(result["status"], "online")

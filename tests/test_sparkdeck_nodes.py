@@ -172,6 +172,11 @@ class NodeRenameTests(unittest.IsolatedAsyncioTestCase):
                     "protocol_version": AGENT_PROTOCOL_VERSION,
                     "docker_ready": True,
                 },
+                {
+                    "name": "Old worker name",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                    "docker_ready": True,
+                },
                 {"name": "New durable alias"},
             ])
 

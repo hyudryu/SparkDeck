@@ -697,8 +697,9 @@ class Manager:
         # Storage inventory combines remote cache scans with best-effort Hub
         # metadata. Coalesce concurrent page refreshes and retain it briefly;
         # transfer job progress remains live and is merged separately.
-        self._virtual_nas_nodes_cache: tuple[float, list[dict]] | None = None
+        self._virtual_nas_nodes_cache: tuple[float, float, list[dict]] | None = None
         self._virtual_nas_nodes_task: asyncio.Task | None = None
+        self._virtual_nas_job_statuses: dict[str, str] = {}
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
@@ -1764,11 +1765,32 @@ class Manager:
         ]
         if not self.virtual_nas_enabled():
             self._virtual_nas_rate_samples = {}
+            self._virtual_nas_job_statuses = {}
             return {
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
-        nodes = await self._virtual_nas_nodes()
+        transfer_items = self.virtual_nas.list_transfers()["items"]
+        previous_statuses = getattr(self, "_virtual_nas_job_statuses", {})
+        terminal_statuses = {"completed", "failed", "canceled", "cancelled"}
+        cached_nodes = getattr(self, "_virtual_nas_nodes_cache", None)
+        cached_at = cached_nodes[0] if cached_nodes else 0.0
+
+        def completed_after_cache(job: dict) -> bool:
+            if job.get("status") not in terminal_statuses:
+                return False
+            try:
+                return float(job.get("completed_at") or 0) > cached_at
+            except (TypeError, ValueError):
+                return False
+
+        refresh_nodes = any(
+            previous_statuses.get(str(job.get("id") or ""))
+            in {"queued", "running"}
+            and job.get("status") in terminal_statuses
+            for job in transfer_items
+        ) or any(completed_after_cache(job) for job in transfer_items)
+        nodes, sampled_at = await self._virtual_nas_nodes(force=refresh_nodes)
         models_by_node = {
             str(node.get("id")): {
                 str(model.get("model_id")): model
@@ -1777,9 +1799,8 @@ class Manager:
             for node in nodes
         }
         jobs = []
-        sampled_at = _monotonic()
         active_job_ids = set()
-        for job in self.virtual_nas.list_transfers()["items"]:
+        for job in transfer_items:
             snapshot = dict(job)
             if (
                 job.get("kind") == "download"
@@ -1808,16 +1829,23 @@ class Manager:
         rate_samples = getattr(self, "_virtual_nas_rate_samples", {})
         for job_id in set(rate_samples) - active_job_ids:
             rate_samples.pop(job_id, None)
+        self._virtual_nas_job_statuses = {
+            str(job.get("id") or ""): str(job.get("status") or "")
+            for job in transfer_items
+            if job.get("id")
+        }
         return {
             "enabled": True, "nodes": nodes,
             "jobs": jobs,
             "instructions": instructions,
         }
 
-    async def _virtual_nas_nodes(self) -> list[dict]:
+    async def _virtual_nas_nodes(
+        self, *, force: bool = False,
+    ) -> tuple[list[dict], float]:
         cached = getattr(self, "_virtual_nas_nodes_cache", None)
-        if cached and time.time() - cached[0] < 10.0:
-            return cached[1]
+        if not force and cached and time.time() - cached[0] < 10.0:
+            return cached[2], cached[1]
         task = getattr(self, "_virtual_nas_nodes_task", None)
         if task is None or task.done():
             task = asyncio.create_task(
@@ -1829,8 +1857,12 @@ class Manager:
         finally:
             if task.done() and self._virtual_nas_nodes_task is task:
                 self._virtual_nas_nodes_task = None
-        self._virtual_nas_nodes_cache = (time.time(), nodes)
-        return nodes
+        sampled_at = _monotonic()
+        self._virtual_nas_nodes_cache = (time.time(), sampled_at, nodes)
+        return nodes, sampled_at
+
+    def _invalidate_virtual_nas_nodes(self) -> None:
+        self._virtual_nas_nodes_cache = None
 
     def _sample_virtual_nas_transfer_rate(
         self, job: dict, sampled_at: float,
@@ -3013,13 +3045,16 @@ class Manager:
                 f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}",
                 timeout=600,
             )
+            self._invalidate_virtual_nas_nodes()
             return {**(result or {}), "node_id": node_id, "model_id": model_id}
         if await self._local_model_uses_cache(model_id):
             raise RuntimeError("model is in use by a local deployment")
-        return {
+        result = {
             **self.virtual_nas.delete_model(model_id),
             "node_id": LOCAL_NODE_ID,
         }
+        self._invalidate_virtual_nas_nodes()
+        return result
 
     async def _local_model_uses_cache(self, model_id: str) -> bool:
         active_container_states = {"created", "restarting", "running", "paused"}

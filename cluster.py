@@ -569,11 +569,15 @@ class NodeRegistry:
         ) from last_error
 
     async def probe(
-        self, node: dict, *, force: bool = False, details: bool = False,
+        self, node: dict, *, force: bool = False, details: bool = True,
     ) -> dict:
         node_id = node["id"]
         cached = self._status_cache.get(node_id)
-        if not force and cached and time.monotonic() - cached[0] < 4.0:
+        cached_has_details = bool(cached and "docker_ready" in cached[1])
+        if (
+            not force and cached and time.monotonic() - cached[0] < 4.0
+            and (not details or cached_has_details)
+        ):
             return cached[1]
         started = time.monotonic()
         public = self.public_config(node)
@@ -581,6 +585,7 @@ class NodeRegistry:
             result = {**public, "status": "disabled", "online": False}
         else:
             try:
+                status_has_details = False
                 try:
                     status = await self.request(
                         node_id, "GET", "/api/agent/health", timeout=3,
@@ -593,6 +598,7 @@ class NodeRegistry:
                     status = await self.request(
                         node_id, "GET", "/api/agent/status", timeout=3,
                     )
+                    status_has_details = True
                 compatible = status.get("protocol_version") == AGENT_PROTOCOL_VERSION
                 issues = []
                 if not compatible:
@@ -602,7 +608,7 @@ class NodeRegistry:
                         str(status.get("status_message") or "").strip()
                         or "Docker is unavailable"
                     )
-                if details:
+                if details and not status_has_details:
                     try:
                         details_status = await self.request(
                             node_id, "GET", "/api/agent/status", timeout=15,

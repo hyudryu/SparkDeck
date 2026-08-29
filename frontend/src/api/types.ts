@@ -137,6 +137,7 @@ export interface DeploymentUpdateInput {
 
 // Editable fields of a saved deployment bookmark (before its first launch).
 export interface SavedDeploymentUpdateInput {
+  alias?: string
   context_length?: number | null
   tensor_parallel_size?: number | null
   parallel_slots?: number | null

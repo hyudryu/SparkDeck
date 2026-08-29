@@ -70,7 +70,13 @@ describe('StoragePage', () => {
       nodes: [
         {
           id: 'node-e', name: 'Tight Spark', online: true, total_size: 900 * gib, free_size: 100 * gib,
-          models: [{ model_id: 'org/big', size_bytes: 400 * gib, revision: 'main', file_count: 4 }],
+          models: [
+            { model_id: 'org/big', size_bytes: 400 * gib, revision: 'main', file_count: 4 },
+            {
+              model_id: 'org/comfyui', size_bytes: 200 * gib,
+              externally_managed: true, transferable: false, deletable: false,
+            },
+          ],
         },
         {
           id: 'node-f', name: 'Full Spark', online: true, total_size: 900 * gib, free_size: 0,
@@ -89,6 +95,7 @@ describe('StoragePage', () => {
     expect(await screen.findByText('400 GB used')).toBeInTheDocument()
     expect(screen.getByText('100 GB free')).toBeInTheDocument()
     expect(screen.getByText('500 GB total')).toBeInTheDocument()
+    expect(screen.getByText('200 GB in ComfyUI')).toBeInTheDocument()
     expect(screen.queryByText('900 GB total')).not.toBeInTheDocument()
     const track = screen.getByLabelText('Tight Spark used model storage')
     expect(track.firstElementChild).toHaveStyle({ width: '80%' })
@@ -273,8 +280,9 @@ describe('StoragePage', () => {
     expect(mixed).toHaveAttribute('draggable', 'true')
     expect(screen.queryByRole('button', { name: 'Finish download of org/mixed-model on Studio Spark' })).not.toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'org/mixed-model' })).toBeInTheDocument()
-    const external = screen.getByLabelText('Installed external weights Lightricks/LTX-2.5 on Studio Spark')
-    expect(external).toHaveTextContent('ComfyUI · Externally managed')
+    const external = screen.getByLabelText('Installed weights Lightricks/LTX-2.5 on Studio Spark')
+    expect(external).toHaveTextContent('Lightricks/LTX-2.5')
+    expect(external).not.toHaveTextContent('Externally managed')
     expect(external).toHaveAttribute('draggable', 'false')
     expect(screen.queryByRole('button', { name: 'Delete Lightricks/LTX-2.5 from Studio Spark' })).not.toBeInTheDocument()
     expect(screen.queryByRole('option', { name: 'Lightricks/LTX-2.5' })).not.toBeInTheDocument()

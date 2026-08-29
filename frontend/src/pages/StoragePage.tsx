@@ -291,11 +291,18 @@ export function StoragePage() {
                   - (modelsById.get(left)?.size_bytes ?? activeJobs.get(left)?.bytes_total ?? 0)
                 || compareModelIdsDescending(left, right)
               ))
-            const used = node.models.reduce((total, model) => total + model.size_bytes, 0)
-            // "Used" counts SparkDeck-managed model weights only, so the
-            // capacity denominator must be that usage plus the free space on
-            // the model-cache mount (reported with the inventory). The free
-            // reading is only meaningful while the node's inventory is valid —
+            const used = node.models.reduce(
+              (total, model) => total + (model.externally_managed ? 0 : model.size_bytes),
+              0,
+            )
+            const comfyUiUsed = node.models.reduce(
+              (total, model) => total + (model.externally_managed ? model.size_bytes : 0),
+              0,
+            )
+            // The capacity bar describes the Hugging Face cache mount, so its
+            // used and free values exclude weights found in ComfyUI storage.
+            // The cache free reading is reported with the inventory and is
+            // only meaningful while the node's inventory is valid —
             // the manager marks a node offline when that request fails — and
             // zero is a genuinely full disk, not missing data.
             const cacheFree = node.online && typeof node.free_size === 'number' ? node.free_size : undefined
@@ -327,6 +334,7 @@ export function StoragePage() {
                 <span>{formatBytes(used)} used</span>
                 {hasFree && <span>{formatBytes(cacheFree)} free</span>}
                 <span>{formatBytes(capacity)} total</span>
+                {comfyUiUsed > 0 && <span>{formatBytes(comfyUiUsed)} in ComfyUI</span>}
               </div>
               <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>
@@ -340,7 +348,7 @@ export function StoragePage() {
                     aria-label={model.partial
                       ? `Partial cache ${model.model_id} on ${node.name}`
                       : model.externally_managed
-                        ? `Installed external weights ${model.model_id} on ${node.name}`
+                        ? `Installed weights ${model.model_id} on ${node.name}`
                         : `Transfer ${model.model_id} from ${node.name}`}
                     onDragStart={(event) => startDrag(event, model, node)}
                     onDragEnd={() => {
@@ -357,7 +365,7 @@ export function StoragePage() {
                       disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
-                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : model.externally_managed ? ' · Externally managed' : ''}</small></div>
+                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                     {model.deletable !== false && <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
@@ -420,7 +428,7 @@ export function StoragePage() {
           <div className="responsive-table storage-model-table" role="table" aria-label="Model storage inventory">
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Size</span><span role="columnheader">Files</span><span role="columnheader">Node availability</span></div>
             {inventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
-              <div role="cell" data-label="Model"><strong>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? `${model.source ?? 'External'} · Externally managed` : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
+              <div role="cell" data-label="Model"><strong>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? 'Installed' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
               <div role="cell" data-label="Size">{formatBytes(model.size_bytes)}</div>
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
               <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => {

@@ -53,6 +53,7 @@ _SELECTIVE_MARKER_CONTENT = b"selective\n"
 _EXTERNAL_SNAPSHOT_MARKER = ".sparkdeck-external"
 _EXTERNAL_MARKER_CONTENT = b"comfyui\n"
 _EXTERNAL_PSEUDO_REVISION = "comfyui"
+_HF_XET_HIGH_PERFORMANCE = "HF_XET_HIGH_PERFORMANCE"
 _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
@@ -102,6 +103,22 @@ _COMFYUI_BUNDLE_PATHS = frozenset(
         *(path for group in alternative_groups for path in group),
     )
 )
+
+
+def _enable_hf_xet_high_performance() -> None:
+    """Use the Hub's highest-throughput downloader settings on SparkDeck nodes.
+
+    SparkDeck targets NVMe-equipped, high-memory nodes for large model pulls.
+    Set this before importing Hugging Face download helpers so hf-xet can apply
+    its high-performance configuration to every new download process.
+    """
+    os.environ[_HF_XET_HIGH_PERFORMANCE] = "1"
+
+
+# The process must set this before any lazy huggingface_hub import. Every
+# SparkDeck controller and agent imports this module on startup, so restarting
+# nodes applies the high-throughput Xet configuration uniformly.
+_enable_hf_xet_high_performance()
 
 
 def _default_comfyui_model_roots() -> list[Path]:
@@ -757,6 +774,7 @@ class VirtualNAS:
         sizes, repository_files, blob_keys = await asyncio.to_thread(inspect)
 
         def download_selected() -> dict[str, Any]:
+            _enable_hf_xet_high_performance()
             try:
                 from huggingface_hub import hf_hub_download
             except ImportError as exc:
@@ -903,6 +921,7 @@ class VirtualNAS:
                 "size_bytes": _nonnegative_int(existing.get("size_bytes")),
             }
         try:
+            _enable_hf_xet_high_performance()
             from huggingface_hub import snapshot_download
         except ImportError as exc:
             raise RuntimeError("huggingface-hub is required to download model weights") from exc

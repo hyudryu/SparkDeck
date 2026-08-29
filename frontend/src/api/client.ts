@@ -849,7 +849,7 @@ export const api = {
         node_ids: nodeIds,
         download_node_id: downloadNodeId || undefined,
       }),
-    }),
+    }, NO_REQUEST_TIMEOUT),
     cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),

@@ -176,6 +176,24 @@ describe('API client adapters', () => {
     await expect(result).resolves.toEqual(expect.objectContaining({ id: 'dep-slow', status: 'running' }))
   })
 
+  it('does not time out model preparation while the controller queues a download', async () => {
+    vi.useFakeTimers()
+    let finishRequest: ((response: Response) => void) | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => new Promise((resolve) => {
+      finishRequest = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = api.storage.prepareModel('org/model', 'main', ['worker-a'], 'worker-a')
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    finishRequest?.(new Response(JSON.stringify({ job_ids: ['job-1'], jobs: [] }), {
+      status: 202, headers: { 'Content-Type': 'application/json' },
+    }))
+    await expect(result).resolves.toEqual(expect.objectContaining({ job_ids: ['job-1'] }))
+  })
+
   it('does not time out a long-running image pull', async () => {
     vi.useFakeTimers()
     let finishRequest: ((response: Response) => void) | undefined

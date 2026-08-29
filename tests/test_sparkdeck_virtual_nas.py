@@ -181,6 +181,24 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue((hub / "models--org--model").is_dir())
 
+    def test_download_forces_hf_xet_high_performance_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "configured-cache" / "hub"
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            def download_into_cache(**kwargs):
+                create_cached_model(Path(kwargs["cache_dir"]))
+                return str(hub / "models--org--model" / "snapshots" / "revision-1")
+
+            huggingface_hub = Mock(snapshot_download=Mock(side_effect=download_into_cache))
+            with patch.dict(
+                os.environ, {"HF_XET_HIGH_PERFORMANCE": "0"}, clear=False,
+            ), patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
+                nas.download_model("org/model", "revision-1")
+                self.assertEqual(os.environ.get("HF_XET_HIGH_PERFORMANCE"), "1")
+
     async def test_mutable_revision_resolution_is_fresh_and_returns_commit_sha(self):
         with tempfile.TemporaryDirectory() as directory:
             first_sha = "a" * 40

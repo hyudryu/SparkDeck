@@ -146,7 +146,7 @@ describe('StoragePage', () => {
     ])
   })
 
-  it('keeps in-progress downloads in strict descending size order', async () => {
+  it('pins newest in-progress tasks above models sorted by descending size', async () => {
     const storage: StorageState = {
       ...enabledStorage,
       nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
@@ -187,7 +187,7 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
     expect([...nodePanel.querySelectorAll('.storage-weight-list strong')].map((item) => item.textContent)).toEqual([
-      'org/zeta', 'org/model', 'org/beta', 'org/alpha', 'org/aardvark',
+      'org/aardvark', 'org/alpha', 'org/zeta', 'org/model', 'org/beta',
     ])
 
     const modelSelect = screen.getByRole('combobox', { name: 'Model weights' })
@@ -226,6 +226,39 @@ describe('StoragePage', () => {
       body: JSON.stringify({ model_id: 'org/model', source_node_id: 'node-a', target_node_ids: ['node-b'] }),
     })))
     expect(await screen.findByRole('status')).toHaveTextContent('Queued org/model for transfer to Backup Spark.')
+  })
+
+  it('stops polling optimistic jobs after Virtual NAS is disabled', async () => {
+    let enabled = true
+    const storage = { ...enabledStorage, jobs: [] }
+    const queuedJob = {
+      id: 'optimistic-job', kind: 'transfer' as const, model_id: 'org/model',
+      source_node_id: 'node-a', source_node_name: 'Studio Spark',
+      target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'queued',
+      bytes_total: 1_000_000_000, bytes_transferred: 0, progress: 0,
+      created_at: '2026-08-29T12:00:00Z',
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') {
+        return json({ job_ids: [queuedJob.id], jobs: [queuedJob] }, 202)
+      }
+      if (path.endsWith('/api/v1/storage/settings') && init?.method === 'PUT') enabled = false
+      return json(enabled ? storage : { enabled: false, nodes: [], jobs: [], instructions: [] })
+    })
+    const setIntervalSpy = vi.spyOn(window, 'setInterval')
+    const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<StoragePage />)
+
+    await user.click(await screen.findByRole('checkbox', { name: /Backup Spark/ }))
+    await user.click(screen.getByRole('button', { name: 'Queue transfer' }))
+    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled())
+    await user.click(screen.getByRole('button', { name: 'Disable Virtual NAS' }))
+
+    expect(await screen.findByRole('heading', { name: 'Virtual NAS is off' })).toBeInTheDocument()
+    await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalled())
   })
 
   it('shows partial caches with a warning and excludes them from transfers', async () => {
@@ -307,7 +340,16 @@ describe('StoragePage', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (init?.method === 'DELETE') return new Response(null, { status: 204 })
-      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') return json({ id: 'new-job' }, 201)
+      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') return json({
+        job_ids: ['new-job'],
+        jobs: [{
+          id: 'new-job', kind: 'transfer', model_id: 'org/model',
+          source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'queued',
+          bytes_total: 1_000_000_000, bytes_transferred: 0, progress: 0,
+          created_at: '2026-08-29T12:00:00Z',
+        }],
+      }, 202)
       return json(enabledStorage)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -338,6 +380,10 @@ describe('StoragePage', () => {
       method: 'POST',
       body: JSON.stringify({ model_id: 'org/model', source_node_id: 'node-a', target_node_ids: ['node-b'] }),
     })))
+    const queuedCopy = await within(target).findByLabelText('Transfer queued org/model on Backup Spark')
+    expect(queuedCopy).toHaveClass('storage-active-weight')
+    expect(queuedCopy).toHaveStyle({ '--storage-active-progress': '0%' })
+    expect(within(target).getAllByRole('listitem')[0]).toBe(queuedCopy)
 
     await user.click(screen.getAllByRole('button', { name: 'Cancel org/other transfer' })[0])
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -359,11 +405,13 @@ describe('StoragePage', () => {
           id: 'download-1', model_id: 'org/download', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
           target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
           bytes_total: 100 * gib, bytes_transferred: 97.5 * gib, progress: 0.975, created_at: '2026-08-26T12:00:00Z',
+          bytes_per_second: 2_500_000_000,
         },
         {
           id: 'transfer-1', model_id: 'org/copy', source_node_id: 'node-a', source_node_name: 'Studio Spark',
           target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'transfer',
           bytes_total: 1000, bytes_transferred: 400, progress: 0.4, created_at: '2026-08-26T12:00:00Z',
+          bytes_per_second: 1_250_000_000,
         },
       ],
     }
@@ -376,10 +424,39 @@ describe('StoragePage', () => {
     expect(downloadProgress).toHaveAttribute('aria-valuenow', '97.5')
     expect(downloadProgress.firstElementChild).toHaveStyle({ transform: 'scaleX(0.975)' })
     expect(within(download).getByText(/^97\.5%/)).toBeInTheDocument()
+    expect(download).toHaveStyle({ '--storage-active-progress': '97.5%' })
+    expect(within(download).getByText(/2\.50 GB\/s avg/)).toBeInTheDocument()
     expect(within(nodePanel).getAllByText('org/download')).toHaveLength(1)
     expect(within(nodePanel).queryByText('No model weights reported')).not.toBeInTheDocument()
-    expect(within(nodePanel).getByRole('progressbar', { name: 'Transferring from Studio Spark org/copy progress' })).toHaveAttribute('aria-valuenow', '40')
+    const copy = within(nodePanel).getByLabelText('Transferring from Studio Spark org/copy on Backup Spark')
+    expect(within(copy).getByRole('progressbar', { name: 'Transferring from Studio Spark org/copy progress' })).toHaveAttribute('aria-valuenow', '40')
+    expect(within(copy).getByText(/1\.25 GB\/s avg/)).toBeInTheDocument()
     expect(within(nodePanel).getByRole('button', { name: 'Cancel org/copy transfer' })).toBeInTheDocument()
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
+  })
+
+  it('shows only the five newest transfer tasks above model inventory', async () => {
+    const createdOrder = [5, 1, 7, 2, 6, 3, 4]
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: createdOrder.map((number) => ({
+        id: `job-${number}`, model_id: `org/job-${number}`,
+        source_node_id: 'node-a', source_node_name: 'Studio Spark',
+        target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'completed',
+        bytes_total: 1_000_000_000, bytes_transferred: 1_000_000_000,
+        created_at: `2026-08-${20 + number}T12:00:00Z`,
+      })),
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const queue = await screen.findByRole('table', { name: 'Model transfer queue' })
+    expect([...queue.querySelectorAll('.table-row:not(.table-header) [data-label="Model"] strong')].map((item) => item.textContent)).toEqual([
+      'org/job-7', 'org/job-6', 'org/job-5', 'org/job-4', 'org/job-3',
+    ])
+    expect(createdOrder).toEqual([5, 1, 7, 2, 6, 3, 4])
+    const queueHeading = screen.getByRole('heading', { name: 'Transfer queue' })
+    const inventoryHeading = screen.getByRole('heading', { name: 'Model inventory' })
+    expect(queueHeading.compareDocumentPosition(inventoryHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 })

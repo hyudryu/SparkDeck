@@ -81,6 +81,7 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_model_gains_expected_size_from_hub_tree(self):
         manager = Manager.__new__(Manager)
+        manager.settings = {}
         manager.cluster_nodes = AsyncMock(return_value=[
             {"id": "local", "name": "Spark One", "online": True},
         ])

@@ -2659,14 +2659,18 @@ def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:
                 continue
             names: list[str] = []
             for item in revision.rglob("*"):
-                # Snapshot entries are symlinks into blobs; is_file() follows
-                # them and rejects dangling links, while is_dir() skips the
-                # (non-symlinked) subdirectories.
                 if item.is_dir() or not item.is_file():
                     continue
                 if item.name.endswith((".incomplete", ".lock")):
                     continue
-                names.append(item.relative_to(revision).as_posix())
+                # Mirror the launch path's containment validation so a name
+                # reported as cached is exactly a file the launcher will
+                # accept: symlinked snapshot entries must resolve inside the
+                # repository's blobs directory, never outside the cache.
+                relative = item.relative_to(revision).as_posix()
+                if _safe_cached_snapshot_file(repository, revision.name, relative) is None:
+                    continue
+                names.append(relative)
                 total_names += 1
                 # Enforce the cap inside the walk so a single huge snapshot
                 # cannot make traversal collect an unbounded name list.

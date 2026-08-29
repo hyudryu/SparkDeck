@@ -529,6 +529,21 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "selective", encoding="utf-8",
             )
             (selective / "download.lock").write_text("locked", encoding="utf-8")
+            # A symlink escaping the cache (and a dangling one) is reported
+            # by the same containment rules the launch path applies.
+            outside = Path(directory) / "outside.gguf"
+            outside.write_bytes(b"outside")
+            escape_linked = False
+            dangling_linked = False
+            try:
+                (selective / "escape.gguf").symlink_to(outside)
+                escape_linked = True
+                (selective / "dangling.gguf").symlink_to(
+                    repository / "blobs" / "missing-blob",
+                )
+                dangling_linked = True
+            except OSError:
+                pass
             nas = VirtualNAS(
                 Path(directory), lambda: hub, FakeRegistry(), lambda: False,
             )
@@ -543,6 +558,10 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 selective_revision: ["model-Q8_0.gguf"],
             })
+            if escape_linked:
+                self.assertNotIn("escape.gguf", models[0]["snapshot_files"][selective_revision])
+            if dangling_linked:
+                self.assertNotIn("dangling.gguf", models[0]["snapshot_files"][selective_revision])
             self.assertNotIn(str(repository), json.dumps(models))
 
     async def test_snapshot_file_inventory_enforces_cap_during_traversal(self):

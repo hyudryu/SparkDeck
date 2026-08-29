@@ -180,7 +180,7 @@ export function BenchmarkRunner() {
   const activeData = activeRun.data?.id === activeRunId ? activeRun.data : undefined
 
   return (
-    <div className="page">
+    <div className="benchmark-runner">
       <Panel className="runner-tool-panel">
         <div className="runner-tool-row">
           <span className="runner-tool-icon"><Gauge size={19} aria-hidden="true" /></span>

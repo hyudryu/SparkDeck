@@ -2362,6 +2362,9 @@ class VirtualNAS:
         self._cancel_events[job["id"]] = event
         job.update({
             "status": "running", "started_at": time.time(),
+            # Archive copies are not resumable. A requeued attempt streams the
+            # full archive again, so its progress and rate restart at byte zero.
+            "bytes_transferred": 0,
             "completed_at": None, "error": None,
         })
         self._save()

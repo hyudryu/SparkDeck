@@ -27,7 +27,7 @@ from cluster import (
 )
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
-from sparkdeck.benchy import BenchyError, BenchyService
+from sparkdeck.benchmark_runner import BenchmarkRunnerError, BenchmarkRunnerService
 from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
@@ -46,7 +46,7 @@ from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
-benchy = BenchyService(manager, sparkdeck, data_dir=ROOT / "data")
+benchmark_runner = BenchmarkRunnerService(manager, sparkdeck, data_dir=ROOT / "data")
 onboarding = OnboardingService(
     manager, data_dir=ROOT / "data", port=7878,
     revoke_community_consent=sparkdeck.revoke_community_membership,
@@ -2841,87 +2841,87 @@ async def v1_delete_benchmark(sample_id: str):
     return {"ok": True, "id": sample_id}
 
 
-# ---------- llama-benchy benchmark runner ----------
+# ---------- llama-benchy powered benchmark runner ----------
 
-@app.get("/api/v1/benchy/status")
-async def v1_benchy_status():
-    status = await benchy.detect()
-    status["active_run_id"] = (benchy.active_run() or {}).get("id")
+@app.get("/api/v1/benchmark-runner/status")
+async def v1_benchmark_runner_status():
+    status = await benchmark_runner.detect()
+    status["active_run_id"] = (benchmark_runner.active_run() or {}).get("id")
     return status
 
 
-@app.post("/api/v1/benchy/install")
-async def v1_benchy_install():
+@app.post("/api/v1/benchmark-runner/install")
+async def v1_benchmark_runner_install():
     try:
-        return await benchy.install()
-    except BenchyError as exc:
+        return await benchmark_runner.install()
+    except BenchmarkRunnerError as exc:
         raise HTTPException(502, str(exc)) from exc
 
 
-@app.get("/api/v1/benchy/models")
-async def v1_benchy_models():
+@app.get("/api/v1/benchmark-runner/models")
+async def v1_benchmark_runner_models():
     items = [
         {key: value for key, value in model.items() if not key.startswith("_")}
-        for model in await benchy.served_models()
+        for model in await benchmark_runner.served_models()
     ]
     return {"items": items}
 
 
-@app.post("/api/v1/benchy/runs", status_code=202)
-async def v1_benchy_start_run(req: Request):
+@app.post("/api/v1/benchmark-runner/runs", status_code=202)
+async def v1_benchmark_runner_start_run(req: Request):
     try:
         body = await req.json()
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body must be valid JSON") from exc
     try:
-        return await benchy.start_run(body if isinstance(body, dict) else {})
-    except BenchyError as exc:
+        return await benchmark_runner.start_run(body if isinstance(body, dict) else {})
+    except BenchmarkRunnerError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.get("/api/v1/benchy/runs")
-async def v1_benchy_runs():
-    return {"items": benchy.list_runs()}
+@app.get("/api/v1/benchmark-runner/runs")
+async def v1_benchmark_runner_runs():
+    return {"items": benchmark_runner.list_runs()}
 
 
-@app.get("/api/v1/benchy/runs/{run_id}")
-async def v1_benchy_run(run_id: str):
+@app.get("/api/v1/benchmark-runner/runs/{run_id}")
+async def v1_benchmark_runner_run(run_id: str):
     try:
-        return benchy.get_run(run_id)
+        return benchmark_runner.get_run(run_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 
-@app.post("/api/v1/benchy/runs/{run_id}/cancel")
-async def v1_benchy_cancel_run(run_id: str):
+@app.post("/api/v1/benchmark-runner/runs/{run_id}/cancel")
+async def v1_benchmark_runner_cancel_run(run_id: str):
     try:
-        return await benchy.cancel_run(run_id)
+        return await benchmark_runner.cancel_run(run_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except BenchyError as exc:
+    except BenchmarkRunnerError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.delete("/api/v1/benchy/runs/{run_id}")
-async def v1_benchy_delete_run(run_id: str):
+@app.delete("/api/v1/benchmark-runner/runs/{run_id}")
+async def v1_benchmark_runner_delete_run(run_id: str):
     try:
-        benchy.delete_run(run_id)
+        benchmark_runner.delete_run(run_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except BenchyError as exc:
+    except BenchmarkRunnerError as exc:
         raise HTTPException(400, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(500, f"could not delete benchmark run files: {exc}") from exc
     return {"ok": True, "id": run_id}
 
 
-@app.get("/api/v1/benchy/runs/{run_id}/csv")
-async def v1_benchy_run_csv(run_id: str):
+@app.get("/api/v1/benchmark-runner/runs/{run_id}/csv")
+async def v1_benchmark_runner_run_csv(run_id: str):
     try:
-        path = benchy.csv_path(run_id)
+        path = benchmark_runner.csv_path(run_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
-    return FileResponse(path, media_type="text/csv", filename=f"benchy-{run_id}.csv")
+    return FileResponse(path, media_type="text/csv", filename=f"benchmark-run-{run_id}.csv")
 
 
 _cognito_jwks_client = None

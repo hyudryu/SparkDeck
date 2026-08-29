@@ -6,6 +6,7 @@ import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingStat
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { BenchmarkLineChart } from '../components/BenchmarkLineChart'
+import { BenchmarkRunner } from '../components/BenchmarkRunner'
 import { LegalDialog } from '../components/LegalDialog'
 
 export function BenchmarksPage() {
@@ -82,7 +83,8 @@ export function BenchmarksPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="Performance evidence" title="Benchmarks" description="Review measurements captured from SparkDeck requests and compare them with privacy-preserving community results." />
+      <PageHeader eyebrow="Performance evidence" title="Benchmarks" description="Run llama-benchy against served models, review measurements captured from SparkDeck requests, and compare them with privacy-preserving community results." />
+      <BenchmarkRunner />
       <div className="benchmark-summary-grid">
         <Panel className="sync-panel">
           <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Optional, account-linked benchmark evidence with a strict data allowlist.</p></div></div>

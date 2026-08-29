@@ -7,10 +7,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from sparkdeck.benchy import (
+from sparkdeck.benchmark_runner import (
     CSV_COLUMNS,
-    BenchyError,
-    BenchyService,
+    BenchmarkRunnerError,
+    BenchmarkRunnerService,
     _flatten_report,
     _write_csv,
 )
@@ -159,7 +159,7 @@ async def _wait_terminal(service, run_id):
 
 class ValidateConfigTests(unittest.TestCase):
     def setUp(self):
-        self.service = BenchyService.__new__(BenchyService)
+        self.service = BenchmarkRunnerService.__new__(BenchmarkRunnerService)
 
     def test_defaults_fill_missing_fields(self):
         config = self.service._validate_config({"model_id": "m"})
@@ -173,7 +173,7 @@ class ValidateConfigTests(unittest.TestCase):
         self.assertFalse(config["exact_tg"])
 
     def test_requires_model_id(self):
-        with self.assertRaises(BenchyError):
+        with self.assertRaises(BenchmarkRunnerError):
             self.service._validate_config({"prompt_sizes": [512]})
 
     def test_rejects_empty_and_non_integer_lists(self):
@@ -184,11 +184,11 @@ class ValidateConfigTests(unittest.TestCase):
             {"model_id": "m", "runs": "3"},
             {"model_id": "m", "runs": 99},
         ):
-            with self.assertRaises(BenchyError, msg=str(body)):
+            with self.assertRaises(BenchmarkRunnerError, msg=str(body)):
                 self.service._validate_config(body)
 
     def test_requires_at_least_one_measured_run(self):
-        with self.assertRaises(BenchyError):
+        with self.assertRaises(BenchmarkRunnerError):
             self.service._validate_config({"model_id": "m", "runs": 0})
         config = self.service._validate_config(
             {"model_id": "m", "runs": 1, "warmup_runs": 0}
@@ -198,7 +198,7 @@ class ValidateConfigTests(unittest.TestCase):
 
     def test_requires_boolean_exact_tg(self):
         for bad in ("false", "true", 1):
-            with self.assertRaises(BenchyError, msg=str(bad)):
+            with self.assertRaises(BenchmarkRunnerError, msg=str(bad)):
                 self.service._validate_config({"model_id": "m", "exact_tg": bad})
         self.assertFalse(
             self.service._validate_config({"model_id": "m"})["exact_tg"]
@@ -214,7 +214,7 @@ class ValidateConfigTests(unittest.TestCase):
             "response_sizes": [64, 128, 256, 512, 1024, 2048, 4096, 8192],
             "concurrency_levels": [1, 2, 4, 8, 16, 32, 64, 128],
         }
-        with self.assertRaises(BenchyError):
+        with self.assertRaises(BenchmarkRunnerError):
             self.service._validate_config(body)
 
     def test_rejects_oversized_lists(self):
@@ -222,7 +222,7 @@ class ValidateConfigTests(unittest.TestCase):
             "model_id": "m",
             "prompt_sizes": [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
         }
-        with self.assertRaises(BenchyError):
+        with self.assertRaises(BenchmarkRunnerError):
             self.service._validate_config(body)
 
 
@@ -276,7 +276,7 @@ class ReportFlatteningTests(unittest.TestCase):
 
 class ServedModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_llama_model_is_listed_with_quantization(self):
-        service = BenchyService(FakeManager(llama_running=True), FakeSparkdeck(), Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(llama_running=True), FakeSparkdeck(), Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(len(models), 1)
         self.assertEqual(models[0]["id"], "unsloth/Qwen3-4B-GGUF")
@@ -291,7 +291,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "org/model", "runtime": "vllm", "deployment_id": "dep-1",
             "model": {"repository": "org/model", "quantization": "FP8"},
         }]})
-        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
         self.assertEqual(models[0]["model"], "org/model")
@@ -306,7 +306,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "org/model", "runtime": "vllm", "deployment_id": "dep-1",
             "model": {"repository": "org/model", "quantization": None},
         }]})
-        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://127.0.0.1:7878")
         # The proxy resolves the alias to the upstream model server-side.
@@ -320,7 +320,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "org/model", "runtime": "vllm", "deployment_id": "dep-1",
             "model": {"repository": "org/model", "quantization": None},
         }]})
-        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
 
@@ -336,7 +336,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         manager = FakeManager(containers=[
             {"name": "c1", "served_models": ["served-model-name"]},
         ])
-        service = BenchyService(manager, sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(manager, sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
         self.assertEqual(models[0]["model"], "served-model-name")
@@ -351,9 +351,9 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "port": 8123, "container_name": "c1",
             "model": {"repository": "org/model", "quantization": None},
         }]})
-        remote = BenchyService(FakeManager(primary_node_id="node-2"), sparkdeck, Path("data-unused"))
+        remote = BenchmarkRunnerService(FakeManager(primary_node_id="node-2"), sparkdeck, Path("data-unused"))
         self.assertEqual(await remote.served_models(), [])
-        local = BenchyService(FakeManager(primary_node_id="local"), sparkdeck, Path("data-unused"))
+        local = BenchmarkRunnerService(FakeManager(primary_node_id="local"), sparkdeck, Path("data-unused"))
         self.assertEqual(len(await local.served_models()), 1)
 
     async def test_discovered_container_is_benchmarkable(self):
@@ -367,7 +367,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         manager = FakeManager(containers=[
             {"name": "legacy-vllm", "served_models": ["legacy-served"]},
         ])
-        service = BenchyService(manager, sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(manager, sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8222")
         self.assertEqual(models[0]["model"], "legacy-served")
@@ -380,7 +380,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "unsloth/Qwen3-4B-GGUF", "runtime": "vllm", "deployment_id": "dep-1",
             "model": {"repository": "unsloth/Qwen3-4B-GGUF", "quantization": None},
         }]})
-        service = BenchyService(FakeManager(llama_running=True), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(llama_running=True), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(len(models), 1)
         self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
@@ -391,7 +391,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "alias", "runtime": "vllm", "deployment_id": "dep-2", "port": 8123,
             "model": {"repository": "org/model", "quantization": None},
         }]})
-        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
 
@@ -401,7 +401,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "id": "alias", "runtime": "vllm", "deployment_id": "dep-3",
             "model": {"repository": "org/model", "quantization": None},
         }]})
-        service = BenchyService(FakeManager(), sparkdeck, Path("data-unused"))
+        service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         self.assertEqual(await service.served_models(), [])
 
 
@@ -411,7 +411,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
 
     def _service(self):
-        return BenchyService(FakeManager(llama_running=True), FakeSparkdeck(), Path(self.temp.name))
+        return BenchmarkRunnerService(FakeManager(llama_running=True), FakeSparkdeck(), Path(self.temp.name))
 
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
@@ -456,7 +456,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "quantization", csv_path.read_text(encoding="utf-8").splitlines()[0],
         )
         # The completed state survives a service reload.
-        reloaded = BenchyService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
+        reloaded = BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
         self.assertEqual(reloaded.get_run(run["id"])["status"], "completed")
 
     async def test_failed_run_records_output_tail(self):
@@ -495,7 +495,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(service, "served_models", AsyncMock(return_value=[_target()])), \
                 patch.object(service, "_spawn", AsyncMock(side_effect=fake_spawn)):
             first = await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
-            with self.assertRaises(BenchyError):
+            with self.assertRaises(BenchmarkRunnerError):
                 await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
             self.assertEqual(service.active_run()["id"], first["id"])
 
@@ -525,7 +525,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             )
             started = [item for item in results if not isinstance(item, Exception)]
-            errors = [item for item in results if isinstance(item, BenchyError)]
+            errors = [item for item in results if isinstance(item, BenchmarkRunnerError)]
             self.assertEqual(len(started), 1)
             self.assertEqual(len(errors), 1)
             self.assertIn("already in progress", str(errors[0]))
@@ -537,7 +537,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_monitor_cancellation_terminates_child(self):
         service = self._service()
         run_id = "20260101-000000-cancel"
-        run_dir = Path(self.temp.name) / "benchy" / "runs" / run_id
+        run_dir = Path(self.temp.name) / "benchmark-runner" / "runs" / run_id
         run_dir.mkdir(parents=True)
         run = {
             "id": run_id, "status": "running",
@@ -588,9 +588,9 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return b"", None
 
         pip_process = HangingPipProcess()
-        with patch("sparkdeck.benchy.asyncio.create_subprocess_exec",
+        with patch("sparkdeck.benchmark_runner.asyncio.create_subprocess_exec",
                    AsyncMock(return_value=pip_process)):
-            service = BenchyService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
+            service = BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
             task = asyncio.create_task(service.install())
             await asyncio.sleep(0)
             task.cancel()
@@ -604,7 +604,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
                 patch.object(service, "served_models", AsyncMock(return_value=[_target()])), \
                 patch.object(service, "_save_state", Mock(side_effect=OSError("disk full"))):
-            with self.assertRaises(BenchyError) as caught:
+            with self.assertRaises(BenchmarkRunnerError) as caught:
                 await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
         self.assertIn("could not record benchmark state", str(caught.exception))
         self.assertEqual(service.runs, {})
@@ -615,14 +615,14 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_failure_keeps_run_recorded(self):
         service = self._service()
         run_id = "20260101-000000-stuck"
-        run_dir = Path(self.temp.name) / "benchy" / "runs" / run_id
+        run_dir = Path(self.temp.name) / "benchmark-runner" / "runs" / run_id
         run_dir.mkdir(parents=True)
         service.runs[run_id] = {
             "id": run_id, "status": "completed",
             "created_at": "2026-01-01T00:00:00+00:00",
             "config": {"runs": 1, "warmup_runs": 0, "exact_tg": False},
         }
-        with patch("sparkdeck.benchy.shutil.rmtree", side_effect=OSError("file busy")):
+        with patch("sparkdeck.benchmark_runner.shutil.rmtree", side_effect=OSError("file busy")):
             with self.assertRaises(OSError):
                 service.delete_run(run_id)
         self.assertIn(run_id, service.runs)
@@ -632,7 +632,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service = self._service()
         with patch.object(service, "detect", AsyncMock(return_value=_installed())), \
                 patch.object(service, "served_models", AsyncMock(return_value=[])):
-            with self.assertRaises(BenchyError):
+            with self.assertRaises(BenchmarkRunnerError):
                 await service.start_run({"model_id": "ghost/model"})
 
     async def test_uninstalled_tool_is_rejected(self):
@@ -640,18 +640,18 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(service, "detect", AsyncMock(return_value={
                 "installed": False, "version": None,
                 "launch_mode": None, "path_on_host": False})):
-            with self.assertRaises(BenchyError):
+            with self.assertRaises(BenchmarkRunnerError):
                 await service.start_run({"model_id": "unsloth/Qwen3-4B-GGUF"})
 
     async def test_orphaned_active_runs_fail_on_restart(self):
-        BenchyService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
+        BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
         run_id = "20260101-000000-abcdef"
-        run_dir = Path(self.temp.name) / "benchy" / "runs" / run_id
+        run_dir = Path(self.temp.name) / "benchmark-runner" / "runs" / run_id
         run_dir.mkdir(parents=True)
         (run_dir / "state.json").write_text(json.dumps({
             "id": run_id, "status": "running", "created_at": "2026-01-01T00:00:00+00:00",
         }), encoding="utf-8")
-        reloaded = BenchyService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
+        reloaded = BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path(self.temp.name))
         run = reloaded.get_run(run_id)
         self.assertEqual(run["status"], "failed")
         self.assertIn("restart", run["error"])
@@ -671,10 +671,10 @@ class InstallTests(unittest.IsolatedAsyncioTestCase):
             async def communicate(self):
                 return b"ERROR: no matching distribution", None
 
-        with patch("sparkdeck.benchy.asyncio.create_subprocess_exec",
+        with patch("sparkdeck.benchmark_runner.asyncio.create_subprocess_exec",
                    AsyncMock(return_value=FailingProcess())):
-            service = BenchyService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
-            with self.assertRaises(BenchyError) as caught:
+            service = BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
+            with self.assertRaises(BenchmarkRunnerError) as caught:
                 await service.install()
         self.assertIn("no matching distribution", str(caught.exception))
 
@@ -691,16 +691,16 @@ class InstallTests(unittest.IsolatedAsyncioTestCase):
             async def communicate(self):
                 return b"Successfully installed llama-benchy-0.1.2", None
 
-        with patch("sparkdeck.benchy.asyncio.create_subprocess_exec",
+        with patch("sparkdeck.benchmark_runner.asyncio.create_subprocess_exec",
                    AsyncMock(return_value=OkProcess())):
-            service = BenchyService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
+            service = BenchmarkRunnerService(FakeManager(), FakeSparkdeck(), Path("data-unused"))
             with patch.object(service, "_probe_version", AsyncMock(return_value="0.1.2")):
                 status = await service.install()
         self.assertTrue(status["installed"])
         self.assertEqual(status["version"], "0.1.2")
 
 
-class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
+class BenchmarkRunnerApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         with patch("docker.from_env", return_value=Mock()):
             import server
@@ -717,9 +717,9 @@ class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
             "installed": True, "version": "0.1.2",
             "launch_mode": "path", "path_on_host": True,
         })
-        with patch.object(self.server.benchy, "detect", detect), \
-                patch.object(self.server.benchy, "active_run", Mock(return_value=None)):
-            response = await self.client.get("/api/v1/benchy/status")
+        with patch.object(self.server.benchmark_runner, "detect", detect), \
+                patch.object(self.server.benchmark_runner, "active_run", Mock(return_value=None)):
+            response = await self.client.get("/api/v1/benchmark-runner/status")
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["installed"])
@@ -728,23 +728,23 @@ class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_models_list_delegates_to_service(self):
         served = AsyncMock(return_value=[_target()])
-        with patch.object(self.server.benchy, "served_models", served):
-            response = await self.client.get("/api/v1/benchy/models")
+        with patch.object(self.server.benchmark_runner, "served_models", served):
+            response = await self.client.get("/api/v1/benchmark-runner/models")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["items"][0]["id"], "unsloth/Qwen3-4B-GGUF")
 
     async def test_models_list_strips_internal_credential_fields(self):
         served = AsyncMock(return_value=[{**_target(), "_api_key": "secret-key"}])
-        with patch.object(self.server.benchy, "served_models", served):
-            response = await self.client.get("/api/v1/benchy/models")
+        with patch.object(self.server.benchmark_runner, "served_models", served):
+            response = await self.client.get("/api/v1/benchmark-runner/models")
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("secret-key", response.text)
         self.assertNotIn("_api_key", response.text)
 
     async def test_start_run_passes_body_through(self):
         started = AsyncMock(return_value={"id": "run-1", "status": "running"})
-        with patch.object(self.server.benchy, "start_run", started):
-            response = await self.client.post("/api/v1/benchy/runs", json={
+        with patch.object(self.server.benchmark_runner, "start_run", started):
+            response = await self.client.post("/api/v1/benchmark-runner/runs", json={
                 "model_id": "m", "prompt_sizes": [512], "concurrency_levels": [1, 2],
             })
         self.assertEqual(response.status_code, 202)
@@ -752,27 +752,27 @@ class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_run_maps_validation_errors_to_400(self):
         with patch.object(
-            self.server.benchy, "start_run",
-            AsyncMock(side_effect=BenchyError("model_id is required")),
+            self.server.benchmark_runner, "start_run",
+            AsyncMock(side_effect=BenchmarkRunnerError("model_id is required")),
         ):
-            response = await self.client.post("/api/v1/benchy/runs", json={})
+            response = await self.client.post("/api/v1/benchmark-runner/runs", json={})
         self.assertEqual(response.status_code, 400)
         self.assertIn("model_id", response.json()["detail"])
 
     async def test_missing_run_returns_404(self):
         missing = LookupError("benchmark run not found")
-        with patch.object(self.server.benchy, "get_run", Mock(side_effect=missing)), \
-                patch.object(self.server.benchy, "csv_path", Mock(side_effect=missing)), \
-                patch.object(self.server.benchy, "delete_run", Mock(side_effect=missing)):
-            detail = await self.client.get("/api/v1/benchy/runs/missing")
-            csv = await self.client.get("/api/v1/benchy/runs/missing/csv")
-            deleted = await self.client.delete("/api/v1/benchy/runs/missing")
+        with patch.object(self.server.benchmark_runner, "get_run", Mock(side_effect=missing)), \
+                patch.object(self.server.benchmark_runner, "csv_path", Mock(side_effect=missing)), \
+                patch.object(self.server.benchmark_runner, "delete_run", Mock(side_effect=missing)):
+            detail = await self.client.get("/api/v1/benchmark-runner/runs/missing")
+            csv = await self.client.get("/api/v1/benchmark-runner/runs/missing/csv")
+            deleted = await self.client.delete("/api/v1/benchmark-runner/runs/missing")
         for response in (detail, csv, deleted):
             self.assertEqual(response.status_code, 404)
 
     async def test_runs_list_shape(self):
-        with patch.object(self.server.benchy, "list_runs", Mock(return_value=[])):
-            response = await self.client.get("/api/v1/benchy/runs")
+        with patch.object(self.server.benchmark_runner, "list_runs", Mock(return_value=[])):
+            response = await self.client.get("/api/v1/benchmark-runner/runs")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"items": []})
 
@@ -780,11 +780,11 @@ class BenchyApiTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as temp:
             csv_file = Path(temp) / "results.csv"
             csv_file.write_text("run_id,model\n1,m\n", encoding="utf-8")
-            with patch.object(self.server.benchy, "csv_path", Mock(return_value=csv_file)):
-                response = await self.client.get("/api/v1/benchy/runs/run-1/csv")
+            with patch.object(self.server.benchmark_runner, "csv_path", Mock(return_value=csv_file)):
+                response = await self.client.get("/api/v1/benchmark-runner/runs/run-1/csv")
             self.assertEqual(response.status_code, 200)
             self.assertIn("text/csv", response.headers["content-type"])
-            self.assertIn("benchy-run-1.csv", response.headers["content-disposition"])
+            self.assertIn("benchmark-run-run-1.csv", response.headers["content-disposition"])
 
 
 if __name__ == "__main__":

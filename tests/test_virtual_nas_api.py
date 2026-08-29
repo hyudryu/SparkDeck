@@ -601,11 +601,11 @@ class VirtualNASInventoryTests(unittest.TestCase):
             self.assertEqual(models[0]["revisions"], ["revision-1"])
 
     def test_inventory_marks_missing_runtime_requirements_partial(self):
-        # A snapshot with config but no tokenizer is unusable by Transformers
-        # runtimes and stays partial; a weights-only snapshot ships neither by
-        # design and counts as complete.
+        # A snapshot with only one of config/tokenizer is an interrupted
+        # Transformers download and stays partial; a weights-only snapshot
+        # ships neither by design and counts as complete.
         cases = {
-            "configuration": ({"tokenizer.json", "model.safetensors"}, False),
+            "configuration": ({"tokenizer.json", "model.safetensors"}, True),
             "tokenizer": ({"config.json", "model.safetensors"}, True),
         }
         for missing, (filenames, partial) in cases.items():

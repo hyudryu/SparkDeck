@@ -271,6 +271,38 @@ describe('BenchmarksPage community privacy', () => {
     ))).toBe(false)
   })
 
+  it('renders local history rows with unmeasured speed or TTFT as placeholders', async () => {
+    // Proxied captures can be recorded without timing data (ttft_ms and
+    // generation_tps stay NULL in storage), and the wire payload then carries
+    // JSON null instead of a number.
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown
+      if (path.endsWith('/api/v1/benchmark-models')) body = { items: [] }
+      else if (path.includes('/api/v1/benchmarks')) body = {
+        items: [{
+          id: 'sample-unmeasured', created_at: '2026-08-26T00:00:00Z',
+          model: { repository: 'org/model' }, runtime: 'vllm',
+          configuration: {}, latency_ms: 100, ttft_ms: null,
+          generation_tokens_per_second: null, eligible_for_community: false,
+        }],
+        total: 1, limit: 100, offset: 0,
+      }
+      else if (path.endsWith('/api/v1/community/aggregates')) body = {
+        items: [], availability: 'not_configured',
+        evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
+      }
+      else body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+
+    const history = await screen.findByRole('table', { name: 'Local benchmark history' })
+    expect(within(history).getByText('org/model')).toBeInTheDocument()
+    expect(within(history).getAllByText('—').length).toBeGreaterThanOrEqual(2)
+  })
+
   it('surfaces failed worker consent withdrawal and lets the user retry it', async () => {
     let consent = true
     let withdrawalAttempts = 0

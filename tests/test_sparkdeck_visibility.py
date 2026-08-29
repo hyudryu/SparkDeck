@@ -62,6 +62,76 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nodes[3]["free_size"], 0)
         self.assertEqual(nodes[3]["total_size"], 300)
 
+    async def test_inventory_propagates_hidden_from_dashboard(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True, "hidden_from_dashboard": True},
+            {"id": "node-2", "name": "Spark Two", "online": True},
+        ])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = []
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(return_value={"models": []})
+
+        nodes = await manager.model_cache_inventory()
+
+        self.assertTrue(nodes[0]["hidden_from_dashboard"])
+        self.assertFalse(nodes[1]["hidden_from_dashboard"])
+
+    async def test_partial_model_gains_expected_size_from_hub_tree(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True},
+        ])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{
+            "model_id": "org/model", "size_bytes": 10,
+            "partial": True, "revision": "main",
+        }]
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.node_registry = Mock()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.host, "huggingface.co")
+            self.assertEqual(request.url.path, "/api/models/org/model/tree/main")
+            return httpx.Response(200, json=[
+                {"path": "model.safetensors", "size": 1000},
+                {"path": "config.json", "size": 500},
+            ])
+
+        manager.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            nodes = await manager.model_cache_inventory(enrich_expected_sizes=True)
+        finally:
+            await manager.http.aclose()
+
+        self.assertEqual(nodes[0]["models"][0]["expected_size_bytes"], 1500)
+
+    async def test_partial_model_omits_expected_size_when_lookup_fails(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True},
+        ])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{
+            "model_id": "org/model", "size_bytes": 10,
+            "partial": True, "revision": "main",
+        }]
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.node_registry = Mock()
+        manager.http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(404, json={"error": "not found"}),
+        ))
+        try:
+            nodes = await manager.model_cache_inventory()
+        finally:
+            await manager.http.aclose()
+
+        model = nodes[0]["models"][0]
+        self.assertNotIn("expected_size_bytes", model)
+        self.assertEqual(model["size_bytes"], 10)
+
 
 class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_with_node_selection_relaunches_on_chosen_nodes(self):

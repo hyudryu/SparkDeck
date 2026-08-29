@@ -2735,9 +2735,14 @@ class VirtualNAS:
                             pass
                     result = await operation
                     received = _nonnegative_int((result or {}).get("bytes_received"))
-                    if received != actual_size:
-                        raise RuntimeError("target did not receive the complete direct transfer")
-                    job["bytes_transferred"] = received
+                    # The wire payload is a tar archive, so headers, padding,
+                    # and synthetic cache metadata make it larger than the
+                    # source model's logical size. Successful extraction plus
+                    # the inventory verification below establish completion;
+                    # exact archive/model byte equality is invalid.
+                    if received <= 0:
+                        raise RuntimeError("target did not receive a model archive")
+                    job["bytes_transferred"] = actual_size
                     source = None
                 else:
                     source_response = await self.node_registry.open_stream(

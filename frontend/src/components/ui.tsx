@@ -252,16 +252,16 @@ export function SplitButton({
   )
 }
 
-export function formatNumber(value?: number) {
-  if (value === undefined) return '—'
+export function formatNumber(value?: number | null) {
+  if (value == null) return '—'
   return Intl.NumberFormat('en', { notation: value >= 10_000 ? 'compact' : 'standard' }).format(value)
 }
 
-export function formatRate(value?: number) {
-  return value === undefined ? '—' : `${value.toFixed(1)} tok/s`
+export function formatRate(value?: number | null) {
+  return value == null ? '—' : `${value.toFixed(1)} tok/s`
 }
 
-export function formatDuration(value?: number) {
-  if (value === undefined) return '—'
+export function formatDuration(value?: number | null) {
+  if (value == null) return '—'
   return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`
 }

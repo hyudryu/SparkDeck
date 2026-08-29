@@ -344,8 +344,8 @@ export interface BenchmarkSample {
   input_tokens?: number
   output_tokens?: number
   latency_ms: number
-  ttft_ms?: number
-  tokens_per_second?: number
+  ttft_ms?: number | null
+  tokens_per_second?: number | null
   cold_start?: boolean
   upload_eligible?: boolean
   sync_state?: 'local' | 'pending' | 'synced' | 'failed' | 'waiting_for_account'

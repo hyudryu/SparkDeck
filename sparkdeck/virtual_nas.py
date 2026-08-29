@@ -33,6 +33,7 @@ VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-transfer-v1"
+ARCHIVE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -254,21 +255,34 @@ class _TarQueueWriter:
     def __init__(self, chunks: queue.Queue, stopped: threading.Event):
         self.chunks = chunks
         self.stopped = stopped
+        self.buffer = bytearray()
 
-    def write(self, value: bytes) -> int:
-        data = bytes(value)
+    def _publish(self, data: bytes) -> None:
         while data and not self.stopped.is_set():
             try:
                 self.chunks.put(data, timeout=0.1)
-                return len(data)
+                return
             except queue.Full:
                 continue
         if data:
             raise BrokenPipeError("archive consumer closed")
-        return 0
+
+    def write(self, value: bytes) -> int:
+        data = bytes(value)
+        if data and self.stopped.is_set():
+            raise BrokenPipeError("archive consumer closed")
+        self.buffer.extend(data)
+        while len(self.buffer) >= ARCHIVE_STREAM_CHUNK_BYTES:
+            chunk = bytes(self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES])
+            del self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES]
+            self._publish(chunk)
+        return len(data)
 
     def flush(self) -> None:
-        return None
+        if self.buffer:
+            chunk = bytes(self.buffer)
+            self.buffer.clear()
+            self._publish(chunk)
 
 
 class _TrackedExport:
@@ -1169,6 +1183,10 @@ class VirtualNAS:
 
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
+                    # tarfile writes small blocks efficiently. Coalesce them in
+                    # the mutable queue writer so each network yield is large
+                    # without tarfile quadratically rebuilding a huge immutable
+                    # internal buffer.
                     with tarfile.open(fileobj=writer, mode="w|") as archive:
                         if external_files is None:
                             archive.add(repository, arcname=repository.name, recursive=True)
@@ -1176,6 +1194,7 @@ class VirtualNAS:
                             _write_external_bundle_archive(
                                 archive, model_id, external_files,
                             )
+                    writer.flush()
                 except BrokenPipeError:
                     pass
                 except BaseException as exc:
@@ -1281,7 +1300,9 @@ class VirtualNAS:
                 }) as response:
                     response.raise_for_status()
                     async def tracked() -> AsyncIterator[bytes]:
-                        async for chunk in response.aiter_bytes():
+                        async for chunk in response.aiter_bytes(
+                            chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                        ):
                             if record["cancel"].is_set():
                                 raise TransferCanceled()
                             record["bytes_transferred"] += len(chunk)
@@ -1533,6 +1554,7 @@ class VirtualNAS:
                             archive.addfile(
                                 info, io.BytesIO(_SELECTIVE_MARKER_CONTENT),
                             )
+                    writer.flush()
                 except BrokenPipeError:
                     pass
                 except BaseException as exc:
@@ -1776,7 +1798,9 @@ class VirtualNAS:
                     timeout=3600, use_fabric=True,
                 )
                 await _raise_remote_status(source_response, "source")
-                source = source_response.aiter_bytes()
+                source = source_response.aiter_bytes(
+                    chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                )
             if target_node_id == LOCAL_NODE_ID:
                 return await self.import_model_files(
                     model_id, source, required_model_bytes=expected,
@@ -2720,9 +2744,14 @@ class VirtualNAS:
                             pass
                     result = await operation
                     received = _nonnegative_int((result or {}).get("bytes_received"))
-                    if received != actual_size:
-                        raise RuntimeError("target did not receive the complete direct transfer")
-                    job["bytes_transferred"] = received
+                    # The wire payload is a tar archive, so headers, padding,
+                    # and synthetic cache metadata make it larger than the
+                    # source model's logical size. Successful extraction plus
+                    # the inventory verification below establish completion;
+                    # exact archive/model byte equality is invalid.
+                    if received <= 0:
+                        raise RuntimeError("target did not receive a model archive")
+                    job["bytes_transferred"] = actual_size
                     source = None
                 else:
                     source_response = await self.node_registry.open_stream(
@@ -2731,7 +2760,9 @@ class VirtualNAS:
                         timeout=3600, use_fabric=True,
                     )
                     await _raise_remote_status(source_response, "source")
-                    source = source_response.aiter_bytes()
+                    source = source_response.aiter_bytes(
+                        chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                    )
 
             async def tracked() -> AsyncIterator[bytes]:
                 async for chunk in source:

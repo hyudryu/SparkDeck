@@ -970,9 +970,12 @@ async def agent_virtual_nas_export_capability(model_id: str, req: Request):
     _require_agent(req)
     try:
         body = await req.json()
-        if not isinstance(body, dict) or set(body) != {"revision"} or not isinstance(body["revision"], str):
+        if not isinstance(body, dict) or set(body) != {"revision"} or body["revision"] is not None and not isinstance(body["revision"], str):
             raise ValueError("direct transfer capability request requires a revision")
-        return {"capability": manager.virtual_nas.issue_direct_export_capability(model_id, body["revision"])}
+        capability = await asyncio.to_thread(
+            manager.virtual_nas.issue_direct_export_capability, model_id, body["revision"],
+        )
+        return {"capability": capability}
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (TypeError, ValueError, LookupError, RuntimeError) as exc:
@@ -998,7 +1001,7 @@ async def agent_virtual_nas_import_from_peer(model_id: str, req: Request):
     try:
         body = await req.json()
         if not isinstance(body, dict) or set(body) != {
-            "source_agent_url", "source_capability", "expected_bytes", "model_bytes",
+            "source_agent_url", "source_capability", "model_bytes", "transfer_id",
         }:
             raise ValueError("direct transfer request has invalid fields")
         source_agent_url = normalize_agent_url(body["source_agent_url"])
@@ -1006,22 +1009,40 @@ async def agent_virtual_nas_import_from_peer(model_id: str, req: Request):
             raise ValueError("direct transfer source must use HTTP on the fabric")
         ipaddress.ip_address(urlsplit(source_agent_url).hostname or "")
         source_capability = body["source_capability"]
-        expected_bytes = body["expected_bytes"]
         model_bytes = body["model_bytes"]
+        transfer_id = body["transfer_id"]
         if (
             not isinstance(source_capability, str)
-            or isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes < 0
             or isinstance(model_bytes, bool) or not isinstance(model_bytes, int) or model_bytes <= 0
+            or not isinstance(transfer_id, str) or not transfer_id
         ):
             raise ValueError("direct transfer request has invalid values")
         result = await manager.virtual_nas.import_model_from_peer(
             model_id, source_agent_url, source_capability,
-            req.headers.get(COORDINATOR_ID_HEADER, ""), expected_bytes, model_bytes,
+            req.headers.get(COORDINATOR_ID_HEADER, ""), model_bytes, transfer_id,
         )
         return _public_storage_payload(result)
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (TypeError, ValueError, LookupError, RuntimeError, FileExistsError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.get("/api/agent/virtual-nas/models/{model_id:path}/peer-imports/{transfer_id}")
+async def agent_virtual_nas_peer_import_status(model_id: str, transfer_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return manager.virtual_nas.peer_import_status(transfer_id)
+    except LookupError as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.delete("/api/agent/virtual-nas/models/{model_id:path}/peer-imports/{transfer_id}")
+async def agent_virtual_nas_cancel_peer_import(model_id: str, transfer_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return manager.virtual_nas.cancel_peer_import(transfer_id)
+    except LookupError as exc:
         raise _storage_error(exc) from exc
 
 

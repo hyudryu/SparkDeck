@@ -63,10 +63,10 @@ function compareJobsNewestFirst(left: StorageTransferJob, right: StorageTransfer
 function formatTransferRate(job: StorageTransferJob) {
   if (!job.bytes_per_second || job.bytes_per_second <= 0) return undefined
   const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s']
-  const exponent = Math.min(
+  const exponent = Math.max(0, Math.min(
     Math.floor(Math.log10(job.bytes_per_second) / 3),
     units.length - 1,
-  )
+  ))
   const rate = job.bytes_per_second / 1000 ** exponent
   const digits = rate >= 100 ? 0 : rate >= 10 ? 1 : 2
   return `${rate.toFixed(digits)} ${units[exponent]} avg`

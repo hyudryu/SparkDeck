@@ -300,7 +300,7 @@ describe('model discovery', () => {
 
     render(<MemoryRouter initialEntries={['/models?model=org/chosen-model&runtime=sglang']}><ModelsPage /></MemoryRouter>)
 
-    expect(await screen.findByRole('dialog', { name: 'Add a model server' })).toBeInTheDocument()
+    expect(await screen.findByRole('dialog', { name: 'Create deployment' })).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('org/chosen-model')
     expect(screen.getByRole('textbox', { name: 'Display name' })).toHaveValue('chosen-model')
     await waitFor(() => {
@@ -340,16 +340,16 @@ describe('model discovery', () => {
       '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=artifacts%2Fqwen3.8-q4_k_m.gguf',
     ]}><ModelsPage /></MemoryRouter>)
 
-    const dialog = await screen.findByRole('dialog', { name: 'Add a model server' })
+    const dialog = await screen.findByRole('dialog', { name: 'Create deployment' })
     expect(within(dialog).getByRole('textbox', { name: 'Model repository or GGUF artifact' })).toHaveValue('RadixArk/Qwen3.8-27B')
     expect(within(dialog).getByRole('textbox', { name: 'Quantization (optional)' })).toHaveValue('Q4_K_M')
-    expect(within(dialog).getByRole('textbox', { name: 'GGUF artifact' })).toHaveValue('artifacts/qwen3.8-q4_k_m.gguf')
+    expect(within(dialog).getByRole('textbox', { name: /^GGUF artifact/ })).toHaveValue('artifacts/qwen3.8-q4_k_m.gguf')
     await waitFor(() => {
       expect(within(dialog).getByRole('combobox', { name: 'Runtime' })).toHaveValue('llama.cpp')
       expect(within(dialog).getByRole('spinbutton', { name: 'Context length' })).toHaveValue(24576)
     })
 
-    await user.click(within(dialog).getByRole('button', { name: 'Add to 1 node' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Save deployment' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments',
       expect.objectContaining({ method: 'POST' }),
@@ -397,7 +397,7 @@ describe('model discovery', () => {
 
     render(<MemoryRouter initialEntries={['/models?model=zai-org/GLM-5.3-Flash&layout=sharded']}><ModelsPage /></MemoryRouter>)
 
-    const dialog = await screen.findByRole('dialog', { name: 'Add a model server' })
+    const dialog = await screen.findByRole('dialog', { name: 'Create deployment' })
     await waitFor(() => expect(within(dialog).getAllByRole('combobox')).toHaveLength(2))
     const deploymentLayout = within(dialog).getAllByRole('combobox')[1]
     await waitFor(() => expect(deploymentLayout).toHaveValue('sharded'))
@@ -415,7 +415,7 @@ describe('model discovery', () => {
     await user.selectOptions(deploymentLayout, 'sharded')
     expect(tensorParallel).toHaveValue(4)
 
-    await user.click(within(dialog).getByRole('button', { name: 'Add to 4 nodes' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Save deployment' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments',
       expect.objectContaining({
@@ -1268,7 +1268,7 @@ describe('model deployments', () => {
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Saved configurations: saved configurations unavailable')
-    expect(screen.getByText('No model servers yet')).toBeInTheDocument()
+    expect(screen.getByText('No deployments yet')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
   })
 
@@ -1282,7 +1282,7 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Add model' }))
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
 
     const contextLength = screen.getByRole('spinbutton', { name: 'Context length' })
     const runtime = screen.getByRole('combobox', { name: 'Runtime' })
@@ -1313,14 +1313,14 @@ describe('model deployments', () => {
     })
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Add model' }))
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
 
     await user.type(screen.getByRole('textbox', { name: 'Display name' }), 'Flagged model')
     await user.type(screen.getByRole('textbox', { name: 'Model repository or GGUF artifact' }), 'org/model')
     await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
     await user.type(screen.getByRole('spinbutton', { name: 'GPU memory util' }), '0.85')
     await user.type(screen.getByRole('textbox', { name: 'Extra flags' }), '--served-model-name "My Model" --kv-cache-dtype fp8')
-    await user.click(screen.getByRole('button', { name: 'Add to 1 node' }))
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments',
@@ -1342,7 +1342,7 @@ describe('model deployments', () => {
         }),
       }),
     ))
-    expect(await screen.findByText('Added Flagged model on This device.')).toBeInTheDocument()
+    expect(await screen.findByText('Saved Flagged model. Launch it from the deployments list when ready.')).toBeInTheDocument()
   })
 
   it('groups saved configurations by company and pins cards within a group', async () => {
@@ -1488,7 +1488,7 @@ describe('model deployments', () => {
     expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Three/ })).toBeDisabled()
-    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 2 nodes' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments/dep-1/start',
@@ -1526,7 +1526,7 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Start Solo model' })
     expect(within(dialog).getByRole('radio', { name: /Spark Two/ })).toBeChecked()
     expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeDisabled()
-    await user.click(within(dialog).getByRole('button', { name: 'Start on 1 node' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments/dep-2/start',
@@ -1567,7 +1567,7 @@ describe('model deployments', () => {
       const path = String(input)
       const body = path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-llama', alias: 'Local GGUF', runtime: 'llama.cpp', kind: 'managed',
-        model: { repository: 'org/llama-artifact' }, status: 'stopped', settings: {},
+        model: { repository: 'org/llama-artifact', artifact: '/models/local.gguf' }, status: 'stopped', settings: {},
         node_ids: ['local'], deployment_mode: 'single', required_node_count: 1,
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
@@ -1582,8 +1582,159 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Start Local GGUF' })
     expect(within(dialog).getByRole('radio', { name: /Controller/ })).toBeChecked()
     expect(within(dialog).getByRole('radio', { name: /Worker/ })).toBeDisabled()
-    expect(within(dialog).getByRole('button', { name: 'Start on 1 node' })).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: 'Launch on 1 node' })).toBeEnabled()
     expect(dialog).toHaveTextContent('This local artifact can run only on the controller')
+  })
+
+  it('launches a saved deployment after transferring weights via Virtual NAS', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      const method = init?.method ?? 'GET'
+      if (path === '/api/v1/deployments/dep-saved/prepare/preflight' && method === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main',
+          source: { node_id: 'node-2', node_name: 'Spark Two', size_bytes: 1000 },
+          sources: [{ node_id: 'node-2', node_name: 'Spark Two', size_bytes: 1000 }],
+          targets: [
+            { node_id: 'local', node_name: 'Spark One', eligible: true, has_required_weights: false, free_bytes: 900, required_free_bytes: 500 },
+            { node_id: 'node-2', node_name: 'Spark Two', eligible: true, has_required_weights: true },
+          ],
+          node_ids: ['local', 'node-2'], eligible: true, action: 'transfer',
+          download_node_id: null, download_node_ids: [],
+          transfer_target_node_ids: ['local'], reason: null,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-saved/prepare' && method === 'POST') {
+        expect(JSON.parse(String(init?.body))).toEqual({ node_ids: ['local'] })
+        return new Response(JSON.stringify({
+          workflow_id: 'wf-1', job_ids: ['job-1'],
+          jobs: [{ id: 'job-1', model_id: 'org/model', source_node_id: 'node-2', source_node_name: 'Spark Two', target_node_id: 'local', target_node_name: 'Spark One', status: 'queued', bytes_total: 1000, bytes_transferred: 0, created_at: 1 }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/storage') {
+        return new Response(JSON.stringify({
+          enabled: true, nodes: [], instructions: [],
+          jobs: [{ id: 'job-1', model_id: 'org/model', source_node_id: 'node-2', source_node_name: 'Spark Two', target_node_id: 'local', target_node_name: 'Spark One', status: 'completed', bytes_total: 1000, bytes_transferred: 1000, created_at: 1 }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-saved/start' && method === 'POST') {
+        expect(JSON.parse(String(init?.body))).toEqual({ node_ids: ['local'] })
+        return new Response(JSON.stringify({
+          id: 'dep-saved', alias: 'Saved model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local'],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-saved', alias: 'Saved model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'saved', settings: {}, node_ids: ['local'],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Saved model' })
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' })).toBeEnabled()
+    await user.click(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' }))
+
+    expect(await screen.findByRole('dialog', { name: 'Prepare model weights?' })).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Transfer & launch' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-saved/start',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['local'] }) }),
+    ))
+    expect(await screen.findByText('Starting Saved model on This device.')).toBeInTheDocument()
+  })
+
+  it('keeps viable nodes launchable when an unrelated node lacks cache space', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-mixed/prepare/preflight' && (init?.method ?? 'GET') === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main',
+          source: null, sources: [],
+          download: { size_bytes: 5_000_000_000, required_free_bytes: 10_000_000_000 },
+          targets: [
+            { node_id: 'local', node_name: 'Spark One', eligible: true, has_required_weights: false, has_model_cache: false, free_bytes: 900, download_eligible: true },
+            { node_id: 'node-2', node_name: 'Spark Two', eligible: false, has_required_weights: false, has_model_cache: false, free_bytes: 100, download_eligible: false, download_reason: 'Not enough free cache space for the Hugging Face download' },
+          ],
+          node_ids: ['local', 'node-2'], eligible: true, action: 'download',
+          download_node_id: 'local', download_node_ids: ['local'],
+          transfer_target_node_ids: [], reason: null,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-mixed', alias: 'Mixed nodes', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'saved', settings: {}, node_ids: ['local'],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Mixed nodes' })
+    await waitFor(() => expect(
+      within(dialog).getByRole('radio', { name: /Spark Two/ }),
+    ).toBeDisabled())
+    // Spark One can receive the weights, so the launch stays available even
+    // though Spark Two is blocked by its own cache capacity.
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
+    expect(within(dialog).getByRole('button', { name: /launch on 1 node/i })).toBeEnabled()
+  })
+
+  it('blocks a saved deployment launch when no node has enough free cache space', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-full/prepare/preflight' && (init?.method ?? 'GET') === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main',
+          source: null, sources: [],
+          download: { size_bytes: 5_000_000_000, required_free_bytes: 10_000_000_000 },
+          targets: [
+            { node_id: 'local', node_name: 'Spark One', eligible: false, has_required_weights: false, has_model_cache: false, free_bytes: 100, download_eligible: false, download_reason: 'Not enough free cache space for the Hugging Face download', transfer_after_download_eligible: false, transfer_after_download_reason: 'Not enough free cache space for Virtual NAS staging' },
+          ],
+          node_ids: ['local'], eligible: false, action: 'download',
+          download_node_id: null, download_node_ids: [],
+          transfer_target_node_ids: ['local'],
+          reason: 'Not enough free cache space for the Hugging Face download',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-full', alias: 'Too big', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'saved', settings: {}, node_ids: ['local'],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Too big' })
+    await waitFor(() => expect(
+      within(dialog).getByRole('radio', { name: /Spark One/ }),
+    ).toBeDisabled())
+    expect(within(dialog).getByRole('button', { name: /launch on 1 node/i })).toBeDisabled()
+    expect(dialog).toHaveTextContent('Only 0 of 1 required node is launchable')
   })
 
   it('keeps the persisted replicated layout even when tensor parallelism is 1', async () => {
@@ -1613,7 +1764,7 @@ describe('model deployments', () => {
     expect(dialog).toHaveTextContent('exactly 2 nodes')
     expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()
     expect(within(dialog).getByRole('checkbox', { name: /Spark Two/ })).toBeChecked()
-    expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: 'Launch on 2 nodes' })).toBeEnabled()
   })
 
   it('sorts deployments by recency or name and renames them inline', async () => {

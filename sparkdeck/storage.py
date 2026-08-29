@@ -357,6 +357,23 @@ class SparkDeckStore:
                 (alias, deployment_id),
             )
 
+    def update_deployment_model(
+        self, deployment_id: str, model: dict[str, Any],
+    ) -> None:
+        """Persist edited model-identity fields of a saved deployment."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE deployments SET repository = ?, revision = ?, artifact = ?, "
+                "quantization = ? WHERE id = ?",
+                (
+                    str(model.get("repository") or ""),
+                    model.get("revision"),
+                    model.get("artifact"),
+                    model.get("quantization"),
+                    deployment_id,
+                ),
+            )
+
     def update_desired_state(self, deployment_id: str, desired_state: str) -> None:
         if desired_state not in {"running", "stopped"}:
             raise ValueError("desired_state must be running or stopped")

@@ -482,11 +482,15 @@ class LlamaCppHomesContractTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.temp.cleanup()
 
-    async def test_homes_require_the_controller_first(self):
-        with self.assertRaisesRegex(ValueError, "first selected node must be the controller"):
-            self.service._llama_cpp_artifact_homes(
-                ["worker-1", "local"], {"download_node_id": "worker-1"},
-            )
+    async def test_homes_accept_any_node_order(self):
+        # Llama server now runs on any selected node, so a selection without
+        # the controller is a valid home set and keeps its order.
+        homes, seed = self.service._llama_cpp_artifact_homes(
+            ["worker-1", "local"], {"download_node_id": "worker-1"},
+        )
+
+        self.assertEqual(homes, ["worker-1", "local"])
+        self.assertEqual(seed, "worker-1")
 
     async def test_homes_default_to_controller_only_when_no_nodes_requested(self):
         homes, seed = self.service._llama_cpp_artifact_homes(None, {})

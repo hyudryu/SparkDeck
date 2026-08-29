@@ -153,6 +153,7 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             captured.append(request)
             return httpx.Response(200, json={
                 "id": "unsloth/Qwen3.8-27B-GGUF",
+                "sha": "d" * 40,
                 "tags": ["gguf"],
                 "gguf": {"total": 27_000_000_000},
                 "siblings": [
@@ -171,6 +172,10 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured[0].url.path, "/api/models/unsloth/Qwen3.8-27B-GGUF")
         self.assertIn("siblings", captured[0].url.params.get_list("expand[]"))
+        # The resolved commit must be requested so clients can compare
+        # cached snapshot revisions against the current file listing.
+        self.assertIn("sha", captured[0].url.params.get_list("expand[]"))
+        self.assertEqual(item["revision"], "d" * 40)
         self.assertEqual(item["parameter_count"], 27_000_000_000)
         self.assertEqual(
             [(value["name"], value["weight_size_bytes"]) for value in item["quantizations"]],

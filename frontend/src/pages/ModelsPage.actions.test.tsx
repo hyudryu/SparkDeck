@@ -296,7 +296,7 @@ describe('deployment creator model and quantization pickers', () => {
     aggregates: [],
   })
 
-  function mockGgufCluster(revision = CACHED_SHA) {
+  function mockGgufCluster(revision = CACHED_SHA, catalogOverrides: Record<string, unknown> = {}) {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
       if (path === '/api/v1/deployments') {
@@ -309,7 +309,21 @@ describe('deployment creator model and quantization pickers', () => {
         return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path === '/api/v1/catalog/models/org%2Fgguf') {
-        return new Response(JSON.stringify(ggufCatalog(revision)), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        return new Response(JSON.stringify({ ...ggufCatalog(revision), ...catalogOverrides }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fother') {
+        return new Response(JSON.stringify({
+          model: {
+            id: 'org/other',
+            revision: 'c'.repeat(40),
+            quantizations: [{
+              name: 'R1',
+              files: [{ filename: 'other-R1.gguf', size_bytes: 900 }],
+              weight_size_bytes: 900,
+            }],
+          },
+          aggregates: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path === '/api/v1/recipes') {
         return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -372,6 +386,62 @@ describe('deployment creator model and quantization pickers', () => {
     await user.selectOptions(quantSelect, '')
     expect(quantSelect).toHaveValue('')
     expect(artifactSelect).toHaveValue('')
+  })
+
+  it('adopts the canonical repository id after a Hub rename redirect', async () => {
+    const user = userEvent.setup()
+    const redirected = ggufCatalog(CACHED_SHA)
+    mockGgufCluster(CACHED_SHA, { model: { ...redirected.model, id: 'org/gguf-renamed' } })
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+
+    // The listing resolved for the typed query is trusted even though the
+    // Hub answered with the canonical id, and the form adopts it.
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    await waitFor(() => {
+      expect(screen.getByLabelText('Model repository or GGUF artifact')).toHaveValue('org/gguf-renamed')
+    })
+    // The dropdowns survive the adoption; the cached files are keyed by the
+    // old repository id, so the downloaded mark honestly disappears.
+    expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B' })).toBeInTheDocument()
+    expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
+  })
+
+  it('clears repository-derived selections when the model id changes', async () => {
+    const user = userEvent.setup()
+    mockGgufCluster()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    const modelInput = screen.getByLabelText('Model repository or GGUF artifact')
+    await user.type(modelInput, 'org/gguf')
+
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    await user.selectOptions(quantSelect, 'Q8_0')
+
+    const artifactSelect = screen.getByRole('combobox', { name: /GGUF artifact/ })
+    expect(artifactSelect).toHaveValue('Llama-3.2-1B-Q8_0.gguf')
+
+    await user.clear(screen.getByLabelText('Model repository or GGUF artifact'))
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/other')
+
+    // The other repository's listing does not carry the previously picked
+    // artifact or quantization, so both reset instead of saving a broken
+    // combination.
+    const dialog = screen.getByRole('dialog')
+    await within(dialog).findByRole('option', { name: 'R1 · 900 B' })
+    // The fields swap between text inputs and dropdowns while the listing
+    // loads, so re-query them instead of reusing the old elements.
+    expect(within(dialog).getByRole('combobox', { name: /Quantization/ })).toHaveValue('')
+    expect(within(dialog).getByRole('combobox', { name: /GGUF artifact/ })).toHaveValue('')
   })
 
   it('withholds downloaded marks when the listing resolves a newer revision', async () => {

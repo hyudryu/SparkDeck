@@ -625,10 +625,28 @@ export function ModelsPage() {
   )
   const trimmedModelId = form.model_id.trim()
   const createCatalogData = createCatalogModel.data?.model
-  // Only trust the listing while it still describes the model id currently
-  // in the form; a failed lookup for a new id must not keep showing the
-  // previous repository's files.
-  const createCatalogUsable = Boolean(trimmedModelId && createCatalogData?.id === trimmedModelId)
+  // Trust the listing while it was fetched for the model id currently in
+  // the form: an exact id match, or a listing resolved for this very query
+  // (the Hub follows repository renames and answers with the canonical
+  // id). A failed lookup for a new id must not keep showing a previous
+  // repository's files.
+  const createCatalogUsable = Boolean(
+    trimmedModelId
+    && createCatalogData?.id
+    && (createCatalogData.id === trimmedModelId || catalogModelQuery === trimmedModelId),
+  )
+
+  // Adopt the canonical repository id after a rename redirect: the Hub
+  // resolved this exact query, so point the form at the canonical name
+  // instead of rejecting the successful listing.
+  useEffect(() => {
+    const canonicalId = createCatalogModel.data?.model?.id
+    if (!canonicalId || !catalogModelQuery || canonicalId === catalogModelQuery) return
+    setForm((current) => (
+      current.model_id.trim() === catalogModelQuery ? { ...current, model_id: canonicalId } : current
+    ))
+  }, [createCatalogModel.data, catalogModelQuery])
+
   const createQuantizations = createCatalogUsable
     ? (createCatalogData?.quantizations ?? EMPTY_QUANTIZATIONS)
     : EMPTY_QUANTIZATIONS
@@ -648,6 +666,33 @@ export function ModelsPage() {
     const files = revision ? entry.filesByRevision.get(revision) : undefined
     return files?.size ? files : EMPTY_CACHED_FILES
   }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
+
+  // Drop repository-derived quantization and artifact selections that the
+  // current listing does not offer (picked from a previous repository, or
+  // renamed away upstream): they would fail at launch while looking valid
+  // in the form. vLLM/SGLang free-text quantization and local artifact
+  // paths are not repository-derived and stay untouched.
+  useEffect(() => {
+    if (!createCatalogUsable) return
+    setForm((current) => {
+      if (current.runtime !== 'llama.cpp') return current
+      const quantization = current.settings.quantization
+      const artifact = current.settings.artifact
+      const nextQuantization = quantization
+        && createQuantizations.length > 0
+        && !createQuantizations.some((variant) => variant.name === quantization)
+        ? undefined
+        : quantization
+      const nextArtifact = artifact
+        && !isLocalArtifact(artifact)
+        && createArtifactOptions.length > 0
+        && !createArtifactOptions.some((option) => option.filename === artifact)
+        ? undefined
+        : artifact
+      if (nextQuantization === quantization && nextArtifact === artifact) return current
+      return { ...current, settings: { ...current.settings, quantization: nextQuantization, artifact: nextArtifact } }
+    })
+  }, [createCatalogUsable, createQuantizations, createArtifactOptions])
 
   const updateCreateQuantization = (name: string) => setForm((current) => {
     if (current.runtime !== 'llama.cpp') {
@@ -1853,8 +1898,6 @@ export function ModelsPage() {
                       {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFiles))}
                     </option>
                   ))}
-                  {form.settings.quantization && !createQuantizations.some((variant) => variant.name === form.settings.quantization)
-                    && <option value={form.settings.quantization}>{form.settings.quantization} (manual)</option>}
                 </select>
                 <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
               </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
@@ -1870,8 +1913,6 @@ export function ModelsPage() {
                       {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFiles))}
                     </option>
                   ))}
-                  {form.settings.artifact && !createArtifactOptions.some((option) => option.filename === form.settings.artifact)
-                    && <option value={form.settings.artifact}>{form.settings.artifact} (manual)</option>}
                 </select>
                 <small>The repository publishes one GGUF file per quantization; the chosen file is what nodes download from {form.model_id}. An absolute local path runs on this device only.</small>
               </label> : form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>}

@@ -135,7 +135,7 @@ class HuggingFaceCatalog:
                 *(('expand[]', field) for field in (
                     "author", "downloads", "likes", "tags", "safetensors",
                     "gguf", "pipeline_tag", "gated", "private", "lastModified",
-                    "siblings",
+                    "siblings", "sha",
                 )),
             ]
             request_headers = {

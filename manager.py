@@ -1742,7 +1742,7 @@ class Manager:
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
-        nodes = await self.model_cache_inventory()
+        nodes = await self.model_cache_inventory(enrich_expected_sizes=True)
         models_by_node = {
             str(node.get("id")): {
                 str(model.get("model_id")): model
@@ -1804,7 +1804,9 @@ class Manager:
             == resolved_revision
         )
 
-    async def model_cache_inventory(self) -> list[dict]:
+    async def model_cache_inventory(
+        self, enrich_expected_sizes: bool = False,
+    ) -> list[dict]:
         """Return safe Hugging Face cache sizes even when transfers are off.
 
         The Models page needs read-only disk accounting independently of the
@@ -1846,6 +1848,7 @@ class Manager:
             return {
                 "id": node.get("id"), "name": node.get("name"),
                 "online": online,
+                "hidden_from_dashboard": bool(node.get("hidden_from_dashboard")),
                 "virtual_nas_download_capable": bool(
                     node.get("id") == LOCAL_NODE_ID
                     or VIRTUAL_NAS_DOWNLOAD_CAPABILITY
@@ -1858,7 +1861,122 @@ class Manager:
             }
 
         nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
+        if enrich_expected_sizes:
+            await self._enrich_partial_model_sizes(list(nodes))
         return list(nodes)
+
+    async def _enrich_partial_model_sizes(self, nodes: list[dict]) -> None:
+        """Annotate partial hub-cache models with their expected total size.
+
+        The Hub tree lookup is best-effort display enrichment: any failure
+        simply omits ``expected_size_bytes`` and never fails the inventory.
+        """
+        targets: dict[tuple[str, str], None] = {}
+        for node in nodes:
+            for model in node.get("models") or []:
+                if not model.get("partial") or model.get("externally_managed"):
+                    continue
+                model_id = str(model.get("model_id") or "")
+                if not model_id:
+                    continue
+                revision = model.get("revision")
+                if not isinstance(revision, str) or not revision.strip():
+                    continue
+                revision = revision.strip()
+                targets.setdefault((model_id, revision))
+        if not targets:
+            return
+        semaphore = asyncio.Semaphore(4)
+
+        async def lookup(model_id: str, revision: str) -> int | None:
+            async with semaphore:
+                return await self._expected_model_size_bytes(model_id, revision)
+
+        results = await asyncio.gather(*(
+            lookup(model_id, revision) for model_id, revision in targets
+        ))
+        expected = dict(zip(targets, results))
+        for node in nodes:
+            for model in node.get("models") or []:
+                if not model.get("partial") or model.get("externally_managed"):
+                    continue
+                key = (
+                    str(model.get("model_id") or ""),
+                    str(model.get("revision") or ""),
+                )
+                size = expected.get(key)
+                if size:
+                    model["expected_size_bytes"] = size
+
+    async def _expected_model_size_bytes(
+        self, model_id: str, revision: str,
+    ) -> int | None:
+        """Return the full repository size, cached for an hour per revision."""
+        cache = getattr(self, "_expected_model_size_cache", None)
+        if cache is None:
+            cache = self._expected_model_size_cache = {}
+        key = (model_id.casefold(), revision)
+        now = time.monotonic()
+        cached = cache.get(key)
+        if cached and now - cached[0] < 3600:
+            return cached[1]
+        try:
+            validate_model_id(model_id)
+            validate_revision(revision)
+            size: int | None = await self._fetch_model_tree_size(
+                model_id, revision,
+            )
+        except Exception:
+            size = None
+        # Failures are cached too so the polling dashboard cannot re-hammer
+        # Hugging Face for a repository that keeps failing.
+        cache[key] = (now, size)
+        return size
+
+    async def _fetch_model_tree_size(self, model_id: str, revision: str) -> int:
+        """Sum file sizes across the paginated Hugging Face tree listing."""
+        tree_path = (
+            f"/api/models/{quote(model_id, safe='/')}"
+            f"/tree/{quote(revision, safe='')}"
+        )
+        tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
+        params: dict[str, Any] | None = {"recursive": "true", "limit": 1000}
+        total = 0
+        seen_pages: set[str] = set()
+        while True:
+            headers = {}
+            token = self._resolved_hf_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            response = await self.http.get(
+                tree_url, params=params, headers=headers or None, timeout=5,
+            )
+            response.raise_for_status()
+            current_page = str(response.url)
+            if current_page in seen_pages:
+                raise ValueError("Hugging Face returned a repeated model tree page")
+            seen_pages.add(current_page)
+            page = response.json()
+            if not isinstance(page, list):
+                raise ValueError("Hugging Face returned an invalid model tree")
+            total += sum(
+                int(entry.get("size") or 0)
+                for entry in page
+                if isinstance(entry, dict)
+            )
+            next_href = response.links.get("next", {}).get("url")
+            if not next_href:
+                break
+            next_url = response.url.join(str(next_href))
+            if (
+                next_url.scheme != "https"
+                or next_url.host != "huggingface.co"
+                or not next_url.path.startswith(tree_path)
+            ):
+                raise ValueError("Hugging Face returned an unsafe model tree page")
+            tree_url = next_url
+            params = None
+        return total
 
     async def queue_virtual_nas_transfer(
         self, model_id: str, source_node_id: str,

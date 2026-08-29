@@ -1104,6 +1104,8 @@ describe('model deployments', () => {
       '/api/v1/deployments/dep-remove', expect.objectContaining({ method: 'DELETE' }),
     ))
     await waitFor(() => expect(screen.queryByRole('link', { name: 'Remove accepted' })).not.toBeInTheDocument())
+    expect(screen.getByText('No deployments yet')).toBeInTheDocument()
+    expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
 
     resolveInitialList(new Response(JSON.stringify({ items: [] }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

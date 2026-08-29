@@ -1557,7 +1557,7 @@ export function ModelsPage() {
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
-      {!resource.loading && !resource.error && resource.data?.length === 0 && (
+      {!resource.error && resource.data?.length === 0 && (
         <EmptyState title="No deployments yet" description="Save a deployment for any runtime, then launch it on the nodes you choose." action={<Button variant="primary" onClick={openCreator}>Create your first deployment</Button>} />
       )}
       {resource.data && resource.data.length > 0 && (

@@ -40,7 +40,7 @@ from .storage import (
     SparkDeckStore,
     community_context_window,
 )
-from .virtual_nas import LOCAL_NODE_ID
+from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -1250,18 +1250,24 @@ class SparkDeckService:
         self, stored: dict[str, Any], changes: dict[str, Any],
     ) -> dict[str, Any]:
         """Edit a saved deployment bookmark before its first launch."""
+        # The keys the DeploymentPage editor submits on the manager-backed
+        # contract are translated below so an unchanged detail form saves
+        # cleanly against a bookmark that Manager has never seen.
         allowed = {
             "context_length", "tensor_parallel_size", "parallel_slots",
             "gpu_layers", "quantization", "artifact", "extra_args",
             "gpu_memory_utilization", "node_ids", "deployment_mode",
+            "launch_controls", "gpu_memory_gb",
+            "sg_tp_size", "sg_mem_fraction",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
         settings = dict(stored.get("settings") or {})
+        runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         numeric_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
-            "gpu_layers", "gpu_memory_utilization",
+            "gpu_layers", "gpu_memory_utilization", "gpu_memory_gb",
         )
         for field in numeric_fields:
             if field not in changes:
@@ -1282,8 +1288,8 @@ class SparkDeckService:
             )
         if "artifact" in changes:
             artifact = _optional_string(changes.get("artifact"))
-            if artifact and str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value:
-                artifact_path = Path(artifact)
+            if artifact and runtime_is_llama:
+                artifact_path = Path(artifact).expanduser()
                 if artifact_path.is_absolute():
                     # Controller-local artifacts keep the same rule as
                     # creation: the file must already exist on the controller.
@@ -1291,12 +1297,34 @@ class SparkDeckService:
                         raise ValueError(
                             "llama.cpp managed deployments require an existing local GGUF artifact"
                         )
+                    artifact = str(artifact_path)
                 else:
                     self._validate_public_gguf_artifact(
                         str((stored.get("model") or {}).get("repository") or ""),
                         artifact, settings.get("quantization"),
                     )
             settings["artifact"] = artifact
+        if "launch_controls" in changes:
+            controls = changes.get("launch_controls")
+            if not isinstance(controls, dict):
+                raise ValueError("launch_controls must be an object")
+            context_window = controls.get("context_window")
+            if context_window not in (None, ""):
+                try:
+                    settings["context_length"] = int(context_window)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("context_window must be an integer") from exc
+            max_concurrency = controls.get("max_concurrency")
+            if max_concurrency not in (None, ""):
+                target = "parallel_slots" if runtime_is_llama else "max_running_requests"
+                try:
+                    settings[target] = int(max_concurrency)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("max_concurrency must be an integer") from exc
+        if changes.get("sg_tp_size") is not None:
+            settings["tensor_parallel_size"] = changes["sg_tp_size"]
+        if changes.get("sg_mem_fraction") is not None:
+            settings["mem_fraction_static"] = changes["sg_mem_fraction"]
         if "extra_args" in changes:
             extra_args = changes.get("extra_args")
             if not isinstance(extra_args, list) or any(
@@ -1324,6 +1352,20 @@ class SparkDeckService:
                     "deployment_mode must be single, sharded, or replicated"
                 )
             settings["deployment_mode"] = mode
+        # Validate the effective artifact/quantization pair, so a partial
+        # update cannot relabel a saved GGUF with a mismatching precision.
+        if runtime_is_llama:
+            effective_artifact = _optional_string(
+                settings.get("artifact")
+                or (stored.get("model") or {}).get("artifact")
+            )
+            if effective_artifact and not Path(
+                effective_artifact
+            ).expanduser().is_absolute():
+                self._validate_public_gguf_artifact(
+                    str((stored.get("model") or {}).get("repository") or ""),
+                    effective_artifact, settings.get("quantization"),
+                )
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
@@ -1656,12 +1698,17 @@ class SparkDeckService:
             if self.store.deployment(alias):
                 raise ValueError(f"deployment alias '{alias}' is already in use")
             artifact_is_local = False
+            model_is_local_path = False
             artifact_homes: list[str] | None = None
             artifact_seed: str | None = None
             if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED:
                 artifact_homes, artifact_seed = self._llama_cpp_artifact_homes(
                     requested_node_ids, body,
                 )
+            resolve_local = getattr(self.manager, "_resolve_local_path", None)
+            model_is_local_path = bool(
+                resolve_local and resolve_local(model)
+            )
             if (
                 runtime is RuntimeKind.LLAMA_CPP
                 and kind is DeploymentKind.MANAGED
@@ -1669,8 +1716,10 @@ class SparkDeckService:
             ):
                 # Classify the caller's raw artifact. A repo-relative Hub path
                 # such as ~/quantized/model.gguf must not become controller-
-                # local merely because the same path exists under its home.
-                artifact_path = Path(artifact)
+                # local merely because the same path exists under its home,
+                # while a genuine tilde reference is expanded and must name a
+                # real file to count as controller-local.
+                artifact_path = Path(artifact).expanduser()
                 if artifact_path.is_absolute():
                     if not artifact_path.is_file():
                         raise ValueError(
@@ -1686,6 +1735,10 @@ class SparkDeckService:
                         )
                     artifact_is_local = True
                     settings["model_source"] = "local"
+                    # Persist the expanded absolute path so every later
+                    # classification sees one unambiguous controller-local
+                    # reference instead of a tilde shorthand.
+                    artifact = str(artifact_path)
                 else:
                     # A saved deployment only records the reference; the GGUF
                     # is resolved (and downloaded if needed) at launch time.
@@ -1725,13 +1778,21 @@ class SparkDeckService:
                 return (self.store.deployment(deployment_id) or deployment.to_dict())
 
             if requested_node_ids is not None:
-                if runtime is RuntimeKind.LLAMA_CPP and (
-                    artifact_is_local
-                    or (not artifact and _public_model_id(model) == "local-model")
-                ) and any(item != "local" for item in requested_node_ids):
-                    raise ValueError(
-                        "local GGUF artifacts can only be saved for the controller node"
-                    )
+                if any(item != "local" for item in requested_node_ids):
+                    # Controller-local models can never run remotely, whatever
+                    # the runtime: reject the mixed selection at save time
+                    # instead of producing an unlaunchable bookmark.
+                    if model_is_local_path:
+                        raise ValueError(
+                            "local model paths can only be saved for the controller node"
+                        )
+                    if runtime is RuntimeKind.LLAMA_CPP and (
+                        artifact_is_local
+                        or (not artifact and _public_model_id(model) == "local-model")
+                    ):
+                        raise ValueError(
+                            "local GGUF artifacts can only be saved for the controller node"
+                        )
                 selected = await self.manager.selected_cluster_nodes(requested_node_ids)
                 mode = deployment_mode or (
                     "replicated" if len(requested_node_ids) > 1 else "single"
@@ -2739,18 +2800,39 @@ class SparkDeckService:
         relative = self._validate_public_gguf_artifact(model, artifact, None)
         return self._expand_gguf_shard_files(relative)
 
+    async def _selected_files_size(
+        self, model: str, resolved_revision: str, files: list[str],
+    ) -> int | None:
+        """Estimate the Hub size of exactly the selected GGUF files.
+
+        Returns ``None`` when the estimate is unavailable (offline, private
+        repository, older agent) so capacity gating degrades to the exact
+        per-node check that runs at prepare time.
+        """
+        virtual_nas = getattr(self.manager, "virtual_nas", None)
+        estimate = getattr(virtual_nas, "estimate_selected_files_size", None)
+        if not callable(estimate):
+            return None
+        try:
+            size = await estimate(model, resolved_revision, files)
+        except Exception:
+            return None
+        return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
+
     async def _llama_preparation_plan(
         self, model: str, revision: str, files: list[str],
         node_ids: list[str],
     ) -> dict[str, Any]:
         """Plan selective GGUF preparation for one llama.cpp bookmark.
 
-        Readiness means the selected files exist inside the node's snapshot of
-        the resolved revision; unlike the whole-repository recipe planner, the
-        required capacity is the selected file set, so capacity checks run on
-        the exact bytes at prepare time.
+        Readiness is per-file: a node is ready when its cache already holds
+        every selected file of the resolved revision (including snapshots the
+        selective downloader marked as deliberately partial). Capacity is
+        estimated from the selected files' Hub sizes so undersized nodes are
+        disabled with per-node reasons instead of failing after confirmation.
         """
         resolved = await self._resolved_model_revision(model, revision)
+        required_bytes = await self._selected_files_size(model, resolved, files)
         inventory = {
             str(node.get("id")): node
             for node in await self.manager.model_cache_inventory()
@@ -2761,29 +2843,88 @@ class SparkDeckService:
         }
         targets: list[dict[str, Any]] = []
         for node_id in node_ids:
-            node = nodes.get(node_id) or {}
+            node = nodes.get(node_id)
             entry = inventory.get(node_id) or {}
             model_entry = next((
                 item for item in entry.get("models") or []
                 if isinstance(item, dict) and item.get("model_id") == model
             ), None)
-            has_weights = bool(
-                model_entry
-                and not model_entry.get("partial")
-                and resolved in (model_entry.get("revisions") or [])
-            )
+            has_weights = False
+            presence = getattr(self.manager, "node_has_model_files", None)
+            if callable(presence):
+                try:
+                    has_weights = bool(await presence(
+                        node_id, model, resolved, files,
+                    ))
+                except Exception:
+                    has_weights = False
+            if not has_weights and model_entry:
+                # Fall back to the inventory when the per-file check cannot
+                # answer: a complete snapshot of the resolved revision
+                # certainly contains the selected files.
+                has_weights = bool(
+                    not model_entry.get("partial")
+                    and resolved in (model_entry.get("revisions") or [])
+                )
+            if node is None:
+                # An unknown, removed, or mistyped node ID must never look
+                # downloadable; preparation would fail on it later anyway.
+                targets.append({
+                    "node_id": node_id,
+                    "node_name": node_id,
+                    "eligible": False,
+                    "reason": "Unknown cluster node",
+                    "free_bytes": None,
+                    "required_free_bytes": None,
+                    "active_job_id": None,
+                    "active_job_status": None,
+                    "active_job_kind": None,
+                    "has_preparation_conflict": False,
+                    "preparation_conflict_reason": None,
+                    "has_required_weights": False,
+                    "has_model_cache": False,
+                    "download_eligible": False,
+                    "download_reason": "Unknown cluster node",
+                    "transfer_after_download_eligible": False,
+                    "transfer_after_download_reason": None,
+                    "transfer_after_download_required_free_bytes": None,
+                })
+                continue
             online = node.get("online") is not False
             capable = node_id == "local" or bool(
                 entry.get("virtual_nas_download_capable", True)
             )
-            download_eligible = online and capable
+            free_bytes = entry.get("cache_free_size")
+            required_free = (
+                download_required_free_bytes(required_bytes, 0)
+                if required_bytes is not None and not has_weights
+                else None
+            )
+            capacity_reason = None
+            if (
+                not has_weights
+                and required_free is not None
+                and free_bytes is not None
+                and free_bytes < required_free
+            ):
+                capacity_reason = (
+                    "Not enough free cache space for the GGUF download"
+                )
+            download_eligible = online and capable and capacity_reason is None
+            download_reason = (
+                None if download_eligible
+                else "Node is offline" if not online
+                else "Node must be updated before downloading from Hugging Face"
+                if not capable
+                else capacity_reason
+            )
             targets.append({
                 "node_id": node_id,
                 "node_name": str(node.get("name") or node_id),
                 "eligible": False,
                 "reason": None,
-                "free_bytes": entry.get("cache_free_size"),
-                "required_free_bytes": None,
+                "free_bytes": free_bytes,
+                "required_free_bytes": required_free,
                 "active_job_id": None,
                 "active_job_status": None,
                 "active_job_kind": None,
@@ -2792,11 +2933,7 @@ class SparkDeckService:
                 "has_required_weights": has_weights,
                 "has_model_cache": model_entry is not None,
                 "download_eligible": download_eligible,
-                "download_reason": (
-                    None if download_eligible
-                    else "Node is offline" if not online
-                    else "Node must be updated before downloading from Hugging Face"
-                ),
+                "download_reason": download_reason,
                 "transfer_after_download_eligible": False,
                 "transfer_after_download_reason": None,
                 "transfer_after_download_required_free_bytes": None,

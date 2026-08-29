@@ -596,7 +596,13 @@ export function ModelsPage() {
   })
 
   const openCreator = () => {
+    // Canceling an edit leaves the shared form populated with the edited
+    // deployment; a fresh creator must never inherit those values.
     setEditingDeployment(undefined)
+    setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
+    setExtraFlags('')
+    setGpuMemoryUtil('')
+    setFormError(undefined)
     setCreating(true)
   }
 
@@ -638,9 +644,8 @@ export function ModelsPage() {
         // Saved deployments are editable bookmarks: the same form updates the
         // recorded runtime settings and node preferences without launching.
         // Runtime and model are fixed once saved; only the name can change.
-        if (form.alias !== editing.alias) {
-          await api.deployments.rename(editing.id, form.alias)
-        }
+        // Settings apply before the rename so a rejected edit never leaves a
+        // partially applied rename behind.
         await api.deployments.update(editing.id, {
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
@@ -653,6 +658,9 @@ export function ModelsPage() {
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
         })
+        if (form.alias !== editing.alias) {
+          await api.deployments.rename(editing.id, form.alias)
+        }
         setActionNotice(`Updated ${form.alias}. Launch it from the deployments list when ready.`)
       } else {
         const deployment = await api.deployments.create({ ...form, settings })
@@ -1340,7 +1348,7 @@ export function ModelsPage() {
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
-                    {deployment.managed && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
+                    {deployment.managed && deployment.status !== 'saved' && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     {deployment.id.startsWith('container:') && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Save ${deployment.alias} as recipe`} title="Save as recipe" onClick={() => void importContainerRecipe(deployment)}><FolderPlus size={16} /></Button>
                     )}

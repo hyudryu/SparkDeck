@@ -815,7 +815,7 @@ export interface UsageAnalysis {
   daily: DailyUsagePoint[]
 }
 
-export interface BenchyStatus {
+export interface BenchmarkRunnerStatus {
   installed: boolean
   version?: string | null
   launch_mode?: 'path' | 'python_module' | null
@@ -823,7 +823,7 @@ export interface BenchyStatus {
   active_run_id?: string | null
 }
 
-export interface BenchyServedModel {
+export interface BenchmarkRunnerModel {
   id: string
   label: string
   runtime?: string
@@ -833,7 +833,7 @@ export interface BenchyServedModel {
   base_url: string
 }
 
-export interface BenchyRunConfig {
+export interface BenchmarkRunnerRunConfig {
   model_id: string
   prompt_sizes: number[]
   response_sizes: number[]
@@ -844,7 +844,7 @@ export interface BenchyRunConfig {
   exact_tg: boolean
 }
 
-export interface BenchyRunProgress {
+export interface BenchmarkRunnerRunProgress {
   requests_done: number
   requests_failed: number
   current?: {
@@ -855,9 +855,9 @@ export interface BenchyRunProgress {
   } | null
 }
 
-export type BenchyRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type BenchmarkRunnerRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
-export interface BenchyResultRow {
+export interface BenchmarkRunnerResultRow {
   prompt_size?: number
   response_size?: number
   context_depth?: number
@@ -878,9 +878,9 @@ export interface BenchyResultRow {
   e2e_ttft_ms?: number | null
 }
 
-export interface BenchyRunSummary {
+export interface BenchmarkRunnerRunSummary {
   id: string
-  status: BenchyRunStatus
+  status: BenchmarkRunnerRunStatus
   created_at: string
   started_at?: string | null
   finished_at?: string | null
@@ -891,15 +891,15 @@ export interface BenchyRunSummary {
   runtime?: string | null
   base_url?: string
   deployment_id?: string | null
-  config: BenchyRunConfig
+  config: BenchmarkRunnerRunConfig
   benchy_version?: string | null
   error?: string | null
   result_count?: number
-  progress?: BenchyRunProgress
+  progress?: BenchmarkRunnerRunProgress
 }
 
-export interface BenchyRunDetail extends BenchyRunSummary {
-  results: BenchyResultRow[]
+export interface BenchmarkRunnerRunDetail extends BenchmarkRunnerRunSummary {
+  results: BenchmarkRunnerResultRow[]
   csv_filename?: string | null
   report?: {
     benchy_version?: string | null

@@ -1661,6 +1661,7 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Launch Saved model' })
     expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
     expect(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' })).toBeEnabled()
+    expect(dialog).toHaveTextContent('Weights will be transferred from Spark Two to Spark One via Virtual NAS before launch.')
     await user.click(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' }))
 
     expect(await screen.findByRole('dialog', { name: 'Prepare model weights?' })).toBeInTheDocument()

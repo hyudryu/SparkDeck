@@ -298,6 +298,22 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launch["gpu_memory_gb"], 40)
         self.assertEqual(started["node_ids"], ["remote-1"])
 
+    async def test_saved_vllm_bookmark_image_can_be_changed_before_launch(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "editable-image", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"image": "registry.example/vllm:old"},
+        })
+
+        detail = await self.service.update_deployment_settings("editable-image", {
+            "image": "registry.example/vllm:pinned",
+        })
+        self.assertEqual(detail["image"], "registry.example/vllm:pinned")
+
+        await self.service.deployment_action("editable-image", "start")
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["image"], "registry.example/vllm:pinned")
+
     async def test_sensitive_launch_arguments_are_rejected_before_saving(self):
         self.manager._reject_sensitive_cli_credentials = (
             Manager._reject_sensitive_cli_credentials

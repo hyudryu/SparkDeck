@@ -616,6 +616,9 @@ export interface DashboardData {
 export interface StorageModel {
   model_id: string
   size_bytes: number
+  // Best-effort full repository size for partial caches, looked up from the
+  // Hugging Face tree API. Absent when the lookup failed or was not attempted.
+  expected_size_bytes?: number
   partial?: boolean
   has_partial_download?: boolean
   partial_size_bytes?: number
@@ -638,6 +641,7 @@ export interface StorageNode {
   id: string
   name: string
   online: boolean
+  hidden_from_dashboard?: boolean
   total_size?: number | null
   cache_free_size?: number | null
   free_size?: number | null

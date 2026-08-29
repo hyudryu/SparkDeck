@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from manager import DEFAULT_SETTINGS, Manager
+from sparkdeck import virtual_nas
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
@@ -498,6 +499,90 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(models[0]["size_bytes"], 0)
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
+
+    async def test_inventory_reports_snapshot_files_by_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            weights = blobs / "weights"
+            weights.write_bytes(b"gguf-weights")
+            complete_revision = "c" * 40
+            complete = repository / "snapshots" / complete_revision
+            complete.mkdir(parents=True)
+            nested = complete / "sub" / "dir"
+            nested.mkdir(parents=True)
+            try:
+                (complete / "model-Q4_K_M.gguf").symlink_to(weights)
+                (nested / "tokenizer.json").symlink_to(weights)
+            except OSError:
+                (complete / "model-Q4_K_M.gguf").write_bytes(b"gguf-weights")
+                (nested / "tokenizer.json").write_bytes(b"gguf-weights")
+            # A selective snapshot carries its marker and a download lock;
+            # its real files still count as cached, the residue does not.
+            selective_revision = "d" * 40
+            selective = repository / "snapshots" / selective_revision
+            selective.mkdir()
+            (selective / "model-Q8_0.gguf").write_bytes(b"gguf-weights")
+            (selective / ".sparkdeck-selective.incomplete").write_text(
+                "selective", encoding="utf-8",
+            )
+            (selective / "download.lock").write_text("locked", encoding="utf-8")
+            # A symlink escaping the cache (and a dangling one) is reported
+            # by the same containment rules the launch path applies.
+            outside = Path(directory) / "outside.gguf"
+            outside.write_bytes(b"outside")
+            escape_linked = False
+            dangling_linked = False
+            try:
+                (selective / "escape.gguf").symlink_to(outside)
+                escape_linked = True
+                (selective / "dangling.gguf").symlink_to(
+                    repository / "blobs" / "missing-blob",
+                )
+                dangling_linked = True
+            except OSError:
+                pass
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            self.assertEqual(models[0]["snapshot_files"], {
+                complete_revision: [
+                    "model-Q4_K_M.gguf",
+                    "sub/dir/tokenizer.json",
+                ],
+                selective_revision: ["model-Q8_0.gguf"],
+            })
+            if escape_linked:
+                self.assertNotIn("escape.gguf", models[0]["snapshot_files"][selective_revision])
+            if dangling_linked:
+                self.assertNotIn("dangling.gguf", models[0]["snapshot_files"][selective_revision])
+            self.assertNotIn(str(repository), json.dumps(models))
+
+    async def test_snapshot_file_inventory_enforces_cap_during_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            snapshot = repository / "snapshots" / ("c" * 40)
+            snapshot.mkdir(parents=True)
+            for index in range(2100):
+                (snapshot / f"file-{index:05}.txt").write_text("x", encoding="utf-8")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            files_by_revision = virtual_nas._snapshot_files_by_revision(repository)
+
+            reported = sum(len(names) for names in files_by_revision.values())
+            self.assertLessEqual(
+                reported,
+                virtual_nas._INVENTORY_FILE_LIMIT,
+            )
 
     async def test_partial_revision_survives_when_its_blob_is_shared_with_complete_revision(self):
         with tempfile.TemporaryDirectory() as directory:

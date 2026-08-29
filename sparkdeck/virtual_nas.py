@@ -1009,6 +1009,7 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
+                "snapshot_files": _snapshot_files_by_revision(repository),
                 "partial": partial,
                 "has_partial_download": (
                     partial or bool(incomplete_revisions)
@@ -2629,6 +2630,59 @@ def _safe_incomplete_blob_bytes(
 
 def _is_complete_repository(repository: Path) -> bool:
     return bool(_complete_snapshot_revisions(repository))
+
+
+# Safety valve for pathologies like a repository snapshot holding thousands
+# of loose files: inventory stays a summary, not a full file dump.
+_INVENTORY_FILE_LIMIT = 2000
+
+
+def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:
+    """Map each cached snapshot revision to its repository-relative files.
+
+    Inventory responses stay path-free: these are the same repo-relative
+    artifact names the Hub API publishes, so the UI can compare a resolved
+    revision's files and mark which quantizations are already on disk.
+    Download residue (``.incomplete`` blobs and ``.lock`` files, including
+    the selective-snapshot marker) is excluded; files from selective
+    snapshots still count because a downloaded GGUF artifact is usable
+    as-is.
+    """
+    files_by_revision: dict[str, list[str]] = {}
+    total_names = 0
+    try:
+        snapshots = repository / "snapshots"
+        if not snapshots.is_dir() or snapshots.is_symlink():
+            return {}
+        for revision in sorted(snapshots.iterdir()):
+            if not revision.is_dir() or revision.is_symlink():
+                continue
+            names: list[str] = []
+            for item in revision.rglob("*"):
+                if item.is_dir() or not item.is_file():
+                    continue
+                if item.name.endswith((".incomplete", ".lock")):
+                    continue
+                # Mirror the launch path's containment validation so a name
+                # reported as cached is exactly a file the launcher will
+                # accept: symlinked snapshot entries must resolve inside the
+                # repository's blobs directory, never outside the cache.
+                relative = item.relative_to(revision).as_posix()
+                if _safe_cached_snapshot_file(repository, revision.name, relative) is None:
+                    continue
+                names.append(relative)
+                total_names += 1
+                # Enforce the cap inside the walk so a single huge snapshot
+                # cannot make traversal collect an unbounded name list.
+                if total_names >= _INVENTORY_FILE_LIMIT:
+                    break
+            if names:
+                files_by_revision[revision.name] = names
+            if total_names >= _INVENTORY_FILE_LIMIT:
+                break
+    except OSError:
+        return files_by_revision
+    return files_by_revision
 
 
 def _complete_snapshot_revisions(repository: Path) -> set[str]:

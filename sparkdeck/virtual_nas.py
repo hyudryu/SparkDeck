@@ -1009,6 +1009,7 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
+                "files": _snapshot_file_names(repository),
                 "partial": partial,
                 "has_partial_download": (
                     partial or bool(incomplete_revisions)
@@ -2629,6 +2630,45 @@ def _safe_incomplete_blob_bytes(
 
 def _is_complete_repository(repository: Path) -> bool:
     return bool(_complete_snapshot_revisions(repository))
+
+
+# Safety valve for pathologies like a repository snapshot holding thousands
+# of loose files: inventory stays a summary, not a full file dump.
+_INVENTORY_FILE_LIMIT = 2000
+
+
+def _snapshot_file_names(repository: Path) -> list[str]:
+    """Repository-relative names of the files present in any cached snapshot.
+
+    Inventory responses stay path-free: these are the same repo-relative
+    artifact names the Hub API publishes, so the UI can mark which
+    quantizations are already on disk. Download residue (``.incomplete``
+    blobs and ``.lock`` files, including the selective-snapshot marker) is
+    excluded; files from incomplete snapshots still count because a
+    selectively downloaded GGUF artifact is usable as-is.
+    """
+    names: set[str] = set()
+    try:
+        snapshots = repository / "snapshots"
+        if not snapshots.is_dir() or snapshots.is_symlink():
+            return []
+        for revision in snapshots.iterdir():
+            if not revision.is_dir() or revision.is_symlink():
+                continue
+            for item in revision.rglob("*"):
+                # Snapshot entries are symlinks into blobs; is_file() follows
+                # them and rejects dangling links, while is_dir() skips the
+                # (non-symlinked) subdirectories.
+                if item.is_dir() or not item.is_file():
+                    continue
+                if item.name.endswith((".incomplete", ".lock")):
+                    continue
+                names.add(item.relative_to(revision).as_posix())
+            if len(names) >= _INVENTORY_FILE_LIMIT:
+                break
+    except OSError:
+        return []
+    return sorted(names)[:_INVENTORY_FILE_LIMIT]
 
 
 def _complete_snapshot_revisions(repository: Path) -> set[str]:

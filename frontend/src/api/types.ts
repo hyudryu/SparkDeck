@@ -602,6 +602,9 @@ export interface StorageModel {
   revision?: string
   revisions?: string[]
   file_count?: number
+  // Repo-relative names of the files present in any cached snapshot; lets
+  // the UI mark which quantizations or artifacts are already downloaded.
+  files?: string[]
   source?: string
   externally_managed?: boolean
   transferable?: boolean

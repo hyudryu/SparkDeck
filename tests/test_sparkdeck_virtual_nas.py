@@ -499,6 +499,48 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(str(complete), json.dumps(models))
             self.assertNotIn("path", models[0])
 
+    async def test_inventory_reports_cached_snapshot_file_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            blobs = repository / "blobs"
+            blobs.mkdir(parents=True)
+            weights = blobs / "weights"
+            weights.write_bytes(b"gguf-weights")
+            complete_revision = "c" * 40
+            complete = repository / "snapshots" / complete_revision
+            complete.mkdir(parents=True)
+            nested = complete / "sub" / "dir"
+            nested.mkdir(parents=True)
+            try:
+                (complete / "model-Q4_K_M.gguf").symlink_to(weights)
+                (nested / "tokenizer.json").symlink_to(weights)
+            except OSError:
+                (complete / "model-Q4_K_M.gguf").write_bytes(b"gguf-weights")
+                (nested / "tokenizer.json").write_bytes(b"gguf-weights")
+            # A selective snapshot carries its marker and a download lock;
+            # its real files still count as cached, the residue does not.
+            selective = repository / "snapshots" / ("d" * 40)
+            selective.mkdir()
+            (selective / "model-Q8_0.gguf").write_bytes(b"gguf-weights")
+            (selective / ".sparkdeck-selective.incomplete").write_text(
+                "selective", encoding="utf-8",
+            )
+            (selective / "download.lock").write_text("locked", encoding="utf-8")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            self.assertEqual(models[0]["files"], [
+                "model-Q4_K_M.gguf",
+                "model-Q8_0.gguf",
+                "sub/dir/tokenizer.json",
+            ])
+            self.assertNotIn(str(repository), json.dumps(models))
+
     async def test_partial_revision_survives_when_its_blob_is_shared_with_complete_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

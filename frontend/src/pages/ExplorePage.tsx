@@ -7,18 +7,13 @@ import { Button, EmptyState, ErrorState, formatNumber, formatRate, LoadingState,
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { formatBytes } from '../utils/format'
+import { ggufArtifactOptions, type GgufArtifactOption } from '../utils/gguf'
 
 type CatalogTab = 'hugging-face' | 'community'
 type FitTone = 'easy' | 'tight' | 'no-fit' | 'unknown'
 type DisplayCatalogModel = CatalogModel & {
   communityEvidenceSource?: 'community' | 'local'
   communityVariantKey?: string
-}
-type GgufArtifactOption = {
-  key: string
-  filename: string
-  quantization: string
-  weightSize?: number | null
 }
 
 const MIB = 1024 ** 2
@@ -89,26 +84,6 @@ function aggregateQuantization(item: BenchmarkAggregate) {
 
 function communityVariantKey(item: BenchmarkAggregate) {
   return `${item.model_id}::${aggregateQuantization(item)}::${item.prompt_tokens_bucket}`
-}
-
-function ggufArtifactOptions(quantizations: NonNullable<CatalogModel['quantizations']>): GgufArtifactOption[] {
-  return quantizations.flatMap((variant) => {
-    const artifacts = variant.artifacts?.length
-      ? variant.artifacts
-      : variant.files.some((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))
-        ? [{
-          filename: variant.files.find((file) => file.filename.toLocaleLowerCase().endsWith('.gguf'))!.filename,
-          files: variant.files,
-          weight_size_bytes: variant.weight_size_bytes,
-        }]
-        : []
-    return artifacts.map((artifact) => ({
-      key: `${variant.name}\u0000${artifact.filename}`,
-      filename: artifact.filename,
-      quantization: variant.name,
-      weightSize: artifact.weight_size_bytes,
-    }))
-  })
 }
 
 function mergeRuntimeCompatibility(

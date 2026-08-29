@@ -260,3 +260,107 @@ describe('models page running actions', () => {
     expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
   })
 })
+
+describe('deployment creator model and quantization pickers', () => {
+  const ggufCache = {
+    nodes: [
+      {
+        id: 'local', name: 'Controller', online: true,
+        models: [{
+          model_id: 'org/gguf', size_bytes: 10,
+          files: ['Llama-3.2-1B-Q4_K_M.gguf'],
+        }],
+      },
+    ],
+  }
+  const ggufCatalog = {
+    model: {
+      id: 'org/gguf',
+      quantizations: [
+        {
+          name: 'Q4_K_M',
+          files: [{ filename: 'Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
+          weight_size_bytes: 807,
+        },
+        {
+          name: 'Q8_0',
+          files: [{ filename: 'Llama-3.2-1B-Q8_0.gguf', size_bytes: 1200 }],
+          weight_size_bytes: 1200,
+        },
+      ],
+    },
+    aggregates: [],
+  }
+
+  function mockGgufCluster() {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+        if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fgguf') {
+        return new Response(JSON.stringify(ggufCatalog), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  it('keeps the picked cached model visible in the picker', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    const picker = await screen.findByLabelText('Or pick a model already on the cluster')
+    await user.selectOptions(picker, 'org/model')
+
+    // The picker reflects the selection instead of snapping back to the
+    // placeholder, and the repository field receives the model id.
+    expect(picker).toHaveValue('org/model')
+    expect(screen.getByLabelText('Model repository or GGUF artifact')).toHaveValue('org/model')
+  })
+
+  it('lists repository quantizations and GGUF artifacts with downloaded marks', async () => {
+    const user = userEvent.setup()
+    mockGgufCluster()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+
+    // The field help text inside the label extends the accessible name, so
+    // match by a name prefix.
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B · ✓ Downloaded' })).toBeInTheDocument()
+    expect(within(quantSelect).getByRole('option', { name: 'Q8_0 · 1.2 KB' })).toBeInTheDocument()
+
+    const artifactSelect = screen.getByRole('combobox', { name: /GGUF artifact/ })
+    expect(within(artifactSelect).getByRole('option', { name: 'Llama-3.2-1B-Q4_K_M.gguf · 807 B · ✓ Downloaded' })).toBeInTheDocument()
+
+    // Picking a quantization selects its artifact, and picking an artifact
+    // carries its quantization back.
+    await user.selectOptions(quantSelect, 'Q4_K_M')
+    expect(artifactSelect).toHaveValue('Llama-3.2-1B-Q4_K_M.gguf')
+    await user.selectOptions(artifactSelect, 'Llama-3.2-1B-Q8_0.gguf')
+    expect(quantSelect).toHaveValue('Q8_0')
+  })
+})

@@ -706,6 +706,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             await nas._run_download(job)
 
             self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["download_attempt_start_bytes"], cached)
             request = registry.request.await_args
             self.assertEqual(
                 request.kwargs["json_body"]["download_cache_baseline_bytes"], 100,
@@ -775,6 +776,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(job["status"], "completed")
             self.assertEqual(job["bytes_transferred"], MODEL_BYTES)
+            self.assertEqual(job["download_attempt_start_bytes"], MODEL_BYTES)
             nas.estimate_download_size.assert_awaited_once()
             registry.request.assert_awaited_once()
             self.assertEqual(

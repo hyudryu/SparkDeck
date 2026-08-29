@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type FormEvent } from 'react'
 import { AlertTriangle, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Trash2, UploadCloud } from 'lucide-react'
 import { api } from '../api/client'
 import type { StorageModel, StorageNode, StorageTransferJob } from '../api/types'
@@ -50,6 +50,25 @@ function formatProgress(value: number) {
   return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)
 }
 
+function timestampValue(value?: string | number) {
+  if (!value) return 0
+  const timestamp = new Date(typeof value === 'number' && value < 1_000_000_000_000 ? value * 1000 : value).valueOf()
+  return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+function compareJobsNewestFirst(left: StorageTransferJob, right: StorageTransferJob) {
+  return timestampValue(right.created_at) - timestampValue(left.created_at) || right.id.localeCompare(left.id)
+}
+
+function formatTransferRate(job: StorageTransferJob) {
+  if (!job.bytes_per_second || job.bytes_per_second <= 0) return undefined
+  const gigabytesPerSecond = job.bytes_per_second / 1_000_000_000
+  const rate = gigabytesPerSecond < 0.001
+    ? '<0.001'
+    : gigabytesPerSecond.toFixed(gigabytesPerSecond < 0.01 ? 3 : 2)
+  return `${rate} GB/s avg`
+}
+
 function SmoothProgress({ value, label }: { value: number; label: string }) {
   const progress = Math.max(0, Math.min(100, value))
   return <div
@@ -79,6 +98,7 @@ export function StoragePage() {
   const [busy, setBusy] = useState<string>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
+  const [queuedJobs, setQueuedJobs] = useState<StorageTransferJob[]>([])
   const [draggedModel, setDraggedModel] = useState<DraggedModel>()
   const [dropTargetId, setDropTargetId] = useState<string>()
   const draggedModelRef = useRef<DraggedModel | undefined>(undefined)
@@ -107,15 +127,30 @@ export function StoragePage() {
     }))
     return [...models.values()].sort((left, right) => compareModels(left.model, right.model))
   }, [visibleNodes])
+  const transferJobs = useMemo(() => {
+    const serverJobs = resource.data?.jobs ?? []
+    const knownJobIds = new Set(serverJobs.map((job) => job.id))
+    return [...serverJobs, ...queuedJobs.filter((job) => !knownJobIds.has(job.id))]
+  }, [queuedJobs, resource.data?.jobs])
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes])
+  const visibleTransferJobs = useMemo(
+    () => transferJobs.filter((job) =>
+      (job.kind === 'download' || !job.source_node_id || visibleNodeIds.has(job.source_node_id))
+      && visibleNodeIds.has(job.target_node_id),
+    ),
+    [transferJobs, visibleNodeIds],
+  )
+  const visibleRecentJobs = useMemo(() => [...visibleTransferJobs].sort(compareJobsNewestFirst).slice(0, 5), [visibleTransferJobs])
   const activeJobsByNode = useMemo(() => {
-    const jobs = new Map<string, Map<string, StorageTransferJob>>()
-    resource.data?.jobs.filter(isActive).forEach((job) => {
-      const nodeJobs = jobs.get(job.target_node_id) ?? new Map<string, StorageTransferJob>()
-      nodeJobs.set(job.model_id, job)
-      jobs.set(job.target_node_id, nodeJobs)
+    const jobsByNode = new Map<string, Map<string, StorageTransferJob>>()
+    const activeJobs = [...visibleTransferJobs].filter(isActive).sort(compareJobsNewestFirst)
+    activeJobs.forEach((job) => {
+      const nodeJobs = jobsByNode.get(job.target_node_id) ?? new Map<string, StorageTransferJob>()
+      if (!nodeJobs.has(job.model_id)) nodeJobs.set(job.model_id, job)
+      jobsByNode.set(job.target_node_id, nodeJobs)
     })
-    return jobs
-  }, [resource.data?.jobs])
+    return jobsByNode
+  }, [visibleTransferJobs])
 
   useEffect(() => {
     if (!visibleNodes.length) return
@@ -131,7 +166,7 @@ export function StoragePage() {
     setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && visibleNodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
   }, [modelId, visibleNodes, sourceNodeId])
 
-  const hasActiveJobs = resource.data?.jobs.some(isActive) ?? false
+  const hasActiveJobs = Boolean(resource.data?.enabled && visibleTransferJobs.some(isActive))
   useEffect(() => {
     if (!hasActiveJobs) return
     const timer = window.setInterval(resource.reload, 3000)
@@ -159,10 +194,14 @@ export function StoragePage() {
     setError(undefined)
     setNotice(undefined)
     try {
-      await api.storage.transfer({
+      const result = await api.storage.transfer({
         model_id: transferModelId,
         source_node_id: 'id' in source ? source.id : source.sourceNodeId,
         target_node_ids: targets,
+      })
+      setQueuedJobs((current) => {
+        const currentIds = new Set(current.map((job) => job.id))
+        return [...current, ...(result.jobs ?? []).filter((job) => !currentIds.has(job.id))]
       })
       const targetNames = targets.map((id) => visibleNodes.find((node) => node.id === id)?.name ?? id).join(', ')
       setNotice(`Queued ${transferModelId} for transfer to ${targetNames}.`)
@@ -236,7 +275,11 @@ export function StoragePage() {
     setError(undefined)
     setNotice(undefined)
     try {
-      await api.storage.finishDownload(node.id, model.model_id, model.revision)
+      const result = await api.storage.finishDownload(node.id, model.model_id, model.revision)
+      setQueuedJobs((current) => {
+        const currentIds = new Set(current.map((job) => job.id))
+        return [...current, ...(result.jobs ?? []).filter((job) => !currentIds.has(job.id))]
+      })
       setNotice(`Queued ${model.model_id} to finish downloading on ${node.name}.`)
       resource.reload()
     } catch (reason) {
@@ -290,12 +333,10 @@ export function StoragePage() {
           {visibleNodes.map((node) => {
             const activeJobs = activeJobsByNode.get(node.id) ?? new Map<string, StorageTransferJob>()
             const modelsById = new Map(node.models.map((model) => [model.model_id, model]))
-            const weightRows = [...new Set([...modelsById.keys(), ...activeJobs.keys()])]
-              .sort((left, right) => (
-                (modelsById.get(right)?.size_bytes ?? activeJobs.get(right)?.bytes_total ?? 0)
-                  - (modelsById.get(left)?.size_bytes ?? activeJobs.get(left)?.bytes_total ?? 0)
-                || compareModelIdsDescending(left, right)
-              ))
+            const weightRows = [
+              ...[...activeJobs.values()].sort(compareJobsNewestFirst).map((job) => job.model_id),
+              ...node.models.filter((model) => !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
+            ]
             const used = node.models.reduce(
               (total, model) => total + (model.externally_managed ? 0 : model.size_bytes),
               0,
@@ -381,14 +422,20 @@ export function StoragePage() {
                   </li>
                   if (!job) return null
                   const progress = jobProgress(job)
+                  const transferRate = formatTransferRate(job)
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
                   const activity = downloading
                     ? running ? 'Downloading from Hugging Face' : 'Download queued'
                     : running ? `Transferring from ${job.source_node_name}` : 'Transfer queued'
-                  return <li className="storage-active-weight" key={`job:${job.id}`} aria-label={`${activity} ${job.model_id} on ${node.name}`}>
+                  return <li
+                    className="storage-active-weight"
+                    key={`job:${job.id}`}
+                    aria-label={`${activity} ${job.model_id} on ${node.name}`}
+                    style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
+                  >
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <UploadCloud size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}</small></div>
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</small></div>
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
                 })}
@@ -428,6 +475,24 @@ export function StoragePage() {
           </form>
         </Panel>
 
+        <div className="section-heading"><div><h2>Transfer queue</h2><p>Queued, active, completed, and failed model copies.</p></div></div>
+        {visibleTransferJobs.length === 0 ? <EmptyState title="No transfers yet" description="Drag a model between node cards or use the transfer form to queue a copy." /> : <Panel className="table-panel">
+          <div className="responsive-table storage-job-table" role="table" aria-label="Model transfer queue">
+            <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Route</span><span role="columnheader">Status</span><span role="columnheader">Progress</span><span role="columnheader">Actions</span></div>
+            {visibleRecentJobs.map((job) => {
+              const progress = jobProgress(job)
+              const transferRate = formatTransferRate(job)
+              return <div className="table-row" role="row" key={job.id}>
+                <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
+                <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
+                <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert">{job.error}</small>}</div>
+                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</span></div>
+                <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
+              </div>
+            })}
+          </div>
+        </Panel>}
+
         <div className="section-heading"><div><h2>Model inventory</h2><p>Availability matrix across every storage node.</p></div></div>
         {inventory.length === 0 ? <EmptyState title="No model weights found" description="Models downloaded on participating nodes will appear here." /> : <Panel className="table-panel">
           <div className="responsive-table storage-model-table" role="table" aria-label="Model storage inventory">
@@ -449,23 +514,6 @@ export function StoragePage() {
                 >!</button> : <span aria-hidden="true">{location ? '✓' : '—'}</span>} {node.name}</span>
               })}</div>
             </div>)}
-          </div>
-        </Panel>}
-
-        <div className="section-heading"><div><h2>Transfer queue</h2><p>Queued, active, completed, and failed model copies.</p></div></div>
-        {resource.data.jobs.length === 0 ? <EmptyState title="No transfers yet" description="Drag a model between node cards or use the transfer form to queue a copy." /> : <Panel className="table-panel">
-          <div className="responsive-table storage-job-table" role="table" aria-label="Model transfer queue">
-            <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Route</span><span role="columnheader">Status</span><span role="columnheader">Progress</span><span role="columnheader">Actions</span></div>
-            {resource.data.jobs.map((job) => {
-              const progress = jobProgress(job)
-              return <div className="table-row" role="row" key={job.id}>
-                <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
-                <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
-                <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert">{job.error}</small>}</div>
-                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}</span></div>
-                <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
-              </div>
-            })}
           </div>
         </Panel>}
       </>}

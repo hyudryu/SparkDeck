@@ -951,7 +951,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
             self.assertEqual(by_id["Comfy-Org/MiniMax-Music-3"]["file_count"], 3)
-            for name in ("Minimax Video", "foo"):
+            for name in ("checkpoints/Minimax Video", "loras/foo"):
                 entry = by_id[name]
                 self.assertEqual(entry["size_bytes"], 7)
                 self.assertEqual(entry["file_count"], 1)
@@ -1181,12 +1181,16 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_failure_is_recorded(self):
         registry = FakeRegistry(fail_target="worker-a")
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.start = Mock()
         await nas.queue_transfer("org/model", "local", ["worker-a"])
+        job = nas.jobs[0]
+        job["bytes_transferred"] = 5
 
-        final = await self.wait_final(nas, 1)
+        await nas._run_transfer(job)
 
-        self.assertEqual(final[0]["status"], "failed")
-        self.assertIn("simulated target outage", final[0]["error"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["bytes_transferred"], 0)
+        self.assertIn("simulated target outage", job["error"])
         await nas.stop()
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):
@@ -1901,7 +1905,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "source_node_id": "huggingface", "target_node_id": "worker-a",
             "revision": RESOLVED_REVISION, "status": "running",
             "bytes_total": 1000, "bytes_transferred": 970,
-            "download_cache_baseline_bytes": 1000, "created_at": 1,
+            "download_cache_baseline_bytes": 1000,
+            "download_attempt_start_bytes": 970,
+            "download_attempted_at": 100, "started_at": 99, "created_at": 1,
         }]}
         manager.node_registry = Mock()
         manager.node_registry.get.return_value = {
@@ -1916,10 +1922,41 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             }],
         }])
 
-        result = await manager.virtual_nas_inventory()
+        with patch("manager.time.time", return_value=102):
+            result = await manager.virtual_nas_inventory()
 
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
+        self.assertEqual(result["jobs"][0]["bytes_per_second"], 2.5)
+
+    def test_public_job_reports_average_transfer_rate(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"cluster_node_name": "Coordinator"}
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "worker-a", "name": "Worker A",
+        }
+
+        with patch("manager.time.time", return_value=110):
+            result = manager._public_virtual_nas_job({
+                "id": "transfer-1", "kind": "transfer", "model_id": "org/model",
+                "source_node_id": "local", "target_node_id": "worker-a",
+                "status": "running", "bytes_total": 10_000_000_000,
+                "bytes_transferred": 5_000_000_000,
+                "created_at": 99, "started_at": 100, "completed_at": None,
+            })
+            alias_only = manager._public_virtual_nas_job({
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "worker-a",
+                "status": "completed", "bytes_total": 5_000_000_000,
+                "bytes_transferred": 5_000_000_000,
+                "download_attempt_start_bytes": 5_000_000_000,
+                "download_attempted_at": 100, "completed_at": 101,
+                "created_at": 99,
+            })
+
+        self.assertEqual(result["bytes_per_second"], 500_000_000)
+        self.assertIsNone(alias_only["bytes_per_second"])
 
 
 if __name__ == "__main__":

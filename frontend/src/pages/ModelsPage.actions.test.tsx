@@ -262,20 +262,24 @@ describe('models page running actions', () => {
 })
 
 describe('deployment creator model and quantization pickers', () => {
+  const CACHED_SHA = 'a'.repeat(40)
+  const NEW_SHA = 'b'.repeat(40)
   const ggufCache = {
     nodes: [
       {
         id: 'local', name: 'Controller', online: true,
         models: [{
           model_id: 'org/gguf', size_bytes: 10,
-          files: ['Llama-3.2-1B-Q4_K_M.gguf'],
+          revision_refs: { main: CACHED_SHA },
+          snapshot_files: { [CACHED_SHA]: ['Llama-3.2-1B-Q4_K_M.gguf'] },
         }],
       },
     ],
   }
-  const ggufCatalog = {
+  const ggufCatalog = (revision: string) => ({
     model: {
       id: 'org/gguf',
+      revision,
       quantizations: [
         {
           name: 'Q4_K_M',
@@ -290,12 +294,12 @@ describe('deployment creator model and quantization pickers', () => {
       ],
     },
     aggregates: [],
-  }
+  })
 
-  function mockGgufCluster() {
+  function mockGgufCluster(revision = CACHED_SHA) {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
-        if (path === '/api/v1/deployments') {
+      if (path === '/api/v1/deployments') {
         return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path === '/api/v1/nodes') {
@@ -305,7 +309,7 @@ describe('deployment creator model and quantization pickers', () => {
         return new Response(JSON.stringify(ggufCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path === '/api/v1/catalog/models/org%2Fgguf') {
-        return new Response(JSON.stringify(ggufCatalog), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        return new Response(JSON.stringify(ggufCatalog(revision)), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path === '/api/v1/recipes') {
         return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -362,5 +366,29 @@ describe('deployment creator model and quantization pickers', () => {
     expect(artifactSelect).toHaveValue('Llama-3.2-1B-Q4_K_M.gguf')
     await user.selectOptions(artifactSelect, 'Llama-3.2-1B-Q8_0.gguf')
     expect(quantSelect).toHaveValue('Q8_0')
+
+    // Clearing the quantization clears the linked artifact, so an
+    // incompatible combination cannot be saved.
+    await user.selectOptions(quantSelect, '')
+    expect(quantSelect).toHaveValue('')
+    expect(artifactSelect).toHaveValue('')
+  })
+
+  it('withholds downloaded marks when the listing resolves a newer revision', async () => {
+    const user = userEvent.setup()
+    mockGgufCluster(NEW_SHA)
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+
+    // The cache only holds the older revision's files, so the current
+    // listing's quantizations must not claim a downloaded state.
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B' })).toBeInTheDocument()
+    expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
   })
 })

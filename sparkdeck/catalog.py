@@ -266,6 +266,9 @@ class HuggingFaceCatalog:
             "id": repository,
             "author": str(item.get("author") or repository.partition("/")[0] or "")[:200] or None,
             "name": repository.split("/")[-1],
+            # The commit the file listing was resolved at, so clients can
+            # compare locally cached snapshot revisions against current files.
+            "revision": str(item.get("sha") or "")[:64] or None,
             "downloads": _nonnegative_int(item.get("downloads")),
             "likes": _nonnegative_int(item.get("likes")),
             "parameter_count": parameter_count,

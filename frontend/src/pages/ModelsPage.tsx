@@ -241,6 +241,7 @@ export function ModelsPage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const [searchParams, setSearchParams] = useSearchParams()
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
+  const [recipeSeedNodeId, setRecipeSeedNodeId] = useState<string>()
   const acceptedDeployments = useRef(new Map<string, Deployment>())
   const resource = useResource(async (signal) => {
     const deployments = await api.deployments.list(signal)
@@ -1091,6 +1092,7 @@ export function ModelsPage() {
       .slice(0, recipe.required_node_count)
     setRecipeError(undefined)
     setRecipeTransferNotice(undefined)
+    setRecipeSeedNodeId(undefined)
     setRecipeDeployment({ recipe, nodeIds })
   }
 
@@ -1101,7 +1103,10 @@ export function ModelsPage() {
     setBusy(`recipe-prepare:${recipe.id}`)
     setRecipeError(undefined)
     try {
-      const plan = await api.storage.preparationPreflight(recipe.id, nodeIds)
+      const seedNodeId = recipeSeedNodeId && nodeIds.includes(recipeSeedNodeId)
+        ? recipeSeedNodeId
+        : undefined
+      const plan = await api.storage.preparationPreflight(recipe.id, nodeIds, seedNodeId)
       reloadTransferPreflight()
       if (!plan.eligible) throw new Error(plan.reason || 'The selected nodes are no longer eligible')
       if (plan.action === 'ready') {
@@ -1130,7 +1135,7 @@ export function ModelsPage() {
         confirmLabel: 'Start preparation',
       })) return
       setRecipeTransferNotice(undefined)
-      const result = await api.storage.prepareRecipe(recipe.id, nodeIds)
+      const result = await api.storage.prepareRecipe(recipe.id, nodeIds, seedNodeId)
       if (!result.jobs.length) {
         reloadModelCache()
         return
@@ -1474,7 +1479,10 @@ export function ModelsPage() {
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
-              onChange={(next) => setRecipeDeployment({ recipe, nodeIds: next.length <= recipe.required_node_count ? next : nodeIds })}
+              onChange={(next) => {
+                setRecipeDeployment({ recipe, nodeIds: next.length <= recipe.required_node_count ? next : nodeIds })
+                if (recipeSeedNodeId && !next.includes(recipeSeedNodeId)) setRecipeSeedNodeId(undefined)
+              }}
               loading={nodes.loading}
               error={nodes.error}
               onRetry={nodes.reload}
@@ -1497,6 +1505,25 @@ export function ModelsPage() {
               {transferPreflight.data && !transferPreflight.data.enabled && <p>Virtual NAS is disabled. Enable it on the Storage page before transferring weights.</p>}
               {transferPreflight.data?.enabled && transferPreflight.data.source && <p>A complete copy is available on {transferPreflight.data.source.node_name}; cache-empty nodes will receive it through Virtual NAS, while incomplete caches resume from Hugging Face.</p>}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download && <p>No cluster node has the requested revision. Incomplete selected caches will resume from Hugging Face; a cache-empty selected node will seed any Virtual NAS fan-out.</p>}
+              {transferPreflight.data?.enabled
+                && !(transferPreflight.data.sources ?? []).some((source) => nodeIds.includes(source.node_id))
+                && nodeIds.length > 1 && (
+                <label className="field">
+                  <span>Hub download seed (optional)</span>
+                  <select
+                    value={recipeSeedNodeId ?? ''}
+                    disabled={recipeBusy}
+                    onChange={(event) => setRecipeSeedNodeId(event.target.value || undefined)}
+                  >
+                    <option value="">Automatic</option>
+                    {nodeIds.map((id) => {
+                      const node = nodes.data?.find((item) => item.id === id)
+                      return <option key={id} value={id}>{id === localNodeId ? localLabel : node?.name ?? id}</option>
+                    })}
+                  </select>
+                  <small>The selected node downloads from Hugging Face first; the other nodes receive copies over Virtual NAS instead of downloading separately.</small>
+                </label>
+              )}
               {transferPreflight.data?.enabled && !transferPreflight.data.source && transferPreflight.data.download_error && <p>{transferPreflight.data.download_error}</p>}
               {transferPreflight.data?.enabled && <div className="recipe-transfer-targets">
                 {missingNodes.filter((node) => nodeIds.includes(node.id)).map((node) => {

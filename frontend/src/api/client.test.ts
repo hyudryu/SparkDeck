@@ -458,20 +458,22 @@ describe('API client adapters', () => {
   it('saves node preferences for llama.cpp deployments like the other runtimes', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       id: 'dep-llama', alias: 'local-gguf', runtime: 'llama.cpp', kind: 'managed',
-      model: { repository: 'models/local.gguf' }, status: 'saved', settings: {},
+      model: { repository: 'org/model', artifact: 'Q4_K_M/model.gguf' }, status: 'saved', settings: {},
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
 
     await api.deployments.create({
-      alias: 'local-gguf', model_id: 'models/local.gguf', runtime: 'llama.cpp', managed: true,
-      settings: { context_length: 8192, gpu_layers: 99 }, node_ids: ['local'], deployment_mode: 'single',
+      alias: 'local-gguf', model_id: 'org/model', runtime: 'llama.cpp', managed: true,
+      settings: { context_length: 8192, gpu_layers: 99, artifact: 'Q4_K_M/model.gguf' },
+      node_ids: ['local', 'spark-2'], deployment_mode: 'replicated',
     })
 
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>
     expect(body).toEqual(expect.objectContaining({
-      node_ids: ['local'],
-      deployment_mode: 'single',
+      node_ids: ['local', 'spark-2'],
+      deployment_mode: 'replicated',
     }))
+    expect(body).not.toHaveProperty('download_node_id')
   })
 
   it('sends selected node IDs when pulling an image', async () => {

@@ -1851,6 +1851,26 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
+        self.assertIsNone(result["jobs"][0]["bytes_per_second"])
+
+    def test_public_job_reports_average_transfer_rate(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"cluster_node_name": "Coordinator"}
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "worker-a", "name": "Worker A",
+        }
+
+        with patch("manager.time.time", return_value=110):
+            result = manager._public_virtual_nas_job({
+                "id": "transfer-1", "kind": "transfer", "model_id": "org/model",
+                "source_node_id": "local", "target_node_id": "worker-a",
+                "status": "running", "bytes_total": 10_000_000_000,
+                "bytes_transferred": 5_000_000_000,
+                "created_at": 99, "started_at": 100, "completed_at": None,
+            })
+
+        self.assertEqual(result["bytes_per_second"], 500_000_000)
 
 
 if __name__ == "__main__":

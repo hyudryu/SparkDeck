@@ -3084,6 +3084,11 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
     config = lowered.get("config.json")
     if config is None:
+        # Tokenizer assets without configuration are an interrupted
+        # Transformers download, not a raw weights-only repository.
+        basenames = {Path(name).name for name in lowered}
+        if basenames & _TOKENIZER_FILES or {"vocab.json", "merges.txt"} <= basenames:
+            return False
         # A raw weights-only repository is complete only when the cache shows
         # no unfinished download that could belong to this snapshot. Blobs
         # are named by etag with no revision attribution, so exact scoping is

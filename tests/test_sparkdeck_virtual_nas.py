@@ -909,6 +909,24 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["model_id"], "org/raw")
             self.assertFalse(model["partial"])
 
+    async def test_inventory_marks_tokenizer_without_config_partial(self):
+        # Tokenizer assets prove the repository is a Transformers model
+        # whose config.json never arrived, not a raw weights-only repo.
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = hub / "models--org--raw" / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True)
+            (snapshot / "model.safetensors").write_bytes(b"weights")
+            (snapshot / "tokenizer.json").write_text("{}")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "org/raw")
+            self.assertTrue(model["partial"])
+
     async def test_inventory_scopes_inflight_blobs_to_the_snapshot(self):
         # An interrupted snapshot_download links the weights first; the
         # unfinished config/tokenizer blobs sit in blobs/ outside the

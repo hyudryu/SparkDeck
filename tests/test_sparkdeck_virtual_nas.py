@@ -1832,7 +1832,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "source_node_id": "huggingface", "target_node_id": "worker-a",
             "revision": RESOLVED_REVISION, "status": "running",
             "bytes_total": 1000, "bytes_transferred": 970,
-            "download_cache_baseline_bytes": 1000, "created_at": 1,
+            "download_cache_baseline_bytes": 1000,
+            "download_attempt_start_bytes": 970,
+            "download_attempted_at": 100, "started_at": 99, "created_at": 1,
         }]}
         manager.node_registry = Mock()
         manager.node_registry.get.return_value = {
@@ -1847,11 +1849,12 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             }],
         }])
 
-        result = await manager.virtual_nas_inventory()
+        with patch("manager.time.time", return_value=102):
+            result = await manager.virtual_nas_inventory()
 
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
-        self.assertIsNone(result["jobs"][0]["bytes_per_second"])
+        self.assertEqual(result["jobs"][0]["bytes_per_second"], 2.5)
 
     def test_public_job_reports_average_transfer_rate(self):
         manager = Manager.__new__(Manager)

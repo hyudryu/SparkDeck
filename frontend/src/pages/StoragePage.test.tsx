@@ -372,6 +372,7 @@ describe('StoragePage', () => {
           id: 'download-1', model_id: 'org/download', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
           target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
           bytes_total: 100 * gib, bytes_transferred: 97.5 * gib, progress: 0.975, created_at: '2026-08-26T12:00:00Z',
+          bytes_per_second: 2_500_000_000,
         },
         {
           id: 'transfer-1', model_id: 'org/copy', source_node_id: 'node-a', source_node_name: 'Studio Spark',
@@ -391,6 +392,7 @@ describe('StoragePage', () => {
     expect(downloadProgress.firstElementChild).toHaveStyle({ transform: 'scaleX(0.975)' })
     expect(within(download).getByText(/^97\.5%/)).toBeInTheDocument()
     expect(download).toHaveStyle({ '--storage-active-progress': '97.5%' })
+    expect(within(download).getByText(/2\.50 GB\/s avg/)).toBeInTheDocument()
     expect(within(nodePanel).getAllByText('org/download')).toHaveLength(1)
     expect(within(nodePanel).queryByText('No model weights reported')).not.toBeInTheDocument()
     const copy = within(nodePanel).getByLabelText('Transferring from Studio Spark org/copy on Backup Spark')

@@ -2613,18 +2613,27 @@ class Manager:
             min(1.0, transferred / total) if total
             else (1.0 if job.get("status") == "completed" else 0.0)
         )
-        started_at = job.get("started_at")
+        downloading = job.get("kind") == "download"
+        started_at = (
+            job.get("download_attempted_at") if downloading
+            else job.get("started_at")
+        )
         completed_at = job.get("completed_at")
         bytes_per_second = None
-        # Download progress includes bytes already present in a resumable cache,
-        # so only node-to-node copies have an honest elapsed-time transfer rate.
-        if job.get("kind") == "transfer":
+        start_bytes = (
+            job.get("download_attempt_start_bytes") if downloading else 0
+        )
+        if start_bytes is not None:
             try:
                 started = float(started_at)
-                ended = float(completed_at) if completed_at is not None else time.time()
+                ended = (
+                    float(completed_at)
+                    if completed_at is not None else time.time()
+                )
                 elapsed = ended - started
-                if transferred > 0 and elapsed > 0:
-                    bytes_per_second = transferred / elapsed
+                attempt_bytes = max(0, transferred - int(start_bytes))
+                if attempt_bytes > 0 and elapsed > 0:
+                    bytes_per_second = attempt_bytes / elapsed
             except (TypeError, ValueError):
                 pass
         return {

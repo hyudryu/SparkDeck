@@ -2687,9 +2687,12 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             first = await manager.virtual_nas_inventory()
             inventory["models"][0]["size_bytes"] = 1975
             inventory["models"][0]["partial_revision_size_bytes"][RESOLVED_REVISION] = 975
+            cached = await manager.virtual_nas_inventory()
+            manager._invalidate_virtual_nas_nodes()
             result = await manager.virtual_nas_inventory()
 
         self.assertIsNone(first["jobs"][0]["bytes_per_second"])
+        self.assertIsNone(cached["jobs"][0]["bytes_per_second"])
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
         self.assertEqual(result["jobs"][0]["bytes_per_second"], 2.5)

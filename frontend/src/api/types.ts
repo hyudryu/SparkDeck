@@ -619,8 +619,8 @@ export interface DashboardData {
 export interface StorageModel {
   model_id: string
   size_bytes: number
-  // Best-effort full repository size for partial caches, looked up from the
-  // Hugging Face tree API. Absent when the lookup failed or was not attempted.
+  // Best-effort full repository or selected-artifact size for partial caches,
+  // looked up from the Hugging Face tree API. Absent when lookup failed.
   expected_size_bytes?: number
   partial?: boolean
   has_partial_download?: boolean
@@ -633,6 +633,9 @@ export interface StorageModel {
   // The UI compares the revision a model listing resolved to before marking
   // quantizations or artifacts as already downloaded.
   snapshot_files?: Record<string, string[]>
+  // Exact files selected for a partial snapshot. Older cache markers may
+  // report the already-cached subset instead.
+  selective_files_by_revision?: Record<string, string[]>
   revision_refs?: Record<string, string>
   source?: string
   externally_managed?: boolean

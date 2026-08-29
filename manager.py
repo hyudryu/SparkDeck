@@ -1871,7 +1871,7 @@ class Manager:
         The Hub tree lookup is best-effort display enrichment: any failure
         simply omits ``expected_size_bytes`` and never fails the inventory.
         """
-        targets: dict[tuple[str, str], None] = {}
+        targets: dict[tuple[str, str, tuple[str, ...]], None] = {}
         for node in nodes:
             for model in node.get("models") or []:
                 if not model.get("partial") or model.get("externally_managed"):
@@ -1883,17 +1883,30 @@ class Manager:
                 if not isinstance(revision, str) or not revision.strip():
                     continue
                 revision = revision.strip()
-                targets.setdefault((model_id, revision))
+                resolved_revision = str(
+                    (model.get("partial_revision_refs") or {}).get(revision)
+                    or revision
+                )
+                selected_files = (model.get("selective_files_by_revision") or {}).get(
+                    resolved_revision
+                )
+                files = tuple(selected_files) if isinstance(selected_files, list) else ()
+                targets.setdefault((model_id, revision, files))
         if not targets:
             return
         semaphore = asyncio.Semaphore(4)
 
-        async def lookup(model_id: str, revision: str) -> int | None:
+        async def lookup(
+            model_id: str, revision: str, files: tuple[str, ...],
+        ) -> int | None:
             async with semaphore:
-                return await self._expected_model_size_bytes(model_id, revision)
+                return await self._expected_model_size_bytes(
+                    model_id, revision, files or None,
+                )
 
         results = await asyncio.gather(*(
-            lookup(model_id, revision) for model_id, revision in targets
+            lookup(model_id, revision, files)
+            for model_id, revision, files in targets
         ))
         expected = dict(zip(targets, results))
         for node in nodes:
@@ -1903,19 +1916,24 @@ class Manager:
                 key = (
                     str(model.get("model_id") or ""),
                     str(model.get("revision") or ""),
+                    tuple((model.get("selective_files_by_revision") or {}).get(
+                        str((model.get("partial_revision_refs") or {}).get(
+                            str(model.get("revision") or "")
+                        ) or model.get("revision") or "")
+                    ) or []),
                 )
                 size = expected.get(key)
                 if size:
                     model["expected_size_bytes"] = size
 
     async def _expected_model_size_bytes(
-        self, model_id: str, revision: str,
+        self, model_id: str, revision: str, filenames: tuple[str, ...] | None = None,
     ) -> int | None:
-        """Return the full repository size, cached for an hour per revision."""
+        """Return a repository or selected-artifact size, cached for an hour."""
         cache = getattr(self, "_expected_model_size_cache", None)
         if cache is None:
             cache = self._expected_model_size_cache = {}
-        key = (model_id.casefold(), revision)
+        key = (model_id.casefold(), revision, filenames or ())
         now = time.monotonic()
         cached = cache.get(key)
         if cached and now - cached[0] < 3600:
@@ -1924,7 +1942,7 @@ class Manager:
             validate_model_id(model_id)
             validate_revision(revision)
             size: int | None = await self._fetch_model_tree_size(
-                model_id, revision,
+                model_id, revision, filenames,
             )
         except Exception:
             size = None
@@ -1933,8 +1951,10 @@ class Manager:
         cache[key] = (now, size)
         return size
 
-    async def _fetch_model_tree_size(self, model_id: str, revision: str) -> int:
-        """Sum file sizes across the paginated Hugging Face tree listing."""
+    async def _fetch_model_tree_size(
+        self, model_id: str, revision: str, filenames: tuple[str, ...] | None = None,
+    ) -> int:
+        """Sum repository or exact selected-artifact sizes from the Hub tree."""
         tree_path = (
             f"/api/models/{quote(model_id, safe='/')}"
             f"/tree/{quote(revision, safe='')}"
@@ -1942,6 +1962,8 @@ class Manager:
         tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
         params: dict[str, Any] | None = {"recursive": "true", "limit": 1000}
         total = 0
+        selected = set(filenames or ())
+        found: set[str] = set()
         seen_pages: set[str] = set()
         while True:
             headers = {}
@@ -1959,11 +1981,18 @@ class Manager:
             page = response.json()
             if not isinstance(page, list):
                 raise ValueError("Hugging Face returned an invalid model tree")
-            total += sum(
-                int(entry.get("size") or 0)
-                for entry in page
-                if isinstance(entry, dict)
-            )
+            for entry in page:
+                if not isinstance(entry, dict):
+                    continue
+                path = entry.get("path")
+                if selected and path not in selected:
+                    continue
+                size = entry.get("size")
+                if selected and (isinstance(size, bool) or not isinstance(size, int) or size < 0):
+                    raise ValueError("Hugging Face did not report a selected file size")
+                total += int(size or 0)
+                if isinstance(path, str) and path in selected:
+                    found.add(path)
             next_href = response.links.get("next", {}).get("url")
             if not next_href:
                 break
@@ -1976,6 +2005,8 @@ class Manager:
                 raise ValueError("Hugging Face returned an unsafe model tree page")
             tree_url = next_url
             params = None
+        if selected and found != selected:
+            raise ValueError("Hugging Face did not report every selected file")
         return total
 
     async def queue_virtual_nas_transfer(

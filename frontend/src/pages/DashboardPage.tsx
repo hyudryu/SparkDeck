@@ -16,7 +16,7 @@ import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Runtim
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { useDashboardStream } from '../hooks/useDashboardStream'
-import type { DashboardStreamResources } from '../hooks/useDashboardStream'
+import type { DashboardStreamResources, DashboardStreamSource } from '../hooks/useDashboardStream'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
   return value === null || value === undefined ? '—' : `${value.toFixed(digits)}${suffix}`
@@ -118,12 +118,14 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
 export function DashboardPage() {
   const resourcesRef = useRef<DashboardStreamResources | null>(null)
   const stream = useDashboardStream(resourcesRef)
-  const polling = !stream.live
-  const statsResource = useDashboardResource((signal) => api.dashboard.stats(signal), polling)
-  const admissionResource = useDashboardResource((signal) => api.dashboard.admission(signal), polling)
-  const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal), polling)
-  const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal), polling)
-  const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal), polling)
+  // Poll while the socket is down, and keep polling any source the stream
+  // reports as failed (null) so it recovers through the REST fallback.
+  const polling = (source: DashboardStreamSource) => !stream.live || stream.failed.has(source)
+  const statsResource = useDashboardResource((signal) => api.dashboard.stats(signal), polling('stats'))
+  const admissionResource = useDashboardResource((signal) => api.dashboard.admission(signal), polling('admission'))
+  const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal), polling('deployments'))
+  const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal), polling('sync'))
+  const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal), polling('nodes'))
   useEffect(() => {
     resourcesRef.current = {
       stats: statsResource,

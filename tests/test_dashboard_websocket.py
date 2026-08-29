@@ -3,6 +3,7 @@ from contextlib import ExitStack
 from unittest.mock import AsyncMock, Mock, patch
 
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -23,20 +24,25 @@ NODES = [{"id": "local", "name": "Spark Four"}]
 
 
 def _patch_sources(stack: ExitStack, stats_override=None):
+    mocks = Mock()
+    mocks.get_stats = stats_override or AsyncMock(return_value=STATS)
+    mocks.inference_admission = Mock(return_value=ADMISSION)
+    mocks.deployments = AsyncMock(return_value=DEPLOYMENTS)
+    mocks.community_sync = Mock(return_value=COMMUNITY_SYNC)
+    mocks.cluster_nodes = AsyncMock(return_value=NODES)
+    stack.enter_context(patch.object(server.manager, "get_stats", mocks.get_stats))
     stack.enter_context(patch.object(
-        server.manager, "get_stats",
-        stats_override or AsyncMock(return_value=STATS)))
+        server.manager, "inference_admission", mocks.inference_admission))
     stack.enter_context(patch.object(
-        server.manager, "inference_admission", Mock(return_value=ADMISSION)))
+        server.sparkdeck, "deployments", mocks.deployments))
     stack.enter_context(patch.object(
-        server.sparkdeck, "deployments", AsyncMock(return_value=DEPLOYMENTS)))
+        server, "_community_sync_status", mocks.community_sync))
     stack.enter_context(patch.object(
-        server, "_community_sync_status", Mock(return_value=COMMUNITY_SYNC)))
-    stack.enter_context(patch.object(
-        server.manager, "cluster_nodes", AsyncMock(return_value=NODES)))
+        server.manager, "cluster_nodes", mocks.cluster_nodes))
     stack.enter_context(patch.object(
         server.manager, "public_target_node",
         Mock(side_effect=lambda node: dict(node, public=True))))
+    return mocks
 
 
 class DashboardWebSocketTests(unittest.TestCase):
@@ -72,6 +78,56 @@ class DashboardWebSocketTests(unittest.TestCase):
             self.assertEqual(snapshot["type"], "snapshot")
             self.assertIsNone(snapshot["stats"])
             self.assertEqual(snapshot["admission"], ADMISSION)
+
+    def test_slow_sources_repeat_between_refresh_ticks(self):
+        client = TestClient(server.app)
+        with ExitStack() as stack:
+            mocks = _patch_sources(stack)
+            with client.websocket_connect("/api/ws/dashboard") as websocket:
+                first = websocket.receive_json()
+                second = websocket.receive_json()
+
+        # The second tick re-reads the fast sources but reuses the slow ones.
+        self.assertEqual(mocks.get_stats.await_count, 2)
+        self.assertEqual(mocks.inference_admission.call_count, 2)
+        self.assertEqual(mocks.deployments.await_count, 1)
+        self.assertEqual(mocks.community_sync.call_count, 1)
+        self.assertEqual(mocks.cluster_nodes.await_count, 1)
+        self.assertEqual(second["deployments"], first["deployments"])
+        self.assertEqual(second["community_sync"], first["community_sync"])
+        self.assertEqual(second["nodes"], first["nodes"])
+
+    def test_cross_origin_socket_is_rejected(self):
+        client = TestClient(server.app)
+        with self.assertRaises(WebSocketDisconnect) as raised:
+            with client.websocket_connect(
+                "/api/ws/dashboard",
+                headers={"origin": "https://malicious.example"},
+            ):
+                pass
+        self.assertEqual(raised.exception.code, 1008)
+
+    def test_same_origin_socket_is_accepted(self):
+        client = TestClient(server.app)
+        with ExitStack() as stack:
+            _patch_sources(stack)
+            with client.websocket_connect(
+                "/api/ws/dashboard",
+                headers={"origin": "http://testserver"},
+            ) as websocket:
+                snapshot = websocket.receive_json()
+        self.assertEqual(snapshot["type"], "snapshot")
+
+    def test_joined_worker_refuses_the_stream(self):
+        client = TestClient(server.app)
+        with patch.object(
+            server.onboarding.assignment, "load",
+            Mock(return_value={"controller_url": "http://controller:8080"}),
+        ):
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                with client.websocket_connect("/api/ws/dashboard"):
+                    pass
+        self.assertEqual(raised.exception.code, 1008)
 
 
 if __name__ == "__main__":

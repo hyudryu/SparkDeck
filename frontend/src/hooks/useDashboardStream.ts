@@ -12,12 +12,14 @@ import type {
 
 const RECONNECT_DELAY_MS = 5_000
 
+export type DashboardStreamSource = 'stats' | 'admission' | 'deployments' | 'sync' | 'nodes'
+
 export interface DashboardStreamResources {
-  stats: { setData: (value: SystemStats) => void }
-  admission: { setData: (value: Record<string, AdmissionStats>) => void }
-  deployments: { setData: (value: Deployment[]) => void }
-  sync: { setData: (value: SyncStatus) => void }
-  nodes: { setData: (value: NodeInventoryItem[]) => void }
+  stats: { apply: (value: SystemStats) => void }
+  admission: { apply: (value: Record<string, AdmissionStats>) => void }
+  deployments: { apply: (value: Deployment[]) => void }
+  sync: { apply: (value: SyncStatus) => void }
+  nodes: { apply: (value: NodeInventoryItem[]) => void }
 }
 
 interface DashboardSnapshot {
@@ -34,12 +36,23 @@ interface DashboardSnapshot {
 // polling fallback, while snapshots only need the resources once connected.
 export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResources | null>) {
   const [live, setLive] = useState(false)
+  const [failed, setFailed] = useState<ReadonlySet<DashboardStreamSource>>(new Set())
 
   useEffect(() => {
     if (typeof WebSocket === 'undefined') return undefined
     let socket: WebSocket | undefined
     let reconnectTimer: number | undefined
     let closed = false
+
+    const markFailed = (source: DashboardStreamSource, isFailed: boolean) => {
+      setFailed((current) => {
+        if (current.has(source) === isFailed) return current
+        const next = new Set(current)
+        if (isFailed) next.add(source)
+        else next.delete(source)
+        return next
+      })
+    }
 
     const connect = () => {
       let next: WebSocket
@@ -58,13 +71,30 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
           if (snapshot?.type !== 'snapshot') return
           const resources = resourcesRef.current
           if (!resources) return
-          if (snapshot.stats) resources.stats.setData(snapshot.stats)
-          if (snapshot.admission) resources.admission.setData(snapshot.admission)
-          if (snapshot.deployments) {
-            resources.deployments.setData(snapshot.deployments.items.map(deploymentFromWire))
+          // A null value means that source failed server-side; keep polling
+          // it via REST while the socket stays live for the other sources.
+          if (snapshot.stats !== undefined) {
+            markFailed('stats', snapshot.stats === null)
+            if (snapshot.stats) resources.stats.apply(snapshot.stats)
           }
-          if (snapshot.community_sync) resources.sync.setData(syncStatusFromWire(snapshot.community_sync))
-          if (snapshot.nodes) resources.nodes.setData(snapshot.nodes.items)
+          if (snapshot.admission !== undefined) {
+            markFailed('admission', snapshot.admission === null)
+            if (snapshot.admission) resources.admission.apply(snapshot.admission)
+          }
+          if (snapshot.deployments !== undefined) {
+            markFailed('deployments', snapshot.deployments === null)
+            if (snapshot.deployments) {
+              resources.deployments.apply(snapshot.deployments.items.map(deploymentFromWire))
+            }
+          }
+          if (snapshot.community_sync !== undefined) {
+            markFailed('sync', snapshot.community_sync === null)
+            if (snapshot.community_sync) resources.sync.apply(syncStatusFromWire(snapshot.community_sync))
+          }
+          if (snapshot.nodes !== undefined) {
+            markFailed('nodes', snapshot.nodes === null)
+            if (snapshot.nodes) resources.nodes.apply(snapshot.nodes.items)
+          }
         } catch {
           // Ignore malformed frames; the next snapshot replaces the state.
         }
@@ -85,5 +115,5 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
     }
   }, [resourcesRef])
 
-  return { live }
+  return { live, failed }
 }

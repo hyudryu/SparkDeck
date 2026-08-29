@@ -601,7 +601,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 {"models": [wrong_alias], "free_size": AMPLE_BYTES},
             ])
 
-            async def source_bytes():
+            async def source_bytes(chunk_size=None):
                 yield b"archive"
 
             source_response = Mock(status_code=200)

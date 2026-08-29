@@ -125,6 +125,10 @@ class FakeRegistry:
 class RemoteSourceRegistry(FakeRegistry):
     """A fabric-configured remote source for archive-leg routing tests."""
 
+    def __init__(self):
+        super().__init__()
+        self.last_source_response = None
+
     async def request(self, node_id, method, path, **_kwargs):
         if "files/size" in path:
             return {"size_bytes": 7}
@@ -134,9 +138,11 @@ class RemoteSourceRegistry(FakeRegistry):
         self.stream_calls.append((node_id, method, path, kwargs))
         if method == "GET":
             class SourceResponse(FakeResponse):
-                async def aiter_bytes(self):
+                async def aiter_bytes(self, chunk_size=None):
+                    self.chunk_size = chunk_size
                     yield b"archive"
-            return SourceResponse()
+            self.last_source_response = SourceResponse()
+            return self.last_source_response
         return await super().open_stream(node_id, method, path, **kwargs)
 
 
@@ -170,7 +176,10 @@ class DirectTransferRegistry(FakeRegistry):
                 "model_id": "org/model", "size_bytes": body["model_bytes"],
                 "partial": False, "revisions": ["revision-1"],
             }]
-            return {"bytes_received": body["model_bytes"]}
+            # Tar headers and record padding make wire bytes larger than the
+            # model's logical size; that must not turn a valid import into a
+            # false failure.
+            return {"bytes_received": body["model_bytes"] + 10_240}
         return {
             "models": self.remote_models.get(node_id, []),
             "free_size": 10 * 1024 * 1024 * 1024,
@@ -1493,6 +1502,24 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FileExistsError):
                 await target.import_model("org/model", bytes_stream(b"unused"))
 
+    async def test_streamed_export_batches_archive_for_high_throughput(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            payload_size = virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES * 2 + 123
+            (repository / "snapshots" / "revision-1" / "model.safetensors").write_bytes(
+                b"x" * payload_size
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+
+            chunk_sizes = [len(chunk) async for chunk in nas.export_model("org/model")]
+
+            self.assertGreaterEqual(chunk_sizes.count(virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES), 2)
+            self.assertLessEqual(max(chunk_sizes), virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES)
+            self.assertGreater(sum(chunk_sizes), payload_size)
+
     async def test_delete_is_blocked_while_local_export_is_reserved(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
@@ -1745,6 +1772,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "completed")
         download = next(call for call in registry.stream_calls if call[1] == "GET")
         self.assertTrue(download[3]["use_fabric"])
+        self.assertEqual(
+            registry.last_source_response.chunk_size,
+            virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES,
+        )
 
     async def test_local_source_selective_file_upload_uses_fabric_stream(self):
         registry = FakeRegistry()
@@ -1776,6 +1807,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         download = next(call for call in registry.stream_calls if call[1] == "GET")
         self.assertTrue(download[3]["use_fabric"])
+        self.assertEqual(
+            registry.last_source_response.chunk_size,
+            virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES,
+        )
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):
         registry = FakeRegistry(block_upload=True)

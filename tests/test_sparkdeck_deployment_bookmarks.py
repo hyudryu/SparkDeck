@@ -574,6 +574,25 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["launch_controls"]["context_window"], 16384)
         self.assertEqual(detail["status"], "saved")
 
+        # Clearing a control in the editor also drops the saved scalar.
+        await self.service.update_deployment_settings("bookmark", {
+            "launch_controls": {
+                "context_window": None,
+                "max_concurrency": None,
+                "kv_cache_dtype": None,
+                "thinking_mode": None,
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+            },
+        })
+        cleared = await self.service.deployment_detail(
+            self.service.store.deployment("bookmark")["id"],
+        )
+        self.assertIsNone(cleared["launch_controls"]["context_window"])
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertIsNone(stored["settings"]["context_length"])
+
         # Alias changes save atomically with the settings in one request.
         detail = await self.service.update_deployment_settings("bookmark", {
             "alias": "renamed-bookmark",
@@ -592,9 +611,41 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 "alias": "other",
             })
         self.assertEqual(
-            self.service.store.deployment("renamed-bookmark")["settings"]["context_length"],
+            self.service.store.deployment(
+                "renamed-bookmark"
+            )["settings"]["context_length"],
             32768,
         )
+
+    async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "fresh", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"context_length": 24576},
+        })
+
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("fresh")["id"],
+        )
+
+        # First editor use shows the bookmark's own scalars instead of
+        # blanks, so an unchanged Save/Run cannot strip the launch argument.
+        self.assertEqual(detail["launch_controls"]["context_window"], 24576)
+        self.assertEqual(detail["gpu_memory_gb"], None)
+
+    async def test_saved_sglang_bookmark_detail_exposes_saved_scalars(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "sg-bookmark", "runtime": "sglang",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"tensor_parallel_size": 2, "mem_fraction_static": 0.8},
+        })
+
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("sg-bookmark")["id"],
+        )
+
+        self.assertEqual(detail["sg_tp_size"], 2)
+        self.assertEqual(detail["sg_mem_fraction"], 0.8)
 
     async def test_quantization_only_change_is_revalidated_against_the_artifact(self):
         await self.service.create_deployment({

@@ -1104,10 +1104,22 @@ class SparkDeckService:
                 })
                 if launch_settings is not None
                 else {
+                    # Seed from the scalar bookmark settings so first use of
+                    # the editor shows the values the bookmark will launch
+                    # with; an unchanged save round-trips them instead of
+                    # submitting nulls that would strip launch arguments.
                     **self.manager._deployment_launch_controls({
                         "engine": str(public.get("runtime") or "vllm"),
                         "extra_args": extra_args,
                     }),
+                    **{
+                        "context_window": saved_settings.get("context_length"),
+                        "max_concurrency": (
+                            saved_settings.get("parallel_slots")
+                            if str(public.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+                            else saved_settings.get("max_running_requests")
+                        ),
+                    },
                     # Structured controls saved through this editor are the
                     # authoritative round-trip source; the argv parse only
                     # fills controls the bookmark has never stored.
@@ -1175,6 +1187,13 @@ class SparkDeckService:
         gpu_memory_utilization = (launch_settings or {}).get("gpu_memory_utilization")
         sg_tp_size = (launch_settings or {}).get("sg_tp_size")
         sg_mem_fraction = (launch_settings or {}).get("sg_mem_fraction")
+        if saved_only:
+            # Before the first launch the bookmark's own scalars are the only
+            # source, so an unchanged editor save cannot erase them with null.
+            sg_tp_size = saved_settings.get("tensor_parallel_size", sg_tp_size)
+            sg_mem_fraction = saved_settings.get(
+                "mem_fraction_static", sg_mem_fraction,
+            )
         image = (launch_settings or {}).get("image")
         if discovered_settings is not None:
             engine = str(public.get("runtime") or "vllm")
@@ -1302,7 +1321,12 @@ class SparkDeckService:
         if "artifact" in changes:
             artifact = _optional_string(changes.get("artifact"))
             if artifact and runtime_is_llama:
-                artifact_path = Path(artifact).expanduser()
+                try:
+                    artifact_path = Path(artifact).expanduser()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        "llama.cpp managed deployments require an existing local GGUF artifact"
+                    ) from exc
                 if artifact_path.is_absolute():
                     # Controller-local artifacts keep the same rule as
                     # creation: the file must already exist on the controller.
@@ -1327,6 +1351,10 @@ class SparkDeckService:
                     settings["context_length"] = int(context_window)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("context_window must be an integer") from exc
+            elif "context_window" in controls:
+                # An explicit clear must also drop the saved scalar, or the
+                # launch keeps the stale context length the editor removed.
+                settings["context_length"] = None
             max_concurrency = controls.get("max_concurrency")
             if max_concurrency not in (None, ""):
                 target = "parallel_slots" if runtime_is_llama else "max_running_requests"
@@ -1334,6 +1362,8 @@ class SparkDeckService:
                     settings[target] = int(max_concurrency)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("max_concurrency must be an integer") from exc
+            elif "max_concurrency" in controls:
+                settings["parallel_slots" if runtime_is_llama else "max_running_requests"] = None
             # Persist the complete structured contract: Manager's preflight
             # merges every control (KV dtype, thinking, speculative tokens,
             # cudagraph size, batched tokens) into the launch argv for vLLM
@@ -1409,14 +1439,17 @@ class SparkDeckService:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
             raise ValueError("sharded deployment requires at least two nodes")
-        self.store.update_managed_routing(
-            stored["id"],
-            self._local_configuration(settings),
-            stored.get("container_name"),
-            stored.get("_base_url"),
-        )
         if alias != stored.get("alias"):
-            self.store.update_alias(stored["id"], alias)
+            self.store.update_saved_deployment_settings(
+                stored["id"], self._local_configuration(settings), alias,
+            )
+        else:
+            self.store.update_managed_routing(
+                stored["id"],
+                self._local_configuration(settings),
+                stored.get("container_name"),
+                stored.get("_base_url"),
+            )
         model = dict(stored.get("model") or {})
         if "quantization" in changes:
             model["quantization"] = settings.get("quantization")
@@ -1748,7 +1781,12 @@ class SparkDeckService:
                 # local merely because the same path exists under its home,
                 # while a genuine tilde reference is expanded and must name a
                 # real file to count as controller-local.
-                artifact_path = Path(artifact).expanduser()
+                try:
+                    artifact_path = Path(artifact).expanduser()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        "llama.cpp managed deployments require an existing local GGUF artifact"
+                    ) from exc
                 if artifact_path.is_absolute():
                     if not artifact_path.is_file():
                         raise ValueError(
@@ -4192,7 +4230,10 @@ def _artifact_is_controller_local(artifact: str | None) -> bool:
         return False
     try:
         return Path(artifact).expanduser().is_absolute()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
+        # An unresolvable "~user" home makes the reference unusable; callers
+        # treat this as "not controller-local" and repo-relative validation
+        # rejects it as a malformed artifact.
         return False
 
 

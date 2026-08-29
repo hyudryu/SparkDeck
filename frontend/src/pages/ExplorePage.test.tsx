@@ -367,10 +367,18 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByText('600 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
     expect(screen.getByText('512 GB aggregate sharded memory across 4 measured nodes')).toBeInTheDocument()
 
+    // Minimum node counts pool the largest measured nodes first.
+    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 2+ nodes')
+    expect(screen.getByText('306 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 3+ nodes')
+    expect(screen.getByText('400 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 4+ nodes')
+    expect(screen.getByText('600 GB').closest('.catalog-model-size')).not.toHaveTextContent('node')
+    expect(screen.getByText('600 GB').closest('.catalog-model-size')).not.toHaveTextContent('Fits on')
+
     await user.click(screen.getByRole('button', { name: 'Expand zai-org/GLM-5.3-Flash' }))
     const fitDetails = screen.getByText(/Fit assumes a sharded deployment/)
     expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
     expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
+    expect(fitDetails.closest('.catalog-model-details')).toHaveTextContent('Fits easily · 306 GB · Fits on 3+ nodes')
     expect(screen.getByRole('link', { name: 'Deploy zai-org/GLM-5.3-Flash' })).toHaveAttribute(
       'href', '/models?model=zai-org%2FGLM-5.3-Flash&runtime=vllm&layout=sharded',
     )
@@ -389,6 +397,25 @@ describe('ExplorePage model rows', () => {
     await user.click(screen.getByRole('checkbox', { name: /Only with community data/ }))
     expect(screen.getByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Expand org/tight' })).not.toBeInTheDocument()
+  })
+
+  it('reports a one-node minimum when a single node holds the weights alone', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [{
+        id: 'org/compact', name: 'compact', weight_size_bytes: 80 * gib,
+        downloads: 1, likes: 0, runtime_compatibility: [],
+      }], total: 1 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Spark One', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+
+    expect(await screen.findByRole('button', { name: 'Expand org/compact' })).toBeInTheDocument()
+    expect(screen.getByText('80 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 1 node')
   })
 
   it('does not pool worker memory when the controller cannot join a sharded deployment', async () => {

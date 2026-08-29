@@ -80,6 +80,9 @@ DEFAULT_SETTINGS = {
     "vllm_auto_adjust_concurrency": True,
     # Opt-in model cache replication across authenticated cluster nodes.
     "virtual_nas_enabled": False,
+    # The only SparkDeck node expected to have a direct Ethernet path to the
+    # RouterOS management interface. Credentials remain on that selected node.
+    "routeros_gateway_node_id": "",
     # Cluster management uses the normal LAN/Tailscale address while model
     # collectives use this ConnectX/RDMA interface. Blank values are inferred
     # from the local interfaces advertised by the node agent.
@@ -1267,80 +1270,162 @@ class Manager:
         return [available[node_id] for node_id in requested]
 
     # ---------- RouterOS switch management ----------
+    @staticmethod
+    def _routeros_node_summary(node: dict) -> dict:
+        state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
+        discovery = state.get("discovery")
+        return {
+            "node_id": str(node.get("id") or ""),
+            "node_name": str(node.get("name") or node.get("id") or ""),
+            "online": bool(node.get("online")),
+            "detected": bool(state.get("detected")),
+            "configured": bool(state.get("configured")),
+            "discovery": discovery if isinstance(discovery, list) else [],
+            "discovery_error": state.get("discovery_error"),
+        }
+
+    def _routeros_gateway_node_id(self, summaries: list[dict]) -> str:
+        available = {str(item.get("node_id") or ""): item for item in summaries}
+        selected = str(
+            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
+        ).strip()
+        if selected in available:
+            return selected
+        for key in ("configured", "detected"):
+            candidate = next(
+                (item for item in summaries if item.get(key) and item.get("online")),
+                None,
+            )
+            if candidate:
+                return str(candidate["node_id"])
+        return ""
+
+    def _save_routeros_gateway_node_id(self, node_id: str) -> None:
+        settings = getattr(self, "settings", None)
+        if not isinstance(settings, dict):
+            return
+        settings["routeros_gateway_node_id"] = str(node_id or "")
+        self._save_settings()
+
     async def routeros_cluster_presence(self) -> dict:
         nodes = await self.cluster_nodes()
-        summaries = []
-        for node in nodes:
-            state = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
-            # Presence is intentionally local and lightweight. Connectivity is
-            # unknown until routeros_cluster_overview authenticates to the switch.
-            summaries.append({
-                "node_id": node.get("id"),
-                "node_name": node.get("name"),
-                "online": bool(node.get("online")),
-                "detected": bool(state.get("detected")),
-                "configured": bool(state.get("configured")),
-            })
+        summaries = [self._routeros_node_summary(node) for node in nodes]
         return {
             "detected": any(item["detected"] for item in summaries),
+            "gateway_node_id": self._routeros_gateway_node_id(summaries) or None,
             "nodes": summaries,
         }
 
     async def routeros_cluster_overview(self) -> dict:
         nodes = await self.cluster_nodes()
-
-        async def load(node: dict) -> dict:
-            node_id = str(node.get("id") or "")
-            node_name = str(node.get("name") or node_id)
-            presence = node.get("routeros") if isinstance(node.get("routeros"), dict) else {}
-            if not node.get("online"):
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
+        summaries = [self._routeros_node_summary(node) for node in nodes]
+        gateway_node_id = self._routeros_gateway_node_id(summaries)
+        gateway_node = next(
+            (node for node in nodes if str(node.get("id") or "") == gateway_node_id),
+            None,
+        )
+        gateway = None
+        if gateway_node is not None:
+            summary = self._routeros_node_summary(gateway_node)
+            gateway_check = {
+                "id": "ethernet-gateway",
+                "label": "Ethernet gateway node",
+                "status": "passed" if summary["online"] else "failed",
+                "detail": (
+                    f"{summary['node_name']} is online and selected for the RouterOS Ethernet link."
+                    if summary["online"]
+                    else f"{summary['node_name']} is selected but currently offline."
+                ),
+            }
+            if not summary["online"]:
+                result = {
+                    **summary,
                     "connected": False,
-                    "error": node.get("status_message") or "SparkDeck node is offline",
+                    "error": gateway_node.get("status_message") or "SparkDeck node is offline",
                     "health": [],
                     "interfaces": [],
+                    "network": {
+                        "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                        "active_interfaces": 0, "total_interfaces": 0,
+                    },
+                    "configuration_checks": [],
                 }
-            if not presence.get("detected") and not presence.get("configured"):
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
+            elif not summary["detected"] and not summary["configured"]:
+                result = {
+                    **summary,
                     "connected": False,
                     "health": [],
                     "interfaces": [],
+                    "network": {
+                        "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                        "active_interfaces": 0, "total_interfaces": 0,
+                    },
+                    "configuration_checks": [{
+                        "id": "routeros-authentication",
+                        "label": "RouterOS authentication",
+                        "status": "warning",
+                        "detail": "Enter RouterOS credentials to validate this connection.",
+                    }],
                 }
-            try:
-                if node_id == LOCAL_NODE_ID:
-                    result = await self.routeros.overview()
-                else:
-                    result = await self.node_registry.request(
-                        node_id, "GET", "/api/agent/routeros",
-                        timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
-                    )
-                return {**result, "node_id": node_id, "node_name": node_name}
-            except Exception as exc:
-                return {
-                    **presence,
-                    "node_id": node_id,
-                    "node_name": node_name,
-                    "connected": False,
-                    "error": str(exc),
-                    "health": [],
-                    "interfaces": [],
-                }
-
-        overviews = await asyncio.gather(*(load(node) for node in nodes))
+            else:
+                try:
+                    if gateway_node_id == LOCAL_NODE_ID:
+                        loaded = await self.routeros.overview()
+                    else:
+                        loaded = await self.node_registry.request(
+                            gateway_node_id, "GET", "/api/agent/routeros",
+                            timeout=ROUTEROS_OVERVIEW_TIMEOUT_SECONDS,
+                        )
+                    result = {**summary, **loaded}
+                    result.setdefault("health", [])
+                    result.setdefault("interfaces", [])
+                    result.setdefault("configuration_checks", [])
+                    result.setdefault("network", {
+                        "rx_bits_per_second": 0,
+                        "tx_bits_per_second": 0,
+                        "active_interfaces": 0,
+                        "total_interfaces": len(result["interfaces"]),
+                    })
+                except Exception as exc:
+                    result = {
+                        **summary,
+                        "connected": False,
+                        "error": str(exc),
+                        "health": [],
+                        "interfaces": [],
+                        "network": {
+                            "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                            "active_interfaces": 0, "total_interfaces": 0,
+                        },
+                        "configuration_checks": [{
+                            "id": "routeros-authentication",
+                            "label": "RouterOS authentication",
+                            "status": "failed",
+                            "detail": str(exc),
+                        }],
+                    }
+            gateway = {
+                **result,
+                "node_id": gateway_node_id,
+                "node_name": summary["node_name"],
+                "configuration_checks": [
+                    gateway_check,
+                    *(result.get("configuration_checks") or []),
+                ],
+            }
         return {
-            "detected": any(bool(item.get("detected")) for item in overviews),
-            "nodes": overviews,
+            "detected": any(bool(item.get("detected")) for item in summaries),
+            "gateway_node_id": gateway_node_id or None,
+            "nodes": summaries,
+            "gateway": gateway,
         }
 
-    async def _routeros_target(self, node_id: str) -> dict:
+    async def _routeros_target(
+        self, node_id: str, nodes: list[dict] | None = None,
+    ) -> dict:
         normalized = str(node_id or "").strip()
-        available = {node["id"]: node for node in await self.cluster_nodes()}
+        cluster_nodes = nodes if nodes is not None else await self.cluster_nodes()
+        available = {node["id"]: node for node in cluster_nodes}
         node = available.get(normalized)
         if not node:
             raise ValueError("cluster node not found")
@@ -1349,29 +1434,76 @@ class Manager:
         return node
 
     async def connect_routeros(self, node_id: str, body: dict) -> dict:
-        node = await self._routeros_target(node_id)
-        if node["id"] == LOCAL_NODE_ID:
-            return await self.routeros.connect(body)
-        result = await self.node_registry.request(
-            node["id"], "PUT", "/api/agent/routeros/connection",
-            json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
+        nodes = await self.cluster_nodes()
+        node = await self._routeros_target(node_id, nodes=nodes)
+        summaries = [self._routeros_node_summary(item) for item in nodes]
+        previous_node_id = self._routeros_gateway_node_id(summaries)
+        previous_node = next(
+            (
+                item for item in nodes
+                if item.get("id") == previous_node_id and item.get("id") != node["id"]
+            ),
+            None,
         )
-        # _routeros_target() just populated the four-second agent-status cache.
-        # Drop that pre-connection snapshot so the immediate UI reload probes
-        # the worker and observes its newly configured RouterOS state.
+        if node["id"] == LOCAL_NODE_ID:
+            result = await self.routeros.connect(body)
+        else:
+            result = await self.node_registry.request(
+                node["id"], "PUT", "/api/agent/routeros/connection",
+                json_body=body, timeout=ROUTEROS_CONNECT_TIMEOUT_SECONDS,
+            )
+            # _routeros_target() just populated the four-second agent-status cache.
+            # Drop that pre-connection snapshot so the immediate UI reload probes
+            # the worker and observes its newly configured RouterOS state.
+            self.node_registry._status_cache.pop(node["id"], None)
+        if previous_node is not None:
+            try:
+                await self._disconnect_routeros_node(previous_node)
+            except Exception as exc:
+                rollback_failed = False
+                try:
+                    await self._disconnect_routeros_node(node)
+                except Exception:
+                    rollback_failed = True
+                detail = (
+                    "; the new gateway may also retain credentials"
+                    if rollback_failed else ""
+                )
+                raise RuntimeError(
+                    "Could not remove RouterOS credentials from the previous gateway"
+                    f"{detail}"
+                ) from exc
+        self._save_routeros_gateway_node_id(node["id"])
+        return result
+
+    async def _disconnect_routeros_node(self, node: dict) -> dict:
+        if node["id"] == LOCAL_NODE_ID:
+            return self.routeros.disconnect()
+        result = await self.node_registry.request(
+            node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+        )
         self.node_registry._status_cache.pop(node["id"], None)
         return result
 
     async def disconnect_routeros(self, node_id: str) -> dict:
         node = await self._routeros_target(node_id)
-        if node["id"] == LOCAL_NODE_ID:
-            return self.routeros.disconnect()
-        return await self.node_registry.request(
-            node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+        result = await self._disconnect_routeros_node(node)
+        selected = str(
+            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
         )
+        if selected == node["id"]:
+            self._save_routeros_gateway_node_id("")
+        return result
 
     async def update_routeros_fan_settings(self, node_id: str, body: dict) -> dict:
-        node = await self._routeros_target(node_id)
+        nodes = await self.cluster_nodes()
+        node = await self._routeros_target(node_id, nodes=nodes)
+        summaries = [self._routeros_node_summary(item) for item in nodes]
+        effective = self._routeros_gateway_node_id(summaries)
+        if effective and node["id"] != effective:
+            raise ValueError(
+                "fan settings can only be changed through the selected RouterOS gateway node"
+            )
         if node["id"] == LOCAL_NODE_ID:
             return await self.routeros.update_fan_settings(body)
         return await self.node_registry.request(
@@ -1610,7 +1742,7 @@ class Manager:
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
-        nodes = await self.model_cache_inventory()
+        nodes = await self.model_cache_inventory(enrich_expected_sizes=True)
         models_by_node = {
             str(node.get("id")): {
                 str(model.get("model_id")): model
@@ -1672,7 +1804,9 @@ class Manager:
             == resolved_revision
         )
 
-    async def model_cache_inventory(self) -> list[dict]:
+    async def model_cache_inventory(
+        self, enrich_expected_sizes: bool = False,
+    ) -> list[dict]:
         """Return safe Hugging Face cache sizes even when transfers are off.
 
         The Models page needs read-only disk accounting independently of the
@@ -1727,7 +1861,8 @@ class Manager:
             }
 
         nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
-        await self._enrich_partial_model_sizes(list(nodes))
+        if enrich_expected_sizes:
+            await self._enrich_partial_model_sizes(list(nodes))
         return list(nodes)
 
     async def _enrich_partial_model_sizes(self, nodes: list[dict]) -> None:
@@ -1744,7 +1879,10 @@ class Manager:
                 model_id = str(model.get("model_id") or "")
                 if not model_id:
                     continue
-                revision = str(model.get("revision") or "main")
+                revision = model.get("revision")
+                if not isinstance(revision, str) or not revision.strip():
+                    continue
+                revision = revision.strip()
                 targets.setdefault((model_id, revision))
         if not targets:
             return
@@ -1764,7 +1902,7 @@ class Manager:
                     continue
                 key = (
                     str(model.get("model_id") or ""),
-                    str(model.get("revision") or "main"),
+                    str(model.get("revision") or ""),
                 )
                 size = expected.get(key)
                 if size:
@@ -1806,7 +1944,13 @@ class Manager:
         total = 0
         seen_pages: set[str] = set()
         while True:
-            response = await self.http.get(tree_url, params=params, timeout=5)
+            headers = {}
+            token = self._resolved_hf_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            response = await self.http.get(
+                tree_url, params=params, headers=headers or None, timeout=5,
+            )
             response.raise_for_status()
             current_page = str(response.url)
             if current_page in seen_pages:
@@ -2719,11 +2863,35 @@ class Manager:
             min(1.0, transferred / total) if total
             else (1.0 if job.get("status") == "completed" else 0.0)
         )
+        downloading = job.get("kind") == "download"
+        started_at = (
+            job.get("download_attempted_at") if downloading
+            else job.get("started_at")
+        )
+        completed_at = job.get("completed_at")
+        bytes_per_second = None
+        start_bytes = (
+            job.get("download_attempt_start_bytes") if downloading else 0
+        )
+        if start_bytes is not None:
+            try:
+                started = float(started_at)
+                ended = (
+                    float(completed_at)
+                    if completed_at is not None else time.time()
+                )
+                elapsed = ended - started
+                attempt_bytes = max(0, transferred - int(start_bytes))
+                if attempt_bytes > 0 and elapsed > 0:
+                    bytes_per_second = attempt_bytes / elapsed
+            except (TypeError, ValueError):
+                pass
         return {
             **job,
             "source_node_name": node_name(job["source_node_id"]),
             "target_node_name": node_name(job["target_node_id"]),
             "progress": progress,
+            "bytes_per_second": bytes_per_second,
             "finished_at": job.get("completed_at"),
         }
 
@@ -6632,7 +6800,10 @@ class Manager:
             for k, v in data.items():
                 # Dashboard visibility is presentation-only node state. Keep
                 # its strictly typed node endpoint as the sole write path.
-                if k in DEFAULT_SETTINGS and k != "cluster_node_hidden_from_dashboard":
+                if k in DEFAULT_SETTINGS and k not in {
+                    "cluster_node_hidden_from_dashboard",
+                    "routeros_gateway_node_id",
+                }:
                     # The UI sends an empty password field when an existing
                     # token should remain unchanged.
                     if k == "hf_token" and not str(v or "").strip():

@@ -102,7 +102,7 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
 
         manager.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            nodes = await manager.model_cache_inventory()
+            nodes = await manager.model_cache_inventory(enrich_expected_sizes=True)
         finally:
             await manager.http.aclose()
 

@@ -439,6 +439,10 @@ class VirtualNAS:
                     if raw.get("download_cache_baseline_bytes") is not None else None
                 ),
                 "download_attempted_at": raw.get("download_attempted_at"),
+                "download_attempt_start_bytes": (
+                    _nonnegative_int(raw.get("download_attempt_start_bytes"))
+                    if raw.get("download_attempt_start_bytes") is not None else None
+                ),
                 "legacy_download_attempt_tracking": bool(
                     raw.get(
                         "legacy_download_attempt_tracking",
@@ -2023,6 +2027,7 @@ class VirtualNAS:
             "require_partial_cache": bool(require_partial_cache),
             "download_cache_baseline_bytes": download_baselines[node_id],
             "download_attempted_at": None,
+            "download_attempt_start_bytes": None,
             "legacy_download_attempt_tracking": False,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
@@ -2323,6 +2328,18 @@ class VirtualNAS:
                     json_body=download_body,
                     timeout=24 * 60 * 60,
                 )
+            job["download_attempt_start_bytes"] = (
+                _nonnegative_int(immutable_complete.get("size_bytes"))
+                if immutable_complete is not None
+                else min(
+                    _nonnegative_int(job.get("bytes_total")),
+                    cached_download_bytes(
+                        cached_model,
+                        job.get("download_cache_baseline_bytes"),
+                        job.get("revision") or "main",
+                    ),
+                )
+            )
             job["download_attempted_at"] = time.time()
             self._save()
             # Neither a local snapshot_download worker nor a remote agent's
@@ -2366,6 +2383,9 @@ class VirtualNAS:
         self._cancel_events[job["id"]] = event
         job.update({
             "status": "running", "started_at": time.time(),
+            # Archive copies are not resumable. A requeued attempt streams the
+            # full archive again, so its progress and rate restart at byte zero.
+            "bytes_transferred": 0,
             "completed_at": None, "error": None,
         })
         self._save()
@@ -2815,9 +2835,10 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
                 models[model_id] = candidate
             claimed.update(files)
         for entry in _comfyui_fallback_entries(root, claimed):
-            current = models.get(entry["model_id"])
+            entry_id = entry["model_id"]
+            current = models.get(entry_id)
             if current is None or entry["size_bytes"] > current["size_bytes"]:
-                models[entry["model_id"]] = entry
+                models[entry_id] = entry
     return sorted(models.values(), key=lambda item: str(item["model_id"]))
 
 
@@ -2871,7 +2892,7 @@ def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, 
                 continue
             last_modified = max(stat.st_mtime for stat in stats)
             entries.append({
-                "model_id": name,
+                "model_id": f"{section}/{name}",
                 "size_bytes": sum(stat.st_size for stat in stats),
                 "file_count": len(files),
                 "partial": False,
@@ -3046,10 +3067,18 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
     config = lowered.get("config.json")
     if config is None:
-        # Raw weights-only repositories ship neither configuration nor
-        # tokenizer assets; the integrity gates above (recognized non-empty
-        # weights, complete shards and indexes, no in-progress markers) are
-        # sufficient evidence of a usable snapshot.
+        # A raw weights-only repository is complete only when the cache has
+        # no unfinished Hub blobs. Those blobs live outside the snapshot, so
+        # checking the snapshot alone would misclassify an interrupted pull.
+        if blob_root is None:
+            # Minimal test/portable caches may not materialize a blobs mount;
+            # there is then no external unfinished-blob evidence to reject.
+            return True
+        try:
+            if any(blob.is_file() for blob in blob_root.rglob("*.incomplete")):
+                return False
+        except (OSError, RuntimeError):
+            return False
         return True
     if not _required_files_are_nonempty([config]):
         return False

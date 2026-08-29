@@ -380,8 +380,8 @@ interface WireBenchmark {
   input_tokens: number
   output_tokens: number
   latency_ms: number
-  ttft_ms?: number
-  generation_tokens_per_second?: number
+  ttft_ms?: number | null
+  generation_tokens_per_second?: number | null
   cold_start?: boolean
   eligible_for_community: boolean
   sync_state?: BenchmarkSample['sync_state']

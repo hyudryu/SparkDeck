@@ -1168,6 +1168,7 @@ class SparkDeckService:
         gpu_memory_utilization = (launch_settings or {}).get("gpu_memory_utilization")
         sg_tp_size = (launch_settings or {}).get("sg_tp_size")
         sg_mem_fraction = (launch_settings or {}).get("sg_mem_fraction")
+        gpu_memory_gb = (launch_settings or {}).get("gpu_memory_gb")
         if saved_only:
             # Before the first launch the bookmark's own scalars are the only
             # source, so an unchanged editor save cannot erase them with null.
@@ -1175,6 +1176,7 @@ class SparkDeckService:
             sg_mem_fraction = saved_settings.get(
                 "mem_fraction_static", sg_mem_fraction,
             )
+            gpu_memory_gb = saved_settings.get("gpu_memory_gb", gpu_memory_gb)
         image = (launch_settings or {}).get("image")
         if discovered_settings is not None:
             engine = str(public.get("runtime") or "vllm")
@@ -1195,7 +1197,7 @@ class SparkDeckService:
             "extra_args": extra_args,
             "launch_controls": launch_controls,
             "gpu_memory_utilization": gpu_memory_utilization,
-            "gpu_memory_gb": (launch_settings or {}).get("gpu_memory_gb"),
+            "gpu_memory_gb": gpu_memory_gb,
             "sg_tp_size": sg_tp_size,
             "sg_mem_fraction": sg_mem_fraction,
             "image": image,
@@ -1291,7 +1293,6 @@ class SparkDeckService:
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
-            "gpu_layers", "gpu_memory_gb",
         )
         for field in integer_fields:
             if field not in changes:
@@ -1300,22 +1301,54 @@ class SparkDeckService:
             if value is None:
                 settings[field] = None
                 continue
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{field} must be a number")
-            if value != int(value):
-                raise ValueError(f"{field} must be a whole number")
-            settings[field] = int(value)
-        minimums = {
-            "context_length": 256, "tensor_parallel_size": 1,
-            "parallel_slots": 1, "gpu_memory_gb": 1,
-        }
-        for field, minimum in minimums.items():
-            value = settings.get(field)
-            if value is not None and value < minimum:
+            settings[field] = self._validated_positive_int_setting(
+                field, value, minimum=256 if field == "context_length" else 1,
+            )
+        if "gpu_layers" in changes:
+            value = changes.get("gpu_layers")
+            if value is None:
+                settings["gpu_layers"] = None
+            else:
+                number = self._validated_number("gpu_layers", value)
+                if number < 0:
+                    raise ValueError(
+                        "gpu_layers must be zero or a positive integer"
+                    )
+                settings["gpu_layers"] = int(number)
+        if "gpu_memory_gb" in changes:
+            value = changes.get("gpu_memory_gb")
+            if value is None:
+                settings["gpu_memory_gb"] = None
+            else:
+                # Fractional reservations are valid: DeploymentPage edits this
+                # field in tenths and Manager consumes it as a float.
+                number = self._validated_number("gpu_memory_gb", value)
+                if number <= 0:
+                    raise ValueError("gpu_memory_gb must be positive")
+                settings["gpu_memory_gb"] = number
+        # Stored values created through the raw API can be numeric strings or
+        # other shapes; normalize them through the same validator so the
+        # minimum comparisons below never raise a TypeError-shaped 500.
+        for field, minimum in (
+            ("context_length", 256),
+            ("tensor_parallel_size", 1),
+            ("parallel_slots", 1),
+        ):
+            stored_value = settings.get(field)
+            if stored_value is None:
+                continue
+            if self._validated_number(field, stored_value) < minimum:
                 raise ValueError(f"{field} must be at least {minimum}")
         gpu_layers = settings.get("gpu_layers")
-        if gpu_layers is not None and gpu_layers < 0:
+        if gpu_layers is not None and self._validated_number(
+            "gpu_layers", gpu_layers,
+        ) < 0:
             raise ValueError("gpu_layers must be zero or a positive integer")
+        gpu_memory_gb = settings.get("gpu_memory_gb")
+        if gpu_memory_gb is not None and self._validated_number(
+            "gpu_memory_gb", gpu_memory_gb,
+        ) <= 0:
+            raise ValueError("gpu_memory_gb must be positive")
         if "gpu_memory_utilization" in changes:
             value = changes.get("gpu_memory_utilization")
             if value is None:
@@ -1619,6 +1652,30 @@ class SparkDeckService:
         # are normally symlinks into blobs/, whose content-addressed targets
         # have no .gguf suffix and do not retain multi-shard names.
         return str(candidate)
+
+    @staticmethod
+    def _validated_number(field: str, value: Any) -> float:
+        """Coerce editor/API numeric input to a finite float or raise 400."""
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field} must be a finite number")
+        return number
+
+    def _validated_positive_int_setting(
+        self, field: str, value: Any, minimum: int = 1,
+    ) -> int:
+        number = self._validated_number(field, value)
+        if number != int(number):
+            raise ValueError(f"{field} must be a whole number")
+        integer = int(number)
+        if integer < minimum:
+            raise ValueError(f"{field} must be at least {minimum}")
+        return integer
 
     def _saved_bookmark_launch_controls(
         self, runtime: str, extra_args: list[str],

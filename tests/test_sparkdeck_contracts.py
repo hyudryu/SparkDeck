@@ -210,35 +210,41 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
 
-    async def test_repo_relative_tilde_gguf_is_not_expanded_to_controller_home(self):
-        prepared = str(Path(self.temp.name) / "cache" / "model.gguf")
-        coincidental_home_artifact = Path(self.temp.name) / "home" / "model.gguf"
-        coincidental_home_artifact.parent.mkdir()
-        coincidental_home_artifact.write_bytes(b"unrelated")
-        prepare = AsyncMock(return_value=prepared)
+    async def test_tilde_gguf_is_expanded_to_a_controller_local_artifact(self):
+        # A tilde artifact is expanded and must name a real file under the
+        # home directory to count as controller-local; the expanded path is
+        # persisted so nothing downstream ever re-interprets the shorthand.
+        home_artifact = Path(self.temp.name) / "home" / "model.gguf"
+        home_artifact.parent.mkdir()
+        home_artifact.write_bytes(b"gguf")
         launch = AsyncMock(return_value={
             "name": "sparkdeck-tilde", "port": 8080, "status": "running",
         })
 
-        self.assertTrue(coincidental_home_artifact.exists())
         with (
-            patch.object(
-                self.service, "_prepare_public_gguf_artifact", prepare,
-            ),
+            patch.object(Path, "expanduser", return_value=home_artifact),
             patch("sparkdeck.service.launch_managed_container", launch),
         ):
             created = await self.service.create_deployment({
-                "model": "org/model", "alias": "tilde-repository-path",
+                "model": "org/model", "alias": "tilde-home-path",
                 "runtime": "llama.cpp", "revision": "release-1",
                 "settings": {"artifact": "~/model.gguf"},
             }, launch=True)
 
-        prepare.assert_awaited_once_with(
-            "org/model", "~/model.gguf", "release-1", None,
-            home_node_ids=None, download_node_id=None,
-        )
-        self.assertEqual(created["model"]["artifact"], prepared)
-        self.assertEqual(created["settings"]["model_source"], "public_repository")
+        self.assertEqual(created["model"]["artifact"], str(home_artifact))
+        self.assertEqual(created["settings"]["model_source"], "local")
+        missing = Path(self.temp.name) / "home" / "absent.gguf"
+        with (
+            patch.object(Path, "expanduser", return_value=missing),
+            self.assertRaisesRegex(
+                ValueError, "require an existing local GGUF artifact",
+            ),
+        ):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "tilde-missing",
+                "runtime": "llama.cpp",
+                "settings": {"artifact": "~/absent.gguf"},
+            })
 
     async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
         self.service.store.add_deployment(Deployment(

@@ -546,6 +546,53 @@ class VirtualNAS:
         )
         return int(resolved["size_bytes"])
 
+    async def estimate_selected_files_size(
+        self, model_id: str, revision: str, filenames: list[str],
+        explicit_token: str | None = None,
+    ) -> int:
+        """Sum the Hub-reported sizes of exactly the requested files."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        token = str(
+            explicit_token if explicit_token is not None else self._token_provider() or ""
+        ).strip()
+
+        def inspect() -> int:
+            try:
+                from huggingface_hub import HfApi
+            except ImportError as exc:
+                raise RuntimeError("huggingface-hub is required to download model weights") from exc
+            try:
+                info = HfApi(token=token or None).model_info(
+                    model_id, revision=revision, files_metadata=True,
+                )
+                sizes: dict[str, int] = {}
+                for sibling in list(getattr(info, "siblings", None) or []):
+                    filename = getattr(sibling, "rfilename", None)
+                    size = getattr(sibling, "size", None)
+                    if isinstance(filename, str) and isinstance(size, int) and size >= 0:
+                        sizes[filename] = size
+                missing = [name for name in selected if name not in sizes]
+                if missing:
+                    raise RuntimeError(
+                        "Hugging Face did not report every selected repository file: "
+                        + ", ".join(missing)
+                    )
+                return sum(sizes[name] for name in selected)
+            except Exception as exc:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(
+                    "could not inspect Hugging Face model; verify repository access, revision, credentials, and network"
+                ) from exc
+
+        return await asyncio.to_thread(inspect)
+
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,

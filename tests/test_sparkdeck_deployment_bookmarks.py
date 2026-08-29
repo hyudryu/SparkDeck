@@ -373,6 +373,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas.enabled = True
+        virtual_nas.estimate_selected_files_size = AsyncMock(return_value=5_000_000_000)
         self.manager.virtual_nas = virtual_nas
         self.manager.node_registry = Mock()
         self.manager.node_registry.request = AsyncMock(return_value={"ok": True})
@@ -381,8 +382,8 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.manager.node_download_model_files = AsyncMock(return_value={"ok": True})
         self.manager.node_transfer_model_files = AsyncMock(return_value={"ok": True})
         self.manager.model_cache_inventory = AsyncMock(return_value=[
-            {"id": "local", "models": []},
-            {"id": "remote-1", "models": []},
+            {"id": "local", "models": [], "cache_free_size": 20_000_000_000},
+            {"id": "remote-1", "models": [], "cache_free_size": 20_000_000_000},
         ])
         await self.service.create_deployment({
             "model": "org/model", "alias": "llama-bookmark",
@@ -396,7 +397,46 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(plan["action"], "download")
         self.assertTrue(plan["eligible"])
+        for target in plan["targets"]:
+            self.assertTrue(target["download_eligible"])
+            self.assertIsNotNone(target["required_free_bytes"])
 
+        # A node whose cache cannot hold the selected files is disabled with
+        # a per-node capacity reason before the user confirms anything.
+        small = await self.service.deployment_preparation_preflight(
+            "llama-bookmark", ["remote-1"],
+        )
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "remote-1", "models": [], "cache_free_size": 100},
+        ])
+        small = await self.service.deployment_preparation_preflight(
+            "llama-bookmark", ["remote-1"],
+        )
+        self.assertFalse(small["eligible"])
+        self.assertFalse(small["targets"][0]["download_eligible"])
+        self.assertIn("cache space", small["targets"][0]["download_reason"])
+
+        # Selectively prepared files satisfy readiness even though the
+        # snapshot is deliberately marked partial in the inventory.
+        self.manager.node_has_model_files = AsyncMock(return_value=True)
+        ready = await self.service.deployment_preparation_preflight(
+            "llama-bookmark", ["remote-1"],
+        )
+        self.assertEqual(ready["action"], "ready")
+
+        # Unknown node IDs are never downloadable.
+        unknown = await self.service.deployment_preparation_preflight(
+            "llama-bookmark", ["ghost"],
+        )
+        self.assertFalse(unknown["eligible"])
+        self.assertEqual(unknown["targets"][0]["download_reason"], "Unknown cluster node")
+
+        # Restore the shared fixtures for the prepare + launch assertions.
+        self.manager.node_has_model_files = AsyncMock(return_value=False)
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "local", "models": [], "cache_free_size": 20_000_000_000},
+            {"id": "remote-1", "models": [], "cache_free_size": 20_000_000_000},
+        ])
         await self.service.deployment_prepare("llama-bookmark", ["local", "remote-1"])
 
         # One selected node seeds the artifact from Hugging Face and the rest
@@ -472,6 +512,105 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             self.manager.update_deployment_settings.call_args.args[1]["launch_controls"]["max_concurrency"],
             4,
         )
+
+    async def test_local_model_directory_rejects_remote_nodes_for_any_runtime(self):
+        model_dir = Path(self.temp.name) / "local-model"
+        model_dir.mkdir()
+        self.manager._resolve_local_path = Mock(return_value=str(model_dir))
+        with self.assertRaisesRegex(ValueError, "local model paths"):
+            await self.service.create_deployment({
+                "model": str(model_dir), "alias": "local-vllm",
+                "runtime": "vllm",
+                "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+            })
+
+        # The controller-only selection stays saveable.
+        created = await self.service.create_deployment({
+            "model": str(model_dir), "alias": "local-vllm",
+            "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+        self.assertEqual(created["status"], "saved")
+
+    async def test_saved_bookmark_accepts_the_detail_editor_contract(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"context_length": 8192},
+        })
+
+        # The DeploymentPage editor submits the manager-backed contract; a
+        # saved bookmark must translate it instead of rejecting the save, and
+        # the complete structured controls persist for Manager to merge.
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "launch_controls": {
+                "context_window": 16384,
+                "max_concurrency": 8,
+                "kv_cache_dtype": "fp8",
+                "thinking_mode": "default",
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+            },
+            "gpu_memory_gb": 24,
+            "sg_tp_size": None,
+            "sg_mem_fraction": None,
+            "gpu_memory_utilization": None,
+            "extra_args": ["--enable-prefix-caching"],
+        })
+
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertEqual(stored["settings"]["context_length"], 16384)
+        self.assertEqual(stored["settings"]["max_running_requests"], 8)
+        self.assertEqual(stored["settings"]["gpu_memory_gb"], 24)
+        self.assertEqual(stored["settings"]["extra_args"], ["--enable-prefix-caching"])
+        self.assertEqual(stored["settings"]["launch_controls"]["kv_cache_dtype"], "fp8")
+        # The detail response round-trips the persisted structured controls
+        # so a subsequent unchanged save cannot blank them out.
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("bookmark")["id"],
+        )
+        self.assertEqual(detail["launch_controls"]["kv_cache_dtype"], "fp8")
+        self.assertEqual(detail["launch_controls"]["context_window"], 16384)
+        self.assertEqual(detail["status"], "saved")
+
+        # Alias changes save atomically with the settings in one request.
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "alias": "renamed-bookmark",
+            "context_length": 32768,
+        })
+        self.assertEqual(detail["alias"], "renamed-bookmark")
+        self.assertIsNone(self.service.store.deployment("bookmark"))
+        self.assertIsNotNone(self.service.store.deployment("renamed-bookmark"))
+        # A second deployment's alias cannot be taken.
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "other", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        with self.assertRaisesRegex(ValueError, "already in use"):
+            await self.service.update_deployment_settings("renamed-bookmark", {
+                "alias": "other",
+            })
+        self.assertEqual(
+            self.service.store.deployment("renamed-bookmark")["settings"]["context_length"],
+            32768,
+        )
+
+    async def test_quantization_only_change_is_revalidated_against_the_artifact(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "llama-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"artifact": "model-Q4_K_M.gguf", "quantization": "Q4_K_M"},
+        })
+
+        with self.assertRaisesRegex(ValueError, "does not match the selected quantization"):
+            await self.service.update_deployment_settings("llama-bookmark", {
+                "quantization": "Q8_0",
+            })
+
+        stored = self.service.store.deployment("llama-bookmark", include_private=True)
+        self.assertEqual(stored["model"]["quantization"], "Q4_K_M")
 
     async def test_external_bookmarks_still_register_without_nodes(self):
         created = await self.service.create_deployment({

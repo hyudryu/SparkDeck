@@ -671,6 +671,10 @@ export interface StorageTransferJob {
   bytes_transferred: number
   bytes_per_second?: number | null
   progress?: number
+  // Receiver-owned post-copy stage. It remains active until the cache is safe
+  // to use, even when bytes_transferred has reached bytes_total.
+  phase?: string | null
+  phase_started_at?: string | number | null
   created_at: string | number
   started_at?: string | number
   completed_at?: string | number

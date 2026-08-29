@@ -706,6 +706,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             await nas._run_download(job)
 
             self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["download_attempt_start_bytes"], cached)
             request = registry.request.await_args
             self.assertEqual(
                 request.kwargs["json_body"]["download_cache_baseline_bytes"], 100,

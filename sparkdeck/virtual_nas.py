@@ -422,6 +422,10 @@ class VirtualNAS:
                     if raw.get("download_cache_baseline_bytes") is not None else None
                 ),
                 "download_attempted_at": raw.get("download_attempted_at"),
+                "download_attempt_start_bytes": (
+                    _nonnegative_int(raw.get("download_attempt_start_bytes"))
+                    if raw.get("download_attempt_start_bytes") is not None else None
+                ),
                 "legacy_download_attempt_tracking": bool(
                     raw.get(
                         "legacy_download_attempt_tracking",
@@ -2006,6 +2010,7 @@ class VirtualNAS:
             "require_partial_cache": bool(require_partial_cache),
             "download_cache_baseline_bytes": download_baselines[node_id],
             "download_attempted_at": None,
+            "download_attempt_start_bytes": None,
             "legacy_download_attempt_tracking": False,
             "workflow_id": workflow_id,
             "workflow_node_ids": list(workflow_node_ids or []),
@@ -2306,6 +2311,14 @@ class VirtualNAS:
                     json_body=download_body,
                     timeout=24 * 60 * 60,
                 )
+            job["download_attempt_start_bytes"] = min(
+                _nonnegative_int(job.get("bytes_total")),
+                cached_download_bytes(
+                    cached_model,
+                    job.get("download_cache_baseline_bytes"),
+                    job.get("revision") or "main",
+                ),
+            )
             job["download_attempted_at"] = time.time()
             self._save()
             # Neither a local snapshot_download worker nor a remote agent's

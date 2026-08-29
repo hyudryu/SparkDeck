@@ -479,6 +479,24 @@ describe('StoragePage', () => {
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 
+  it('uses MB/s for sub-gigabyte transfer rates and truncates failed-job errors with a tooltip', async () => {
+    const error = 'gx10-node-3 agent error: HTTP 409: download finished without a complete requested revision'
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [{
+        id: 'failed-transfer', model_id: 'org/failed', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+        target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'failed', kind: 'transfer',
+        bytes_total: 13_000_000_000, bytes_transferred: 354_000_000, bytes_per_second: 40_000_000,
+        created_at: '2026-08-29T12:00:00Z', error,
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    expect(await screen.findByText(/40\.0 MB\/s avg/)).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveAttribute('title', error)
+  })
+
   it('hides dashboard-hidden nodes from cards, the transfer form, and availability', async () => {
     const storage: StorageState = {
       ...enabledStorage,

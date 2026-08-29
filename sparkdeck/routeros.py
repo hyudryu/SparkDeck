@@ -72,6 +72,10 @@ _TRAFFIC_FIELDS = frozenset({
     "fp-rx-packets-per-second", "fp-tx-packets-per-second",
     "tx-queue-drops-per-second",
 })
+_ETHERNET_LINK_FIELDS = frozenset({
+    "name", "status", "rate", "full-duplex", "auto-negotiation",
+    "tx-flow-control", "rx-flow-control", "sfp-module-present",
+})
 
 _MNDP_PUBLIC_FIELDS = frozenset({*_MNDP_FIELDS.values(), "address"})
 _MNDP_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
@@ -252,6 +256,103 @@ def _health_rows(value: Any) -> list[dict[str, Any]]:
             else:
                 result.append({"name": name, "value": reading})
     return result
+
+
+def _nonnegative_rate(value: Any) -> int:
+    try:
+        return max(0, int(str(value or "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _configuration_checks(
+    config: dict[str, Any], device: dict[str, Any], health: list[dict[str, Any]],
+    fan_settings: dict[str, Any], interfaces: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = [{
+        "id": "routeros-authentication",
+        "label": "RouterOS authentication",
+        "status": "passed",
+        "detail": "Credentials were accepted by the RouterOS REST API.",
+    }]
+    secure_transport = str(config.get("base_url") or "").startswith("https://")
+    verifies_tls = bool(config.get("verify_tls", True))
+    checks.append({
+        "id": "secure-rest",
+        "label": "Secure REST connection",
+        "status": "passed" if secure_transport and verifies_tls else "warning",
+        "detail": (
+            "HTTPS is enabled and the RouterOS certificate is verified."
+            if secure_transport and verifies_tls
+            else "Traffic is encrypted but the RouterOS certificate is not verified."
+            if secure_transport
+            else "RouterOS credentials are being sent over unencrypted HTTP."
+        ),
+    })
+    identity = str(device.get("identity") or "").strip()
+    board = str(device.get("board-name") or "").strip()
+    version = str(device.get("version") or "").strip()
+    checks.append({
+        "id": "device-identity",
+        "label": "Device identity",
+        "status": "passed" if identity and board and version else "warning",
+        "detail": (
+            f"Connected to {identity} ({board}) running RouterOS {version}."
+            if identity and board and version
+            else "RouterOS responded, but some identity details were unavailable."
+        ),
+    })
+    active_interfaces = sum(
+        str(item.get("running") or "").casefold() in {"true", "yes", "1"}
+        for item in interfaces
+    )
+    checks.append({
+        "id": "active-interfaces",
+        "label": "Active Ethernet links",
+        "status": "passed" if active_interfaces else "warning",
+        "detail": (
+            f"{active_interfaces} of {len(interfaces)} reported interfaces are running."
+            if interfaces
+            else "RouterOS did not report interface telemetry."
+        ),
+    })
+    temperature_sensors = sum(
+        bool(re.search(r"temp|thermal", f"{item.get('name', '')} {item.get('type', '')}", re.I))
+        for item in health
+    )
+    checks.append({
+        "id": "temperature-telemetry",
+        "label": "Temperature telemetry",
+        "status": "passed" if temperature_sensors else "warning",
+        "detail": (
+            f"{temperature_sensors} temperature sensor"
+            f"{'s are' if temperature_sensors != 1 else ' is'} reporting."
+            if temperature_sensors
+            else "This device did not expose a temperature sensor through RouterOS."
+        ),
+    })
+    supported_fan_settings = FAN_SETTING_KEYS.intersection(fan_settings)
+    target = fan_settings.get("fan-target-temp")
+    full_speed = fan_settings.get("fan-full-speed-temp")
+    invalid_curve = False
+    try:
+        invalid_curve = target is not None and full_speed is not None and int(target) >= int(full_speed)
+    except (TypeError, ValueError):
+        invalid_curve = True
+    checks.append({
+        "id": "fan-control",
+        "label": "Fan temperature control",
+        "status": "failed" if invalid_curve else "passed" if supported_fan_settings else "warning",
+        "detail": (
+            "Target temperature must be below the full-speed temperature."
+            if invalid_curve
+            else f"{len(supported_fan_settings)} device-supported fan setting"
+            f"{'s are' if len(supported_fan_settings) != 1 else ' is'} available."
+            if supported_fan_settings
+            else "This RouterOS model exposes fan monitoring but no writable fan settings."
+        ),
+    })
+    return checks
 
 
 class _MNDPProtocol(asyncio.DatagramProtocol):
@@ -499,7 +600,14 @@ class RouterOSService:
     ) -> dict[str, Any]:
         presence = self.presence()
         if not config:
-            return {**presence, "connected": False, "health": [], "interfaces": []}
+            return {
+                **presence, "connected": False, "health": [], "interfaces": [],
+                "configuration_checks": [],
+                "network": {
+                    "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                    "active_interfaces": 0, "total_interfaces": 0,
+                },
+            }
         # A caller holding an explicit snapshot must report that snapshot
         # consistently even if connect/disconnect changes the durable file
         # while its read/write/read transaction is in flight.
@@ -533,23 +641,59 @@ class RouterOSService:
             interface_names = [
                 str(row.get("name") or "") for row in interface_rows if row.get("name")
             ]
-            traffic = None
-            if interface_names:
-                traffic = await optional(
+            ethernet_names = [
+                str(row.get("name") or "") for row in interface_rows
+                if row.get("name") and str(row.get("type") or "").casefold() == "ether"
+            ]
+            traffic, link_state = await asyncio.gather(
+                optional(
                     "POST", "interface/monitor-traffic",
                     {"interface": ",".join(interface_names), "once": ""},
-                )
+                ) if interface_names else asyncio.sleep(0, result=None),
+                optional(
+                    "POST", "interface/ethernet/monitor",
+                    {"numbers": ",".join(ethernet_names), "once": ""},
+                ) if ethernet_names else asyncio.sleep(0, result=None),
+            )
             traffic_by_name = {
                 str(row.get("name")): {
                     key: value for key, value in row.items() if key in _TRAFFIC_FIELDS
                 }
                 for row in _rows(traffic) if row.get("name")
             }
+            link_by_name = {
+                str(row.get("name")): {
+                    key: value for key, value in row.items()
+                    if key in _ETHERNET_LINK_FIELDS
+                }
+                for row in _rows(link_state) if row.get("name")
+            }
             interface_rows = [
-                {**row, **traffic_by_name.get(str(row.get("name") or ""), {})}
+                {
+                    **row,
+                    **traffic_by_name.get(str(row.get("name") or ""), {}),
+                    **link_by_name.get(str(row.get("name") or ""), {}),
+                }
                 for row in interface_rows
             ]
             settings = _single(fan_settings)
+            health_rows = _health_rows(health)
+            active_interfaces = sum(
+                str(row.get("running") or "").casefold() in {"true", "yes", "1"}
+                for row in interface_rows
+            )
+            network = {
+                "rx_bits_per_second": sum(
+                    _nonnegative_rate(row.get("rx-bits-per-second"))
+                    for row in interface_rows
+                ),
+                "tx_bits_per_second": sum(
+                    _nonnegative_rate(row.get("tx-bits-per-second"))
+                    for row in interface_rows
+                ),
+                "active_interfaces": active_interfaces,
+                "total_interfaces": len(interface_rows),
+            }
             return {
                 **presence,
                 "detected": True,
@@ -559,10 +703,14 @@ class RouterOSService:
                 "verify_tls": bool(config.get("verify_tls", True)),
                 "device": device,
                 "cpus": _rows(cpus),
-                "health": _health_rows(health),
+                "health": health_rows,
                 "fan_settings": settings or None,
                 "fan_capabilities": sorted(FAN_SETTING_KEYS.intersection(settings)),
                 "interfaces": interface_rows,
+                "network": network,
+                "configuration_checks": _configuration_checks(
+                    config, device, health_rows, settings, interface_rows,
+                ),
             }
         except RuntimeError as exc:
             return {
@@ -574,6 +722,16 @@ class RouterOSService:
                 "verify_tls": bool(config.get("verify_tls", True)),
                 "health": [],
                 "interfaces": [],
+                "network": {
+                    "rx_bits_per_second": 0, "tx_bits_per_second": 0,
+                    "active_interfaces": 0, "total_interfaces": 0,
+                },
+                "configuration_checks": [{
+                    "id": "routeros-authentication",
+                    "label": "RouterOS authentication",
+                    "status": "failed",
+                    "detail": str(exc),
+                }],
                 "error": str(exc),
             }
 
@@ -634,6 +792,13 @@ class RouterOSService:
         if not supported:
             raise ValueError("manual fan control is unavailable on this RouterOS device")
         validated = self.validate_fan_settings(body, supported)
+        combined = {**(current.get("fan_settings") or {}), **validated}
+        target = combined.get("fan-target-temp")
+        full_speed = combined.get("fan-full-speed-temp")
+        if target is not None and full_speed is not None and int(target) >= int(full_speed):
+            raise ValueError(
+                "fan-target-temp must be below fan-full-speed-temp"
+            )
         await self._request(
             "POST", "system/health/settings/set",
             config=config, json_body=validated,

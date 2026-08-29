@@ -185,13 +185,16 @@ export interface NodeInventoryItem extends NodeSummary {
 export interface RouterOSPresenceNode {
   node_id: string
   node_name: string
+  online: boolean
   detected: boolean
   configured: boolean
-  connected?: boolean
+  discovery?: RouterOSDiscoveryCandidate[]
+  discovery_error?: string
 }
 
 export interface RouterOSPresence {
   detected: boolean
+  gateway_node_id?: string | null
   nodes: RouterOSPresenceNode[]
 }
 
@@ -210,6 +213,20 @@ export interface RouterOSHealthItem {
   type?: string
 }
 
+export interface RouterOSConfigurationCheck {
+  id: string
+  label: string
+  status: 'passed' | 'warning' | 'failed'
+  detail: string
+}
+
+export interface RouterOSNetworkSummary {
+  rx_bits_per_second: number
+  tx_bits_per_second: number
+  active_interfaces: number
+  total_interfaces: number
+}
+
 export interface RouterOSNodeOverview extends RouterOSPresenceNode {
   connected: boolean
   discovery?: RouterOSDiscoveryCandidate[]
@@ -222,11 +239,15 @@ export interface RouterOSNodeOverview extends RouterOSPresenceNode {
   fan_settings?: Record<string, unknown> | null
   fan_capabilities?: string[] | null
   interfaces: Array<Record<string, unknown>>
+  network: RouterOSNetworkSummary
+  configuration_checks: RouterOSConfigurationCheck[]
 }
 
 export interface RouterOSOverview {
   detected: boolean
-  nodes: RouterOSNodeOverview[]
+  gateway_node_id?: string | null
+  nodes: RouterOSPresenceNode[]
+  gateway?: RouterOSNodeOverview | null
 }
 
 export interface RouterOSConnectionInput {

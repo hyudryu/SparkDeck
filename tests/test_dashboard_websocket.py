@@ -108,6 +108,18 @@ class DashboardWebSocketTests(unittest.TestCase):
                 pass
         self.assertEqual(raised.exception.code, 1008)
 
+    def test_origin_scheme_must_match_the_socket_scheme(self):
+        # The test client speaks ws://, so an https origin is a downgrade
+        # attempt against a plaintext socket and must be refused.
+        client = TestClient(server.app)
+        with self.assertRaises(WebSocketDisconnect) as raised:
+            with client.websocket_connect(
+                "/api/ws/dashboard",
+                headers={"origin": "https://testserver"},
+            ):
+                pass
+        self.assertEqual(raised.exception.code, 1008)
+
     def test_same_origin_socket_is_accepted(self):
         client = TestClient(server.app)
         with ExitStack() as stack:

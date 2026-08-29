@@ -446,13 +446,17 @@ async def _dashboard_nodes() -> list[dict]:
 async def dashboard_stream(websocket: WebSocket):
     """Push the dashboard's five data sources as periodic full snapshots."""
     # Websockets bypass same-origin policy, so check Origin the same way
-    # _require_same_origin_or_forwarded does; clients without an Origin
-    # header (non-browser) are allowed.
+    # _require_same_origin_or_forwarded does, additionally pinning the
+    # origin scheme to the socket's (https for wss, http for ws); clients
+    # without an Origin header (non-browser) are allowed.
     origin = websocket.headers.get("origin")
     if origin:
         parsed = urlsplit(origin)
+        expected_scheme = (
+            "https" if websocket.url.scheme == "wss" else "http"
+        )
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != expected_scheme
             or parsed.netloc.casefold()
             != websocket.headers.get("host", "").casefold()
         ):

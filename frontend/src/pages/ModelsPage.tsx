@@ -26,6 +26,10 @@ const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm'
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
 const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
 
+// Sentinel option in the GGUF artifact dropdown: switching to it reveals
+// the text field so a controller-local artifact path can be entered.
+const MANUAL_ARTIFACT_OPTION = '__enter-local-path__'
+
 // Dropdown option labels state the download size and whether the weights
 // already sit in the cluster cache, so the badge travels with the text.
 const quantizationOptionLabel = (variant: GgufQuantization, downloaded: boolean) => (
@@ -628,6 +632,13 @@ export function ModelsPage() {
   // creator offers the repository's real quantizations and GGUF artifacts
   // instead of free-text guesses. Debounced because the id is typed by hand.
   const [catalogModelQuery, setCatalogModelQuery] = useState('')
+  // When the repository lists GGUF artifacts, the artifact field becomes a
+  // dropdown; this flag brings back the text field so a controller-local
+  // path can still be entered.
+  const [artifactManualEntry, setArtifactManualEntry] = useState(false)
+  useEffect(() => {
+    if (!creating) setArtifactManualEntry(false)
+  }, [creating])
   useEffect(() => {
     const modelId = form.model_id.trim()
     if (!creating || !modelId.includes('/') || isLocalModelPath(modelId)) {
@@ -805,6 +816,15 @@ export function ModelsPage() {
     setForm((current) => ({ ...current, settings: { ...current.settings, artifact: artifact || undefined } }))
   }
 
+  // Fresh form sessions (a new creator, or an editor loading saved
+  // settings) start without any listing-derived provenance.
+  const resetSelectionProvenance = (modelId?: string) => {
+    linkedQuantizationRef.current = undefined
+    linkedArtifactRef.current = undefined
+    previousModelIdRef.current = modelId ?? ''
+    setArtifactManualEntry(false)
+  }
+
   const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
     const sharded = current.deployment_mode === 'sharded'
     const nodeIds = sharded && localNodeId
@@ -842,6 +862,7 @@ export function ModelsPage() {
     setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
     setExtraFlags('')
     setGpuMemoryUtil('')
+    resetSelectionProvenance()
     setFormError(undefined)
     setCreating(true)
   }
@@ -864,6 +885,10 @@ export function ModelsPage() {
       node_ids: deployment.node_ids?.length ? deployment.node_ids : (localNodeId ? [localNodeId] : []),
       deployment_mode: (deployment.deployment_mode as CreateDeploymentInput['deployment_mode']) ?? 'single',
     })
+    // The saved settings were not derived from the current listing, so a
+    // stale provenance from a previous creator session must not treat them
+    // as leftovers and clear them before display.
+    resetSelectionProvenance(deployment.model_id)
     setFormError(undefined)
     setCreating(true)
   }
@@ -1980,11 +2005,17 @@ export function ModelsPage() {
                 </select>
                 <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
               </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
-              {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) ? <label className="field"><span>GGUF artifact</span>
+              {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) && !artifactManualEntry ? <label className="field"><span>GGUF artifact</span>
                 <select
                   required
                   value={form.settings.artifact ?? ''}
-                  onChange={(event) => updateCreateArtifact(event.target.value)}
+                  onChange={(event) => {
+                    if (event.target.value === MANUAL_ARTIFACT_OPTION) {
+                      setArtifactManualEntry(true)
+                      return
+                    }
+                    updateCreateArtifact(event.target.value)
+                  }}
                 >
                   <option value="">Choose from the repository files…</option>
                   {createArtifactOptions.map((option) => (
@@ -1992,9 +2023,13 @@ export function ModelsPage() {
                       {artifactOptionLabel(option, artifactFilesDownloaded(option.files, createCachedFileSets))}
                     </option>
                   ))}
+                  <option value={MANUAL_ARTIFACT_OPTION}>Use a local file path on this device…</option>
                 </select>
                 <small>The repository publishes one GGUF file per quantization; the chosen file is what nodes download from {form.model_id}. An absolute local path runs on this device only.</small>
-              </label> : form.runtime === 'llama.cpp' && <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => updateManualArtifact(event.target.value)} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>}
+              </label> : form.runtime === 'llama.cpp' && <>
+                <label className="field"><span>GGUF artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => updateManualArtifact(event.target.value)} placeholder="model-Q4_K_M.gguf" /><small>Repo-relative (e.g. subdir/model-Q4_K_M.gguf) to run on any node; an absolute local path runs on this device only.</small></label>
+                {artifactManualEntry && createArtifactOptions.length > 0 && <Button type="button" variant="tertiary" onClick={() => { setArtifactManualEntry(false); updateManualArtifact('') }}>Choose from the repository files…</Button>}
+              </>}
               {createModelCacheInfo && (createModelCacheInfo.cached.length > 0 || createModelCacheInfo.missing.length > 0) && <p className="field-note">
                 {createModelCacheInfo.cached.length
                   ? `Weights cached on ${createModelCacheInfo.cached.join(', ')}.`

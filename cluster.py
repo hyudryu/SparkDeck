@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 
@@ -23,6 +23,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_json_wri
 LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 1
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
+AGENT_FABRIC_PORT = 7878
 
 
 class NodeAgentResponseError(RuntimeError):
@@ -188,9 +189,13 @@ class NodeRegistry:
         self, data_dir: Path, http: httpx.AsyncClient,
         controller_id: str = "",
         connection_resolver: Callable[[Any], Awaitable[Any]] | None = None,
+        fabric_http: httpx.AsyncClient | None = None,
     ):
         self.path = Path(data_dir) / "nodes.json"
         self.http = http
+        # Manager provides a dedicated client with trust_env=False.  Falling
+        # back to ``http`` keeps lightweight test callers source-compatible.
+        self.fabric_http = fabric_http or http
         self.controller_id = str(controller_id or "")
         self.connection_resolver = connection_resolver
         self.nodes = self._load()
@@ -369,16 +374,11 @@ class NodeRegistry:
             return None
         try:
             fabric_ip = str(ipaddress.ip_address(str(node.get("fabric_ip") or "")))
-            parsed = urlparse(str(node["agent_url"]))
+            urlparse(str(node["agent_url"]))
         except (KeyError, TypeError, ValueError):
             return None
-        if parsed.scheme != "http":
-            return None
-        port = parsed.port or 80
         host = f"[{fabric_ip}]" if ":" in fabric_ip else fabric_ip
-        return urlunparse((
-            "http", f"{host}:{port}", parsed.path.rstrip("/"), "", "", "",
-        ))
+        return f"http://{host}:{AGENT_FABRIC_PORT}"
 
     async def resolve_direct_transfer_source(self, node_id: str) -> str | None:
         """Resolve a data-plane endpoint without ever selecting Wi-Fi.
@@ -402,30 +402,40 @@ class NodeRegistry:
 
         status = await self.probe(node)
         configured_interface = str(node.get("fabric_interface") or "").strip()
-        interfaces = status.get("interfaces") or []
-        for interface in interfaces:
-            if not isinstance(interface, dict):
-                continue
-            if not interface.get("up") or not interface.get("rdma"):
-                continue
-            if configured_interface and interface.get("name") != configured_interface:
-                continue
-            for value in interface.get("ipv4") or []:
-                try:
-                    address = ipaddress.ip_address(str(value))
-                except ValueError:
+        rdma_interfaces = [
+            interface for interface in (status.get("interfaces") or [])
+            if isinstance(interface, dict) and interface.get("rdma")
+        ]
+        candidates = [
+            interface for interface in rdma_interfaces
+            if not configured_interface or interface.get("name") == configured_interface
+        ]
+        if configured_interface and not candidates:
+            raise RuntimeError(
+                f"{node.get('name', node_id)} has no reported RDMA interface named {configured_interface}"
+            )
+        if candidates:
+            for interface in candidates:
+                if not interface.get("up"):
+                    if configured_interface:
+                        raise RuntimeError(
+                            f"{node.get('name', node_id)} RDMA interface {interface.get('name')} is down"
+                        )
                     continue
-                if address.version != 4:
-                    continue
-                parsed = urlparse(str(node.get("agent_url") or ""))
-                if parsed.scheme != "http":
+                for value in interface.get("ipv4") or []:
+                    try:
+                        address = ipaddress.ip_address(str(value))
+                    except ValueError:
+                        continue
+                    if address.version == 4:
+                        return f"http://{address}:{AGENT_FABRIC_PORT}"
+                if configured_interface:
                     raise RuntimeError(
-                        f"{node.get('name', node_id)} does not expose an HTTP fabric endpoint"
+                        f"{node.get('name', node_id)} RDMA interface {interface.get('name')} has no usable IPv4 address"
                     )
-                port = parsed.port or 80
-                return urlunparse((
-                    "http", f"{address}:{port}", parsed.path.rstrip("/"), "", "", "",
-                ))
+            raise RuntimeError(
+                f"{node.get('name', node_id)} reports RDMA interfaces but none has a usable UP IPv4 endpoint"
+            )
         if status.get("fabric_ready") is True:
             raise RuntimeError(
                 f"{node.get('name', node_id)} reports a fabric but no usable UP RDMA IPv4 endpoint"
@@ -533,14 +543,15 @@ class NodeRegistry:
         elif json_body is not None:
             payload["json"] = json_body
         last_error: httpx.HTTPError | None = None
+        stream_client = self.fabric_http if use_fabric and fabric_endpoint is not None else self.http
         for target, pinned_headers, extensions in targets:
             candidate_headers = {**request_headers, **pinned_headers}
-            request = self.http.build_request(
+            request = stream_client.build_request(
                 method, target, headers=candidate_headers,
                 timeout=timeout, extensions=extensions, **payload,
             )
             try:
-                return await self.http.send(
+                return await stream_client.send(
                     request, stream=True, follow_redirects=False,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

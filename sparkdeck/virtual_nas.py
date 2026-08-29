@@ -1273,7 +1273,9 @@ class VirtualNAS:
         self._peer_imports[transfer_id] = record
         url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=15)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(3600, connect=15), trust_env=False,
+            ) as client:
                 async with client.stream("GET", url, headers={
                     "X-SparkDeck-Direct-Transfer-Capability": source_capability,
                 }) as response:

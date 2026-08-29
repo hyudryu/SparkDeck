@@ -89,7 +89,7 @@ function formatTransferRate(job: StorageTransferJob) {
   ))
   const rate = job.bytes_per_second / 1000 ** exponent
   const digits = rate >= 100 ? 0 : rate >= 10 ? 1 : 2
-  return `${rate.toFixed(digits)} ${units[exponent]} avg`
+  return `${rate.toFixed(digits)} ${units[exponent]}`
 }
 
 function SmoothProgress({ value, label }: { value: number; label: string }) {
@@ -391,12 +391,8 @@ export function StoragePage() {
               (total, model) => total + (model.externally_managed ? 0 : model.size_bytes),
               0,
             )
-            const comfyUiUsed = node.models.reduce(
-              (total, model) => total + (model.externally_managed ? model.size_bytes : 0),
-              0,
-            )
             // The capacity bar describes the Hugging Face cache mount, so its
-            // used and free values exclude weights found in ComfyUI storage.
+            // used and free values exclude externally managed weights.
             // The cache free reading is reported with the inventory and is
             // only meaningful while the node's inventory is valid —
             // the manager marks a node offline when that request fails — and
@@ -430,7 +426,6 @@ export function StoragePage() {
                 <span>{formatBytes(used)} used</span>
                 {hasFree && <span>{formatBytes(cacheFree)} free</span>}
                 <span>{formatBytes(capacity)} total</span>
-                {comfyUiUsed > 0 && <span>{formatBytes(comfyUiUsed)} in ComfyUI</span>}
               </div>
               <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>

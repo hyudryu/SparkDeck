@@ -286,7 +286,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.deployment_action.assert_not_awaited()
 
-    async def test_start_enforces_saved_count_and_normalizes_sharded_coordinator(self):
+    async def test_start_enforces_saved_count_and_preserves_sharded_coordinator(self):
         self.service.store.add_deployment(Deployment(
             id="dep-sharded", alias="sharded", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
@@ -323,7 +323,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.manager.deployment_action.assert_awaited_once_with(
-            "cluster-1", "start", ["local", "worker-1"],
+            "cluster-1", "start", ["worker-1", "local"],
         )
 
     async def test_start_rejects_node_selection_for_standalone_container(self):

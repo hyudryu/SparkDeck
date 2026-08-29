@@ -29,6 +29,54 @@ afterEach(() => {
 })
 
 describe('ExplorePage model rows', () => {
+  it('pulls once to the first selected node and queues Virtual NAS fan-out', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({ items: [{
+        id: 'org/pull-model', name: 'pull-model', downloads: 10, likes: 2,
+        weight_size_bytes: 8 * gib, runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+      }], total: 1 })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'org/pull-model', name: 'pull-model', revision: 'a'.repeat(40),
+        runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'worker-1', name: 'Node 4', online: true, docker_ready: true, selectable: true },
+      ] })
+      if (path === '/api/v1/storage/preparations' && init?.method === 'POST') return json({
+        workflow_id: 'workflow-1', job_ids: ['download-1', 'transfer-1'], jobs: [
+          { id: 'download-1', kind: 'download', model_id: 'org/pull-model', source_node_id: 'huggingface', source_node_name: 'Hugging Face', target_node_id: 'local', target_node_name: 'Controller', status: 'queued', bytes_total: 100, bytes_transferred: 0, created_at: 1 },
+          { id: 'transfer-1', kind: 'transfer', model_id: 'org/pull-model', source_node_id: 'local', source_node_name: 'Controller', target_node_id: 'worker-1', target_node_name: 'Node 4', status: 'queued', depends_on_job_id: 'download-1', bytes_total: 100, bytes_transferred: 0, created_at: 1 },
+        ],
+      }, 202)
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Expand org/pull-model' }))
+    await user.click(await screen.findByRole('button', { name: 'Pull weights for org/pull-model' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Pull org/pull-model' })
+    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeChecked()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 4/ }))
+    expect(within(dialog).getByText(/Download seed:/).closest('p')).toHaveTextContent('Controller')
+    await user.click(within(dialog).getByRole('button', { name: 'Pull to 2 nodes' }))
+
+    expect(await screen.findByText(/Queued 1 Hugging Face download and 1 Virtual NAS transfer/)).toBeInTheDocument()
+    const preparationCall = fetchMock.mock.calls.find(([input, init]) => (
+      String(input) === '/api/v1/storage/preparations' && init?.method === 'POST'
+    ))
+    expect(JSON.parse(String(preparationCall?.[1]?.body))).toEqual({
+      model_id: 'org/pull-model',
+      revision: 'a'.repeat(40),
+      node_ids: ['local', 'worker-1'],
+      download_node_id: 'local',
+    })
+  })
+
   it('reveals community evidence only after expansion and describes other SparkDeck users', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

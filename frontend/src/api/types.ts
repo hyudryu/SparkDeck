@@ -64,6 +64,7 @@ export interface CatalogResponse {
 }
 
 export interface DeploymentSettings {
+  image?: string
   context_length?: number
   tensor_parallel_size?: number
   data_parallel_size?: number
@@ -138,6 +139,7 @@ export interface DeploymentUpdateInput {
 // Editable fields of a saved deployment bookmark (before its first launch).
 export interface SavedDeploymentUpdateInput {
   alias?: string
+  image?: string | null
   context_length?: number | null
   tensor_parallel_size?: number | null
   parallel_slots?: number | null
@@ -469,6 +471,7 @@ export interface AppSettings {
   // controls were removed from the Settings page.
   default_runtime?: RuntimeKind
   default_context_length?: number
+  vllm_image?: string
   hf_token?: string
   hf_token_configured?: boolean
   telemetry_interval_seconds?: number

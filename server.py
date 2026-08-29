@@ -2006,7 +2006,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         # Saved-deployment bookmarks (never launched) accept the creator-form
         # contract; which keys apply is decided per record in the service.
         "alias", "context_length", "tensor_parallel_size", "parallel_slots",
-        "gpu_layers", "quantization", "artifact", "node_ids", "deployment_mode",
+        "gpu_layers", "quantization", "artifact", "image", "node_ids", "deployment_mode",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -2172,15 +2172,6 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             400,
             f"this saved configuration requires exactly {contract['required_node_count']} node(s)",
         )
-    if contract["deployment_mode"] == "sharded":
-        if LOCAL_NODE_ID not in selected_node_ids:
-            raise HTTPException(
-                400, "sharded deployments must include the controller node"
-            )
-        selected_node_ids = [
-            LOCAL_NODE_ID,
-            *(node_id for node_id in selected_node_ids if node_id != LOCAL_NODE_ID),
-        ]
     try:
         await manager.selected_cluster_nodes(selected_node_ids)
     except ValueError as exc:
@@ -2254,6 +2245,7 @@ async def v1_settings():
         key: sparkdeck.store.get_setting(key, default)
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
+    values["vllm_image"] = manager.settings.get("vllm_image")
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     # cluster_node_name is deliberately absent: this response is forwarded to
     # the controller on joined workers, so it would name the controller rather
@@ -2299,6 +2291,7 @@ async def v1_update_settings(req: Request):
         sparkdeck.store.set_setting(key, value)
     if credential:
         await manager.update_settings({"hf_token": credential})
+    values["vllm_image"] = manager.settings.get("vllm_image")
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
@@ -2310,6 +2303,7 @@ async def v1_clear_hf_token():
         key: sparkdeck.store.get_setting(key, default)
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
+    values["vllm_image"] = manager.settings.get("vllm_image")
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
@@ -2576,10 +2570,6 @@ async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dic
         raise ValueError(
             f"this saved configuration requires exactly {contract['required_node_count']} node(s)"
         )
-    if contract["deployment_mode"] == "sharded":
-        if LOCAL_NODE_ID not in selected:
-            raise ValueError("sharded deployments must include the controller node")
-        selected = [LOCAL_NODE_ID, *(item for item in selected if item != LOCAL_NODE_ID)]
     await manager.selected_cluster_nodes(selected)
     return recipe, contract, selected, download_node_id
 

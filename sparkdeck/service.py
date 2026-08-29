@@ -1178,6 +1178,8 @@ class SparkDeckService:
             )
             gpu_memory_gb = saved_settings.get("gpu_memory_gb", gpu_memory_gb)
         image = (launch_settings or {}).get("image")
+        if saved_only:
+            image = saved_settings.get("image", image)
         if discovered_settings is not None:
             engine = str(public.get("runtime") or "vllm")
             if engine == "sglang":
@@ -1276,7 +1278,7 @@ class SparkDeckService:
         # cleanly against a bookmark that Manager has never seen.
         allowed = {
             "context_length", "tensor_parallel_size", "parallel_slots",
-            "gpu_layers", "quantization", "artifact", "extra_args",
+            "gpu_layers", "quantization", "artifact", "image", "extra_args",
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
@@ -1291,6 +1293,11 @@ class SparkDeckService:
                 raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+        if "image" in changes:
+            image = _optional_string(changes.get("image"))
+            if not runtime_is_llama and not image:
+                raise ValueError("image must be a non-empty container image")
+            settings["image"] = image
         integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
         )
@@ -2600,14 +2607,6 @@ class SparkDeckService:
             raise ValueError(
                 f"this deployment requires exactly {required} node(s)"
             )
-        if contract.get("deployment_mode") == "sharded":
-            if "local" not in selected:
-                raise ValueError(
-                    "sharded deployments must include the controller node"
-                )
-            selected = [
-                "local", *(node_id for node_id in selected if node_id != "local")
-            ]
         return selected
 
     async def _validate_start_selection(

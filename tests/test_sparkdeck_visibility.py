@@ -81,6 +81,7 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_model_gains_expected_size_from_hub_tree(self):
         manager = Manager.__new__(Manager)
+        manager.settings = {}
         manager.cluster_nodes = AsyncMock(return_value=[
             {"id": "local", "name": "Spark One", "online": True},
         ])
@@ -806,6 +807,15 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/recipes/recipe-tp2/deploy",
                 json={"node_ids": ["local", "node-3"]},
             )
+            remote_only_missing = await self.client.post(
+                "/api/v1/recipes/recipe-tp2/deploy",
+                json={"node_ids": ["node-2", "node-3"]},
+            )
+            inventory[2]["models"] = [{
+                "model_id": "deepseek/model", "size_bytes": 12,
+                "revisions": ["main", PINNED_A],
+                "revision_refs": {"main": PINNED_A},
+            }]
             remote_only = await self.client.post(
                 "/api/v1/recipes/recipe-tp2/deploy",
                 json={"node_ids": ["node-2", "node-3"]},
@@ -827,12 +837,16 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exactly 2", too_few.text)
         self.assertEqual(missing_weights.status_code, 409)
         self.assertIn("node-3", missing_weights.text)
-        self.assertEqual(remote_only.status_code, 400)
-        self.assertIn("controller node", remote_only.text)
+        self.assertEqual(remote_only_missing.status_code, 409)
+        self.assertIn("node-3", remote_only_missing.text)
+        self.assertEqual(remote_only.status_code, 201)
         self.assertEqual(duplicate.status_code, 400)
         self.assertIn("exactly 2", duplicate.text)
         self.assertEqual(launched.status_code, 201)
-        self.assertEqual(create.await_args.args[0]["node_ids"], ["local", "node-2"])
+        self.assertEqual(
+            create.await_args_list[-2].args[0]["node_ids"], ["node-2", "node-3"],
+        )
+        self.assertEqual(create.await_args.args[0]["node_ids"], ["node-2", "local"])
         self.assertEqual(create.await_args.args[0]["deployment_mode"], "sharded")
 
     async def test_node_readiness_is_validated_before_weight_inventory(self):

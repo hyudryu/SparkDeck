@@ -2308,6 +2308,63 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload["cluster_member"]["fabric_interface"],
                                  "cx7-local" if node_id == "local" else "cx7-remote")
 
+    async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = []
+            captured = []
+
+            async def cluster_nodes(local_stats=None):
+                return [
+                    {
+                        "id": "local", "name": "Controller", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.1",
+                        "fabric_interface": "cx7-local", "interfaces": [],
+                    },
+                    {
+                        "id": "remote-3", "name": "Node 3", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.3",
+                        "fabric_interface": "cx7-node-3", "interfaces": [],
+                    },
+                    {
+                        "id": "remote-4", "name": "Node 4", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.4",
+                        "fabric_interface": "cx7-node-4", "interfaces": [],
+                    },
+                ]
+
+            async def create_member(node_id, payload):
+                captured.append((node_id, payload))
+                return {
+                    "id": f"container-{node_id}", "status": "running",
+                    "port": 8100 if node_id == "remote-3" else None,
+                    "model_source": "public_repository",
+                }
+
+            instance.cluster_nodes = cluster_nodes
+            instance._create_member = create_member
+
+            deployment = await instance.create_deployment({
+                "model": "org/remote-model",
+                "engine": "vllm",
+                "deployment_mode": "sharded",
+                "node_ids": ["remote-3", "remote-4"],
+                "extra_args": ["--tensor-parallel-size", "2"],
+            })
+
+            self.assertEqual(deployment["node_ids"], ["remote-3", "remote-4"])
+            self.assertEqual([node_id for node_id, _ in captured], ["remote-3", "remote-4"])
+            for rank, (_, payload) in enumerate(captured):
+                args = payload["extra_args"]
+                self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
+                self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.3")
+            self.assertEqual(captured[0][1]["cluster_member"]["fabric_interface"], "cx7-node-3")
+
     def test_vllm_prompt_token_details_flag_is_idempotent_and_overridable(self) -> None:
         self.assertEqual(
             Manager._with_vllm_prompt_token_details(["--max-model-len", "1024"]),

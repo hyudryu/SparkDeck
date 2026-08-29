@@ -230,9 +230,13 @@ async def security_headers(request: Request, call_next):
             response = await call_next(request)
     else:
         response = await call_next(request)
+    host = request.headers.get("host", "")
+    # Some browsers do not match ws:/wss: against 'self'; permit the dashboard
+    # socket on the same host the page was served from.
+    websocket_sources = f" ws://{host} wss://{host}" if host else ""
     response.headers.setdefault(
         "Content-Security-Policy",
-        f"default-src 'self'; connect-src 'self' {COGNITO_IDP_ORIGIN}; img-src 'self' data:; "
+        f"default-src 'self'; connect-src 'self' {COGNITO_IDP_ORIGIN}{websocket_sources}; img-src 'self' data:; "
         "style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; "
         "base-uri 'self'; frame-ancestors 'none'",
     )
@@ -415,13 +419,18 @@ DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
 # Stats and admission stream every tick; the slower inventories (deployments,
 # community sync, nodes) only refresh every Nth tick and repeat in between.
 DASHBOARD_STREAM_SLOW_TICKS = 5
+# Bound each source read (a couple of ticks) so one hung await, e.g. a Docker
+# API call that never resolves, cannot stall the whole stream.
+DASHBOARD_SOURCE_TIMEOUT_SECONDS = 5.0
 
 
 async def _dashboard_source(source):
     """Evaluate one dashboard source; a failure must not kill the stream."""
     try:
         result = source()
-        return await result if asyncio.iscoroutine(result) else result
+        if not asyncio.iscoroutine(result):
+            return result
+        return await asyncio.wait_for(result, DASHBOARD_SOURCE_TIMEOUT_SECONDS)
     except Exception:
         return None
 

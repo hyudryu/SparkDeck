@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, Mock, patch
@@ -128,6 +129,33 @@ class DashboardWebSocketTests(unittest.TestCase):
                 with client.websocket_connect("/api/ws/dashboard"):
                     pass
         self.assertEqual(raised.exception.code, 1008)
+
+    def test_hung_source_streams_none_after_the_timeout(self):
+        async def hang_forever():
+            await asyncio.sleep(60)
+
+        client = TestClient(server.app)
+        with ExitStack() as stack:
+            _patch_sources(stack, stats_override=hang_forever)
+            stack.enter_context(patch.object(
+                server, "DASHBOARD_SOURCE_TIMEOUT_SECONDS", 0.1))
+            with client.websocket_connect("/api/ws/dashboard") as websocket:
+                snapshot = websocket.receive_json()
+
+        self.assertEqual(snapshot["type"], "snapshot")
+        self.assertIsNone(snapshot["stats"])
+        self.assertEqual(snapshot["admission"], ADMISSION)
+
+    def test_csp_permits_same_host_websockets(self):
+        client = TestClient(server.app)
+        with patch.object(
+            server.manager, "get_stats", AsyncMock(return_value=STATS),
+        ):
+            response = client.get("/api/stats")
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("connect-src 'self'", csp)
+        self.assertIn("ws://testserver", csp)
+        self.assertIn("wss://testserver", csp)
 
 
 if __name__ == "__main__":

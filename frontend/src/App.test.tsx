@@ -404,7 +404,7 @@ describe('model discovery', () => {
     for (const node of ['Controller', 'Worker Two', 'Worker Three', 'Worker Four']) {
       expect(within(dialog).getByRole('checkbox', { name: new RegExp(node) })).toBeChecked()
     }
-    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeEnabled()
     const tensorParallel = within(dialog).getByRole('spinbutton', { name: /^Tensor parallel size/ })
     expect(tensorParallel).toHaveValue(4)
     expect(tensorParallel).toHaveAttribute('readonly')
@@ -425,7 +425,12 @@ describe('model discovery', () => {
           alias: 'GLM-5.3-Flash',
           runtime: 'vllm',
           kind: 'managed',
-          settings: { context_length: 8192, tensor_parallel_size: 4, extra_args: [] },
+          settings: {
+            context_length: 8192,
+            tensor_parallel_size: 4,
+            image: 'nvcr.io/nvidia/vllm:26.03.post1-py3',
+            extra_args: [],
+          },
           node_ids: ['local', 'node-2', 'node-3', 'node-4'],
           deployment_mode: 'sharded',
         }),
@@ -1334,6 +1339,7 @@ describe('model deployments', () => {
           settings: {
             context_length: 8192,
             tensor_parallel_size: 1,
+            image: 'nvcr.io/nvidia/vllm:26.03.post1-py3',
             extra_args: ['--served-model-name', 'My Model', '--kv-cache-dtype', 'fp8'],
             gpu_memory_utilization: 0.85,
           },

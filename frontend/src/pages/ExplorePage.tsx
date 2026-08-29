@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { BenchmarkAggregate, CatalogModel, NodeInventoryItem, RuntimeKind } from '../api/types'
 import { Button, EmptyState, ErrorState, formatNumber, formatRate, LoadingState, PageHeader, RuntimeMark } from '../components/ui'
+import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { formatBytes } from '../utils/format'
@@ -155,6 +156,7 @@ function ModelRow({
   communityMode,
   requestedRuntime,
   onToggle,
+  onPull,
 }: {
   model: DisplayCatalogModel
   capacity: number
@@ -166,6 +168,7 @@ function ModelRow({
   communityMode: boolean
   requestedRuntime: RuntimeKind | ''
   onToggle: () => void
+  onPull: (model: DisplayCatalogModel) => void
 }) {
   const rowKey = model.communityVariantKey ?? model.id
   const panelId = `model-details-${rowKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
@@ -297,6 +300,7 @@ function ModelRow({
       </div>}
       <div className="catalog-model-actions">
         <a className="button" href={`https://huggingface.co/${model.id}`} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Hugging Face</a>
+        <button className="button" type="button" aria-label={`Pull weights for ${model.id}`} onClick={() => onPull({ ...model, revision: detailedModel?.revision ?? model.revision })}><Download size={14} /> Pull weights</button>
         <label className="catalog-deployment-type"><span>Deployment type</span><select aria-label={`Deployment type for ${model.id}`} value={deploymentRuntime} onChange={(event) => setDeploymentRuntime(event.target.value as RuntimeKind)}>
           <option value="vllm" disabled={compatibilityByRuntime.get('vllm') === false}>vLLM</option>
           <option value="sglang" disabled={compatibilityByRuntime.get('sglang') === false}>SGLang</option>
@@ -322,6 +326,10 @@ export function ExplorePage() {
   const [communityOnly, setCommunityOnly] = useState(false)
   const [communityLimit, setCommunityLimit] = useState(COMMUNITY_PAGE_SIZE)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
+  const [pullSelection, setPullSelection] = useState<{ model: DisplayCatalogModel; nodeIds: string[] }>()
+  const [pullBusy, setPullBusy] = useState(false)
+  const [pullError, setPullError] = useState<string>()
+  const [pullNotice, setPullNotice] = useState<string>()
   const activeRuntime = tab === 'hugging-face' ? runtime : ''
   const catalog = useResource(
     (signal) => api.catalog.search(query, activeRuntime || undefined, undefined, signal),
@@ -427,6 +435,38 @@ export function ExplorePage() {
     return next
   })
 
+  const openPull = (model: DisplayCatalogModel) => {
+    const firstNode = (nodes.data ?? []).find(isNodeSelectable)
+    setPullError(undefined)
+    setPullSelection({ model, nodeIds: firstNode ? [firstNode.id] : [] })
+  }
+
+  const pullWeights = async () => {
+    if (!pullSelection?.nodeIds.length) return
+    const { model, nodeIds } = pullSelection
+    setPullBusy(true)
+    setPullError(undefined)
+    setPullNotice(undefined)
+    try {
+      const result = await api.storage.prepareModel(
+        model.id,
+        model.revision,
+        nodeIds,
+        nodeIds[0],
+      )
+      const transferCount = result.jobs.filter((job) => job.kind === 'transfer').length
+      const downloadCount = result.jobs.filter((job) => job.kind === 'download').length
+      setPullSelection(undefined)
+      setPullNotice(result.jobs.length === 0
+        ? `${model.id} is already available on every selected node.`
+        : `Queued ${downloadCount ? `${downloadCount} Hugging Face ${downloadCount === 1 ? 'download' : 'downloads'}` : 'the cached source'}${transferCount ? ` and ${transferCount} Virtual NAS ${transferCount === 1 ? 'transfer' : 'transfers'}` : ''} for ${model.id}.`)
+    } catch (reason) {
+      setPullError(reason instanceof Error ? reason.message : 'Could not queue the model weights')
+    } finally {
+      setPullBusy(false)
+    }
+  }
+
   const communityEnabled = communityAccess.enabled
   const communityUnavailable = tab === 'community'
     && (Boolean(aggregates.error) || aggregates.data?.availability === 'unavailable')
@@ -440,6 +480,7 @@ export function ExplorePage() {
         title="Find the right model for your hardware"
         description="Search Hugging Face models, see what fits across your SparkDeck cluster, and compare community-sampled inference speed."
       />
+      {pullNotice && <p className="inline-success" role="status">{pullNotice} <Link to="/storage">View Storage</Link></p>}
 
       <div className="usage-tabs catalog-tabs" role="tablist" aria-label="Model catalog source">
         <button role="tab" aria-selected={tab === 'hugging-face'} onClick={() => setTab('hugging-face')}>Hugging Face</button>
@@ -492,10 +533,31 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Unique clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = model.communityVariantKey ?? model.id
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}
+      {pullSelection && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !pullBusy && setPullSelection(undefined)}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="pull-model-title">
+          <div className="modal-heading"><div><p className="eyebrow">Model Explorer</p><h2 id="pull-model-title">Pull {pullSelection.model.id}</h2></div><button className="icon-button" disabled={pullBusy} onClick={() => setPullSelection(undefined)} aria-label="Close dialog">×</button></div>
+          <p className="modal-description">Choose every node that should receive the weights. SparkDeck downloads once to the first selected node, then automatically transfers that copy to the rest through Virtual NAS.</p>
+          {pullError && <p className="form-error" role="alert">{pullError}</p>}
+          <NodeSelector
+            nodes={nodes.data ?? []}
+            selectedIds={pullSelection.nodeIds}
+            onChange={(nodeIds) => setPullSelection({ ...pullSelection, nodeIds })}
+            loading={nodes.loading}
+            error={nodes.error}
+            onRetry={nodes.reload}
+            multiple
+            disabled={pullBusy}
+            legend="Weight targets"
+            help="The first selected node is the download seed. Additional selected nodes receive queued Virtual NAS transfers after that download finishes."
+          />
+          {pullSelection.nodeIds.length > 0 && <p className="field-note"><strong>Download seed:</strong> {selectedNodeLabel(nodes.data ?? [], [pullSelection.nodeIds[0]])}</p>}
+          <div className="modal-actions"><Button type="button" disabled={pullBusy} onClick={() => setPullSelection(undefined)}>Cancel</Button><Button type="button" variant="primary" disabled={pullBusy || pullSelection.nodeIds.length === 0} onClick={() => void pullWeights()}><Download size={15} /> {pullBusy ? 'Queueing…' : `Pull to ${pullSelection.nodeIds.length} ${pullSelection.nodeIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
+        </section>
+      </div>}
     </div>
   )
 }

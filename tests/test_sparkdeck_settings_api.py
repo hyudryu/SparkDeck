@@ -56,6 +56,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "theme": "dark",
             "default_runtime": "sglang",
             "default_context_length": 24576,
+            "vllm_image": server.manager.settings["vllm_image"],
             "hf_token_configured": True,
         })
         # The node name must never ride the settings response: on joined
@@ -88,6 +89,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "theme": "light",
             "default_runtime": "sglang",
             "default_context_length": 32768,
+            "vllm_image": server.manager.settings["vllm_image"],
             "hf_token_configured": True,
         })
         self.assertNotIn(sentinel, response.text)

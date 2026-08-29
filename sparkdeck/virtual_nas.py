@@ -826,8 +826,14 @@ class VirtualNAS:
                         raise RuntimeError(
                             "Hugging Face selective snapshot marker is not safe"
                         )
+                    existing_files = _selective_files_by_revision(
+                        repository, _snapshot_files_by_revision(repository),
+                    ).get(revision, [])
                     marker.write_text(
-                        json.dumps({"files": selected}, separators=(",", ":")),
+                        json.dumps(
+                            {"files": list(dict.fromkeys((*existing_files, *selected)))},
+                            separators=(",", ":"),
+                        ),
                         encoding="utf-8",
                     )
                 if missing:

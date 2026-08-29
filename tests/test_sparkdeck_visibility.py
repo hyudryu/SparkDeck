@@ -152,6 +152,10 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
         manager.node_registry = Mock()
 
         def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                request.url.path,
+                f"/api/models/org/many-quants/tree/{PINNED_A}",
+            )
             return httpx.Response(200, json=[
                 {"path": "mmproj-F16.gguf", "size": 3},
                 {"path": "model-Q8_K_XL.gguf", "size": 34},

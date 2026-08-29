@@ -1891,7 +1891,7 @@ class Manager:
                     resolved_revision
                 )
                 files = tuple(selected_files) if isinstance(selected_files, list) else ()
-                targets.setdefault((model_id, revision, files))
+                targets.setdefault((model_id, resolved_revision, files))
         if not targets:
             return
         semaphore = asyncio.Semaphore(4)
@@ -1915,7 +1915,9 @@ class Manager:
                     continue
                 key = (
                     str(model.get("model_id") or ""),
-                    str(model.get("revision") or ""),
+                    str((model.get("partial_revision_refs") or {}).get(
+                        str(model.get("revision") or "")
+                    ) or model.get("revision") or ""),
                     tuple((model.get("selective_files_by_revision") or {}).get(
                         str((model.get("partial_revision_refs") or {}).get(
                             str(model.get("revision") or "")

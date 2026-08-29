@@ -588,6 +588,10 @@ export interface StorageModel {
   revision?: string
   revisions?: string[]
   file_count?: number
+  source?: string
+  externally_managed?: boolean
+  transferable?: boolean
+  deletable?: boolean
 }
 
 export interface StorageNode {

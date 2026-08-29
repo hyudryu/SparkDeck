@@ -47,6 +47,52 @@ TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 _SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
 _SELECTIVE_MARKER_CONTENT = b"selective\n"
+_COMFYUI_MODEL_BUNDLES = (
+    (
+        "Lightricks/LTX-2.5",
+        (
+            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+            "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+            "text_encoders/gemma4_e2b_it_bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+        ),
+        (
+            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+            "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            "vae/LTX2.5/ltx-2.5-video-vae-conv-bf16.safetensors",
+            "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+        ),
+    ),
+    (
+        "Comfy-Org/MiniMax-Music-3",
+        (
+            "diffusion_models/minimax_music3_dit_fp16.safetensors",
+            "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+            "vae/minimax_music3_dav.safetensors",
+        ),
+        (),
+    ),
+)
+
+
+def _default_comfyui_model_roots() -> list[Path]:
+    """Return bounded, conventional ComfyUI model stores without exposing paths."""
+    configured = str(os.environ.get("SPARKDECK_COMFYUI_MODELS_ROOTS") or "")
+    candidates = [
+        *(Path(value.strip()) for value in configured.split(os.pathsep) if value.strip()),
+        Path("/bridge-mcp/ComfyUI/models"),
+        Path.home() / "ComfyUI" / "models",
+    ]
+    roots = []
+    seen = set()
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        key = os.path.normcase(str(expanded))
+        if key not in seen:
+            seen.add(key)
+            roots.append(expanded)
+    return roots
 
 
 def partial_download_size_bytes(
@@ -208,12 +254,16 @@ class VirtualNAS:
         node_registry: Any,
         enabled_provider: Callable[[], bool],
         token_provider: Callable[[], str] | None = None,
+        external_model_roots_provider: Callable[[], list[Path]] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
         self.node_registry = node_registry
         self._enabled_provider = enabled_provider
         self._token_provider = token_provider or (lambda: "")
+        self._external_model_roots_provider = (
+            external_model_roots_provider or _default_comfyui_model_roots
+        )
         self.path = self.data_dir / "virtual_nas_transfers.json"
         self.jobs = self._load_jobs()
         self._wake = asyncio.Event()
@@ -827,7 +877,7 @@ class VirtualNAS:
     def inventory(self) -> list[dict[str, Any]]:
         hub = self._hub()
         if not hub.is_dir():
-            return []
+            return _external_comfyui_inventory(self._external_model_roots_provider())
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -925,6 +975,33 @@ class VirtualNAS:
                     if last_modified else None
                 ),
             })
+        external_models = _external_comfyui_inventory(
+            self._external_model_roots_provider()
+        )
+        model_indexes = {
+            model["model_id"]: index for index, model in enumerate(models)
+        }
+        for external in external_models:
+            index = model_indexes.get(external["model_id"])
+            if index is None:
+                model_indexes[external["model_id"]] = len(models)
+                models.append(external)
+            elif models[index].get("partial"):
+                # A usable external installation is authoritative for runtime
+                # availability even if the same repository also has resumable
+                # Hugging Face cache residue on this node.
+                models[index] = {
+                    **external,
+                    "size_bytes": external["size_bytes"] + models[index]["size_bytes"],
+                    "file_count": external["file_count"] + models[index]["file_count"],
+                    "has_partial_download": True,
+                    "partial_size_bytes": models[index]["partial_size_bytes"],
+                    "partial_revision_size_bytes": models[index][
+                        "partial_revision_size_bytes"
+                    ],
+                    "partial_revisions": models[index]["partial_revisions"],
+                    "partial_revision_refs": models[index]["partial_revision_refs"],
+                }
         return models
 
     def model_info(self, model_id: str) -> dict[str, Any]:
@@ -2516,6 +2593,76 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return set()
 
 
+def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
+    """Report known complete ComfyUI bundles as read-only external weights."""
+    models: dict[str, dict[str, Any]] = {}
+    for raw_root in roots:
+        try:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                continue
+            root = raw_root.resolve(strict=True)
+        except OSError:
+            continue
+        for model_id, required_files, optional_files in _COMFYUI_MODEL_BUNDLES:
+            files = []
+            try:
+                for relative in required_files:
+                    candidate = root.joinpath(*PurePosixPath(relative).parts)
+                    if candidate.is_symlink() or not candidate.is_file():
+                        files = []
+                        break
+                    resolved = candidate.resolve(strict=True)
+                    if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
+                        files = []
+                        break
+                    files.append(resolved)
+            except (OSError, RuntimeError, ValueError):
+                files = []
+            if len(files) != len(required_files):
+                continue
+            for relative in optional_files:
+                try:
+                    candidate = root.joinpath(*PurePosixPath(relative).parts)
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    resolved = candidate.resolve(strict=True)
+                    if resolved.is_relative_to(root) and resolved.stat().st_size > 0:
+                        files.append(resolved)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            try:
+                stats = [path.stat() for path in files]
+            except OSError:
+                continue
+            size_bytes = sum(stat.st_size for stat in stats)
+            last_modified = max(stat.st_mtime for stat in stats)
+            candidate = {
+                "model_id": model_id,
+                "size_bytes": size_bytes,
+                "file_count": len(files),
+                "partial": False,
+                "has_partial_download": False,
+                "partial_size_bytes": 0,
+                "partial_revision_size_bytes": {},
+                "partial_revisions": [],
+                "partial_revision_refs": {},
+                "revision": "ComfyUI",
+                "revisions": [],
+                "revision_refs": {},
+                "last_modified": datetime.fromtimestamp(
+                    last_modified, timezone.utc,
+                ).isoformat(),
+                "source": "ComfyUI",
+                "externally_managed": True,
+                "transferable": False,
+                "deletable": False,
+            }
+            current = models.get(model_id)
+            if current is None or candidate["size_bytes"] > current["size_bytes"]:
+                models[model_id] = candidate
+    return sorted(models.values(), key=lambda item: str(item["model_id"]))
+
+
 def _safe_incomplete_snapshot_revisions(
     repository: Path, complete_revisions: set[str],
 ) -> set[str]:
@@ -2667,7 +2814,10 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if any(name.endswith(".gguf") for name in weights):
         return True
     config = lowered.get("config.json")
-    if config is None or not _required_files_are_nonempty([config]):
+    if (
+        (config is None or not _required_files_are_nonempty([config]))
+        and not _is_complete_diffusers_snapshot(lowered)
+    ):
         return False
     tokenizer = [
         path for name, path in lowered.items()
@@ -2681,6 +2831,35 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _required_files_are_nonempty(tokenizer):
         return False
     return True
+
+
+def _is_complete_diffusers_snapshot(files: dict[str, Path]) -> bool:
+    """Recognize a self-contained Diffusers pipeline rooted by model_index.json."""
+    index = files.get("model_index.json")
+    if index is None or not _required_files_are_nonempty([index]):
+        return False
+    try:
+        manifest = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(manifest.get("_class_name"), str)
+        or not manifest["_class_name"].strip()
+    ):
+        return False
+    components = [
+        str(name).casefold()
+        for name, descriptor in manifest.items()
+        if not str(name).startswith("_")
+        and isinstance(descriptor, list)
+        and len(descriptor) >= 2
+        and any(value is not None for value in descriptor[:2])
+    ]
+    return bool(components) and all(
+        any(name.startswith(f"{component}/") for name in files)
+        for component in components
+    )
 
 
 def _required_files_are_nonempty(paths: Any) -> bool:

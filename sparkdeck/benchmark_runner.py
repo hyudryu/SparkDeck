@@ -4,7 +4,7 @@ llama-benchy (https://github.com/eugr/llama-benchy) benchmarks any
 OpenAI-compatible endpoint with llama-bench style measurements. This service
 detects the tool, runs it against models currently served by SparkDeck,
 captures its JSON report, stores a meaningful CSV per run, and keeps run
-history on disk under ``<data_dir>/benchy/runs/<run_id>/``.
+history on disk under ``<data_dir>/benchmark-runner/runs/<run_id>/``.
 """
 
 from __future__ import annotations
@@ -32,17 +32,17 @@ _MAX_POSITIVE = 2_000_000
 CONTROLLER_LOCAL_BASE_URL = "http://127.0.0.1:7878"
 
 
-class BenchyError(ValueError):
+class BenchmarkRunnerError(ValueError):
     """Raised for invalid benchmark requests; maps to HTTP 400."""
 
 
-class BenchyService:
+class BenchmarkRunnerService:
     """Run and record llama-benchy benchmarks against served models."""
 
     def __init__(self, manager: Any, sparkdeck: Any, data_dir: Path):
         self.manager = manager
         self.sparkdeck = sparkdeck
-        self.runs_dir = Path(data_dir) / "benchy" / "runs"
+        self.runs_dir = Path(data_dir) / "benchmark-runner" / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.runs: dict[str, dict[str, Any]] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
@@ -98,19 +98,19 @@ class BenchyService:
                     stderr=asyncio.subprocess.STDOUT,
                 )
             except OSError as exc:
-                raise BenchyError(f"could not start pip: {exc}") from exc
+                raise BenchmarkRunnerError(f"could not start pip: {exc}") from exc
             try:
                 stdout, _ = await asyncio.wait_for(process.communicate(), timeout=900)
             except asyncio.TimeoutError:
                 await _stop_process(process)
-                raise BenchyError("llama-benchy installation timed out")
+                raise BenchmarkRunnerError("llama-benchy installation timed out")
             except asyncio.CancelledError:
                 # Shutdown must not leave pip mutating the shared environment
                 # after the replacement server has started.
                 await _stop_process(process)
                 raise
         if process.returncode != 0:
-            raise BenchyError(_output_tail(stdout))
+            raise BenchmarkRunnerError(_output_tail(stdout))
         return await self.detect(refresh=True)
 
     def _argv_prefix(self, detection: dict[str, Any]) -> list[str]:
@@ -305,17 +305,17 @@ class BenchyService:
     async def _start_run_locked(self, body: dict[str, Any]) -> dict[str, Any]:
         detection = await self.detect()
         if not detection.get("installed"):
-            raise BenchyError("llama-benchy is not installed")
+            raise BenchmarkRunnerError("llama-benchy is not installed")
         active = self.active_run()
         if active:
-            raise BenchyError(f"benchmark run {active['id']} is already in progress")
+            raise BenchmarkRunnerError(f"benchmark run {active['id']} is already in progress")
         config = self._validate_config(body)
         target = next(
             (item for item in await self.served_models() if item["id"] == config["model_id"]),
             None,
         )
         if target is None:
-            raise BenchyError(
+            raise BenchmarkRunnerError(
                 f"model {config['model_id']} is not currently served; load it first"
             )
 
@@ -351,7 +351,7 @@ class BenchyService:
             self._save_state(run)
         except OSError as exc:
             shutil.rmtree(run_dir, ignore_errors=True)
-            raise BenchyError(f"could not record benchmark state: {exc}") from exc
+            raise BenchmarkRunnerError(f"could not record benchmark state: {exc}") from exc
         self.runs[run_id] = run
         argv = self._build_argv(run, target, run_dir, detection)
         run["_argv"] = argv
@@ -398,7 +398,7 @@ class BenchyService:
             run["error"] = f"could not launch llama-benchy: {exc}"
             run["finished_at"] = _utcnow()
             self._save_state(run)
-            raise BenchyError(run["error"])
+            raise BenchmarkRunnerError(run["error"])
         self._processes[run["id"]] = process
         return process
 
@@ -523,7 +523,7 @@ class BenchyService:
         if run is None:
             raise LookupError("benchmark run not found")
         if run["status"] not in RUN_ACTIVE_STATES:
-            raise BenchyError("benchmark run is not active")
+            raise BenchmarkRunnerError("benchmark run is not active")
         run["_cancel_requested"] = True
         process = self._processes.get(run_id)
         if process and process.returncode is None:
@@ -538,7 +538,7 @@ class BenchyService:
         if run is None:
             raise LookupError("benchmark run not found")
         if run["status"] in RUN_ACTIVE_STATES:
-            raise BenchyError("cancel the running benchmark before deleting it")
+            raise BenchmarkRunnerError("cancel the running benchmark before deleting it")
         # Remove the files before dropping the in-memory record: if removal
         # fails the record must stay consistent with what is on disk, or the
         # run would reappear from the surviving state.json after a restart.
@@ -585,10 +585,10 @@ class BenchyService:
 
     def _validate_config(self, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(body, dict):
-            raise BenchyError("request body must be an object")
+            raise BenchmarkRunnerError("request body must be an object")
         model_id = str(body.get("model_id") or "").strip()
         if not model_id:
-            raise BenchyError("model_id is required")
+            raise BenchmarkRunnerError("model_id is required")
         prompt_sizes = _positive_list(body.get("prompt_sizes"), "prompt_sizes", [2048])
         response_sizes = _positive_list(body.get("response_sizes"), "response_sizes", [128])
         concurrency = _positive_list(
@@ -601,10 +601,10 @@ class BenchyService:
         warmup = _bounded_int(body.get("warmup_runs"), "warmup_runs", default=1, maximum=10)
         exact_tg_value = body.get("exact_tg", False)
         if not isinstance(exact_tg_value, bool):
-            raise BenchyError("exact_tg must be a boolean")
+            raise BenchmarkRunnerError("exact_tg must be a boolean")
         shapes = len(prompt_sizes) * len(response_sizes) * len(concurrency) * len(depths)
         if shapes > 256:
-            raise BenchyError(
+            raise BenchmarkRunnerError(
                 "the requested combination would run more than 256 test shapes"
             )
         return {
@@ -760,18 +760,18 @@ def _positive_list(
     if value is None:
         return list(default)
     if not isinstance(value, list) or not value:
-        raise BenchyError(f"{name} must be a non-empty list of integers")
+        raise BenchmarkRunnerError(f"{name} must be a non-empty list of integers")
     numbers: list[int] = []
     for item in value:
         if isinstance(item, bool) or not isinstance(item, int):
-            raise BenchyError(f"{name} must contain integers only")
+            raise BenchmarkRunnerError(f"{name} must contain integers only")
         if item < 0 or (item == 0 and not allow_zero) or item > maximum:
-            raise BenchyError(f"{name} values must be between "
+            raise BenchmarkRunnerError(f"{name} values must be between "
                               f"{0 if allow_zero else 1} and {maximum}")
         if item not in numbers:
             numbers.append(item)
     if len(numbers) > MAX_LIST_ITEMS:
-        raise BenchyError(f"{name} accepts at most {MAX_LIST_ITEMS} values")
+        raise BenchmarkRunnerError(f"{name} accepts at most {MAX_LIST_ITEMS} values")
     return numbers
 
 
@@ -781,9 +781,9 @@ def _bounded_int(
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int):
-        raise BenchyError(f"{name} must be an integer")
+        raise BenchmarkRunnerError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
-        raise BenchyError(f"{name} must be between {minimum} and {maximum}")
+        raise BenchmarkRunnerError(f"{name} must be between {minimum} and {maximum}")
     return value
 
 

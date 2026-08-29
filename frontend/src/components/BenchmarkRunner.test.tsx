@@ -2,7 +2,7 @@ import { cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { BenchyPage } from './BenchyPage'
+import { BenchmarkRunner } from './BenchmarkRunner'
 
 const completedRun = {
   id: 'run-1',
@@ -68,17 +68,17 @@ function stubFetch(overrides: {
   const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const path = String(input)
     let body: unknown
-    if (path.endsWith('/api/v1/benchy/status')) body = { ...state.status, active_run_id: null }
-    else if (path.endsWith('/api/v1/benchy/install')) {
+    if (path.endsWith('/api/v1/benchmark-runner/status')) body = { ...state.status, active_run_id: null }
+    else if (path.endsWith('/api/v1/benchmark-runner/install')) {
       state.status = { installed: true, version: '0.1.2' }
       body = { installed: true, version: '0.1.2', launch_mode: 'python_module', path_on_host: false }
     }
-    else if (path.endsWith('/api/v1/benchy/models')) body = { items: [{
+    else if (path.endsWith('/api/v1/benchmark-runner/models')) body = { items: [{
       id: 'unsloth/Qwen3-4B-GGUF', label: 'Qwen3-4B-GGUF', runtime: 'llama.cpp',
       deployment_id: null, model: 'unsloth/Qwen3-4B-GGUF',
       quantization: 'Q4_K_M', base_url: 'http://127.0.0.1:8080',
     }] }
-    else if (path.endsWith('/api/v1/benchy/runs') && init?.method === 'POST') {
+    else if (path.endsWith('/api/v1/benchmark-runner/runs') && init?.method === 'POST') {
       if (overrides.startError) {
         return new Response(JSON.stringify({ detail: 'llama-benchy is not installed' }), {
           status: overrides.startError, headers: { 'Content-Type': 'application/json' },
@@ -86,8 +86,8 @@ function stubFetch(overrides: {
       }
       body = { ...completedRun, id: 'run-2', status: 'running', results: [] }
     }
-    else if (path.endsWith('/api/v1/benchy/runs')) body = { items: state.runs }
-    else if (path.includes('/api/v1/benchy/runs/')) body = state.runDetail
+    else if (path.endsWith('/api/v1/benchmark-runner/runs')) body = { items: state.runs }
+    else if (path.includes('/api/v1/benchmark-runner/runs/')) body = state.runDetail
     else body = {}
     return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
   })
@@ -102,10 +102,10 @@ afterEach(() => {
 })
 
 function renderPage() {
-  return render(<MemoryRouter><BenchyPage /></MemoryRouter>)
+  return render(<MemoryRouter><BenchmarkRunner /></MemoryRouter>)
 }
 
-describe('BenchyPage', () => {
+describe('BenchmarkRunner', () => {
   it('offers a one-button install when llama-benchy is missing', async () => {
     const state = stubFetch({ status: { installed: false }, runs: [] })
     const user = userEvent.setup()
@@ -133,7 +133,7 @@ describe('BenchyPage', () => {
     await user.click(screen.getByRole('button', { name: 'Start benchmark' }))
 
     const startCall = vi.mocked(globalThis.fetch).mock.calls.find(
-      ([input, init]) => String(input).endsWith('/api/v1/benchy/runs') && init?.method === 'POST',
+      ([input, init]) => String(input).endsWith('/api/v1/benchmark-runner/runs') && init?.method === 'POST',
     )
     expect(startCall).toBeTruthy()
     const body = JSON.parse(String(startCall![1]?.body ?? '{}'))
@@ -157,7 +157,7 @@ describe('BenchyPage', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Enter at least one concurrency level.')
     const startCalls = vi.mocked(globalThis.fetch).mock.calls.filter(
-      ([input, init]) => String(input).endsWith('/api/v1/benchy/runs') && init?.method === 'POST',
+      ([input, init]) => String(input).endsWith('/api/v1/benchmark-runner/runs') && init?.method === 'POST',
     )
     expect(startCalls).toHaveLength(0)
   })
@@ -174,7 +174,7 @@ describe('BenchyPage', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Invalid values: 1.5')
     const startCalls = vi.mocked(globalThis.fetch).mock.calls.filter(
-      ([input, init]) => String(input).endsWith('/api/v1/benchy/runs') && init?.method === 'POST',
+      ([input, init]) => String(input).endsWith('/api/v1/benchmark-runner/runs') && init?.method === 'POST',
     )
     expect(startCalls).toHaveLength(0)
   })
@@ -200,7 +200,7 @@ describe('BenchyPage', () => {
     expect(within(measurements).getAllByText('30.0 tok/s').length).toBeGreaterThan(0)
 
     const csv = screen.getByRole('link', { name: 'Download CSV' })
-    expect(csv).toHaveAttribute('href', '/api/v1/benchy/runs/run-1/csv')
+    expect(csv).toHaveAttribute('href', '/api/v1/benchmark-runner/runs/run-1/csv')
   })
 
   it('keeps response sizes as separate chart series instead of overwriting points', async () => {

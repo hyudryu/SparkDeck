@@ -1876,8 +1876,18 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "bytes_transferred": 5_000_000_000,
                 "created_at": 99, "started_at": 100, "completed_at": None,
             })
+            alias_only = manager._public_virtual_nas_job({
+                "id": "download-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "worker-a",
+                "status": "completed", "bytes_total": 5_000_000_000,
+                "bytes_transferred": 5_000_000_000,
+                "download_attempt_start_bytes": 5_000_000_000,
+                "download_attempted_at": 100, "completed_at": 101,
+                "created_at": 99,
+            })
 
         self.assertEqual(result["bytes_per_second"], 500_000_000)
+        self.assertIsNone(alias_only["bytes_per_second"])
 
 
 if __name__ == "__main__":

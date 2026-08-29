@@ -2311,13 +2311,17 @@ class VirtualNAS:
                     json_body=download_body,
                     timeout=24 * 60 * 60,
                 )
-            job["download_attempt_start_bytes"] = min(
-                _nonnegative_int(job.get("bytes_total")),
-                cached_download_bytes(
-                    cached_model,
-                    job.get("download_cache_baseline_bytes"),
-                    job.get("revision") or "main",
-                ),
+            job["download_attempt_start_bytes"] = (
+                _nonnegative_int(immutable_complete.get("size_bytes"))
+                if immutable_complete is not None
+                else min(
+                    _nonnegative_int(job.get("bytes_total")),
+                    cached_download_bytes(
+                        cached_model,
+                        job.get("download_cache_baseline_bytes"),
+                        job.get("revision") or "main",
+                    ),
+                )
             )
             job["download_attempted_at"] = time.time()
             self._save()

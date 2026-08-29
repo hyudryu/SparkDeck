@@ -244,7 +244,9 @@ export function StoragePage() {
     if (model.deletable === false) return
     if (!await confirm({
       title: `Delete ${model.model_id}?`,
-      message: `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
+      message: model.externally_managed
+        ? `Delete these weights from ${node.name}? The files will be deleted from ComfyUI's model folders. Copies on other nodes are not affected.`
+        : `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
       confirmLabel: 'Delete weights',
       danger: true,
     })) return

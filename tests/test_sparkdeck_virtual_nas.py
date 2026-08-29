@@ -121,6 +121,36 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 
+    def test_has_model_files_reports_presence_per_selected_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            create_cached_model(hub)
+            revision_sha = "a" * 40
+            snapshot = hub / "models--org--model" / "snapshots" / revision_sha
+            snapshot.mkdir(parents=True)
+            (snapshot / "q4" / "model.gguf").parent.mkdir()
+            (snapshot / "q4" / "model.gguf").write_bytes(b"gguf")
+
+            complete = nas.has_model_files(
+                "org/model", revision_sha, ["q4/model.gguf"],
+            )
+            partial = nas.has_model_files(
+                "org/model", revision_sha, ["q4/model.gguf", "missing.gguf"],
+            )
+            absent = nas.has_model_files(
+                "org/model", "b" * 40, ["q4/model.gguf"],
+            )
+
+            self.assertTrue(complete["complete"])
+            self.assertEqual(complete["missing_files"], [])
+            self.assertEqual(partial["present_files"], ["q4/model.gguf"])
+            self.assertEqual(partial["missing_files"], ["missing.gguf"])
+            self.assertFalse(partial["complete"])
+            self.assertFalse(absent["complete"])
+
     def test_download_uses_the_configured_hub_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "configured-cache" / "hub"
@@ -535,6 +565,249 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model["has_partial_download"])
             self.assertEqual(model["revisions"], ["revision-1"])
 
+    async def test_inventory_accepts_complete_diffusers_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = (
+                hub / "models--Tongyi-MAI--Z-Image-Turbo"
+                / "snapshots" / RESOLVED_REVISION
+            )
+            (snapshot / "transformer").mkdir(parents=True)
+            (snapshot / "tokenizer").mkdir()
+            (snapshot / "scheduler").mkdir()
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ZImagePipeline",
+                "transformer": ["diffusers", "ZImageTransformer2DModel"],
+                "tokenizer": ["transformers", "Qwen2Tokenizer"],
+                "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            }), encoding="utf-8")
+            (snapshot / "transformer" / "config.json").write_text("{}")
+            (snapshot / "transformer" / "diffusion_pytorch_model.safetensors").write_bytes(b"weights")
+            (snapshot / "tokenizer" / "tokenizer.json").write_text("{}")
+            (snapshot / "scheduler" / "scheduler_config.json").write_text("{}")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "Tongyi-MAI/Z-Image-Turbo")
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["has_partial_download"])
+            self.assertEqual(model["revisions"], [RESOLVED_REVISION])
+
+            (snapshot / "text_encoder").mkdir()
+            (snapshot / "text_encoder" / "config.json").write_text("{}")
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ZImagePipeline",
+                "transformer": ["diffusers", "ZImageTransformer2DModel"],
+                "text_encoder": ["transformers", "Qwen2Model"],
+                "tokenizer": ["transformers", "Qwen2Tokenizer"],
+                "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            }), encoding="utf-8")
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ZImagePipeline",
+                "missing_component": ["diffusers", "MissingModel"],
+            }), encoding="utf-8")
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+    async def test_inventory_accepts_tokenizer_free_diffusers_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = hub / "models--org--ddpm" / "snapshots" / RESOLVED_REVISION
+            (snapshot / "unet").mkdir(parents=True)
+            (snapshot / "scheduler").mkdir()
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "DDPMPipeline",
+                "unet": ["diffusers", "UNet2DModel"],
+                "scheduler": ["diffusers", "DDPMScheduler"],
+            }), encoding="utf-8")
+            (snapshot / "unet" / "config.json").write_text("{}")
+            (snapshot / "unet" / "diffusion_pytorch_model.safetensors").write_bytes(b"weights")
+            (snapshot / "scheduler" / "scheduler_config.json").write_text("{}")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "org/ddpm")
+            self.assertFalse(model["partial"])
+
+    async def test_inventory_resolves_diffusers_shards_relative_to_component_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshot = hub / "models--org--sharded" / "snapshots" / RESOLVED_REVISION
+            transformer = snapshot / "transformer"
+            scheduler = snapshot / "scheduler"
+            transformer.mkdir(parents=True)
+            scheduler.mkdir()
+            (snapshot / "model_index.json").write_text(json.dumps({
+                "_class_name": "ShardedPipeline",
+                "transformer": ["diffusers", "Transformer2DModel"],
+                "scheduler": ["diffusers", "DDPMScheduler"],
+            }), encoding="utf-8")
+            shard_names = [
+                "diffusion_pytorch_model-00001-of-00002.safetensors",
+                "diffusion_pytorch_model-00002-of-00002.safetensors",
+            ]
+            for shard_name in shard_names:
+                (transformer / shard_name).write_bytes(b"weights")
+            (transformer / "config.json").write_text("{}")
+            (transformer / "diffusion_pytorch_model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {
+                    "layer.0": shard_names[0],
+                    "layer.1": shard_names[1],
+                }}),
+                encoding="utf-8",
+            )
+            (scheduler / "scheduler_config.json").write_text("{}")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+            )
+
+            self.assertFalse(nas.inventory()[0]["partial"])
+
+            (transformer / shard_names[1]).unlink()
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+    async def test_inventory_reports_complete_external_comfyui_bundle_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            )
+            for relative in files:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            models = nas.inventory()
+            self.assertEqual(models, [{
+                "model_id": "Comfy-Org/MiniMax-Music-3",
+                "size_bytes": 21,
+                "file_count": 3,
+                "partial": False,
+                "has_partial_download": False,
+                "partial_size_bytes": 0,
+                "partial_revision_size_bytes": {},
+                "partial_revisions": [],
+                "partial_revision_refs": {},
+                "revision": "ComfyUI",
+                "revisions": [],
+                "revision_refs": {},
+                "last_modified": models[0]["last_modified"],
+                "source": "ComfyUI",
+                "externally_managed": True,
+                "transferable": False,
+                "deletable": False,
+            }])
+
+    async def test_inventory_counts_installed_ltx_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            files = (
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                "text_encoders/gemma4_e2b_it_bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+                "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            )
+            for relative in files:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["model_id"], "Lightricks/LTX-2.5")
+            self.assertEqual(model["file_count"], 6)
+            self.assertEqual(model["size_bytes"], 42)
+            self.assertFalse(model["partial"])
+            self.assertFalse(model["transferable"])
+            self.assertFalse(model["deletable"])
+
+    async def test_inventory_accepts_each_supported_ltx_transformer_format(self):
+        transformers = (
+            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+            "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+        )
+        required = (
+            "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+            "text_encoders/gemma4_e2b_it_bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+        )
+        for transformer in transformers:
+            with self.subTest(transformer=transformer), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "ComfyUI" / "models"
+                for relative in (*required, transformer):
+                    target = root.joinpath(*relative.split("/"))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"weights")
+                nas = VirtualNAS(
+                    Path(directory), lambda: Path(directory) / "missing-hub",
+                    FakeRegistry(), lambda: False,
+                    external_model_roots_provider=lambda: [root],
+                )
+
+                model = nas.inventory()[0]
+
+                self.assertEqual(model["model_id"], "Lightricks/LTX-2.5")
+                self.assertEqual(model["file_count"], 5)
+                self.assertFalse(model["partial"])
+
+    async def test_inventory_ignores_ltx_bundle_without_a_transformer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            required = (
+                "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                "text_encoders/gemma4_e2b_it_bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+                "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+            )
+            for relative in required:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
+    async def test_inventory_ignores_incomplete_external_comfyui_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            target = root / "vae" / "minimax_music3_dav.safetensors"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
@@ -787,6 +1060,52 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs, [])
         await nas.stop()
+
+    async def test_nontransferable_source_is_rejected_without_persisting_jobs(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+
+        async def storage(node_id):
+            if node_id == "local":
+                return {"models": [{
+                    "model_id": "org/model", "size_bytes": 13,
+                    "partial": False, "transferable": False,
+                }]}
+            return {"models": [], "free_size": 10 * 1024 * 1024 * 1024}
+
+        nas._node_storage = AsyncMock(side_effect=storage)
+
+        with self.assertRaisesRegex(RuntimeError, "current storage location"):
+            await nas.queue_transfer("org/model", "local", ["worker-a"])
+
+        self.assertEqual(nas.jobs, [])
+
+    async def test_worker_revalidates_source_transferability_before_export(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+        result = await nas.queue_transfer("org/model", "local", ["worker-a"])
+        job = nas.jobs[0]
+
+        async def storage(node_id):
+            if node_id == "local":
+                return {"models": [{
+                    "model_id": "org/model", "size_bytes": 13,
+                    "partial": False, "transferable": False,
+                }]}
+            return {"models": [], "free_size": 10 * 1024 * 1024 * 1024}
+
+        nas._node_storage = AsyncMock(side_effect=storage)
+        nas.export_model = Mock()
+
+        await nas._run_transfer(job)
+
+        self.assertEqual(result["job_ids"], [job["id"]])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("current storage location", job["error"])
+        nas.export_model.assert_not_called()
 
     async def test_insufficient_target_capacity_is_rejected_without_jobs(self):
         registry = FakeRegistry()

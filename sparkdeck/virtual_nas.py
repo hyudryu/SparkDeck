@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import posixpath
@@ -18,7 +19,7 @@ import weakref
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 
 LOCAL_NODE_ID = "local"
@@ -27,6 +28,7 @@ _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
+VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -44,6 +46,58 @@ _TOKENIZER_FILES = {
 TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 _SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
+_SELECTIVE_MARKER_CONTENT = b"selective\n"
+_COMFYUI_MODEL_BUNDLES = (
+    (
+        "Lightricks/LTX-2.5",
+        (
+            "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+            "text_encoders/gemma4_e2b_it_bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
+            "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
+        ),
+        (
+            (
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+                "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            ),
+        ),
+        (
+            "vae/LTX2.5/ltx-2.5-video-vae-conv-bf16.safetensors",
+            "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+        ),
+    ),
+    (
+        "Comfy-Org/MiniMax-Music-3",
+        (
+            "diffusion_models/minimax_music3_dit_fp16.safetensors",
+            "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+            "vae/minimax_music3_dav.safetensors",
+        ),
+        (),
+        (),
+    ),
+)
+
+
+def _default_comfyui_model_roots() -> list[Path]:
+    """Return bounded, conventional ComfyUI model stores without exposing paths."""
+    configured = str(os.environ.get("SPARKDECK_COMFYUI_MODELS_ROOTS") or "")
+    candidates = [
+        *(Path(value.strip()) for value in configured.split(os.pathsep) if value.strip()),
+        Path("/bridge-mcp/ComfyUI/models"),
+        Path.home() / "ComfyUI" / "models",
+    ]
+    roots = []
+    seen = set()
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        key = os.path.normcase(str(expanded))
+        if key not in seen:
+            seen.add(key)
+            roots.append(expanded)
+    return roots
 
 
 def partial_download_size_bytes(
@@ -205,12 +259,16 @@ class VirtualNAS:
         node_registry: Any,
         enabled_provider: Callable[[], bool],
         token_provider: Callable[[], str] | None = None,
+        external_model_roots_provider: Callable[[], list[Path]] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
         self.node_registry = node_registry
         self._enabled_provider = enabled_provider
         self._token_provider = token_provider or (lambda: "")
+        self._external_model_roots_provider = (
+            external_model_roots_provider or _default_comfyui_model_roots
+        )
         self.path = self.data_dir / "virtual_nas_transfers.json"
         self.jobs = self._load_jobs()
         self._wake = asyncio.Event()
@@ -718,6 +776,37 @@ class VirtualNAS:
             asyncio.to_thread(download_selected),
         )
 
+    def has_model_files(
+        self, model_id: str, revision: str, filenames: list[str],
+    ) -> dict[str, Any]:
+        """Report which selected files of one revision are already cached.
+
+        A pure local filesystem check so the controller can decide between
+        transferring an existing copy and seeding a fresh Hub download
+        without touching the network.
+        """
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        repository = self._model_path(model_id)
+        present = [
+            filename for filename in selected
+            if _safe_cached_snapshot_file(repository, revision, filename) is not None
+        ]
+        return {
+            "model_id": model_id,
+            "revision": revision,
+            "present_files": present,
+            "missing_files": [
+                filename for filename in selected if filename not in present
+            ],
+            "complete": not any(filename not in present for filename in selected),
+        }
+
     def download_model(
         self, model_id: str, revision: str = "main", explicit_token: str | None = None,
         requested_revision: str | None = None,
@@ -793,7 +882,7 @@ class VirtualNAS:
     def inventory(self) -> list[dict[str, Any]]:
         hub = self._hub()
         if not hub.is_dir():
-            return []
+            return _external_comfyui_inventory(self._external_model_roots_provider())
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -891,6 +980,33 @@ class VirtualNAS:
                     if last_modified else None
                 ),
             })
+        external_models = _external_comfyui_inventory(
+            self._external_model_roots_provider()
+        )
+        model_indexes = {
+            model["model_id"]: index for index, model in enumerate(models)
+        }
+        for external in external_models:
+            index = model_indexes.get(external["model_id"])
+            if index is None:
+                model_indexes[external["model_id"]] = len(models)
+                models.append(external)
+            elif models[index].get("partial"):
+                # A usable external installation is authoritative for runtime
+                # availability even if the same repository also has resumable
+                # Hugging Face cache residue on this node.
+                models[index] = {
+                    **external,
+                    "size_bytes": external["size_bytes"] + models[index]["size_bytes"],
+                    "file_count": external["file_count"] + models[index]["file_count"],
+                    "has_partial_download": True,
+                    "partial_size_bytes": models[index]["partial_size_bytes"],
+                    "partial_revision_size_bytes": models[index][
+                        "partial_revision_size_bytes"
+                    ],
+                    "partial_revisions": models[index]["partial_revisions"],
+                    "partial_revision_refs": models[index]["partial_revision_refs"],
+                }
         return models
 
     def model_info(self, model_id: str) -> dict[str, Any]:
@@ -1027,6 +1143,503 @@ class VirtualNAS:
             raise FileExistsError("cached model already exists on target node")
         os.replace(extracted, destination)
 
+    def _selected_snapshot_entries(
+        self, repository: Path, revision: str, filenames: list[str],
+    ) -> tuple[dict[str, Path], bool]:
+        """Resolve selected snapshot entries plus whether the snapshot is selective."""
+        snapshot = repository / "snapshots" / revision
+        entries: dict[str, Path] = {}
+        for filename in filenames:
+            resolved = _safe_cached_snapshot_file(repository, revision, filename)
+            if resolved is None:
+                raise LookupError(
+                    "snapshot does not contain every requested repository file"
+                )
+            entries[filename] = snapshot / filename
+        marker = snapshot / _SELECTIVE_SNAPSHOT_MARKER
+        selective = marker.is_file() and not marker.is_symlink()
+        return entries, selective
+
+    def _model_files_members(
+        self, repository: Path, revision: str, filenames: list[str],
+        requested_revision: str,
+    ) -> tuple[list[Path], list[str], int, bool]:
+        """Collect archive members for one file-scoped snapshot transfer.
+
+        Returns the filesystem paths to archive, their arcnames, the byte
+        total of the real files, and whether the target snapshot must carry
+        the selective marker. A file-scoped export is selective unless it
+        ships every file of an already-complete source snapshot, otherwise
+        targets would advertise a partial copy as a complete revision.
+        """
+        entries, marker_present = self._selected_snapshot_entries(
+            repository, revision, filenames,
+        )
+        snapshot = repository / "snapshots" / revision
+        marker = snapshot / _SELECTIVE_SNAPSHOT_MARKER
+        snapshot_files = {
+            item.relative_to(snapshot).as_posix()
+            for item in snapshot.rglob("*")
+            if (item.is_symlink() or item.is_file())
+            and item != marker
+        }
+        ships_whole_snapshot = snapshot_files == set(filenames)
+        selective = marker_present or not ships_whole_snapshot
+        synthetic_marker = selective and not marker_present
+        paths: list[Path] = []
+        arcnames: list[str] = []
+        total = 0
+        archived_reals: set[Path] = set()
+        snapshot = repository / "snapshots" / revision
+
+        def add(path: Path, arcname: str, *, size: bool) -> None:
+            nonlocal total
+            paths.append(path)
+            arcnames.append(arcname)
+            if size and not path.is_symlink():
+                total += path.stat().st_size
+
+        root = repository.name
+        add(repository, root, size=False)
+        snapshots_dir = repository / "snapshots"
+        blobs_dir = repository / "blobs"
+        if blobs_dir.is_dir() and not blobs_dir.is_symlink():
+            add(blobs_dir, f"{root}/blobs", size=False)
+        add(snapshots_dir, f"{root}/snapshots", size=False)
+        add(snapshot, f"{root}/snapshots/{revision}", size=False)
+        directories: set[str] = set()
+        for filename, entry in entries.items():
+            relative = PurePosixPath(filename).parts
+            for depth in range(1, len(relative)):
+                directory = "/".join(relative[:depth])
+                if directory not in directories:
+                    directories.add(directory)
+                    add(
+                        snapshot / directory,
+                        f"{root}/snapshots/{revision}/{directory}",
+                        size=False,
+                    )
+        for filename, entry in entries.items():
+            real = entry.resolve(strict=True)
+            if real.is_file() and real not in archived_reals:
+                archived_reals.add(real)
+                blob_relative = real.relative_to(repository).as_posix()
+                add(real, f"{root}/{blob_relative}", size=True)
+        for filename, entry in entries.items():
+            if entry in archived_reals:
+                # A regular-file entry (degraded symlink layouts) was already
+                # archived under its snapshot path; adding it again would
+                # duplicate the payload in the archive.
+                continue
+            add(
+                entry,
+                f"{root}/snapshots/{revision}/{filename}",
+                size=True,
+            )
+        if marker_present:
+            add(
+                marker,
+                f"{root}/snapshots/{revision}/{_SELECTIVE_SNAPSHOT_MARKER}",
+                size=False,
+            )
+        refs_root = repository / "refs"
+        if refs_root.is_dir() and not refs_root.is_symlink():
+            for ref in sorted(refs_root.rglob("*")):
+                if not ref.is_file() or ref.is_symlink():
+                    continue
+                try:
+                    content = ref.read_text(encoding="utf-8").strip()
+                except OSError:
+                    continue
+                if content == revision:
+                    add(
+                        ref,
+                        f"{root}/refs/{ref.relative_to(refs_root).as_posix()}",
+                        size=True,
+                    )
+        return paths, arcnames, total, synthetic_marker
+
+    def export_model_files(
+        self, model_id: str, revision: str, filenames: list[str],
+        requested_revision: str | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Stream a tar of exactly one snapshot's selected files and blobs."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        requested_revision = validate_revision(requested_revision or revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        repository = self._model_path(model_id)
+        if not repository.is_dir() or repository.is_symlink():
+            raise LookupError("cached model not found")
+        entries, _ = self._selected_snapshot_entries(
+            repository, revision, selected,
+        )
+        paths, arcnames, total, synthetic_marker = self._model_files_members(
+            repository, revision, selected, requested_revision,
+        )
+        self._reserve_stream(model_id)
+
+        async def stream() -> AsyncIterator[bytes]:
+            chunks: queue.Queue[Any] = queue.Queue(maxsize=8)
+            stopped = threading.Event()
+            finished = object()
+
+            def produce() -> None:
+                def publish(value: Any) -> None:
+                    while not stopped.is_set():
+                        try:
+                            chunks.put(value, timeout=0.1)
+                            return
+                        except queue.Full:
+                            continue
+
+                try:
+                    writer = _TarQueueWriter(chunks, stopped)
+                    with tarfile.open(fileobj=writer, mode="w|") as archive:
+                        for path, arcname in zip(paths, arcnames):
+                            archive.add(
+                                path, arcname=arcname, recursive=False,
+                            )
+                        if synthetic_marker:
+                            info = tarfile.TarInfo(
+                                f"{repository.name}/snapshots/{revision}/"
+                                f"{_SELECTIVE_SNAPSHOT_MARKER}"
+                            )
+                            info.size = len(_SELECTIVE_MARKER_CONTENT)
+                            archive.addfile(
+                                info, io.BytesIO(_SELECTIVE_MARKER_CONTENT),
+                            )
+                except BrokenPipeError:
+                    pass
+                except BaseException as exc:
+                    publish(exc)
+                finally:
+                    publish(finished)
+
+            producer = asyncio.create_task(asyncio.to_thread(produce))
+            try:
+                while True:
+                    item = await asyncio.to_thread(chunks.get)
+                    if item is finished:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+            finally:
+                stopped.set()
+                await asyncio.gather(producer, return_exceptions=True)
+
+        return _TrackedExport(self, model_id, stream())
+
+    async def import_model_files(
+        self,
+        model_id: str,
+        chunks: AsyncIterator[bytes],
+        expected_bytes: int | None = None,
+        required_model_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """Receive one file-scoped archive, placing or merging it atomically.
+
+        Targets without the repository receive the archive as-is; targets
+        already caching the repository (for example a different GGUF
+        quantization) get the missing blobs, snapshot entries, and revision
+        refs merged in without touching their existing content.
+        """
+        model_id = validate_model_id(model_id)
+        self._reserve_stream(model_id)
+        hub = self._hub()
+        try:
+            if required_model_bytes is not None:
+                model_bytes = _nonnegative_int(required_model_bytes)
+                required_free = model_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
+                free_bytes = self.free_bytes()
+                if free_bytes is None or free_bytes < required_free:
+                    raise RuntimeError(
+                        "target cache volume no longer has enough free space for import"
+                    )
+            hub.mkdir(parents=True, exist_ok=True)
+            archive_name = _cache_name(model_id)
+            stage = Path(tempfile.mkdtemp(prefix=".sparkdeck-vnas-stage-", dir=hub))
+            descriptor, archive_path_value = tempfile.mkstemp(
+                prefix=".sparkdeck-vnas-", suffix=".tar", dir=hub,
+            )
+            archive_path = Path(archive_path_value)
+            received = 0
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    async for chunk in chunks:
+                        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                            raise ValueError("archive stream yielded non-bytes data")
+                        data = bytes(chunk)
+                        received += len(data)
+                        output.write(data)
+                        if expected_bytes is not None and received > int(expected_bytes):
+                            raise ValueError(
+                                "archive byte count exceeds the expected size"
+                            )
+                    output.flush()
+                    os.fsync(output.fileno())
+                await asyncio.to_thread(
+                    self._place_or_merge_model_files,
+                    archive_path, stage, archive_name,
+                )
+                return {
+                    "ok": True, "model_id": model_id, "bytes_received": received,
+                }
+            finally:
+                archive_path.unlink(missing_ok=True)
+                shutil.rmtree(stage, ignore_errors=True)
+        finally:
+            self._release_stream(model_id)
+
+    def _place_or_merge_model_files(
+        self, archive_path: Path, stage: Path, archive_name: str,
+    ) -> None:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            members = archive.getmembers()
+            if not members:
+                raise ValueError("model archive is empty")
+            for member in members:
+                _validate_tar_member(member, archive_name)
+            archive.extractall(stage, members=members, filter="data")
+        extracted = stage / archive_name
+        if not extracted.is_dir() or extracted.is_symlink():
+            raise ValueError("model archive does not contain the expected repository")
+        snapshot_dirs = [
+            item for item in (extracted / "snapshots").iterdir()
+            if item.is_dir() and not item.is_symlink()
+        ]
+        if not snapshot_dirs:
+            raise ValueError("model archive does not contain a snapshot")
+        destination = self._hub() / archive_name
+        if not destination.exists():
+            # Capacity was gated before the stream started; the staging copy
+            # is already part of that budget, so placement is a rename. The
+            # archive's own marker state defines snapshot completeness.
+            os.replace(extracted, destination)
+            return
+        # Mirror the download, inventory, and delete paths: a repository
+        # entry that is not a real cache-local directory must never be
+        # written through, or a tampered link would export merge writes
+        # outside the configured Hub directory.
+        if destination.is_symlink() or not destination.is_dir():
+            raise RuntimeError("cached model repository is not a safe directory")
+        self._merge_model_directory(extracted, destination)
+        shutil.rmtree(extracted, ignore_errors=True)
+
+    def _merge_model_directory(self, extracted: Path, destination: Path) -> None:
+        """Merge one cached repository into an existing one, never deleting.
+
+        Snapshot markers are governed by the destination for pre-existing
+        snapshot directories (they keep their own marker state so an
+        incoming selective subset can never downgrade a complete target
+        snapshot), while snapshot directories newly created by this merge
+        take the archive's marker because they hold only the shipped
+        subset. Revision refs are updated to the incoming alias mapping
+        when it differs.
+        """
+        destination_snapshots = destination / "snapshots"
+        pre_existing = {
+            item.name
+            for item in destination_snapshots.iterdir()
+            if item.is_dir() and not item.is_symlink()
+        } if destination_snapshots.is_dir() else set()
+
+        for source_path in sorted(extracted.rglob("*")):
+            relative = source_path.relative_to(extracted)
+            target_path = destination / relative
+            if (
+                len(relative.parts) >= 3
+                and relative.parts[0] == "snapshots"
+                and relative.parts[2] == _SELECTIVE_SNAPSHOT_MARKER
+                and relative.parts[1] in pre_existing
+            ):
+                # Pre-existing snapshots keep their own marker state so an
+                # incoming selective subset cannot downgrade a complete
+                # target snapshot; newly created snapshots accept the
+                # archive's marker because they hold only a subset.
+                continue
+            if source_path.is_dir() and not source_path.is_symlink():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if not target_path.exists():
+                os.replace(source_path, target_path)
+                continue
+            if relative.parts[0] == "refs" and source_path.is_file():
+                content = source_path.read_text(encoding="utf-8").strip()
+                if (
+                    target_path.is_file()
+                    and target_path.read_text(encoding="utf-8").strip() == content
+                ):
+                    continue
+                if re.fullmatch(r"[0-9a-fA-F]{40}", content):
+                    staging_ref = target_path.with_name(
+                        target_path.name + ".sparkdeck-ref"
+                    )
+                    staging_ref.write_text(content + "\n", encoding="utf-8")
+                    os.replace(staging_ref, target_path)
+                continue
+            if source_path.is_symlink() or target_path.is_symlink():
+                if source_path.is_symlink() and target_path.is_symlink() and (
+                    os.readlink(source_path) == os.readlink(target_path)
+                ):
+                    continue
+                raise RuntimeError(
+                    "refusing to merge a snapshot entry that differs on the target"
+                )
+            if (
+                source_path.is_file() and target_path.is_file()
+                and source_path.stat().st_size == target_path.stat().st_size
+            ):
+                continue
+            raise RuntimeError(
+                "refusing to merge a cached file that differs on the target"
+            )
+        shutil.rmtree(extracted, ignore_errors=True)
+
+    async def transfer_model_files(
+        self, model_id: str, revision: str, filenames: list[str],
+        source_node_id: str, target_node_id: str,
+        requested_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Stream one file-scoped snapshot subset between two cluster nodes.
+
+        Unlike the whole-repository transfer jobs, this path accepts
+        selective (marker-flagged) snapshots and merges into targets that
+        already cache the same repository under another quantization.
+        """
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        requested_revision = validate_revision(requested_revision or revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        if source_node_id == target_node_id:
+            return {"ok": True, "model_id": model_id, "bytes_transferred": 0}
+        expected = await self._model_files_transfer_bytes(
+            model_id, revision, selected, source_node_id,
+        )
+        target_storage = await self._node_storage(target_node_id)
+        free_bytes = _optional_nonnegative_int(target_storage.get("free_size"))
+        if free_bytes is None:
+            raise RuntimeError("target node did not report free cache capacity")
+        if free_bytes < expected * 2 + TRANSFER_STAGING_RESERVE_BYTES:
+            raise RuntimeError(
+                f"target node has insufficient free cache space "
+                f"({free_bytes} bytes available; "
+                f"{expected * 2 + TRANSFER_STAGING_RESERVE_BYTES} bytes required)"
+            )
+        source_response = None
+        target_response = None
+        source: AsyncIterator[bytes] | None = None
+        try:
+            if source_node_id == LOCAL_NODE_ID:
+                source = self.export_model_files(
+                    model_id, revision, selected, requested_revision,
+                )
+            else:
+                query = urlencode([
+                    ("revision", revision),
+                    ("requested_revision", requested_revision),
+                    *[("files", filename) for filename in selected],
+                ])
+                source_response = await self.node_registry.open_stream(
+                    source_node_id, "GET",
+                    f"{self._model_agent_path(model_id, 'files/export')}?{query}",
+                    timeout=3600,
+                )
+                await _raise_remote_status(source_response, "source")
+                source = source_response.aiter_bytes()
+            if target_node_id == LOCAL_NODE_ID:
+                return await self.import_model_files(
+                    model_id, source, required_model_bytes=expected,
+                )
+            target_response = await self.node_registry.open_stream(
+                target_node_id, "PUT",
+                self._model_agent_path(model_id, "files/import"),
+                content=source,
+                headers={
+                    "Content-Type": "application/x-tar",
+                    "X-SparkDeck-Model-Bytes": str(expected),
+                },
+                timeout=3600,
+            )
+            await _raise_remote_status(target_response, "target")
+            await target_response.aread()
+            imported_storage = await self._node_storage(target_node_id)
+            if not any(
+                item.get("model_id") == model_id
+                for item in imported_storage.get("models") or []
+            ):
+                raise RuntimeError("target did not report the merged repository")
+            return {"ok": True, "model_id": model_id, "bytes_transferred": expected}
+        finally:
+            if source is not None and hasattr(source, "aclose"):
+                await source.aclose()
+            if target_response is not None:
+                await target_response.aclose()
+            if source_response is not None:
+                await source_response.aclose()
+
+    def estimate_model_files_bytes(
+        self, model_id: str, revision: str, filenames: list[str],
+    ) -> dict[str, Any]:
+        """Report the byte total of the real files backing selected snapshot entries.
+
+        Blobs shared by several snapshot entries are counted once, matching
+        what a file-scoped archive actually contains.
+        """
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision)
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename) for filename in filenames
+        ))
+        if not selected:
+            raise ValueError("at least one repository file must be selected")
+        repository = self._model_path(model_id)
+        entries, _ = self._selected_snapshot_entries(repository, revision, selected)
+        total = 0
+        seen: set[Path] = set()
+        for entry in entries.values():
+            real = entry.resolve(strict=True)
+            if real in seen or not real.is_file():
+                continue
+            seen.add(real)
+            total += real.stat().st_size
+        if total <= 0:
+            raise RuntimeError("source node did not report a usable cached size")
+        return {"model_id": model_id, "revision": revision, "size_bytes": total}
+
+    async def _model_files_transfer_bytes(
+        self, model_id: str, revision: str, filenames: list[str],
+        source_node_id: str,
+    ) -> int:
+        if source_node_id == LOCAL_NODE_ID:
+            result = await asyncio.to_thread(
+                self.estimate_model_files_bytes, model_id, revision, filenames,
+            )
+            return _nonnegative_int(result["size_bytes"])
+        result = await self.node_registry.request(
+            source_node_id, "GET",
+            f"{self._model_agent_path(model_id, 'files/size')}?"
+            + urlencode([
+                ("revision", revision),
+                *[("files", filename) for filename in filenames],
+            ]),
+            timeout=60,
+        )
+        size = _nonnegative_int((result or {}).get("size_bytes"))
+        if size <= 0:
+            raise RuntimeError("source node did not report a usable cached size")
+        return size
+
     def delete_model(self, model_id: str) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         if self.model_in_transfer(model_id, LOCAL_NODE_ID):
@@ -1096,6 +1709,10 @@ class VirtualNAS:
             raise LookupError("cached source model revision not found")
         if source_model.get("partial"):
             raise RuntimeError("partial cached models cannot be transferred")
+        if source_model.get("transferable") is False:
+            raise RuntimeError(
+                "model weights cannot be transferred from their current storage location"
+            )
         model_size = _nonnegative_int(source_model.get("size_bytes"))
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")
@@ -1703,6 +2320,12 @@ class VirtualNAS:
             ), None)
             if source_model is None:
                 raise RuntimeError("source node does not have the complete requested revision")
+            if source_model.get("partial"):
+                raise RuntimeError("source node no longer has a complete requested revision")
+            if source_model.get("transferable") is False:
+                raise RuntimeError(
+                    "model weights cannot be transferred from their current storage location"
+                )
             actual_size = _nonnegative_int(source_model.get("size_bytes"))
             if actual_size <= 0:
                 raise RuntimeError("source node did not report a usable cached model size")
@@ -1985,6 +2608,95 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return set()
 
 
+def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
+    """Report known complete ComfyUI bundles as installed node weights."""
+    models: dict[str, dict[str, Any]] = {}
+    for raw_root in roots:
+        try:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                continue
+            root = raw_root.resolve(strict=True)
+        except OSError:
+            continue
+        for model_id, required_files, alternative_groups, optional_files in _COMFYUI_MODEL_BUNDLES:
+            files: dict[Path, Path] = {}
+
+            def installed(relative: str) -> Path | None:
+                candidate = root.joinpath(*PurePosixPath(relative).parts)
+                if candidate.is_symlink() or not candidate.is_file():
+                    return None
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
+                    return None
+                return resolved
+
+            try:
+                for relative in required_files:
+                    resolved = installed(relative)
+                    if resolved is None:
+                        files = {}
+                        break
+                    files[resolved] = resolved
+            except (OSError, RuntimeError, ValueError):
+                files = {}
+            if len(files) != len(required_files):
+                continue
+            alternatives_complete = True
+            for alternatives in alternative_groups:
+                installed_alternatives = []
+                for relative in alternatives:
+                    try:
+                        resolved = installed(relative)
+                    except (OSError, RuntimeError, ValueError):
+                        resolved = None
+                    if resolved is not None:
+                        installed_alternatives.append(resolved)
+                if not installed_alternatives:
+                    alternatives_complete = False
+                    break
+                files.update((path, path) for path in installed_alternatives)
+            if not alternatives_complete:
+                continue
+            for relative in optional_files:
+                try:
+                    resolved = installed(relative)
+                    if resolved is not None:
+                        files[resolved] = resolved
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            try:
+                stats = [path.stat() for path in files.values()]
+            except OSError:
+                continue
+            size_bytes = sum(stat.st_size for stat in stats)
+            last_modified = max(stat.st_mtime for stat in stats)
+            candidate = {
+                "model_id": model_id,
+                "size_bytes": size_bytes,
+                "file_count": len(files),
+                "partial": False,
+                "has_partial_download": False,
+                "partial_size_bytes": 0,
+                "partial_revision_size_bytes": {},
+                "partial_revisions": [],
+                "partial_revision_refs": {},
+                "revision": "ComfyUI",
+                "revisions": [],
+                "revision_refs": {},
+                "last_modified": datetime.fromtimestamp(
+                    last_modified, timezone.utc,
+                ).isoformat(),
+                "source": "ComfyUI",
+                "externally_managed": True,
+                "transferable": False,
+                "deletable": False,
+            }
+            current = models.get(model_id)
+            if current is None or candidate["size_bytes"] > current["size_bytes"]:
+                models[model_id] = candidate
+    return sorted(models.values(), key=lambda item: str(item["model_id"]))
+
+
 def _safe_incomplete_snapshot_revisions(
     repository: Path, complete_revisions: set[str],
 ) -> set[str]:
@@ -2116,14 +2828,7 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
 
     lowered = {name.casefold(): path for name, path in files.items()}
-    weights = {
-        name: path for name, path in lowered.items()
-        if name.endswith((".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"))
-        or (
-            name.endswith(".bin")
-            and Path(name).name.startswith(("pytorch_model", "model", "adapter_model"))
-        )
-    }
+    weights = {name: path for name, path in lowered.items() if _is_weight_file(name)}
     if not weights or not _required_files_are_nonempty(weights.values()):
         return False
     if not _weight_shards_are_complete(weights):
@@ -2131,8 +2836,11 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _weight_indexes_are_complete(lowered):
         return False
 
+    if _is_complete_diffusers_snapshot(lowered):
+        return True
+
     # GGUF contains its own tensor metadata and tokenizer vocabulary. Other
-    # runtimes need both the Transformers configuration and tokenizer assets.
+    # Transformers runtimes need both configuration and tokenizer assets.
     if any(name.endswith(".gguf") for name in weights):
         return True
     config = lowered.get("config.json")
@@ -2150,6 +2858,84 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _required_files_are_nonempty(tokenizer):
         return False
     return True
+
+
+def _is_complete_diffusers_snapshot(files: dict[str, Path]) -> bool:
+    """Recognize a self-contained Diffusers pipeline rooted by model_index.json."""
+    index = files.get("model_index.json")
+    if index is None or not _required_files_are_nonempty([index]):
+        return False
+    try:
+        manifest = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(manifest.get("_class_name"), str)
+        or not manifest["_class_name"].strip()
+    ):
+        return False
+    components = [
+        (str(name).casefold(), descriptor)
+        for name, descriptor in manifest.items()
+        if not str(name).startswith("_")
+        and isinstance(descriptor, list)
+        and len(descriptor) >= 2
+        and any(value is not None for value in descriptor[:2])
+    ]
+    if not components:
+        return False
+    for component, descriptor in components:
+        component_files = {
+            name: path for name, path in files.items()
+            if name.startswith(f"{component}/")
+        }
+        if not component_files or not _required_files_are_nonempty(component_files.values()):
+            return False
+        filenames = {PurePosixPath(name).name for name in component_files}
+        descriptor_name = " ".join(str(value or "") for value in descriptor[:2]).casefold()
+        if "scheduler" in component or "scheduler" in descriptor_name:
+            if "scheduler_config.json" not in filenames:
+                return False
+            continue
+        if "tokenizer" in component or "tokenizer" in descriptor_name:
+            if not (
+                filenames & _TOKENIZER_FILES
+                or {"vocab.json", "merges.txt"} <= filenames
+            ):
+                return False
+            continue
+        if any(
+            marker in component or marker in descriptor_name
+            for marker in ("feature_extractor", "image_processor", "processor")
+        ):
+            if not filenames & {
+                "preprocessor_config.json", "feature_extractor_config.json",
+                "processor_config.json", "image_processor_config.json",
+            }:
+                return False
+            continue
+        component_weights = {
+            name: path for name, path in component_files.items()
+            if _is_weight_file(name)
+        }
+        if (
+            not component_weights
+            or not _weight_shards_are_complete(component_weights)
+            or not _weight_indexes_are_complete(component_files)
+        ):
+            return False
+    return True
+
+
+def _is_weight_file(name: str) -> bool:
+    return (
+        name.endswith((".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"))
+        or (
+            name.endswith(".bin")
+            and Path(name).name.startswith(("pytorch_model", "model", "adapter_model"))
+        )
+    )
 
 
 def _required_files_are_nonempty(paths: Any) -> bool:
@@ -2186,13 +2972,13 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
             )
     if not required_indexes <= indexes.keys():
         return False
-    for path in indexes.values():
+    for index_name, path in indexes.items():
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             weight_map = value.get("weight_map") if isinstance(value, dict) else None
             if not isinstance(weight_map, dict) or not weight_map:
                 return False
-            required = set()
+            index_directory = PurePosixPath(index_name).parent
             for raw in weight_map.values():
                 candidate = PurePosixPath(str(raw or ""))
                 if (
@@ -2200,9 +2986,11 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
                     or ".." in candidate.parts
                 ):
                     return False
-                required.add(candidate.as_posix().casefold())
-            if not required <= files.keys():
-                return False
+                candidates = {candidate.as_posix().casefold()}
+                if index_directory != PurePosixPath("."):
+                    candidates.add((index_directory / candidate).as_posix().casefold())
+                if not candidates & files.keys():
+                    return False
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False
     return True

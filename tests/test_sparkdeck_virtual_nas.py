@@ -199,6 +199,22 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PermissionError, "invalid or expired"):
                 nas.export_model_with_capability("org/model", capability)
 
+    async def test_import_reports_each_durable_finalization_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            source_hub = Path(directory) / "source-hub"
+            create_cached_model(source_hub)
+            source = VirtualNAS(Path(directory) / "source", lambda: source_hub, FakeRegistry(), lambda: True)
+            target = VirtualNAS(Path(directory) / "target", lambda: hub, FakeRegistry(), lambda: True)
+            phases: list[str] = []
+
+            result = await target.import_model(
+                "org/model", source.export_model("org/model"), phase=phases.append,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(phases, ["receiving", "syncing", "extracting", "validating", "registering"])
+
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 

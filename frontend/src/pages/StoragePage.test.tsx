@@ -479,6 +479,26 @@ describe('StoragePage', () => {
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 
+  it('keeps completed bytes visible while the receiver syncs and registers the cache', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [{
+        id: 'finalizing-transfer', model_id: 'org/finalizing', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+        target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'transfer',
+        bytes_total: 1000, bytes_transferred: 1000, progress: 1, phase: 'syncing', created_at: '2026-08-29T12:00:00Z',
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const finalizing = within(nodePanel).getByLabelText('Finalizing on Backup Spark org/finalizing on Backup Spark')
+    expect(within(finalizing).getByText('Syncing archive to disk')).toBeInTheDocument()
+    const phaseBar = within(finalizing).getByRole('progressbar', { name: 'Syncing archive to disk progress' })
+    expect(phaseBar).toHaveAttribute('aria-valuetext', 'Syncing archive to disk')
+    expect(within(finalizing).getByText(/^100%/)).toBeInTheDocument()
+  })
+
   it('filters models across every node from one global search field', async () => {
     const storage: StorageState = {
       ...enabledStorage,

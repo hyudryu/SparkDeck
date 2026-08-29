@@ -45,6 +45,24 @@ function jobProgress(job: StorageTransferJob) {
   return Math.max(0, Math.min(100, Number.isFinite(reported) ? reported : measured))
 }
 
+function finalizationLabel(job: StorageTransferJob) {
+  switch (job.phase) {
+    case 'syncing': return 'Syncing archive to disk'
+    case 'extracting': return 'Extracting model cache'
+    case 'validating': return 'Validating model cache'
+    case 'registering': return 'Registering model cache'
+    case 'verifying': return 'Verifying model inventory'
+    case 'finalizing': return 'Finalizing receiver'
+    default: return 'Finalizing model cache'
+  }
+}
+
+function isFinalizing(job: StorageTransferJob) {
+  if (job.status.toLowerCase() !== 'running' || job.kind === 'download') return false
+  if (['syncing', 'extracting', 'validating', 'registering', 'verifying', 'finalizing'].includes(job.phase ?? '')) return true
+  return job.bytes_total > 0 && job.bytes_transferred >= job.bytes_total
+}
+
 function formatProgress(value: number) {
   const rounded = Math.round(value * 10) / 10
   return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)
@@ -82,6 +100,10 @@ function SmoothProgress({ value, label }: { value: number; label: string }) {
     aria-valuemax={100}
     aria-valuenow={Math.round(progress * 10) / 10}
   ><span style={{ transform: `scaleX(${progress / 100})` }} /></div>
+}
+
+function FinalizationProgress({ label }: { label: string }) {
+  return <div className="storage-progress storage-progress-indeterminate" role="progressbar" aria-label={`${label} progress`} aria-valuetext={label}><span /></div>
 }
 
 function isActive(job: StorageTransferJob) {
@@ -449,9 +471,11 @@ export function StoragePage() {
                   const transferRate = formatTransferRate(job)
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
-                  const activity = downloading
+                  const finalizing = isFinalizing(job)
+                  const activity = finalizing ? `Finalizing on ${node.name}` : downloading
                     ? running ? 'Downloading from Hugging Face' : 'Download queued'
                     : running ? `Transferring from ${job.source_node_name}` : 'Transfer queued'
+                  const phaseLabel = finalizationLabel(job)
                   return <li
                     className="storage-active-weight"
                     key={`job:${job.id}`}
@@ -459,7 +483,7 @@ export function StoragePage() {
                     style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
                   >
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <ArrowLeftRight size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</small></div>
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</small>{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
                 })}
@@ -506,11 +530,13 @@ export function StoragePage() {
             {visibleRecentJobs.map((job) => {
               const progress = jobProgress(job)
               const transferRate = formatTransferRate(job)
+              const finalizing = isFinalizing(job)
+              const phaseLabel = finalizationLabel(job)
               return <div className="table-row" role="row" key={job.id}>
                 <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
                 <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
                 <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert" title={job.error}>{job.error}</small>}</div>
-                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</span></div>
+                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</span>{finalizing && <><span className="storage-finalization-label">{phaseLabel}</span><FinalizationProgress label={phaseLabel} /></>}</div>
                 <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
               </div>
             })}

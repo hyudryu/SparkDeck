@@ -51,15 +51,19 @@ _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
         (
-            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
             "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
             "text_encoders/gemma4_e2b_it_bf16.safetensors",
             "vae/LTX2.5/ltx-2.5-video-vae-bf16.safetensors",
             "vae/LTX2.5/ltx-2.5-audio-vae-bf16.safetensors",
         ),
         (
-            "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
-            "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            (
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                "diffusion_models/LTX2.5/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+                "diffusion_models/LTX2.5/LTX-2.5-Distilled-Q8_0.gguf",
+            ),
+        ),
+        (
             "vae/LTX2.5/ltx-2.5-video-vae-conv-bf16.safetensors",
             "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
         ),
@@ -71,6 +75,7 @@ _COMFYUI_MODEL_BUNDLES = (
             "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
             "vae/minimax_music3_dav.safetensors",
         ),
+        (),
         (),
     ),
 )
@@ -1704,6 +1709,10 @@ class VirtualNAS:
             raise LookupError("cached source model revision not found")
         if source_model.get("partial"):
             raise RuntimeError("partial cached models cannot be transferred")
+        if source_model.get("transferable") is False:
+            raise RuntimeError(
+                "model weights cannot be transferred from their current storage location"
+            )
         model_size = _nonnegative_int(source_model.get("size_bytes"))
         if model_size <= 0:
             raise RuntimeError("source node did not report a usable cached model size")
@@ -2311,6 +2320,12 @@ class VirtualNAS:
             ), None)
             if source_model is None:
                 raise RuntimeError("source node does not have the complete requested revision")
+            if source_model.get("partial"):
+                raise RuntimeError("source node no longer has a complete requested revision")
+            if source_model.get("transferable") is False:
+                raise RuntimeError(
+                    "model weights cannot be transferred from their current storage location"
+                )
             actual_size = _nonnegative_int(source_model.get("size_bytes"))
             if actual_size <= 0:
                 raise RuntimeError("source node did not report a usable cached model size")
@@ -2594,7 +2609,7 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
 
 
 def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
-    """Report known complete ComfyUI bundles as read-only external weights."""
+    """Report known complete ComfyUI bundles as installed node weights."""
     models: dict[str, dict[str, Any]] = {}
     for raw_root in roots:
         try:
@@ -2603,35 +2618,54 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             root = raw_root.resolve(strict=True)
         except OSError:
             continue
-        for model_id, required_files, optional_files in _COMFYUI_MODEL_BUNDLES:
-            files = []
+        for model_id, required_files, alternative_groups, optional_files in _COMFYUI_MODEL_BUNDLES:
+            files: dict[Path, Path] = {}
+
+            def installed(relative: str) -> Path | None:
+                candidate = root.joinpath(*PurePosixPath(relative).parts)
+                if candidate.is_symlink() or not candidate.is_file():
+                    return None
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
+                    return None
+                return resolved
+
             try:
                 for relative in required_files:
-                    candidate = root.joinpath(*PurePosixPath(relative).parts)
-                    if candidate.is_symlink() or not candidate.is_file():
-                        files = []
+                    resolved = installed(relative)
+                    if resolved is None:
+                        files = {}
                         break
-                    resolved = candidate.resolve(strict=True)
-                    if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
-                        files = []
-                        break
-                    files.append(resolved)
+                    files[resolved] = resolved
             except (OSError, RuntimeError, ValueError):
-                files = []
+                files = {}
             if len(files) != len(required_files):
+                continue
+            alternatives_complete = True
+            for alternatives in alternative_groups:
+                installed_alternatives = []
+                for relative in alternatives:
+                    try:
+                        resolved = installed(relative)
+                    except (OSError, RuntimeError, ValueError):
+                        resolved = None
+                    if resolved is not None:
+                        installed_alternatives.append(resolved)
+                if not installed_alternatives:
+                    alternatives_complete = False
+                    break
+                files.update((path, path) for path in installed_alternatives)
+            if not alternatives_complete:
                 continue
             for relative in optional_files:
                 try:
-                    candidate = root.joinpath(*PurePosixPath(relative).parts)
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    resolved = candidate.resolve(strict=True)
-                    if resolved.is_relative_to(root) and resolved.stat().st_size > 0:
-                        files.append(resolved)
+                    resolved = installed(relative)
+                    if resolved is not None:
+                        files[resolved] = resolved
                 except (OSError, RuntimeError, ValueError):
                     continue
             try:
-                stats = [path.stat() for path in files]
+                stats = [path.stat() for path in files.values()]
             except OSError:
                 continue
             size_bytes = sum(stat.st_size for stat in stats)
@@ -2794,14 +2828,7 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
 
     lowered = {name.casefold(): path for name, path in files.items()}
-    weights = {
-        name: path for name, path in lowered.items()
-        if name.endswith((".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"))
-        or (
-            name.endswith(".bin")
-            and Path(name).name.startswith(("pytorch_model", "model", "adapter_model"))
-        )
-    }
+    weights = {name: path for name, path in lowered.items() if _is_weight_file(name)}
     if not weights or not _required_files_are_nonempty(weights.values()):
         return False
     if not _weight_shards_are_complete(weights):
@@ -2809,15 +2836,15 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _weight_indexes_are_complete(lowered):
         return False
 
+    if _is_complete_diffusers_snapshot(lowered):
+        return True
+
     # GGUF contains its own tensor metadata and tokenizer vocabulary. Other
-    # runtimes need both the Transformers configuration and tokenizer assets.
+    # Transformers runtimes need both configuration and tokenizer assets.
     if any(name.endswith(".gguf") for name in weights):
         return True
     config = lowered.get("config.json")
-    if (
-        (config is None or not _required_files_are_nonempty([config]))
-        and not _is_complete_diffusers_snapshot(lowered)
-    ):
+    if config is None or not _required_files_are_nonempty([config]):
         return False
     tokenizer = [
         path for name, path in lowered.items()
@@ -2849,16 +2876,65 @@ def _is_complete_diffusers_snapshot(files: dict[str, Path]) -> bool:
     ):
         return False
     components = [
-        str(name).casefold()
+        (str(name).casefold(), descriptor)
         for name, descriptor in manifest.items()
         if not str(name).startswith("_")
         and isinstance(descriptor, list)
         and len(descriptor) >= 2
         and any(value is not None for value in descriptor[:2])
     ]
-    return bool(components) and all(
-        any(name.startswith(f"{component}/") for name in files)
-        for component in components
+    if not components:
+        return False
+    for component, descriptor in components:
+        component_files = {
+            name: path for name, path in files.items()
+            if name.startswith(f"{component}/")
+        }
+        if not component_files or not _required_files_are_nonempty(component_files.values()):
+            return False
+        filenames = {PurePosixPath(name).name for name in component_files}
+        descriptor_name = " ".join(str(value or "") for value in descriptor[:2]).casefold()
+        if "scheduler" in component or "scheduler" in descriptor_name:
+            if "scheduler_config.json" not in filenames:
+                return False
+            continue
+        if "tokenizer" in component or "tokenizer" in descriptor_name:
+            if not (
+                filenames & _TOKENIZER_FILES
+                or {"vocab.json", "merges.txt"} <= filenames
+            ):
+                return False
+            continue
+        if any(
+            marker in component or marker in descriptor_name
+            for marker in ("feature_extractor", "image_processor", "processor")
+        ):
+            if not filenames & {
+                "preprocessor_config.json", "feature_extractor_config.json",
+                "processor_config.json", "image_processor_config.json",
+            }:
+                return False
+            continue
+        component_weights = {
+            name: path for name, path in component_files.items()
+            if _is_weight_file(name)
+        }
+        if (
+            not component_weights
+            or not _weight_shards_are_complete(component_weights)
+            or not _weight_indexes_are_complete(component_files)
+        ):
+            return False
+    return True
+
+
+def _is_weight_file(name: str) -> bool:
+    return (
+        name.endswith((".safetensors", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"))
+        or (
+            name.endswith(".bin")
+            and Path(name).name.startswith(("pytorch_model", "model", "adapter_model"))
+        )
     )
 
 
@@ -2896,13 +2972,13 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
             )
     if not required_indexes <= indexes.keys():
         return False
-    for path in indexes.values():
+    for index_name, path in indexes.items():
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             weight_map = value.get("weight_map") if isinstance(value, dict) else None
             if not isinstance(weight_map, dict) or not weight_map:
                 return False
-            required = set()
+            index_directory = PurePosixPath(index_name).parent
             for raw in weight_map.values():
                 candidate = PurePosixPath(str(raw or ""))
                 if (
@@ -2910,9 +2986,11 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
                     or ".." in candidate.parts
                 ):
                     return False
-                required.add(candidate.as_posix().casefold())
-            if not required <= files.keys():
-                return False
+                candidates = {candidate.as_posix().casefold()}
+                if index_directory != PurePosixPath("."):
+                    candidates.add((index_directory / candidate).as_posix().casefold())
+                if not candidates & files.keys():
+                    return False
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False
     return True

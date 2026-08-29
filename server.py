@@ -263,6 +263,7 @@ _STORAGE_PRIVATE_KEYS = {
 _STORAGE_INSTRUCTIONS = [
     "Pair SparkDeck nodes over a cluster-private network such as Tailscale.",
     "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
+    "Complete externally managed ComfyUI bundles are inventoried read-only.",
     "Choose an online source and one or more online targets with enough free space.",
 ]
 

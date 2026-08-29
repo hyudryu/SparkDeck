@@ -246,19 +246,19 @@ describe('StoragePage', () => {
       if (path.endsWith('/api/v1/storage/settings') && init?.method === 'PUT') enabled = false
       return json(enabled ? storage : { enabled: false, nodes: [], jobs: [], instructions: [] })
     })
-    const setIntervalSpy = vi.spyOn(window, 'setInterval')
-    const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+    const clearTimeoutSpy = vi.spyOn(window, 'clearTimeout')
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
     render(<StoragePage />)
 
     await user.click(await screen.findByRole('checkbox', { name: /Backup Spark/ }))
     await user.click(screen.getByRole('button', { name: 'Queue transfer' }))
-    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled())
+    await waitFor(() => expect(setTimeoutSpy).toHaveBeenCalled())
     await user.click(screen.getByRole('button', { name: 'Disable Virtual NAS' }))
 
     expect(await screen.findByRole('heading', { name: 'Virtual NAS is off' })).toBeInTheDocument()
-    await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalled())
+    await waitFor(() => expect(clearTimeoutSpy).toHaveBeenCalled())
   })
 
   it('shows partial caches with a warning and excludes them from transfers', async () => {
@@ -497,6 +497,23 @@ describe('StoragePage', () => {
     const phaseBar = within(finalizing).getByRole('progressbar', { name: 'Syncing archive to disk progress' })
     expect(phaseBar).toHaveAttribute('aria-valuetext', 'Syncing archive to disk')
     expect(within(finalizing).getByText(/^100%/)).toBeInTheDocument()
+  })
+
+  it('does not call a reported copy phase finalization just because tar bytes exceed model bytes', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [{
+        id: 'receiving-transfer', model_id: 'org/receiving', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+        target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'transfer',
+        bytes_total: 1000, bytes_transferred: 1024, progress: 1, phase: 'receiving', created_at: '2026-08-29T12:00:00Z',
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    expect(within(nodePanel).getByLabelText('Transferring from Studio Spark org/receiving on Backup Spark')).toBeInTheDocument()
+    expect(within(nodePanel).queryByText('Finalizing model cache')).not.toBeInTheDocument()
   })
 
   it('filters models across every node from one global search field', async () => {

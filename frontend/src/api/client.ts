@@ -78,6 +78,7 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
+const DEPLOYMENTS_TIMEOUT_MS = 10_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
@@ -490,7 +491,9 @@ export const api = {
   },
   deployments: {
     list: async (signal?: AbortSignal) => {
-      const data = await request<{ items: WireDeployment[] }>('/api/v1/deployments', { signal })
+      const data = await request<{ items: WireDeployment[] }>(
+        '/api/v1/deployments', { signal }, DEPLOYMENTS_TIMEOUT_MS,
+      )
       return data.items.map(deploymentFromWire)
     },
     get: async (id: string, signal?: AbortSignal) => {

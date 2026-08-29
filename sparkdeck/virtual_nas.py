@@ -47,6 +47,12 @@ TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 _SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
 _SELECTIVE_MARKER_CONTENT = b"selective\n"
+# Marks a snapshot exported from an externally managed ComfyUI install: bare
+# weight files under a synthetic pseudo-revision with no Hugging Face
+# metadata, so completeness is judged by the weight checks alone.
+_EXTERNAL_SNAPSHOT_MARKER = ".sparkdeck-external"
+_EXTERNAL_MARKER_CONTENT = b"comfyui\n"
+_EXTERNAL_PSEUDO_REVISION = "comfyui"
 _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
@@ -1091,11 +1097,19 @@ class VirtualNAS:
     def export_model(self, model_id: str) -> AsyncIterator[bytes]:
         model_id = validate_model_id(model_id)
         repository = self._model_path(model_id)
+        external_files: dict[str, Path] | None = None
         if (
             not repository.is_dir() or repository.is_symlink()
             or not _is_complete_repository(repository)
         ):
-            raise LookupError("cached model not found")
+            # Fall back to an externally managed ComfyUI install: its files
+            # stream as a synthetic Hugging Face cache so the target imports a
+            # normal SparkDeck-managed copy. Re-resolved on every export.
+            external_files = _external_comfyui_bundle_files(
+                self._external_model_roots_provider(), model_id,
+            )
+            if external_files is None:
+                raise LookupError("cached model not found")
         self._reserve_stream(model_id)
 
         async def stream() -> AsyncIterator[bytes]:
@@ -1115,7 +1129,12 @@ class VirtualNAS:
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
                     with tarfile.open(fileobj=writer, mode="w|") as archive:
-                        archive.add(repository, arcname=repository.name, recursive=True)
+                        if external_files is None:
+                            archive.add(repository, arcname=repository.name, recursive=True)
+                        else:
+                            _write_external_bundle_archive(
+                                archive, model_id, external_files,
+                            )
                 except BrokenPipeError:
                     pass
                 except BaseException as exc:
@@ -1715,13 +1734,42 @@ class VirtualNAS:
             raise RuntimeError("model is in use by a virtual NAS transfer")
         repository = self._model_path(model_id)
         if not repository.exists():
-            raise LookupError("cached model not found")
+            return self._delete_external_model(model_id)
         if repository.is_symlink() or not repository.is_dir():
             raise ValueError("cached model repository is not a safe directory")
         hub = self._hub()
         if repository.resolve().parent != hub:
             raise ValueError("model cache path escapes the Hugging Face hub")
         shutil.rmtree(repository)
+        return {"ok": True, "model_id": model_id}
+
+    def _delete_external_model(self, model_id: str) -> dict[str, Any]:
+        """Unlink an externally managed ComfyUI bundle's real files.
+
+        The bundle is re-resolved at delete time and every path is re-verified
+        before anything is removed: regular files only, never symlinks, and
+        always inside one of the currently configured, resolved ComfyUI model
+        roots. Directories and unrelated files are left untouched.
+        """
+        raw_roots = self._external_model_roots_provider()
+        roots = []
+        for raw_root in raw_roots:
+            try:
+                if raw_root.is_symlink() or not raw_root.is_dir():
+                    continue
+                roots.append(raw_root.resolve(strict=True))
+            except OSError:
+                continue
+        files = _external_comfyui_bundle_files(raw_roots, model_id)
+        if files is None:
+            raise LookupError("cached model not found")
+        for path in files.values():
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("external model file is not a safe regular file")
+            if not any(path.is_relative_to(root) for root in roots):
+                raise ValueError("external model file escapes the ComfyUI model roots")
+        for path in files.values():
+            path.unlink()
         return {"ok": True, "model_id": model_id}
 
     async def queue_transfer(
@@ -2746,6 +2794,127 @@ def _complete_snapshot_revisions(repository: Path) -> set[str]:
         return set()
 
 
+def _resolve_comfyui_bundle_files(
+    root: Path,
+    required_files: tuple[str, ...],
+    alternative_groups: tuple[tuple[str, ...], ...],
+    optional_files: tuple[str, ...],
+) -> dict[str, Path] | None:
+    """Resolve one bundle under an already-resolved ComfyUI models root.
+
+    Returns each installed file as relative POSIX name -> resolved absolute
+    path, or None when a required file or a whole alternative group is
+    missing, symlinked, escaping the root, or empty.
+    """
+    files: dict[str, Path] = {}
+
+    def installed(relative: str) -> Path | None:
+        candidate = root.joinpath(*PurePosixPath(relative).parts)
+        if candidate.is_symlink() or not candidate.is_file():
+            return None
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
+            return None
+        return resolved
+
+    try:
+        for relative in required_files:
+            resolved = installed(relative)
+            if resolved is None:
+                return None
+            files[relative] = resolved
+        for alternatives in alternative_groups:
+            installed_alternatives = []
+            for relative in alternatives:
+                try:
+                    resolved = installed(relative)
+                except (OSError, RuntimeError, ValueError):
+                    resolved = None
+                if resolved is not None:
+                    installed_alternatives.append((relative, resolved))
+            if not installed_alternatives:
+                return None
+            files.update(installed_alternatives)
+        for relative in optional_files:
+            try:
+                resolved = installed(relative)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved is not None:
+                files[relative] = resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return files
+
+
+def _external_comfyui_bundle_files(
+    roots: list[Path], model_id: str,
+) -> dict[str, Path] | None:
+    """Resolve a known ComfyUI bundle's installed files, freshly at call time.
+
+    Returns relative POSIX name -> resolved absolute path from the first root
+    holding a complete, safe installation, or None when the model is not a
+    known bundle or no root has it fully installed. Never trust a stale
+    inventory snapshot: callers re-resolve at operation time.
+    """
+    bundle = next(
+        (entry for entry in _COMFYUI_MODEL_BUNDLES if entry[0] == model_id), None,
+    )
+    if bundle is None:
+        return None
+    _, required_files, alternative_groups, optional_files = bundle
+    for raw_root in roots:
+        try:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                continue
+            root = raw_root.resolve(strict=True)
+        except OSError:
+            continue
+        files = _resolve_comfyui_bundle_files(
+            root, required_files, alternative_groups, optional_files,
+        )
+        if files is not None:
+            return files
+    return None
+
+
+def _write_external_bundle_archive(
+    archive: tarfile.TarFile, model_id: str, files: dict[str, Path],
+) -> None:
+    """Stream external bundle files as a synthetic Hugging Face cache repo.
+
+    The layout matches a regular whole-model export so targets import a
+    normal SparkDeck-managed copy: bundle files land under
+    ``snapshots/<pseudo-revision>/`` alongside a marker that relaxes the
+    config/tokenizer completeness requirement for bare weight bundles.
+    """
+    root = _cache_name(model_id)
+    snapshot = f"{root}/snapshots/{_EXTERNAL_PSEUDO_REVISION}"
+
+    def add_directory(name: str) -> None:
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        archive.addfile(info)
+
+    add_directory(root)
+    add_directory(f"{root}/snapshots")
+    add_directory(snapshot)
+    directories: set[str] = set()
+    for relative in files:
+        parts = PurePosixPath(relative).parts
+        for depth in range(1, len(parts)):
+            directory = "/".join(parts[:depth])
+            if directory not in directories:
+                directories.add(directory)
+                add_directory(f"{snapshot}/{directory}")
+    for relative, resolved in files.items():
+        archive.add(resolved, arcname=f"{snapshot}/{relative}", recursive=False)
+    marker = tarfile.TarInfo(f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}")
+    marker.size = len(_EXTERNAL_MARKER_CONTENT)
+    archive.addfile(marker, io.BytesIO(_EXTERNAL_MARKER_CONTENT))
+
+
 def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
     """Report known complete ComfyUI bundles as installed node weights."""
     models: dict[str, dict[str, Any]] = {}
@@ -2758,51 +2927,11 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             continue
         claimed: set[Path] = set()
         for model_id, required_files, alternative_groups, optional_files in _COMFYUI_MODEL_BUNDLES:
-            files: dict[Path, Path] = {}
-
-            def installed(relative: str) -> Path | None:
-                candidate = root.joinpath(*PurePosixPath(relative).parts)
-                if candidate.is_symlink() or not candidate.is_file():
-                    return None
-                resolved = candidate.resolve(strict=True)
-                if not resolved.is_relative_to(root) or resolved.stat().st_size <= 0:
-                    return None
-                return resolved
-
-            try:
-                for relative in required_files:
-                    resolved = installed(relative)
-                    if resolved is None:
-                        files = {}
-                        break
-                    files[resolved] = resolved
-            except (OSError, RuntimeError, ValueError):
-                files = {}
-            if len(files) != len(required_files):
+            files = _resolve_comfyui_bundle_files(
+                root, required_files, alternative_groups, optional_files,
+            )
+            if files is None:
                 continue
-            alternatives_complete = True
-            for alternatives in alternative_groups:
-                installed_alternatives = []
-                for relative in alternatives:
-                    try:
-                        resolved = installed(relative)
-                    except (OSError, RuntimeError, ValueError):
-                        resolved = None
-                    if resolved is not None:
-                        installed_alternatives.append(resolved)
-                if not installed_alternatives:
-                    alternatives_complete = False
-                    break
-                files.update((path, path) for path in installed_alternatives)
-            if not alternatives_complete:
-                continue
-            for relative in optional_files:
-                try:
-                    resolved = installed(relative)
-                    if resolved is not None:
-                        files[resolved] = resolved
-                except (OSError, RuntimeError, ValueError):
-                    continue
             try:
                 stats = [path.stat() for path in files.values()]
             except OSError:
@@ -2827,13 +2956,11 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
                 ).isoformat(),
                 "source": "ComfyUI",
                 "externally_managed": True,
-                "transferable": False,
-                "deletable": False,
             }
             current = models.get(model_id)
             if current is None or candidate["size_bytes"] > current["size_bytes"]:
                 models[model_id] = candidate
-            claimed.update(files)
+            claimed.update(files.values())
         for entry in _comfyui_fallback_entries(root, claimed):
             entry_id = entry["model_id"]
             current = models.get(entry_id)
@@ -3053,6 +3180,12 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return False
     if not _weight_indexes_are_complete(lowered):
         return False
+
+    if _EXTERNAL_SNAPSHOT_MARKER in files:
+        # Snapshots exported from an externally managed ComfyUI install are
+        # bare weight files: no config, tokenizer, or Diffusers metadata, so
+        # the weight checks above are the whole completeness contract.
+        return True
 
     if _is_complete_diffusers_snapshot(lowered):
         return True

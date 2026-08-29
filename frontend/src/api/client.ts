@@ -831,7 +831,7 @@ export const api = {
     prepareRecipe: (recipeId: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>(`/api/v1/recipes/${encodeURIComponent(recipeId)}/prepare`, {
       method: 'POST',
       body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
-    }),
+    }, NO_REQUEST_TIMEOUT),
     preparationPreflightModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>('/api/v1/storage/preparations/preflight', {
       method: 'POST',
       body: JSON.stringify({

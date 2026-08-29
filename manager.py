@@ -1742,7 +1742,11 @@ class Manager:
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
             }
-        nodes = await self.model_cache_inventory(enrich_expected_sizes=True)
+        nodes = await self.model_cache_inventory()
+        # Expected-total enrichment is display-only metadata; it belongs to
+        # this storage dashboard payload and never blocks other consumers of
+        # model_cache_inventory (preflight, download recovery, readiness).
+        await self._enrich_partial_model_sizes(nodes)
         models_by_node = {
             str(node.get("id")): {
                 str(model.get("model_id")): model
@@ -1804,9 +1808,7 @@ class Manager:
             == resolved_revision
         )
 
-    async def model_cache_inventory(
-        self, enrich_expected_sizes: bool = False,
-    ) -> list[dict]:
+    async def model_cache_inventory(self) -> list[dict]:
         """Return safe Hugging Face cache sizes even when transfers are off.
 
         The Models page needs read-only disk accounting independently of the
@@ -1861,8 +1863,6 @@ class Manager:
             }
 
         nodes = await asyncio.gather(*(inventory_for(node) for node in cluster_nodes))
-        if enrich_expected_sizes:
-            await self._enrich_partial_model_sizes(list(nodes))
         return list(nodes)
 
     async def _enrich_partial_model_sizes(self, nodes: list[dict]) -> None:
@@ -1902,7 +1902,7 @@ class Manager:
                     continue
                 key = (
                     str(model.get("model_id") or ""),
-                    str(model.get("revision") or ""),
+                    str(model.get("revision") or "").strip(),
                 )
                 size = expected.get(key)
                 if size:

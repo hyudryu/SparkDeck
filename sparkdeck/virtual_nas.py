@@ -98,6 +98,11 @@ _COMFYUI_BUNDLE_PATHS = frozenset(
 )
 
 
+# Bundle identities (Owner/Repo) are authoritative; fallback groups never
+# merge into a bundle entry.
+_COMFYUI_BUNDLE_IDS = frozenset(bundle[0] for bundle in _COMFYUI_MODEL_BUNDLES)
+
+
 def _default_comfyui_model_roots() -> list[Path]:
     """Return bounded, conventional ComfyUI model stores without exposing paths."""
     configured = str(os.environ.get("SPARKDECK_COMFYUI_MODELS_ROOTS") or "")
@@ -2836,9 +2841,21 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             claimed.update(files)
         for entry in _comfyui_fallback_entries(root, claimed):
             entry_id = entry["model_id"]
+            if entry_id in _COMFYUI_BUNDLE_IDS:
+                # Whitelist bundle identities are authoritative; a fallback
+                # group never folds into a bundle entry.
+                continue
             current = models.get(entry_id)
-            if current is None or entry["size_bytes"] > current["size_bytes"]:
+            if current is None:
                 models[entry_id] = entry
+                continue
+            # Same-named weight groups from different sections or roots merge
+            # into one entry instead of clobbering each other.
+            current["size_bytes"] += entry["size_bytes"]
+            current["file_count"] += entry["file_count"]
+            current["last_modified"] = max(
+                str(current["last_modified"]), str(entry["last_modified"]),
+            )
     return sorted(models.values(), key=lambda item: str(item["model_id"]))
 
 
@@ -2892,7 +2909,7 @@ def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, 
                 continue
             last_modified = max(stat.st_mtime for stat in stats)
             entries.append({
-                "model_id": f"{section}/{name}",
+                "model_id": name,
                 "size_bytes": sum(stat.st_size for stat in stats),
                 "file_count": len(files),
                 "partial": False,
@@ -3075,7 +3092,12 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
             # there is then no external unfinished-blob evidence to reject.
             return True
         try:
-            if any(blob.is_file() for blob in blob_root.rglob("*.incomplete")):
+            inflight = (
+                blob.is_file()
+                for pattern in ("*.incomplete", "*.lock")
+                for blob in blob_root.rglob(pattern)
+            )
+            if any(inflight):
                 return False
         except (OSError, RuntimeError):
             return False

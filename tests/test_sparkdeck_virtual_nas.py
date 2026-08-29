@@ -908,6 +908,26 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["model_id"], "org/raw")
             self.assertFalse(model["partial"])
 
+    async def test_inventory_marks_weights_only_snapshot_with_inflight_blob_partial(self):
+        # An interrupted snapshot_download links the weights first; the
+        # unfinished config/tokenizer blobs sit in blobs/ outside the
+        # snapshot, so a weights-only snapshot is complete only when the
+        # repository has no in-progress download evidence.
+        for marker in ("stale.incomplete", "stale.lock"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                hub = Path(directory) / "hub"
+                repository = hub / "models--org--raw"
+                snapshot = repository / "snapshots" / RESOLVED_REVISION
+                snapshot.mkdir(parents=True)
+                (repository / "blobs").mkdir()
+                (repository / "blobs" / marker).write_bytes(b"partial")
+                (snapshot / "model.safetensors").write_bytes(b"weights")
+                nas = VirtualNAS(
+                    Path(directory), lambda: hub, FakeRegistry(), lambda: False,
+                )
+
+                self.assertTrue(nas.inventory()[0]["partial"])
+
     async def test_inventory_marks_config_without_tokenizer_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
@@ -951,7 +971,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
             self.assertEqual(by_id["Comfy-Org/MiniMax-Music-3"]["file_count"], 3)
-            for name in ("checkpoints/Minimax Video", "loras/foo"):
+            for name in ("Minimax Video", "foo"):
                 entry = by_id[name]
                 self.assertEqual(entry["size_bytes"], 7)
                 self.assertEqual(entry["file_count"], 1)
@@ -961,6 +981,28 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(entry["externally_managed"])
                 self.assertFalse(entry["transferable"])
                 self.assertFalse(entry["deletable"])
+
+    async def test_inventory_merges_same_named_comfyui_weights_across_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            for relative in ("checkpoints/foo.safetensors", "loras/foo.safetensors"):
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            entry = models[0]
+            self.assertEqual(entry["model_id"], "foo")
+            self.assertEqual(entry["size_bytes"], 14)
+            self.assertEqual(entry["file_count"], 2)
+            self.assertTrue(entry["externally_managed"])
 
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:

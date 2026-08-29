@@ -470,6 +470,57 @@ describe('StoragePage', () => {
     expect(within(inventory).queryByText(/Secret Spark/)).not.toBeInTheDocument()
   })
 
+  it('excludes jobs referencing hidden nodes from the transfer queue', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: [
+        {
+          id: 'node-a', name: 'Studio Spark', online: true, total_size: 2_000_000_000,
+          models: [{ model_id: 'org/model', size_bytes: 1_000_000_000, revision: 'main', file_count: 4 }],
+        },
+        {
+          id: 'node-h', name: 'Secret Spark', online: true, total_size: 8_000_000_000,
+          hidden_from_dashboard: true,
+          models: [{ model_id: 'org/hidden-model', size_bytes: 5_000_000_000 }],
+        },
+      ],
+      jobs: [
+        {
+          id: 'job-visible', model_id: 'org/model', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'completed',
+          bytes_total: 1000, bytes_transferred: 1000, created_at: '2026-08-26T12:00:00Z',
+        },
+        {
+          id: 'job-hidden-target', model_id: 'org/hidden-model', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-h', target_node_name: 'Secret Spark', status: 'running',
+          bytes_total: 1000, bytes_transferred: 500, created_at: '2026-08-26T12:01:00Z',
+        },
+        {
+          id: 'job-hidden-source', model_id: 'org/hidden-model', source_node_id: 'node-h', source_node_name: 'Secret Spark',
+          target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'running',
+          bytes_total: 1000, bytes_transferred: 500, created_at: '2026-08-26T12:02:00Z',
+        },
+        {
+          id: 'job-hidden-download', model_id: 'org/hidden-model', kind: 'download',
+          source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-h', target_node_name: 'Secret Spark', status: 'running',
+          bytes_total: 1000, bytes_transferred: 500, created_at: '2026-08-26T12:03:00Z',
+        },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const queue = await screen.findByRole('table', { name: 'Model transfer queue' })
+    expect(within(queue).getByText('org/model')).toBeInTheDocument()
+    expect(within(queue).queryByText('org/hidden-model')).not.toBeInTheDocument()
+    expect(within(queue).queryByText(/Secret Spark/)).not.toBeInTheDocument()
+
+    // Hidden-node jobs never surface as active rows on visible node cards.
+    const nodePanel = screen.getByRole('region', { name: 'Storage on Studio Spark' })
+    expect(within(nodePanel).queryByLabelText(/org\/hidden-model/)).not.toBeInTheDocument()
+  })
+
   it('shows only the five newest transfer tasks above model inventory', async () => {
     const createdOrder = [5, 1, 7, 2, 6, 3, 4]
     const storage: StorageState = {

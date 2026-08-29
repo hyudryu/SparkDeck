@@ -33,6 +33,7 @@ VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-transfer-v1"
+ARCHIVE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -1169,7 +1170,14 @@ class VirtualNAS:
 
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
-                    with tarfile.open(fileobj=writer, mode="w|") as archive:
+                    # tarfile's streaming default is only 10 KiB. Each write
+                    # crosses a thread queue, the event loop, ASGI, and HTTP,
+                    # which starves high-bandwidth ConnectX links. Buffer full
+                    # multi-megabyte archive chunks before yielding them.
+                    with tarfile.open(
+                        fileobj=writer, mode="w|",
+                        bufsize=ARCHIVE_STREAM_CHUNK_BYTES,
+                    ) as archive:
                         if external_files is None:
                             archive.add(repository, arcname=repository.name, recursive=True)
                         else:
@@ -1281,7 +1289,9 @@ class VirtualNAS:
                 }) as response:
                     response.raise_for_status()
                     async def tracked() -> AsyncIterator[bytes]:
-                        async for chunk in response.aiter_bytes():
+                        async for chunk in response.aiter_bytes(
+                            chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                        ):
                             if record["cancel"].is_set():
                                 raise TransferCanceled()
                             record["bytes_transferred"] += len(chunk)
@@ -1519,7 +1529,10 @@ class VirtualNAS:
 
                 try:
                     writer = _TarQueueWriter(chunks, stopped)
-                    with tarfile.open(fileobj=writer, mode="w|") as archive:
+                    with tarfile.open(
+                        fileobj=writer, mode="w|",
+                        bufsize=ARCHIVE_STREAM_CHUNK_BYTES,
+                    ) as archive:
                         for path, arcname in zip(paths, arcnames):
                             archive.add(
                                 path, arcname=arcname, recursive=False,
@@ -1776,7 +1789,9 @@ class VirtualNAS:
                     timeout=3600, use_fabric=True,
                 )
                 await _raise_remote_status(source_response, "source")
-                source = source_response.aiter_bytes()
+                source = source_response.aiter_bytes(
+                    chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                )
             if target_node_id == LOCAL_NODE_ID:
                 return await self.import_model_files(
                     model_id, source, required_model_bytes=expected,
@@ -2731,7 +2746,9 @@ class VirtualNAS:
                         timeout=3600, use_fabric=True,
                     )
                     await _raise_remote_status(source_response, "source")
-                    source = source_response.aiter_bytes()
+                    source = source_response.aiter_bytes(
+                        chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                    )
 
             async def tracked() -> AsyncIterator[bytes]:
                 async for chunk in source:

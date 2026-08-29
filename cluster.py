@@ -372,11 +372,12 @@ class NodeRegistry:
             parsed = urlparse(str(node["agent_url"]))
         except (KeyError, TypeError, ValueError):
             return None
-        if parsed.scheme != "http" or not parsed.port:
+        if parsed.scheme != "http":
             return None
+        port = parsed.port or 80
         host = f"[{fabric_ip}]" if ":" in fabric_ip else fabric_ip
         return urlunparse((
-            "http", f"{host}:{parsed.port}", parsed.path.rstrip("/"), "", "", "",
+            "http", f"{host}:{port}", parsed.path.rstrip("/"), "", "", "",
         ))
 
     async def request(

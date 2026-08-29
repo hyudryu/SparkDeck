@@ -126,7 +126,7 @@ class DirectTransferRegistry(FakeRegistry):
         self.direct_requests: list[tuple[str, str, str, dict]] = []
 
     def direct_transfer_source(self, node_id):
-        return "http://169.254.10.4:7878" if node_id == "worker-a" else None
+        return {"worker-a": "http://169.254.10.4:7878", "worker-b": "http://169.254.10.3:7878"}.get(node_id)
 
     async def probe(self, node, force=False):
         return {

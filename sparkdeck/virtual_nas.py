@@ -1366,6 +1366,15 @@ class VirtualNAS:
             for item in destination_snapshots.iterdir()
             if item.is_dir() and not item.is_symlink()
         } if destination_snapshots.is_dir() else set()
+        members = [
+            item.relative_to(extracted)
+            for item in sorted(extracted.rglob("*"))
+        ]
+        # A symlinked ancestor inside the destination (a tampered blobs or
+        # snapshots directory, for example) would redirect every write in
+        # this merge outside the cache, so all intermediate directories are
+        # validated as real cache-local directories before anything moves.
+        self._ensure_real_merge_directories(destination, members)
 
         for source_path in sorted(extracted.rglob("*")):
             relative = source_path.relative_to(extracted)
@@ -1412,13 +1421,34 @@ class VirtualNAS:
                 )
             if (
                 source_path.is_file() and target_path.is_file()
-                and source_path.stat().st_size == target_path.stat().st_size
+                and _files_identical(source_path, target_path)
             ):
                 continue
             raise RuntimeError(
                 "refusing to merge a cached file that differs on the target"
             )
         shutil.rmtree(extracted, ignore_errors=True)
+
+    def _ensure_real_merge_directories(
+        self, destination: Path, relatives: list[PurePosixPath],
+    ) -> None:
+        """Reject symlinked or non-directory ancestors under the merge target."""
+        checked: set[Path] = set()
+        for relative in relatives:
+            current = destination
+            for part in relative.parts[:-1]:
+                current = current / part
+                if current in checked:
+                    continue
+                checked.add(current)
+                if current.is_symlink():
+                    raise RuntimeError(
+                        "cached model directory is not a safe directory"
+                    )
+                if current.exists() and not current.is_dir():
+                    raise RuntimeError(
+                        "cached model directory is not a directory"
+                    )
 
     async def transfer_model_files(
         self, model_id: str, revision: str, filenames: list[str],
@@ -2442,6 +2472,22 @@ def _ensure_safe_snapshot_directory(repository: Path, revision: str) -> Path:
         raise RuntimeError("Hugging Face snapshot directory is not safe")
     snapshot.mkdir(exist_ok=True)
     return snapshot
+
+
+def _files_identical(left: Path, right: Path, chunk_size: int = 1024 * 1024) -> bool:
+    """Byte-compare two files so same-size corrupted caches are not merged."""
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    if left.is_symlink() or right.is_symlink():
+        return False
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        while True:
+            left_chunk = left_file.read(chunk_size)
+            right_chunk = right_file.read(chunk_size)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
 
 
 def _safe_cached_snapshot_file(

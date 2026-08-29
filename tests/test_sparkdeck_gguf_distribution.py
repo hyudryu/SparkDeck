@@ -485,6 +485,44 @@ class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "not a safe directory"):
                 await target.import_model_files("org/model", export)
 
+    async def test_merge_rejects_a_same_size_corrupted_target_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            root = source_hub / "models--org--model"
+            snapshot = root / "snapshots" / revision
+            (snapshot / "UD").mkdir(parents=True)
+            (snapshot / "UD" / "model-Q8.gguf").write_bytes(b"good-weights")
+            target_root = target_hub / "models--org--model"
+            tampered = target_root / "snapshots" / revision / "UD"
+            tampered.mkdir(parents=True)
+            (tampered / "model-Q8.gguf").write_bytes(b"bad!weights")
+
+            export = source.export_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"], "main",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "differs on the target"):
+                await target.import_model_files("org/model", export)
+
+    async def test_merge_rejects_a_non_directory_ancestor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target, source_hub, target_hub = self.build_nodes(Path(directory))
+            revision = "a" * 40
+            self.seed_selective_source(source_hub, revision)
+            # A tampered cache whose snapshots entry is not a real directory
+            # (a symlink to elsewhere would behave the same) must not be
+            # written through.
+            (target_hub / "models--org--model").mkdir(parents=True)
+            (target_hub / "models--org--model" / "snapshots").write_bytes(b"junk")
+
+            export = source.export_model_files(
+                "org/model", revision, ["UD/model-Q8.gguf"], "main",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "not a directory"):
+                await target.import_model_files("org/model", export)
+
     async def test_multi_shard_transfer_carries_every_selected_file(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target, _, _ = self.build_nodes(Path(directory))

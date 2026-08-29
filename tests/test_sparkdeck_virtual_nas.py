@@ -176,7 +176,10 @@ class DirectTransferRegistry(FakeRegistry):
                 "model_id": "org/model", "size_bytes": body["model_bytes"],
                 "partial": False, "revisions": ["revision-1"],
             }]
-            return {"bytes_received": body["model_bytes"]}
+            # Tar headers and record padding make wire bytes larger than the
+            # model's logical size; that must not turn a valid import into a
+            # false failure.
+            return {"bytes_received": body["model_bytes"] + 10_240}
         return {
             "models": self.remote_models.get(node_id, []),
             "free_size": 10 * 1024 * 1024 * 1024,

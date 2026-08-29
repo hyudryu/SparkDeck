@@ -1,0 +1,561 @@
+"""Saved-deployment bookmarks: save, prepare weights via Virtual NAS, launch."""
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+
+from manager import Manager
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from sparkdeck.service import SparkDeckService
+
+
+def node(node_id: str, name: str, *, local: bool = False) -> dict:
+    return {
+        "id": node_id,
+        "name": name,
+        "local": local,
+        "enabled": True,
+        "status": "online",
+        "online": True,
+        "docker_ready": True,
+        "fabric_ready": True,
+        "agent_url": f"https://{node_id}.private.example",
+        "fabric_ip": "169.254.10.2",
+        "stats": {"gpus": [{"name": "GB10"}]},
+        "disk": {"free_bytes": 1000},
+    }
+
+
+class FakeBookmarkManager:
+    def __init__(self, nodes):
+        self.http = httpx.AsyncClient()
+        self.nodes = nodes
+        self.deployments = []
+        self.create_deployment = AsyncMock(return_value={
+            "id": "cluster-1",
+            "status": "starting",
+            "api_port": 8008,
+            "node_ids": ["remote-1"],
+            "members": [{
+                "node_id": "remote-1", "node_name": "Worker",
+                "container_name": "rank-0",
+            }],
+        })
+        self.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        self.list_containers = AsyncMock(return_value=[])
+        self.remove_container = AsyncMock(return_value={"ok": True})
+        self.selected_cluster_nodes = AsyncMock(side_effect=self._selected)
+        self.cluster_nodes = AsyncMock(return_value=self.nodes)
+        self.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "remote-1", "models": [
+                {"model_id": "org/model", "partial": False, "revisions": ["main"]},
+            ]},
+            {"id": "local", "models": []},
+        ])
+        self.recipe_model_preparation_preflight = AsyncMock(return_value={
+            "enabled": True, "model_id": "org/model", "revision": "main",
+            "targets": [], "node_ids": ["remote-1"], "eligible": True,
+            "action": "ready", "download_node_ids": [],
+            "transfer_target_node_ids": [], "reason": None,
+        })
+        self.queue_recipe_model_preparation = AsyncMock(return_value={
+            "workflow_id": None, "job_ids": [], "jobs": [],
+        })
+
+    async def _selected(self, node_ids):
+        by_id = {item["id"]: item for item in self.nodes}
+        return [by_id[node_id] for node_id in node_ids]
+
+    @staticmethod
+    def _without_sensitive_cli_credentials(args):
+        return [str(item) for item in args or []]
+
+    # Reuse Manager's real parser so llama.cpp controls surface correctly.
+    _deployment_launch_controls = Manager._deployment_launch_controls
+
+    @staticmethod
+    def public_target_node(value):
+        return Manager.public_target_node(value)
+
+
+class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.manager = FakeBookmarkManager(
+            [node("local", "Coordinator", local=True), node("remote-1", "Worker")],
+        )
+        self.service = SparkDeckService(self.manager, Path(self.temp.name))
+
+    async def asyncTearDown(self):
+        await self.manager.http.aclose()
+        await self.service.close()
+        self.temp.cleanup()
+
+    async def test_create_saves_bookmark_without_launching(self):
+        created = await self.service.create_deployment({
+            "model": "org/model",
+            "alias": "bookmark",
+            "runtime": "vllm",
+            "node_ids": ["remote-1"],
+            "deployment_mode": "single",
+            "settings": {"context_length": 8192},
+        })
+
+        self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["node_ids"], ["remote-1"])
+        self.assertEqual(created["deployment_mode"], "single")
+        self.manager.create_deployment.assert_not_awaited()
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertEqual(stored["desired_state"], "stopped")
+        self.assertIsNone(stored["container_name"])
+        self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
+
+    async def test_bookmark_is_reported_as_saved_in_the_deployments_list(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+
+        listed = await self.service.deployments()
+        self.assertEqual(listed[0]["status"], "saved")
+        self.assertEqual(listed[0]["node_ids"], ["remote-1"])
+        self.assertNotIn("last_error", listed[0])
+
+    async def test_start_launches_saved_bookmark_on_requested_nodes(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"context_length": 8192},
+        })
+        self.manager.create_deployment.assert_not_awaited()
+
+        started = await self.service.deployment_action(
+            "bookmark", "start", ["remote-1"],
+        )
+
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["engine"], "vllm")
+        self.assertEqual(launch["node_ids"], ["remote-1"])
+        self.assertEqual(launch["deployment_mode"], "single")
+        self.assertEqual(launch["extra_args"], ["--max-model-len", "8192"])
+        self.assertEqual(started["node_ids"], ["remote-1"])
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertEqual(stored["desired_state"], "running")
+        self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
+
+    async def test_start_without_nodes_falls_back_to_saved_preferences(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+
+        await self.service.deployment_action("bookmark", "start")
+
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["node_ids"], ["remote-1"])
+
+    async def test_llama_bookmark_launches_cluster_members_with_cache_relative_artifact(self):
+        revision = "a" * 40
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        self.manager.virtual_nas = virtual_nas
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "llama-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"artifact": "FP16/model-F16.gguf", "context_length": 4096},
+        })
+
+        await self.service.deployment_action("llama-bookmark", "start")
+
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["engine"], "llama.cpp")
+        self.assertEqual(
+            launch["llama_artifact"],
+            f"models--org--model/snapshots/{revision}/FP16/model-F16.gguf",
+        )
+        self.assertEqual(launch["llama_context_length"], 4096)
+        self.assertNotIn("--revision", launch["extra_args"])
+
+    async def test_llama_bookmark_without_nodes_prepares_controller_gguf_at_start(self):
+        revision = "b" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        artifact = model_root / "snapshots" / revision / "model-F16.gguf"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"gguf")
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._model_path = Mock(return_value=model_root)
+        self.manager.virtual_nas = virtual_nas
+        launch = AsyncMock(return_value={
+            "name": "sparkdeck-llama-local", "port": 8080, "status": "running",
+            "model_source": "public_repository",
+        })
+
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "llama-local",
+            "runtime": "llama.cpp",
+            "settings": {"artifact": "model-F16.gguf"},
+        })
+        with patch("sparkdeck.service.launch_managed_container", launch):
+            started = await self.service.deployment_action("llama-local", "start")
+
+        virtual_nas.download_model_files_checked.assert_awaited_once()
+        self.assertEqual(started["status"], "running")
+        stored = self.service.store.deployment("llama-local", include_private=True)
+        self.assertEqual(stored["desired_state"], "running")
+        self.assertTrue(stored["container_name"])
+
+    async def test_prepare_endpoints_delegate_to_manager_model_preparation(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+
+        plan = await self.service.deployment_preparation_preflight(
+            "bookmark", ["remote-1"],
+        )
+        result = await self.service.deployment_prepare("bookmark", ["remote-1"])
+
+        self.manager.recipe_model_preparation_preflight.assert_awaited_once_with(
+            "org/model", "main", ["remote-1"],
+        )
+        self.manager.queue_recipe_model_preparation.assert_awaited_once_with(
+            "org/model", "main", ["remote-1"],
+        )
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(result["workflow_id"], None)
+
+    async def test_saved_bookmark_settings_and_node_preferences_are_editable(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "context_length": 16384,
+            "node_ids": ["remote-1"],
+        })
+
+        self.assertTrue(detail["editable"])
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertEqual(stored["settings"]["context_length"], 16384)
+        self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
+
+    async def test_controller_local_gguf_bookmark_is_saved_for_the_controller(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "local-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": str(artifact)},
+        })
+
+        self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["node_ids"], ["local"])
+
+        with self.assertRaisesRegex(ValueError, "cannot be distributed"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "remote-local",
+                "runtime": "llama.cpp",
+                "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+                "settings": {"artifact": str(artifact)},
+            })
+
+    async def test_saved_bookmark_response_exposes_required_node_count(self):
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "replica-bookmark", "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+        })
+
+        self.assertEqual(created["required_node_count"], 2)
+        self.assertEqual(created["deployment_mode"], "replicated")
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+    async def test_saved_bookmark_keeps_launch_inputs_for_relaunch(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "with-image", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"image": "private/image", "port": 8021,
+                         "gpu_memory_gb": 40},
+        })
+
+        started = await self.service.deployment_action("with-image", "start")
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["image"], "private/image")
+        self.assertEqual(launch["port"], 8021)
+        self.assertEqual(launch["gpu_memory_gb"], 40)
+        self.assertEqual(started["node_ids"], ["remote-1"])
+
+    async def test_sensitive_launch_arguments_are_rejected_before_saving(self):
+        self.manager._reject_sensitive_cli_credentials = (
+            Manager._reject_sensitive_cli_credentials
+        )
+        with self.assertRaisesRegex(ValueError, "configure credentials"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "credentialed", "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+                "settings": {"extra_args": ["--hf-token", "super-secret"]},
+            })
+        self.assertIsNone(self.service.store.deployment("credentialed"))
+
+    async def test_saved_deployment_mode_and_nodes_are_validated_together(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "deployment_mode": "replicated",
+            "node_ids": ["local", "remote-1"],
+        })
+        self.assertEqual(detail["deployment_mode"], "replicated")
+        self.assertEqual(detail["node_ids"], ["local", "remote-1"])
+
+        with self.assertRaisesRegex(ValueError, "exactly one node"):
+            await self.service.update_deployment_settings("bookmark", {
+                "deployment_mode": "single",
+            })
+
+    async def test_controller_local_gguf_bookmark_stays_saved_after_creation(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "local-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": str(artifact)},
+        })
+
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["status"], "saved")
+        bookmark_id = self.service.store.deployment("local-bookmark")["id"]
+        detail = await self.service.deployment_detail(bookmark_id)
+        self.assertTrue(detail["editable"])
+
+    async def test_edit_accepts_unchanged_controller_local_artifact(self):
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "local-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": str(artifact), "context_length": 4096},
+        })
+
+        detail = await self.service.update_deployment_settings("local-bookmark", {
+            "artifact": str(artifact),
+            "context_length": 8192,
+        })
+
+        self.assertEqual(detail["status"], "saved")
+        # The artifact lives on the model identity, not in filtered settings.
+        stored = self.service.store.deployment("local-bookmark", include_private=True)
+        self.assertEqual(stored["model"]["artifact"], str(artifact))
+
+    async def test_llama_prepare_downloads_only_selected_files_per_node(self):
+        revision = "c" * 40
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas.enabled = True
+        self.manager.virtual_nas = virtual_nas
+        self.manager.node_registry = Mock()
+        self.manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        self.manager.node_supports_selective_downloads = AsyncMock(return_value=True)
+        self.manager.node_has_model_files = AsyncMock(return_value=False)
+        self.manager.node_download_model_files = AsyncMock(return_value={"ok": True})
+        self.manager.node_transfer_model_files = AsyncMock(return_value={"ok": True})
+        self.manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "local", "models": []},
+            {"id": "remote-1", "models": []},
+        ])
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "llama-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+            "settings": {"artifact": "FP16/model-F16.gguf"},
+        })
+
+        plan = await self.service.deployment_preparation_preflight(
+            "llama-bookmark", ["local", "remote-1"],
+        )
+        self.assertEqual(plan["action"], "download")
+        self.assertTrue(plan["eligible"])
+
+        await self.service.deployment_prepare("llama-bookmark", ["local", "remote-1"])
+
+        # One selected node seeds the artifact from Hugging Face and the rest
+        # receive file-scoped Virtual NAS streams.
+        self.manager.node_download_model_files.assert_awaited_once_with(
+            "local", "org/model", revision, ["FP16/model-F16.gguf"], "main",
+        )
+        self.manager.node_transfer_model_files.assert_awaited_once_with(
+            "local", "remote-1", "org/model", revision,
+            ["FP16/model-F16.gguf"], "main",
+        )
+        stored = self.service.store.deployment("llama-bookmark", include_private=True)
+        self.assertEqual(stored["settings"]["prepared_revision"], revision)
+
+        # The launch reuses the prepared revision instead of re-resolving.
+        resolves_after_prepare = virtual_nas.resolve_download_revision.await_count
+        await self.service.deployment_action("llama-bookmark", "start")
+        self.assertEqual(
+            virtual_nas.resolve_download_revision.await_count,
+            resolves_after_prepare,
+        )
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(
+            launch["llama_artifact"],
+            f"models--org--model/snapshots/{revision}/FP16/model-F16.gguf",
+        )
+
+    async def test_stopped_llama_cluster_settings_remain_editable(self):
+        launch_settings = {
+            "engine": "llama.cpp", "model": "org/model",
+            "extra_args": ["--ctx-size", "4096"],
+            "deployment_mode": "single", "node_ids": ["remote-1"],
+        }
+        # A llama.cpp cluster that already launched: the SQLite row routes to
+        # a stopped Manager record.
+        self.service.store.add_deployment(Deployment(
+            id="llama-cluster", alias="llama-cluster",
+            runtime=RuntimeKind.LLAMA_CPP, kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1",
+                      "deployment_mode": "single", "node_ids": ["remote-1"]},
+        ), "http://127.0.0.1:8080", None)
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "desired_state": "stopped",
+            "launch_settings": dict(launch_settings), "node_ids": ["remote-1"],
+        }]
+        self.manager._deployment = lambda deployment_id: next(
+            (item for item in self.manager.deployments if item["id"] == deployment_id),
+            None,
+        )
+        self.manager.update_deployment_settings = Mock(return_value={
+            "launch_settings": {
+                **launch_settings,
+                "extra_args": ["--ctx-size", "8192", "--parallel", "4"],
+            },
+            "mode": "single", "node_ids": ["remote-1"],
+        })
+        self.manager.recipe_deployment_contract = Mock(return_value={
+            "deployment_mode": "single", "required_node_count": 1,
+            "tensor_parallel_size": 1, "pipeline_parallel_size": 1,
+            "model_revision": None, "supported": True, "error": None,
+        })
+
+        bookmark_id = self.service.store.deployment("llama-cluster")["id"]
+        detail = await self.service.deployment_detail(bookmark_id)
+        self.assertTrue(detail["editable"])
+        self.assertEqual(detail["launch_controls"]["context_window"], 4096)
+
+        await self.service.update_deployment_settings("llama-cluster", {
+            "launch_controls": {"context_window": 8192, "max_concurrency": 4},
+        })
+        self.assertEqual(
+            self.manager.update_deployment_settings.call_args.args[1]["launch_controls"]["max_concurrency"],
+            4,
+        )
+
+    async def test_external_bookmarks_still_register_without_nodes(self):
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "external", "runtime": "vllm",
+            "kind": "external", "base_url": "http://127.0.0.1:9000/v1",
+        })
+
+        self.assertEqual(created["alias"], "external")
+        self.manager.create_deployment.assert_not_awaited()
+
+
+class LlamaContainerArtifactTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+
+    async def asyncTearDown(self):
+        self.temp.cleanup()
+
+    def manager_with_cache(self, root: Path):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"hf_cache": str(root)}
+        manager.client = Mock()
+        manager.client.images.get = Mock(
+            return_value=Mock(attrs={"Config": {"Env": []}}),
+        )
+        return manager
+
+    def snapshot(self, root: Path, filename: str) -> Path:
+        artifact = (
+            root / "hub" / "models--org--model" / "snapshots" / ("a" * 40)
+            / filename
+        )
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"gguf")
+        return artifact
+
+    async def test_resolve_llama_artifact_maps_into_the_container_cache(self):
+        root = Path(self.temp.name)
+        self.snapshot(root, "model-F16.gguf")
+        manager = self.manager_with_cache(root)
+
+        model_path, siblings = manager._resolve_llama_artifact(
+            "org/model", "models--org--model/snapshots/" + ("a" * 40) + "/model-F16.gguf",
+        )
+
+        self.assertEqual(
+            model_path,
+            f"/root/.cache/huggingface/hub/models--org--model/snapshots/"
+            f"{'a' * 40}/model-F16.gguf",
+        )
+        self.assertEqual(siblings, [
+            "models--org--model/snapshots/" + ("a" * 40) + "/model-F16.gguf",
+        ])
+
+    async def test_resolve_llama_artifact_requires_every_shard(self):
+        root = Path(self.temp.name)
+        revision = "a" * 40
+        self.snapshot(root, "model-00001-of-00002.gguf")
+        self.snapshot(root, "model-00002-of-00002.gguf")
+        manager = self.manager_with_cache(root)
+        reference = f"models--org--model/snapshots/{revision}/model-00001-of-00002.gguf"
+
+        model_path, siblings = manager._resolve_llama_artifact("org/model", reference)
+        self.assertTrue(model_path.endswith("model-00001-of-00002.gguf"))
+        self.assertEqual(len(siblings), 2)
+
+        (root / "hub" / "models--org--model" / "snapshots" / revision
+         / "model-00002-of-00002.gguf").unlink()
+        with self.assertRaisesRegex(ValueError, "not cached on this node"):
+            manager._resolve_llama_artifact("org/model", reference)
+
+    async def test_resolve_llama_artifact_rejects_escape_and_non_gguf(self):
+        root = Path(self.temp.name)
+        manager = self.manager_with_cache(root)
+
+        with self.assertRaisesRegex(ValueError, "cache-relative GGUF artifact"):
+            manager._resolve_llama_artifact(
+                "org/model", "models--org--model/snapshots/../../escape.gguf",
+            )
+        with self.assertRaisesRegex(ValueError, "require a .gguf artifact"):
+            manager._resolve_llama_artifact(
+                "org/model", "models--org--model/snapshots/" + ("a" * 40) + "/model.bin",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,5 @@
 export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
-export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopped' | 'degraded' | 'error' | 'unknown'
+export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
   runtime: RuntimeKind
@@ -135,6 +135,20 @@ export interface DeploymentUpdateInput {
   sg_mem_fraction?: number | null
 }
 
+// Editable fields of a saved deployment bookmark (before its first launch).
+export interface SavedDeploymentUpdateInput {
+  context_length?: number | null
+  tensor_parallel_size?: number | null
+  parallel_slots?: number | null
+  gpu_layers?: number | null
+  quantization?: string | null
+  artifact?: string | null
+  extra_args?: string[]
+  gpu_memory_utilization?: number | null
+  node_ids?: string[]
+  deployment_mode?: 'single' | 'replicated' | 'sharded' | null
+}
+
 export interface CreateDeploymentInput {
   alias: string
   model_id: string
@@ -145,7 +159,6 @@ export interface CreateDeploymentInput {
   settings: DeploymentSettings
   node_ids?: string[]
   deployment_mode?: 'single' | 'replicated' | 'sharded'
-  download_node_id?: string
 }
 
 export interface NodeSummary {

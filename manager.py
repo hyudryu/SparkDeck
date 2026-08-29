@@ -234,6 +234,16 @@ def _remove_persisted_error(existing: Any, marker: str) -> str:
 # should not fall back to the configured vLLM image.
 DEFAULT_SGLANG_IMAGE = "lmsysorg/sglang:latest"
 
+# Llama.cpp cluster members read the GGUF straight from the node's shared
+# Hugging Face cache, so a launch only needs the image plus a cache-relative
+# artifact path.
+DEFAULT_LLAMA_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+_LLAMA_SERVE_PORT = 8080
+_LLAMA_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+
 CONTROLLER_LABEL = "io.sparkdeck.managed"
 MODEL_LABEL = "io.sparkdeck.model"
 ENGINE_LABEL = "io.sparkdeck.runtime"
@@ -2890,7 +2900,7 @@ class Manager:
                     "stopped" if deployment.get("status") == "stopped" else "running",
                 )
                 engine = str(deployment.get("engine") or "vllm")
-                if engine not in {"vllm", "sglang"}:
+                if engine not in {"vllm", "sglang", "llama.cpp"}:
                     deployment["status"] = "error"
                     deployment["error"] = f"unsupported persisted runtime: {engine}"
             return value
@@ -3293,6 +3303,10 @@ class Manager:
             "sg_max_running_requests": body.get("sg_max_running_requests"),
             "sg_mem_fraction": body.get("sg_mem_fraction"),
             "sg_image": body.get("sg_image") or None,
+            "llama_artifact": body.get("llama_artifact") or None,
+            "llama_context_length": body.get("llama_context_length"),
+            "llama_parallel_slots": body.get("llama_parallel_slots"),
+            "llama_gpu_layers": body.get("llama_gpu_layers"),
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
@@ -3346,6 +3360,22 @@ class Manager:
         if engine == "sglang":
             context_window = settings.get("sg_context_length") or context_window
             max_concurrency = settings.get("sg_max_running_requests") or max_concurrency
+        if engine == "llama.cpp":
+            context_window = cls._cli_option(
+                args, {"--ctx-size", "--context-size", "-c"}, int,
+            ) or settings.get("llama_context_length")
+            max_concurrency = cls._cli_option(
+                args, {"--parallel", "-np"}, int,
+            ) or settings.get("llama_parallel_slots")
+            return {
+                "context_window": context_window,
+                "max_concurrency": max_concurrency,
+                "kv_cache_dtype": None,
+                "thinking_mode": None,
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+            }
         return {
             "context_window": context_window,
             "max_concurrency": max_concurrency,
@@ -3404,6 +3434,23 @@ class Manager:
             if parsed <= 0:
                 raise ValueError(f"{key} must be a positive integer")
             return parsed
+
+        if engine == "llama.cpp":
+            # Llama.cpp exposes different flag names and has no vLLM-style
+            # structured speculative/thinking controls; only map the two
+            # shared scalars and leave the remaining argv untouched.
+            flags = self._replace_command_option(
+                flags, {"--ctx-size", "--context-size", "-c"},
+                positive_int("context_window"),
+            )
+            flags = self._replace_command_option(
+                flags, {"--parallel", "-np"},
+                positive_int("max_concurrency"),
+            )
+            try:
+                return shlex.split(flags)
+            except ValueError as exc:
+                raise ValueError("launch arguments have invalid shell quoting") from exc
 
         flags = self._replace_command_option(
             flags,
@@ -3523,8 +3570,8 @@ class Manager:
             )
         if not settings["model"]:
             raise ValueError("model is required")
-        if settings["engine"] not in {"vllm", "sglang"}:
-            raise ValueError("engine must be vllm or sglang")
+        if settings["engine"] not in {"vllm", "sglang", "llama.cpp"}:
+            raise ValueError("engine must be vllm, sglang, or llama.cpp")
         mode = settings["deployment_mode"]
         if mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
@@ -4441,10 +4488,10 @@ class Manager:
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
-        if engine not in {"vllm", "sglang"}:
-            raise ValueError("engine must be vllm or sglang")
+        if engine not in {"vllm", "sglang", "llama.cpp"}:
+            raise ValueError("engine must be vllm, sglang, or llama.cpp")
         controls = body.get("launch_controls")
-        if controls is not None:
+        if controls is not None and engine != "llama.cpp":
             if not isinstance(controls, dict):
                 raise ValueError("launch_controls must be an object")
             controls = {
@@ -4464,6 +4511,12 @@ class Manager:
         mode = body.get("deployment_mode") or "single"
         if mode not in {"single", "sharded", "replicated"}:
             raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if mode == "sharded" and engine == "llama.cpp":
+            # llama.cpp has no cross-node tensor pipeline; every selected node
+            # runs its own complete replica instead.
+            raise ValueError(
+                "llama.cpp deployments support single and replicated layouts, not sharded"
+            )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
         if mode == "single":
             node_ids = node_ids[:1] or [LOCAL_NODE_ID]
@@ -4681,6 +4734,10 @@ class Manager:
             "sg_max_running_requests": body.get("sg_max_running_requests"),
             "sg_mem_fraction": body.get("sg_mem_fraction"),
             "sg_image": body.get("sg_image"),
+            "llama_artifact": body.get("llama_artifact"),
+            "llama_context_length": body.get("llama_context_length"),
+            "llama_parallel_slots": body.get("llama_parallel_slots"),
+            "llama_gpu_layers": body.get("llama_gpu_layers"),
         }
 
         tasks = []
@@ -4933,7 +4990,8 @@ class Manager:
             )
         if (
             action == "start"
-            and str(deployment.get("engine") or "vllm") not in {"vllm", "sglang"}
+            and str(deployment.get("engine") or "vllm")
+            not in {"vllm", "sglang", "llama.cpp"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
 
@@ -9894,6 +9952,10 @@ class Manager:
         cluster_member: dict | None = None,
         hf_token: str | None = None,
         sparkdeck_deployment_id: str | None = None,
+        llama_artifact: str | None = None,
+        llama_context_length: int | None = None,
+        llama_parallel_slots: int | None = None,
+        llama_gpu_layers: int | None = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -9918,6 +9980,10 @@ class Manager:
             recipe_id=recipe_id, cluster_member=cluster_member,
             hf_token=hf_token,
             sparkdeck_deployment_id=sparkdeck_deployment_id,
+            llama_artifact=llama_artifact,
+            llama_context_length=llama_context_length,
+            llama_parallel_slots=llama_parallel_slots,
+            llama_gpu_layers=llama_gpu_layers,
         )
         if reserved_port is None:
             return await create_call
@@ -9937,6 +10003,182 @@ class Manager:
 
         creation_task.add_done_callback(release_reservation)
         return await asyncio.shield(creation_task)
+
+    def _resolve_llama_artifact(
+        self, model: str, artifact: str, image: str | None = None,
+    ) -> tuple[str, list[str]]:
+        """Resolve a hub-relative GGUF reference on this node.
+
+        Returns the in-container ``--model`` path plus every shard path that
+        must exist relative to the mounted Hugging Face cache. The reference
+        uses the ``models--owner--repo/snapshots/<revision>/file.gguf`` form so
+        the same payload works on the controller and on any agent.
+        """
+        relative = str(artifact or "").strip().replace("\\", "/")
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise ValueError(
+                "llama.cpp cluster deployments require a cache-relative GGUF artifact"
+            )
+        if not relative.casefold().endswith(".gguf"):
+            raise ValueError("llama.cpp cluster deployments require a .gguf artifact")
+        hub = Path(self.settings["hf_cache"]).expanduser() / "hub"
+        first_path = hub / relative
+        shard = _LLAMA_GGUF_SHARD_PATTERN.match(Path(relative).name)
+        if shard:
+            count = int(shard.group("count"))
+            siblings = []
+            for index in range(1, count + 1):
+                name = (
+                    f"{shard.group('stem')}-{index:05d}-of-{count:05d}.gguf"
+                )
+                siblings.append(
+                    (Path(relative).parent / name).as_posix()
+                )
+        else:
+            siblings = [relative]
+        missing = [
+            candidate for candidate in siblings
+            if not (hub / candidate).is_file()
+        ]
+        if missing:
+            raise ValueError(
+                "llama.cpp model artifact is not cached on this node "
+                f"({missing[0]}); prepare the model weights first"
+            )
+        resolved = first_path.resolve(strict=True)
+        try:
+            resolved.relative_to(hub.resolve(strict=True))
+        except ValueError as exc:
+            raise ValueError(
+                "llama.cpp artifact path escapes the Hugging Face cache"
+            ) from exc
+        model_path = f"{self._image_hf_cache_target(image)}/hub/{siblings[0]}"
+        return model_path, siblings
+
+    async def _create_llama_container(
+        self,
+        model: str,
+        port: int | None,
+        image: str | None,
+        extra_args: list[str] | None,
+        name: str | None,
+        llama_artifact: str | None,
+        llama_context_length: int | None,
+        llama_parallel_slots: int | None,
+        llama_gpu_layers: int | None,
+        cluster_member: dict | None,
+        sparkdeck_deployment_id: str | None,
+    ) -> dict:
+        if cluster_member and cluster_member.get("mode") == "sharded":
+            raise ValueError("llama.cpp deployments cannot run sharded")
+        if not llama_artifact:
+            raise ValueError(
+                "llama.cpp cluster deployments require a GGUF artifact"
+            )
+        image = image or DEFAULT_LLAMA_IMAGE
+        # Llama.cpp keeps its own CUDA context, so stale engines must be
+        # released before the container claims the GPUs.
+        await self.evict_other_backends(protect="llama.cpp")
+        if port is None:
+            port = await self._allocate_port()
+        if name is None:
+            safe = model.replace("/", "-").replace("_", "-").lower()
+            name = f"llama-{safe}-{port}"
+        self._cluster_launch_update(
+            name, "preparing", "Preparing Llama server launch",
+            model=model, cluster_member=cluster_member,
+        )
+
+        def _create():
+            try:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+                self.client.images.get(image)
+            except docker.errors.ImageNotFound:
+                self._cluster_launch_update(
+                    name, "pulling_image",
+                    f"Downloading Docker image {image}; this can take several minutes",
+                    model=model, cluster_member=cluster_member,
+                )
+                print(f"[llama] pulling missing image: {image}")
+                self.client.images.pull(image)
+            # Resolve the in-container model path only after the image is
+            # present: a custom image declaring HF_HOME mounts the cache
+            # somewhere else, so the pull decides where --model must point.
+            model_path, _shards = self._resolve_llama_artifact(
+                model, llama_artifact, image,
+            )
+            command = [
+                "--host", "0.0.0.0", "--port", str(_LLAMA_SERVE_PORT),
+                "--model", model_path,
+            ]
+            if llama_context_length:
+                command += ["--ctx-size", str(int(llama_context_length))]
+            if llama_parallel_slots:
+                command += ["--parallel", str(int(llama_parallel_slots))]
+            if llama_gpu_layers is not None:
+                command += ["--n-gpu-layers", str(int(llama_gpu_layers))]
+            command.extend(str(item) for item in extra_args or [])
+            self._cluster_launch_update(
+                name, "creating_container", "Creating Docker container",
+                model=model, cluster_member=cluster_member,
+            )
+            labels = {
+                CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                ENGINE_LABEL: "llama.cpp",
+            }
+            if sparkdeck_deployment_id:
+                labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
+            if cluster_member:
+                labels.update({
+                    DEPLOYMENT_LABEL: cluster_member["deployment_id"],
+                    NODE_LABEL: cluster_member["node_id"],
+                    RANK_LABEL: str(cluster_member["rank"]),
+                    MODE_LABEL: cluster_member.get("mode", "single"),
+                    NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
+                })
+            run_options = {
+                "image": image,
+                # The llama.cpp server image ships llama-server as its
+                # entrypoint; the command is pure argument list.
+                "command": command,
+                "name": name,
+                "detach": True,
+                "volumes": self._build_volumes("", self.settings["hf_cache"], image),
+                "ipc_mode": "host",
+                "shm_size": self.settings["shm_size"],
+                "device_requests": [
+                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                ],
+                "labels": labels,
+                "restart_policy": {"Name": "unless-stopped"},
+                "ports": {f"{_LLAMA_SERVE_PORT}/tcp": port},
+            }
+            container = self._run_managed_container(run_options)
+            container.reload()
+            self._cluster_launch_update(
+                name, "starting", "Container created; starting the model server",
+                model=model, cluster_member=cluster_member,
+            )
+            summary = self._container_summary(container)
+            if summary is not None:
+                # The cache-relative artifact only exists for public Hub
+                # repositories; report that provenance so benchmark results
+                # aggregate under the public model instead of a local key.
+                summary["model_source"] = "public_repository"
+            return summary
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
 
     async def _create_container_with_port(
         self,
@@ -9958,13 +10200,28 @@ class Manager:
         cluster_member: dict | None = None,
         hf_token: str | None = None,
         sparkdeck_deployment_id: str | None = None,
+        llama_artifact: str | None = None,
+        llama_context_length: int | None = None,
+        llama_parallel_slots: int | None = None,
+        llama_gpu_layers: int | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
-        if engine not in {"vllm", "sglang"}:
-            raise ValueError("engine must be vllm or sglang")
+        if engine not in {"vllm", "sglang", "llama.cpp"}:
+            raise ValueError("engine must be vllm, sglang, or llama.cpp")
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
+        if engine == "llama.cpp":
+            return await self._create_llama_container(
+                model=model, port=port, image=image,
+                extra_args=extra_args, name=name,
+                llama_artifact=llama_artifact,
+                llama_context_length=llama_context_length,
+                llama_parallel_slots=llama_parallel_slots,
+                llama_gpu_layers=llama_gpu_layers,
+                cluster_member=cluster_member,
+                sparkdeck_deployment_id=sparkdeck_deployment_id,
+            )
         if engine == "sglang":
             recipe_launch = None
             if recipe_id:

@@ -14,6 +14,7 @@ from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+    VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
     VirtualNAS,
     validate_model_id,
     validate_revision,
@@ -119,7 +120,51 @@ class FakeRegistry:
         return FakeResponse()
 
 
+class DirectTransferRegistry(FakeRegistry):
+    def __init__(self):
+        super().__init__()
+        self.direct_requests: list[tuple[str, str, str, dict]] = []
+
+    def direct_transfer_source(self, node_id):
+        return {"worker-a": "http://169.254.10.4:7878", "worker-b": "http://169.254.10.3:7878"}.get(node_id)
+
+    async def probe(self, node, force=False):
+        return {
+            **node, "online": True,
+            "capabilities": [VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY],
+            "disk": {"free": 10 * 1024 * 1024 * 1024},
+        }
+
+    async def request(self, node_id, method, path, **kwargs):
+        body = kwargs.get("json_body") or {}
+        self.direct_requests.append((node_id, method, path, body))
+        if path.endswith("/export-capability"):
+            return {"capability": "single-use-capability"}
+        if path.endswith("/import-from-peer"):
+            self.remote_models[node_id] = [{
+                "model_id": "org/model", "size_bytes": body["model_bytes"],
+                "partial": False, "revisions": ["revision-1"],
+            }]
+            return {"bytes_received": body["model_bytes"]}
+        return {
+            "models": self.remote_models.get(node_id, []),
+            "free_size": 10 * 1024 * 1024 * 1024,
+        }
+
+
 class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_export_capability_is_single_use_and_revision_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            capability = nas.issue_direct_export_capability("org/model", "revision-1")
+
+            stream = nas.export_model_with_capability("org/model", capability)
+            await stream.aclose()
+            with self.assertRaisesRegex(PermissionError, "invalid or expired"):
+                nas.export_model_with_capability("org/model", capability)
+
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
 
@@ -1520,6 +1565,35 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["bytes_transferred"], 0)
         self.assertIn("simulated target outage", job["error"])
         await nas.stop()
+
+    async def test_remote_nodes_transfer_directly_over_the_fabric(self):
+        registry = DirectTransferRegistry()
+        registry.remote_models["worker-a"] = [{
+            "model_id": "org/model", "size_bytes": 123,
+            "partial": False, "transferable": True, "revisions": ["revision-1"],
+        }]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        job = {
+            "id": "direct-job", "kind": "transfer", "model_id": "org/model",
+            "source_node_id": "worker-a", "target_node_id": "worker-b",
+            "revision": "revision-1", "requested_revision": "revision-1",
+            "status": "queued", "bytes_total": 123, "bytes_transferred": 0,
+            "created_at": 0, "started_at": None, "completed_at": None, "error": None,
+        }
+        nas.jobs = [job]
+
+        await nas._run_transfer(job)
+
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["bytes_transferred"], 123)
+        self.assertEqual(registry.received, {})
+        self.assertEqual(
+            [path for _, _, path, _ in registry.direct_requests if path.endswith(("export-capability", "import-from-peer"))],
+            [
+                "/api/agent/virtual-nas/models/org%2Fmodel/export-capability",
+                "/api/agent/virtual-nas/models/org%2Fmodel/import-from-peer",
+            ],
+        )
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):
         registry = FakeRegistry(block_upload=True)

@@ -62,11 +62,14 @@ function compareJobsNewestFirst(left: StorageTransferJob, right: StorageTransfer
 
 function formatTransferRate(job: StorageTransferJob) {
   if (!job.bytes_per_second || job.bytes_per_second <= 0) return undefined
-  const gigabytesPerSecond = job.bytes_per_second / 1_000_000_000
-  const rate = gigabytesPerSecond < 0.001
-    ? '<0.001'
-    : gigabytesPerSecond.toFixed(gigabytesPerSecond < 0.01 ? 3 : 2)
-  return `${rate} GB/s avg`
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s']
+  const exponent = Math.max(0, Math.min(
+    Math.floor(Math.log10(job.bytes_per_second) / 3),
+    units.length - 1,
+  ))
+  const rate = job.bytes_per_second / 1000 ** exponent
+  const digits = rate >= 100 ? 0 : rate >= 10 ? 1 : 2
+  return `${rate.toFixed(digits)} ${units[exponent]} avg`
 }
 
 function SmoothProgress({ value, label }: { value: number; label: string }) {
@@ -487,7 +490,7 @@ export function StoragePage() {
               return <div className="table-row" role="row" key={job.id}>
                 <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
                 <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
-                <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert">{job.error}</small>}</div>
+                <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert" title={job.error}>{job.error}</small>}</div>
                 <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</span></div>
                 <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
               </div>

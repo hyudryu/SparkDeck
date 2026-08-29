@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import httpx
 import io
 import json
 import os
@@ -10,6 +12,7 @@ import posixpath
 import queue
 import re
 import shutil
+import secrets
 import tarfile
 import tempfile
 import threading
@@ -29,6 +32,7 @@ _HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
+VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-transfer-v1"
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -297,6 +301,8 @@ class VirtualNAS:
         self._wake = asyncio.Event()
         self._dispatcher: asyncio.Task | None = None
         self._active: dict[str, asyncio.Task] = {}
+        self._direct_export_capabilities: dict[str, dict[str, Any]] = {}
+        self._peer_imports: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._last_progress_save: dict[str, float] = {}
         self._streaming_models: dict[str, int] = {}
@@ -1210,6 +1216,95 @@ class VirtualNAS:
                 shutil.rmtree(stage, ignore_errors=True)
         finally:
             self._release_stream(model_id)
+
+    async def import_model_from_peer(
+        self,
+        model_id: str,
+        source_agent_url: str,
+        source_capability: str,
+        coordinator_id: str,
+        required_model_bytes: int | None = None,
+        transfer_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Pull an archive from a source agent without relaying it via the controller."""
+        model_id = validate_model_id(model_id)
+        source_agent_url = str(source_agent_url or "").strip().rstrip("/")
+        source_capability = str(source_capability or "").strip()
+        transfer_id = str(transfer_id or "").strip()
+        coordinator_id = str(coordinator_id or "").strip()
+        if not source_agent_url.startswith("http://") or not source_capability or not coordinator_id or not transfer_id:
+            raise ValueError("direct transfer requires an authenticated HTTP peer endpoint")
+        record = {"status": "running", "bytes_transferred": 0, "cancel": asyncio.Event()}
+        self._peer_imports[transfer_id] = record
+        url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=15)) as client:
+                async with client.stream("GET", url, headers={
+                    "X-SparkDeck-Direct-Transfer-Capability": source_capability,
+                }) as response:
+                    response.raise_for_status()
+                    async def tracked() -> AsyncIterator[bytes]:
+                        async for chunk in response.aiter_bytes():
+                            if record["cancel"].is_set():
+                                raise TransferCanceled()
+                            record["bytes_transferred"] += len(chunk)
+                            yield chunk
+                    result = await self.import_model(
+                        model_id, tracked(), required_model_bytes=required_model_bytes,
+                    )
+                    record["status"] = "completed"
+                    return result
+        except TransferCanceled:
+            record["status"] = "canceled"
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"source peer rejected direct transfer (HTTP {exc.response.status_code})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"could not reach source peer for direct transfer: {exc}") from exc
+        finally:
+            if record["status"] == "running":
+                record["status"] = "failed"
+
+    def peer_import_status(self, transfer_id: str) -> dict[str, Any]:
+        record = self._peer_imports.get(str(transfer_id or ""))
+        if record is None:
+            raise LookupError("direct transfer is not active")
+        return {"status": record["status"], "bytes_transferred": record["bytes_transferred"]}
+
+    def cancel_peer_import(self, transfer_id: str) -> dict[str, Any]:
+        record = self._peer_imports.get(str(transfer_id or ""))
+        if record is None:
+            raise LookupError("direct transfer is not active")
+        record["cancel"].set()
+        return {"status": record["status"]}
+
+    def issue_direct_export_capability(self, model_id: str, revision: str | None) -> str:
+        """Create a single-use, short-lived capability for a fabric peer pull."""
+        model_id = validate_model_id(model_id)
+        revision = validate_revision(revision) if revision else None
+        model = next((item for item in self.inventory() if item.get("model_id") == model_id), None)
+        if model is None or model.get("partial") or (revision and not self._has_revision(model, revision, revision)):
+            raise LookupError("source node does not have the complete requested revision")
+        capability = secrets.token_urlsafe(32)
+        self._direct_export_capabilities[hashlib.sha256(capability.encode()).hexdigest()] = {
+            "model_id": model_id, "revision": revision, "expires_at": time.monotonic() + 300,
+        }
+        return capability
+
+    def export_model_with_capability(
+        self, model_id: str, capability: str,
+    ) -> AsyncIterator[bytes]:
+        model_id = validate_model_id(model_id)
+        key = hashlib.sha256(str(capability or "").encode()).hexdigest()
+        grant = self._direct_export_capabilities.pop(key, None)
+        if (
+            grant is None or grant.get("model_id") != model_id
+            or time.monotonic() > float(grant.get("expires_at") or 0)
+        ):
+            raise PermissionError("direct transfer capability is invalid or expired")
+        return self.export_model(model_id)
 
     def _extract_and_finalize(
         self, archive_path: Path, stage: Path, archive_name: str
@@ -2515,12 +2610,77 @@ class VirtualNAS:
             if job["source_node_id"] == LOCAL_NODE_ID:
                 source = self.export_model(job["model_id"])
             else:
-                source_response = await self.node_registry.open_stream(
-                    job["source_node_id"], "GET",
-                    self._model_agent_path(job["model_id"], "export"), timeout=3600,
+                direct_source = None
+                if job["target_node_id"] != LOCAL_NODE_ID:
+                    direct_source = getattr(
+                        self.node_registry, "direct_transfer_source", lambda _node_id: None,
+                    )(
+                        job["source_node_id"]
+                    )
+                target_status = (
+                    await self._validate_online_node(job["target_node_id"])
+                    if direct_source is not None else None
                 )
-                await _raise_remote_status(source_response, "source")
-                source = source_response.aiter_bytes()
+                source_status = (
+                    await self._validate_online_node(job["source_node_id"])
+                    if direct_source is not None else None
+                )
+                if (
+                    direct_source is not None
+                    and getattr(self.node_registry, "direct_transfer_source", lambda _node_id: None)(job["target_node_id"])
+                    and VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY
+                    in (target_status.get("capabilities") or [])
+                    and VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY
+                    in (source_status.get("capabilities") or [])
+                ):
+                    capability_result = await self.node_registry.request(
+                        job["source_node_id"], "POST",
+                        self._model_agent_path(job["model_id"], "export-capability"),
+                        json_body={"revision": job.get("revision")}, timeout=30,
+                    )
+                    source_capability = str((capability_result or {}).get("capability") or "")
+                    if not source_capability:
+                        raise RuntimeError("source did not issue a direct transfer capability")
+                    operation = asyncio.create_task(self.node_registry.request(
+                        job["target_node_id"], "POST",
+                        self._model_agent_path(job["model_id"], "import-from-peer"),
+                        json_body={
+                            "source_agent_url": direct_source,
+                            "source_capability": source_capability,
+                            "model_bytes": actual_size,
+                            "transfer_id": job["id"],
+                        },
+                        timeout=3600,
+                    ))
+                    while not operation.done():
+                        try:
+                            await asyncio.wait_for(event.wait(), timeout=0.5)
+                        except TimeoutError:
+                            pass
+                        if event.is_set():
+                            await self.node_registry.request(job["target_node_id"], "DELETE", self._model_agent_path(job["model_id"], f"peer-imports/{job['id']}"), timeout=15)
+                            operation.cancel()
+                            await asyncio.gather(operation, return_exceptions=True)
+                            raise TransferCanceled()
+                        try:
+                            status = await self.node_registry.request(job["target_node_id"], "GET", self._model_agent_path(job["model_id"], f"peer-imports/{job['id']}"), timeout=5)
+                            job["bytes_transferred"] = min(actual_size, _nonnegative_int((status or {}).get("bytes_transferred")))
+                            self._save_progress(job)
+                        except Exception:
+                            pass
+                    result = await operation
+                    received = _nonnegative_int((result or {}).get("bytes_received"))
+                    if received != actual_size:
+                        raise RuntimeError("target did not receive the complete direct transfer")
+                    job["bytes_transferred"] = received
+                    source = None
+                else:
+                    source_response = await self.node_registry.open_stream(
+                        job["source_node_id"], "GET",
+                        self._model_agent_path(job["model_id"], "export"), timeout=3600,
+                    )
+                    await _raise_remote_status(source_response, "source")
+                    source = source_response.aiter_bytes()
 
             async def tracked() -> AsyncIterator[bytes]:
                 async for chunk in source:
@@ -2530,8 +2690,13 @@ class VirtualNAS:
                     self._save_progress(job)
                     yield chunk
 
-            tracked_stream = tracked()
-            if job["target_node_id"] == LOCAL_NODE_ID:
+            if source is None:
+                tracked_stream = None
+            else:
+                tracked_stream = tracked()
+            if source is None:
+                pass
+            elif job["target_node_id"] == LOCAL_NODE_ID:
                 await self.import_model(
                     job["model_id"], tracked_stream,
                     required_model_bytes=actual_size,

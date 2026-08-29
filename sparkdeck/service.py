@@ -1310,6 +1310,8 @@ class SparkDeckService:
                 settings["gpu_layers"] = None
             else:
                 number = self._validated_number("gpu_layers", value)
+                if number != int(number):
+                    raise ValueError("gpu_layers must be a whole number")
                 if number < 0:
                     raise ValueError(
                         "gpu_layers must be zero or a positive integer"
@@ -1340,10 +1342,14 @@ class SparkDeckService:
             if self._validated_number(field, stored_value) < minimum:
                 raise ValueError(f"{field} must be at least {minimum}")
         gpu_layers = settings.get("gpu_layers")
-        if gpu_layers is not None and self._validated_number(
-            "gpu_layers", gpu_layers,
-        ) < 0:
-            raise ValueError("gpu_layers must be zero or a positive integer")
+        if gpu_layers is not None:
+            normalized_layers = self._validated_number("gpu_layers", gpu_layers)
+            if normalized_layers != int(normalized_layers):
+                raise ValueError("gpu_layers must be a whole number")
+            if normalized_layers < 0:
+                raise ValueError(
+                    "gpu_layers must be zero or a positive integer"
+                )
         gpu_memory_gb = settings.get("gpu_memory_gb")
         if gpu_memory_gb is not None and self._validated_number(
             "gpu_memory_gb", gpu_memory_gb,

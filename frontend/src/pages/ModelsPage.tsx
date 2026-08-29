@@ -647,6 +647,7 @@ export function ModelsPage() {
         // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
           alias: form.alias,
+          context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,

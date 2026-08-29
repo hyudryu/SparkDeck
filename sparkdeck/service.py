@@ -1103,10 +1103,16 @@ class SparkDeckService:
                     "extra_args": extra_args,
                 })
                 if launch_settings is not None
-                else self.manager._deployment_launch_controls({
-                    "engine": str(public.get("runtime") or "vllm"),
-                    "extra_args": extra_args,
-                }) if saved_only else {}
+                else {
+                    **self.manager._deployment_launch_controls({
+                        "engine": str(public.get("runtime") or "vllm"),
+                        "extra_args": extra_args,
+                    }),
+                    # Structured controls saved through this editor are the
+                    # authoritative round-trip source; the argv parse only
+                    # fills controls the bookmark has never stored.
+                    **(saved_settings.get("launch_controls") or {}),
+                } if saved_only else {}
             )
 
         raw_status = str(
@@ -1311,20 +1317,6 @@ class SparkDeckService:
                         artifact, settings.get("quantization"),
                     )
             settings["artifact"] = artifact
-            if artifact and runtime_is_llama and Path(
-                artifact
-            ).expanduser().is_absolute():
-                effective_nodes = [
-                    str(item).strip()
-                    for item in settings.get("node_ids") or []
-                    if str(item).strip()
-                ]
-                if any(node_id != LOCAL_NODE_ID for node_id in effective_nodes):
-                    raise ValueError(
-                        "local GGUF artifact files live outside the cluster cache "
-                        "and cannot be distributed; select the controller only or "
-                        "use a repo-relative Hub artifact"
-                    )
         if "launch_controls" in changes:
             controls = changes.get("launch_controls")
             if not isinstance(controls, dict):
@@ -1347,9 +1339,9 @@ class SparkDeckService:
             # cudagraph size, batched tokens) into the launch argv for vLLM
             # and SGLang, including clearing a previously set value.
             settings["launch_controls"] = controls
-        if changes.get("sg_tp_size") is not None:
+        if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
-        if changes.get("sg_mem_fraction") is not None:
+        if "sg_mem_fraction" in changes:
             settings["mem_fraction_static"] = changes["sg_mem_fraction"]
         if "extra_args" in changes:
             extra_args = changes.get("extra_args")
@@ -1378,20 +1370,32 @@ class SparkDeckService:
                     "deployment_mode must be single, sharded, or replicated"
                 )
             settings["deployment_mode"] = mode
-        # Validate the effective artifact/quantization pair, so a partial
-        # update cannot relabel a saved GGUF with a mismatching precision.
+        # Validate the effective combination: locality of the final artifact
+        # against the final nodes, and the artifact/quantization pair so a
+        # partial update cannot relabel a saved GGUF with a mismatching
+        # precision.
+        effective_nodes = [
+            str(item).strip() for item in settings.get("node_ids") or []
+            if str(item).strip()
+        ]
         if runtime_is_llama:
             effective_artifact = _optional_string(
                 settings.get("artifact")
                 or (stored.get("model") or {}).get("artifact")
             )
-            if effective_artifact and not Path(
-                effective_artifact
-            ).expanduser().is_absolute():
-                self._validate_public_gguf_artifact(
-                    str((stored.get("model") or {}).get("repository") or ""),
-                    effective_artifact, settings.get("quantization"),
-                )
+            if effective_artifact:
+                if _artifact_is_controller_local(effective_artifact):
+                    if any(node_id != LOCAL_NODE_ID for node_id in effective_nodes):
+                        raise ValueError(
+                            "local GGUF artifact files live outside the cluster cache "
+                            "and cannot be distributed; select the controller only or "
+                            "use a repo-relative Hub artifact"
+                        )
+                else:
+                    self._validate_public_gguf_artifact(
+                        str((stored.get("model") or {}).get("repository") or ""),
+                        effective_artifact, settings.get("quantization"),
+                    )
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
@@ -1401,10 +1405,6 @@ class SparkDeckService:
                 "llama.cpp deployments support single and replicated layouts, not sharded"
             )
         contract = self._saved_layout_contract(settings)
-        effective_nodes = [
-            str(item).strip() for item in settings.get("node_ids") or []
-            if str(item).strip()
-        ]
         if contract["deployment_mode"] == "single" and len(effective_nodes) > 1:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
@@ -2870,29 +2870,51 @@ class SparkDeckService:
             str(node.get("id")): node
             for node in await self.manager.cluster_nodes()
         }
+
+        # Presence checks hit every selected agent; run them concurrently and
+        # skip nodes cluster_nodes already reports offline. Results are
+        # tri-state: True/False when the check answered, None when it could
+        # not (offline, unreachable, or an older agent without the endpoint).
+        presence = getattr(self.manager, "node_has_model_files", None)
+        presence_available = callable(presence)
+
+        async def check_presence(node_id: str) -> bool | None:
+            node = nodes.get(node_id)
+            if not presence_available or node is None or node.get("online") is False:
+                return None
+            try:
+                return bool(await presence(node_id, model, resolved, files))
+            except Exception:
+                return None
+
+        presence_results = await asyncio.gather(
+            *(check_presence(node_id) for node_id in node_ids),
+            return_exceptions=True,
+        )
+
         targets: list[dict[str, Any]] = []
-        for node_id in node_ids:
+        for index, node_id in enumerate(node_ids):
             node = nodes.get(node_id)
             entry = inventory.get(node_id) or {}
             model_entry = next((
                 item for item in entry.get("models") or []
                 if isinstance(item, dict) and item.get("model_id") == model
             ), None)
-            has_weights = False
-            presence = getattr(self.manager, "node_has_model_files", None)
-            if callable(presence):
-                try:
-                    has_weights = bool(await presence(
-                        node_id, model, resolved, files,
-                    ))
-                except Exception:
-                    has_weights = False
-            if not has_weights and model_entry:
-                # Fall back to the inventory when the per-file check cannot
-                # answer: a complete snapshot of the resolved revision
-                # certainly contains the selected files.
+            raw_presence = presence_results[index]
+            has_weights: bool = (
+                raw_presence
+                if isinstance(raw_presence, bool)
+                else False
+            )
+            if raw_presence is None:
+                # A successful answer is authoritative even when it reports
+                # files missing; the inventory fallback applies only when the
+                # per-file check raised or was unavailable. A complete
+                # snapshot of the resolved revision certainly contains the
+                # selected files.
                 has_weights = bool(
-                    not model_entry.get("partial")
+                    model_entry
+                    and not model_entry.get("partial")
                     and resolved in (model_entry.get("revisions") or [])
                 )
             if node is None:

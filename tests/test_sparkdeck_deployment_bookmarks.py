@@ -565,6 +565,13 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["gpu_memory_gb"], 24)
         self.assertEqual(stored["settings"]["extra_args"], ["--enable-prefix-caching"])
         self.assertEqual(stored["settings"]["launch_controls"]["kv_cache_dtype"], "fp8")
+        # The detail response round-trips the persisted structured controls
+        # so a subsequent unchanged save cannot blank them out.
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("bookmark")["id"],
+        )
+        self.assertEqual(detail["launch_controls"]["kv_cache_dtype"], "fp8")
+        self.assertEqual(detail["launch_controls"]["context_window"], 16384)
         self.assertEqual(detail["status"], "saved")
 
         # Alias changes save atomically with the settings in one request.

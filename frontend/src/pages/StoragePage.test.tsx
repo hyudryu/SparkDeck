@@ -479,6 +479,49 @@ describe('StoragePage', () => {
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 
+  it('filters models across every node from one global search field', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: [
+        {
+          id: 'node-a', name: 'Studio Spark', online: true, total_size: 3_000_000_000,
+          models: [
+            { model_id: 'Qwen/Qwen3.8-Flash-Next-FP8', size_bytes: 2_000_000_000 },
+            { model_id: 'org/other-model', size_bytes: 1_000_000_000 },
+          ],
+        },
+        {
+          id: 'node-b', name: 'Backup Spark', online: true, total_size: 3_000_000_000,
+          models: [
+            { model_id: 'community/qwen-small', size_bytes: 800_000_000 },
+            { model_id: 'team/unrelated', size_bytes: 700_000_000 },
+          ],
+        },
+      ],
+      jobs: [],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    const user = userEvent.setup()
+    render(<StoragePage />)
+
+    await user.type(
+      await screen.findByRole('searchbox', { name: 'Search models across all storage nodes' }),
+      'QWEN',
+    )
+
+    const studio = screen.getByRole('region', { name: 'Storage on Studio Spark' })
+    const backup = screen.getByRole('region', { name: 'Storage on Backup Spark' })
+    expect(within(studio).getByText('Qwen/Qwen3.8-Flash-Next-FP8')).toBeInTheDocument()
+    expect(within(studio).queryByText('org/other-model')).not.toBeInTheDocument()
+    expect(within(backup).getByText('community/qwen-small')).toBeInTheDocument()
+    expect(within(backup).queryByText('team/unrelated')).not.toBeInTheDocument()
+
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    expect(within(inventory).getByText('Qwen/Qwen3.8-Flash-Next-FP8')).toBeInTheDocument()
+    expect(within(inventory).getByText('community/qwen-small')).toBeInTheDocument()
+    expect(within(inventory).queryByText('org/other-model')).not.toBeInTheDocument()
+  })
+
   it('uses MB/s for sub-gigabyte transfer rates and truncates failed-job errors with a tooltip', async () => {
     const error = 'gx10-node-3 agent error: HTTP 409: download finished without a complete requested revision'
     const storage: StorageState = {

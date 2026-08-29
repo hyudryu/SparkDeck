@@ -663,6 +663,78 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         stored = self.service.store.deployment("llama-bookmark", include_private=True)
         self.assertEqual(stored["model"]["quantization"], "Q4_K_M")
 
+    async def test_detail_seeds_parsed_args_without_clobbering_them(self):
+        # Controls that live only in extra_args parse into the editor and an
+        # unchanged save must not strip them.
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "argv-controls", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {
+                "context_length": None,
+                "extra_args": ["--max-model-len", "8192", "--max-num-seqs", "4"],
+            },
+        })
+
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("argv-controls")["id"],
+        )
+
+        self.assertEqual(detail["launch_controls"]["context_window"], 8192)
+        self.assertEqual(detail["launch_controls"]["max_concurrency"], 4)
+
+    async def test_bookmark_integer_fields_are_validated(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+
+        for bad in (0, -1, 1.5):
+            with self.assertRaisesRegex(ValueError, "context_length"):
+                await self.service.update_deployment_settings("bookmark", {
+                    "context_length": bad,
+                })
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            await self.service.update_deployment_settings("bookmark", {
+                "gpu_memory_utilization": 1.5,
+            })
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertNotIn("context_length", stored["settings"])
+
+    async def test_creator_fields_are_rejected_for_launched_standalone(self):
+        # A launched controller-only llama deployment owns a live container;
+        # its creator-form identity fields must not change behind it.
+        artifact = Path(self.temp.name) / "local.gguf"
+        artifact.write_bytes(b"gguf")
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "local-bookmark",
+            "runtime": "llama.cpp",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"artifact": str(artifact)},
+        })
+        self.manager.evict_other_backends = AsyncMock(
+            return_value={"ok": True}
+        )
+        with patch(
+            "sparkdeck.service.launch_managed_container",
+            AsyncMock(return_value={
+                "name": "sparkdeck-local-bookmark", "port": 8080,
+                "status": "running", "model_source": "local",
+            }),
+        ):
+            await self.service.deployment_action("local-bookmark", "start")
+        self.assertIsNotNone(
+            self.service.store.deployment("local-bookmark")["container_name"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "editable saved launch settings"):
+            await self.service.update_deployment_settings("local-bookmark", {
+                "context_length": 4096,
+            })
+        with self.assertRaisesRegex(ValueError, "editable saved launch settings"):
+            await self.service.update_deployment_settings("local-bookmark", {
+                "node_ids": ["remote-1"],
+            })
+
     async def test_external_bookmarks_still_register_without_nodes(self):
         created = await self.service.create_deployment({
             "model": "org/model", "alias": "external", "runtime": "vllm",

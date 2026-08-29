@@ -69,27 +69,65 @@ function renderPage() {
 }
 
 describe('models page llama.cpp pull targets', () => {
-  it('lets llama.cpp deployments select remote pull nodes and a Hub seed', async () => {
+  it('lets llama.cpp bookmark creation pick several nodes without pinning the controller', async () => {
     const user = userEvent.setup()
     renderPage()
 
     await screen.findByText('running')
-    await user.click(screen.getByRole('button', { name: /Add model/ }))
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
 
     const runtimeSelect = await screen.findByLabelText('Runtime')
     await user.selectOptions(runtimeSelect, 'llama.cpp')
 
+    // Llama server replicas run on any prepared node, so the controller is
+    // no longer locked in as the only selection.
     const controllerCheckbox = screen.getByRole('checkbox', { name: /Controller/ })
     expect(controllerCheckbox).toBeChecked()
-    expect(controllerCheckbox).toBeDisabled()
+    expect(controllerCheckbox).toBeEnabled()
     const remoteCheckbox = screen.getByRole('checkbox', { name: /Node 4/ })
     expect(remoteCheckbox).toBeEnabled()
-
     await user.click(remoteCheckbox)
+    expect(remoteCheckbox).toBeChecked()
+  })
 
+  it('offers a Hub download seed when launching a saved llama deployment on several nodes', async () => {
+    const user = userEvent.setup()
+    const savedLlama = {
+      id: 'dep-llama', alias: 'Local GGUF', runtime: 'llama.cpp', kind: 'managed',
+      model: { repository: 'org/model', artifact: 'FP16/model-F16.gguf' },
+      status: 'saved', settings: {}, node_ids: ['local', 'worker-1'],
+      deployment_mode: 'replicated', required_node_count: 2,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-llama/prepare/preflight' && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: 'org/model', revision: 'main',
+          source: null, sources: [], download: null, download_error: null,
+          targets: [
+            { node_id: 'local', node_name: 'Controller', eligible: false, has_required_weights: false, has_model_cache: false, download_eligible: true },
+            { node_id: 'worker-1', node_name: 'Node 4', eligible: false, has_required_weights: false, has_model_cache: false, download_eligible: true },
+          ],
+          node_ids: ['local', 'worker-1'], eligible: true, action: 'download',
+          download_node_id: 'local', download_node_ids: ['local', 'worker-1'],
+          transfer_target_node_ids: [], reason: null,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path === '/api/v1/deployments' ? { items: [savedLlama] }
+        : path === '/api/v1/nodes' ? { items: nodes }
+          : path === '/api/v1/model-cache' ? { nodes: [] }
+            : path === '/api/v1/recipes' ? { items: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Local GGUF' })
     const seedSelect = await screen.findByLabelText(/Hub download seed/)
     expect(seedSelect).toBeEnabled()
-    expect(screen.getByRole('option', { name: 'Node 4' })).toBeInTheDocument()
+    expect(within(dialog).getByRole('option', { name: 'Node 4' })).toBeInTheDocument()
+    expect(within(dialog).getByRole('option', { name: 'Automatic' })).toBeInTheDocument()
   })
 })
 

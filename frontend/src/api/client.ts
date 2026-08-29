@@ -509,9 +509,15 @@ export const api = {
       `/api/v1/deployments/${encodeURIComponent(id)}/prepare/preflight`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }), signal },
     ),
-    prepare: (id: string, nodeIds: string[]) => request<RecipePreparationResult>(
+    prepare: (id: string, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>(
       `/api/v1/deployments/${encodeURIComponent(id)}/prepare`,
-      { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          node_ids: nodeIds,
+          download_node_id: downloadNodeId || undefined,
+        }),
+      },
       NO_REQUEST_TIMEOUT,
     ),
     action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[]) => {

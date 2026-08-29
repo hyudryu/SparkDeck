@@ -2711,9 +2711,17 @@ async def v1_deployment_prepare(deployment_id: str, req: Request):
         or any(not isinstance(item, str) or not item.strip() for item in node_ids)
     ):
         raise HTTPException(400, "node_ids must contain non-empty node IDs")
+    download_node_id = body.get("download_node_id")
+    if download_node_id is not None and (
+        not isinstance(download_node_id, str) or not download_node_id.strip()
+    ):
+        raise HTTPException(400, "download_node_id must be a non-empty node ID")
     try:
         return await sparkdeck.deployment_prepare(
             deployment_id, [item.strip() for item in node_ids],
+            download_node_id=(
+                download_node_id.strip() if download_node_id else None
+            ),
         )
     except LookupError as e:
         raise HTTPException(404, str(e))

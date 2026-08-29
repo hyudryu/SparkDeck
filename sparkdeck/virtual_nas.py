@@ -136,6 +136,21 @@ def partial_download_size_bytes(
     return _nonnegative_int(value)
 
 
+def resolved_partial_revision(model: dict[str, Any]) -> str:
+    """Resolve a partial entry's revision alias to the commit it resumes.
+
+    Finish-download resumes the immutable commit recorded in
+    ``partial_revision_refs``; expected-size lookups must query that same
+    commit rather than wherever a mutable alias (e.g. ``main``) points
+    upstream right now.
+    """
+    revision = str(model.get("revision") or "").strip()
+    refs = model.get("partial_revision_refs")
+    if isinstance(refs, dict):
+        revision = str(refs.get(revision) or revision)
+    return revision
+
+
 def download_required_free_bytes(expected_bytes: int, cached_bytes: int = 0) -> int:
     """Return staging capacity needed after accounting for reusable cache data."""
     expected = _nonnegative_int(expected_bytes)
@@ -2898,7 +2913,13 @@ def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, 
                 except (OSError, RuntimeError, ValueError):
                     continue
                 parent = relative.parent
-                group = parent.parts[0] if str(parent) != "." else relative.stem
+                if str(parent) != ".":
+                    group = parent.parts[0]
+                else:
+                    # Shards of one loose model aggregate into a single group
+                    # so completeness is validated against the whole set.
+                    shard = _WEIGHT_SHARD.match(relative.name)
+                    group = shard.group("prefix") if shard else relative.stem
                 groups.setdefault(group, []).append(resolved)
         except (OSError, RuntimeError, ValueError):
             continue
@@ -2906,6 +2927,17 @@ def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, 
             try:
                 stats = [path.stat() for path in files]
             except OSError:
+                continue
+            names = {
+                path.relative_to(resolved_section).as_posix().casefold(): path
+                for path in files
+            }
+            if not _weight_shards_are_complete(names):
+                # Externally managed weights have no finish-download path,
+                # so an incomplete shard set is not actionable; like an
+                # incomplete whitelist bundle, the group is not listed.
+                # Hub-style index files are not required here: ComfyUI
+                # weight installs do not follow the Hub index convention.
                 continue
             last_modified = max(stat.st_mtime for stat in stats)
             entries.append({

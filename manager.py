@@ -45,6 +45,7 @@ from sparkdeck.virtual_nas import (
     cached_download_bytes,
     download_required_free_bytes,
     partial_download_size_bytes,
+    resolved_partial_revision,
     validate_model_id,
     validate_revision,
 )
@@ -1883,7 +1884,10 @@ class Manager:
                 if not isinstance(revision, str) or not revision.strip():
                     continue
                 revision = revision.strip()
-                targets.setdefault((model_id, revision))
+                # Mirror the finish-download resolution: query and cache the
+                # immutable commit the resume targets, not wherever a mutable
+                # alias (e.g. main) happens to point upstream right now.
+                targets.setdefault((model_id, resolved_partial_revision(model)))
         if not targets:
             return
         semaphore = asyncio.Semaphore(4)
@@ -1902,7 +1906,7 @@ class Manager:
                     continue
                 key = (
                     str(model.get("model_id") or ""),
-                    str(model.get("revision") or "").strip(),
+                    resolved_partial_revision(model),
                 )
                 size = expected.get(key)
                 if size:

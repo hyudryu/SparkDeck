@@ -275,6 +275,42 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
             state["nodes"][0]["models"][0]["expected_size_bytes"], 1500,
         )
 
+    async def test_expected_size_queries_the_resolved_partial_commit(self):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True},
+        ])
+        manager.settings = {}
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{
+            "model_id": "org/model", "size_bytes": 10,
+            "partial": True, "revision": "main",
+            "partial_revision_refs": {"main": PINNED_A},
+        }]
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.virtual_nas.list_transfers.return_value = {"items": []}
+        manager.virtual_nas_enabled = lambda: True
+        manager.node_registry = Mock()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.host, "huggingface.co")
+            self.assertEqual(
+                request.url.path, f"/api/models/org/model/tree/{PINNED_A}",
+            )
+            return httpx.Response(
+                200, json=[{"path": "model.safetensors", "size": 1000}],
+            )
+
+        manager.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            state = await manager.virtual_nas_inventory()
+        finally:
+            await manager.http.aclose()
+
+        self.assertEqual(
+            state["nodes"][0]["models"][0]["expected_size_bytes"], 1000,
+        )
+
 
 class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_with_node_selection_relaunches_on_chosen_nodes(self):

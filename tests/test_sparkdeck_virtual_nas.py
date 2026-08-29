@@ -1036,6 +1036,52 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry["file_count"], 2)
             self.assertTrue(entry["externally_managed"])
 
+    async def test_inventory_ignores_incomplete_comfyui_shard_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            group = root / "checkpoints" / "Sharded"
+            group.mkdir(parents=True)
+            (group / "model-00001-of-00002.safetensors").write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
+            (group / "model-00002-of-00002.safetensors").write_bytes(b"weights")
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            entry = models[0]
+            self.assertEqual(entry["model_id"], "Sharded")
+            self.assertEqual(entry["file_count"], 2)
+            self.assertFalse(entry["partial"])
+
+    async def test_inventory_aggregates_loose_comfyui_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            checkpoints = root / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            (checkpoints / "model-00001-of-00002.safetensors").write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: False,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertEqual(nas.inventory(), [])
+
+            (checkpoints / "model-00002-of-00002.safetensors").write_bytes(b"weights")
+            models = nas.inventory()
+
+            self.assertEqual(len(models), 1)
+            entry = models[0]
+            self.assertEqual(entry["model_id"], "model")
+            self.assertEqual(entry["file_count"], 2)
+            self.assertFalse(entry["partial"])
+
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

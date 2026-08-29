@@ -65,6 +65,8 @@ _LOCAL_ROUTING_KEYS = {
     "prepared_revision",
     # Preferred Hub seed node for distributing a saved GGUF artifact.
     "download_node_id",
+    # Structured launch controls Manager merges into argv at launch.
+    "launch_controls",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -1258,11 +1260,16 @@ class SparkDeckService:
             "gpu_layers", "quantization", "artifact", "extra_args",
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction",
+            "sg_tp_size", "sg_mem_fraction", "alias",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+        alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
+        if alias != stored.get("alias"):
+            existing = self.store.deployment(alias)
+            if existing and existing["id"] != stored["id"]:
+                raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         numeric_fields = (
@@ -1304,6 +1311,20 @@ class SparkDeckService:
                         artifact, settings.get("quantization"),
                     )
             settings["artifact"] = artifact
+            if artifact and runtime_is_llama and Path(
+                artifact
+            ).expanduser().is_absolute():
+                effective_nodes = [
+                    str(item).strip()
+                    for item in settings.get("node_ids") or []
+                    if str(item).strip()
+                ]
+                if any(node_id != LOCAL_NODE_ID for node_id in effective_nodes):
+                    raise ValueError(
+                        "local GGUF artifact files live outside the cluster cache "
+                        "and cannot be distributed; select the controller only or "
+                        "use a repo-relative Hub artifact"
+                    )
         if "launch_controls" in changes:
             controls = changes.get("launch_controls")
             if not isinstance(controls, dict):
@@ -1321,6 +1342,11 @@ class SparkDeckService:
                     settings[target] = int(max_concurrency)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("max_concurrency must be an integer") from exc
+            # Persist the complete structured contract: Manager's preflight
+            # merges every control (KV dtype, thinking, speculative tokens,
+            # cudagraph size, batched tokens) into the launch argv for vLLM
+            # and SGLang, including clearing a previously set value.
+            settings["launch_controls"] = controls
         if changes.get("sg_tp_size") is not None:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if changes.get("sg_mem_fraction") is not None:
@@ -1389,6 +1415,8 @@ class SparkDeckService:
             stored.get("container_name"),
             stored.get("_base_url"),
         )
+        if alias != stored.get("alias"):
+            self.store.update_alias(stored["id"], alias)
         model = dict(stored.get("model") or {})
         if "quantization" in changes:
             model["quantization"] = settings.get("quantization")
@@ -1410,6 +1438,7 @@ class SparkDeckService:
         if (
             relative.is_absolute() or not relative.parts
             or any(part in {"", ".", ".."} for part in relative.parts)
+            or artifact.startswith("~")
             or "\\" in artifact
             or re.match(r"^[A-Za-z]:", artifact)
             or relative.suffix.casefold() != ".gguf"
@@ -2024,9 +2053,9 @@ class SparkDeckService:
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         if resolve_local and resolve_local(model):
             return True
-        if artifact and not PurePosixPath(artifact).is_absolute():
-            return False
-        return bool(artifact) or _public_model_id(model) == "local-model"
+        if artifact:
+            return _artifact_is_controller_local(artifact)
+        return _public_model_id(model) == "local-model"
 
     async def _launch_saved_deployment(
         self, deployment: dict[str, Any], node_ids: list[str] | None,
@@ -2079,7 +2108,7 @@ class SparkDeckService:
         deployment_id = record.id
         adapter = self.registry.get(record.runtime)
         launch_settings = dict(settings)
-        if artifact and not PurePosixPath(artifact).is_absolute():
+        if artifact and not _artifact_is_controller_local(artifact):
             # Resolve (downloading if needed) the public GGUF on the controller.
             launch_settings["artifact"] = await self._prepare_public_gguf_artifact(
                 model, artifact,
@@ -2453,7 +2482,7 @@ class SparkDeckService:
         )
         controller_artifact = (
             deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
-            and (not artifact or PurePosixPath(artifact).is_absolute())
+            and (not artifact or _artifact_is_controller_local(artifact))
         )
         if (is_local_path or controller_artifact) and any(
             item != "local" for item in node_ids
@@ -2795,7 +2824,7 @@ class SparkDeckService:
             or (deployment.get("settings") or {}).get("artifact")
             or ""
         )
-        if not artifact or PurePosixPath(artifact).is_absolute():
+        if not artifact or _artifact_is_controller_local(artifact):
             return None
         relative = self._validate_public_gguf_artifact(model, artifact, None)
         return self._expand_gguf_shard_files(relative)
@@ -2905,8 +2934,13 @@ class SparkDeckService:
                 not has_weights
                 and required_free is not None
                 and free_bytes is not None
+                and model_entry is None
                 and free_bytes < required_free
             ):
+                # Hard-gate only cache-empty nodes, where nothing is reusable
+                # and the estimate is exact. Partial caches resume from local
+                # blobs the whole-set estimate cannot credit, so those defer
+                # to the exact per-node check at prepare time.
                 capacity_reason = (
                     "Not enough free cache space for the GGUF download"
                 )
@@ -4128,6 +4162,16 @@ def _is_missing_container_error(exc: Exception) -> bool:
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
     return status == 404
+
+
+def _artifact_is_controller_local(artifact: str | None) -> bool:
+    """True when the artifact names a file on this host (platform-aware)."""
+    if not artifact:
+        return False
+    try:
+        return Path(artifact).expanduser().is_absolute()
+    except (OSError, ValueError):
+        return False
 
 
 def _public_model_id(value: str) -> str:

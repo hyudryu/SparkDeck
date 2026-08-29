@@ -693,12 +693,54 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.update_deployment_settings("bookmark", {
                     "context_length": bad,
                 })
+        # Non-finite and oversized numeric junk is a 400-shaped ValueError,
+        # never an escaping OverflowError/TypeError. A numeric string such as
+        # "8192" is accepted and normalized instead.
+        for bad in (1e309, float("nan"), "not-a-number"):
+            with self.assertRaisesRegex(ValueError, "context_length"):
+                await self.service.update_deployment_settings("bookmark", {
+                    "context_length": bad,
+                })
         with self.assertRaisesRegex(ValueError, "between 0 and 1"):
             await self.service.update_deployment_settings("bookmark", {
                 "gpu_memory_utilization": 1.5,
             })
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertNotIn("context_length", stored["settings"])
+
+    async def test_saved_bookmark_accepts_fractional_gpu_memory_gb(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "gpu_memory_gb": 24.5,
+        })
+
+        self.assertEqual(detail["gpu_memory_gb"], 24.5)
+        stored = self.service.store.deployment("bookmark", include_private=True)
+        self.assertEqual(stored["settings"]["gpu_memory_gb"], 24.5)
+
+    async def test_alias_only_edit_survives_string_scalars_from_raw_api(self):
+        # A raw-API create can persist numeric scalars as strings; a later
+        # alias-only edit must still succeed (or cleanly reject), never 500.
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "stringy", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        self.service.store.update_managed_routing(
+            self.service.store.deployment("stringy")["id"],
+            {"context_length": "8192", "node_ids": ["remote-1"],
+             "deployment_mode": "single"},
+            None, None,
+        )
+
+        detail = await self.service.update_deployment_settings("stringy", {
+            "alias": "stringy-renamed",
+        })
+
+        self.assertEqual(detail["alias"], "stringy-renamed")
 
     async def test_creator_fields_are_rejected_for_launched_standalone(self):
         # A launched controller-only llama deployment owns a live container;

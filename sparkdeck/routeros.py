@@ -302,18 +302,22 @@ def _configuration_checks(
             else "RouterOS responded, but some identity details were unavailable."
         ),
     })
+    ethernet_interfaces = [
+        item for item in interfaces
+        if str(item.get("type") or "").casefold() == "ether"
+    ]
     active_interfaces = sum(
         str(item.get("running") or "").casefold() in {"true", "yes", "1"}
-        for item in interfaces
+        for item in ethernet_interfaces
     )
     checks.append({
         "id": "active-interfaces",
         "label": "Active Ethernet links",
         "status": "passed" if active_interfaces else "warning",
         "detail": (
-            f"{active_interfaces} of {len(interfaces)} reported interfaces are running."
-            if interfaces
-            else "RouterOS did not report interface telemetry."
+            f"{active_interfaces} of {len(ethernet_interfaces)} Ethernet interfaces are running."
+            if ethernet_interfaces
+            else "RouterOS did not report physical Ethernet interface telemetry."
         ),
     })
     temperature_sensors = sum(
@@ -678,21 +682,25 @@ class RouterOSService:
             ]
             settings = _single(fan_settings)
             health_rows = _health_rows(health)
+            ethernet_rows = [
+                row for row in interface_rows
+                if str(row.get("type") or "").casefold() == "ether"
+            ]
             active_interfaces = sum(
                 str(row.get("running") or "").casefold() in {"true", "yes", "1"}
-                for row in interface_rows
+                for row in ethernet_rows
             )
             network = {
                 "rx_bits_per_second": sum(
                     _nonnegative_rate(row.get("rx-bits-per-second"))
-                    for row in interface_rows
+                    for row in ethernet_rows
                 ),
                 "tx_bits_per_second": sum(
                     _nonnegative_rate(row.get("tx-bits-per-second"))
-                    for row in interface_rows
+                    for row in ethernet_rows
                 ),
                 "active_interfaces": active_interfaces,
-                "total_interfaces": len(interface_rows),
+                "total_interfaces": len(ethernet_rows),
             }
             return {
                 **presence,

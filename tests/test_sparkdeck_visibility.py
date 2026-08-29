@@ -133,6 +133,44 @@ class ModelCacheInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("expected_size_bytes", model)
         self.assertEqual(model["size_bytes"], 10)
 
+    async def test_selective_partial_model_uses_only_selected_artifact_size(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {}
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "Spark One", "online": True},
+        ])
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.inventory.return_value = [{
+            "model_id": "org/many-quants", "size_bytes": 37,
+            "partial": True, "revision": "main",
+            "partial_revision_refs": {"main": PINNED_A},
+            "selective_files_by_revision": {
+                PINNED_A: ["mmproj-F16.gguf", "model-Q8_K_XL.gguf"],
+            },
+        }]
+        manager.virtual_nas.free_bytes.return_value = 0
+        manager.node_registry = Mock()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                request.url.path,
+                f"/api/models/org/many-quants/tree/{PINNED_A}",
+            )
+            return httpx.Response(200, json=[
+                {"path": "mmproj-F16.gguf", "size": 3},
+                {"path": "model-Q8_K_XL.gguf", "size": 34},
+                {"path": "model-Q4_K_M.gguf", "size": 20},
+                {"path": "model-F16.gguf", "size": 500},
+            ])
+
+        manager.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            nodes = await manager.model_cache_inventory(enrich_expected_sizes=True)
+        finally:
+            await manager.http.aclose()
+
+        self.assertEqual(nodes[0]["models"][0]["expected_size_bytes"], 37)
+
 
 class DeploymentStartNodeSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_with_node_selection_relaunches_on_chosen_nodes(self):

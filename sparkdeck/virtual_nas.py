@@ -832,7 +832,16 @@ class VirtualNAS:
                         raise RuntimeError(
                             "Hugging Face selective snapshot marker is not safe"
                         )
-                    marker.write_text("selective\n", encoding="utf-8")
+                    existing_files = _selective_files_by_revision(
+                        repository, _snapshot_files_by_revision(repository),
+                    ).get(revision, [])
+                    marker.write_text(
+                        json.dumps(
+                            {"files": list(dict.fromkeys((*existing_files, *selected)))},
+                            separators=(",", ":"),
+                        ),
+                        encoding="utf-8",
+                    )
                 if missing:
                     try:
                         for filename in missing:
@@ -1057,11 +1066,15 @@ class VirtualNAS:
                     if target == incomplete_revision
                 )
                 partial_revision = aliases[0] if aliases else incomplete_revision
-            models.append({
+            snapshot_files = _snapshot_files_by_revision(repository)
+            selective_files = _selective_files_by_revision(
+                repository, snapshot_files,
+            )
+            model = {
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
-                "snapshot_files": _snapshot_files_by_revision(repository),
+                "snapshot_files": snapshot_files,
                 "partial": partial,
                 "has_partial_download": (
                     partial or bool(incomplete_revisions)
@@ -1079,7 +1092,10 @@ class VirtualNAS:
                     datetime.fromtimestamp(last_modified, timezone.utc).isoformat()
                     if last_modified else None
                 ),
-            })
+            }
+            if selective_files:
+                model["selective_files_by_revision"] = selective_files
+            models.append(model)
         external_models = _external_comfyui_inventory(
             self._external_model_roots_provider()
         )
@@ -2986,6 +3002,51 @@ def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:
     except OSError:
         return files_by_revision
     return files_by_revision
+
+
+def _selective_files_by_revision(
+    repository: Path, snapshot_files: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Return exact selected files for partial snapshots without exposing paths.
+
+    New selective pulls persist their chosen files in the marker. Older caches
+    used a text-only marker, so fall back to their safely cached snapshot files
+    instead of treating every quantization in the repository as required.
+    """
+    result: dict[str, list[str]] = {}
+    try:
+        snapshots = repository / "snapshots"
+        if not snapshots.is_dir() or snapshots.is_symlink():
+            return result
+        for snapshot in snapshots.iterdir():
+            if not snapshot.is_dir() or snapshot.is_symlink():
+                continue
+            marker = snapshot / _SELECTIVE_SNAPSHOT_MARKER
+            if not marker.is_file() or marker.is_symlink():
+                continue
+            selected: list[str] = []
+            try:
+                if marker.stat().st_size <= 1024 * 1024:
+                    value = json.loads(marker.read_text(encoding="utf-8"))
+                    raw_files = value.get("files") if isinstance(value, dict) else None
+                    if isinstance(raw_files, list):
+                        selected = list(dict.fromkeys(
+                            _validate_repo_relative_file(filename)
+                            for filename in raw_files
+                            if isinstance(filename, str)
+                        ))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                selected = []
+            # Text markers from previous SparkDeck versions have no manifest.
+            # The cache inventory is still a strictly better denominator than
+            # the full multi-quantization Hub repository.
+            if not selected:
+                selected = list(snapshot_files.get(snapshot.name) or [])
+            if selected:
+                result[snapshot.name] = selected
+    except OSError:
+        pass
+    return result
 
 
 def _complete_snapshot_revisions(repository: Path) -> set[str]:

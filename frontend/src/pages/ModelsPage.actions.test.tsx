@@ -553,6 +553,82 @@ describe('deployment creator model and quantization pickers', () => {
     expect(screen.getByLabelText('Quantization (optional)')).toHaveValue('')
   })
 
+  it('marks a sharded quantization downloaded only when one node holds every shard', async () => {
+    const user = userEvent.setup()
+    const shardCache = {
+      nodes: [
+        {
+          id: 'local', name: 'Controller', online: true,
+          models: [{
+            model_id: 'org/gguf', size_bytes: 10,
+            revision_refs: { main: CACHED_SHA },
+            snapshot_files: { [CACHED_SHA]: ['shard-00001-of-00002.gguf'] },
+          }],
+        },
+        {
+          id: 'worker-1', name: 'Node 4', online: true,
+          models: [{
+            model_id: 'org/gguf', size_bytes: 10,
+            revision_refs: { main: CACHED_SHA },
+            snapshot_files: { [CACHED_SHA]: ['shard-00002-of-00002.gguf'] },
+          }],
+        },
+      ],
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify(shardCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/catalog/models/org%2Fgguf') {
+        return new Response(JSON.stringify({
+          model: {
+            id: 'org/gguf',
+            revision: CACHED_SHA,
+            quantizations: [{
+              name: 'Q4_K_M',
+              files: [
+                { filename: 'shard-00001-of-00002.gguf', size_bytes: 400 },
+                { filename: 'shard-00002-of-00002.gguf', size_bytes: 407 },
+              ],
+              weight_size_bytes: 807,
+            }],
+          },
+          aggregates: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.selectOptions(await screen.findByLabelText('Runtime'), 'llama.cpp')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/gguf')
+
+    // Shards split across two nodes do not add up to one usable copy, so
+    // the quantization must not claim a downloaded state.
+    const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
+    expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B' })).toBeInTheDocument()
+    expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
+  })
+
   it('withholds downloaded marks when the listing resolves a newer revision', async () => {
     const user = userEvent.setup()
     mockGgufCluster(NEW_SHA)

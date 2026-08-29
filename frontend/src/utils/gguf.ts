@@ -34,11 +34,14 @@ export function ggufArtifactOptions(quantizations: NonNullable<CatalogModel['qua
   })
 }
 
-// A quantization counts as downloaded once every file of its artifact group
-// sits in some node's cache (compare repo-relative names exactly).
+// A quantization counts as downloaded only when at least one node holds
+// every file of its artifact group — compare repo-relative names exactly.
+// Sets are per node: shards split across caches do not add up to one
+// usable copy.
 export function artifactFilesDownloaded(
   files: Array<{ filename: string }>,
-  cachedFiles: ReadonlySet<string>,
+  cachedFileSets: ReadonlyArray<ReadonlySet<string>>,
 ) {
-  return files.length > 0 && files.every((file) => cachedFiles.has(file.filename))
+  return files.length > 0
+    && cachedFileSets.some((set) => files.every((file) => set.has(file.filename)))
 }

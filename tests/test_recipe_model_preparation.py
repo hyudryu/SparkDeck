@@ -776,6 +776,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(job["status"], "completed")
             self.assertEqual(job["bytes_transferred"], MODEL_BYTES)
+            self.assertEqual(job["download_attempt_start_bytes"], MODEL_BYTES)
             nas.estimate_download_size.assert_awaited_once()
             registry.request.assert_awaited_once()
             self.assertEqual(

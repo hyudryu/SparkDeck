@@ -1745,6 +1745,7 @@ class Manager:
             "Complete externally managed ComfyUI bundles are inventoried read-only and cannot be transferred or deleted here.",
         ]
         if not self.virtual_nas_enabled():
+            self._virtual_nas_rate_samples = {}
             return {
                 "enabled": False, "nodes": [], "jobs": [],
                 "instructions": instructions,
@@ -1758,6 +1759,8 @@ class Manager:
             for node in nodes
         }
         jobs = []
+        sampled_at = time.monotonic()
+        active_job_ids = set()
         for job in self.virtual_nas.list_transfers()["items"]:
             snapshot = dict(job)
             if (
@@ -1778,12 +1781,51 @@ class Manager:
                         max(0, int(job.get("bytes_transferred") or 0)),
                         min(total, live_bytes),
                     )
+            if snapshot.get("status") == "running":
+                active_job_ids.add(str(snapshot.get("id") or ""))
+            snapshot["bytes_per_second"] = self._sample_virtual_nas_transfer_rate(
+                snapshot, sampled_at,
+            )
             jobs.append(self._public_virtual_nas_job(snapshot))
+        rate_samples = getattr(self, "_virtual_nas_rate_samples", {})
+        for job_id in set(rate_samples) - active_job_ids:
+            rate_samples.pop(job_id, None)
         return {
             "enabled": True, "nodes": nodes,
             "jobs": jobs,
             "instructions": instructions,
         }
+
+    def _sample_virtual_nas_transfer_rate(
+        self, job: dict, sampled_at: float,
+    ) -> float | None:
+        """Measure current transfer throughput between inventory samples."""
+        samples = getattr(self, "_virtual_nas_rate_samples", None)
+        if samples is None:
+            samples = {}
+            self._virtual_nas_rate_samples = samples
+        job_id = str(job.get("id") or "")
+        if not job_id or job.get("status") != "running":
+            samples.pop(job_id, None)
+            return None
+        transferred = max(0, int(job.get("bytes_transferred") or 0))
+        previous = samples.get(job_id)
+        if previous is None:
+            samples[job_id] = (sampled_at, transferred, None)
+            return None
+        previous_at, previous_bytes, previous_rate = previous
+        elapsed = sampled_at - previous_at
+        if elapsed < 0.5:
+            return previous_rate
+        if elapsed > 15:
+            samples[job_id] = (sampled_at, transferred, None)
+            return None
+        if transferred < previous_bytes:
+            rate = None
+        else:
+            rate = (transferred - previous_bytes) / elapsed
+        samples[job_id] = (sampled_at, transferred, rate)
+        return rate
 
     @staticmethod
     def _byte_count(value: Any) -> int | None:
@@ -2903,29 +2945,12 @@ class Manager:
             min(1.0, transferred / total) if total
             else (1.0 if job.get("status") == "completed" else 0.0)
         )
-        downloading = job.get("kind") == "download"
-        started_at = (
-            job.get("download_attempted_at") if downloading
-            else job.get("started_at")
-        )
-        completed_at = job.get("completed_at")
-        bytes_per_second = None
-        start_bytes = (
-            job.get("download_attempt_start_bytes") if downloading else 0
-        )
-        if start_bytes is not None:
-            try:
-                started = float(started_at)
-                ended = (
-                    float(completed_at)
-                    if completed_at is not None else time.time()
-                )
-                elapsed = ended - started
-                attempt_bytes = max(0, transferred - int(start_bytes))
-                if attempt_bytes > 0 and elapsed > 0:
-                    bytes_per_second = attempt_bytes / elapsed
-            except (TypeError, ValueError):
-                pass
+        try:
+            bytes_per_second = float(job.get("bytes_per_second"))
+            if bytes_per_second <= 0:
+                bytes_per_second = None
+        except (TypeError, ValueError):
+            bytes_per_second = None
         return {
             **job,
             "source_node_name": node_name(job["source_node_id"]),

@@ -2643,7 +2643,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "virtual_nas_enabled": True, "cluster_node_name": "Coordinator",
         }
         manager.virtual_nas = Mock()
-        manager.virtual_nas.list_transfers.return_value = {"items": [{
+        job = {
             "id": "download-1", "kind": "download", "model_id": "org/model",
             "source_node_id": "huggingface", "target_node_id": "worker-a",
             "revision": RESOLVED_REVISION, "status": "running",
@@ -2651,28 +2651,34 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "download_cache_baseline_bytes": 1000,
             "download_attempt_start_bytes": 970,
             "download_attempted_at": 100, "started_at": 99, "created_at": 1,
-        }]}
+        }
+        manager.virtual_nas.list_transfers.return_value = {"items": [job]}
         manager.node_registry = Mock()
         manager.node_registry.get.return_value = {
             "id": "worker-a", "name": "Worker A",
         }
-        manager.model_cache_inventory = AsyncMock(return_value=[{
+        inventory = {
             "id": "worker-a", "name": "Worker A", "online": True,
             "models": [{
-                "model_id": "org/model", "size_bytes": 1975,
+                "model_id": "org/model", "size_bytes": 1970,
                 "partial": False, "has_partial_download": True,
-                "partial_revision_size_bytes": {RESOLVED_REVISION: 975},
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 970},
             }],
-        }])
+        }
+        manager.model_cache_inventory = AsyncMock(return_value=[inventory])
 
-        with patch("manager.time.time", return_value=102):
+        with patch("manager.time.monotonic", side_effect=[100, 102]):
+            first = await manager.virtual_nas_inventory()
+            inventory["models"][0]["size_bytes"] = 1975
+            inventory["models"][0]["partial_revision_size_bytes"][RESOLVED_REVISION] = 975
             result = await manager.virtual_nas_inventory()
 
+        self.assertIsNone(first["jobs"][0]["bytes_per_second"])
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 975)
         self.assertEqual(result["jobs"][0]["progress"], 0.975)
         self.assertEqual(result["jobs"][0]["bytes_per_second"], 2.5)
 
-    def test_public_job_reports_average_transfer_rate(self):
+    def test_public_job_only_reports_sampled_live_transfer_rate(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"cluster_node_name": "Coordinator"}
         manager.node_registry = Mock()
@@ -2680,26 +2686,26 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             "id": "worker-a", "name": "Worker A",
         }
 
-        with patch("manager.time.time", return_value=110):
-            result = manager._public_virtual_nas_job({
-                "id": "transfer-1", "kind": "transfer", "model_id": "org/model",
-                "source_node_id": "local", "target_node_id": "worker-a",
-                "status": "running", "bytes_total": 10_000_000_000,
-                "bytes_transferred": 5_000_000_000,
-                "created_at": 99, "started_at": 100, "completed_at": None,
-            })
-            alias_only = manager._public_virtual_nas_job({
-                "id": "download-1", "kind": "download", "model_id": "org/model",
-                "source_node_id": "huggingface", "target_node_id": "worker-a",
-                "status": "completed", "bytes_total": 5_000_000_000,
-                "bytes_transferred": 5_000_000_000,
-                "download_attempt_start_bytes": 5_000_000_000,
-                "download_attempted_at": 100, "completed_at": 101,
-                "created_at": 99,
-            })
+        result = manager._public_virtual_nas_job({
+            "id": "transfer-1", "kind": "transfer", "model_id": "org/model",
+            "source_node_id": "local", "target_node_id": "worker-a",
+            "status": "running", "bytes_total": 10_000_000_000,
+            "bytes_transferred": 5_000_000_000,
+            "bytes_per_second": 625_000_000,
+            "created_at": 99, "started_at": 100, "completed_at": None,
+        })
+        unsampled = manager._public_virtual_nas_job({
+            "id": "download-1", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "worker-a",
+            "status": "completed", "bytes_total": 5_000_000_000,
+            "bytes_transferred": 5_000_000_000,
+            "download_attempt_start_bytes": 0,
+            "download_attempted_at": 100, "completed_at": 101,
+            "created_at": 99,
+        })
 
-        self.assertEqual(result["bytes_per_second"], 500_000_000)
-        self.assertIsNone(alias_only["bytes_per_second"])
+        self.assertEqual(result["bytes_per_second"], 625_000_000)
+        self.assertIsNone(unsampled["bytes_per_second"])
 
 
 if __name__ == "__main__":

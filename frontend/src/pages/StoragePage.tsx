@@ -89,11 +89,16 @@ export function StoragePage() {
       models: [...node.models].sort(compareModels),
     }
   }), [resource.data?.nodes])
-  const sourceNode = nodes.find((node) => node.id === sourceNodeId)
+  // Nodes hidden from the dashboard are hidden from every storage view too.
+  const visibleNodes = useMemo(
+    () => nodes.filter((node) => node.hidden_from_dashboard !== true),
+    [nodes],
+  )
+  const sourceNode = visibleNodes.find((node) => node.id === sourceNodeId)
   const sourceModels = sourceNode?.models.filter(isTransferableModel) ?? []
   const inventory = useMemo(() => {
     const models = new Map<string, { model: StorageModel; nodes: Map<string, StorageModel> }>()
-    nodes.forEach((node) => node.models.forEach((model) => {
+    visibleNodes.forEach((node) => node.models.forEach((model) => {
       const current = models.get(model.model_id)
       if (current) {
         current.nodes.set(node.id, model)
@@ -101,7 +106,7 @@ export function StoragePage() {
       } else models.set(model.model_id, { model, nodes: new Map([[node.id, model]]) })
     }))
     return [...models.values()].sort((left, right) => compareModels(left.model, right.model))
-  }, [nodes])
+  }, [visibleNodes])
   const activeJobsByNode = useMemo(() => {
     const jobs = new Map<string, Map<string, StorageTransferJob>>()
     resource.data?.jobs.filter(isActive).forEach((job) => {
@@ -113,9 +118,9 @@ export function StoragePage() {
   }, [resource.data?.jobs])
 
   useEffect(() => {
-    if (!nodes.length) return
-    const selected = nodes.find((node) => node.id === sourceNodeId && node.online && node.models.some(isTransferableModel))
-      ?? nodes.find((node) => node.online && node.models.some(isTransferableModel))
+    if (!visibleNodes.length) return
+    const selected = visibleNodes.find((node) => node.id === sourceNodeId && node.online && node.models.some(isTransferableModel))
+      ?? visibleNodes.find((node) => node.online && node.models.some(isTransferableModel))
     const completeModels = selected?.models.filter(isTransferableModel) ?? []
     const nextSourceId = selected?.id ?? ''
     const nextModelId = completeModels.some((model) => model.model_id === modelId)
@@ -123,8 +128,8 @@ export function StoragePage() {
       : completeModels[0]?.model_id ?? ''
     setSourceNodeId(nextSourceId)
     setModelId(nextModelId)
-    setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && nodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
-  }, [modelId, nodes, sourceNodeId])
+    setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && visibleNodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
+  }, [modelId, visibleNodes, sourceNodeId])
 
   const hasActiveJobs = resource.data?.jobs.some(isActive) ?? false
   useEffect(() => {
@@ -159,7 +164,7 @@ export function StoragePage() {
         source_node_id: 'id' in source ? source.id : source.sourceNodeId,
         target_node_ids: targets,
       })
-      const targetNames = targets.map((id) => nodes.find((node) => node.id === id)?.name ?? id).join(', ')
+      const targetNames = targets.map((id) => visibleNodes.find((node) => node.id === id)?.name ?? id).join(', ')
       setNotice(`Queued ${transferModelId} for transfer to ${targetNames}.`)
       setTargetNodeIds([])
       resource.reload()
@@ -281,8 +286,8 @@ export function StoragePage() {
 
       {resource.data?.enabled && <>
         <div className="section-heading"><div><h2>Node storage</h2><p>Drag an individual model to another online node, or use the transfer form below.</p></div></div>
-        {nodes.length === 0 ? <EmptyState title="No storage nodes" description="Join a node to the cluster before transferring model weights." /> : <div className="storage-node-grid">
-          {nodes.map((node) => {
+        {visibleNodes.length === 0 ? <EmptyState title="No storage nodes" description="Join a node to the cluster before transferring model weights." /> : <div className="storage-node-grid">
+          {visibleNodes.map((node) => {
             const activeJobs = activeJobsByNode.get(node.id) ?? new Map<string, StorageTransferJob>()
             const modelsById = new Map(node.models.map((model) => [model.model_id, model]))
             const weightRows = [...new Set([...modelsById.keys(), ...activeJobs.keys()])]
@@ -329,7 +334,7 @@ export function StoragePage() {
               }}
               onDrop={(event) => dropModel(event, node)}
             >
-              <div className="storage-node-heading"><HardDrive size={18} /><div><h3>{node.name}</h3><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div></div>
+              <div className="storage-node-heading"><HardDrive size={18} /><div><h3 title={node.name}>{node.name}</h3><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div></div>
               <div className="storage-capacity">
                 <span>{formatBytes(used)} used</span>
                 {hasFree && <span>{formatBytes(cacheFree)} free</span>}
@@ -365,7 +370,7 @@ export function StoragePage() {
                       disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
-                    <div><strong>{model.model_id}</strong><small>{formatBytes(model.size_bytes)}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
+                    <div><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                     {model.deletable !== false && <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
@@ -397,27 +402,27 @@ export function StoragePage() {
           <form onSubmit={submitTransfer} aria-label="Queue model transfer">
             <div className="field-grid">
               <label className="field"><span>Source node</span><select value={sourceNodeId} onChange={(event) => {
-                const next = nodes.find((node) => node.id === event.target.value)
+                const next = visibleNodes.find((node) => node.id === event.target.value)
                 setSourceNodeId(event.target.value)
                 setModelId(next?.models.find(isTransferableModel)?.model_id ?? '')
                 setTargetNodeIds((current) => current.filter((id) => id !== event.target.value))
-              }}><option value="">Select a source</option>{nodes.map((node) => {
+              }}><option value="">Select a source</option>{visibleNodes.map((node) => {
                 const completeCount = node.models.filter(isTransferableModel).length
                 return <option key={node.id} value={node.id} disabled={!node.online || completeCount === 0}>{node.name}{!node.online ? ' (offline)' : completeCount === 0 ? ' (no transferable models)' : ''}</option>
               })}</select></label>
               <label className="field"><span>Model weights</span><select value={modelId} onChange={(event) => {
                 const nextModelId = event.target.value
                 setModelId(nextModelId)
-                setTargetNodeIds((current) => current.filter((id) => !nodes.find((node) => node.id === id)?.models.some((model) => model.model_id === nextModelId)))
+                setTargetNodeIds((current) => current.filter((id) => !visibleNodes.find((node) => node.id === id)?.models.some((model) => model.model_id === nextModelId)))
               }} disabled={!sourceNode}><option value="">Select a model</option>{sourceModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.model_id}</option>)}</select></label>
             </div>
             <fieldset className="storage-targets"><legend>Target nodes</legend><p>Select every online node that should receive a copy.</p><div>
-              {nodes.filter((node) => node.id !== sourceNodeId).map((node) => {
+              {visibleNodes.filter((node) => node.id !== sourceNodeId).map((node) => {
                 const alreadyAvailable = Boolean(modelId && node.models.some((model) => model.model_id === modelId))
                 const unavailable = !node.online || alreadyAvailable
                 return <label className={`check-field ${unavailable ? 'unavailable' : ''}`} key={node.id}><input type="checkbox" checked={targetNodeIds.includes(node.id)} disabled={unavailable || busy === 'transfer'} onChange={(event) => setTargetNodeIds((current) => event.target.checked ? [...current, node.id] : current.filter((id) => id !== node.id))} /><span><strong>{node.name}</strong><small>{!node.online ? 'Offline' : alreadyAvailable ? 'Model already available' : `${node.models.length} models available`}</small></span></label>
               })}
-              {nodes.filter((node) => node.id !== sourceNodeId).length === 0 && <p className="storage-target-empty">No other nodes are available.</p>}
+              {visibleNodes.filter((node) => node.id !== sourceNodeId).length === 0 && <p className="storage-target-empty">No other nodes are available.</p>}
             </div></fieldset>
             <div className="storage-transfer-actions"><span>{targetNodeIds.length ? `${targetNodeIds.length} target${targetNodeIds.length === 1 ? '' : 's'} selected` : 'Select at least one target'}</span><Button type="submit" variant="primary" disabled={busy === 'transfer' || !modelId || !sourceNodeId || targetNodeIds.length === 0}><UploadCloud size={16} /> {busy === 'transfer' ? 'Queueing…' : 'Queue transfer'}</Button></div>
           </form>
@@ -428,10 +433,10 @@ export function StoragePage() {
           <div className="responsive-table storage-model-table" role="table" aria-label="Model storage inventory">
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Size</span><span role="columnheader">Files</span><span role="columnheader">Node availability</span></div>
             {inventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
-              <div role="cell" data-label="Model"><strong>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? 'Installed' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
-              <div role="cell" data-label="Size">{formatBytes(model.size_bytes)}</div>
+              <div role="cell" data-label="Model"><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? 'Installed' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
+              <div role="cell" data-label="Size">{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}</div>
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
-              <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{nodes.map((node) => {
+              <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{visibleNodes.map((node) => {
                 const location = locations.get(node.id)
                 const resumable = Boolean(location && isPartialModel(location))
                 return <span key={node.id} className={resumable ? 'partial' : location ? 'available' : ''}>{resumable && location ? <button

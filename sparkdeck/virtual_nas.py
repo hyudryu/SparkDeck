@@ -79,6 +79,23 @@ _COMFYUI_MODEL_BUNDLES = (
         (),
     ),
 )
+# Conventional ComfyUI model-store sections scanned by the generic fallback
+# inventory. The scan stays bounded to these directories only.
+_COMFYUI_SECTION_DIRS = (
+    "checkpoints", "diffusion_models", "unet", "loras", "vae",
+    "text_encoders", "clip", "clip_vision", "controlnet", "upscale_models",
+    "embeddings", "latent_upscale_models", "style_models", "hypernetworks",
+)
+# Every file referenced by a known bundle, relative to a ComfyUI model root.
+# The generic fallback never reports these, even while a bundle is incomplete.
+_COMFYUI_BUNDLE_PATHS = frozenset(
+    relative
+    for _, required, alternative_groups, optional in _COMFYUI_MODEL_BUNDLES
+    for relative in (
+        *required, *optional,
+        *(path for group in alternative_groups for path in group),
+    )
+)
 
 
 def _default_comfyui_model_roots() -> list[Path]:
@@ -2719,6 +2736,7 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             root = raw_root.resolve(strict=True)
         except OSError:
             continue
+        claimed: set[Path] = set()
         for model_id, required_files, alternative_groups, optional_files in _COMFYUI_MODEL_BUNDLES:
             files: dict[Path, Path] = {}
 
@@ -2795,7 +2813,85 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
             current = models.get(model_id)
             if current is None or candidate["size_bytes"] > current["size_bytes"]:
                 models[model_id] = candidate
+            claimed.update(files)
+        for entry in _comfyui_fallback_entries(root, claimed):
+            current = models.get(entry["model_id"])
+            if current is None or entry["size_bytes"] > current["size_bytes"]:
+                models[entry["model_id"]] = entry
     return sorted(models.values(), key=lambda item: str(item["model_id"]))
+
+
+def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, Any]]:
+    """Report unrecognized ComfyUI weights grouped by section directory.
+
+    Weight files inside a dedicated subdirectory of a conventional section
+    (e.g. ``checkpoints/Minimax Video/``) collapse into one entry named by
+    that directory; loose files at a section root become one entry per file
+    stem. Files already claimed by a known bundle are never duplicated.
+    """
+    entries: list[dict[str, Any]] = []
+    for section in _COMFYUI_SECTION_DIRS:
+        try:
+            section_dir = root / section
+            if section_dir.is_symlink() or not section_dir.is_dir():
+                continue
+            resolved_section = section_dir.resolve(strict=True)
+            if not resolved_section.is_relative_to(root):
+                continue
+        except OSError:
+            continue
+        groups: dict[str, list[Path]] = {}
+        try:
+            for item in resolved_section.rglob("*"):
+                try:
+                    if item.is_symlink() or not item.is_file():
+                        continue
+                    resolved = item.resolve(strict=True)
+                    if not resolved.is_relative_to(root) or resolved in claimed:
+                        continue
+                    relative = resolved.relative_to(resolved_section)
+                    if (
+                        any(part.startswith(".") for part in relative.parts)
+                        or not _is_weight_file(relative.as_posix().casefold())
+                        or f"{section}/{relative.as_posix()}" in _COMFYUI_BUNDLE_PATHS
+                        or resolved.stat().st_size <= 0
+                    ):
+                        continue
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                parent = relative.parent
+                group = parent.parts[0] if str(parent) != "." else relative.stem
+                groups.setdefault(group, []).append(resolved)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for name, files in groups.items():
+            try:
+                stats = [path.stat() for path in files]
+            except OSError:
+                continue
+            last_modified = max(stat.st_mtime for stat in stats)
+            entries.append({
+                "model_id": name,
+                "size_bytes": sum(stat.st_size for stat in stats),
+                "file_count": len(files),
+                "partial": False,
+                "has_partial_download": False,
+                "partial_size_bytes": 0,
+                "partial_revision_size_bytes": {},
+                "partial_revisions": [],
+                "partial_revision_refs": {},
+                "revision": "ComfyUI",
+                "revisions": [],
+                "revision_refs": {},
+                "last_modified": datetime.fromtimestamp(
+                    last_modified, timezone.utc,
+                ).isoformat(),
+                "source": "ComfyUI",
+                "externally_managed": True,
+                "transferable": False,
+                "deletable": False,
+            })
+    return entries
 
 
 def _safe_incomplete_snapshot_revisions(
@@ -2944,8 +3040,18 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     # Transformers runtimes need both configuration and tokenizer assets.
     if any(name.endswith(".gguf") for name in weights):
         return True
+    if "model_index.json" in lowered:
+        # A declared Diffusers pipeline that failed validation is an
+        # incomplete pipeline, not a raw weights-only repository.
+        return False
     config = lowered.get("config.json")
-    if config is None or not _required_files_are_nonempty([config]):
+    if config is None:
+        # Raw weights-only repositories ship neither configuration nor
+        # tokenizer assets; the integrity gates above (recognized non-empty
+        # weights, complete shards and indexes, no in-progress markers) are
+        # sufficient evidence of a usable snapshot.
+        return True
+    if not _required_files_are_nonempty([config]):
         return False
     tokenizer = [
         path for name, path in lowered.items()

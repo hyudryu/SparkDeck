@@ -1112,12 +1112,16 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_failure_is_recorded(self):
         registry = FakeRegistry(fail_target="worker-a")
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.start = Mock()
         await nas.queue_transfer("org/model", "local", ["worker-a"])
+        job = nas.jobs[0]
+        job["bytes_transferred"] = 5
 
-        final = await self.wait_final(nas, 1)
+        await nas._run_transfer(job)
 
-        self.assertEqual(final[0]["status"], "failed")
-        self.assertIn("simulated target outage", final[0]["error"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["bytes_transferred"], 0)
+        self.assertIn("simulated target outage", job["error"])
         await nas.stop()
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):

@@ -228,6 +228,39 @@ describe('StoragePage', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Queued org/model for transfer to Backup Spark.')
   })
 
+  it('stops polling optimistic jobs after Virtual NAS is disabled', async () => {
+    let enabled = true
+    const storage = { ...enabledStorage, jobs: [] }
+    const queuedJob = {
+      id: 'optimistic-job', kind: 'transfer' as const, model_id: 'org/model',
+      source_node_id: 'node-a', source_node_name: 'Studio Spark',
+      target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'queued',
+      bytes_total: 1_000_000_000, bytes_transferred: 0, progress: 0,
+      created_at: '2026-08-29T12:00:00Z',
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers') && init?.method === 'POST') {
+        return json({ job_ids: [queuedJob.id], jobs: [queuedJob] }, 202)
+      }
+      if (path.endsWith('/api/v1/storage/settings') && init?.method === 'PUT') enabled = false
+      return json(enabled ? storage : { enabled: false, nodes: [], jobs: [], instructions: [] })
+    })
+    const setIntervalSpy = vi.spyOn(window, 'setInterval')
+    const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<StoragePage />)
+
+    await user.click(await screen.findByRole('checkbox', { name: /Backup Spark/ }))
+    await user.click(screen.getByRole('button', { name: 'Queue transfer' }))
+    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalled())
+    await user.click(screen.getByRole('button', { name: 'Disable Virtual NAS' }))
+
+    expect(await screen.findByRole('heading', { name: 'Virtual NAS is off' })).toBeInTheDocument()
+    await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalled())
+  })
+
   it('shows partial caches with a warning and excludes them from transfers', async () => {
     const storage: StorageState = {
       ...enabledStorage,

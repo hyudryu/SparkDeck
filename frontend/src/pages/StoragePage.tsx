@@ -153,7 +153,7 @@ export function StoragePage() {
     setTargetNodeIds((current) => current.filter((id) => id !== nextSourceId && nodes.some((node) => node.id === id && node.online && !node.models.some((model) => model.model_id === nextModelId))))
   }, [modelId, nodes, sourceNodeId])
 
-  const hasActiveJobs = transferJobs.some(isActive)
+  const hasActiveJobs = Boolean(resource.data?.enabled && transferJobs.some(isActive))
   useEffect(() => {
     if (!hasActiveJobs) return
     const timer = window.setInterval(resource.reload, 3000)

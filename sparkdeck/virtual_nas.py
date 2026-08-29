@@ -1273,7 +1273,9 @@ class VirtualNAS:
         self._peer_imports[transfer_id] = record
         url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=15)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(3600, connect=15), trust_env=False,
+            ) as client:
                 async with client.stream("GET", url, headers={
                     "X-SparkDeck-Direct-Transfer-Capability": source_capability,
                 }) as response:
@@ -1771,7 +1773,7 @@ class VirtualNAS:
                 source_response = await self.node_registry.open_stream(
                     source_node_id, "GET",
                     f"{self._model_agent_path(model_id, 'files/export')}?{query}",
-                    timeout=3600,
+                    timeout=3600, use_fabric=True,
                 )
                 await _raise_remote_status(source_response, "source")
                 source = source_response.aiter_bytes()
@@ -1787,7 +1789,7 @@ class VirtualNAS:
                     "Content-Type": "application/x-tar",
                     "X-SparkDeck-Model-Bytes": str(expected),
                 },
-                timeout=3600,
+                timeout=3600, use_fabric=True,
             )
             await _raise_remote_status(target_response, "target")
             await target_response.aread()
@@ -2646,12 +2648,25 @@ class VirtualNAS:
                 source = self.export_model(job["model_id"])
             else:
                 direct_source = None
+                direct_target = None
                 if job["target_node_id"] != LOCAL_NODE_ID:
-                    direct_source = getattr(
-                        self.node_registry, "direct_transfer_source", lambda _node_id: None,
-                    )(
-                        job["source_node_id"]
+                    resolver = getattr(
+                        self.node_registry, "resolve_direct_transfer_source", None,
                     )
+                    if resolver is not None:
+                        direct_source = await resolver(job["source_node_id"])
+                        direct_target = await resolver(job["target_node_id"])
+                    else:
+                        direct_source = getattr(
+                            self.node_registry, "direct_transfer_source", lambda _node_id: None,
+                        )(
+                            job["source_node_id"]
+                        )
+                        direct_target = getattr(
+                            self.node_registry, "direct_transfer_source", lambda _node_id: None,
+                        )(
+                            job["target_node_id"]
+                        )
                 target_status = (
                     await self._validate_online_node(job["target_node_id"])
                     if direct_source is not None else None
@@ -2662,7 +2677,7 @@ class VirtualNAS:
                 )
                 if (
                     direct_source is not None
-                    and getattr(self.node_registry, "direct_transfer_source", lambda _node_id: None)(job["target_node_id"])
+                    and direct_target is not None
                     and VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY
                     in (target_status.get("capabilities") or [])
                     and VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY
@@ -2712,7 +2727,8 @@ class VirtualNAS:
                 else:
                     source_response = await self.node_registry.open_stream(
                         job["source_node_id"], "GET",
-                        self._model_agent_path(job["model_id"], "export"), timeout=3600,
+                        self._model_agent_path(job["model_id"], "export"),
+                        timeout=3600, use_fabric=True,
                     )
                     await _raise_remote_status(source_response, "source")
                     source = source_response.aiter_bytes()
@@ -2745,7 +2761,7 @@ class VirtualNAS:
                         "Content-Type": "application/x-tar",
                         "X-SparkDeck-Model-Bytes": str(actual_size),
                     },
-                    timeout=3600,
+                    timeout=3600, use_fabric=True,
                 )
                 await _raise_remote_status(target_response, "target")
                 await target_response.aread()

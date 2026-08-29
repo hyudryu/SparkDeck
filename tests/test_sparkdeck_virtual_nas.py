@@ -74,6 +74,7 @@ class FakeRegistry:
         self.max_active = 0
         self.received: dict[str, bytes] = {}
         self.remote_models: dict[str, list[dict]] = {}
+        self.stream_calls: list[tuple[str, str, str, dict]] = []
 
     def get(self, node_id):
         return self.nodes.get(node_id)
@@ -95,6 +96,7 @@ class FakeRegistry:
         }
 
     async def open_stream(self, node_id, method, path, **kwargs):
+        self.stream_calls.append((node_id, method, path, kwargs))
         if node_id == self.fail_target:
             raise RuntimeError("simulated target outage")
         if method != "PUT":
@@ -120,13 +122,36 @@ class FakeRegistry:
         return FakeResponse()
 
 
+class RemoteSourceRegistry(FakeRegistry):
+    """A fabric-configured remote source for archive-leg routing tests."""
+
+    async def request(self, node_id, method, path, **_kwargs):
+        if "files/size" in path:
+            return {"size_bytes": 7}
+        return await super().request(node_id, method, path)
+
+    async def open_stream(self, node_id, method, path, **kwargs):
+        self.stream_calls.append((node_id, method, path, kwargs))
+        if method == "GET":
+            class SourceResponse(FakeResponse):
+                async def aiter_bytes(self):
+                    yield b"archive"
+            return SourceResponse()
+        return await super().open_stream(node_id, method, path, **kwargs)
+
+
 class DirectTransferRegistry(FakeRegistry):
     def __init__(self):
         super().__init__()
         self.direct_requests: list[tuple[str, str, str, dict]] = []
+        self.direct_resolutions: list[str] = []
 
     def direct_transfer_source(self, node_id):
         return {"worker-a": "http://169.254.10.4:7878", "worker-b": "http://169.254.10.3:7878"}.get(node_id)
+
+    async def resolve_direct_transfer_source(self, node_id):
+        self.direct_resolutions.append(node_id)
+        return self.direct_transfer_source(node_id)
 
     async def probe(self, node, force=False):
         return {
@@ -1655,6 +1680,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["bytes_transferred"], 123)
         self.assertEqual(registry.received, {})
+        self.assertEqual(registry.direct_resolutions, ["worker-a", "worker-b"])
         self.assertEqual(
             [path for _, _, path, _ in registry.direct_requests if path.endswith(("export-capability", "import-from-peer"))],
             [
@@ -1662,6 +1688,94 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 "/api/agent/virtual-nas/models/org%2Fmodel/import-from-peer",
             ],
         )
+
+    async def test_local_source_whole_model_upload_uses_fabric_stream(self):
+        registry = FakeRegistry()
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        job = {
+            "id": "local-source-job", "kind": "transfer", "model_id": "org/model",
+            "source_node_id": "local", "target_node_id": "worker-a",
+            "revision": "revision-1", "requested_revision": "revision-1",
+            "status": "queued", "bytes_total": 0, "bytes_transferred": 0,
+            "created_at": 0, "started_at": None, "completed_at": None, "error": None,
+        }
+        nas.jobs = [job]
+
+        await nas._run_transfer(job)
+
+        self.assertEqual(job["status"], "completed")
+        upload = next(call for call in registry.stream_calls if call[1] == "PUT")
+        self.assertTrue(upload[3]["use_fabric"])
+
+    async def test_remote_source_whole_model_download_uses_fabric_stream(self):
+        registry = RemoteSourceRegistry()
+        registry.remote_models["worker-a"] = [{
+            "model_id": "org/model", "size_bytes": 7,
+            "partial": False, "transferable": True, "revisions": ["revision-1"],
+        }]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        local_models: list[dict] = []
+
+        async def storage(node_id):
+            if node_id == "worker-a":
+                return {"models": registry.remote_models["worker-a"], "free_size": 10**12}
+            return {"models": local_models, "free_size": 10**12}
+
+        async def imported(model_id, chunks, **_kwargs):
+            received = b"".join([chunk async for chunk in chunks])
+            local_models.append({
+                "model_id": model_id, "size_bytes": len(received),
+                "partial": False, "revisions": ["revision-1"],
+            })
+            return {"bytes_received": len(received)}
+
+        nas._node_storage = storage
+        nas.import_model = imported
+        job = {
+            "id": "remote-source-job", "kind": "transfer", "model_id": "org/model",
+            "source_node_id": "worker-a", "target_node_id": "local",
+            "revision": "revision-1", "requested_revision": "revision-1",
+            "status": "queued", "bytes_total": 7, "bytes_transferred": 0,
+            "created_at": 0, "started_at": None, "completed_at": None, "error": None,
+        }
+        nas.jobs = [job]
+
+        await nas._run_transfer(job)
+
+        self.assertEqual(job["status"], "completed")
+        download = next(call for call in registry.stream_calls if call[1] == "GET")
+        self.assertTrue(download[3]["use_fabric"])
+
+    async def test_local_source_selective_file_upload_uses_fabric_stream(self):
+        registry = FakeRegistry()
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+
+        result = await nas.transfer_model_files(
+            "org/model", "revision-1", ["model.safetensors"], "local", "worker-a",
+        )
+
+        self.assertTrue(result["ok"])
+        upload = next(call for call in registry.stream_calls if call[1] == "PUT")
+        self.assertTrue(upload[3]["use_fabric"])
+
+    async def test_remote_source_selective_file_download_uses_fabric_stream(self):
+        registry = RemoteSourceRegistry()
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+
+        async def imported(_model_id, chunks, **_kwargs):
+            return {
+                "ok": True,
+                "bytes_received": len(b"".join([chunk async for chunk in chunks])),
+            }
+
+        nas.import_model_files = imported
+        result = await nas.transfer_model_files(
+            "org/model", "revision-1", ["model.safetensors"], "worker-a", "local",
+        )
+
+        self.assertTrue(result["ok"])
+        download = next(call for call in registry.stream_calls if call[1] == "GET")
+        self.assertTrue(download[3]["use_fabric"])
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):
         registry = FakeRegistry(block_upload=True)

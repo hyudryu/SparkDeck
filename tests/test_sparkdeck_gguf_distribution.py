@@ -260,8 +260,12 @@ class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 models = [{"model_id": "org/model", "size_bytes": 10}]
             return {"models": models, "free_size": 1 << 30}
 
-        async def fake_open_stream(node_id, method, path, *, content=None, headers=None, timeout=600):
+        async def fake_open_stream(
+            node_id, method, path, *, content=None, headers=None, timeout=600,
+            use_fabric=False,
+        ):
             if method == "PUT" and path.endswith("/files/import"):
+                assert use_fabric, "selective archive uploads must use the fabric path"
                 model_bytes = int(headers["X-SparkDeck-Model-Bytes"])
                 await target.import_model_files(
                     "org/model", content, required_model_bytes=model_bytes,

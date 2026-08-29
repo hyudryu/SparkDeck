@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SplitButton, Tooltip } from './ui'
+import { formatDuration, formatNumber, formatRate, SplitButton, Tooltip } from './ui'
 
 afterEach(() => {
   cleanup()
@@ -20,6 +20,21 @@ function renderSplitButton() {
   )
   return onSelect
 }
+
+describe('format helpers', () => {
+  it('renders placeholders for null and undefined measurements', () => {
+    // Benchmark samples can be recorded without timing data; the API then
+    // returns JSON null, which previously crashed the page on .toFixed.
+    expect(formatRate(null)).toBe('—')
+    expect(formatRate(undefined)).toBe('—')
+    expect(formatRate(42.54)).toBe('42.5 tok/s')
+    expect(formatDuration(null)).toBe('—')
+    expect(formatDuration(undefined)).toBe('—')
+    expect(formatDuration(250)).toBe('250 ms')
+    expect(formatNumber(null)).toBe('—')
+    expect(formatNumber(undefined)).toBe('—')
+  })
+})
 
 describe('SplitButton', () => {
   it('moves keyboard focus into the menu and back to the toggle on close', async () => {

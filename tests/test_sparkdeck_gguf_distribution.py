@@ -55,6 +55,7 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
         virtual_nas._model_path = Mock(return_value=self.model_root)
+        virtual_nas.model_in_transfer = Mock(return_value=False)
         virtual_nas.enabled = True
         self.virtual_nas = virtual_nas
         self.manager.virtual_nas = virtual_nas
@@ -139,6 +140,16 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "worker-1"):
+            await self.prepare(home_node_ids=["local", "worker-1"])
+
+        self.manager.node_download_model_files.assert_not_awaited()
+
+    async def test_homes_with_active_transfers_are_rejected_before_downloading(self):
+        self.virtual_nas.model_in_transfer = Mock(
+            side_effect=lambda model_id, node_id: node_id == "worker-1"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "already active on node"):
             await self.prepare(home_node_ids=["local", "worker-1"])
 
         self.manager.node_download_model_files.assert_not_awaited()

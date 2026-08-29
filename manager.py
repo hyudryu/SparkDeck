@@ -2360,11 +2360,27 @@ class Manager:
         # A cached seed's export contains its whole repository, including
         # other revisions and blobs that are absent from the Hub estimate for
         # this revision. Use a cache-empty seed whenever fan-out is needed so
-        # target sizing remains tied to the requested snapshot size.
+        # target sizing remains tied to the requested snapshot size. An
+        # explicitly designated seed is honored only under the same
+        # invariant: when fan-out is required, a seed that already caches
+        # this repository is rejected instead of silently expanding the
+        # transferred archive beyond the admitted disk budget.
         if requested_seed:
-            # An explicitly designated seed is authoritative: consider only
-            # that node so the plan either honors the choice or reports why
-            # it cannot, instead of silently downloading somewhere else.
+            fan_out = any(node_id != requested_seed for node_id in missing_ids)
+            if fan_out and options[requested_seed].get("has_model_cache"):
+                return {
+                    **preflight, "download": download,
+                    "download_error": download_error,
+                    "node_ids": selected_ids, "eligible": False,
+                    "action": "download", "download_node_id": None,
+                    "download_node_ids": [],
+                    "transfer_target_node_ids": missing_ids,
+                    "reason": (
+                        "the designated seed already caches this repository; "
+                        "Virtual NAS fan-out needs a cache-empty seed so "
+                        "transferred sizes match the requested revision"
+                    ),
+                }
             candidate_ids = [requested_seed]
         else:
             candidate_ids = empty_candidate_ids or selected_ids

@@ -198,6 +198,21 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["download_node_id"], "node-a")
         self.assertEqual(plan["transfer_target_node_ids"], ["node-b"])
 
+    async def test_cached_explicit_seed_is_rejected_when_fan_out_is_required(self):
+        preflight = preparation_preflight([
+            target("node-b", has_model_cache=True), target("node-a"),
+        ])
+        manager = planning_manager(preflight)
+
+        plan = await manager.recipe_model_preparation_preflight(
+            MODEL_ID, REVISION, ["node-b", "node-a"],
+            download_node_id="node-b",
+        )
+
+        self.assertFalse(plan["eligible"])
+        self.assertIsNone(plan["download_node_id"])
+        self.assertIn("cache-empty seed", str(plan["reason"]))
+
     async def test_explicit_seed_that_cannot_download_blocks_instead_of_falling_back(self):
         preflight = preparation_preflight([target("node-b"), target("node-a")])
         preflight["targets"][1]["download_eligible"] = False

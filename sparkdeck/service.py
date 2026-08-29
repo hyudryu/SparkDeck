@@ -1367,6 +1367,18 @@ class SparkDeckService:
                 "node(s) do not support selective model file transfers; "
                 "update their SparkDeck agent: " + ", ".join(unsupported)
             )
+        # A queued or running whole-repository import for the same model
+        # would race this file-scoped distribution on the same cache, so
+        # homes with active preparation are refused up front.
+        busy = [
+            node_id for node_id in home_node_ids
+            if self.manager.virtual_nas.model_in_transfer(repository, node_id)
+        ]
+        if busy:
+            raise RuntimeError(
+                "model preparation is already active on node(s): "
+                + ", ".join(busy)
+            )
         complete: dict[str, bool] = {}
         for node_id in home_node_ids:
             try:

@@ -328,6 +328,10 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 )
                 partial_model = nas.inventory()[0]
                 self.assertTrue(partial_model["partial"])
+                self.assertEqual(
+                    partial_model["selective_files_by_revision"],
+                    {resolved: [selected_name]},
+                )
                 self.assertEqual(partial_model["revision"], "release-gguf")
                 self.assertEqual(partial_model["revision_refs"], {})
                 self.assertEqual(
@@ -575,6 +579,9 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                     "model-Q4_K_M.gguf",
                     "sub/dir/tokenizer.json",
                 ],
+                selective_revision: ["model-Q8_0.gguf"],
+            })
+            self.assertEqual(models[0]["selective_files_by_revision"], {
                 selective_revision: ["model-Q8_0.gguf"],
             })
             if escape_linked:

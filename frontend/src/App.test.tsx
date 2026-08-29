@@ -939,6 +939,8 @@ describe('model deployments', () => {
   it('moves an accepted recipe launch into Deployments and refreshes its live phase', async () => {
     const user = userEvent.setup()
     let deploymentListCalls = 0
+    let resolveLiveRefresh: (response: Response) => void = () => undefined
+    const liveRefresh = new Promise<Response>((resolve) => { resolveLiveRefresh = resolve })
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
@@ -955,11 +957,8 @@ describe('model deployments', () => {
       }
       if (path.includes('/api/v1/deployments')) {
         deploymentListCalls += 1
-        const deployments = deploymentListCalls === 1 ? [] : deploymentListCalls === 2 ? [{
-          id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
-          model: { repository: 'org/model' }, status: 'error', settings: {},
-          node_ids: ['local'], launch_phase: 'pulling_image', launch_message: 'Downloading Docker image',
-        }] : [{
+        if (deploymentListCalls === 2) return liveRefresh
+        const deployments = deploymentListCalls === 1 ? [] : [{
           id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
           model: { repository: 'org/model' }, status: 'running', settings: {},
           node_ids: ['local'], launch_phase: 'ready', launch_message: 'SGLang API ready',
@@ -990,6 +989,16 @@ describe('model deployments', () => {
     expect(within(deploymentRow).getByText('Launch accepted')).toBeInTheDocument()
     expect(within(deploymentRow).getByRole('button', { name: 'Stop' })).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent('Started deployment Live recipe on This device.')
+
+    await waitFor(() => expect(deploymentListCalls).toBe(2), { timeout: 3500 })
+    expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Live recipe' })).toBeInTheDocument()
+
+    resolveLiveRefresh(new Response(JSON.stringify({ items: [{
+      id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
+      model: { repository: 'org/model' }, status: 'error', settings: {},
+      node_ids: ['local'], launch_phase: 'pulling_image', launch_message: 'Downloading Docker image',
+    }] }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 
     expect(await within(deploymentRow).findByText('Downloading Docker image', {}, { timeout: 3500 })).toBeInTheDocument()
     expect(within(deploymentRow).getByText('Pulling Image')).toBeInTheDocument()
@@ -1100,6 +1109,8 @@ describe('model deployments', () => {
       '/api/v1/deployments/dep-remove', expect.objectContaining({ method: 'DELETE' }),
     ))
     await waitFor(() => expect(screen.queryByRole('link', { name: 'Remove accepted' })).not.toBeInTheDocument())
+    expect(screen.getByText('No deployments yet')).toBeInTheDocument()
+    expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
 
     resolveInitialList(new Response(JSON.stringify({ items: [] }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

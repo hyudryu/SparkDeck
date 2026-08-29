@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type FormEvent } from 'react'
-import { AlertTriangle, ArrowLeftRight, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowLeftRight, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Search, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { StorageModel, StorageNode, StorageTransferJob } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -102,6 +102,7 @@ export function StoragePage() {
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [queuedJobs, setQueuedJobs] = useState<StorageTransferJob[]>([])
+  const [modelSearch, setModelSearch] = useState('')
   const [draggedModel, setDraggedModel] = useState<DraggedModel>()
   const [dropTargetId, setDropTargetId] = useState<string>()
   const draggedModelRef = useRef<DraggedModel | undefined>(undefined)
@@ -130,6 +131,11 @@ export function StoragePage() {
     }))
     return [...models.values()].sort((left, right) => compareModels(left.model, right.model))
   }, [visibleNodes])
+  const normalizedModelSearch = modelSearch.trim().toLocaleLowerCase()
+  const matchesModelSearch = (modelId: string) => (
+    !normalizedModelSearch || modelId.toLocaleLowerCase().includes(normalizedModelSearch)
+  )
+  const filteredInventory = inventory.filter(({ model }) => matchesModelSearch(model.model_id))
   const transferJobs = useMemo(() => {
     const serverJobs = resource.data?.jobs ?? []
     const knownJobIds = new Set(serverJobs.map((job) => job.id))
@@ -334,13 +340,26 @@ export function StoragePage() {
 
       {resource.data?.enabled && <>
         <div className="section-heading"><div><h2>Node storage</h2><p>Drag an individual model to another online node, or use the transfer form below.</p></div></div>
+        <label className="storage-model-search">
+          <span className="sr-only">Search models across all storage nodes</span>
+          <Search size={16} aria-hidden="true" />
+          <input
+            type="search"
+            value={modelSearch}
+            onChange={(event) => setModelSearch(event.target.value)}
+            placeholder="Search models across all nodes"
+          />
+        </label>
         {visibleNodes.length === 0 ? <EmptyState title="No storage nodes" description="Join a node to the cluster before transferring model weights." /> : <div className="storage-node-grid">
           {visibleNodes.map((node) => {
-            const activeJobs = activeJobsByNode.get(node.id) ?? new Map<string, StorageTransferJob>()
+            const activeJobs = new Map(
+              [...(activeJobsByNode.get(node.id) ?? new Map<string, StorageTransferJob>())]
+                .filter(([activeModelId]) => matchesModelSearch(activeModelId)),
+            )
             const modelsById = new Map(node.models.map((model) => [model.model_id, model]))
             const weightRows = [
               ...[...activeJobs.values()].sort(compareJobsNewestFirst).map((job) => job.model_id),
-              ...node.models.filter((model) => !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
+              ...node.models.filter((model) => matchesModelSearch(model.model_id) && !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
             ]
             const used = node.models.reduce(
               (total, model) => total + (model.externally_managed ? 0 : model.size_bytes),
@@ -389,7 +408,7 @@ export function StoragePage() {
               </div>
               <div className="storage-capacity-track" aria-label={`${node.name} used model storage`}><span style={{ width: `${capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0}%` }} /></div>
               <p className="storage-drop-hint">{dropTargetId === node.id ? `Drop to copy ${draggedModel?.modelId}` : alreadyStored ? 'This model is already available here' : node.online ? 'Drop model weights here to queue a copy' : 'Node must be online to receive transfers'}</p>
-              {weightRows.length === 0 ? <p className="storage-node-empty">No model weights reported</p> : <ul className="storage-weight-list">
+              {weightRows.length === 0 ? <p className="storage-node-empty">{normalizedModelSearch ? 'No models match this search' : 'No model weights reported'}</p> : <ul className="storage-weight-list">
                 {weightRows.map((modelId) => {
                   const job = activeJobs.get(modelId)
                   const model = modelsById.get(modelId)
@@ -499,10 +518,10 @@ export function StoragePage() {
         </Panel>}
 
         <div className="section-heading"><div><h2>Model inventory</h2><p>Availability matrix across every storage node.</p></div></div>
-        {inventory.length === 0 ? <EmptyState title="No model weights found" description="Models downloaded on participating nodes will appear here." /> : <Panel className="table-panel">
+        {filteredInventory.length === 0 ? <EmptyState title={normalizedModelSearch ? 'No matching models' : 'No model weights found'} description={normalizedModelSearch ? 'Try another model name or clear the search.' : 'Models downloaded on participating nodes will appear here.'} /> : <Panel className="table-panel">
           <div className="responsive-table storage-model-table" role="table" aria-label="Model storage inventory">
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Size</span><span role="columnheader">Files</span><span role="columnheader">Node availability</span></div>
-            {inventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
+            {filteredInventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
               <div role="cell" data-label="Model"><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? 'Installed' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
               <div role="cell" data-label="Size">{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}</div>
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>

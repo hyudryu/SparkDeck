@@ -3853,8 +3853,6 @@ class Manager:
             settings["node_ids"] = settings["node_ids"][:1] or [LOCAL_NODE_ID]
         elif len(settings["node_ids"]) < 2:
             raise ValueError(f"{mode} deployment requires at least two nodes")
-        if mode == "sharded" and settings["node_ids"][0] != LOCAL_NODE_ID:
-            raise ValueError("the coordinator must be the first node in a sharded deployment")
         if mode == "sharded" and settings["engine"] == "vllm":
             requested_tp = self._cli_option(
                 settings["extra_args"], {"--tensor-parallel-size", "-tp"}, int
@@ -4796,9 +4794,6 @@ class Manager:
             node_ids = node_ids[:1] or [LOCAL_NODE_ID]
         elif len(node_ids) < 2:
             raise ValueError(f"{mode} deployment requires at least two nodes")
-        if mode == "sharded" and node_ids[0] != LOCAL_NODE_ID:
-            raise ValueError("the coordinator must be the first node in a sharded deployment")
-
         available = {n["id"]: n for n in await self.cluster_nodes()}
         missing = [nid for nid in node_ids if nid not in available]
         offline = [nid for nid in node_ids if nid in available and not available[nid].get("online")]
@@ -4855,23 +4850,27 @@ class Manager:
                 )
             else:
                 local_port = await self._allocate_port()
-        master_ip, _ = self._inferred_fabric(
-            available[LOCAL_NODE_ID],
-            self.settings.get("cluster_fabric_ip"),
-            self.settings.get("cluster_fabric_interface"),
-        )
-        if mode == "sharded" and not master_ip:
-            raise ValueError("could not determine the coordinator ConnectX/fabric IP")
         fabrics: dict[str, tuple[str | None, str | None]] = {}
         for node_id in node_ids:
             node = available[node_id]
+            requested_ip = (
+                self.settings.get("cluster_fabric_ip")
+                if node_id == LOCAL_NODE_ID else node.get("fabric_ip")
+            )
+            requested_interface = (
+                self.settings.get("cluster_fabric_interface")
+                if node_id == LOCAL_NODE_ID else node.get("fabric_interface")
+            )
             fabrics[node_id] = self._inferred_fabric(
-                node, node.get("fabric_ip"), node.get("fabric_interface")
+                node, requested_ip, requested_interface
             )
             if mode == "sharded" and not fabrics[node_id][0]:
                 raise ValueError(
                     f"could not determine fabric IP for {node.get('name', node_id)}"
                 )
+        master_ip = fabrics[node_ids[0]][0]
+        if mode == "sharded" and not master_ip:
+            raise ValueError("could not determine the coordinator ConnectX/fabric IP")
 
         return {
             "body": body,

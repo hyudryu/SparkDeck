@@ -16,7 +16,11 @@ const initialForm: CreateDeploymentInput = {
   runtime: 'vllm',
   managed: true,
   endpoint_url: '',
-  settings: { context_length: 8192, tensor_parallel_size: 1 },
+  settings: {
+    context_length: 8192,
+    tensor_parallel_size: 1,
+    image: 'nvcr.io/nvidia/vllm:26.03.post1-py3',
+  },
   node_ids: ['local'],
   deployment_mode: 'single',
 }
@@ -47,12 +51,19 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
     && savedContextLength >= 256
     ? savedContextLength
     : initialForm.settings.context_length
+  const vllmImage = typeof settings?.vllm_image === 'string' && settings.vllm_image.trim()
+    ? settings.vllm_image.trim()
+    : initialForm.settings.image
   return {
     ...initialForm,
     runtime,
     settings: runtime === 'llama.cpp'
       ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-      : { context_length: contextLength, tensor_parallel_size: 1 },
+      : {
+        context_length: contextLength,
+        tensor_parallel_size: 1,
+        image: runtime === 'vllm' ? vllmImage : undefined,
+      },
     node_ids: [localNodeId],
   }
 }
@@ -494,11 +505,14 @@ export function ModelsPage() {
       const local = inventory.find((node) => node.local)
       const available = (current.node_ids ?? []).filter((id) => inventory.some((node) => node.id === id && isNodeSelectable(node)))
       const fallback = local && isNodeSelectable(local) ? local : inventory.find(isNodeSelectable)
-      const sharded = (current.deployment_mode === 'sharded' || catalogShardedLayout.current)
-        && Boolean(local && isNodeSelectable(local))
-      const nodeIds = sharded
-        ? [local!.id, ...inventory.filter((node) => node.id !== local!.id && isNodeSelectable(node)).map((node) => node.id)]
+      const requestedSharded = current.deployment_mode === 'sharded' || catalogShardedLayout.current
+      const shardedCandidates = available.length > 1
+        ? available
+        : inventory.filter(isNodeSelectable).map((node) => node.id)
+      const nodeIds = requestedSharded
+        ? shardedCandidates
         : available.length ? available : fallback ? [fallback.id] : []
+      const sharded = requestedSharded && nodeIds.length > 1
       const deploymentMode = sharded && nodeIds.length > 1 ? 'sharded' : nodeIds.length > 1 ? 'replicated' : 'single'
       catalogShardedLayout.current = false
       return {
@@ -514,7 +528,7 @@ export function ModelsPage() {
   }, [nodes.data])
 
   const localNodeId = nodes.data?.find((node) => node.local)?.id
-  const shardedAvailable = nodes.data?.some((node) => node.id === localNodeId && isNodeSelectable(node)) ?? false
+  const shardedAvailable = (nodes.data?.filter(isNodeSelectable).length ?? 0) > 1
 
   useEffect(() => {
     if (!appSettings.data || defaultsApplied.current) return
@@ -550,6 +564,7 @@ export function ModelsPage() {
             context_length: contextLength,
             tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
             quantization: current.settings.quantization,
+            image: runtime === 'vllm' ? current.settings.image ?? defaults.settings.image : undefined,
           },
       }
     })
@@ -559,7 +574,6 @@ export function ModelsPage() {
     && (form.node_ids ?? []).every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
     && (form.deployment_mode !== 'sharded' || (
       (form.node_ids?.length ?? 0) > 1
-      && form.node_ids?.[0] === localNodeId
       && form.settings.tensor_parallel_size === (form.node_ids?.length ?? 0)
     ))
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
@@ -844,9 +858,7 @@ export function ModelsPage() {
 
   const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
     const sharded = current.deployment_mode === 'sharded'
-    const nodeIds = sharded && localNodeId
-      ? [localNodeId, ...selectedIds.filter((id) => id !== localNodeId)]
-      : selectedIds
+    const nodeIds = selectedIds
     const deploymentMode = nodeIds.length > 1 ? (sharded ? 'sharded' : 'replicated') : 'single'
     return {
       ...current,
@@ -861,9 +873,7 @@ export function ModelsPage() {
 
   const updateDeploymentMode = (mode: 'replicated' | 'sharded') => setForm((current) => {
     const selectedIds = current.node_ids ?? []
-    const nodeIds = mode === 'sharded' && localNodeId
-      ? [localNodeId, ...selectedIds.filter((id) => id !== localNodeId)]
-      : selectedIds
+    const nodeIds = selectedIds
     return {
       ...current,
       node_ids: nodeIds,
@@ -897,6 +907,9 @@ export function ModelsPage() {
       endpoint_url: '',
       settings: {
         ...deployment.settings,
+        image: deployment.settings.image
+          ?? deployment.image
+          ?? (deployment.runtime === 'vllm' ? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image : undefined),
         extra_args: deployment.settings.extra_args ?? [],
       },
       node_ids: deployment.node_ids?.length ? deployment.node_ids : (localNodeId ? [localNodeId] : []),
@@ -929,6 +942,7 @@ export function ModelsPage() {
         // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
           alias: form.alias,
+          image: form.runtime === 'vllm' ? settings.image ?? null : undefined,
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
           parallel_slots: settings.parallel_slots ?? null,
@@ -1374,11 +1388,8 @@ export function ModelsPage() {
   const openRecipeDeployment = (recipe: SavedConfiguration) => {
     const weighted = nodesWithWeights(recipe)
     const eligible = (nodes.data ?? []).filter(isNodeSelectable)
-    let preferred = [...new Set(recipe.node_ids)]
+    const preferred = [...new Set(recipe.node_ids)]
       .filter((id) => eligible.some((node) => node.id === id))
-    if (recipe.deployment_mode === 'sharded' && localNodeId && eligible.some((node) => node.id === localNodeId)) {
-      preferred = [localNodeId, ...preferred.filter((id) => id !== localNodeId)]
-    }
     const weightedFallback = eligible.filter((node) => weighted.has(node.id)).map((node) => node.id)
     const nodeIds = [...preferred, ...weightedFallback, ...eligible.map((node) => node.id)]
       .filter((id, index, values) => values.indexOf(id) === index)
@@ -1539,6 +1550,9 @@ export function ModelsPage() {
             context_length: contextLength,
             tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
             quantization: current.settings.quantization,
+            image: runtime === 'vllm'
+              ? current.settings.image ?? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image
+              : undefined,
           },
       }
     })
@@ -1754,14 +1768,12 @@ export function ModelsPage() {
                 ?? preflightTargets.get(node.id)?.transfer_after_download_reason
                 ?? 'Model weights not cached',
         ]))
-        const localRequired = recipe.deployment_mode === 'sharded' && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === recipe.required_node_count
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const weightsReady = nodeIds.every((id) => weighted.has(id))
         const activeSelected = nodeIds.some((id) => recipeTransferJobs[recipeJobKey(recipe.id, recipe.model, id)])
-        const coordinatorReady = recipe.deployment_mode !== 'sharded' || Boolean(localNodeId && nodeIds.includes(localNodeId))
-        const ready = !nodes.loading && !nodes.error && exactCount && allEligible && weightsReady && coordinatorReady
-        const canPrepare = !localPath && Boolean(transferPreflight.data?.enabled) && !transferPreflight.loading && exactCount && allEligible && !weightsReady && !activeSelected && coordinatorReady
+        const ready = !nodes.loading && !nodes.error && exactCount && allEligible && weightsReady
+        const canPrepare = !localPath && Boolean(transferPreflight.data?.enabled) && !transferPreflight.loading && exactCount && allEligible && !weightsReady && !activeSelected
         const recipeBusy = busy === `recipe:${recipe.id}` || busy === `recipe-prepare:${recipe.id}`
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !recipeBusy && setRecipeDeployment(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deploy-saved-configuration-title">
@@ -1781,13 +1793,10 @@ export function ModelsPage() {
               onRetry={nodes.reload}
               multiple={recipe.required_node_count > 1}
               disabled={recipeBusy}
-              requiredIds={localRequired}
               allowedIds={allowedIds}
               unavailableReasons={unavailableReasons}
               localLabel={localLabel}
-              primaryId={recipe.deployment_mode === 'sharded'
-                ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
-                : nodeIds[0]}
+              primaryId={nodeIds[0]}
               legend={layoutLegend(recipe.deployment_mode, recipe.required_node_count)}
               help={localPath ? 'Local model paths can run only on the controller.' : `Choose the intended deployment nodes. ${layoutHelp(recipe.deployment_mode)} SparkDeck can seed ${recipe.model} from Hugging Face and fan it out through Virtual NAS.`}
             />
@@ -1839,7 +1848,6 @@ export function ModelsPage() {
                 })}
               </div>}
             </div>}
-            {recipe.deployment_mode === 'sharded' && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={(!ready && !canPrepare) || recipeBusy} onClick={() => void (ready ? deployRecipe() : prepareRecipeWeights())}>{ready ? <Play size={15} /> : <UploadCloud size={15} />} {recipeBusy ? (busy === `recipe:${recipe.id}` ? 'Deploying…' : 'Queueing…') : ready ? `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}` : 'Prepare selected nodes'}</Button></div>
           </section>
@@ -1879,12 +1887,10 @@ export function ModelsPage() {
                   ?? 'Model weights not cached and the node cannot receive them']
           }))
         const sharded = deployment.deployment_mode === 'sharded'
-        const localRequired = sharded && localNodeId && allowedIds.includes(localNodeId) ? [localNodeId] : []
         const exactCount = nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-        const coordinatorReady = !sharded || Boolean(localNodeId && nodeIds.includes(localNodeId))
         const planReady = !savedLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
-        const ready = !nodes.loading && !nodes.error && planReady && exactCount && allEligible && coordinatorReady
+        const ready = !nodes.loading && !nodes.error && planReady && exactCount && allEligible
         const needsPrep = savedLaunch && !controllerArtifact && nodeIds.some((id) => !weighted.has(id))
         const startBusy = busy === deployment.id
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
@@ -1904,13 +1910,10 @@ export function ModelsPage() {
               onRetry={() => { nodes.reload(); modelCache.reload(); if (savedLaunch) startPreflight.reload() }}
               multiple={required > 1}
               disabled={startBusy}
-              requiredIds={localRequired}
               allowedIds={allowedIds}
               unavailableReasons={unavailableReasons}
               localLabel={localLabel}
-              primaryId={sharded
-                ? (localNodeId && nodeIds.includes(localNodeId) ? localNodeId : undefined)
-                : nodeIds[0]}
+              primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
               help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />
@@ -1927,7 +1930,6 @@ export function ModelsPage() {
               </select>
               <small>One selected node downloads the GGUF from Hugging Face and the rest receive copies over the cluster network. Pick a node to control where that download runs.</small>
             </label>}
-            {sharded && !coordinatorReady && <p className="field-note">Sharded deployments must include the controller. Transfer the model weights to the controller in Storage if it is disabled.</p>}
             {allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : 'Starting…') : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
@@ -1987,6 +1989,7 @@ export function ModelsPage() {
                 <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select
                   value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
@@ -2069,14 +2072,13 @@ export function ModelsPage() {
                 onRetry={nodes.reload}
                 multiple={form.runtime !== 'llama.cpp' || !isLocalArtifact(form.settings.artifact)}
                 disabled={busy === 'create' || busy === 'edit'}
-                requiredIds={form.deployment_mode === 'sharded' && localNodeId ? [localNodeId] : []}
                 localLabel={localLabel}
-                primaryId={form.deployment_mode === 'sharded' ? localNodeId : (form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
+                primaryId={(form.node_ids?.length ?? 0) > 1 ? form.node_ids?.[0] : undefined}
                 legend={layoutLegend(form.deployment_mode, form.node_ids?.length ?? 0)}
                 help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The controller is required as the primary node, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
                   contextLengthTouched.current = true

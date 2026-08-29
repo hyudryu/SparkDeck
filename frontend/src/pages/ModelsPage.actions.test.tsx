@@ -53,7 +53,7 @@ beforeEach(() => {
       return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
     if (path === '/api/v1/settings') {
-      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ vllm_image: 'registry.example/vllm:configured' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
     return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
   })
@@ -67,6 +67,59 @@ afterEach(() => {
 function renderPage() {
   return render(<MemoryRouter initialEntries={['/models']}><ModelsPage /></MemoryRouter>)
 }
+
+describe('models page vLLM deployment targets', () => {
+  it('allows remote-only tensor parallelism and submits the selected vLLM image', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    const imageInput = await screen.findByLabelText(/vLLM image/)
+    expect(imageInput).toHaveValue('registry.example/vllm:configured')
+    await user.clear(imageInput)
+    await user.type(imageInput, 'registry.example/vllm:pinned')
+    await user.type(screen.getByLabelText('Display name'), 'Remote TP')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/remote-model')
+
+    const controller = screen.getByRole('checkbox', { name: /Controller/ })
+    const node3 = screen.getByRole('checkbox', { name: /Node 3/ })
+    const node4 = screen.getByRole('checkbox', { name: /Node 4/ })
+    await user.click(node3)
+    await user.click(node4)
+    await user.selectOptions(screen.getByLabelText(/Deployment layout/), 'sharded')
+
+    expect(controller).toBeEnabled()
+    await user.click(controller)
+    expect(controller).not.toBeChecked()
+    expect(node3).toBeChecked()
+    expect(node4).toBeChecked()
+    expect(screen.getByText(/Primary: Node 3/)).toBeInTheDocument()
+    expect(screen.getByLabelText(/Tensor parallel size/)).toHaveValue(2)
+
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input) === '/api/v1/deployments' && init?.method === 'POST'
+      ))
+      expect(call).toBeDefined()
+      const payload = JSON.parse(String(call?.[1]?.body))
+      expect(payload).toMatchObject({
+        model: 'org/remote-model',
+        alias: 'Remote TP',
+        runtime: 'vllm',
+        node_ids: ['worker-2', 'worker-1'],
+        deployment_mode: 'sharded',
+        settings: {
+          image: 'registry.example/vllm:pinned',
+          tensor_parallel_size: 2,
+        },
+      })
+    })
+  })
+})
 
 describe('models page llama.cpp pull targets', () => {
   it('lets llama.cpp bookmark creation pick several nodes without pinning the controller', async () => {

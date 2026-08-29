@@ -8,6 +8,46 @@ function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }
 
+class MockWebSocket {
+  static instances: MockWebSocket[] = []
+  static autoOpen = true
+  readonly url: string
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  onclose: (() => void) | null = null
+  private closed = false
+
+  constructor(url: string) {
+    this.url = url
+    MockWebSocket.instances.push(this)
+    if (MockWebSocket.autoOpen) {
+      queueMicrotask(() => { if (!this.closed) this.onopen?.() })
+    }
+  }
+
+  close() {
+    if (this.closed) return
+    this.closed = true
+    this.onclose?.()
+  }
+
+  emit(snapshot: unknown) {
+    this.onmessage?.({ data: JSON.stringify(snapshot) })
+  }
+}
+
+function stubDashboardFetch(stats: Record<string, unknown>) {
+  return vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const path = String(input)
+    if (path.includes('/api/stats')) return json(stats)
+    if (path.includes('/api/inference-queue')) return json({})
+    if (path.includes('/api/v1/deployments')) return json({ items: [] })
+    if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+    return json({ items: [] })
+  })
+}
+
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
@@ -275,6 +315,147 @@ describe('DashboardPage', () => {
     expect(snapshot.cpuPct).toBe(80)
     expect(snapshot.ramUsed).toBe(8)
     expect(snapshot.gpuPct).toBe(70)
+  })
+
+  it('applies pushed stream snapshots without extra fetches', async () => {
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    const fetchMock = stubDashboardFetch({ cpu_pct: 20, mem: {}, gpus: [], active_requests: {}, ts: 1_777_000_000 })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('20.0%')).toBeInTheDocument()
+    const baselineCalls = fetchMock.mock.calls.length
+    const socket = MockWebSocket.instances[0]
+    expect(socket.url).toBe('ws://localhost:3000/api/ws/dashboard')
+
+    act(() => socket.emit({
+      type: 'snapshot',
+      stats: { cpu_pct: 90, mem: {}, gpus: [], active_requests: {}, ts: 1_777_000_000 },
+      admission: { chat: { running: 1, queued: 3 } },
+      deployments: { items: [] },
+      community_sync: { consent: false, outbox: {} },
+      nodes: { items: [] },
+    }))
+
+    expect(screen.getByText('90.0%')).toBeInTheDocument()
+    expect(screen.getAllByText(/3 queued/).length).toBeGreaterThan(0)
+    expect(screen.getByText(/· live/)).toBeInTheDocument()
+    expect(fetchMock.mock.calls.length).toBe(baselineCalls)
+  })
+
+  it('resumes the 10s polling fallback when the stream closes', async () => {
+    vi.useFakeTimers()
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    let statsCalls = 0
+    const fetchMock = stubDashboardFetch({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+    const baseImplementation = fetchMock.getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/stats')) statsCalls += 1
+      return baseImplementation!(input, init)
+    }))
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    await act(async () => { await Promise.resolve() })
+    expect(statsCalls).toBe(1)
+
+    // While the socket is live the 10s polling stays paused.
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    expect(statsCalls).toBe(1)
+
+    // The stream drops and reconnects never open: polling resumes.
+    MockWebSocket.autoOpen = false
+    act(() => { MockWebSocket.instances[0].close() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(statsCalls).toBe(2)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(statsCalls).toBe(3)
+  })
+
+  it('keeps polling a source whose stream value is null', async () => {
+    vi.useFakeTimers()
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    let statsCalls = 0
+    let nodesCalls = 0
+    const fetchMock = stubDashboardFetch({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+    const baseImplementation = fetchMock.getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) statsCalls += 1
+      if (path.includes('/api/v1/nodes')) nodesCalls += 1
+      return baseImplementation!(input, init)
+    }))
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    await act(async () => { await Promise.resolve() })
+    expect(statsCalls).toBe(1)
+    expect(nodesCalls).toBe(1)
+
+    // stats failed server-side: only its REST polling stays active.
+    act(() => MockWebSocket.instances[0].emit({
+      type: 'snapshot',
+      stats: null,
+      admission: {},
+      deployments: { items: [] },
+      community_sync: { consent: false, outbox: {} },
+      nodes: { items: [] },
+    }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(statsCalls).toBe(2)
+    expect(nodesCalls).toBe(1)
+
+    // A later healthy stats value clears the failure and pauses polling again.
+    act(() => MockWebSocket.instances[0].emit({
+      type: 'snapshot',
+      stats: { cpu_pct: 30, mem: {}, gpus: [], active_requests: {} },
+      admission: {},
+      deployments: { items: [] },
+      community_sync: { consent: false, outbox: {} },
+      nodes: { items: [] },
+    }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    expect(statsCalls).toBe(2)
+  })
+
+  it('clears a resource error when stream data arrives', async () => {
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) {
+        return new Response(JSON.stringify({ detail: 'telemetry down' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('telemetry down')).toBeInTheDocument()
+
+    act(() => MockWebSocket.instances[0].emit({
+      type: 'snapshot',
+      stats: { cpu_pct: 90, mem: {}, gpus: [], active_requests: {}, ts: 1_777_000_000 },
+      admission: {},
+      deployments: { items: [] },
+      community_sync: { consent: false, outbox: {} },
+      nodes: { items: [] },
+    }))
+
+    expect(screen.queryByText('telemetry down')).not.toBeInTheDocument()
+    expect(screen.getByText('90.0%')).toBeInTheDocument()
   })
 
   it('uses equal node weighting when logical CPU counts are incomplete', () => {

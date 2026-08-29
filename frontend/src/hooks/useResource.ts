@@ -11,6 +11,13 @@ export function useResource<T>(
   const [version, setVersion] = useState(0)
 
   const reload = useCallback(() => setVersion((value) => value + 1), [])
+  // Streamed data replaces the resource wholesale: clear any retained
+  // error/loading state alongside the new value.
+  const apply = useCallback((value: T) => {
+    setData(value)
+    setError(undefined)
+    setLoading(false)
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -37,5 +44,5 @@ export function useResource<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...dependencies, enabled, version])
 
-  return { data, error, loading, reload, setData }
+  return { data, error, loading, reload, setData, apply }
 }

@@ -412,6 +412,9 @@ async def get_inference_queue():
 
 
 DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
+# Stats and admission stream every tick; the slower inventories (deployments,
+# community sync, nodes) only refresh every Nth tick and repeat in between.
+DASHBOARD_STREAM_SLOW_TICKS = 5
 
 
 async def _dashboard_source(source):
@@ -431,18 +434,39 @@ async def _dashboard_nodes() -> list[dict]:
 @app.websocket("/api/ws/dashboard")
 async def dashboard_stream(websocket: WebSocket):
     """Push the dashboard's five data sources as periodic full snapshots."""
+    # Websockets bypass same-origin policy, so check Origin the same way
+    # _require_same_origin_or_forwarded does; clients without an Origin
+    # header (non-browser) are allowed.
+    origin = websocket.headers.get("origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.netloc.casefold()
+            != websocket.headers.get("host", "").casefold()
+        ):
+            await websocket.close(code=1008)
+            return
+    # Joined workers forward dashboard REST calls to the controller; refuse
+    # the socket so the UI stays on that forwarded polling fallback.
+    if onboarding.assignment.load():
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
+    deployments = community_sync = nodes = None
+    tick = 0
     try:
         while True:
-            stats, admission, deployments, community_sync, nodes = (
-                await asyncio.gather(
-                    _dashboard_source(manager.get_stats),
-                    _dashboard_source(manager.inference_admission),
+            stats, admission = await asyncio.gather(
+                _dashboard_source(manager.get_stats),
+                _dashboard_source(manager.inference_admission),
+            )
+            if tick % DASHBOARD_STREAM_SLOW_TICKS == 0:
+                deployments, community_sync, nodes = await asyncio.gather(
                     _dashboard_source(sparkdeck.deployments),
                     _dashboard_source(_community_sync_status),
                     _dashboard_source(_dashboard_nodes),
                 )
-            )
             await websocket.send_json({
                 "type": "snapshot",
                 "stats": stats,
@@ -453,6 +477,7 @@ async def dashboard_stream(websocket: WebSocket):
                 "community_sync": community_sync,
                 "nodes": None if nodes is None else {"items": nodes},
             })
+            tick += 1
             await asyncio.sleep(DASHBOARD_STREAM_INTERVAL_SECONDS)
     except (WebSocketDisconnect, RuntimeError):
         pass

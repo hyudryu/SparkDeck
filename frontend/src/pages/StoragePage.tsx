@@ -205,7 +205,7 @@ export function StoragePage() {
     // Do not abort and restart an expensive cluster inventory every three
     // seconds. Wait for the last response to settle before scheduling another.
     const timer = window.setTimeout(resource.reload, 3000)
-    return () => window.clearInterval(timer)
+    return () => window.clearTimeout(timer)
   }, [hasActiveJobs, resource.loading, resource.reload])
 
   const enable = async (enabled: boolean) => {

@@ -19,6 +19,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any
 from urllib.parse import quote
 
@@ -1776,7 +1777,7 @@ class Manager:
             for node in nodes
         }
         jobs = []
-        sampled_at = time.monotonic()
+        sampled_at = _monotonic()
         active_job_ids = set()
         for job in self.virtual_nas.list_transfers()["items"]:
             snapshot = dict(job)
@@ -1815,7 +1816,7 @@ class Manager:
 
     async def _virtual_nas_nodes(self) -> list[dict]:
         cached = getattr(self, "_virtual_nas_nodes_cache", None)
-        if cached and time.monotonic() - cached[0] < 10.0:
+        if cached and time.time() - cached[0] < 10.0:
             return cached[1]
         task = getattr(self, "_virtual_nas_nodes_task", None)
         if task is None or task.done():
@@ -1828,7 +1829,7 @@ class Manager:
         finally:
             if task.done() and self._virtual_nas_nodes_task is task:
                 self._virtual_nas_nodes_task = None
-        self._virtual_nas_nodes_cache = (time.monotonic(), nodes)
+        self._virtual_nas_nodes_cache = (time.time(), nodes)
         return nodes
 
     def _sample_virtual_nas_transfer_rate(

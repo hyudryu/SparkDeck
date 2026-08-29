@@ -758,7 +758,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             (transformer / shard_names[1]).unlink()
             self.assertTrue(nas.inventory()[0]["partial"])
 
-    async def test_inventory_reports_complete_external_comfyui_bundle_read_only(self):
+    async def test_inventory_reports_complete_external_comfyui_bundle_as_manageable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "ComfyUI" / "models"
             files = (
@@ -793,8 +793,6 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "last_modified": models[0]["last_modified"],
                 "source": "ComfyUI",
                 "externally_managed": True,
-                "transferable": False,
-                "deletable": False,
             }])
 
     async def test_inventory_counts_installed_ltx_variants(self):
@@ -824,8 +822,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["file_count"], 6)
             self.assertEqual(model["size_bytes"], 42)
             self.assertFalse(model["partial"])
-            self.assertFalse(model["transferable"])
-            self.assertFalse(model["deletable"])
+            self.assertNotIn("transferable", model)
+            self.assertNotIn("deletable", model)
 
     async def test_inventory_accepts_each_supported_ltx_transformer_format(self):
         transformers = (
@@ -893,7 +891,141 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(nas.inventory(), [])
 
-    async def test_inventory_accepts_weights_only_snapshot(self):
+    async def test_external_comfyui_model_export_import_roundtrip(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            root = Path(source_dir) / "ComfyUI" / "models"
+            bundle_files = {
+                "diffusion_models/minimax_music3_dit_fp16.safetensors": b"dit-weights",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors": b"encoder-weights",
+                "vae/minimax_music3_dav.safetensors": b"vae-weights",
+            }
+            for relative, content in bundle_files.items():
+                path = root.joinpath(*relative.split("/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            source = VirtualNAS(
+                Path(source_dir), lambda: Path(source_dir) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+            target_hub = Path(target_dir) / "hub"
+            target = VirtualNAS(
+                Path(target_dir), lambda: target_hub, FakeRegistry(), lambda: True,
+            )
+
+            result = await target.import_model(
+                "Comfy-Org/MiniMax-Music-3",
+                source.export_model("Comfy-Org/MiniMax-Music-3"),
+            )
+
+            self.assertTrue(result["ok"])
+            # The export copies; the ComfyUI install is left untouched.
+            for relative, content in bundle_files.items():
+                self.assertEqual(
+                    root.joinpath(*relative.split("/")).read_bytes(), content,
+                )
+            snapshot = (
+                target_hub / "models--Comfy-Org--MiniMax-Music-3"
+                / "snapshots" / "comfyui"
+            )
+            for relative, content in bundle_files.items():
+                self.assertEqual(
+                    snapshot.joinpath(*relative.split("/")).read_bytes(), content,
+                )
+            self.assertEqual(
+                (snapshot / ".sparkdeck-external").read_bytes(), b"comfyui\n",
+            )
+            models = target.inventory()
+            self.assertEqual(len(models), 1)
+            model = models[0]
+            self.assertEqual(model["model_id"], "Comfy-Org/MiniMax-Music-3")
+            self.assertFalse(model["partial"])
+            self.assertFalse(model.get("externally_managed"))
+            self.assertNotEqual(model.get("deletable"), False)
+            # The imported copy is a normal managed model: deletable.
+            self.assertTrue(target.delete_model("Comfy-Org/MiniMax-Music-3")["ok"])
+            self.assertEqual(target.inventory(), [])
+
+    async def test_delete_external_comfyui_model_unlinks_only_bundle_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            bundle_files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            )
+            for relative in bundle_files:
+                path = root.joinpath(*relative.split("/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"weights")
+            keep = root / "loras" / "keep.safetensors"
+            keep.parent.mkdir(parents=True)
+            keep.write_bytes(b"keep")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            self.assertTrue(nas.delete_model("Comfy-Org/MiniMax-Music-3")["ok"])
+
+            for relative in bundle_files:
+                self.assertFalse(root.joinpath(*relative.split("/")).exists())
+            self.assertEqual(keep.read_bytes(), b"keep")
+            # Directories are left in place for ComfyUI.
+            self.assertTrue((root / "diffusion_models").is_dir())
+            with self.assertRaises(LookupError):
+                nas.delete_model("Comfy-Org/MiniMax-Music-3")
+
+    async def test_delete_external_comfyui_model_refuses_symlinked_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            outside = Path(directory) / "outside.safetensors"
+            outside.write_bytes(b"outside")
+            real_files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+            )
+            for relative in real_files:
+                path = root.joinpath(*relative.split("/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"weights")
+            link = root / "vae" / "minimax_music3_dav.safetensors"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside)
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            with self.assertRaises(LookupError):
+                nas.delete_model("Comfy-Org/MiniMax-Music-3")
+
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertTrue(link.is_symlink())
+
+    async def test_delete_external_comfyui_model_is_blocked_during_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            for relative in (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            ):
+                path = root.joinpath(*relative.split("/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            stream = nas.export_model("Comfy-Org/MiniMax-Music-3")
+            with self.assertRaisesRegex(RuntimeError, "transfer"):
+                nas.delete_model("Comfy-Org/MiniMax-Music-3")
+            await stream.aclose()
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             snapshot = hub / "models--org--raw" / "snapshots" / RESOLVED_REVISION
@@ -1264,6 +1396,64 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "failed")
         self.assertIn("current storage location", job["error"])
         nas.export_model.assert_not_called()
+
+    async def test_external_comfyui_source_model_transfers_to_worker(self):
+        root = Path(self.temp.name) / "ComfyUI" / "models"
+        bundle_files = {
+            "diffusion_models/minimax_music3_dit_fp16.safetensors": b"dit-weights",
+            "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors": b"encoder-weights",
+            "vae/minimax_music3_dav.safetensors": b"vae-weights",
+        }
+        for relative, content in bundle_files.items():
+            path = root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        registry = FakeRegistry()
+
+        async def request(node_id, method, path, **kwargs):
+            if "worker-a" in registry.received:
+                return {"models": [{
+                    "model_id": "Comfy-Org/MiniMax-Music-3",
+                    "size_bytes": len(registry.received["worker-a"]),
+                    "partial": False,
+                }], "free_size": 10 * 1024 * 1024 * 1024}
+            return {"models": [], "free_size": 10 * 1024 * 1024 * 1024}
+
+        registry.request = request
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, registry, lambda: True,
+            external_model_roots_provider=lambda: [root],
+        )
+
+        result = await nas.queue_transfer(
+            "Comfy-Org/MiniMax-Music-3", "local", ["worker-a"],
+        )
+        final = await self.wait_final(nas, 1)
+
+        self.assertEqual(len(result["job_ids"]), 1)
+        self.assertEqual(final[0]["status"], "completed")
+        with tarfile.open(
+            fileobj=io.BytesIO(registry.received["worker-a"]), mode="r:",
+        ) as archive:
+            self.assertIn(
+                "models--Comfy-Org--MiniMax-Music-3"
+                "/snapshots/comfyui/.sparkdeck-external",
+                archive.getnames(),
+            )
+            for relative, content in bundle_files.items():
+                member = (
+                    "models--Comfy-Org--MiniMax-Music-3"
+                    f"/snapshots/comfyui/{relative}"
+                )
+                extracted = archive.extractfile(member)
+                self.assertIsNotNone(extracted)
+                self.assertEqual(extracted.read(), content)
+        # The transfer copies; the ComfyUI install is left untouched.
+        for relative, content in bundle_files.items():
+            self.assertEqual(
+                root.joinpath(*relative.split("/")).read_bytes(), content,
+            )
+        await nas.stop()
 
     async def test_insufficient_target_capacity_is_rejected_without_jobs(self):
         registry = FakeRegistry()

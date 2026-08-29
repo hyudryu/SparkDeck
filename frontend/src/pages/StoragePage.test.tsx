@@ -74,7 +74,7 @@ describe('StoragePage', () => {
             { model_id: 'org/big', size_bytes: 400 * gib, revision: 'main', file_count: 4 },
             {
               model_id: 'org/comfyui', size_bytes: 200 * gib,
-              externally_managed: true, transferable: false, deletable: false,
+              externally_managed: true,
             },
           ],
         },
@@ -278,7 +278,7 @@ describe('StoragePage', () => {
               {
                 model_id: 'Lightricks/LTX-2.5', size_bytes: 68_000_000_000,
                 partial: false, revision: 'ComfyUI', source: 'ComfyUI',
-                externally_managed: true, transferable: false, deletable: false,
+                externally_managed: true,
               },
             ],
           }
@@ -316,9 +316,9 @@ describe('StoragePage', () => {
     const external = screen.getByLabelText('Installed weights Lightricks/LTX-2.5 on Studio Spark')
     expect(external).toHaveTextContent('Lightricks/LTX-2.5')
     expect(external).not.toHaveTextContent('Externally managed')
-    expect(external).toHaveAttribute('draggable', 'false')
-    expect(screen.queryByRole('button', { name: 'Delete Lightricks/LTX-2.5 from Studio Spark' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('option', { name: 'Lightricks/LTX-2.5' })).not.toBeInTheDocument()
+    expect(external).toHaveAttribute('draggable', 'true')
+    expect(screen.getByRole('button', { name: 'Delete Lightricks/LTX-2.5 from Studio Spark' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Lightricks/LTX-2.5' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
     let dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
@@ -391,6 +391,50 @@ describe('StoragePage', () => {
       expect.objectContaining({ method: 'DELETE' }),
     ))
     expect(screen.getByRole('progressbar', { name: 'Transfer org/other progress' })).toHaveAttribute('aria-valuenow', '40')
+  })
+
+  it('warns that deleting externally managed weights removes them from ComfyUI', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              ...node.models,
+              {
+                model_id: 'Comfy-Org/MiniMax-Music-3', size_bytes: 21_000_000_000,
+                partial: false, revision: 'ComfyUI', source: 'ComfyUI',
+                externally_managed: true,
+              },
+            ],
+          }
+        : node),
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 })
+      return json(storage)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<StoragePage />)
+
+    const external = await screen.findByLabelText('Installed weights Comfy-Org/MiniMax-Music-3 on Studio Spark')
+    expect(external).toHaveAttribute('draggable', 'true')
+
+    await user.click(screen.getByRole('button', { name: 'Delete Comfy-Org/MiniMax-Music-3 from Studio Spark' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete Comfy-Org/MiniMax-Music-3?' })
+    expect(dialog).toHaveTextContent("The files will be deleted from ComfyUI's model folders")
+    await user.click(within(dialog).getByRole('button', { name: 'Delete weights' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/storage/nodes/node-a/models/Comfy-Org%2FMiniMax-Music-3',
+      expect.objectContaining({ method: 'DELETE' }),
+    ))
+
+    // Managed weights keep the original confirmation copy.
+    await user.click(screen.getByRole('button', { name: 'Delete org/model from Studio Spark' }))
+    const managedDialog = await screen.findByRole('dialog', { name: 'Delete org/model?' })
+    expect(managedDialog).not.toHaveTextContent('ComfyUI')
+    await user.click(within(managedDialog).getByRole('button', { name: 'Cancel' }))
   })
 
   it('shows active downloads and transfers on their target NAS cards', async () => {

@@ -1,6 +1,6 @@
-import type { BenchyResultRow } from '../api/types'
+import type { BenchmarkRunnerResultRow } from '../api/types'
 
-export type BenchyMetricKey =
+export type BenchmarkRunMetricKey =
   | 'pp_tokens_per_second'
   | 'tg_tokens_per_second'
   | 'tg_tokens_per_second_request'
@@ -9,11 +9,11 @@ const WIDTH = 760
 const HEIGHT = 260
 const PADDING = { top: 18, right: 18, bottom: 42, left: 62 }
 
-interface BenchyChartProps {
+interface BenchmarkRunChartProps {
   title: string
   subtitle: string
-  rows: BenchyResultRow[]
-  metric: BenchyMetricKey
+  rows: BenchmarkRunnerResultRow[]
+  metric: BenchmarkRunMetricKey
 }
 
 function compactTokens(value: number) {
@@ -29,7 +29,7 @@ function smoothPath(coordinates: { x: number; y: number }[]) {
   }, `M ${coordinates[0].x} ${coordinates[0].y}`)
 }
 
-export function BenchyChart({ title, subtitle, rows, metric }: BenchyChartProps) {
+export function BenchmarkRunChart({ title, subtitle, rows, metric }: BenchmarkRunChartProps) {
   const measured = rows.filter((row) => typeof row[metric] === 'number')
   const promptSizes = [...new Set(measured.map((row) => row.prompt_size ?? 0))].sort((a, b) => a - b)
   const maximum = Math.max(1, ...measured.map((row) => row[metric] as number))
@@ -43,7 +43,7 @@ export function BenchyChart({ title, subtitle, rows, metric }: BenchyChartProps)
     responseSize: number
     depth: number
     label: string
-    values: Map<number, BenchyResultRow>
+    values: Map<number, BenchmarkRunnerResultRow>
   }
   const seriesById = new Map<string, Series>()
   for (const row of measured) {

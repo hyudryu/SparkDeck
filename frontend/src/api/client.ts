@@ -57,11 +57,11 @@ import type {
   FanMaxSpeedResult,
   FanPidSettings,
   FanSettingsUpdateResult,
-  BenchyStatus,
-  BenchyServedModel,
-  BenchyRunConfig,
-  BenchyRunSummary,
-  BenchyRunDetail,
+  BenchmarkRunnerStatus,
+  BenchmarkRunnerModel,
+  BenchmarkRunnerRunConfig,
+  BenchmarkRunnerRunSummary,
+  BenchmarkRunnerRunDetail,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -622,32 +622,32 @@ export const api = {
       signal,
     }, NO_REQUEST_TIMEOUT),
   chatStream: streamChat,
-  benchy: {
-    status: (signal?: AbortSignal) => request<BenchyStatus>('/api/v1/benchy/status', { signal }),
-    install: () => request<BenchyStatus>('/api/v1/benchy/install', { method: 'POST' }, NO_REQUEST_TIMEOUT),
-    models: async (signal?: AbortSignal): Promise<BenchyServedModel[]> => {
-      const data = await request<{ items: BenchyServedModel[] }>('/api/v1/benchy/models', { signal })
+  benchmarkRunner: {
+    status: (signal?: AbortSignal) => request<BenchmarkRunnerStatus>('/api/v1/benchmark-runner/status', { signal }),
+    install: () => request<BenchmarkRunnerStatus>('/api/v1/benchmark-runner/install', { method: 'POST' }, NO_REQUEST_TIMEOUT),
+    models: async (signal?: AbortSignal): Promise<BenchmarkRunnerModel[]> => {
+      const data = await request<{ items: BenchmarkRunnerModel[] }>('/api/v1/benchmark-runner/models', { signal })
       return data.items
     },
-    start: (config: BenchyRunConfig) => request<BenchyRunDetail>('/api/v1/benchy/runs', {
+    start: (config: BenchmarkRunnerRunConfig) => request<BenchmarkRunnerRunDetail>('/api/v1/benchmark-runner/runs', {
       method: 'POST',
       body: JSON.stringify(config),
     }, NO_REQUEST_TIMEOUT),
-    list: async (signal?: AbortSignal): Promise<BenchyRunSummary[]> => {
-      const data = await request<{ items: BenchyRunSummary[] }>('/api/v1/benchy/runs', { signal })
+    list: async (signal?: AbortSignal): Promise<BenchmarkRunnerRunSummary[]> => {
+      const data = await request<{ items: BenchmarkRunnerRunSummary[] }>('/api/v1/benchmark-runner/runs', { signal })
       return data.items
     },
     get: (id: string, signal?: AbortSignal) =>
-      request<BenchyRunDetail>(`/api/v1/benchy/runs/${encodeURIComponent(id)}`, { signal }),
-    cancel: (id: string) => request<BenchyRunDetail>(
-      `/api/v1/benchy/runs/${encodeURIComponent(id)}/cancel`,
+      request<BenchmarkRunnerRunDetail>(`/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}`, { signal }),
+    cancel: (id: string) => request<BenchmarkRunnerRunDetail>(
+      `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}/cancel`,
       { method: 'POST' },
     ),
     remove: (id: string) => request<void>(
-      `/api/v1/benchy/runs/${encodeURIComponent(id)}`,
+      `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}`,
       { method: 'DELETE' },
     ),
-    csvUrl: (id: string) => `/api/v1/benchy/runs/${encodeURIComponent(id)}/csv`,
+    csvUrl: (id: string) => `/api/v1/benchmark-runner/runs/${encodeURIComponent(id)}/csv`,
   },
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {

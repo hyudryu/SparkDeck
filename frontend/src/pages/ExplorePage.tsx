@@ -44,12 +44,13 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
     .map((node) => ({ node, capacity: nodeMemoryBytes(node) }))
     .filter((item): item is { node: NodeInventoryItem; capacity: number } => item.capacity !== undefined)
   if (measured.length === 0) {
-    return { capacity: 0, localCapacity: 0, measuredNodes: 0, aggregate: false }
+    return { capacity: 0, localCapacity: 0, measuredNodes: 0, aggregate: false, workerCapacities: [] as number[] }
   }
+  const isLocal = (node: NodeInventoryItem) => node.local === true || node.id === 'local'
   const localCapacity = measured.find(({ node }) => node.local === true)?.capacity
     ?? measured.find(({ node }) => node.id === 'local')?.capacity
     ?? 0
-  const aggregate = measured.length > 1 && measured.some(({ node }) => node.local === true || node.id === 'local')
+  const aggregate = measured.length > 1 && measured.some(({ node }) => isLocal(node))
   return {
     capacity: aggregate
       ? measured.reduce((sum, item) => sum + item.capacity, 0)
@@ -57,7 +58,37 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
     measuredNodes: measured.length,
     aggregate,
     localCapacity,
+    workerCapacities: measured.filter(({ node }) => !isLocal(node)).map((item) => item.capacity),
   }
+}
+
+function minimumFitNodes(
+  weightSize: number | null | undefined,
+  capacities: number[],
+  pinnedCapacity?: number,
+): number | undefined {
+  // Sharded deployments always include the controller (the creation flow
+  // prepends it), so its memory is pinned and only worker capacities are
+  // pooled greedily, largest first — count-optimal either way. Returns
+  // undefined when the weights do not fit at all.
+  if (!Number.isFinite(weightSize) || Number(weightSize) <= 0) return undefined
+  const weight = Number(weightSize)
+  if (pinnedCapacity !== undefined) {
+    if (pinnedCapacity >= weight) return 1
+    if (capacities.length === 0) return undefined
+  } else if (capacities.length === 0) return undefined
+  let pooled = pinnedCapacity ?? 0
+  const descending = [...capacities].sort((left, right) => right - left)
+  for (let index = 0; index < descending.length; index += 1) {
+    pooled += descending[index]
+    if (pooled >= weight) return (pinnedCapacity === undefined ? 0 : 1) + index + 1
+  }
+  return undefined
+}
+
+function fitNodeLabel(count: number | undefined) {
+  if (count === undefined) return ''
+  return count === 1 ? 'Fits on 1 node' : `Fits on ${count}+ nodes`
 }
 
 function fitTone(weightSize: number | null | undefined, capacity: number): FitTone {
@@ -151,6 +182,7 @@ function ModelRow({
   localCapacity,
   measuredNodes,
   aggregate,
+  workerCapacities,
   expanded,
   communityEnabled,
   communityMode,
@@ -163,6 +195,7 @@ function ModelRow({
   localCapacity: number
   measuredNodes: number
   aggregate: boolean
+  workerCapacities: number[]
   expanded: boolean
   communityEnabled: boolean
   communityMode: boolean
@@ -239,6 +272,13 @@ function ModelRow({
   const fitMeasuredNodes = deploymentRuntime === 'llama.cpp'
     ? localCapacity > 0 ? 1 : 0
     : measuredNodes
+  // Sharded deployments always include the controller, then pool the largest
+  // workers first; single-node and replicated deployments (and Llama server
+  // on the controller) must fit within one node's memory.
+  const minFitNodes = fitAggregate
+    ? minimumFitNodes(fitWeightSize, workerCapacities, localCapacity)
+    : minimumFitNodes(fitWeightSize, [fitCapacity])
+  const minFitLabel = fitNodeLabel(minFitNodes)
 
   return <article className={`catalog-model-row${expanded ? ' expanded' : ''}`}>
     <button
@@ -251,7 +291,7 @@ function ModelRow({
     >
       <span className="catalog-model-identity"><strong>{modelName}</strong><small>{model.id}{communityMode && model.community ? ` · ${aggregateQuantization(model.community)} · ${formatNumber(model.community.prompt_tokens_bucket)}-token prompt bucket` : ''}</small></span>
       <span className="catalog-model-stat"><small>Parameters</small><strong>{formatParameters(parameterCount)}</strong></span>
-      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(fitWeightSize, fitCapacity)}`}><small>Weights</small><strong>{fitWeightSize ? formatBytes(fitWeightSize) : '—'}</strong><em>{fitLabel(fitTone(fitWeightSize, fitCapacity))}</em></span>
+      <span className={`catalog-model-stat catalog-model-size fit-${fitTone(fitWeightSize, fitCapacity)}`}><small>Weights</small><strong>{fitWeightSize ? formatBytes(fitWeightSize) : '—'}</strong><em>{fitLabel(fitTone(fitWeightSize, fitCapacity))}{minFitNodes ? ` · ${minFitNodes === 1 ? '1 node' : `${minFitNodes}+ nodes`}` : ''}</em></span>
       {communityMode
         ? <>
           <span className="catalog-model-stat"><small>Output speed</small><strong>{formatRate(model.community?.inference_tokens_per_second)}</strong></span>
@@ -267,7 +307,7 @@ function ModelRow({
       <div className="catalog-model-detail-grid">
         <div>
           <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : 'Cluster fit'}</span>
-          <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}</strong>
+          <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}{minFitLabel ? ` · ${minFitLabel}` : ''}</strong>
           <p>{fitCapacity > 0
             ? deploymentRuntime === 'llama.cpp'
               ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
@@ -533,7 +573,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Unique clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = model.communityVariantKey ?? model.id
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} communityEnabled={communityEnabled} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

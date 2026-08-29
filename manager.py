@@ -2745,11 +2745,35 @@ class Manager:
             min(1.0, transferred / total) if total
             else (1.0 if job.get("status") == "completed" else 0.0)
         )
+        downloading = job.get("kind") == "download"
+        started_at = (
+            job.get("download_attempted_at") if downloading
+            else job.get("started_at")
+        )
+        completed_at = job.get("completed_at")
+        bytes_per_second = None
+        start_bytes = (
+            job.get("download_attempt_start_bytes") if downloading else 0
+        )
+        if start_bytes is not None:
+            try:
+                started = float(started_at)
+                ended = (
+                    float(completed_at)
+                    if completed_at is not None else time.time()
+                )
+                elapsed = ended - started
+                attempt_bytes = max(0, transferred - int(start_bytes))
+                if attempt_bytes > 0 and elapsed > 0:
+                    bytes_per_second = attempt_bytes / elapsed
+            except (TypeError, ValueError):
+                pass
         return {
             **job,
             "source_node_name": node_name(job["source_node_id"]),
             "target_node_name": node_name(job["target_node_id"]),
             "progress": progress,
+            "bytes_per_second": bytes_per_second,
             "finished_at": job.get("completed_at"),
         }
 

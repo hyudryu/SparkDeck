@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type FormEvent } from 'react'
-import { AlertTriangle, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Trash2, UploadCloud } from 'lucide-react'
+import { AlertTriangle, ArrowLeftRight, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { StorageModel, StorageNode, StorageTransferJob } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -439,7 +439,7 @@ export function StoragePage() {
                     aria-label={`${activity} ${job.model_id} on ${node.name}`}
                     style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
                   >
-                    {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <UploadCloud size={15} aria-hidden="true" />}
+                    {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <ArrowLeftRight size={15} aria-hidden="true" />}
                     <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</small></div>
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
@@ -476,7 +476,7 @@ export function StoragePage() {
               })}
               {visibleNodes.filter((node) => node.id !== sourceNodeId).length === 0 && <p className="storage-target-empty">No other nodes are available.</p>}
             </div></fieldset>
-            <div className="storage-transfer-actions"><span>{targetNodeIds.length ? `${targetNodeIds.length} target${targetNodeIds.length === 1 ? '' : 's'} selected` : 'Select at least one target'}</span><Button type="submit" variant="primary" disabled={busy === 'transfer' || !modelId || !sourceNodeId || targetNodeIds.length === 0}><UploadCloud size={16} /> {busy === 'transfer' ? 'Queueing…' : 'Queue transfer'}</Button></div>
+            <div className="storage-transfer-actions"><span>{targetNodeIds.length ? `${targetNodeIds.length} target${targetNodeIds.length === 1 ? '' : 's'} selected` : 'Select at least one target'}</span><Button type="submit" variant="primary" disabled={busy === 'transfer' || !modelId || !sourceNodeId || targetNodeIds.length === 0}><ArrowLeftRight size={16} /> {busy === 'transfer' ? 'Queueing…' : 'Queue transfer'}</Button></div>
           </form>
         </Panel>
 

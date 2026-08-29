@@ -1420,9 +1420,12 @@ class Manager:
             "gateway": gateway,
         }
 
-    async def _routeros_target(self, node_id: str) -> dict:
+    async def _routeros_target(
+        self, node_id: str, nodes: list[dict] | None = None,
+    ) -> dict:
         normalized = str(node_id or "").strip()
-        available = {node["id"]: node for node in await self.cluster_nodes()}
+        cluster_nodes = nodes if nodes is not None else await self.cluster_nodes()
+        available = {node["id"]: node for node in cluster_nodes}
         node = available.get(normalized)
         if not node:
             raise ValueError("cluster node not found")
@@ -1431,7 +1434,17 @@ class Manager:
         return node
 
     async def connect_routeros(self, node_id: str, body: dict) -> dict:
-        node = await self._routeros_target(node_id)
+        nodes = await self.cluster_nodes()
+        node = await self._routeros_target(node_id, nodes=nodes)
+        summaries = [self._routeros_node_summary(item) for item in nodes]
+        previous_node_id = self._routeros_gateway_node_id(summaries)
+        previous_node = next(
+            (
+                item for item in nodes
+                if item.get("id") == previous_node_id and item.get("id") != node["id"]
+            ),
+            None,
+        )
         if node["id"] == LOCAL_NODE_ID:
             result = await self.routeros.connect(body)
         else:
@@ -1443,17 +1456,38 @@ class Manager:
             # Drop that pre-connection snapshot so the immediate UI reload probes
             # the worker and observes its newly configured RouterOS state.
             self.node_registry._status_cache.pop(node["id"], None)
+        if previous_node is not None:
+            try:
+                await self._disconnect_routeros_node(previous_node)
+            except Exception as exc:
+                rollback_failed = False
+                try:
+                    await self._disconnect_routeros_node(node)
+                except Exception:
+                    rollback_failed = True
+                detail = (
+                    "; the new gateway may also retain credentials"
+                    if rollback_failed else ""
+                )
+                raise RuntimeError(
+                    "Could not remove RouterOS credentials from the previous gateway"
+                    f"{detail}"
+                ) from exc
         self._save_routeros_gateway_node_id(node["id"])
+        return result
+
+    async def _disconnect_routeros_node(self, node: dict) -> dict:
+        if node["id"] == LOCAL_NODE_ID:
+            return self.routeros.disconnect()
+        result = await self.node_registry.request(
+            node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
+        )
+        self.node_registry._status_cache.pop(node["id"], None)
         return result
 
     async def disconnect_routeros(self, node_id: str) -> dict:
         node = await self._routeros_target(node_id)
-        if node["id"] == LOCAL_NODE_ID:
-            result = self.routeros.disconnect()
-        else:
-            result = await self.node_registry.request(
-                node["id"], "DELETE", "/api/agent/routeros/connection", timeout=10,
-            )
+        result = await self._disconnect_routeros_node(node)
         selected = str(
             (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
         )
@@ -1462,12 +1496,14 @@ class Manager:
         return result
 
     async def update_routeros_fan_settings(self, node_id: str, body: dict) -> dict:
-        node = await self._routeros_target(node_id)
-        selected = str(
-            (getattr(self, "settings", {}) or {}).get("routeros_gateway_node_id") or ""
-        )
-        if selected and node["id"] != selected:
-            raise ValueError("fan settings can only be changed through the selected RouterOS gateway node")
+        nodes = await self.cluster_nodes()
+        node = await self._routeros_target(node_id, nodes=nodes)
+        summaries = [self._routeros_node_summary(item) for item in nodes]
+        effective = self._routeros_gateway_node_id(summaries)
+        if effective and node["id"] != effective:
+            raise ValueError(
+                "fan settings can only be changed through the selected RouterOS gateway node"
+            )
         if node["id"] == LOCAL_NODE_ID:
             return await self.routeros.update_fan_settings(body)
         return await self.node_registry.request(

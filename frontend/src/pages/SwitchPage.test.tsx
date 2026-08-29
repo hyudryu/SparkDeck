@@ -73,7 +73,7 @@ describe('SwitchPage', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(disconnected)))
     render(<SwitchPage />)
 
-    const selector = await screen.findByRole('combobox', { name: /Ethernet-connected node/ })
+    const selector = await screen.findByRole('combobox', { name: /^Ethernet-connected node/ })
     expect(selector).toHaveValue('local')
     expect(screen.getByRole('option', { name: 'Main Spark (switch detected)' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Rack Spark' })).toBeInTheDocument()
@@ -93,7 +93,7 @@ describe('SwitchPage', () => {
     const user = userEvent.setup()
     render(<SwitchPage />)
 
-    await user.selectOptions(await screen.findByRole('combobox', { name: /Ethernet-connected node/ }), 'node-2')
+    await user.selectOptions(await screen.findByRole('combobox', { name: /^Ethernet-connected node/ }), 'node-2')
     await user.type(screen.getByRole('textbox', { name: 'Username' }), 'admin')
     await user.type(screen.getByLabelText('Password'), 'secret')
     await user.click(screen.getByRole('button', { name: 'Connect and validate' }))
@@ -109,10 +109,36 @@ describe('SwitchPage', () => {
     const user = userEvent.setup()
     render(<SwitchPage />)
 
-    await screen.findByRole('combobox', { name: /Ethernet-connected node/ })
+    await screen.findByRole('combobox', { name: /^Ethernet-connected node/ })
     await user.click(screen.getByText('Advanced connection settings'))
     expect(screen.getByDisplayValue('https://192.168.88.1')).toHaveAttribute('type', 'url')
     expect(screen.getByRole('checkbox', { name: /Verify TLS certificate/ })).toBeChecked()
+  })
+
+  it('allows every switch discovered from the selected node to be chosen', async () => {
+    const multiSwitch = {
+      ...disconnected,
+      nodes: [{
+        ...nodes[0],
+        discovery: [
+          { address: '192.168.88.1', identity: 'Core Switch' },
+          { address: '192.168.88.2', identity: 'Lab Switch' },
+        ],
+      }, nodes[1]],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(multiSwitch)))
+    const user = userEvent.setup()
+    render(<SwitchPage />)
+
+    await screen.findByRole('combobox', { name: /^Ethernet-connected node/ })
+    await user.click(screen.getByText('Advanced connection settings'))
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: /Discovered switch/ }),
+      'https://192.168.88.2',
+    )
+
+    expect(screen.getByDisplayValue('https://192.168.88.2')).toHaveAttribute('type', 'url')
+    expect(screen.getByText(/Detected 2 RouterOS switches/)).toBeInTheDocument()
   })
 
   it('renders configuration validation, a fan curve, and live port speeds', async () => {
@@ -144,5 +170,20 @@ describe('SwitchPage', () => {
       }),
     })))
     expect(await screen.findByText('Fan settings saved and validation refreshed.')).toBeInTheDocument()
+  })
+
+  it('preserves unsaved fan edits when telemetry reloads', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json(connected))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<SwitchPage />)
+
+    const minimumSpeed = await screen.findByRole('spinbutton', { name: /^Minimum fan speed/ })
+    await user.clear(minimumSpeed)
+    await user.type(minimumSpeed, '45')
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(1))
+
+    expect(minimumSpeed).toHaveValue(45)
   })
 })

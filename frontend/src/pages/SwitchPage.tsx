@@ -41,6 +41,17 @@ function discoveredUrl(node?: RouterOSPresenceNode) {
   return /^https?:\/\//i.test(address) ? address : `https://${address}`
 }
 
+function discoveryChoices(node?: RouterOSPresenceNode) {
+  const choices = new Map<string, string>()
+  for (const candidate of node?.discovery ?? []) {
+    const address = candidate.address?.trim()
+    if (!address) continue
+    const url = /^https?:\/\//i.test(address) ? address : `https://${address}`
+    choices.set(url, candidate.identity?.trim() || address)
+  }
+  return [...choices].map(([url, label]) => ({ url, label }))
+}
+
 function isRunning(value: unknown) {
   return ['1', 'true', 'yes', 'running', 'link-ok'].includes(String(value ?? '').toLowerCase())
 }
@@ -61,6 +72,7 @@ function ConnectionPanel({
   const { confirm, confirmationDialog } = useConfirmDialog()
   const selectedNode = nodes.find((node) => node.node_id === selectedNodeId)
   const selectedGateway = gateway?.node_id === selectedNodeId ? gateway : undefined
+  const discoveredSwitches = discoveryChoices(selectedNode)
   const [form, setForm] = useState<RouterOSConnectionInput>({
     base_url: selectedGateway?.base_url ?? discoveredUrl(selectedNode),
     username: '',
@@ -130,11 +142,13 @@ function ConnectionPanel({
       <details className="switch-advanced-connection">
         <summary>Advanced connection settings</summary>
         <div className="switch-advanced-fields">
+          {discoveredSwitches.length > 0 && <label className="field"><span>Discovered switch</span><select value={discoveredSwitches.some((choice) => choice.url === form.base_url) ? form.base_url : ''} onChange={(event) => event.target.value && setForm({ ...form, base_url: event.target.value })}><option value="">Custom address</option>{discoveredSwitches.map((choice) => <option value={choice.url} key={choice.url}>{choice.label} ({choice.url})</option>)}</select><small>Select any RouterOS device discovered from this Ethernet-connected node.</small></label>}
           <label className="field"><span>RouterOS URL</span><input type="url" required value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder={defaultRouterOSUrl} /><small>Discovery fills this automatically; the factory default is {defaultRouterOSUrl}.</small></label>
           <label className="check-field"><input type="checkbox" checked={form.verify_tls} onChange={(event) => setForm({ ...form, verify_tls: event.target.checked })} /><span><strong>Verify TLS certificate</strong><small>Recommended when RouterOS has a trusted certificate.</small></span></label>
         </div>
       </details>
-      {selectedNode?.discovery?.[0] && <p className="switch-discovery-note"><Cable size={14} aria-hidden="true" /> Detected {selectedNode.discovery[0].identity || selectedNode.discovery[0].address} at {selectedNode.discovery[0].address} from this node.</p>}
+      {discoveredSwitches.length === 1 && <p className="switch-discovery-note"><Cable size={14} aria-hidden="true" /> Detected {discoveredSwitches[0].label} at {discoveredSwitches[0].url.replace(/^https?:\/\//i, '')} from this node.</p>}
+      {discoveredSwitches.length > 1 && <p className="switch-discovery-note"><Cable size={14} aria-hidden="true" /> Detected {discoveredSwitches.length} RouterOS switches from this node. Choose one under advanced settings.</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
       {notice && <p className="inline-success" role="status">{notice}</p>}
       <div className="switch-form-actions"><Button type="submit" variant="primary" disabled={busy || !selectedNode?.online}>{busy ? 'Connecting…' : selectedGateway?.configured ? 'Reconnect and validate' : 'Connect and validate'}</Button>{selectedGateway?.configured && <Button type="button" variant="danger" disabled={busy} onClick={() => void remove()}><Trash2 size={14} aria-hidden="true" /> Remove</Button>}</div>
@@ -197,11 +211,24 @@ function FanCurvePreview({ settings }: { settings: Record<string, unknown> }) {
 
 function FanSettings({ node, onChanged }: { node: RouterOSNodeOverview; onChanged: () => void }) {
   const [settings, setSettings] = useState<Record<string, unknown>>(() => fanForm(node))
+  const [dirty, setDirty] = useState(false)
+  const serverFingerprint = JSON.stringify(fanForm(node))
+  const [syncedServerFingerprint, setSyncedServerFingerprint] = useState(serverFingerprint)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [saved, setSaved] = useState(false)
 
-  useEffect(() => setSettings(fanForm(node)), [node])
+  useEffect(() => {
+    if (dirty || serverFingerprint === syncedServerFingerprint) return
+    setSettings(fanForm(node))
+    setSyncedServerFingerprint(serverFingerprint)
+  }, [dirty, node, serverFingerprint, syncedServerFingerprint])
+
+  const updateSetting = (key: string, value: unknown) => {
+    setSettings((current) => ({ ...current, [key]: value }))
+    setDirty(true)
+    setSaved(false)
+  }
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -215,6 +242,8 @@ function FanSettings({ node, onChanged }: { node: RouterOSNodeOverview; onChange
     setBusy(true)
     try {
       await api.routeros.updateFanSettings(node.node_id, parsed)
+      setSyncedServerFingerprint(serverFingerprint)
+      setDirty(false)
       setSaved(true)
       onChanged()
     } catch (reason) {
@@ -231,8 +260,8 @@ function FanSettings({ node, onChanged }: { node: RouterOSNodeOverview; onChange
       <div className="switch-fan-fields">
         {(node.fan_capabilities ?? []).filter((key) => key in fanFields).map((key) => {
           const field = fanFields[key]
-          if (field.kind === 'boolean') return <label className="check-field" key={key}><input type="checkbox" checked={Boolean(settings[key])} onChange={(event) => setSettings({ ...settings, [key]: event.target.checked })} /><span><strong>{field.label}</strong><small>{humanize(key)}</small></span></label>
-          return <label className="field" key={key}><span>{field.label}{field.unit ? ` (${field.unit})` : ''}</span><input type={field.kind === 'number' ? 'number' : 'text'} required min={field.min} max={field.max} step={field.kind === 'number' ? 1 : undefined} value={String(settings[key] ?? '')} onChange={(event) => setSettings({ ...settings, [key]: event.target.value })} /><small>{field.kind === 'duration' ? 'Use a RouterOS duration such as 30s or 5m.' : humanize(key)}</small></label>
+          if (field.kind === 'boolean') return <label className="check-field" key={key}><input type="checkbox" checked={Boolean(settings[key])} onChange={(event) => updateSetting(key, event.target.checked)} /><span><strong>{field.label}</strong><small>{humanize(key)}</small></span></label>
+          return <label className="field" key={key}><span>{field.label}{field.unit ? ` (${field.unit})` : ''}</span><input type={field.kind === 'number' ? 'number' : 'text'} required min={field.min} max={field.max} step={field.kind === 'number' ? 1 : undefined} value={String(settings[key] ?? '')} onChange={(event) => updateSetting(key, event.target.value)} /><small>{field.kind === 'duration' ? 'Use a RouterOS duration such as 30s or 5m.' : humanize(key)}</small></label>
         })}
       </div>
       {error && <p className="inline-error" role="alert">{error}</p>}
@@ -334,7 +363,7 @@ export function SwitchPage() {
       {resource.data.nodes.length === 0 ? <Panel className="switch-no-nodes"><h2>No cluster nodes available</h2><p>Join or restore a SparkDeck node before connecting a RouterOS switch.</p></Panel> : <>
         {!selectedNode?.detected && <EmptyState title="Switch not detected" description="Connect the selected SparkDeck node to the RouterOS switch by Ethernet, then enter the RouterOS username and password below." />}
         <ConnectionPanel key={`${activeNodeId}:${selectedGateway?.base_url ?? ''}`} nodes={resource.data.nodes} gateway={gateway} selectedNodeId={activeNodeId} onSelected={setSelectedNodeId} onChanged={refresh} />
-        {selectedGateway && <GatewayOverview node={selectedGateway} onChanged={refresh} />}
+        {selectedGateway && <GatewayOverview key={selectedGateway.node_id} node={selectedGateway} onChanged={refresh} />}
       </>}
     </>}
   </div>

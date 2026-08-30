@@ -283,6 +283,32 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         listed = (await self.service.deployments())[0]
         self.assertEqual(listed["required_node_count"], 2)
 
+    async def test_running_cluster_deployment_exposes_last_used_at(self):
+        self.service.store.add_deployment(Deployment(
+            id="running-1", alias="running-model",
+            runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-9",
+                      "deployment_mode": "single", "node_ids": ["remote-1"]},
+        ), "http://127.0.0.1:8000", None)
+        self.manager.deployments = [{
+            "id": "cluster-9", "status": "running", "desired_state": "running",
+            "node_ids": ["remote-1"], "api_port": 8000,
+            "last_used_at": 1_700_000_000.0,
+            "members": [{
+                "rank": 0, "phase": {"phase": "ready", "message": "Ready"},
+            }],
+            "launch_settings": {"engine": "vllm", "extra_args": []},
+        }]
+
+        listed = next(
+            item for item in await self.service.deployments()
+            if item["id"] == "running-1"
+        )
+
+        self.assertEqual(listed["status"], "running")
+        self.assertEqual(listed["last_used_at"], 1_700_000_000.0)
+
     async def test_saved_bookmark_keeps_launch_inputs_for_relaunch(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "with-image", "runtime": "vllm",

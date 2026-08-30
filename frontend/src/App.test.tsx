@@ -469,6 +469,40 @@ describe('model deployments', () => {
     expect(timeout).not.toHaveBeenCalledWith(expect.any(Function), 2000)
   })
 
+  it('shows the last inference age instead of launch progress while running', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path.includes('/api/v1/deployments') ? { items: [
+        {
+          id: 'dep-running', alias: 'Serving model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'running',
+          launch_phase: 'initializing', launch_message: 'initializing engine…',
+          last_used_at: Math.floor(Date.now() / 1000) - 65,
+          settings: {}, node_ids: ['local'],
+        },
+        {
+          id: 'dep-starting', alias: 'Starting model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/other' }, status: 'starting',
+          launch_phase: 'initializing', launch_message: 'initializing engine…',
+          settings: {}, node_ids: ['local'],
+        },
+      ] } : path.includes('/api/v1/nodes') ? { items: [{
+        id: 'local', name: 'This device', local: true, online: true, docker_ready: true, selectable: true,
+      }] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : { items: [] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    const runningRow = (await screen.findByRole('link', { name: 'Serving model' })).closest('[role="row"]') as HTMLElement
+    expect(within(runningRow).getByText(/Last inference \d+m ago/)).toBeInTheDocument()
+    expect(within(runningRow).queryByText('initializing engine…')).not.toBeInTheDocument()
+    expect(within(runningRow).queryByText('Initializing')).not.toBeInTheDocument()
+
+    const startingRow = (await screen.findByRole('link', { name: 'Starting model' })).closest('[role="row"]') as HTMLElement
+    expect(within(startingRow).getByText('initializing engine…')).toBeInTheDocument()
+  })
+
   it('offers Start when stopped intent outlives a still-running container', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
@@ -963,6 +997,7 @@ describe('model deployments', () => {
           id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
           model: { repository: 'org/model' }, status: 'running', settings: {},
           node_ids: ['local'], launch_phase: 'ready', launch_message: 'SGLang API ready',
+          last_used_at: Math.floor(Date.now() / 1000) - 300,
         }]
         return new Response(JSON.stringify({ items: deployments }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -1004,8 +1039,8 @@ describe('model deployments', () => {
 
     expect(await within(deploymentRow).findByText('Downloading Docker image', {}, { timeout: 3500 })).toBeInTheDocument()
     expect(within(deploymentRow).getByText('Pulling Image')).toBeInTheDocument()
-    expect(await within(deploymentRow).findByText('SGLang API ready', {}, { timeout: 3500 })).toBeInTheDocument()
-    expect(within(deploymentRow).getByText('Ready')).toBeInTheDocument()
+    expect(await within(deploymentRow).findByText(/Last inference \d+m ago/, {}, { timeout: 3500 })).toBeInTheDocument()
+    expect(within(deploymentRow).queryByText('SGLang API ready')).not.toBeInTheDocument()
     expect(deploymentListCalls).toBeGreaterThanOrEqual(3)
   })
 

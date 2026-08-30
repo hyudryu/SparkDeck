@@ -358,6 +358,7 @@ export interface WireDeployment {
   desired_state?: 'running' | 'stopped'
   launch_phase?: string
   launch_message?: string
+  last_used_at?: number | null
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -414,6 +415,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     desired_state: item.desired_state,
     launch_phase: item.launch_phase,
     launch_message: item.launch_message,
+    last_used_at: item.last_used_at,
   }
 }
 

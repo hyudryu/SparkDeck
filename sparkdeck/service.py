@@ -889,6 +889,7 @@ class SparkDeckService:
                 stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
             stored.update(_deployment_launch_progress(cluster))
+            stored["last_used_at"] = cluster.get("last_used_at")
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))

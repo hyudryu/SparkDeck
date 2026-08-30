@@ -47,7 +47,7 @@ function jobProgress(job: StorageTransferJob) {
 
 function finalizationLabel(job: StorageTransferJob) {
   switch (job.phase) {
-    case 'syncing': return 'Syncing archive to disk'
+    case 'syncing': return 'Syncing model files to disk'
     case 'extracting': return 'Extracting model cache'
     case 'validating': return 'Validating model cache'
     case 'registering': return 'Registering model cache'

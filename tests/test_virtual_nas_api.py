@@ -477,7 +477,10 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cache_path", str(inventory.json()))
         self.assertEqual(inventory.json()["free_size"], 42)
         self.assertEqual(exported.content, b"tar-bytes")
-        self.assertEqual(exported.headers["content-type"], "application/x-tar")
+        self.assertEqual(
+            exported.headers["content-type"],
+            "application/vnd.sparkdeck.file-stream",
+        )
         self.assertEqual(imported.status_code, 200)
         self.assertNotIn("cache_path", str(imported.json()))
         self.assertEqual(received, {

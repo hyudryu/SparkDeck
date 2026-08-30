@@ -2816,6 +2816,51 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 12,
             )
 
+    def test_stopped_update_without_parallel_controls_preserves_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "api_port": 8000,
+                "members": [],
+                "launch_settings": {
+                    "deployment_name": "cluster",
+                    "model": "example/Model",
+                    "engine": "vllm",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "port": 8000,
+                    "extra_args": [
+                        "--tensor-parallel-size", "2",
+                        "--pipeline-parallel-size", "1",
+                    ],
+                },
+            }]
+
+            # A client that omits the TP/PP keys (e.g. an older frontend)
+            # updates only what it sent instead of clearing the layout.
+            updated = instance.update_deployment_settings("deployment-1", {
+                "launch_controls": {"max_concurrency": 8},
+            })
+
+            args = updated["launch_settings"]["extra_args"]
+            self.assertEqual(
+                instance._cli_option(
+                    args, {"--tensor-parallel-size", "-tp"}, int,
+                ),
+                2,
+            )
+            self.assertEqual(
+                instance._cli_option(args, {"--max-num-seqs"}, int), 8,
+            )
+
     def test_cluster_launch_controls_parse_and_round_trip_dspark_flags(self) -> None:
         instance = Manager.__new__(Manager)
         args = [

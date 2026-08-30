@@ -692,6 +692,10 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.deployment("sharded-bookmark")["id"],
         )
         self.assertIsNone(detail["launch_controls"]["tensor_parallel_size"])
+        stored = self.service.store.deployment(
+            "sharded-bookmark", include_private=True,
+        )
+        self.assertIsNone(stored["settings"]["tensor_parallel_size"])
 
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({

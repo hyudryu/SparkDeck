@@ -37,7 +37,10 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
-from sparkdeck.runtime_environment import normalize_runtime_environment
+from sparkdeck.runtime_environment import (
+    discovered_runtime_environment,
+    normalize_runtime_environment,
+)
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
@@ -10158,19 +10161,18 @@ class Manager:
         except Exception:
             vram_gb = None
 
-        runtime_environment: dict[str, str] = {}
+        inspected_environment: dict[str, str] = {}
         for entry in config.get("Env") or []:
             if not isinstance(entry, str) or "=" not in entry:
                 continue
             name, value = entry.split("=", 1)
-            try:
-                runtime_environment = normalize_runtime_environment(
-                    {**runtime_environment, name: value}, engine_label,
-                )
-            except ValueError:
-                # Credentials, malformed entries, and excess image defaults
-                # are never exposed through the public deployment contract.
-                continue
+            inspected_environment[name] = value
+        # Unlike user-authored launch settings, Docker inspection can contain
+        # arbitrary application credentials. Expose only known-safe tuning
+        # inputs, never values selected by secret-name heuristics.
+        runtime_environment = discovered_runtime_environment(
+            inspected_environment, engine_label,
+        )
         load_settings = self._container_load_settings(cmd, engine_label, model)
         load_settings["environment"] = runtime_environment
 

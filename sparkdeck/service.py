@@ -1357,9 +1357,10 @@ class SparkDeckService:
             )
             deployment["status"] = "running"
         except Exception:
-            if discovered and deployment.get("status") == "starting":
-                # Loading weights is a healthy Docker startup phase even
-                # though the inference endpoint has not opened its port yet.
+            if discovered:
+                # Docker owns lifecycle truth for synthetic container cards.
+                # The endpoint may still be loading or require credentials
+                # that SparkDeck does not have; neither makes it startable.
                 return
             deployment["status"] = "error"
             deployment["last_error"] = "Endpoint health check failed"

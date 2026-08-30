@@ -135,7 +135,9 @@ export function DeploymentPage() {
     setBusy('save'); setError(undefined); setNotice(undefined)
     try {
       await persist()
-      setNotice('Deployment settings saved. They will be applied on the next run.')
+      setNotice(deploymentId.startsWith('container:')
+        ? 'Deployment settings saved and applied.'
+        : 'Deployment settings saved. They will be applied on the next run.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save deployment settings')
     } finally { setBusy(undefined) }

@@ -291,7 +291,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         config = {
             "Image": "example/vllm:latest",
             "Cmd": command,
-            "Env": ["SPECIAL_RUNTIME_FLAG=1"],
+            "Env": [
+                "SPECIAL_RUNTIME_FLAG=1", "NCCL_DEBUG=INFO",
+                "IMAGE_DEFAULT=keep-private",
+            ],
             "Labels": {"vllm-model": model},
         }
         host_config = {
@@ -320,6 +323,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 {
                     **self.manager._container_load_settings(command, "vllm", model),
                     "max_concurrency": 3,
+                    "environment": {"NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"},
                 },
             )
 
@@ -327,7 +331,12 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(replacement.status, "running")
         self.assertTrue(original.removed)
-        self.assertEqual(api.created_config["Env"], ["SPECIAL_RUNTIME_FLAG=1"])
+        self.assertEqual(api.created_config["Env"], [
+            "SPECIAL_RUNTIME_FLAG=1",
+            "IMAGE_DEFAULT=keep-private",
+            "NCCL_DEBUG=WARN",
+            "VLLM_USE_V1=1",
+        ])
         self.assertEqual(api.created_config["HostConfig"], host_config)
         self.assertEqual(
             self.manager._cli_option(

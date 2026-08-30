@@ -11326,11 +11326,38 @@ class Manager:
             engine = _label_value(labels, ENGINE_LABEL, "vllm")
             model = _label_value(labels, MODEL_LABEL, "")
             new_cmd = self._updated_container_command(cmd, engine, model, settings)
+            requested_environment = None
+            if "environment" in settings:
+                requested_environment = normalize_runtime_environment(
+                    settings.get("environment"), engine,
+                )
+                if (
+                    discovered_runtime_environment(requested_environment, engine)
+                    != requested_environment
+                ):
+                    raise ValueError(
+                        "discovered deployment environment variables must use "
+                        "known safe runtime tuning names"
+                    )
             was_running = container.status in {"running", "restarting", "paused"}
             backup_name = f"{name}.settings-backup-{uuid.uuid4().hex[:8]}"
 
             create_config = config
             create_config["Cmd"] = new_cmd
+            if requested_environment is not None:
+                existing_environment: dict[str, str] = {}
+                for entry in config.get("Env") or []:
+                    if isinstance(entry, str) and "=" in entry:
+                        key, value = entry.split("=", 1)
+                        existing_environment[key] = value
+                for key in discovered_runtime_environment(
+                    existing_environment, engine,
+                ):
+                    existing_environment.pop(key, None)
+                existing_environment.update(requested_environment)
+                create_config["Env"] = [
+                    f"{key}={value}" for key, value in existing_environment.items()
+                ]
             create_config["HostConfig"] = copy.deepcopy(attrs.get("HostConfig") or {})
 
             def _replace():

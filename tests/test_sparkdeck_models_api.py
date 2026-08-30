@@ -424,8 +424,8 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertFalse(body["editable"])
-        self.assertIn("read-only", body["edit_reason"])
+        self.assertTrue(body["editable"])
+        self.assertIsNone(body["edit_reason"])
         self.assertEqual(body["launch_controls"]["context_window"], 65536)
         self.assertEqual(body["launch_controls"]["max_concurrency"], 8)
         self.assertEqual(body["launch_controls"]["kv_cache_dtype"], "fp8")
@@ -438,6 +438,84 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--enable-prefix-caching", body["extra_args"])
         self.assertIn("--tensor-parallel-size", body["extra_args"])
         self.assertNotIn("--max-model-len", body["extra_args"])
+
+    async def test_discovered_vllm_settings_rebuild_the_container(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "vllm-dspark", "image": "example/dspark:latest",
+            "load_settings": {
+                "engine": "vllm", "editable": True,
+                "extra_args": ["--enable-prefix-caching"],
+                "context_window": 65536, "max_concurrency": 8,
+                "thinking_mode": "default", "gpu_memory_utilization": 0.85,
+                "environment": {"NCCL_DEBUG": "INFO"},
+            },
+        }
+        update = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_settings", update),
+        ):
+            response = await self.client.put(
+                "/api/v1/deployments/container:vllm-dspark/settings",
+                json={
+                    "extra_args": ["--enable-prefix-caching"],
+                    "launch_controls": {
+                        "context_window": 131072,
+                        "max_concurrency": 4,
+                        "tensor_parallel_size": 2,
+                        "pipeline_parallel_size": 1,
+                        "kv_cache_dtype": "fp8",
+                        "thinking_mode": "disabled",
+                        "dspark_num_speculative_tokens": None,
+                        "max_cudagraph_capture_size": None,
+                        "max_num_batched_tokens": 8192,
+                    },
+                    "gpu_memory_utilization": 0.8,
+                    "gpu_memory_gb": None,
+                    "sg_tp_size": None,
+                    "sg_mem_fraction": None,
+                    "environment": {"NCCL_DEBUG": "WARN"},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        replacement = update.await_args.args[1]
+        self.assertEqual(replacement["context_window"], 131072)
+        self.assertEqual(replacement["max_concurrency"], 4)
+        self.assertEqual(replacement["gpu_memory_utilization"], 0.8)
+        self.assertEqual(replacement["environment"], {"NCCL_DEBUG": "WARN"})
+        flags = replacement["command_flags"]
+        self.assertIn("-tp 2", flags)
+        self.assertIn("-pp 1", flags)
+        self.assertIn("--max-num-batched-tokens 8192", flags)
+
+    async def test_unparseable_discovered_settings_remain_read_only(self):
+        card = {
+            "id": "container:custom", "alias": "custom", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "custom", "load_settings": {
+                "engine": "vllm", "editable": False, "extra_args": [],
+            },
+        }
+        patches = self._stub_discovered(card, container)
+        with patches[0], patches[1]:
+            response = await self.client.get("/api/v1/deployments/container:custom")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["editable"])
+        self.assertIn("cannot be edited safely", response.json()["edit_reason"])
 
     async def test_discovered_sglang_detail_maps_sglang_scalars(self):
         card = {
@@ -471,6 +549,51 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["sg_tp_size"], 1)
         self.assertIsNone(body["gpu_memory_utilization"])
         self.assertEqual(body["extra_args"], ["--enable-metrics"])
+
+    async def test_discovered_sglang_settings_map_runtime_specific_fields(self):
+        card = {
+            "id": "container:qwen-sglang", "alias": "qwen", "runtime": "sglang",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "qwen-sglang", "load_settings": {
+                "engine": "sglang", "editable": True,
+                "extra_args": ["--enable-metrics"],
+                "context_window": 131072, "max_concurrency": 8,
+                "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
+                "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1,
+            },
+        }
+        update = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_settings", update),
+        ):
+            response = await self.client.put(
+                "/api/v1/deployments/container:qwen-sglang/settings",
+                json={
+                    "extra_args": ["--enable-metrics"],
+                    "launch_controls": {
+                        "context_window": 262144, "max_concurrency": 4,
+                        "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
+                    },
+                    "gpu_memory_utilization": None, "gpu_memory_gb": None,
+                    "sg_tp_size": 2, "sg_mem_fraction": 0.75,
+                    "environment": {},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        replacement = update.await_args.args[1]
+        self.assertEqual(replacement["context_window"], 262144)
+        self.assertEqual(replacement["max_concurrency"], 4)
+        self.assertEqual(replacement["gpu_memory_utilization"], 0.75)
+        self.assertIn("--tp-size 2", replacement["command_flags"])
 
     async def test_discovered_detail_falls_back_when_container_is_gone(self):
         card = {

@@ -2441,6 +2441,7 @@ class Manager:
                     item, required_revision, resolved_revision,
                 )
                 and self._byte_count(item.get("size_bytes"))
+                and item.get("transferable") is not False
             ), None)
             if model:
                 sources.append({

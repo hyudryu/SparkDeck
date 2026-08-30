@@ -12,6 +12,7 @@ import queue
 import re
 import shutil
 import secrets
+import stat
 import struct
 import tempfile
 import threading
@@ -40,7 +41,7 @@ _FILE_STREAM_METADATA_MAX_BYTES = 32 * 1024 * 1024
 _FILE_STREAM_PAYLOAD_OVERHEAD_BYTES = 1024 * 1024
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
-_PEER_IMPORT_TERMINAL_RETENTION_SECONDS = 5.0
+_PEER_IMPORT_TERMINAL_RETENTION_SECONDS = 60.0
 _WEIGHT_SHARD = re.compile(
     r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<total>\d{5})"
     r"(?P<suffix>\.(?:safetensors|bin|gguf))$",
@@ -286,8 +287,10 @@ def _file_stream_path_entry(
             resolved = source.resolve(strict=True)
             if not resolved.is_file():
                 raise ValueError("external model contains an unsupported directory link")
+            source_stat = resolved.stat()
             return {
-                "path": name, "type": "file", "size": resolved.stat().st_size,
+                "path": name, "type": "file", "size": source_stat.st_size,
+                "mode": stat.S_IMODE(source_stat.st_mode) & 0o777,
                 "source": resolved,
             }
         repository_root = repository.resolve(strict=True)
@@ -306,10 +309,10 @@ def _file_stream_path_entry(
     if source.is_dir():
         return {"path": name, "type": "directory"}
     if source.is_file():
-        stat = source.stat()
-        identity = (stat.st_dev, stat.st_ino)
+        source_stat = source.stat()
+        identity = (source_stat.st_dev, source_stat.st_ino)
         wire_path = PurePosixPath(name)
-        if hardlinks is not None and stat.st_nlink > 1:
+        if hardlinks is not None and source_stat.st_nlink > 1:
             previous = hardlinks.get(identity)
             if previous is not None:
                 return {
@@ -320,10 +323,28 @@ def _file_stream_path_entry(
                 }
             hardlinks[identity] = wire_path
         return {
-            "path": name, "type": "file", "size": stat.st_size,
+            "path": name, "type": "file", "size": source_stat.st_size,
+            "mode": stat.S_IMODE(source_stat.st_mode) & 0o777,
             "source": source,
         }
     raise ValueError("model contains an unsupported special file")
+
+
+def _validate_file_stream_entry_budget(
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(entries) > _FILE_STREAM_MAX_ENTRIES:
+        raise ValueError(
+            "model repository exceeds the direct transfer entry limit"
+        )
+    return entries
+
+
+def _open_file_stream_destination(destination: Path):
+    """Create an incoming file without transiently widening its permissions."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(destination, flags, 0o600)
+    return os.fdopen(descriptor, "wb")
 
 
 def _validate_file_stream_path(name: Any, root_name: str) -> PurePosixPath:
@@ -1161,8 +1182,10 @@ class VirtualNAS:
             size_bytes = 0
             incomplete_size_bytes = 0
             file_count = 0
+            transfer_entry_count = 1
             last_modified = 0.0
             for root, directories, files in os.walk(repository, followlinks=False):
+                transfer_entry_count += len(directories) + len(files)
                 directories[:] = [
                     name for name in directories
                     if not (Path(root) / name).is_symlink()
@@ -1224,6 +1247,7 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "file_count": file_count,
+                "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
                 "partial": partial,
                 "has_partial_download": (
@@ -1245,6 +1269,8 @@ class VirtualNAS:
             }
             if selective_files:
                 model["selective_files_by_revision"] = selective_files
+            if transfer_entry_count > _FILE_STREAM_MAX_ENTRIES:
+                model["transferable"] = False
             models.append(model)
         external_models = _external_comfyui_inventory(
             self._external_model_roots_provider()
@@ -1363,16 +1389,18 @@ class VirtualNAS:
                 {
                     "path": f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}",
                     "type": "file", "size": len(_EXTERNAL_MARKER_CONTENT),
+                    "mode": 0o644,
                     "content": _EXTERNAL_MARKER_CONTENT,
                 },
                 {"path": f"{root}/refs", "type": "directory"},
                 {
                     "path": f"{root}/refs/main", "type": "file",
                     "size": len(_EXTERNAL_PSEUDO_REVISION.encode("utf-8")),
+                    "mode": 0o644,
                     "content": _EXTERNAL_PSEUDO_REVISION.encode("utf-8"),
                 },
             ])
-        return entries
+        return _validate_file_stream_entry_budget(entries)
 
     @staticmethod
     async def _export_file_stream(
@@ -1394,8 +1422,9 @@ class VirtualNAS:
 
         def produce() -> None:
             try:
-                publish(_FILE_STREAM_MAGIC)
                 stream_entries = entries() if callable(entries) else entries
+                _validate_file_stream_entry_budget(stream_entries)
+                publish(_FILE_STREAM_MAGIC)
                 for entry in stream_entries:
                     public = {
                         key: value for key, value in entry.items()
@@ -1536,7 +1565,8 @@ class VirtualNAS:
         record = {
             "status": "running", "phase": "receiving",
             "phase_started_at": time.time(), "bytes_transferred": 0,
-            "cancel": asyncio.Event(), "model_id": model_id,
+            "cancel": asyncio.Event(), "done": asyncio.Event(),
+            "model_id": model_id,
         }
         self._peer_imports[transfer_id] = record
         url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
@@ -1597,13 +1627,11 @@ class VirtualNAS:
         finally:
             if record["status"] == "running":
                 record["status"] = "failed"
-            if record["status"] == "completed":
-                asyncio.get_running_loop().call_later(
-                    _PEER_IMPORT_TERMINAL_RETENTION_SECONDS,
-                    self._forget_peer_import, transfer_id, record,
-                )
-            else:
-                self._forget_peer_import(transfer_id, record)
+            record["done"].set()
+            asyncio.get_running_loop().call_later(
+                _PEER_IMPORT_TERMINAL_RETENTION_SECONDS,
+                self._forget_peer_import, transfer_id, record,
+            )
 
     def _forget_peer_import(
         self, transfer_id: str, record: dict[str, Any],
@@ -1632,29 +1660,39 @@ class VirtualNAS:
         model_id = validate_model_id(model_id)
         transfer_id = str(transfer_id or "")
         record = self._peer_imports.get(transfer_id)
+        destination = self._model_path(model_id)
         if record is None:
-            return {"status": "not_found"}
+            if destination.exists() or destination.is_symlink():
+                raise RuntimeError(
+                    "direct transfer rollback cannot be confirmed"
+                )
+            return {"status": "canceled", "rollback_confirmed": True}
         if record.get("model_id") != model_id:
             raise LookupError("direct transfer is not active")
-        if record["status"] == "completed":
-            destination = self._model_path(model_id)
-            if destination.is_dir() and not destination.is_symlink():
-                await self._await_uncancelable(
-                    asyncio.to_thread(shutil.rmtree, destination),
-                )
-            record["status"] = "canceled"
-            self._set_peer_import_phase(record, "canceled")
-            self._forget_peer_import(transfer_id, record)
-            return {"status": "canceled"}
         record["cancel"].set()
-        return {"status": record["status"]}
+        if record["status"] == "running":
+            await record["done"].wait()
+        if destination.is_dir() and not destination.is_symlink():
+            await self._await_uncancelable(
+                asyncio.to_thread(shutil.rmtree, destination),
+            )
+        elif destination.exists() or destination.is_symlink():
+            raise RuntimeError("direct transfer rollback cannot be confirmed")
+        record["status"] = "canceled"
+        self._set_peer_import_phase(record, "canceled")
+        return {"status": "canceled", "rollback_confirmed": True}
 
     def issue_direct_export_capability(self, model_id: str, revision: str | None) -> str:
         """Create a single-use, short-lived capability for a fabric peer pull."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision) if revision else None
         model = next((item for item in self.inventory() if item.get("model_id") == model_id), None)
-        if model is None or model.get("partial") or (revision and not self._has_revision(model, revision, revision)):
+        if (
+            model is None
+            or model.get("partial")
+            or model.get("transferable") is False
+            or (revision and not self._has_revision(model, revision, revision))
+        ):
             raise LookupError("source node does not have the complete requested revision")
         capability = secrets.token_urlsafe(32)
         self._direct_export_capabilities[hashlib.sha256(capability.encode()).hexdigest()] = {
@@ -1731,11 +1769,25 @@ class VirtualNAS:
                 target = _validate_file_stream_link(path, entry.get("target"), root_name)
                 links.append((destination, target, entry_type))
                 continue
-            if entry_type != "file" or set(entry) != {"path", "type", "size"}:
+            file_keys = set(entry)
+            if entry_type != "file" or file_keys not in (
+                {"path", "type", "size"},
+                {"path", "type", "size", "mode"},
+            ):
                 raise ValueError("file stream metadata is invalid")
             size = entry.get("size")
             if isinstance(size, bool) or not isinstance(size, int) or size < 0:
                 raise ValueError("file stream file size is invalid")
+            # Older framed senders did not include mode; keep their files
+            # private rather than widening them through the process umask.
+            mode = entry.get("mode", 0o600)
+            if (
+                isinstance(mode, bool)
+                or not isinstance(mode, int)
+                or mode < 0
+                or mode > 0o777
+            ):
+                raise ValueError("file stream file mode is invalid")
             declared_file_bytes += size
             if (
                 max_file_bytes is not None
@@ -1747,7 +1799,9 @@ class VirtualNAS:
             destination.parent.mkdir(parents=True, exist_ok=True)
             remaining = size
             digest = hashlib.sha256()
-            output = await asyncio.to_thread(destination.open, "xb")
+            output = await asyncio.to_thread(
+                _open_file_stream_destination, destination,
+            )
             try:
                 while remaining:
                     if cancel is not None and cancel.is_set():
@@ -1765,6 +1819,7 @@ class VirtualNAS:
             expected_digest = await reader.readexactly(hashlib.sha256().digest_size)
             if not secrets.compare_digest(digest.digest(), expected_digest):
                 raise ValueError("model file failed transfer integrity verification")
+            await asyncio.to_thread(os.chmod, destination, mode)
         await reader.require_eof()
         if expected_bytes is not None and reader.received != int(expected_bytes):
             raise ValueError("file stream byte count does not match expected size")
@@ -1962,8 +2017,10 @@ class VirtualNAS:
                     f"{_SELECTIVE_SNAPSHOT_MARKER}"
                 ),
                 "type": "file", "size": len(_SELECTIVE_MARKER_CONTENT),
+                "mode": 0o644,
                 "content": _SELECTIVE_MARKER_CONTENT,
             })
+        _validate_file_stream_entry_budget(stream_entries)
         self._reserve_stream(model_id)
         return _TrackedExport(
             self, model_id, self._export_file_stream(stream_entries),
@@ -2685,6 +2742,16 @@ class VirtualNAS:
                 "a running Hugging Face download cannot be canceled safely; "
                 "it is resumable and will finish or fail"
             )
+        if job["status"] == "running":
+            job["phase"] = "canceling"
+            job["phase_started_at"] = time.time()
+            job["error"] = None
+            event = self._cancel_events.get(job_id)
+            if event:
+                event.set()
+            self._save()
+            self._wake.set()
+            return dict(job)
         job["status"] = "canceled"
         job["completed_at"] = time.time()
         job["error"] = None
@@ -3010,6 +3077,7 @@ class VirtualNAS:
         target_response = None
         source = None
         tracked_stream = None
+        peer_operation: asyncio.Task | None = None
         try:
             source_storage = await self._node_storage(job["source_node_id"])
             source_model = next((
@@ -3097,7 +3165,7 @@ class VirtualNAS:
                     source_capability = str((capability_result or {}).get("capability") or "")
                     if not source_capability:
                         raise RuntimeError("source did not issue a direct transfer capability")
-                    operation = asyncio.create_task(self.node_registry.request(
+                    peer_operation = asyncio.create_task(self.node_registry.request(
                         job["target_node_id"], "POST",
                         self._model_agent_path(job["model_id"], "import-from-peer"),
                         json_body={
@@ -3108,21 +3176,12 @@ class VirtualNAS:
                         },
                         timeout=3600,
                     ))
-                    while not operation.done():
+                    while not peer_operation.done():
                         try:
                             await asyncio.wait_for(event.wait(), timeout=0.5)
                         except TimeoutError:
                             pass
                         if event.is_set():
-                            try:
-                                await self.node_registry.request(job["target_node_id"], "DELETE", self._model_agent_path(job["model_id"], f"peer-imports/{job['id']}"), timeout=15)
-                            except Exception:
-                                # Cancellation remains authoritative even if
-                                # the best-effort cleanup acknowledgement is
-                                # lost; never relabel a canceled job as failed.
-                                pass
-                            operation.cancel()
-                            await asyncio.gather(operation, return_exceptions=True)
                             raise TransferCanceled()
                         try:
                             status = await self.node_registry.request(job["target_node_id"], "GET", self._model_agent_path(job["model_id"], f"peer-imports/{job['id']}"), timeout=5)
@@ -3134,7 +3193,9 @@ class VirtualNAS:
                             self._save_progress(job)
                         except Exception:
                             pass
-                    result = await operation
+                    result = await peer_operation
+                    if event.is_set():
+                        raise TransferCanceled()
                     received = _nonnegative_int((result or {}).get("bytes_received"))
                     # File framing and synthetic cache metadata make the wire
                     # stream slightly larger than the logical model size. The
@@ -3216,9 +3277,40 @@ class VirtualNAS:
             job["bytes_total"] = job["bytes_transferred"]
             job["completed_at"] = time.time()
         except TransferCanceled:
-            job["status"] = "canceled"
-            job["completed_at"] = time.time()
-            job["error"] = None
+            rollback_error = None
+            if peer_operation is not None:
+                try:
+                    confirmation = await self.node_registry.request(
+                        job["target_node_id"], "DELETE",
+                        self._model_agent_path(
+                            job["model_id"], f"peer-imports/{job['id']}",
+                        ),
+                        timeout=60,
+                    )
+                    if not (
+                        (confirmation or {}).get("status") == "canceled"
+                        and (confirmation or {}).get("rollback_confirmed") is True
+                    ):
+                        raise RuntimeError(
+                            "target did not confirm peer-import rollback"
+                        )
+                except Exception as exc:
+                    rollback_error = exc
+                finally:
+                    if not peer_operation.done():
+                        peer_operation.cancel()
+                    await asyncio.gather(peer_operation, return_exceptions=True)
+            if rollback_error is None:
+                job["status"] = "canceled"
+                job["completed_at"] = time.time()
+                job["error"] = None
+            else:
+                job["status"] = "failed"
+                job["completed_at"] = time.time()
+                job["error"] = (
+                    "cancellation requested but target rollback could not be "
+                    f"confirmed: {rollback_error}"
+                )[:500]
         except asyncio.CancelledError:
             if job["status"] != "canceled":
                 job["status"] = "queued"
@@ -3615,6 +3707,17 @@ def _external_comfyui_bundle_files(
     return best
 
 
+def _external_file_stream_entry_count(files: dict[str, Path]) -> int:
+    directories: set[str] = set()
+    for relative in files:
+        parts = PurePosixPath(relative).parts
+        directories.update(
+            "/".join(parts[:depth]) for depth in range(1, len(parts))
+        )
+    # Synthetic root, snapshots, snapshot, marker, refs, and refs/main.
+    return 6 + len(directories) + len(files)
+
+
 def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
     """Report known complete ComfyUI bundles as installed node weights."""
     models: dict[str, dict[str, Any]] = {}
@@ -3645,6 +3748,7 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
                 # when inventory merges in partial Hugging Face cache residue.
                 "transfer_size_bytes": size_bytes,
                 "file_count": len(files),
+                "transfer_entry_count": _external_file_stream_entry_count(files),
                 "partial": False,
                 "has_partial_download": False,
                 "partial_size_bytes": 0,
@@ -3660,6 +3764,8 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
                 "source": "ComfyUI",
                 "externally_managed": True,
             }
+            if candidate["transfer_entry_count"] > _FILE_STREAM_MAX_ENTRIES:
+                candidate["transferable"] = False
             current = models.get(model_id)
             if current is None or candidate["size_bytes"] > current["size_bytes"]:
                 models[model_id] = candidate

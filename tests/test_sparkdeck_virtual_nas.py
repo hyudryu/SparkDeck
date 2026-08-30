@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import stat
 import struct
 import tempfile
 import threading
@@ -978,6 +979,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "size_bytes": 21,
                 "transfer_size_bytes": 21,
                 "file_count": 3,
+                "transfer_entry_count": 12,
                 "partial": False,
                 "has_partial_download": False,
                 "partial_size_bytes": 0,
@@ -1647,6 +1649,36 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((hub / "models--org--model").exists())
             self.assertEqual(list(hub.glob(".sparkdeck-vnas-stage-*")), [])
 
+    async def test_inventory_and_export_reject_over_budget_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            exact_entries = nas._whole_model_stream_entries(repository, None)
+
+            with patch.object(
+                virtual_nas, "_FILE_STREAM_MAX_ENTRIES", len(exact_entries) - 1,
+            ):
+                model = nas.inventory()[0]
+                self.assertEqual(
+                    model["transfer_entry_count"], len(exact_entries),
+                )
+                self.assertFalse(model["partial"])
+                self.assertIs(model["transferable"], False)
+                with self.assertRaisesRegex(LookupError, "complete requested"):
+                    nas.issue_direct_export_capability("org/model", None)
+                with self.assertRaisesRegex(RuntimeError, "cannot be transferred"):
+                    await nas.queue_transfer(
+                        "org/model", "local", ["worker-a"],
+                    )
+                self.assertEqual(nas.jobs, [])
+                stream = nas.export_model("org/model")
+                with self.assertRaisesRegex(ValueError, "entry limit"):
+                    await anext(stream)
+                await stream.aclose()
+
+            self.assertFalse(nas.model_in_transfer("org/model", "local"))
+
     async def test_streamed_import_cancellation_never_registers_repository(self):
         for cancel_phase in ("syncing", "registering"):
             with self.subTest(cancel_phase=cancel_phase), tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
@@ -1826,8 +1858,79 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             repeated = await nas.cancel_peer_import("org/model", "transfer-1")
 
             self.assertEqual(result["status"], "canceled")
-            self.assertEqual(repeated["status"], "not_found")
+            self.assertTrue(result["rollback_confirmed"])
+            self.assertEqual(repeated["status"], "canceled")
+            self.assertTrue(repeated["rollback_confirmed"])
             self.assertFalse((hub / "models--org--model").exists())
+
+    async def test_running_peer_cancel_waits_for_rollback_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            done = asyncio.Event()
+            record = {
+                "status": "running", "phase": "receiving",
+                "phase_started_at": 0, "bytes_transferred": 1,
+                "cancel": asyncio.Event(), "done": done,
+                "model_id": "org/model",
+            }
+            nas._peer_imports["transfer-1"] = record
+
+            cancellation = asyncio.create_task(
+                nas.cancel_peer_import("org/model", "transfer-1"),
+            )
+            await asyncio.sleep(0)
+            self.assertTrue(record["cancel"].is_set())
+            self.assertFalse(cancellation.done())
+            create_cached_model(hub)
+            record["status"] = "completed"
+            done.set()
+
+            result = await cancellation
+
+            self.assertEqual(result, {
+                "status": "canceled", "rollback_confirmed": True,
+            })
+            self.assertFalse((hub / "models--org--model").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are required")
+    async def test_streamed_import_preserves_private_and_executable_modes(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source_hub = Path(source_dir) / "hub"
+            target_hub = Path(target_dir) / "hub"
+            repository = create_cached_model(source_hub)
+            private = repository / "snapshots" / "revision-1" / "config.json"
+            executable = repository / "snapshots" / "revision-1" / "helper.sh"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            private.chmod(0o600)
+            executable.chmod(0o751)
+            source = VirtualNAS(Path(source_dir), lambda: source_hub, FakeRegistry(), lambda: True)
+            target = VirtualNAS(Path(target_dir), lambda: target_hub, FakeRegistry(), lambda: True)
+
+            await target.import_model("org/model", source.export_model("org/model"))
+
+            copied = target_hub / "models--org--model" / "snapshots" / "revision-1"
+            self.assertEqual(stat.S_IMODE((copied / "config.json").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((copied / "helper.sh").stat().st_mode), 0o751)
+
+    async def test_streamed_import_rejects_unsafe_file_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            for mode in (True, -1, 0o1000):
+                with self.subTest(mode=mode):
+                    body = b"".join([
+                        virtual_nas._FILE_STREAM_MAGIC,
+                        virtual_nas._file_stream_header({
+                            "path": "models--org--model", "type": "directory",
+                        }),
+                        virtual_nas._file_stream_header({
+                            "path": "models--org--model/file", "type": "file",
+                            "size": 0, "mode": mode,
+                        }),
+                    ])
+                    with self.assertRaisesRegex(ValueError, "mode is invalid"):
+                        await nas.import_model("org/model", bytes_stream(body))
 
     async def test_delete_is_blocked_while_local_export_is_reserved(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1985,7 +2088,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         registry.release_upload.set()
         await self.wait_final(nas, 1)
 
-        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["status"], "running")
+        self.assertEqual(canceled["phase"], "canceling")
         self.assertEqual(nas.jobs[0]["status"], "canceled")
         await nas.stop()
 
@@ -2033,6 +2137,69 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 "/api/agent/virtual-nas/models/org%2Fmodel/import-from-peer",
             ],
         )
+
+    async def test_direct_cancel_after_peer_completion_requires_rollback_confirmation(self):
+        for confirms, expected_status in ((True, "canceled"), (False, "failed")):
+            with self.subTest(confirms=confirms):
+                registry = DirectTransferRegistry()
+                registry.remote_models["worker-a"] = [{
+                    "model_id": "org/model", "size_bytes": 123,
+                    "partial": False, "transferable": True,
+                    "revisions": ["revision-1"],
+                }]
+                original_request = registry.request
+
+                async def request(node_id, method, path, **kwargs):
+                    if method == "DELETE" and "/peer-imports/" in path:
+                        registry.direct_requests.append((node_id, method, path, {}))
+                        if not confirms:
+                            raise RuntimeError("rollback endpoint unavailable")
+                        registry.remote_models[node_id] = []
+                        return {
+                            "status": "canceled", "rollback_confirmed": True,
+                        }
+                    return await original_request(node_id, method, path, **kwargs)
+
+                registry.request = request
+                nas = VirtualNAS(
+                    Path(self.temp.name), lambda: self.hub,
+                    registry, lambda: True,
+                )
+                job = {
+                    "id": f"direct-cancel-{confirms}", "kind": "transfer",
+                    "model_id": "org/model", "source_node_id": "worker-a",
+                    "target_node_id": "worker-b", "revision": "revision-1",
+                    "requested_revision": "revision-1", "status": "queued",
+                    "bytes_total": 123, "bytes_transferred": 0,
+                    "created_at": 0, "started_at": None,
+                    "completed_at": None, "error": None,
+                }
+                nas.jobs = [job]
+                original_storage = nas._node_storage
+
+                async def storage(node_id):
+                    value = await original_storage(node_id)
+                    if (
+                        node_id == "worker-b"
+                        and registry.remote_models.get("worker-b")
+                    ):
+                        nas._cancel_events[job["id"]].set()
+                    return value
+
+                nas._node_storage = storage
+
+                await nas._run_transfer(job)
+
+                self.assertEqual(job["status"], expected_status)
+                delete_calls = [
+                    call for call in registry.direct_requests
+                    if call[1] == "DELETE"
+                ]
+                self.assertEqual(len(delete_calls), 1)
+                if confirms:
+                    self.assertEqual(registry.remote_models["worker-b"], [])
+                else:
+                    self.assertIn("rollback could not be confirmed", job["error"])
 
     async def test_local_source_whole_model_upload_uses_fabric_stream(self):
         registry = FakeRegistry()

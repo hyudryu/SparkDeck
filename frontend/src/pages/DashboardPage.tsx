@@ -169,13 +169,19 @@ export function DashboardPage() {
 
   const stats = statsResource.data
   const admission = admissionResource.data
+  // Retained queue data is useful for the stale queue summary, but it must not
+  // override a newer active-request snapshot after the admission refresh fails.
+  const admissionForSessions = admissionResource.error ? undefined : admission
   const deployments = deploymentsResource.data ?? []
   const sync = syncResource.data
-  const activeRequests = Object.entries(activeRequestSnapshot(stats, admission))
+  const activeRequests = Object.entries(activeRequestSnapshot(stats, admissionForSessions))
   const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
   const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
-  const inferenceAvailable = stats !== undefined || admission !== undefined
-  const inferenceComplete = stats !== undefined && admission !== undefined
+  const freshQueuedRequests = Object.values(admissionForSessions ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
+  // Admission only covers concurrency-limited vLLM targets. A non-empty feed
+  // can prove work exists, but an empty feed cannot prove the cluster is idle.
+  const inferenceAvailable = stats !== undefined || activeRequests.length > 0
+  const inferenceComplete = stats !== undefined && admissionForSessions !== undefined
   const activeDeployments = deployments.filter((item) => ACTIVE_DEPLOYMENT_STATUSES.has(item.status))
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
   const allClusterNodes = nodesResource.data ?? []
@@ -189,10 +195,12 @@ export function DashboardPage() {
     : admissionResource.error ? 'queue unavailable' : 'queue loading'
   const inferenceStatus = runningSessions > 0
     ? 'running'
-    : inferenceComplete ? (queuedRequests > 0 ? 'waiting' : 'stopped') : 'waiting'
+    : freshQueuedRequests > 0 ? 'waiting'
+      : inferenceComplete ? 'stopped' : 'waiting'
   const inferenceStatusLabel = runningSessions > 0
     ? 'Processing'
-    : inferenceComplete ? (queuedRequests > 0 ? 'Waiting' : 'Idle')
+    : freshQueuedRequests > 0 ? 'Waiting'
+      : inferenceComplete ? 'Idle'
       : statsResource.error || admissionResource.error ? 'Unavailable' : 'Loading'
   const telemetryNotice = statsResource.error
     ? `Local telemetry ${stats ? 'refresh paused' : 'unavailable; retrying'}: ${statsResource.error}`
@@ -350,18 +358,19 @@ function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, po
 
 function SessionRow({ model, request }: { model: string; request: ActiveRequestStats }) {
   const rate = (request.thinking_tok_s ?? 0) + (request.output_tok_s ?? 0)
+  const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
     .map(([ip, connections]) => `${connections} from ${ip}`)
   return (
     <div className="dashboard-list-row session-row">
-      <span className="status-dot status-running" aria-hidden="true" />
+      <span className={`status-dot status-${waiting ? 'waiting' : 'running'}`} aria-hidden="true" />
       <div>
         <strong>{model}</strong>
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
-      <span className="session-rate">{rate > 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'}</span>
+      <span className="session-rate">{waiting ? 'Waiting' : rate > 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'}</span>
     </div>
   )
 }

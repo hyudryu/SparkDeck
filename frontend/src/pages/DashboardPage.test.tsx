@@ -305,6 +305,92 @@ describe('DashboardPage', () => {
     expect(screen.getByText('12.0 tok/s')).toBeInTheDocument()
   })
 
+  it('renders queued-only admission sessions as waiting', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return new Response(JSON.stringify({ detail: 'telemetry unavailable' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (path.includes('/api/inference-queue')) return json({ target: { model: 'queued-model', running: 0, queued: 2 } })
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    const model = await screen.findByText('queued-model')
+    const row = model.closest('.session-row')!
+    expect(row.querySelector('.status-dot')).toHaveClass('status-waiting')
+    expect(row).toHaveTextContent('0 active · 2 queued')
+    expect(row).toHaveTextContent('Waiting')
+    expect(row).not.toHaveTextContent('Measuring')
+    expect(screen.getByText('Waiting', { selector: '.status' })).toBeInTheDocument()
+  })
+
+  it('keeps inference unavailable when admission is empty and stats fail', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return new Response(JSON.stringify({ detail: 'telemetry unavailable' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Active session status unavailable')).toBeInTheDocument()
+    expect(screen.getByText('Unavailable', { selector: '.status' })).toBeInTheDocument()
+    expect(screen.queryByText('No active inference')).not.toBeInTheDocument()
+    expect(screen.queryByText('Idle')).not.toBeInTheDocument()
+  })
+
+  it('does not let retained errored admission override fresh stats', async () => {
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    let admissionCalls = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+      if (path.includes('/api/inference-queue')) {
+        admissionCalls += 1
+        if (admissionCalls === 1) return json({ target: { model: 'finished-model', running: 1, queued: 0 } })
+        return new Response(JSON.stringify({ detail: 'queue unavailable' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      if (path.includes('/api/v1/onboarding')) return json({ role: 'controller' })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('finished-model')).toBeInTheDocument()
+
+    await act(async () => {
+      MockWebSocket.instances[0].emit({
+        type: 'snapshot',
+        stats: { cpu_pct: 25, mem: {}, gpus: [], active_requests: {} },
+        admission: null,
+      })
+      await Promise.resolve()
+      screen.getByRole('button', { name: 'Refresh' }).click()
+    })
+
+    expect(await screen.findByText(/Queue refresh paused: queue unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText('finished-model')).not.toBeInTheDocument()
+    expect(screen.queryByText('Processing')).not.toBeInTheDocument()
+    expect(screen.getByText('Unavailable', { selector: '.status' })).toBeInTheDocument()
+  })
+
   it('marks retained section data stale when an independent refresh fails', async () => {
     vi.useFakeTimers()
     const attempts = new Map<string, number>()

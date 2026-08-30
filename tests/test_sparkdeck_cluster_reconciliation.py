@@ -236,6 +236,106 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "manager-hermes", "stop",
         )
 
+    async def test_completed_legacy_launch_refreshes_early_adoption(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        cluster = {
+            "id": "manager-hermes",
+            "name": "model",
+            "model": "org/model",
+            "engine": "vllm",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "starting",
+            "api_port": None,
+            "members": [],
+            "launch_settings": {"extra_args": []},
+        }
+        self.manager.deployments = [cluster]
+
+        early = await self.service.deployments()
+        record_id = early[0]["id"]
+        self.assertIsNone(
+            self.service.store.deployment(record_id, include_private=True)[
+                "_base_url"
+            ]
+        )
+        cluster.update({
+            "status": "ready",
+            "api_port": 8123,
+            "model_source": "public_repository",
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "manager-hermes-r0",
+            }],
+        })
+
+        registered = await self.service.register_manager_deployment(cluster)
+
+        stored = self.service.store.deployment(record_id, include_private=True)
+        self.assertEqual(registered["_base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(stored["_base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(stored["container_name"], "manager-hermes-r0")
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+
+    async def test_llama_adoption_preserves_manager_gguf_artifact(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "manager-llama",
+            "name": "GGUF deployment",
+            "model": "org/gguf-model",
+            "engine": "llama.cpp",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "ready",
+            "api_port": 8124,
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "manager-llama-r0",
+            }],
+            "launch_settings": {
+                "llama_artifact": "weights/model-Q4_K_M.gguf",
+                "extra_args": [],
+            },
+        }]
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(
+            listed[0]["model"]["artifact"], "weights/model-Q4_K_M.gguf",
+        )
+        record_id = listed[0]["id"]
+        model = dict(listed[0]["model"])
+        model["artifact"] = None
+        self.service.store.update_deployment_model(record_id, model)
+
+        registered = await self.service.register_manager_deployment(
+            self.manager.deployments[0],
+        )
+
+        self.assertEqual(
+            registered["model"]["artifact"], "weights/model-Q4_K_M.gguf",
+        )
+
+    async def test_deployment_reads_do_not_wait_for_long_create_lock(self):
+        self.manager.deployments = [{
+            "id": "manager-in-flight", "name": "in-flight",
+            "model": "org/in-flight", "engine": "vllm",
+            "node_ids": ["worker-1"], "members": [],
+            "launch_settings": {},
+        }]
+        await self.service._deployment_create_lock.acquire()
+        try:
+            listed = await asyncio.wait_for(self.service.deployments(), timeout=0.2)
+        finally:
+            self.service._deployment_create_lock.release()
+
+        self.assertEqual(listed[0]["id"], "record-1")
+        self.assertFalse(any(item["alias"] == "in-flight" for item in listed))
+        refreshed = await self.service.deployments()
+        self.assertTrue(any(item["alias"] == "in-flight" for item in refreshed))
+
     async def test_reverse_link_collision_allocates_a_distinct_record(self):
         self.manager._save_deployments = Mock()
         self.manager.deployments = [{

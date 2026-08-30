@@ -1636,11 +1636,22 @@ async def create_container(req: Request):
             cluster = await manager.create_deployment(body)
             try:
                 await sparkdeck.register_manager_deployment(cluster)
-            except Exception:
+            except Exception as registration_error:
                 try:
-                    await manager.deployment_action(cluster["id"], "remove")
-                except Exception:
-                    pass
+                    rollback = await manager.deployment_action(
+                        cluster["id"], "remove",
+                    )
+                    if not rollback.get("ok"):
+                        errors = "; ".join(
+                            str(item) for item in rollback.get("errors") or []
+                        ) or "Manager did not confirm removal"
+                        raise RuntimeError(errors)
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"deployment {cluster['id']} was created but catalog "
+                        f"registration failed ({registration_error}); rollback "
+                        f"failed: {rollback_error}"
+                    ) from registration_error
                 raise
             return cluster
         return await manager.create_container(

@@ -347,6 +347,7 @@ class SparkDeckService:
             token_provider=lambda: getattr(manager, "_resolved_hf_token", lambda: "")(),
         )
         self._deployment_create_lock = asyncio.Lock()
+        self._deployment_reconciliation_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
@@ -782,7 +783,7 @@ class SparkDeckService:
     async def deployments(self) -> list[dict[str, Any]]:
         raw_manager_deployments = getattr(self.manager, "deployments", [])
         registered = await self._adopt_unlinked_manager_deployments(
-            raw_manager_deployments,
+            raw_manager_deployments, skip_if_creating=True,
         )
         by_container = {item.get("container_name"): item for item in registered}
         cluster_state: dict[str, Any] = {}
@@ -1019,7 +1020,11 @@ class SparkDeckService:
         self, cluster: dict[str, Any],
     ) -> dict[str, Any]:
         """Persist one legacy Manager launch in the v1 deployment catalog."""
-        registered = await self._adopt_unlinked_manager_deployments([cluster])
+        # Match native v1 creation's mutation boundary. The fixed lock order is
+        # create then reconciliation; read-side reconciliation never acquires
+        # the create lock, so this cannot deadlock with catalog polling.
+        async with self._deployment_create_lock:
+            registered = await self._adopt_unlinked_manager_deployments([cluster])
         record_id = str(cluster.get("sparkdeck_record_id") or "")
         adopted = next(
             (item for item in registered if str(item.get("id") or "") == record_id),
@@ -1030,7 +1035,7 @@ class SparkDeckService:
         return adopted
 
     async def _adopt_unlinked_manager_deployments(
-        self, manager_deployments: Any,
+        self, manager_deployments: Any, *, skip_if_creating: bool = False,
     ) -> list[dict[str, Any]]:
         """Give legacy cluster launches durable cards in the v1 catalog.
 
@@ -1041,7 +1046,12 @@ class SparkDeckService:
         """
         if not isinstance(manager_deployments, list):
             return self.store.deployments(include_private=True)
-        async with self._deployment_create_lock:
+        # Native v1 creation intentionally holds the create lock across remote
+        # launch work. Reads must keep returning the already durable catalog
+        # instead of queueing behind a potentially minutes-long launch.
+        if skip_if_creating and self._deployment_create_lock.locked():
+            return self.store.deployments(include_private=True)
+        async with self._deployment_reconciliation_lock:
             registered = self.store.deployments(include_private=True)
             by_manager_id = {
                 str((item.get("settings") or {}).get("manager_deployment_id")): item
@@ -1056,6 +1066,10 @@ class SparkDeckService:
                 if not isinstance(cluster, dict) or not cluster.get("id"):
                     continue
                 manager_id = str(cluster["id"])
+                launch_settings = (
+                    dict(cluster.get("launch_settings"))
+                    if isinstance(cluster.get("launch_settings"), dict) else {}
+                )
                 linked = by_manager_id.get(manager_id)
                 record_id = str(cluster.get("sparkdeck_record_id") or "")
                 if linked is None and record_id:
@@ -1075,10 +1089,115 @@ class SparkDeckService:
                 if linked is not None:
                     if cluster.get("sparkdeck_record_id") != linked["id"]:
                         cluster["sparkdeck_record_id"] = linked["id"]
-                        launch_settings = cluster.get("launch_settings")
-                        if isinstance(launch_settings, dict):
+                        durable_launch_settings = cluster.get("launch_settings")
+                        if isinstance(durable_launch_settings, dict):
+                            durable_launch_settings["sparkdeck_record_id"] = linked["id"]
                             launch_settings["sparkdeck_record_id"] = linked["id"]
                         changed = True
+                    safe_args = list(launch_settings.get("extra_args") or [])
+                    sanitize_args = getattr(
+                        self.manager, "_without_sensitive_cli_credentials", None,
+                    )
+                    if callable(sanitize_args):
+                        safe_args = sanitize_args(safe_args)
+                    existing_settings = dict(linked.get("settings") or {})
+                    existing_source = str(
+                        existing_settings.get("model_source") or "unknown"
+                    )
+                    incoming_source = str(
+                        cluster.get("model_source")
+                        or launch_settings.get("model_source")
+                        or "unknown"
+                    )
+                    if (
+                        incoming_source not in {
+                            "local", "public_repository", "unknown",
+                        }
+                        or (
+                            incoming_source == "unknown"
+                            and existing_source in {"local", "public_repository"}
+                        )
+                    ):
+                        incoming_source = existing_source
+                    node_ids = [
+                        str(item) for item in (
+                            cluster.get("node_ids")
+                            or existing_settings.get("node_ids")
+                            or []
+                        ) if str(item).strip()
+                    ]
+                    settings = self._local_configuration({
+                        **existing_settings,
+                        **launch_settings,
+                        "extra_args": safe_args,
+                        "deployment_mode": (
+                            cluster.get("mode")
+                            or launch_settings.get("deployment_mode")
+                            or existing_settings.get("deployment_mode")
+                            or ("replicated" if len(node_ids) > 1 else "single")
+                        ),
+                        "node_ids": node_ids,
+                        "manager_deployment_id": manager_id,
+                        "model_source": incoming_source,
+                        "managed_by": (
+                            cluster.get("managed_by")
+                            or existing_settings.get("managed_by")
+                        ),
+                        "automation_run_id": (
+                            cluster.get("automation_run_id")
+                            or existing_settings.get("automation_run_id")
+                        ),
+                    })
+                    members = cluster.get("members") or []
+                    primary = (
+                        members[0]
+                        if members and isinstance(members[0], dict) else {}
+                    )
+                    container_name = (
+                        primary.get("container_name") or linked.get("container_name")
+                    )
+                    try:
+                        port = int(cluster.get("api_port"))
+                    except (TypeError, ValueError):
+                        port = None
+                    self.store.update_managed_routing(
+                        linked["id"], settings, container_name,
+                        f"http://127.0.0.1:{port}" if port else linked.get("_base_url"),
+                    )
+                    try:
+                        runtime = RuntimeKind(str(
+                            cluster.get("engine") or linked.get("runtime") or "vllm"
+                        ))
+                    except ValueError:
+                        runtime = None
+                    model = dict(linked.get("model") or {})
+                    model["repository"] = str(
+                        cluster.get("model") or model.get("repository") or ""
+                    )
+                    model["revision"] = (
+                        self._persisted_revision(launch_settings)
+                        or model.get("revision")
+                    )
+                    model["artifact"] = _optional_string(
+                        (
+                            launch_settings.get("llama_artifact")
+                            if runtime is RuntimeKind.LLAMA_CPP
+                            else launch_settings.get("artifact")
+                        )
+                        or model.get("artifact")
+                    )
+                    model["quantization"] = (
+                        canonical_quantization(launch_settings.get("quantization"))
+                        or model.get("quantization")
+                    )
+                    self.store.update_deployment_model(linked["id"], model)
+                    refreshed = self.store.deployment(
+                        linked["id"], include_private=True,
+                    )
+                    if refreshed is not None:
+                        registered[registered.index(linked)] = refreshed
+                        by_manager_id[manager_id] = refreshed
+                        by_record_id[str(refreshed["id"])] = refreshed
                     continue
                 model = str(cluster.get("model") or "").strip()
                 try:
@@ -1087,10 +1206,6 @@ class SparkDeckService:
                     continue
                 if not model:
                     continue
-                launch_settings = (
-                    dict(cluster.get("launch_settings"))
-                    if isinstance(cluster.get("launch_settings"), dict) else {}
-                )
                 safe_args = list(launch_settings.get("extra_args") or [])
                 sanitize_args = getattr(
                     self.manager, "_without_sensitive_cli_credentials", None,
@@ -1111,7 +1226,11 @@ class SparkDeckService:
                     ),
                     "node_ids": node_ids,
                     "manager_deployment_id": manager_id,
-                    "model_source": cluster.get("model_source") or "unknown",
+                    "model_source": (
+                        cluster.get("model_source")
+                        or launch_settings.get("model_source")
+                        or "unknown"
+                    ),
                     "managed_by": cluster.get("managed_by"),
                     "automation_run_id": cluster.get("automation_run_id"),
                 })
@@ -1142,7 +1261,11 @@ class SparkDeckService:
                     model=ModelIdentity(
                         repository=model,
                         revision=self._persisted_revision(launch_settings),
-                        artifact=_optional_string(launch_settings.get("artifact")),
+                        artifact=_optional_string(
+                            launch_settings.get("llama_artifact")
+                            if runtime is RuntimeKind.LLAMA_CPP
+                            else launch_settings.get("artifact")
+                        ),
                         quantization=canonical_quantization(
                             launch_settings.get("quantization")
                         ),

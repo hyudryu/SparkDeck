@@ -49,7 +49,8 @@ class FakeManager:
     def __init__(self):
         self.http = SimpleNamespace(get=AsyncMock())
         self.node_registry = SimpleNamespace(request=AsyncMock())
-        self.cluster_nodes = AsyncMock(return_value=[{
+        self.cluster_nodes = AsyncMock()
+        self.cluster_node_liveness = AsyncMock(return_value=[{
             "id": "local", "name": "Controller", "local": True,
             "online": True, "enabled": True, "capabilities": [CAPABILITY],
             "app_revision": "a" * 40,
@@ -138,9 +139,45 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(overview["up_to_date"])
         self.assertFalse(overview["can_update"])
 
+    async def test_overview_uses_lightweight_liveness_and_caches_local_checks(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        with patch("sparkdeck.updater.local_blockers", return_value=[]) as blockers:
+            first = await self.service.overview()
+            second = await self.service.overview()
+
+        self.assertTrue(first["can_update"])
+        self.assertTrue(second["can_update"])
+        self.assertEqual(blockers.call_count, 1)
+        self.assertEqual(self.manager.cluster_node_liveness.await_count, 2)
+        self.manager.cluster_nodes.assert_not_awaited()
+
+    async def test_overview_timeout_is_cached_as_an_honest_blocker(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        release_check = threading.Event()
+
+        def blocked_local_check(_root):
+            release_check.wait(timeout=1)
+            return []
+
+        try:
+            with patch(
+                "sparkdeck.updater.OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS", 0.01,
+            ), patch(
+                "sparkdeck.updater.local_blockers", side_effect=blocked_local_check,
+            ) as blockers:
+                first = await asyncio.wait_for(self.service.overview(), timeout=0.5)
+                second = await asyncio.wait_for(self.service.overview(), timeout=0.5)
+        finally:
+            release_check.set()
+
+        self.assertFalse(first["can_update"])
+        self.assertFalse(second["can_update"])
+        self.assertIn("timed out", first["blockers"][0].lower())
+        self.assertEqual(blockers.call_count, 1)
+
     async def test_overview_allows_eligible_nodes_when_another_node_is_blocked(self):
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
-        self.manager.cluster_nodes.return_value = [
+        self.manager.cluster_node_liveness.return_value = [
             {
                 "id": "local", "name": "Controller", "local": True,
                 "online": True, "enabled": True, "capabilities": [CAPABILITY],

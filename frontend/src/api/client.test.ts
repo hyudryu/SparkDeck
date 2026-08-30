@@ -118,6 +118,20 @@ describe('API client adapters', () => {
     await result
   })
 
+  it('bounds the local controller bootstrap check to five seconds', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = expect(api.onboarding.get()).rejects.toMatchObject({ status: 408 })
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    await result
+  })
+
   it('keeps the timeout active while reading a JSON response body', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => ({

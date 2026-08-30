@@ -42,6 +42,7 @@ JOIN_RATE_LIMIT = 5
 JOIN_RATE_WINDOW_SECONDS = 60.0
 PROXY_TIMEOUT_SECONDS = 600.0
 PROXY_DISCONNECT_POLL_SECONDS = 0.1
+CONTROL_DNS_TIMEOUT_SECONDS = 3.0
 
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
@@ -87,9 +88,14 @@ async def _resolve_pinned_connection(url: str) -> ControlConnection:
         literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
         try:
-            rows = await asyncio.to_thread(
-                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(
+                    socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+                ),
+                timeout=CONTROL_DNS_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError as exc:
+            raise ValueError("URL hostname resolution timed out") from exc
         except OSError as exc:
             raise ValueError("URL hostname could not be resolved") from exc
         addresses = []

@@ -37,6 +37,8 @@ FAILED_NODE_PHASES = {"failed", "rolled_back", "recovery_required"}
 RUNTIME_REVISION_BLOCKER = (
     "Running SparkDeck revision could not be verified; restart SparkDeck before updating"
 )
+OVERVIEW_LOCAL_BLOCKERS_TTL_SECONDS = 30.0
+OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS = 10.0
 
 _WINDOWS_HELPER_BOOTSTRAP = r"""
 import json
@@ -428,6 +430,8 @@ class UpdateService:
         self._release_cache: tuple[float, list[dict], str | None] | None = None
         self._resolved_releases: dict[str, dict] = {}
         self._main_cache: tuple[float, dict | None, str | None] | None = None
+        self._overview_blockers_cache: tuple[float, tuple[str, ...]] | None = None
+        self._overview_blockers_lock = asyncio.Lock()
 
     @staticmethod
     def _read(path: Path) -> dict:
@@ -541,6 +545,34 @@ class UpdateService:
             "blockers": blockers,
         }
 
+    async def _overview_local_blockers(self, *, force: bool = False) -> list[str]:
+        now = time.monotonic()
+        cached = self._overview_blockers_cache
+        if not force and cached and now - cached[0] < OVERVIEW_LOCAL_BLOCKERS_TTL_SECONDS:
+            return list(cached[1])
+        async with self._overview_blockers_lock:
+            now = time.monotonic()
+            cached = self._overview_blockers_cache
+            if not force and cached and now - cached[0] < OVERVIEW_LOCAL_BLOCKERS_TTL_SECONDS:
+                return list(cached[1])
+            try:
+                blockers = await asyncio.wait_for(
+                    asyncio.to_thread(local_blockers, self.root),
+                    timeout=OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                blockers = [
+                    "Installation preflight timed out while checking update readiness"
+                ]
+            except Exception as exc:
+                blockers = [
+                    f"Installation preflight failed while checking update readiness: {str(exc)[:240]}"
+                ]
+            self._overview_blockers_cache = (
+                time.monotonic(), tuple(blockers),
+            )
+            return list(blockers)
+
     async def published_releases(self, *, force: bool = False) -> tuple[list[dict], str | None]:
         if not force and self._release_cache and time.monotonic() - self._release_cache[0] < 300:
             return self._release_cache[1], self._release_cache[2]
@@ -635,7 +667,7 @@ class UpdateService:
         self._main_cache = (time.monotonic(), *result)
         return result
 
-    async def overview(self) -> dict:
+    async def overview(self, *, force_preflight: bool = False) -> dict:
         revision = self.runtime_revision
         state = self._read(self.cluster_path)
         agent_state = self._reconciled_agent_state(revision)
@@ -708,12 +740,12 @@ class UpdateService:
                     self._finish_cluster_state(state)
         elif completed_job_reconciled:
             self._write(self.cluster_path, state)
-        main_target, main_error = await self.resolve_main()
-        nodes = await self.manager.cluster_nodes()
+        (main_target, main_error), nodes, blockers = await asyncio.gather(
+            self.resolve_main(),
+            self.manager.cluster_node_liveness(),
+            self._overview_local_blockers(force=force_preflight),
+        )
         public_nodes = []
-        # Windows service preflight launches a bundled status command that can
-        # probe this process. Keep synchronous checks off the event loop.
-        blockers = await asyncio.to_thread(local_blockers, self.root)
         if not revision:
             blockers.insert(0, RUNTIME_REVISION_BLOCKER)
         for node in nodes:
@@ -765,7 +797,7 @@ class UpdateService:
             existing = self._read(self.cluster_path)
             if existing.get("active"):
                 raise RuntimeError("A cluster update is already running")
-            overview = await self.overview()
+            overview = await self.overview(force_preflight=True)
             if not overview["can_update"]:
                 raise RuntimeError("; ".join(overview["blockers"]) or "No update is available")
             release, release_error = await self.resolve_main(force=True)

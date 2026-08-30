@@ -34,10 +34,10 @@ function SoftwareUpdatePanel() {
   const active = Boolean(resource.data?.job?.active)
 
   useEffect(() => {
-    if (!active) return
-    const timer = window.setInterval(resource.reload, 2500)
-    return () => window.clearInterval(timer)
-  }, [active, resource.reload])
+    if (!active || resource.loading) return
+    const timer = window.setTimeout(resource.reload, 2500)
+    return () => window.clearTimeout(timer)
+  }, [active, resource.loading, resource.reload])
 
   const start = async () => {
     const targetRevision = resource.data?.target?.revision

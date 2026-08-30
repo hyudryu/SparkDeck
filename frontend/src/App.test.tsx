@@ -122,6 +122,39 @@ describe('SparkDeck application shell', () => {
     expect(within(dashboard).queryByText('gx10-controller')).not.toBeInTheDocument()
   })
 
+  it('pauses controller requests while a worker is disconnected and resumes after retry', async () => {
+    const user = userEvent.setup()
+    let controllerReachable = false
+    const controllerRequests: string[] = []
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'Worker Two', port: 7878, access_urls: ['http://100.64.0.11:7878'] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: controllerReachable,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      controllerRequests.push(path)
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+
+    expect(await screen.findByRole('heading', { name: 'Controller unavailable' })).toBeInTheDocument()
+    expect(screen.getByText(/retry automatically/i)).toBeInTheDocument()
+    expect(controllerRequests).toEqual([])
+
+    controllerReachable = true
+    await user.click(screen.getByRole('button', { name: 'Retry now' }))
+
+    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
+    await waitFor(() => expect(controllerRequests.length).toBeGreaterThan(0))
+  })
+
   it('refreshes the sidebar node name when the entry node is renamed', async () => {
     let nodeName = 'gx10-node-1'
     fetchMock.mockImplementation(async (input) => {

@@ -1,6 +1,11 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
+import { RefreshCw } from 'lucide-react'
+import { api } from './api/client'
+import type { OnboardingStatus } from './api/types'
 import { AuthProvider } from './auth/AuthContext'
 import { AppShell } from './components/AppShell'
+import { Button, LoadingState, Panel } from './components/ui'
 import { BenchmarksPage } from './pages/BenchmarksPage'
 import { ChatPage } from './pages/ChatPage'
 import { ClusterPage } from './pages/ClusterPage'
@@ -18,9 +23,56 @@ import { SwitchPage } from './pages/SwitchPage'
 import { FanControlPage } from './pages/FanControlPage'
 
 export default function App() {
+  const [onboarding, setOnboarding] = useState<OnboardingStatus>()
+  const [connectionError, setConnectionError] = useState<string>()
+  const [connectionVersion, setConnectionVersion] = useState(0)
+  const retryTimer = useRef<number | undefined>(undefined)
+  const retryConnection = useCallback(() => setConnectionVersion((value) => value + 1), [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    window.clearTimeout(retryTimer.current)
+    api.onboarding.get(controller.signal).then((status) => {
+      if (controller.signal.aborted) return
+      setOnboarding(status)
+      setConnectionError(undefined)
+      if (status.role === 'worker' && status.controller_reachable === false) {
+        retryTimer.current = window.setTimeout(retryConnection, 5_000)
+      }
+    }).catch((reason: unknown) => {
+      if (controller.signal.aborted) return
+      setConnectionError(reason instanceof Error ? reason.message : 'Could not check the controller connection')
+      retryTimer.current = window.setTimeout(retryConnection, 5_000)
+    })
+    return () => {
+      controller.abort()
+      window.clearTimeout(retryTimer.current)
+    }
+  }, [connectionVersion, retryConnection])
+
+  useEffect(() => {
+    window.addEventListener('sparkdeck:node-name-changed', retryConnection)
+    return () => window.removeEventListener('sparkdeck:node-name-changed', retryConnection)
+  }, [retryConnection])
+
+  const controllerUnavailable = onboarding?.role === 'worker' && onboarding.controller_reachable === false
+  const controllerAvailable = Boolean(onboarding) && !controllerUnavailable
+
   return (
-    <AuthProvider>
-      <AppShell>
+    <AppShell controllerAvailable={controllerAvailable} nodeName={onboarding?.node?.name}>
+      {!onboarding && !connectionError && <LoadingState label="Connecting to controller" />}
+      {(controllerUnavailable || connectionError) && (
+        <Panel className="empty-state controller-connection-state" role="alert">
+          <h2>Controller unavailable</h2>
+          <p>{controllerUnavailable
+            ? `This node cannot reach ${onboarding?.controller_url || 'its controller'}. SparkDeck will retry automatically.`
+            : connectionError}</p>
+          <Button type="button" variant="primary" onClick={retryConnection}>
+            <RefreshCw size={16} /> Retry now
+          </Button>
+        </Panel>
+      )}
+      {controllerAvailable && <AuthProvider>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
@@ -40,7 +92,7 @@ export default function App() {
           <Route path="/logs" element={<LogsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-      </AppShell>
-    </AuthProvider>
+      </AuthProvider>}
+    </AppShell>
   )
 }

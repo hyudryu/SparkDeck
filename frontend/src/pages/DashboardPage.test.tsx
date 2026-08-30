@@ -420,20 +420,37 @@ describe('DashboardPage', () => {
     expect(MockWebSocket.instances).toHaveLength(0)
   })
 
-  it('still opens the stream when local role discovery fails', async () => {
+  it('rechecks the worker role before reconnecting after role discovery recovers', async () => {
+    vi.useFakeTimers()
     MockWebSocket.instances = []
     MockWebSocket.autoOpen = true
+    let onboardingCalls = 0
     const fetchMock = stubDashboardFetch({ cpu_pct: 20, mem: {}, gpus: [], active_requests: {} })
     const baseImplementation = fetchMock.getMockImplementation()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
-      if (String(input).includes('/api/v1/onboarding')) throw new TypeError('status unavailable')
+      if (String(input).includes('/api/v1/onboarding')) {
+        onboardingCalls += 1
+        if (onboardingCalls === 1) throw new TypeError('status unavailable')
+        return json({
+          role: 'worker',
+          node: { id: 'worker-1', name: 'Worker 1', port: 7878, access_urls: [] },
+          controller_reachable: true,
+        })
+      }
       return baseImplementation!(input, init)
     }))
     vi.stubGlobal('WebSocket', MockWebSocket)
 
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
-    expect(await screen.findByText('20.0%')).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(onboardingCalls).toBe(1)
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    act(() => { MockWebSocket.instances[0].close() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+
+    expect(onboardingCalls).toBe(2)
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 

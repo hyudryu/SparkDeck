@@ -61,7 +61,7 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
         const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
         next = new WebSocket(`${scheme}://${window.location.host}/api/ws/dashboard`)
       } catch {
-        reconnectTimer = window.setTimeout(connect, RECONNECT_DELAY_MS)
+        reconnectTimer = window.setTimeout(checkRoleAndConnect, RECONNECT_DELAY_MS)
         return
       }
       socket = next
@@ -104,20 +104,24 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
       socket.onclose = () => {
         if (closed) return
         setLive(false)
-        reconnectTimer = window.setTimeout(connect, RECONNECT_DELAY_MS)
+        reconnectTimer = window.setTimeout(checkRoleAndConnect, RECONNECT_DELAY_MS)
       }
     }
 
-    // Joined workers deliberately reject this local WebSocket and serve the
-    // dashboard through controller-forwarded REST polling instead. Check the
-    // unforwarded onboarding status first so that expected fallback does not
-    // produce a failed-handshake error in the browser console every 5 seconds.
-    void api.onboarding.get(roleController.signal).then((status) => {
-      if (!closed && status.role !== 'worker') connect()
-    }).catch(() => {
-      // Preserve the existing stream-first behavior if role discovery fails.
-      if (!closed) connect()
-    })
+    const checkRoleAndConnect = () => {
+      // Joined workers deliberately reject this local WebSocket and serve the
+      // dashboard through controller-forwarded REST polling instead. Recheck
+      // the unforwarded role before every connection attempt so a transient
+      // lookup failure cannot lock a worker into rejected handshake retries.
+      void api.onboarding.get(roleController.signal).then((status) => {
+        if (!closed && status.role !== 'worker') connect()
+      }).catch(() => {
+        // Preserve stream-first behavior while local role discovery is down.
+        if (!closed) connect()
+      })
+    }
+
+    checkRoleAndConnect()
     return () => {
       closed = true
       roleController.abort()

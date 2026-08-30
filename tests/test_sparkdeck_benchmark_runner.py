@@ -744,12 +744,12 @@ class BenchmarkRunnerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_api_key", response.text)
 
     async def test_local_history_models_returns_consolidated_rows(self):
-        history = Mock(return_value=[{
+        history = AsyncMock(return_value=[{
             "id": "sample-new", "model": {"repository": "org/model"},
             "sample_count": 12,
         }])
         with patch.object(
-            self.server.sparkdeck.store, "benchmark_history_models", history,
+            self.server.sparkdeck, "benchmark_history_models", history,
         ):
             response = await self.client.get("/api/v1/benchmark-history/models")
         self.assertEqual(response.status_code, 200)

@@ -396,6 +396,10 @@ class SparkDeckService:
                 self.store.delete_benchmark_model, model_id
             )
 
+    async def benchmark_history_models(self) -> list[dict[str, Any]]:
+        """Read bounded, consolidated local history off the event loop."""
+        return await asyncio.to_thread(self.store.benchmark_history_models)
+
     async def unpair_community_device(
         self, expected_sub: str,
     ) -> tuple[str, dict[str, Any]]:
@@ -4490,9 +4494,12 @@ class SparkDeckService:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
                 if requested_model in ids:
-                    repository = str(
-                        container.get("model") or requested_model
-                    ).strip() or requested_model
+                    repository = str(container.get("model") or "").strip()
+                    if _public_model_id(repository) == "local-model":
+                        repository = _local_benchmark_model_id(
+                            repository or requested_model, None,
+                            upload_model_id="local-model",
+                        )
                     settings = dict(
                         container.get("load_settings")
                         or container.get("settings")
@@ -4867,8 +4874,11 @@ def _local_benchmark_model_id(
     public_model_id = upload_model_id or _public_model_id(value)
     if public_model_id != "local-model":
         return public_model_id
+    private_model_id = str(value or "").strip()
+    if re.fullmatch(r"Private model [0-9a-f]{8}", private_model_id):
+        return private_model_id
     identity = json.dumps(
-        [str(deployment_id or "").strip(), str(value or "").strip()],
+        [str(deployment_id or "").strip(), private_model_id],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

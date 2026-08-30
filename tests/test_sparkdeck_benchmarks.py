@@ -96,6 +96,31 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"][0]["container_name"], "legacy")
         self.assertEqual(result["data"][0]["port"], 8123)
 
+    async def test_repository_shaped_legacy_alias_stays_private(self):
+        self.manager._container_model_ids = lambda container: container["served_models"]
+        self.manager.list_containers = AsyncMock(return_value=[{
+            "served_models": ["private/team-alias"], "model": "",
+        }])
+
+        model, runtime, settings = await self.service._legacy_model_identity(
+            "private/team-alias"
+        )
+
+        self.assertRegex(model, r"^Private model [0-9a-f]{8}$")
+        self.assertNotIn("private/team-alias", model)
+        self.service.store.set_community_consent(True)
+        self.service._record_response(
+            None, model, runtime, settings, time.monotonic() - 0.25,
+            {
+                "usage": {"prompt_tokens": 32, "completion_tokens": 24},
+                "timings": {"predicted_per_second": 96.0},
+            },
+        )
+        items, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(items[0]["model"]["repository"], model)
+        self.assertEqual(self.service.store.outbox_batch(), [])
+
     async def test_passive_telemetry_collects_nothing_when_opted_out(self):
         self._record_passive_sample()
         _, total = self.service.store.benchmarks()

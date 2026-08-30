@@ -11,8 +11,8 @@ import {
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ActiveRequestStats, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
-import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
+import type { ActiveRequestStats, AdmissionStats, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
+import { Button, EmptyState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { useDashboardStream } from '../hooks/useDashboardStream'
@@ -117,6 +117,33 @@ export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStat
   }
 }
 
+export function activeRequestSnapshot(
+  stats?: SystemStats,
+  admission?: Record<string, AdmissionStats>,
+): Record<string, ActiveRequestStats> {
+  const snapshot = Object.fromEntries(
+    Object.entries(stats?.active_requests ?? {}).map(([model, request]) => [model, { ...request }]),
+  )
+  const admitted = new Map<string, { running: number; queued: number }>()
+  Object.entries(admission ?? {}).forEach(([target, item]) => {
+    const model = item.model || target
+    const current = admitted.get(model) ?? { running: 0, queued: 0 }
+    current.running += item.running ?? 0
+    current.queued += item.queued ?? 0
+    admitted.set(model, current)
+  })
+  admitted.forEach(({ running, queued }, model) => {
+    const existing = snapshot[model]
+    if (!existing && running <= 0 && queued <= 0) return
+    snapshot[model] = {
+      ...existing,
+      connections: Math.max(existing?.connections ?? 0, running),
+      queued: Math.max(existing?.queued ?? 0, queued),
+    }
+  })
+  return snapshot
+}
+
 export function DashboardPage() {
   const resourcesRef = useRef<DashboardStreamResources | null>(null)
   const stream = useDashboardStream(resourcesRef)
@@ -144,9 +171,11 @@ export function DashboardPage() {
   const admission = admissionResource.data
   const deployments = deploymentsResource.data ?? []
   const sync = syncResource.data
-  const activeRequests = Object.entries(stats?.active_requests ?? {})
+  const activeRequests = Object.entries(activeRequestSnapshot(stats, admission))
   const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
   const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
+  const inferenceAvailable = stats !== undefined || admission !== undefined
+  const inferenceComplete = stats !== undefined && admission !== undefined
   const activeDeployments = deployments.filter((item) => ACTIVE_DEPLOYMENT_STATUSES.has(item.status))
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
   const allClusterNodes = nodesResource.data ?? []
@@ -160,11 +189,14 @@ export function DashboardPage() {
     : admissionResource.error ? 'queue unavailable' : 'queue loading'
   const inferenceStatus = runningSessions > 0
     ? 'running'
-    : stats && admission ? (queuedRequests > 0 ? 'waiting' : 'stopped') : 'waiting'
+    : inferenceComplete ? (queuedRequests > 0 ? 'waiting' : 'stopped') : 'waiting'
   const inferenceStatusLabel = runningSessions > 0
     ? 'Processing'
-    : stats && admission ? (queuedRequests > 0 ? 'Waiting' : 'Idle')
+    : inferenceComplete ? (queuedRequests > 0 ? 'Waiting' : 'Idle')
       : statsResource.error || admissionResource.error ? 'Unavailable' : 'Loading'
+  const telemetryNotice = statsResource.error
+    ? `Local telemetry ${stats ? 'refresh paused' : 'unavailable; retrying'}: ${statsResource.error}`
+    : undefined
   const reload = () => {
     statsResource.reload()
     admissionResource.reload()
@@ -187,9 +219,7 @@ export function DashboardPage() {
         }
       />
 
-      {statsResource.loading && !stats && <LoadingState label="Loading local telemetry" />}
-      {statsResource.error && !stats && <ErrorState message={statsResource.error} onRetry={statsResource.reload} />}
-      {statsResource.error && stats && <p className="dashboard-stale" role="status">Local telemetry refresh paused: {statsResource.error}</p>}
+      {telemetryNotice && <p className="dashboard-stale" role="status">{telemetryNotice}</p>}
 
       <>
           <section className="metric-grid" aria-label="System overview">
@@ -213,8 +243,8 @@ export function DashboardPage() {
             </Panel>
             <Panel className="metric-panel">
               <div className="metric-label"><Activity size={16} /><span>Inference</span></div>
-              <strong>{stats ? runningSessions : '—'}</strong>
-              <p className="metric-context">{stats ? `active ${runningSessions === 1 ? 'session' : 'sessions'} · ${queueSummary}` : statsResource.error ? 'Inference telemetry unavailable' : 'Loading inference telemetry'}</p>
+              <strong>{inferenceAvailable ? runningSessions : '—'}</strong>
+              <p className="metric-context">{inferenceAvailable ? `active ${runningSessions === 1 ? 'session' : 'sessions'} · ${queueSummary}` : statsResource.error || admissionResource.error ? 'Inference telemetry unavailable' : 'Loading inference telemetry'}</p>
               <div className="metric-status"><Status status={inferenceStatus}>{inferenceStatusLabel}</Status></div>
             </Panel>
           </section>
@@ -273,7 +303,7 @@ export function DashboardPage() {
 
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{stats ? `${runningSessions} active` : 'Active sessions loading'} · {queueSummary}</p></div></div>
+                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{inferenceAvailable ? `${runningSessions} active` : 'Active sessions loading'} · {queueSummary}</p></div></div>
                 <Link className="text-link" to="/chat">Open chat</Link>
               </div>
               {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
@@ -281,9 +311,9 @@ export function DashboardPage() {
                 <div className="dashboard-list">
                   {activeRequests.map(([model, request]) => <SessionRow key={model} model={model} request={request} />)}
                 </div>
-              ) : statsResource.error && !stats ? (
+              ) : !inferenceAvailable && (statsResource.error || admissionResource.error) ? (
                 <EmptyState title="Active session status unavailable" description="Refresh to retry loading current inference sessions." />
-              ) : !stats ? (
+              ) : !inferenceAvailable ? (
                 <LoadingState label="Loading active sessions" />
               ) : (
                 <EmptyState title="No active inference" description="Current sessions and queue pressure will appear here." />

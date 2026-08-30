@@ -166,10 +166,14 @@ class ValidateConfigTests(unittest.TestCase):
         self.assertEqual(config["model_id"], "m")
         self.assertEqual(config["prompt_sizes"], [2048])
         self.assertEqual(config["response_sizes"], [128])
-        self.assertEqual(config["concurrency_levels"], [1])
-        self.assertEqual(config["context_depths"], [0])
+        self.assertEqual(config["concurrency_levels"], [1, 2, 5, 10])
+        self.assertEqual(
+            config["context_depths"],
+            [0, 4096, 8192, 16384, 32768, 65535, 100000],
+        )
         self.assertEqual(config["runs"], 3)
         self.assertEqual(config["warmup_runs"], 1)
+        self.assertTrue(config["enable_prefix_caching"])
         self.assertFalse(config["exact_tg"])
 
     def test_requires_model_id(self):
@@ -196,6 +200,10 @@ class ValidateConfigTests(unittest.TestCase):
         self.assertEqual(config["runs"], 1)
         self.assertEqual(config["warmup_runs"], 0)
 
+    def test_rejects_more_than_one_warmup_run(self):
+        with self.assertRaises(BenchmarkRunnerError):
+            self.service._validate_config({"model_id": "m", "warmup_runs": 2})
+
     def test_requires_boolean_exact_tg(self):
         for bad in ("false", "true", 1):
             with self.assertRaises(BenchmarkRunnerError, msg=str(bad)):
@@ -206,6 +214,54 @@ class ValidateConfigTests(unittest.TestCase):
         self.assertTrue(
             self.service._validate_config({"model_id": "m", "exact_tg": True})["exact_tg"]
         )
+
+    def test_requires_boolean_enable_prefix_caching(self):
+        for bad in ("false", "true", 1):
+            with self.assertRaises(BenchmarkRunnerError, msg=str(bad)):
+                self.service._validate_config({
+                    "model_id": "m", "enable_prefix_caching": bad,
+                })
+        self.assertTrue(
+            self.service._validate_config({"model_id": "m"})["enable_prefix_caching"]
+        )
+        self.assertFalse(self.service._validate_config({
+            "model_id": "m", "enable_prefix_caching": False,
+        })["enable_prefix_caching"])
+
+    def test_default_argv_matches_benchmark_sweep(self):
+        config = self.service._validate_config({"model_id": "m"})
+        with patch.object(self.service, "_argv_prefix", return_value=["llama-benchy"]):
+            argv = self.service._build_argv(
+                {"config": config},
+                {"base_url": "http://localhost:8000/v1", "model": "model-name"},
+                Path("run"),
+                {},
+            )
+
+        self.assertEqual(argv[:5], [
+            "llama-benchy", "--base-url", "http://localhost:8000/v1",
+            "--model", "model-name",
+        ])
+        self.assertEqual(argv[argv.index("--depth") + 1:argv.index("--runs")], [
+            "0", "4096", "8192", "16384", "32768", "65535", "100000",
+        ])
+        self.assertEqual(
+            argv[argv.index("--concurrency") + 1:argv.index("--depth")],
+            ["1", "2", "5", "10"],
+        )
+        self.assertIn("--enable-prefix-caching", argv)
+        self.assertNotIn("--warmup-runs", argv)
+
+    def test_zero_warmups_uses_supported_no_warmup_flag(self):
+        config = self.service._validate_config({"model_id": "m", "warmup_runs": 0})
+        with patch.object(self.service, "_argv_prefix", return_value=["llama-benchy"]):
+            argv = self.service._build_argv(
+                {"config": config},
+                {"base_url": "http://localhost:8000/v1", "model": "model-name"},
+                Path("run"),
+                {},
+            )
+        self.assertIn("--no-warmup", argv)
 
     def test_rejects_explosive_shape_combinations(self):
         body = {
@@ -233,8 +289,14 @@ class ReportFlatteningTests(unittest.TestCase):
             "model": "unsloth/Qwen3-4B-GGUF", "model_id": "unsloth/Qwen3-4B-GGUF",
             "quantization": "Q4_K_M", "runtime": "llama.cpp",
             "base_url": "http://127.0.0.1:8080", "benchy_version": "0.1.2",
-            "config": {"runs": 3, "warmup_runs": 1, "exact_tg": False},
-            "report": {"latency_mode": "api", "latency_ms": 12.5},
+            "config": {
+                "runs": 3, "warmup_runs": 1, "exact_tg": False,
+                "enable_prefix_caching": True,
+            },
+            "report": {
+                "latency_mode": "api", "latency_ms": 12.5,
+                "prefix_caching_enabled": False,
+            },
             "results": results,
         }
 
@@ -254,12 +316,24 @@ class ReportFlatteningTests(unittest.TestCase):
         self.assertEqual(first["quantization"], "Q4_K_M")
         self.assertEqual(first["prompt_size"], "2048")
         self.assertEqual(first["concurrency"], "1")
+        self.assertEqual(first["prefix_caching_enabled"], "False")
         self.assertEqual(first["tg_tokens_per_second"], "42.5")
         self.assertEqual(first["pp_tokens_per_second"], "1800.0")
         second = dict(zip(header, lines[2].split(",")))
         self.assertEqual(second["concurrency"], "2")
         self.assertEqual(second["tg_tokens_per_second"], "60.0")
         self.assertEqual(second["tg_tokens_per_second_request"], "30.0")
+
+    def test_csv_falls_back_to_requested_prefix_caching_mode(self):
+        results = _flatten_report("run-1", _report_payload())
+        run = self._run(results)
+        run["report"].pop("prefix_caching_enabled")
+        with TemporaryDirectory() as temp:
+            csv_path = Path(temp) / "results.csv"
+            _write_csv(csv_path, run)
+            lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+        first = dict(zip(lines[0].split(","), lines[1].split(",")))
+        self.assertEqual(first["prefix_caching_enabled"], "True")
 
     def test_missing_metrics_render_as_empty_cells(self):
         report = _report_payload()

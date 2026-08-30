@@ -14,14 +14,14 @@ import {
 import { useResource } from '../hooks/useResource'
 import { BenchmarkRunChart } from './BenchmarkRunChart'
 
-function parseNumberList(text: string): { values: number[]; invalid: string[] } {
+function parseNumberList(text: string, allowZero = false): { values: number[]; invalid: string[] } {
   const values: number[] = []
   const invalid: string[] = []
   for (const part of text.split(/[\s,]+/)) {
     if (!part) continue
     // Whole positive integers only: parseInt would silently truncate
     // "1.5" to 1 and "2foo" to 2, running a different workload than entered.
-    if (!/^[1-9]\d*$/.test(part)) {
+    if (!(allowZero ? /^(?:0|[1-9]\d*)$/ : /^[1-9]\d*$/).test(part)) {
       invalid.push(part)
       continue
     }
@@ -42,7 +42,11 @@ function configSummary(run: BenchmarkRunnerRunSummary) {
   const concurrency = config.concurrency_levels.map((level) => `C${level}`).join(' ')
   const prompt = config.prompt_sizes.map((size) => size.toLocaleString()).join(', ')
   const response = config.response_sizes.map((size) => size.toLocaleString()).join(', ')
-  return `${prompt} → ${response} tok · ${concurrency}`
+  const depths = config.context_depths.map((depth) => depth.toLocaleString()).join(', ')
+  const prefixCaching = config.enable_prefix_caching === true
+    ? 'prefix cache on'
+    : config.enable_prefix_caching === false ? 'prefix cache off' : 'prefix cache unknown'
+  return `${prompt} → ${response} tok · ${concurrency} · depth ${depths} · ${prefixCaching}`
 }
 
 const RUN_STATUS_LABEL: Record<string, string> = {
@@ -60,10 +64,12 @@ export function BenchmarkRunner() {
   const runs = useResource((signal) => api.benchmarkRunner.list(signal))
 
   const [modelId, setModelId] = useState('')
-  const [concurrencyText, setConcurrencyText] = useState('1, 2')
+  const [concurrencyText, setConcurrencyText] = useState('1, 2, 5, 10')
   const [promptText, setPromptText] = useState('2048')
   const [responseText, setResponseText] = useState('128')
+  const [depthText, setDepthText] = useState('0, 4096, 8192, 16384, 32768, 65535, 100000')
   const [runsPerTest, setRunsPerTest] = useState(3)
+  const [prefixCaching, setPrefixCaching] = useState(true)
   const [exactTg, setExactTg] = useState(false)
   const [formError, setFormError] = useState<string>()
   const [starting, setStarting] = useState(false)
@@ -125,7 +131,8 @@ export function BenchmarkRunner() {
     const concurrency = parseNumberList(concurrencyText)
     const promptSizes = parseNumberList(promptText)
     const responseSizes = parseNumberList(responseText)
-    const invalid = [...promptSizes.invalid, ...responseSizes.invalid, ...concurrency.invalid]
+    const depths = parseNumberList(depthText, true)
+    const invalid = [...promptSizes.invalid, ...responseSizes.invalid, ...concurrency.invalid, ...depths.invalid]
     if (invalid.length) {
       setFormError(`Invalid values: ${invalid.join(', ')}. Use whole numbers, e.g. 2048.`)
       return
@@ -134,6 +141,7 @@ export function BenchmarkRunner() {
     if (!promptSizes.values.length) { setFormError('Enter at least one prompt size.'); return }
     if (!responseSizes.values.length) { setFormError('Enter at least one output token count.'); return }
     if (!concurrency.values.length) { setFormError('Enter at least one concurrency level.'); return }
+    if (!depths.values.length) { setFormError('Enter at least one context depth.'); return }
     setFormError(undefined)
     setActionError(undefined)
     setStarting(true)
@@ -143,9 +151,10 @@ export function BenchmarkRunner() {
         prompt_sizes: promptSizes.values,
         response_sizes: responseSizes.values,
         concurrency_levels: concurrency.values,
-        context_depths: [0],
+        context_depths: depths.values,
         runs: Math.min(10, Math.max(1, runsPerTest || 3)),
         warmup_runs: 1,
+        enable_prefix_caching: prefixCaching,
         exact_tg: exactTg,
       })
       status.reload()
@@ -258,6 +267,17 @@ export function BenchmarkRunner() {
               />
               <small>Generated tokens per test, e.g. “128”.</small>
             </label>
+            <label className="field" htmlFor="runner-depth">
+              <span>Context depths</span>
+              <input
+                id="runner-depth"
+                inputMode="numeric"
+                value={depthText}
+                disabled={Boolean(activeRunId)}
+                onChange={(event) => setDepthText(event.target.value)}
+              />
+              <small>Prefix depths to sweep; zero runs without an existing prefix.</small>
+            </label>
             <label className="field" htmlFor="runner-runs">
               <span>Runs per test</span>
               <input
@@ -282,6 +302,19 @@ export function BenchmarkRunner() {
                   onChange={(event) => setExactTg(event.target.checked)}
                 />
                 <small>Request exactly the configured output tokens (ignore_eos).</small>
+              </span>
+            </label>
+            <label className="field runner-checkbox-field" htmlFor="runner-prefix-caching">
+              <span>Enable prefix caching</span>
+              <span className="runner-checkbox">
+                <input
+                  id="runner-prefix-caching"
+                  type="checkbox"
+                  checked={prefixCaching}
+                  disabled={Boolean(activeRunId)}
+                  onChange={(event) => setPrefixCaching(event.target.checked)}
+                />
+                <small>Reuse cached prefixes across context-depth tests.</small>
               </span>
             </label>
           </div>
@@ -427,7 +460,7 @@ export function BenchmarkRunner() {
             <Panel className="table-panel"><div className="responsive-table runner-measure-table" role="table" aria-label="Run measurements">
               <div className="table-row table-header" role="row">
                 <div role="columnheader">Prompt</div><div role="columnheader">Output</div>
-                <div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>
+                <div role="columnheader">Depth</div><div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>
                 <div role="columnheader">Generation tok/s</div><div role="columnheader">Per-request tok/s</div>
                 <div role="columnheader">TTFR</div>
               </div>
@@ -435,6 +468,7 @@ export function BenchmarkRunner() {
                 <div className="table-row" role="row" key={index}>
                   <div role="cell" data-label="Prompt">{row.prompt_size?.toLocaleString()}</div>
                   <div role="cell" data-label="Output">{row.response_size}</div>
+                  <div role="cell" data-label="Depth">{row.context_depth?.toLocaleString()}</div>
                   <div role="cell" data-label="Concurrency">C{row.concurrency}</div>
                   <div role="cell" data-label="Prompt tok/s">{formatRate(row.pp_tokens_per_second ?? undefined)}</div>
                   <div role="cell" data-label="Generation tok/s">{formatRate(row.tg_tokens_per_second ?? undefined)}</div>

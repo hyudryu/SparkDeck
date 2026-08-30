@@ -24,6 +24,7 @@ const completedRun = {
     context_depths: [0],
     runs: 3,
     warmup_runs: 1,
+    enable_prefix_caching: true,
     exact_tg: false,
   },
   benchy_version: '0.1.2',
@@ -136,6 +137,9 @@ describe('BenchmarkRunner', () => {
     await screen.findByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })
     expect(screen.getByLabelText(/Served model/).closest('.runner-config-panel')).not.toBeNull()
     expect(within(screen.getByLabelText(/Served model/)).getByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })).toBeInTheDocument()
+    expect(screen.getByLabelText(/Concurrency levels/)).toHaveValue('1, 2, 5, 10')
+    expect(screen.getByLabelText(/Context depths/)).toHaveValue('0, 4096, 8192, 16384, 32768, 65535, 100000')
+    expect(screen.getByLabelText(/Enable prefix caching/)).toBeChecked()
 
     await user.clear(screen.getByLabelText(/Concurrency levels/))
     await user.type(screen.getByLabelText(/Concurrency levels/), '1, 2, 4')
@@ -150,9 +154,27 @@ describe('BenchmarkRunner', () => {
     expect(body.concurrency_levels).toEqual([1, 2, 4])
     expect(body.prompt_sizes).toEqual([2048])
     expect(body.response_sizes).toEqual([128])
+    expect(body.context_depths).toEqual([0, 4096, 8192, 16384, 32768, 65535, 100000])
+    expect(body.enable_prefix_caching).toBe(true)
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
     expect(within(history).getAllByText('Q4_K_M').length).toBeGreaterThan(0)
+  })
+
+  it('distinguishes prefix-caching mode in run history', async () => {
+    stubFetch({ runs: [
+      completedRun,
+      {
+        ...completedRun,
+        id: 'run-cache-off',
+        config: { ...completedRun.config, enable_prefix_caching: false },
+      },
+    ] })
+    renderPage()
+
+    const history = await screen.findByRole('table', { name: 'Benchmark run history' })
+    expect(within(history).getByText(/prefix cache on$/)).toBeInTheDocument()
+    expect(within(history).getByText(/prefix cache off$/)).toBeInTheDocument()
   })
 
   it('reports model discovery failures instead of claiming no models are served', async () => {
@@ -203,7 +225,7 @@ describe('BenchmarkRunner', () => {
     renderPage()
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
-    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2'))
+    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2 · depth 0 · prefix cache on'))
 
     expect(await screen.findByRole('region', { name: /Processing speed \(generation\)/ })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: /Prompt processing speed/ })).toBeInTheDocument()
@@ -214,6 +236,8 @@ describe('BenchmarkRunner', () => {
     expect(document.querySelectorAll('.chart-series circle').length).toBeGreaterThanOrEqual(4)
 
     const measurements = screen.getByRole('table', { name: 'Run measurements' })
+    expect(within(measurements).getByRole('columnheader', { name: 'Depth' })).toBeInTheDocument()
+    expect(within(measurements).getAllByText('0')).toHaveLength(2)
     expect(within(measurements).getAllByText('42.5 tok/s').length).toBeGreaterThan(0)
     expect(within(measurements).getAllByText('30.0 tok/s').length).toBeGreaterThan(0)
 
@@ -234,7 +258,7 @@ describe('BenchmarkRunner', () => {
     renderPage()
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
-    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2'))
+    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2 · depth 0 · prefix cache on'))
 
     expect(await screen.findAllByText('C1 · 64 tok').then((items) => items.length)).toBeGreaterThan(0)
     expect(screen.getAllByText('C1 · 128 tok').length).toBeGreaterThan(0)

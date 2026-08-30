@@ -612,7 +612,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .runner-run-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
 .runner-checkbox { display: flex; align-items: center; gap: 8px; min-height: 40px; }
 .runner-checkbox input { width: 16px; height: 16px; accent-color: var(--accent); }
-.runner-active-panel { border-color: var(--accent); }
+.runner-active-panel { padding: 18px; border-color: var(--accent); }
 .runner-active-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .runner-active-shape { margin: 10px 0 2px; font-weight: 600; }
 .runner-run-row { cursor: pointer; }
@@ -625,4 +625,4 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .runner-detail-head p { margin: 2px 0 0; font-size: 12px; }
 /* Benchy tables: explicit columns so desktop rows form a real grid. */
 .runner-history-table .table-row { grid-template-columns: minmax(150px, 1.25fr) minmax(150px, 1.35fr) minmax(95px, .8fr) minmax(150px, 1.2fr) minmax(65px, .6fr) minmax(75px, .7fr) minmax(95px, .8fr) 92px; }
-.runner-measure-table .table-row { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.runner-measure-table .table-row { grid-template-columns: repeat(8, minmax(0, 1fr)); }

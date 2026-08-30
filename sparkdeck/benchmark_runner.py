@@ -369,11 +369,14 @@ class BenchmarkRunnerService:
             "--concurrency", *(str(value) for value in config["concurrency_levels"]),
             "--depth", *(str(value) for value in config["context_depths"]),
             "--runs", str(config["runs"]),
-            "--warmup-runs", str(config["warmup_runs"]),
             "--format", "json",
             "--save-result", str(run_dir / "report.json"),
             "--emit-progress", str(run_dir / "progress.jsonl"),
         ]
+        if config.get("enable_prefix_caching"):
+            argv.append("--enable-prefix-caching")
+        if config["warmup_runs"] == 0:
+            argv.append("--no-warmup")
         if config.get("exact_tg"):
             argv.append("--exact-tg")
         return argv
@@ -588,16 +591,20 @@ class BenchmarkRunnerService:
         prompt_sizes = _positive_list(body.get("prompt_sizes"), "prompt_sizes", [2048])
         response_sizes = _positive_list(body.get("response_sizes"), "response_sizes", [128])
         concurrency = _positive_list(
-            body.get("concurrency_levels"), "concurrency_levels", [1], maximum=256,
+            body.get("concurrency_levels"), "concurrency_levels", [1, 2, 5, 10], maximum=256,
         )
         depths = _positive_list(
-            body.get("context_depths"), "context_depths", [0], allow_zero=True,
+            body.get("context_depths"), "context_depths",
+            [0, 4096, 8192, 16384, 32768, 65535, 100000], allow_zero=True,
         )
         runs = _bounded_int(body.get("runs"), "runs", default=3, maximum=10, minimum=1)
-        warmup = _bounded_int(body.get("warmup_runs"), "warmup_runs", default=1, maximum=10)
+        warmup = _bounded_int(body.get("warmup_runs"), "warmup_runs", default=1, maximum=1)
         exact_tg_value = body.get("exact_tg", False)
         if not isinstance(exact_tg_value, bool):
             raise BenchmarkRunnerError("exact_tg must be a boolean")
+        prefix_caching_value = body.get("enable_prefix_caching", True)
+        if not isinstance(prefix_caching_value, bool):
+            raise BenchmarkRunnerError("enable_prefix_caching must be a boolean")
         shapes = len(prompt_sizes) * len(response_sizes) * len(concurrency) * len(depths)
         if shapes > 256:
             raise BenchmarkRunnerError(
@@ -611,6 +618,7 @@ class BenchmarkRunnerService:
             "context_depths": depths,
             "runs": runs,
             "warmup_runs": warmup,
+            "enable_prefix_caching": prefix_caching_value,
             "exact_tg": exact_tg_value,
         }
 
@@ -687,7 +695,8 @@ CSV_COLUMNS = [
     "run_id", "created_at", "model", "model_id", "quantization", "runtime",
     "base_url", "benchy_version", "latency_mode", "latency_ms",
     "prompt_size", "response_size", "context_depth", "concurrency",
-    "runs", "warmup_runs", "exact_tg", "is_context_prefill_phase",
+    "runs", "warmup_runs", "exact_tg", "prefix_caching_enabled",
+    "is_context_prefill_phase",
     "pp_tokens_per_second", "pp_tokens_per_second_std",
     "pp_tokens_per_second_request", "pp_tokens_per_second_request_std",
     "tg_tokens_per_second", "tg_tokens_per_second_std",
@@ -700,6 +709,9 @@ CSV_COLUMNS = [
 def _write_csv(path: Path, run: dict[str, Any]) -> None:
     config = run.get("config") or {}
     report = run.get("report") or {}
+    prefix_caching_enabled = report.get("prefix_caching_enabled")
+    if not isinstance(prefix_caching_enabled, bool):
+        prefix_caching_enabled = config.get("enable_prefix_caching")
     header = {column: None for column in CSV_COLUMNS}
     rows = []
     for result in run.get("results") or []:
@@ -718,6 +730,7 @@ def _write_csv(path: Path, run: dict[str, Any]) -> None:
             "runs": config.get("runs"),
             "warmup_runs": config.get("warmup_runs"),
             "exact_tg": config.get("exact_tg"),
+            "prefix_caching_enabled": prefix_caching_enabled,
             **{key: _round(value) for key, value in result.items()},
         }
         rows.append(row)

@@ -113,7 +113,7 @@ export function DeploymentPage() {
   const navigate = useNavigate()
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const [editor, setEditor] = useState<Editor>()
-  const [busy, setBusy] = useState<'save' | 'run'>()
+  const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
 
@@ -142,14 +142,25 @@ export function DeploymentPage() {
   }
 
   const run = async (form: HTMLFormElement | null) => {
-    if (!form || !form.reportValidity()) return
+    if (resource.data?.editable && (!form || !form.reportValidity())) return
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
-      await persist()
+      if (resource.data?.editable) await persist()
       await api.deployments.action(deploymentId, 'start')
       navigate('/models')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not run deployment')
+      setBusy(undefined)
+    }
+  }
+
+  const stop = async () => {
+    setBusy('stop'); setError(undefined); setNotice(undefined)
+    try {
+      await api.deployments.action(deploymentId, 'stop')
+      navigate('/models')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not stop deployment')
       setBusy(undefined)
     }
   }
@@ -159,6 +170,8 @@ export function DeploymentPage() {
   const detail = resource.data
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
+  const active = ['launching', 'starting', 'running', 'ready'].includes(detail.status)
+  const lifecycleDisabled = Boolean(busy) || (!detail.editable && !detail.controllable)
 
   return <div className="page">
     <PageHeader
@@ -193,7 +206,12 @@ export function DeploymentPage() {
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
         </>}
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
-        <div className="settings-save wide-field"><Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button><Button type="button" variant="primary" disabled={disabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button></div>
+        <div className="settings-save wide-field">
+          <Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
+          {active && detail.controllable
+            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
+            : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button>}
+        </div>
       </form>
     </Panel>
   </div>

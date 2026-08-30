@@ -16,6 +16,9 @@ class FakeManager:
         self.http = httpx.AsyncClient()
         self.list_containers = AsyncMock(return_value=[])
         self.remove_container = AsyncMock(return_value={"ok": True})
+        self.start_container = AsyncMock(return_value={"ok": True})
+        self.stop_container = AsyncMock(return_value={"ok": True})
+        self.get_cluster_member_logs = AsyncMock(return_value="container output")
         self._vllm_chat = AsyncMock()
         self._vllm_completions = AsyncMock()
         self.proxy_chat_completions = AsyncMock()
@@ -88,7 +91,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unmanaged_discovered_container_remove_is_rejected(self):
+    async def test_unmanaged_discovered_container_has_lifecycle_logs_and_remove(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager.list_containers.return_value = [{
@@ -97,10 +100,29 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             }]
             service = SparkDeckService(manager, Path(directory))
 
-            with self.assertRaisesRegex(ValueError, "unmanaged discovered containers"):
-                await service.delete_deployment("container:user-container")
+            stopped = await service.deployment_action(
+                "container:user-container", "stop",
+            )
+            self.assertEqual(stopped["status"], "stopped")
+            manager.stop_container.assert_awaited_once_with(
+                "user-container", explicit=True,
+            )
 
-            manager.remove_container.assert_not_awaited()
+            started = await service.deployment_action(
+                "container:user-container", "start",
+            )
+            self.assertEqual(started["status"], "running")
+            manager.start_container.assert_awaited_once_with(
+                "user-container", explicit=True,
+            )
+
+            logs = await service.deployment_logs("container:user-container")
+            self.assertEqual(logs, {"logs": "container output"})
+
+            result = await service.delete_deployment("container:user-container")
+            self.assertTrue(result["ok"])
+            manager.remove_container.assert_awaited_once_with("user-container")
+
             await manager.http.aclose()
             await service.close()
 

@@ -240,6 +240,35 @@ describe('models page running actions', () => {
     })
   })
 
+  it('shows controls and loading progress for a discovered external container', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'container:kimi-vllm', alias: 'Kimi vLLM', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'starting', settings: {},
+      controllable: true, logs_available: true, removable: true,
+      launch_phase: 'loading', launch_message: 'loading checkpoint shards 7/48',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByText('loading checkpoint shards 7/48')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Logs for Kimi vLLM' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Stop' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => (
+      String(path).endsWith('/deployments/container%3Akimi-vllm/stop') && init?.method === 'POST'
+    ))).toBe(true))
+  })
+
   it('falls back to a plain start button when stopped', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

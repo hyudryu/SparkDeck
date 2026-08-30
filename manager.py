@@ -10097,9 +10097,20 @@ class Manager:
         ):
             return None
 
+        # Docker runs Entrypoint followed by Cmd. Inspect the combined argv so
+        # externally-created containers do not lose flags merely because their
+        # image supplies ``vllm serve`` through the entrypoint.
+        config = attrs.get("Config", {})
+        entrypoint = config.get("Entrypoint") or []
+        configured_cmd = config.get("Cmd") or []
+        if isinstance(entrypoint, str):
+            entrypoint = [entrypoint]
+        if isinstance(configured_cmd, str):
+            configured_cmd = [configured_cmd]
+        cmd = [str(value) for value in [*entrypoint, *configured_cmd]]
+
         # parse model from cmd or label
         model = _label_value(labels, MODEL_LABEL, "")
-        cmd = c.attrs.get("Config", {}).get("Cmd") or []
         if not model:
             if engine_label == "sglang":
                 # SGLang uses --model-path <model>
@@ -10139,6 +10150,22 @@ class Manager:
         except Exception:
             vram_gb = None
 
+        runtime_environment: dict[str, str] = {}
+        for entry in config.get("Env") or []:
+            if not isinstance(entry, str) or "=" not in entry:
+                continue
+            name, value = entry.split("=", 1)
+            try:
+                runtime_environment = normalize_runtime_environment(
+                    {**runtime_environment, name: value}, engine_label,
+                )
+            except ValueError:
+                # Credentials, malformed entries, and excess image defaults
+                # are never exposed through the public deployment contract.
+                continue
+        load_settings = self._container_load_settings(cmd, engine_label, model)
+        load_settings["environment"] = runtime_environment
+
         summary = {
             "id": c.short_id,
             "name": c.name,
@@ -10153,7 +10180,7 @@ class Manager:
             "port": host_port,
             "managed": is_managed,
             "engine": engine_label,
-            "load_settings": self._container_load_settings(cmd, engine_label, model),
+            "load_settings": load_settings,
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),
             "started_at": (c.attrs.get("State") or {}).get("StartedAt"),

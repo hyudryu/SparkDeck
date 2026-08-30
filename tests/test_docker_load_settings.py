@@ -84,6 +84,38 @@ class FakeAPI:
 
 
 class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
+    def test_external_summary_combines_entrypoint_and_cmd_and_exposes_safe_environment(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "external-container-id",
+            "external-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-model-len", "65536", "--enable-prefix-caching"],
+                "Env": [
+                    "VLLM_CACHE_ROOT=/cache/vllm",
+                    "NCCL_DEBUG=INFO",
+                    "HF_TOKEN=must-not-leak",
+                    "SERVICE_API_KEY=must-not-leak",
+                ],
+                "Labels": {},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        settings = summary["load_settings"]
+        self.assertEqual(settings["context_window"], 65536)
+        self.assertIn("--enable-prefix-caching", settings["extra_args"])
+        self.assertEqual(settings["environment"], {
+            "VLLM_CACHE_ROOT": "/cache/vllm",
+            "NCCL_DEBUG": "INFO",
+        })
+
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 

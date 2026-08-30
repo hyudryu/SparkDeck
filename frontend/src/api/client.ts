@@ -359,6 +359,9 @@ export interface WireDeployment {
   launch_phase?: string
   launch_message?: string
   last_used_at?: number | null
+  controllable?: boolean
+  logs_available?: boolean
+  removable?: boolean
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -402,6 +405,9 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
+    controllable: item.controllable,
+    logs_available: item.logs_available,
+    removable: item.removable,
     settings: {
       ...item.settings,
       port: item.port,

@@ -95,6 +95,40 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText(/Runtime flags/)).toBeDisabled()
   })
 
+  it('shows inspected external settings read-only but still allows stopping the container', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async () => {
+      const external = {
+        ...detail,
+        id: 'container:kimi-vllm', kind: 'external', managed: false,
+        status: 'starting', desired_state: 'running', editable: false,
+        controllable: true,
+        edit_reason: 'Discovered deployment settings are read-only.',
+        environment: { VLLM_CACHE_ROOT: '/cache/vllm', NCCL_DEBUG: 'INFO' },
+        extra_args: ['--max-model-len', '400000', '--enable-prefix-caching'],
+      }
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    render(<MemoryRouter initialEntries={['/models/container%3Akimi-vllm']}><Routes>
+      <Route path="/models/:deploymentId" element={<DeploymentPage />} />
+      <Route path="/models" element={<h1>Models destination</h1>} />
+    </Routes></MemoryRouter>)
+
+    expect(await screen.findByLabelText(/Runtime environment variables/)).toHaveValue(
+      'VLLM_CACHE_ROOT=/cache/vllm\nNCCL_DEBUG=INFO',
+    )
+    expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
+      '--max-model-len 400000 --enable-prefix-caching',
+    )
+    await user.click(screen.getByRole('button', { name: 'Stop' }))
+
+    expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
+    const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    expect(mutations.map(([input]) => String(input))).toEqual([
+      '/api/v1/deployments/container%3Akimi-vllm/stop',
+    ])
+  })
+
   it('preserves literal backslashes in double-quoted flags', async () => {
     const user = userEvent.setup()
     renderPage()

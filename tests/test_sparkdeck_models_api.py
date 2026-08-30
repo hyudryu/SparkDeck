@@ -496,6 +496,26 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExternalEndpointProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loading_discovered_card_keeps_starting_phase_when_port_is_closed(self):
+        deployment = {
+            "id": "container:loading", "kind": "external",
+            "runtime": "vllm", "status": "starting", "port": 8123,
+            "launch_phase": "loading",
+            "launch_message": "loading checkpoint shards 7/48",
+        }
+        health = AsyncMock(side_effect=RuntimeError("not listening yet"))
+        with patch.object(
+            server.sparkdeck.registry, "get",
+            Mock(return_value=SimpleNamespace(health=health)),
+        ), patch.object(
+            server.sparkdeck, "_get_credential", Mock(return_value=None),
+        ):
+            await server.sparkdeck._probe_external_endpoint(deployment)
+
+        self.assertEqual(deployment["status"], "starting")
+        self.assertEqual(deployment["launch_phase"], "loading")
+        self.assertNotIn("last_error", deployment)
+
     async def test_discovered_card_without_port_keeps_docker_status(self):
         deployment = {
             "id": "container:host-net", "kind": "external",

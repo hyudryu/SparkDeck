@@ -630,6 +630,37 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual((local, total), ([], 0))
         self.assertEqual(self.store.benchmark_model_summaries()[0]["run_count"], 1)
 
+    def test_local_history_groups_by_model_and_hides_legacy_generic_rows(self):
+        base = BenchmarkSample(
+            id="model-new", created_at="2026-08-27T01:00:00+00:00",
+            deployment_id="dep-1", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None, hardware={},
+            configuration={}, input_tokens=100, output_tokens=50,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=50,
+            prompt_tokens_per_second=1000, cold_start=False,
+            eligible_for_community=False,
+        )
+        self.store.add_benchmark(base, queue=False)
+        self.store.add_benchmark(replace(
+            base, id="model-old", created_at="2026-08-27T00:00:00+00:00",
+            generation_tokens_per_second=40,
+        ), queue=False)
+        self.store.add_benchmark(replace(
+            base, id="legacy-generic", model=ModelIdentity("local-model"),
+        ), queue=False)
+
+        history = self.store.benchmark_history_models()
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["id"], "model-new")
+        self.assertEqual(history[0]["sample_count"], 2)
+        self.assertEqual(history[0]["generation_tokens_per_second"], 50)
+        self.assertEqual(self.store.delete_benchmark_model("org/model"), 2)
+        self.assertEqual(self.store.benchmark_history_models(), [])
+        _, total = self.store.benchmarks()
+        self.assertEqual(total, 1)
+
     def test_migration_backfills_legacy_coordinated_history_link(self):
         database = Path(self.temp.name) / "legacy-series.sqlite3"
         connection = sqlite3.connect(database)

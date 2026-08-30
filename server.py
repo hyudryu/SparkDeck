@@ -3027,6 +3027,19 @@ async def v1_benchmarks(limit: int = 100, offset: int = 0):
             "offset": max(0, offset)}
 
 
+@app.get("/api/v1/benchmark-history/models")
+async def v1_benchmark_history_models():
+    return {"items": sparkdeck.store.benchmark_history_models()}
+
+
+@app.delete("/api/v1/benchmark-history/models/{model_id:path}")
+async def v1_delete_benchmark_history_model(model_id: str):
+    deleted = await sparkdeck.delete_benchmark_model(model_id)
+    if not deleted:
+        raise HTTPException(404, "benchmark model history not found")
+    return {"ok": True, "model_id": model_id, "deleted": deleted}
+
+
 @app.post("/api/v1/benchmark-runs", status_code=201)
 async def v1_record_benchmark_run(req: Request):
     try:

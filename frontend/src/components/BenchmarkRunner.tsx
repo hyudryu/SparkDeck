@@ -203,7 +203,8 @@ export function BenchmarkRunner() {
 
       {installed && <>
         <div className="section-heading"><div><h2>New benchmark run</h2><p>Pick a served model, then sweep prompt sizes and concurrency levels. Each combination runs {runsPerTest || 3} measured passes after a warm-up.</p></div></div>
-        <Panel>
+        <Panel className="runner-config-panel">
+          {models.error && <ErrorState message={`Could not load served models: ${models.error}`} onRetry={models.reload} />}
           <div className="field-grid">
             <label className="field" htmlFor="runner-model">
               <span>Served model</span>
@@ -213,7 +214,7 @@ export function BenchmarkRunner() {
                 onChange={(event) => setModelId(event.target.value)}
                 disabled={models.loading || !models.data?.length || Boolean(activeRunId)}
               >
-                {!models.data?.length && <option value="">{models.loading ? 'Loading served models…' : 'No models currently served'}</option>}
+                {!models.data?.length && <option value="">{models.loading ? 'Loading served models…' : models.error ? 'Served models unavailable' : 'No models currently served'}</option>}
                 {models.data?.map((model) => (
                   <option key={model.id} value={model.id}>
                     {model.label}{model.quantization ? ` · ${model.quantization}` : ''}{model.runtime ? ` · ${model.runtime}` : ''}

@@ -73,8 +73,8 @@ export function BenchmarksPage() {
     }
   }
 
-  const remove = async (id: string) => {
-    await api.benchmarks.deleteLocal(id)
+  const remove = async (modelId: string) => {
+    await api.benchmarks.deleteLocalModel(modelId)
     samples.reload()
     benchmarkModels.reload()
     aggregates.reload()
@@ -151,19 +151,19 @@ export function BenchmarksPage() {
       ))}</div>}
       {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name, quantization, and prompt-length bucket. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
 
-      <div className="section-heading"><div><h2>Local history</h2><p>Successful proxied runs are captured automatically.</p></div></div>
+      <div className="section-heading"><div><h2>Local history</h2><p>One latest result per identified model. Eligible results stay local while signed out and upload after Community sign-in when sharing is enabled.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}
       {samples.error && <ErrorState message={samples.error} onRetry={samples.reload} />}
-      {!samples.loading && !samples.error && samples.data?.length === 0 && <EmptyState title="No benchmark samples yet" description="Chat with or compare a running model to capture your first measurement." />}
+      {!samples.loading && !samples.error && samples.data?.length === 0 && <EmptyState title="No identified benchmark models yet" description="Chat with or compare a running model to capture your first identified measurement." />}
       {samples.data && samples.data.length > 0 && <Panel className="table-panel"><div className="responsive-table benchmark-table" role="table" aria-label="Local benchmark history">
         <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Runtime</span><span role="columnheader">Speed</span><span role="columnheader">TTFT</span><span role="columnheader">Sync</span><span role="columnheader">Actions</span></div>
-        {samples.data.map((sample) => <div className="table-row" role="row" tabIndex={0} key={sample.id}>
-          <div role="cell" data-label="Model"><strong>{sample.model_id}</strong><small>{new Date(sample.created_at).toLocaleString()}</small></div>
+        {samples.data.map((sample) => <div className="table-row" role="row" tabIndex={0} key={sample.model_id}>
+          <div role="cell" data-label="Model"><strong>{sample.model_id}</strong><small>{sample.sample_count ?? 1} saved result{(sample.sample_count ?? 1) === 1 ? '' : 's'} · Latest {new Date(sample.created_at).toLocaleString()}</small></div>
           <div role="cell" data-label="Runtime"><RuntimeMark runtime={sample.runtime} /><small>{sample.quantization ?? 'Default precision'}</small></div>
           <div role="cell" data-label="Speed"><strong>{formatRate(sample.tokens_per_second)}</strong><small>{sample.output_tokens ?? '—'} output tokens</small></div>
           <div role="cell" data-label="TTFT">{formatDuration(sample.ttft_ms)}</div>
           <div role="cell" data-label="Sync"><Status status={sample.sync_state ?? 'local'} /></div>
-          <div role="cell" data-label="Actions"><Button variant="tertiary" aria-label={`Delete benchmark for ${sample.model_id}`} onClick={() => void remove(sample.id)}><Trash2 size={15} /></Button></div>
+          <div role="cell" data-label="Actions"><Button variant="tertiary" aria-label={`Delete all benchmarks for ${sample.model_id}`} onClick={() => void remove(sample.model_id)}><Trash2 size={15} /></Button></div>
         </div>)}
       </div></Panel>}
       {selectedModel && <LegalDialog eyebrow="Benchmark detail" title={selectedModel} titleId="benchmark-model-title" onClose={closeModelDetail} returnFocusRef={modelTriggerRef}>

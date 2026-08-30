@@ -702,7 +702,7 @@ export const api = {
   },
   benchmarks: {
     list: async (signal?: AbortSignal): Promise<BenchmarkSample[]> => {
-      const data = await request<{ items: WireBenchmark[] }>('/api/v1/benchmarks?limit=100&offset=0', { signal })
+      const data = await request<{ items: Array<WireBenchmark & { sample_count?: number }> }>('/api/v1/benchmark-history/models', { signal })
       return data.items.map((item) => ({
         id: item.id,
         deployment_id: item.deployment_id,
@@ -720,8 +720,13 @@ export const api = {
         upload_eligible: item.eligible_for_community,
         sync_state: item.sync_state ?? 'local',
         created_at: item.created_at,
+        sample_count: item.sample_count,
       }))
     },
+    deleteLocalModel: (modelId: string): Promise<void> => request(
+      `/api/v1/benchmark-history/models/${encodeURIComponent(modelId)}`,
+      { method: 'DELETE' },
+    ),
     models: async (signal?: AbortSignal): Promise<BenchmarkModelSummary[]> => {
       const data = await request<{ items: BenchmarkModelSummary[] }>('/api/v1/benchmark-models', { signal })
       return data.items

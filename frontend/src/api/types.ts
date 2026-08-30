@@ -380,6 +380,7 @@ export interface BenchmarkSample {
   upload_eligible?: boolean
   sync_state?: 'local' | 'pending' | 'synced' | 'failed' | 'waiting_for_account'
   created_at: string
+  sample_count?: number
 }
 
 export interface BenchmarkModelSummary {

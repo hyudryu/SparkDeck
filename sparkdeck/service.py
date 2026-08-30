@@ -389,6 +389,13 @@ class SparkDeckService:
         async with self._community_upload_lock:
             return await asyncio.to_thread(self.store.delete_benchmark, sample_id)
 
+    async def delete_benchmark_model(self, model_id: str) -> int:
+        """Delete a consolidated model history row and all its samples."""
+        async with self._community_upload_lock:
+            return await asyncio.to_thread(
+                self.store.delete_benchmark_model, model_id
+            )
+
     async def unpair_community_device(
         self, expected_sub: str,
     ) -> tuple[str, dict[str, Any]]:
@@ -527,7 +534,8 @@ class SparkDeckService:
         ):
             raise ValueError("derived benchmark throughput is outside the supported range")
         raw_model_id = str(
-            (deployment.get("model") or {}).get("repository") or "local-model"
+            (deployment.get("model") or {}).get("repository")
+            or deployment.get("alias") or deployment.get("id") or deployment_id
         ).strip()
         upload_model_id = _public_model_id(raw_model_id)
         if (
@@ -585,7 +593,9 @@ class SparkDeckService:
             id=str(uuid.uuid4()), created_at=point["created_at"],
             deployment_id=deployment.get("id"),
             model=ModelIdentity(
-                repository=upload_model_id, quantization=quantization,
+                # Preserve the resolved identity for local history. Upload
+                # eligibility still uses the separately sanitized model ID.
+                repository=local_model_id, quantization=quantization,
             ), runtime=runtime,
             runtime_version=_optional_string(settings.get("runtime_version")),
             hardware=hardware, configuration=configuration,
@@ -3880,6 +3890,8 @@ class SparkDeckService:
                 "id": alias, "object": "model", "created": 0,
                 "owned_by": "sparkdeck", "runtime": deployment["runtime"],
                 "deployment_id": deployment["id"], "model": deployment["model"],
+                "container_name": deployment.get("container_name"),
+                "port": deployment.get("port"),
             })
         loaded_llama = await self._native_llama_model()
         if loaded_llama and loaded_llama not in seen:
@@ -4369,7 +4381,11 @@ class SparkDeckService:
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
             model=ModelIdentity(
-                repository=public_model,
+                # Preserve public identities and give private models a stable,
+                # non-sensitive local label instead of the old "local-model".
+                repository=_local_benchmark_model_id(
+                    model, deployment_id, upload_model_id=public_model,
+                ),
                 revision=_optional_string(revision),
                 quantization=quantization,
             ),
@@ -4438,9 +4454,9 @@ class SparkDeckService:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
                 if requested_model in ids:
-                    repository = str(container.get("model") or "").strip()
-                    if not repository or "/" not in repository:
-                        repository = "local-model"
+                    repository = str(
+                        container.get("model") or requested_model
+                    ).strip() or requested_model
                     settings = dict(
                         container.get("load_settings")
                         or container.get("settings")
@@ -4453,7 +4469,7 @@ class SparkDeckService:
         except Exception:
             pass
         # An unlinked served alias is not a trustworthy public repository.
-        return "local-model", RuntimeKind.VLLM.value, {}
+        return requested_model or "Unknown model", RuntimeKind.VLLM.value, {}
 
     @staticmethod
     def _model_observation_settings(deployment: dict[str, Any]) -> dict[str, Any]:
@@ -4822,9 +4838,8 @@ def _local_benchmark_model_id(
     ).encode("utf-8")
     digest = hashlib.sha256(identity).hexdigest()[:16]
     # This deliberately does not resemble an owner/repository ID, so the
-    # upload-facing sanitizer will still collapse it to ``local-model`` if it
-    # ever reaches that boundary.
-    return f"local-model-{digest}"
+    # upload-facing sanitizer will reject it if it ever reaches that boundary.
+    return f"Private model {digest[:8]}"
 
 
 def _parse_sse(line: str) -> dict[str, Any] | None:

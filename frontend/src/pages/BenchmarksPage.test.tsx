@@ -43,7 +43,7 @@ describe('BenchmarksPage community privacy', () => {
           { context_window_size: 16384, concurrency: 1, tensor_parallel_size: 2, prompt_tokens_per_second: 4100, generation_tokens_per_second: 90, sample_count: 1 },
         ],
       }
-      else if (path.includes('/api/v1/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+      else if (path.includes('/api/v1/benchmark-history/models')) body = { items: [] }
       else if (path.endsWith('/api/v1/community/aggregates')) body = { items: [], availability: 'available', evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' } }
       else body = { consent: true, pairing: { status: 'paired' }, upload_configured: true, outbox: {} }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -95,7 +95,7 @@ describe('BenchmarksPage community privacy', () => {
         }],
       }
       else if (path.endsWith('/api/v1/benchmark-models/org%2Fmodel-b')) return modelBResponse
-      else if (path.includes('/api/v1/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+      else if (path.includes('/api/v1/benchmark-history/models')) body = { items: [] }
       else if (path.endsWith('/api/v1/community/aggregates')) body = {
         items: [], availability: 'available',
         evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
@@ -130,7 +130,7 @@ describe('BenchmarksPage community privacy', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       let body: unknown
-      if (path.includes('/api/v1/benchmarks')) body = { items: [], total: 0, limit: 100, offset: 0 }
+      if (path.includes('/api/v1/benchmark-history/models')) body = { items: [] }
       else if (path.endsWith('/api/v1/community/aggregates')) body = {
         items: [
           {
@@ -191,7 +191,7 @@ describe('BenchmarksPage community privacy', () => {
           context_windows: [8192], tensor_parallel_sizes: [1],
           latest_at: '2026-08-26T00:00:00Z',
         }] }
-      } else if (path.includes('/api/v1/benchmarks')) {
+      } else if (path.includes('/api/v1/benchmark-history/models')) {
         if (init?.method === 'DELETE') {
           deleted = true
           body = { ok: true }
@@ -228,7 +228,7 @@ describe('BenchmarksPage community privacy', () => {
     const explorerModel = within(modelList).getByRole('button', { name: /org\/model/ })
     expect(explorerModel).toBeInTheDocument()
     expect((await screen.findAllByText('42.5 tok/s')).length).toBeGreaterThan(0)
-    await user.click(screen.getByRole('button', { name: 'Delete benchmark for org/model' }))
+    await user.click(screen.getByRole('button', { name: 'Delete all benchmarks for org/model' }))
 
     expect(await screen.findByText('No coordinated benchmark runs yet')).toBeInTheDocument()
     expect(explorerModel).not.toBeInTheDocument()
@@ -241,7 +241,7 @@ describe('BenchmarksPage community privacy', () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       let body: unknown
-      if (path.includes('/api/v1/benchmarks')) {
+      if (path.includes('/api/v1/benchmark-history/models')) {
         body = { items: [], total: 0, limit: 100, offset: 0 }
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {
@@ -279,14 +279,14 @@ describe('BenchmarksPage community privacy', () => {
       const path = String(input)
       let body: unknown
       if (path.endsWith('/api/v1/benchmark-models')) body = { items: [] }
-      else if (path.includes('/api/v1/benchmarks')) body = {
+      else if (path.includes('/api/v1/benchmark-history/models')) body = {
         items: [{
           id: 'sample-unmeasured', created_at: '2026-08-26T00:00:00Z',
           model: { repository: 'org/model' }, runtime: 'vllm',
           configuration: {}, latency_ms: 100, ttft_ms: null,
           generation_tokens_per_second: null, eligible_for_community: false,
+          sample_count: 2,
         }],
-        total: 1, limit: 100, offset: 0,
       }
       else if (path.endsWith('/api/v1/community/aggregates')) body = {
         items: [], availability: 'not_configured',
@@ -299,7 +299,9 @@ describe('BenchmarksPage community privacy', () => {
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     const history = await screen.findByRole('table', { name: 'Local benchmark history' })
-    expect(within(history).getByText('org/model')).toBeInTheDocument()
+    expect(within(history).getAllByText('org/model')).toHaveLength(1)
+    expect(within(history).getByText(/2 saved results/)).toBeInTheDocument()
+    expect(within(history).queryByText('local-model')).not.toBeInTheDocument()
     expect(within(history).getAllByText('—').length).toBeGreaterThanOrEqual(2)
   })
 
@@ -309,7 +311,7 @@ describe('BenchmarksPage community privacy', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       let body: unknown
-      if (path.includes('/api/v1/benchmarks')) {
+      if (path.includes('/api/v1/benchmark-history/models')) {
         body = { items: [], total: 0, limit: 100, offset: 0 }
       } else if (path.endsWith('/api/v1/community/aggregates')) {
         body = {

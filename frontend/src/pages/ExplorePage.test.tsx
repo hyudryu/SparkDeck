@@ -77,7 +77,7 @@ describe('ExplorePage model rows', () => {
     })
   })
 
-  it('reveals community evidence only after expansion and describes other SparkDeck users', async () => {
+  it('does not render a separate community evidence panel on Hugging Face rows', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -102,15 +102,11 @@ describe('ExplorePage model rows', () => {
     const row = await screen.findByRole('button', { name: 'Expand org/model' })
     expect(row).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
-    expect(screen.queryByText(/No estimate is available/)).not.toBeInTheDocument()
 
     await user.click(row)
 
-    const estimate = screen.getByLabelText('Community inference-speed estimate for org/model')
-    expect(within(estimate).getByText('Sampled from other SparkDeck users')).toBeInTheDocument()
-    expect(within(estimate).getByText('31.3 tok/s')).toBeInTheDocument()
-    expect(within(estimate).getByText(/1,000-token prompt-length bucket/)).toBeInTheDocument()
-    expect(within(estimate).getByText(/estimate, not a guarantee/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
+    expect(screen.getByText('31.3 tok/s')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
   })
 
@@ -442,9 +438,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByRole('button', { name: 'Expand org/large' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Expand org/unknown' })).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('checkbox', { name: /Only with community data/ }))
-    expect(screen.getByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Expand org/tight' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Only with community data/ })).not.toBeInTheDocument()
   })
 
   it('reports a one-node minimum when a single node holds the weights alone', async () => {
@@ -535,13 +529,13 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
 
-    expect(await screen.findByRole('button', { name: 'Expand community/model (unknown, 1,000-token prompt bucket)' })).toBeInTheDocument()
+    const row = await screen.findByRole('button', { name: 'Expand community/model' })
     expect(screen.queryByText('Hugging Face unavailable')).not.toBeInTheDocument()
     expect(screen.getByText('Based on aggregated benchmark samples—not live session tracking.')).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeChecked()
-    await user.click(screen.getByRole('button', { name: 'Expand community/model (unknown, 1,000-token prompt bucket)' }))
-    expect(screen.getByText('Aggregated from benchmarks on this controller')).toBeInTheDocument()
-    expect(screen.queryByText('Sampled from other SparkDeck users')).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Only with community data/ })).not.toBeInTheDocument()
+    await user.click(row)
+    const quantizations = (await screen.findByText('Available quantizations and artifacts')).closest<HTMLElement>('.catalog-quantizations')!
+    expect(within(quantizations).getByText(/^18\.5 tok\/s/)).toBeInTheDocument()
   })
 
   it('does not carry a hidden Hugging Face Llama fit filter into the community tab', async () => {
@@ -588,11 +582,11 @@ describe('ExplorePage model rows', () => {
 
     expect(await screen.findByText('24 GB aggregate sharded memory across 2 measured nodes')).toBeInTheDocument()
     expect(await screen.findByRole('button', {
-      name: 'Expand org/community-mixed (Q4_K_M, 1,000-token prompt bucket)',
+      name: 'Expand org/community-mixed',
     })).toBeInTheDocument()
   })
 
-  it('filters community Llama variants using the GGUF artifact matching their quantization', async () => {
+  it('groups community Llama quantizations into one model row', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -629,7 +623,7 @@ describe('ExplorePage model rows', () => {
       return json({
         items: [
           { model_id: 'org/community-llama', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, unique_cluster_count: 2 },
-          { model_id: 'org/community-llama', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 10, unique_cluster_count: 2 },
+          { model_id: 'org/community-llama', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, unique_cluster_count: 2 },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -637,21 +631,61 @@ describe('ExplorePage model rows', () => {
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
-    expect(await screen.findByRole('button', {
-      name: 'Expand org/community-llama (Q4_K_M, 1,000-token prompt bucket)',
-    })).toBeInTheDocument()
-    expect(screen.getByRole('button', {
-      name: 'Expand org/community-llama (Q8_0, 1,000-token prompt bucket)',
-    })).toBeInTheDocument()
+    const row = await screen.findByRole('button', { name: 'Expand org/community-llama' })
+    expect(within(row).getByText('20.0–30.0 tok/s')).toBeInTheDocument()
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
-    expect(screen.getByRole('button', {
-      name: 'Expand org/community-llama (Q4_K_M, 1,000-token prompt bucket)',
-    })).toBeInTheDocument()
-    expect(screen.queryByRole('button', {
-      name: 'Expand org/community-llama (Q8_0, 1,000-token prompt bucket)',
-    })).not.toBeInTheDocument()
+    const fittingRow = screen.getByRole('button', { name: 'Expand org/community-llama' })
+    expect(within(fittingRow).getByText('8.0 GB')).toBeInTheDocument()
+    await user.click(fittingRow)
+    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/community-llama' })).toHaveValue('Q4_K_M\u0000community-q4_k_m.gguf')
+    expect(screen.getByRole('link', { name: 'Deploy org/community-llama' })).toHaveAttribute(
+      'href', '/models?model=org%2Fcommunity-llama&runtime=llama.cpp&quantization=Q4_K_M&artifact=community-q4_k_m.gguf',
+    )
+  })
+
+  it('filters and sorts grouped non-Llama models by their largest fitting quantization', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [
+        {
+          id: 'org/grouped-vllm', name: 'grouped-vllm', weight_size_bytes: 20 * gib,
+          downloads: 2, likes: 0, runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+        },
+        {
+          id: 'org/twelve-gib', name: 'twelve-gib', weight_size_bytes: 12 * gib,
+          downloads: 1, likes: 0, runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+        },
+      ], total: 2 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({
+        items: [
+          { model_id: 'org/grouped-vllm', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, weight_size_bytes: 20 * gib },
+          { model_id: 'org/grouped-vllm', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, weight_size_bytes: 8 * gib },
+          { model_id: 'org/twelve-gib', quantization: 'FP16', prompt_tokens_bucket: 1000, inference_tokens_per_second: 15, sample_count: 10, weight_size_bytes: 12 * gib },
+        ],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    const rows = screen.getAllByRole('button', { name: /^Expand org\// })
+    expect(rows.map((row) => row.getAttribute('aria-label'))).toEqual([
+      'Expand org/twelve-gib',
+      'Expand org/grouped-vllm',
+    ])
+    expect(within(rows[1]).getByText('8.0 GB')).toBeInTheDocument()
+    await user.click(rows[1])
+    expect(screen.getByRole('link', { name: 'Deploy org/grouped-vllm' })).toHaveAttribute(
+      'href', '/models?model=org%2Fgrouped-vllm&runtime=vllm&quantization=Q4_K_M',
+    )
   })
 
   it('pages large community result sets instead of rendering every model at once', async () => {
@@ -680,7 +714,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByRole('button', { name: 'Load more community models (20 remaining)' })).toBeInTheDocument()
   })
 
-  it('keeps quantization variants separate and shows community-specific columns and artifacts', async () => {
+  it('groups repository quantizations, shows a speed range, and labels each quantization speed', async () => {
     const user = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -700,7 +734,7 @@ describe('ExplorePage model rows', () => {
         items: [
           { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 1000, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
           { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 400, inference_tokens_per_second: 60.1, sample_count: 10, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 400, inference_tokens_per_second: 60.1, sample_count: 30, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -711,35 +745,33 @@ describe('ExplorePage model rows', () => {
 
     const header = document.querySelector('.catalog-model-header')
     expect(header).toHaveTextContent('Output speed')
-    expect(header).toHaveTextContent('Unique clusters')
+    expect(header).toHaveTextContent('Max clusters')
     expect(screen.queryByText('Downloads')).not.toBeInTheDocument()
     expect(screen.queryByText('Likes')).not.toBeInTheDocument()
-    const nvfp4 = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 1,000-token prompt bucket)' })
-    const gguf = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (Q4_K_M, 1,000-token prompt bucket)' })
-    const shortContext = screen.getByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B (NVFP4, 400-token prompt bucket)' })
-    expect(within(nvfp4).getByText('52.4 tok/s')).toBeInTheDocument()
-    expect(within(nvfp4).getByText('7')).toBeInTheDocument()
-    expect(within(gguf).getByText('31.2 tok/s')).toBeInTheDocument()
-    expect(within(gguf).getByText('4')).toBeInTheDocument()
-    expect(within(shortContext).getByText('60.1 tok/s')).toBeInTheDocument()
-    expect(within(shortContext).getByText('3')).toBeInTheDocument()
+    const row = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B' })
+    expect(within(row).getByText('31.2–52.4 tok/s')).toBeInTheDocument()
+    expect(within(row).getByText('7')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B' })).toHaveLength(1)
 
-    await user.click(nvfp4)
+    await user.click(row)
     expect(await screen.findByText('Available quantizations and artifacts')).toBeInTheDocument()
     expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
     expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
-    expect(within(nvfp4.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
+    const modelArticle = row.closest('article')!
+    expect(within(modelArticle).getByText(/^52\.4 tok\/s/)).toBeInTheDocument()
+    expect(within(modelArticle).getByText(/^31\.2 tok\/s/)).toBeInTheDocument()
+    expect(within(modelArticle).queryByText('60.1 tok/s')).not.toBeInTheDocument()
+    expect(within(modelArticle).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
       'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=vllm&quantization=NVFP4',
     )
 
-    await user.click(gguf)
-    const ggufRow = gguf.closest('article')!
-    expect(await within(ggufRow).findByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
-    const deploymentType = within(ggufRow).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
+    const deploymentType = within(modelArticle).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
     expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
     await user.selectOptions(deploymentType, 'llama.cpp')
-    expect(within(ggufRow).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')
-    expect(within(gguf.closest('article')!).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
+    const artifactSelect = within(modelArticle).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })
+    expect(artifactSelect).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')
+    expect(within(artifactSelect).getByRole('option', { name: /Q4_K_M · 31\.2 tok\/s/ })).toBeInTheDocument()
+    expect(within(modelArticle).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
       'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
     )
   })
@@ -768,11 +800,12 @@ describe('ExplorePage model rows', () => {
     const tab = await screen.findByRole('tab', { name: 'Community Run Models' })
     expect(tab).toBeDisabled()
     expect(tab).toHaveAttribute('title', 'Sign in under Settings → Community Features to see community data.')
-    expect(screen.getByRole('checkbox', { name: /Only with community data/ })).toBeDisabled()
+    expect(screen.queryByRole('checkbox', { name: /Only with community data/ })).not.toBeInTheDocument()
 
     await user.click(await screen.findByRole('button', { name: 'Expand org/model' }))
 
     expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
+    expect(screen.queryByText('31.3 tok/s')).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/api/v1/community/aggregates'))).toBe(false)
   })
 

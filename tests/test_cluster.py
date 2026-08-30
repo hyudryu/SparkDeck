@@ -2522,6 +2522,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             deployment = await instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
+                "environment": {"NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1"},
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
@@ -2554,6 +2555,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args.count("--pipeline-parallel-size"), 1)
                 self.assertEqual(payload["cluster_member"]["fabric_interface"],
                                  "cx7-local" if node_id == "local" else "cx7-remote")
+                self.assertEqual(payload["environment"], {
+                    "NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1",
+                })
 
     async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3776,6 +3780,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         first = await instance.create_container(
             "org/first", name="first-r1",
+            environment={"NCCL_DEBUG": "WARN"},
             cluster_member={
                 "deployment_id": "first", "node_id": "remote-1", "rank": 1,
                 "nnodes": 2, "mode": "sharded",
@@ -3795,6 +3800,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             ["8000", "8001"],
         )
         self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
+        self.assertEqual(run_options[0]["environment"]["NCCL_DEBUG"], "WARN")
         self.assertEqual(instance._host_port_reservations, set())
 
         instance.evict_other_backends = mock.AsyncMock()

@@ -67,6 +67,9 @@ _LOCAL_ROUTING_KEYS = {
     "download_node_id",
     # Structured launch controls Manager merges into argv at launch.
     "launch_controls",
+    # Non-secret vLLM environment variables are local launch inputs and must
+    # never be included in community benchmark configuration.
+    "environment",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -1195,8 +1198,10 @@ class SparkDeckService:
             )
             gpu_memory_gb = saved_settings.get("gpu_memory_gb", gpu_memory_gb)
         image = (launch_settings or {}).get("image")
+        environment = (launch_settings or {}).get("environment")
         if saved_only:
             image = saved_settings.get("image", image)
+            environment = saved_settings.get("environment", environment)
         if discovered_settings is not None:
             engine = str(public.get("runtime") or "vllm")
             if engine == "sglang":
@@ -1220,6 +1225,7 @@ class SparkDeckService:
             "sg_tp_size": sg_tp_size,
             "sg_mem_fraction": sg_mem_fraction,
             "image": image,
+            "environment": environment or {},
         }
 
     async def update_deployment_settings(
@@ -1252,6 +1258,7 @@ class SparkDeckService:
 
         allowed = {
             "extra_args", "launch_controls",
+            "environment",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction",
         }
@@ -1299,6 +1306,7 @@ class SparkDeckService:
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
+            "environment",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -1310,6 +1318,10 @@ class SparkDeckService:
                 raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+        if "environment" in changes:
+            settings["environment"] = self.manager._normalize_runtime_environment(
+                changes.get("environment"), str(stored.get("runtime") or "vllm"),
+            )
         if "image" in changes:
             image = _optional_string(changes.get("image"))
             if not runtime_is_llama and not image:
@@ -1946,6 +1958,13 @@ class SparkDeckService:
         # Saved argv persists in SQLite, so credential-bearing flags are
         # rejected at save time instead of failing (or leaking) at launch.
         self._reject_sensitive_launch_args(settings.get("extra_args"))
+        environment = self.manager._normalize_runtime_environment(
+            settings.get("environment"), runtime.value,
+        )
+        if environment:
+            settings["environment"] = environment
+        else:
+            settings.pop("environment", None)
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")

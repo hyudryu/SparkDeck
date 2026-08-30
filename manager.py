@@ -3711,6 +3711,9 @@ class Manager:
             "model": body.get("model") or "",
             "engine": engine,
             "image": body.get("image") or None,
+            "environment": cls._normalize_runtime_environment(
+                body.get("environment"), engine,
+            ),
             "extra_args": extra_args,
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
@@ -3737,6 +3740,47 @@ class Manager:
                 body.get("output_cost_per_1m"), "output_cost_per_1m"
             ),
         }
+
+    @staticmethod
+    def _normalize_runtime_environment(value: Any, engine: str = "vllm") -> dict[str, str]:
+        """Validate non-secret environment variables persisted for vLLM."""
+        if value is None:
+            return {}
+        if engine != "vllm" and value:
+            raise ValueError("runtime environment variables are only supported for vLLM")
+        if not isinstance(value, dict):
+            raise ValueError("environment must be an object of string values")
+        if len(value) > 128:
+            raise ValueError("environment cannot contain more than 128 variables")
+        protected = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
+        secret_name = re.compile(
+            r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY)(?:$|_)",
+            re.IGNORECASE,
+        )
+        result: dict[str, str] = {}
+        total_size = 0
+        for name, raw_value in value.items():
+            if not isinstance(name, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", name,
+            ):
+                raise ValueError(f"invalid environment variable name: {name!r}")
+            if name in protected:
+                raise ValueError(
+                    f"{name} is managed by SparkDeck; configure Hugging Face credentials in Settings"
+                )
+            if secret_name.search(name):
+                raise ValueError(
+                    f"{name} looks secret and cannot be stored in deployment environment variables"
+                )
+            if not isinstance(raw_value, str):
+                raise ValueError(f"environment variable {name} must have a string value")
+            if "\x00" in raw_value:
+                raise ValueError(f"environment variable {name} cannot contain a NUL character")
+            total_size += len(name.encode("utf-8")) + len(raw_value.encode("utf-8"))
+            if total_size > 65536:
+                raise ValueError("environment cannot exceed 64 KiB")
+            result[name] = raw_value
+        return result
 
     @staticmethod
     def _deployment_pricing(settings: dict) -> dict:
@@ -5185,6 +5229,7 @@ class Manager:
             "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
+            "environment": body.get("environment"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
                     list(body.get("extra_args") or [])
@@ -10420,6 +10465,7 @@ class Manager:
         engine: str = "vllm",
         gpu_memory_utilization: float | None = None,
         gpu_memory_gb: float | None = None,
+        environment: dict[str, str] | None = None,
         extra_args: list[str] | None = None,
         name: str | None = None,
         image: str | None = None,
@@ -10452,7 +10498,8 @@ class Manager:
         create_call = self._create_container_with_port(
             model=model, port=port, engine=engine,
             gpu_memory_utilization=gpu_memory_utilization,
-            gpu_memory_gb=gpu_memory_gb, extra_args=extra_args,
+            gpu_memory_gb=gpu_memory_gb, environment=environment,
+            extra_args=extra_args,
             name=name, image=image, sg_tp_size=sg_tp_size,
             sg_context_length=sg_context_length,
             sg_max_running_requests=sg_max_running_requests,
@@ -10667,6 +10714,7 @@ class Manager:
         engine: str = "vllm",
         gpu_memory_utilization: float | None = None,
         gpu_memory_gb: float | None = None,
+        environment: dict[str, str] | None = None,
         extra_args: list[str] | None = None,
         name: str | None = None,
         image: str | None = None,
@@ -10688,6 +10736,7 @@ class Manager:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        runtime_environment = self._normalize_runtime_environment(environment, engine)
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
@@ -10971,9 +11020,11 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                if runtime_environment:
+                    run_options["environment"] = dict(runtime_environment)
                 hf_environment = self._container_hf_environment(hf_token)
                 if hf_environment:
-                    run_options["environment"] = hf_environment
+                    run_options.setdefault("environment", {}).update(hf_environment)
                 if distributed_member:
                     run_options["network_mode"] = "host"
                     run_options["ulimits"] = [

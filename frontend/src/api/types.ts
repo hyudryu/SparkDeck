@@ -76,6 +76,7 @@ export interface DeploymentSettings {
   artifact?: string
   dtype?: string
   gpu_memory_utilization?: number
+  environment?: Record<string, string>
   port?: number
   extra_args?: string[]
 }
@@ -91,6 +92,7 @@ export interface Deployment {
   endpoint_url?: string
   runtime_version?: string
   image?: string
+  environment?: Record<string, string>
   settings: DeploymentSettings
   deployment_mode?: string
   required_node_count?: number
@@ -131,6 +133,7 @@ export interface DeploymentDetail extends Deployment {
 
 export interface DeploymentUpdateInput {
   extra_args: string[]
+  environment?: Record<string, string>
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
@@ -149,6 +152,7 @@ export interface SavedDeploymentUpdateInput {
   quantization?: string | null
   artifact?: string | null
   extra_args?: string[]
+  environment?: Record<string, string>
   gpu_memory_utilization?: number | null
   node_ids?: string[]
   deployment_mode?: 'single' | 'replicated' | 'sharded' | null

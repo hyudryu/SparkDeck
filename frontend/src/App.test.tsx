@@ -1378,6 +1378,7 @@ describe('model deployments', () => {
     await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
     await user.type(screen.getByRole('spinbutton', { name: 'GPU memory util' }), '0.85')
     await user.type(screen.getByRole('textbox', { name: 'Extra flags' }), '--served-model-name "My Model" --kv-cache-dtype fp8')
+    await user.type(screen.getByRole('textbox', { name: /^Runtime environment variables/ }), 'HF_HUB_OFFLINE=1{enter}NCCL_DEBUG=WARN')
     await user.click(screen.getByRole('button', { name: 'Save deployment' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -1394,6 +1395,7 @@ describe('model deployments', () => {
             tensor_parallel_size: 1,
             image: 'nvcr.io/nvidia/vllm:26.03.post1-py3',
             extra_args: ['--served-model-name', 'My Model', '--kv-cache-dtype', 'fp8'],
+            environment: { HF_HUB_OFFLINE: '1', NCCL_DEBUG: 'WARN' },
             gpu_memory_utilization: 0.85,
           },
           node_ids: ['local'],

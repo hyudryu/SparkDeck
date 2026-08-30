@@ -1265,6 +1265,7 @@ async def agent_create_container(req: Request):
             engine=body.get("engine", "vllm"),
             gpu_memory_utilization=body.get("gpu_memory_utilization"),
             gpu_memory_gb=body.get("gpu_memory_gb"),
+            environment=body.get("environment"),
             extra_args=body.get("extra_args") or [],
             name=body.get("name"),
             image=body.get("image"),
@@ -1635,6 +1636,7 @@ async def create_container(req: Request):
             engine=body.get("engine", "vllm"),
             gpu_memory_utilization=body.get("gpu_memory_utilization"),
             gpu_memory_gb=body.get("gpu_memory_gb"),
+            environment=body.get("environment"),
             extra_args=body.get("extra_args") or [],
             name=body.get("name"),
             image=body.get("image"),
@@ -2090,6 +2092,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         raise HTTPException(400, "request body must be an object")
     allowed = {
         "extra_args", "launch_controls",
+        "environment",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_mem_fraction",
         # Saved-deployment bookmarks (never launched) accept the creator-form

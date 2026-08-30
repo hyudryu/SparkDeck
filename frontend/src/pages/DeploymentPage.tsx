@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import type { DeploymentDetail, DeploymentLaunchControls, DeploymentUpdateInput } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { formatEnvironment, parseEnvironment } from '../utils/environment'
 
 const quoteArg = (arg: string) => (arg === '' || /[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
 
@@ -61,7 +62,7 @@ const flagValue = (args: string[], names: string[]) => {
   return undefined
 }
 
-type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'extra_args', string>
+type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
   context_window: detail.launch_controls.context_window?.toString() ?? '',
@@ -79,6 +80,7 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
   sg_tp_size: detail.sg_tp_size?.toString() ?? '',
   sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
+  environment: formatEnvironment(detail.environment ?? detail.settings.environment),
   extra_args: detail.extra_args.map(quoteArg).join(' '),
 })
 
@@ -87,6 +89,7 @@ const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 function updateInput(editor: Editor): DeploymentUpdateInput {
   return {
     extra_args: splitFlags(editor.extra_args),
+    environment: parseEnvironment(editor.environment),
     launch_controls: {
       context_window: optionalNumber(editor.context_window),
       max_concurrency: optionalNumber(editor.max_concurrency),
@@ -183,6 +186,7 @@ export function DeploymentPage() {
           <label className="field"><span>Pipeline parallel size</span><input disabled={disabled} type="number" min="1" value={editor.pipeline_parallel_size} onChange={(event) => set('pipeline_parallel_size', event.target.value)} /></label>
           <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
           <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
+          <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder="VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>
         </>}
         {detail.runtime === 'sglang' && <>
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>

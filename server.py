@@ -1381,7 +1381,10 @@ async def remove_cluster_node(node_id: str):
 @app.post("/api/deployments/{deployment_id}/{action}")
 async def deployment_action(deployment_id: str, action: str):
     try:
-        return await manager.deployment_action(deployment_id, action)
+        result = await manager.deployment_action(deployment_id, action)
+        if action == "remove" and result.get("ok"):
+            sparkdeck.remove_manager_deployment_registration(deployment_id)
+        return result
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

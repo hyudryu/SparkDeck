@@ -1059,7 +1059,19 @@ class SparkDeckService:
                 linked = by_manager_id.get(manager_id)
                 record_id = str(cluster.get("sparkdeck_record_id") or "")
                 if linked is None and record_id:
-                    linked = by_record_id.get(record_id)
+                    candidate = by_record_id.get(record_id)
+                    candidate_manager_id = str(
+                        ((candidate or {}).get("settings") or {}).get(
+                            "manager_deployment_id"
+                        ) or ""
+                    )
+                    if candidate_manager_id in {"", manager_id}:
+                        linked = candidate
+                    elif candidate is not None:
+                        # Never let a caller-supplied reverse link steal a v1
+                        # card from another Manager deployment. Allocate a new
+                        # deterministic record for this cluster instead.
+                        record_id = ""
                 if linked is not None:
                     if cluster.get("sparkdeck_record_id") != linked["id"]:
                         cluster["sparkdeck_record_id"] = linked["id"]
@@ -1171,6 +1183,25 @@ class SparkDeckService:
                         # sufficient to prevent duplicate adoption next time.
                         pass
             return registered
+
+    def remove_manager_deployment_registration(
+        self, manager_id: str,
+    ) -> str | None:
+        """Delete the v1 card linked to a removed legacy Manager deployment."""
+        manager_id = str(manager_id or "")
+        linked = next(
+            (
+                item for item in self.store.deployments(include_private=True)
+                if str((item.get("settings") or {}).get("manager_deployment_id") or "")
+                == manager_id
+            ),
+            None,
+        )
+        if linked is None:
+            return None
+        record_id = str(linked["id"])
+        self.store.delete_deployment(record_id)
+        return record_id
 
     async def _probe_external_endpoint(self, deployment: dict[str, Any]) -> None:
         if deployment.get("kind") != DeploymentKind.EXTERNAL.value:

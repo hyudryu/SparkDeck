@@ -185,6 +185,90 @@ describe('models page llama.cpp pull targets', () => {
 })
 
 describe('models page running actions', () => {
+  it('clones a persisted deployment and shows the generated copy name', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-1/clone' && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          ...runningDeployment,
+          id: 'dep-copy',
+          alias: '(Copy) Chat model',
+          status: 'saved',
+          desired_state: 'stopped',
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Clone Chat model' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-1/clone',
+      expect.objectContaining({ method: 'POST' }),
+    ))
+    expect(await screen.findByText('(Copy) Chat model')).toBeInTheDocument()
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input) === '/api/v1/deployments'
+    )).length).toBeGreaterThanOrEqual(2))
+    // The post-clone list is deliberately stale in this fixture. The accepted
+    // deployment guard keeps the optimistic clone visible until the API lists it.
+    expect(screen.getByText('(Copy) Chat model')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Cloned Chat model as (Copy) Chat model.',
+    )
+  })
+
+  it('refreshes an external clone from registered to its probed endpoint status', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'external-1', alias: 'Hosted model', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'running', settings: {},
+      desired_state: 'running',
+    }
+    const registeredClone = {
+      ...external,
+      id: 'external-copy', alias: '(Copy) Hosted model', status: 'registered',
+    }
+    let cloned = false
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/external-1/clone' && init?.method === 'POST') {
+        cloned = true
+        return new Response(JSON.stringify(registeredClone), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({
+          items: cloned ? [external, { ...registeredClone, status: 'running' }] : [external],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Clone Hosted model' }))
+
+    const cloneName = await screen.findByText('(Copy) Hosted model')
+    const cloneRow = cloneName.closest('[role="row"]')
+    expect(cloneRow).not.toBeNull()
+    await waitFor(() => expect(within(cloneRow as HTMLElement).getByText('running')).toBeInTheDocument())
+    expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input) === '/api/v1/deployments'
+    )).length).toBeGreaterThanOrEqual(2)
+  })
+
   it('shows the running nodes in a status tooltip', async () => {
     renderPage()
 
@@ -262,6 +346,7 @@ describe('models page running actions', () => {
 
     expect(await screen.findByText('loading checkpoint shards 7/48')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Logs for Kimi vLLM' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Clone Kimi vLLM' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Stop' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => (

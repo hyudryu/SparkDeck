@@ -116,6 +116,181 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stored["container_name"])
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
 
+    async def test_clone_copies_settings_as_a_stopped_bookmark_with_numbered_names(self):
+        self.service.store.add_deployment(Deployment(
+            id="running-1", alias="Chat model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity(
+                "org/model", revision="revision-1", quantization="fp8",
+            ),
+            container_name="sparkdeck-chat-model",
+            settings={
+                "context_length": 32768,
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "node_ids": ["remote-1"],
+                "deployment_mode": "single",
+                "manager_deployment_id": "cluster-1",
+                "managed_by": "sparkdeck-mcp",
+                "automation_run_id": "run-1",
+            },
+        ), "http://127.0.0.1:8000")
+
+        first = await self.service.clone_deployment("running-1")
+        second = await self.service.clone_deployment(first["id"])
+
+        self.assertEqual(first["alias"], "(Copy) Chat model")
+        self.assertEqual(second["alias"], "(Copy 2) Chat model")
+        self.assertEqual(first["status"], "saved")
+        self.assertEqual(first["desired_state"], "stopped")
+        self.assertEqual(first["node_ids"], ["remote-1"])
+        self.assertEqual(first["model"]["revision"], "revision-1")
+        self.assertEqual(first["model"]["quantization"], "fp8")
+        self.assertEqual(first["settings"]["context_length"], 32768)
+        self.assertEqual(first["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+        self.assertFalse(first["base_url_set"])
+        self.assertNotIn("manager_deployment_id", first["settings"])
+        self.assertNotIn("managed_by", first["settings"])
+        self.assertNotIn("automation_run_id", first["settings"])
+        private = self.service.store.deployment(first["id"], include_private=True)
+        self.assertIsNone(private["container_name"])
+        self.assertIsNone(private.get("_base_url"))
+
+    async def test_clone_preserves_external_endpoint_and_credential(self):
+        self.service.store.add_deployment(Deployment(
+            id="external-1", alias="Hosted model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            settings={"context_length": 8192}, base_url_set=True,
+        ), "https://models.example/v1", "keyring:external-1")
+
+        with (
+            patch.object(self.service, "_get_credential", return_value="secret") as get_key,
+            patch.object(self.service, "_store_credential", return_value="keyring:copy") as store_key,
+        ):
+            cloned = await self.service.clone_deployment("external-1")
+
+        private = self.service.store.deployment(cloned["id"], include_private=True)
+        self.assertEqual(cloned["alias"], "(Copy) Hosted model")
+        self.assertEqual(private["_base_url"], "https://models.example/v1")
+        self.assertEqual(private["_credential_ref"], "keyring:copy")
+        get_key.assert_called_once_with("external-1", "keyring:external-1")
+        store_key.assert_called_once_with(cloned["id"], "secret")
+
+    async def test_clone_normalizes_adopted_sglang_controls_for_relaunch(self):
+        self.service.store.add_deployment(Deployment(
+            id="sg-record", alias="SGLang model", runtime=RuntimeKind.SGLANG,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={
+                "manager_deployment_id": "sg-cluster",
+                "node_ids": ["local"],
+                "deployment_mode": "single",
+                "sg_tp_size": 2,
+                "sg_context_length": 262144,
+                "sg_max_running_requests": 10,
+                "sg_mem_fraction": 0.85,
+            },
+        ))
+        self.manager.deployments = [{
+            "id": "sg-cluster",
+            "launch_settings": {
+                "engine": "sglang",
+                "extra_args": ["--enable-metrics"],
+                "port": 8123,
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.0,
+                "output_cost_per_1m": 2.5,
+                "sg_tp_size": 2,
+                "sg_context_length": 262144,
+                "sg_max_running_requests": 10,
+                "sg_mem_fraction": 0.85,
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("sg-record")
+
+        self.assertEqual(cloned["settings"]["tensor_parallel_size"], 2)
+        self.assertEqual(cloned["settings"]["context_length"], 262144)
+        self.assertEqual(cloned["settings"]["max_running_requests"], 10)
+        self.assertEqual(cloned["settings"]["mem_fraction_static"], 0.85)
+        self.assertNotIn("port", cloned["settings"])
+        self.assertEqual(cloned["settings"]["input_cost_per_1m"], 1.25)
+        self.assertEqual(cloned["settings"]["cache_cost_per_1m"], 0.0)
+        self.assertEqual(cloned["settings"]["output_cost_per_1m"], 2.5)
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.SGLANG, "org/model", cloned["alias"], cloned["id"],
+            ModelIdentity("org/model"), cloned["settings"], ["local"],
+            "single", llama_artifact=None,
+        )
+        self.assertEqual(launch["sg_tp_size"], 2)
+        self.assertEqual(launch["sg_context_length"], 262144)
+        self.assertEqual(launch["sg_max_running_requests"], 10)
+        self.assertEqual(launch["sg_mem_fraction"], 0.85)
+        self.assertNotIn("port", launch)
+        self.assertEqual(launch["input_cost_per_1m"], 1.25)
+        self.assertEqual(launch["cache_cost_per_1m"], 0.0)
+        self.assertEqual(launch["output_cost_per_1m"], 2.5)
+
+    async def test_clone_restores_adopted_llama_artifact_and_controls(self):
+        revision = "a" * 40
+        cached_artifact = (
+            f"models--org--model/snapshots/{revision}/GGUF/model-Q4_K_M.gguf"
+        )
+        self.service.store.add_deployment(Deployment(
+            id="llama-record", alias="Llama model", runtime=RuntimeKind.LLAMA_CPP,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity(
+                "org/model", artifact=cached_artifact,
+                quantization="Q4_K_M",
+            ),
+            settings={
+                "manager_deployment_id": "llama-cluster",
+                "node_ids": ["remote-1"],
+                "deployment_mode": "single",
+            },
+        ))
+        self.manager.deployments = [{
+            "id": "llama-cluster",
+            "launch_settings": {
+                "engine": "llama.cpp",
+                "extra_args": [],
+                "llama_artifact": cached_artifact,
+                "llama_context_length": 16384,
+                "llama_parallel_slots": 4,
+                "llama_gpu_layers": 77,
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("llama-record")
+
+        self.assertEqual(
+            cloned["model"]["artifact"], "GGUF/model-Q4_K_M.gguf",
+        )
+        self.assertEqual(cloned["model"]["revision"], revision)
+        self.assertEqual(cloned["settings"]["context_length"], 16384)
+        self.assertEqual(cloned["settings"]["parallel_slots"], 4)
+        self.assertEqual(cloned["settings"]["gpu_layers"], 77)
+        prepared_artifact = self.service._hub_relative_llama_artifact(
+            "org/model", cloned["model"]["artifact"], revision,
+        )
+        self.assertEqual(prepared_artifact, cached_artifact)
+        self.assertEqual(
+            self.service._clone_llama_artifact_identity(
+                "org/model", r"C:\models\local.gguf",
+            ),
+            (r"C:\models\local.gguf", None),
+        )
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.LLAMA_CPP, "org/model", cloned["alias"], cloned["id"],
+            ModelIdentity(
+                "org/model", revision=revision,
+                artifact=cloned["model"]["artifact"], quantization="Q4_K_M",
+            ),
+            cloned["settings"], ["remote-1"], "single",
+            llama_artifact=prepared_artifact,
+        )
+        self.assertEqual(launch["llama_artifact"], cached_artifact)
+        self.assertEqual(launch["llama_context_length"], 16384)
+        self.assertEqual(launch["llama_parallel_slots"], 4)
+        self.assertEqual(launch["llama_gpu_layers"], 77)
+
     async def test_bookmark_is_reported_as_saved_in_the_deployments_list(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "bookmark", "runtime": "vllm",

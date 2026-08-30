@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Bookmark, Check, ChevronDown, ChevronRight, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
+import { Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
@@ -1048,6 +1048,30 @@ export function ModelsPage() {
     }
   }
 
+  const cloneDeployment = async (deployment: Deployment) => {
+    setBusy(deployment.id)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      const cloned = await api.deployments.clone(deployment.id)
+      // Keep the accepted row visible if an older list request completes
+      // before the clone appears in the backend's probed deployment list.
+      acceptedDeployments.current.set(cloned.id, cloned)
+      resource.setData((current) => [
+        cloned,
+        ...(current ?? []).filter((item) => item.id !== cloned.id),
+      ])
+      setActionNotice(`Cloned ${deployment.alias} as ${cloned.alias}.`)
+      // External clone responses are initially "registered"; the list probe
+      // resolves them to their live running/error state.
+      resource.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not clone deployment')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const importContainerRecipe = async (deployment: Deployment) => {
     const containerName = deployment.id.startsWith('container:')
       ? decodeURIComponent(deployment.id.slice('container:'.length))
@@ -1715,6 +1739,9 @@ export function ModelsPage() {
                     {(deployment.managed || deployment.logs_available) && deployment.status !== 'saved' && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     {deployment.id.startsWith('container:') && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Save ${deployment.alias} as recipe`} title="Save as recipe" onClick={() => void importContainerRecipe(deployment)}><FolderPlus size={16} /></Button>
+                    )}
+                    {!deployment.id.startsWith('container:') && (
+                      <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Clone ${deployment.alias}`} title="Clone deployment" onClick={() => void cloneDeployment(deployment)}><Copy size={16} /></Button>
                     )}
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => void confirm({

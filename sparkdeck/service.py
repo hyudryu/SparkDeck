@@ -3928,6 +3928,183 @@ class SparkDeckService:
             self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
 
+    def _clone_launch_configuration(
+        self, stored: dict[str, Any], runtime: RuntimeKind,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Normalize persisted and Manager-owned settings for a fresh launch."""
+        settings = copy.deepcopy(stored.get("settings") or {})
+        manager_id = settings.get("manager_deployment_id")
+        manager_deployment = None
+        lookup = getattr(self.manager, "_deployment", None)
+        if manager_id and callable(lookup):
+            manager_deployment = lookup(str(manager_id))
+        if manager_deployment is None and manager_id:
+            manager_deployment = next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and str(item.get("id")) == str(manager_id)
+            ), None)
+        launch_settings = (
+            copy.deepcopy(manager_deployment.get("launch_settings"))
+            if isinstance(manager_deployment, dict)
+            and isinstance(manager_deployment.get("launch_settings"), dict)
+            else {}
+        )
+        launch_inputs = {
+            **settings,
+            **launch_settings,
+            "engine": runtime.value,
+        }
+        sanitize_args = getattr(
+            self.manager, "_without_sensitive_cli_credentials", None,
+        )
+        extra_args = list(launch_inputs.get("extra_args") or [])
+        if callable(sanitize_args):
+            extra_args = sanitize_args(extra_args)
+        launch_inputs["extra_args"] = extra_args
+        normalized = self._local_configuration(launch_inputs)
+        controls = self.manager._deployment_launch_controls(launch_inputs)
+
+        def preserve(key: str, value: Any) -> None:
+            if value is not None:
+                normalized[key] = value
+
+        for pricing_key in (
+            "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+        ):
+            preserve(pricing_key, launch_inputs.get(pricing_key))
+        preserve("context_length", controls.get("context_window"))
+        if runtime is RuntimeKind.SGLANG:
+            preserve("tensor_parallel_size", launch_inputs.get("sg_tp_size"))
+            preserve("max_running_requests", controls.get("max_concurrency"))
+            preserve("mem_fraction_static", launch_inputs.get("sg_mem_fraction"))
+        elif runtime is RuntimeKind.LLAMA_CPP:
+            preserve("parallel_slots", controls.get("max_concurrency"))
+            preserve("gpu_layers", launch_inputs.get("llama_gpu_layers"))
+
+        for runtime_identity_key in (
+            "manager_deployment_id", "managed_by", "automation_run_id",
+        ):
+            normalized.pop(runtime_identity_key, None)
+        return normalized, launch_settings
+
+    def _clone_llama_artifact_identity(
+        self, repository: str, artifact: Any,
+    ) -> tuple[str | None, str | None]:
+        """Restore a Manager cache reference and its pinned snapshot revision."""
+        value = _optional_string(artifact)
+        if value is None:
+            return None, None
+        normalized = value.replace("\\", "/")
+        parts = PurePosixPath(normalized).parts
+        encoded_repository = "models--" + repository.replace("/", "--")
+        if (
+            len(parts) >= 4
+            and parts[0].casefold() == encoded_repository.casefold()
+            and parts[1].casefold() == "snapshots"
+            and re.fullmatch(r"[0-9a-f]{40}", parts[2], re.IGNORECASE)
+        ):
+            relative = "/".join(parts[3:])
+            return (
+                self._validate_public_gguf_artifact(
+                    repository, relative, None,
+                ).as_posix(),
+                parts[2],
+            )
+        return value, None
+
+    async def clone_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Copy a persisted deployment's configuration without its live runtime."""
+        if deployment_id.startswith("container:"):
+            raise ValueError("discovered containers cannot be cloned")
+
+        async with self._deployment_create_lock:
+            stored = self.store.deployment(deployment_id, include_private=True)
+            if not stored:
+                raise LookupError("deployment not found")
+
+            root_alias = re.sub(
+                r"^\(Copy(?: \d+)?\)\s+", "", str(stored["alias"]), count=1,
+            ).strip() or str(stored["alias"])
+            aliases = {
+                str(item.get("alias") or "").casefold()
+                for item in self.store.deployments()
+            }
+            copy_number = 1
+            while True:
+                prefix = "(Copy)" if copy_number == 1 else f"(Copy {copy_number})"
+                alias = f"{prefix} {root_alias}"
+                if alias.casefold() not in aliases:
+                    break
+                copy_number += 1
+
+            clone_id = str(uuid.uuid4())
+            kind = DeploymentKind(str(stored["kind"]))
+            runtime = RuntimeKind(str(stored["runtime"]))
+            settings, launch_settings = self._clone_launch_configuration(
+                stored, runtime,
+            )
+            if kind is DeploymentKind.MANAGED:
+                settings.pop("port", None)
+            model = stored.get("model") or {}
+            repository = str(model.get("repository") or "")
+            artifact = model.get("artifact")
+            revision = _optional_string(model.get("revision"))
+            if runtime is RuntimeKind.LLAMA_CPP:
+                artifact, snapshot_revision = self._clone_llama_artifact_identity(
+                    repository,
+                    launch_settings.get("llama_artifact") or artifact,
+                )
+                revision = snapshot_revision or revision
+            clone_base_url = (
+                stored.get("_base_url")
+                if kind is DeploymentKind.EXTERNAL else None
+            )
+            clone = Deployment(
+                id=clone_id,
+                alias=alias,
+                runtime=runtime,
+                kind=kind,
+                model=ModelIdentity(
+                    repository=repository,
+                    revision=revision,
+                    artifact=artifact,
+                    quantization=_optional_string(model.get("quantization")),
+                ),
+                settings=settings,
+                base_url_set=bool(clone_base_url),
+                desired_state=(
+                    "stopped" if kind is DeploymentKind.MANAGED
+                    else str(stored.get("desired_state") or "running")
+                ),
+            )
+
+            credential_ref = None
+            if stored.get("_credential_ref"):
+                api_key = self._get_credential(
+                    stored["id"], stored.get("_credential_ref"),
+                )
+                if api_key is None:
+                    raise RuntimeError(
+                        "deployment credential could not be read from OS credential storage"
+                    )
+                credential_ref = self._store_credential(clone_id, api_key)
+            try:
+                self.store.add_deployment(
+                    clone, clone_base_url, credential_ref,
+                )
+            except Exception:
+                self._delete_credential(clone_id, credential_ref)
+                raise
+
+            result = self.store.deployment(clone_id) or clone.to_dict()
+            if kind is DeploymentKind.MANAGED:
+                result["status"] = "saved"
+                node_ids = [str(item) for item in settings.get("node_ids") or []]
+                if node_ids:
+                    result["node_ids"] = node_ids
+                result.update(self._saved_layout_contract(settings, clone.runtime.value))
+            return result
+
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
         if not alias:

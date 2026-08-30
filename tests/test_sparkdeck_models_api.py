@@ -141,6 +141,28 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 404)
 
+    async def test_clone_deployment_delegates_to_service(self):
+        clone = AsyncMock(return_value={"id": "dep-copy", "alias": "(Copy) Model"})
+        with patch.object(server.sparkdeck, "clone_deployment", clone):
+            response = await self.client.post("/api/v1/deployments/dep-1/clone")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["alias"], "(Copy) Model")
+        clone.assert_awaited_once_with("dep-1")
+
+    async def test_clone_deployment_maps_missing_and_discovered(self):
+        clone = AsyncMock(side_effect=LookupError("deployment not found"))
+        with patch.object(server.sparkdeck, "clone_deployment", clone):
+            missing = await self.client.post("/api/v1/deployments/missing/clone")
+        clone.side_effect = ValueError("discovered containers cannot be cloned")
+        with patch.object(server.sparkdeck, "clone_deployment", clone):
+            discovered = await self.client.post(
+                "/api/v1/deployments/container%3Auntracked/clone",
+            )
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(discovered.status_code, 400)
+
     async def test_deployment_detail_returns_curated_editable_settings(self):
         detail = {
             "id": "dep-1", "alias": "Model", "runtime": "vllm",

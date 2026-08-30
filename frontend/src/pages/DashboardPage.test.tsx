@@ -130,6 +130,30 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('node probe failed')).not.toBeInTheDocument()
   })
 
+  it('includes starting deployments in the running models card', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({ cpu_pct: 20, mem: {}, gpus: [], active_requests: {} })
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [
+        { id: 'running', alias: 'Ready model', model: { repository: 'org/ready' }, settings: {}, kind: 'managed', runtime: 'vllm', status: 'running' },
+        { id: 'starting', alias: 'Loading model', model: { repository: 'org/loading' }, settings: {}, kind: 'managed', runtime: 'vllm', status: 'starting' },
+        { id: 'stopped', alias: 'Stopped model', model: { repository: 'org/stopped' }, settings: {}, kind: 'managed', runtime: 'vllm', status: 'stopped' },
+      ] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('2 of 3 deployments active')).toBeInTheDocument()
+    expect(screen.getByText('Ready model')).toBeInTheDocument()
+    expect(screen.getByText('Loading model')).toBeInTheDocument()
+    expect(screen.queryByText('Stopped model')).not.toBeInTheDocument()
+    expect(screen.getByText('Loading model').closest('.dashboard-list-row')?.querySelector('.status-dot'))
+      .toHaveClass('status-starting')
+  })
+
   it('shows an explicit empty state when every cluster node is hidden', async () => {
     const stats = { cpu_pct: 25, mem: { used: 8, total: 16 }, gpus: [], active_requests: {} }
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

@@ -33,6 +33,8 @@ function temperatureTone(value: number | null | undefined) {
   return ''
 }
 
+const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'starting', 'launching'])
+
 function MetricBar({ value, label }: { value: number | null | undefined; label: string }) {
   return (
     <div className="metric-bar" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(percent(value))}>
@@ -145,7 +147,7 @@ export function DashboardPage() {
   const activeRequests = Object.entries(stats?.active_requests ?? {})
   const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
   const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
-  const runningDeployments = deployments.filter((item) => item.status === 'running')
+  const activeDeployments = deployments.filter((item) => ACTIVE_DEPLOYMENT_STATUSES.has(item.status))
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
   const allClusterNodes = nodesResource.data ?? []
   const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
@@ -245,7 +247,7 @@ export function DashboardPage() {
           <div className="dashboard-grid">
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${runningDeployments.length} of ${deployments.length} deployments online`}</p></div></div>
+                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${activeDeployments.length} of ${deployments.length} deployments active`}</p></div></div>
                 <Link className="text-link" to="/models">Manage</Link>
               </div>
               {deploymentsResource.error && deploymentsResource.data && <p className="dashboard-stale" role="status">Deployment refresh paused: {deploymentsResource.error}</p>}
@@ -253,13 +255,13 @@ export function DashboardPage() {
                 <LoadingState label="Loading deployments" />
               ) : deploymentsResource.error && !deploymentsResource.data ? (
                 <EmptyState title="Deployment status unavailable" description="Refresh to retry loading model status." />
-              ) : runningDeployments.length === 0 ? (
+              ) : activeDeployments.length === 0 ? (
                 <EmptyState title="No models running" description="Start a deployment to make it available for chat and comparison." action={<Link className="button button-primary" to="/models">Open models</Link>} />
               ) : (
                 <div className="dashboard-list">
-                  {runningDeployments.map((deployment) => (
+                  {activeDeployments.map((deployment) => (
                     <div className="dashboard-list-row" key={deployment.id}>
-                      <span className="status-dot status-running" aria-hidden="true" />
+                      <span className={`status-dot status-${deployment.status}`} aria-hidden="true" />
                       <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small></div>
                       <RuntimeMark runtime={deployment.runtime} />
                     </div>

@@ -364,6 +364,13 @@ class BenchmarkRunnerService:
         argv = self._argv_prefix(detection) + [
             "--base-url", target["base_url"],
             "--model", target["model"],
+            # Benchy's default ``api`` latency probe calls ``GET /v1/models``.
+            # That measures SparkDeck's cluster-wide discovery path rather than
+            # the selected model, and one slow inventory/probe can leave the
+            # benchmark waiting for Benchy's one-hour HTTP timeout even though
+            # inference is healthy. Use its one-token generation probe so the
+            # preflight follows the same targeted inference route as the run.
+            "--latency-mode", "generation",
             "--pp", *(str(value) for value in config["prompt_sizes"]),
             "--tg", *(str(value) for value in config["response_sizes"]),
             "--concurrency", *(str(value) for value in config["concurrency_levels"]),

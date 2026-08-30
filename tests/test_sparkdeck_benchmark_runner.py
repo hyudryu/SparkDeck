@@ -489,6 +489,23 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def _service(self):
         return BenchmarkRunnerService(FakeManager(llama_running=True), FakeSparkdeck(), Path(self.temp.name))
 
+    def test_argv_measures_latency_through_targeted_generation(self):
+        service = self._service()
+        run = {
+            "config": self._validated_config(),
+        }
+        argv = service._build_argv(
+            run, _target(), Path(self.temp.name), _installed(),
+        )
+
+        latency_index = argv.index("--latency-mode")
+        self.assertEqual(argv[latency_index + 1], "generation")
+
+    def _validated_config(self):
+        return self._service()._validate_config({
+            "model_id": "unsloth/Qwen3-4B-GGUF",
+        })
+
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
 

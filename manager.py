@@ -3780,6 +3780,8 @@ class Manager:
             return {
                 "context_window": context_window,
                 "max_concurrency": max_concurrency,
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
                 "kv_cache_dtype": None,
                 "thinking_mode": None,
                 "dspark_num_speculative_tokens": None,
@@ -3789,6 +3791,14 @@ class Manager:
         return {
             "context_window": context_window,
             "max_concurrency": max_concurrency,
+            "tensor_parallel_size": (
+                cls._cli_option(args, {"--tensor-parallel-size", "-tp"}, int)
+                if engine == "vllm" else None
+            ),
+            "pipeline_parallel_size": (
+                cls._cli_option(args, {"--pipeline-parallel-size", "-pp"}, int)
+                if engine == "vllm" else None
+            ),
             "kv_cache_dtype": cls._cli_option(args, {"--kv-cache-dtype"}),
             "thinking_mode": thinking_mode,
             "dspark_num_speculative_tokens": (
@@ -3884,6 +3894,16 @@ class Manager:
         )
 
         if engine == "vllm":
+            flags = self._replace_command_option(
+                flags,
+                {"--tensor-parallel-size", "-tp"},
+                positive_int("tensor_parallel_size"),
+            )
+            flags = self._replace_command_option(
+                flags,
+                {"--pipeline-parallel-size", "-pp"},
+                positive_int("pipeline_parallel_size"),
+            )
             flags = self._replace_command_option(
                 flags,
                 {"--max-cudagraph-capture-size"},
@@ -3997,12 +4017,13 @@ class Manager:
                 settings["extra_args"], {"--pipeline-parallel-size", "-pp"}, int
             )
             if requested_tp is not None or requested_pp is not None:
-                tp = requested_tp or 1
-                pp = requested_pp or 1
-                if tp < 1 or pp < 1 or tp * pp != len(settings["node_ids"]):
+                tp = requested_tp if requested_tp is not None else 1
+                pp = requested_pp if requested_pp is not None else 1
+                world_size = tp * pp
+                if tp < 1 or pp < 1 or world_size % len(settings["node_ids"]):
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
-                        f"and multiply to the {len(settings['node_ids'])} selected nodes"
+                        "and provide a whole number of ranks per selected node"
                     )
 
         # Preserve the assigned API port unless the editor explicitly changes it.
@@ -4958,12 +4979,13 @@ class Manager:
                 requested_args, {"--pipeline-parallel-size", "-pp"}, int
             )
             if requested_tp is not None or requested_pp is not None:
-                tp = requested_tp or 1
-                pp = requested_pp or 1
-                if tp < 1 or pp < 1 or tp * pp != len(node_ids):
+                tp = requested_tp if requested_tp is not None else 1
+                pp = requested_pp if requested_pp is not None else 1
+                world_size = tp * pp
+                if tp < 1 or pp < 1 or world_size % len(node_ids):
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
-                        f"and multiply to the {len(node_ids)} selected nodes"
+                        "and provide a whole number of ranks per selected node"
                     )
                 vllm_parallel_layout = (tp, pp)
             else:

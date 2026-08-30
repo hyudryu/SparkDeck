@@ -2525,7 +2525,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
-                    "--max-model-len", "65536", "--tensor-parallel-size", "2",
+                    "--max-model-len", "65536", "--tensor-parallel-size", "4",
                     "--pipeline-parallel-size", "1", "--headless",
                 ],
             })
@@ -2545,7 +2545,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
                 self.assertEqual(args[args.index("--nnodes") + 1], "2")
-                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "2")
+                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "4")
                 self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "1")
                 self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.1")
                 self.assertEqual("--headless" in args, rank > 0)
@@ -2683,17 +2683,21 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         instance.cluster_nodes = cluster_nodes
 
-        with self.assertRaisesRegex(ValueError, "multiply to the 2 selected nodes"):
-            await instance.create_deployment({
-                "model": "example/Model",
-                "engine": "vllm",
-                "deployment_mode": "sharded",
-                "node_ids": ["local", "remote-1"],
-                "extra_args": [
-                    "--tensor-parallel-size", "2",
-                    "--pipeline-parallel-size", "2",
-                ],
-            })
+        for tp, pp in ((3, 1), (0, 2)):
+            with self.subTest(tp=tp, pp=pp):
+                with self.assertRaisesRegex(
+                    ValueError, "whole number of ranks per selected node|must be positive"
+                ):
+                    await instance.create_deployment({
+                        "model": "example/Model",
+                        "engine": "vllm",
+                        "deployment_mode": "sharded",
+                        "node_ids": ["local", "remote-1"],
+                        "extra_args": [
+                            "--tensor-parallel-size", str(tp),
+                            "--pipeline-parallel-size", str(pp),
+                        ],
+                    })
 
         self.assertEqual(instance.deployments, [])
 
@@ -2729,6 +2733,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "launch_controls": {
                     "context_window": 131072,
                     "max_cudagraph_capture_size": 12,
+                    "tensor_parallel_size": 4,
+                    "pipeline_parallel_size": 1,
                 },
             })
 
@@ -2749,6 +2755,13 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 12,
             )
+            self.assertEqual(
+                instance._cli_option(
+                    updated["launch_settings"]["extra_args"],
+                    {"--tensor-parallel-size", "-tp"}, int,
+                ),
+                4,
+            )
             persisted = json.loads(instance.deployments_path.read_text())
             self.assertEqual(persisted[0]["launch_settings"]["image"], "example/vllm:test")
             self.assertEqual(
@@ -2767,6 +2780,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "--kv-cache-dtype", "nvfp4_ds_mla",
             "--max-cudagraph-capture-size", "72",
             "--max-num-batched-tokens", "8192",
+            "--tensor-parallel-size", "2",
+            "--pipeline-parallel-size", "1",
             "--default-chat-template-kwargs", '{"thinking":true,"tools":true}',
             "--speculative-config",
             '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}',
@@ -2784,6 +2799,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed["dspark_num_speculative_tokens"], 5)
         self.assertEqual(parsed["max_cudagraph_capture_size"], 72)
         self.assertEqual(parsed["max_num_batched_tokens"], 8192)
+        self.assertEqual(parsed["tensor_parallel_size"], 2)
+        self.assertEqual(parsed["pipeline_parallel_size"], 1)
 
         updated = instance._apply_deployment_launch_controls(
             args,
@@ -2796,6 +2813,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "dspark_num_speculative_tokens": 3,
                 "max_cudagraph_capture_size": 48,
                 "max_num_batched_tokens": 4096,
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 1,
             },
         )
 
@@ -2812,6 +2831,12 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             instance._cli_option(updated, {"--max-num-batched-tokens"}, int), 4096
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--tensor-parallel-size", "-tp"}, int), 4
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--pipeline-parallel-size", "-pp"}, int), 1
         )
         speculative = json.loads(
             instance._cli_option(updated, {"--speculative-config"})

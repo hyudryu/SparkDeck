@@ -880,7 +880,11 @@ export function ModelsPage() {
     // and clearing the quantization clears a previously linked artifact so
     // a compatible file must be chosen again. Manually entered artifacts
     // are left untouched.
-    const variantArtifact = variant ? ggufArtifactOptions([variant])[0]?.filename : undefined
+    const variantArtifacts = variant ? ggufArtifactOptions([variant]) : []
+    const variantArtifact = (
+      variantArtifacts.find((option) => artifactFilesDownloaded(option.files, createCachedFileSets))
+      ?? variantArtifacts[0]
+    )?.filename
     linkedQuantizationRef.current = variant?.name
     linkedArtifactRef.current = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
     const artifact = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)

@@ -372,11 +372,18 @@ describe('deployment creator model and quantization pickers', () => {
           name: 'Q4_K_M',
           files: [{ filename: 'preferred/Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
           weight_size_bytes: 807,
-          artifacts: [{
-            filename: 'Llama-3.2-1B-Q4_K_M.gguf',
-            files: [{ filename: 'Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
-            weight_size_bytes: 807,
-          }],
+          artifacts: [
+            {
+              filename: 'preferred/Llama-3.2-1B-Q4_K_M.gguf',
+              files: [{ filename: 'preferred/Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
+              weight_size_bytes: 807,
+            },
+            {
+              filename: 'Llama-3.2-1B-Q4_K_M.gguf',
+              files: [{ filename: 'Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
+              weight_size_bytes: 807,
+            },
+          ],
         },
       ],
     },

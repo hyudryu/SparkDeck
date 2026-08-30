@@ -1242,13 +1242,19 @@ class VirtualNAS:
                 )
                 partial_revision = aliases[0] if aliases else incomplete_revision
             snapshot_files = _snapshot_files_by_revision(repository)
-            quantizations = sorted({
-                quantization
-                for files in snapshot_files.values()
-                for filename in files
-                if filename.lower().endswith(".gguf")
-                if (quantization := quantization_from_text(filename))
-            })
+            quantizations: set[str] = set()
+            for files in snapshot_files.values():
+                for filename in files:
+                    folded_filename = filename.replace("\\", "/").casefold()
+                    if (
+                        not folded_filename.endswith(".gguf")
+                        or "mmproj" in folded_filename
+                        or folded_filename.startswith("mtp/")
+                        or "/mtp-" in folded_filename
+                    ):
+                        continue
+                    if quantization := quantization_from_text(filename):
+                        quantizations.add(quantization)
             selective_files = _selective_files_by_revision(
                 repository, snapshot_files,
             )
@@ -1258,7 +1264,7 @@ class VirtualNAS:
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
-                "quantizations": quantizations,
+                "quantizations": sorted(quantizations),
                 "partial": partial,
                 "has_partial_download": (
                     partial or bool(incomplete_revisions)

@@ -1,8 +1,7 @@
 import asyncio
-import io
 import json
 import os
-import tarfile
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -213,7 +212,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(result["ok"])
-            self.assertEqual(phases, ["receiving", "syncing", "extracting", "validating", "registering"])
+            self.assertEqual(phases, ["receiving", "syncing", "validating", "registering"])
 
     def test_virtual_nas_is_disabled_by_default(self):
         self.assertIs(DEFAULT_SETTINGS["virtual_nas_enabled"], False)
@@ -1291,20 +1290,25 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             # Inventory keeps the largest copy; export must ship those bytes.
             self.assertEqual(nas.inventory()[0]["size_bytes"], 3 * len(b"large-weights"))
-            body = b"".join([
-                chunk
-                async for chunk in nas.export_model("Comfy-Org/MiniMax-Music-3")
-            ])
+            target_hub = Path(directory) / "target-hub"
+            target = VirtualNAS(
+                Path(directory) / "target", lambda: target_hub,
+                FakeRegistry(), lambda: True,
+            )
+            await target.import_model(
+                "Comfy-Org/MiniMax-Music-3",
+                nas.export_model("Comfy-Org/MiniMax-Music-3"),
+            )
 
-            with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as archive:
-                for relative in bundle_files:
-                    member = (
-                        "models--Comfy-Org--MiniMax-Music-3"
-                        f"/snapshots/comfyui/{relative}"
-                    )
-                    extracted = archive.extractfile(member)
-                    self.assertIsNotNone(extracted)
-                    self.assertEqual(extracted.read(), b"large-weights")
+            snapshot = (
+                target_hub / "models--Comfy-Org--MiniMax-Music-3"
+                / "snapshots" / "comfyui"
+            )
+            for relative in bundle_files:
+                self.assertEqual(
+                    snapshot.joinpath(*relative.split("/")).read_bytes(),
+                    b"large-weights",
+                )
             for root in (small_root, large_root):
                 for relative in bundle_files:
                     self.assertTrue(root.joinpath(*relative.split("/")).is_file())
@@ -1515,14 +1519,140 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["ok"])
             copied = target_hub / "models--org--model"
             self.assertEqual((copied / "blobs" / "weights").read_bytes(), b"model-weights")
+            self.assertEqual(list(target_hub.glob(".sparkdeck-vnas-*.tar")), [])
             with self.assertRaises(FileExistsError):
                 await target.import_model("org/model", bytes_stream(b"unused"))
 
-    async def test_streamed_export_batches_archive_for_high_throughput(self):
+    async def test_streamed_import_rejects_corrupted_file_payload(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source_hub = Path(source_dir) / "hub"
+            target_hub = Path(target_dir) / "hub"
+            create_cached_model(source_hub)
+            source = VirtualNAS(
+                Path(source_dir), lambda: source_hub, FakeRegistry(), lambda: True,
+            )
+            target = VirtualNAS(
+                Path(target_dir), lambda: target_hub, FakeRegistry(), lambda: True,
+            )
+            body = bytearray(b"".join([
+                chunk async for chunk in source.export_model("org/model")
+            ]))
+            payload_offset = body.index(b"model-weights")
+            body[payload_offset] ^= 1
+
+            with self.assertRaisesRegex(ValueError, "integrity verification"):
+                await target.import_model("org/model", bytes_stream(bytes(body)))
+
+            self.assertFalse((target_hub / "models--org--model").exists())
+
+    async def test_streamed_import_caps_declared_payload_to_admitted_space(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+            )
+            required = virtual_nas.transfer_required_free_bytes(1)
+            nas.free_bytes = Mock(return_value=required)
+            body = b"".join([
+                virtual_nas._FILE_STREAM_MAGIC,
+                virtual_nas._file_stream_header({
+                    "path": "models--org--model", "type": "directory",
+                }),
+                virtual_nas._file_stream_header({
+                    "path": "models--org--model/blobs/weights",
+                    "type": "file", "size": required + 1,
+                }),
+            ])
+
+            with self.assertRaisesRegex(ValueError, "admitted transfer size"):
+                await nas.import_model(
+                    "org/model", bytes_stream(body), required_model_bytes=1,
+                )
+
+            self.assertFalse((hub / "models--org--model").exists())
+
+    async def test_streamed_import_cancellation_never_registers_repository(self):
+        for cancel_phase in ("syncing", "registering"):
+            with self.subTest(cancel_phase=cancel_phase), tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+                source_hub = Path(source_dir) / "hub"
+                target_hub = Path(target_dir) / "hub"
+                create_cached_model(source_hub)
+                source = VirtualNAS(
+                    Path(source_dir), lambda: source_hub,
+                    FakeRegistry(), lambda: True,
+                )
+                target = VirtualNAS(
+                    Path(target_dir), lambda: target_hub,
+                    FakeRegistry(), lambda: True,
+                )
+                canceled = asyncio.Event()
+
+                def phase(value: str) -> None:
+                    if value == cancel_phase:
+                        canceled.set()
+
+                with self.assertRaises(virtual_nas.TransferCanceled):
+                    await target.import_model(
+                        "org/model", source.export_model("org/model"),
+                        phase=phase, cancel=canceled,
+                    )
+
+                self.assertFalse(
+                    (target_hub / "models--org--model").exists(),
+                )
+
+    async def test_streamed_import_uses_hardlinks_without_symlink_privilege(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source_hub = Path(source_dir) / "hub"
+            target_hub = Path(target_dir) / "hub"
+            repository = create_cached_model(source_hub)
+            blob = repository / "blobs" / "weights"
+            snapshot_file = (
+                repository / "snapshots" / "revision-1" / "model.safetensors"
+            )
+            snapshot_file.unlink()
+            try:
+                snapshot_file.symlink_to(blob)
+            except OSError as exc:
+                self.skipTest(f"source filesystem cannot create test symlink: {exc}")
+            source = VirtualNAS(
+                Path(source_dir), lambda: source_hub, FakeRegistry(), lambda: True,
+            )
+            target = VirtualNAS(
+                Path(target_dir), lambda: target_hub, FakeRegistry(), lambda: True,
+            )
+            stream = source.export_model("org/model")
+
+            with patch(
+                "sparkdeck.virtual_nas.os.symlink",
+                side_effect=PermissionError("symlinks disabled"),
+            ):
+                await target.import_model("org/model", stream)
+
+            copied = target_hub / "models--org--model"
+            self.assertTrue(os.path.samefile(
+                copied / "blobs" / "weights",
+                copied / "snapshots" / "revision-1" / "model.safetensors",
+            ))
+            onward_hub = Path(target_dir) / "onward-hub"
+            onward = VirtualNAS(
+                Path(target_dir) / "onward", lambda: onward_hub,
+                FakeRegistry(), lambda: True,
+            )
+            await onward.import_model(
+                "org/model", target.export_model("org/model"),
+            )
+            onward_copy = onward_hub / "models--org--model"
+            self.assertTrue(os.path.samefile(
+                onward_copy / "blobs" / "weights",
+                onward_copy / "snapshots" / "revision-1" / "model.safetensors",
+            ))
+
+    async def test_streamed_export_batches_files_for_high_throughput(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             repository = create_cached_model(hub)
-            payload_size = virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES * 2 + 123
+            payload_size = virtual_nas.FILE_STREAM_CHUNK_BYTES * 2 + 123
             (repository / "snapshots" / "revision-1" / "model.safetensors").write_bytes(
                 b"x" * payload_size
             )
@@ -1532,8 +1662,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             chunk_sizes = [len(chunk) async for chunk in nas.export_model("org/model")]
 
-            self.assertGreaterEqual(chunk_sizes.count(virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES), 2)
-            self.assertLessEqual(max(chunk_sizes), virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES)
+            self.assertGreaterEqual(chunk_sizes.count(virtual_nas.FILE_STREAM_CHUNK_BYTES), 2)
+            self.assertLessEqual(max(chunk_sizes), virtual_nas.FILE_STREAM_CHUNK_BYTES)
             self.assertGreater(sum(chunk_sizes), payload_size)
 
     async def test_delete_is_blocked_while_local_export_is_reserved(self):
@@ -1553,18 +1683,27 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
-            archive_bytes = io.BytesIO()
-            with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
-                root = tarfile.TarInfo("models--org--model")
-                root.type = tarfile.DIRTYPE
-                archive.addfile(root)
-                link = tarfile.TarInfo("models--org--model/snapshots/rev/weights")
-                link.type = tarfile.SYMTYPE
-                link.linkname = "../../../../outside"
-                archive.addfile(link)
+            for target, error in (
+                ("../../../../outside", "link escapes"),
+                ("C:/outside", "unsafe link"),
+            ):
+                with self.subTest(target=target):
+                    stream_bytes = b"".join([
+                        virtual_nas._FILE_STREAM_MAGIC,
+                        virtual_nas._file_stream_header({
+                            "path": "models--org--model", "type": "directory",
+                        }),
+                        virtual_nas._file_stream_header({
+                            "path": "models--org--model/snapshots/rev/weights",
+                            "type": "symlink", "target": target,
+                        }),
+                        struct.pack(">I", 0),
+                    ])
 
-            with self.assertRaisesRegex(ValueError, "link escapes"):
-                await nas.import_model("org/model", bytes_stream(archive_bytes.getvalue()))
+                    with self.assertRaisesRegex(ValueError, error):
+                        await nas.import_model(
+                            "org/model", bytes_stream(stream_bytes),
+                        )
 
             self.assertFalse((Path(directory) / "outside").exists())
             self.assertFalse((hub / "models--org--model").exists())
@@ -1790,7 +1929,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(download[3]["use_fabric"])
         self.assertEqual(
             registry.last_source_response.chunk_size,
-            virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES,
+            virtual_nas.FILE_STREAM_CHUNK_BYTES,
         )
 
     async def test_local_source_selective_file_upload_uses_fabric_stream(self):
@@ -1825,7 +1964,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(download[3]["use_fabric"])
         self.assertEqual(
             registry.last_source_response.chunk_size,
-            virtual_nas.ARCHIVE_STREAM_CHUNK_BYTES,
+            virtual_nas.FILE_STREAM_CHUNK_BYTES,
         )
 
     async def test_stopping_dispatcher_requeues_running_transfer(self):
@@ -1935,28 +2074,28 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result["job_ids"]), 1)
         self.assertEqual(final[0]["status"], "completed")
-        with tarfile.open(
-            fileobj=io.BytesIO(registry.received["worker-a"]), mode="r:",
-        ) as archive:
-            self.assertIn(
-                "models--Comfy-Org--MiniMax-Music-3"
-                "/snapshots/comfyui/.sparkdeck-external",
-                archive.getnames(),
-            )
+        target_hub = Path(self.temp.name) / "worker-hub"
+        target = VirtualNAS(
+            Path(self.temp.name) / "worker", lambda: target_hub,
+            FakeRegistry(), lambda: True,
+        )
+        await target.import_model(
+            "Comfy-Org/MiniMax-Music-3",
+            bytes_stream(registry.received["worker-a"]),
+        )
+        copied = target_hub / "models--Comfy-Org--MiniMax-Music-3"
+        self.assertEqual((copied / "refs" / "main").read_bytes(), b"comfyui")
+        self.assertEqual(
+            (copied / "snapshots" / "comfyui" / ".sparkdeck-external").read_bytes(),
+            b"comfyui\n",
+        )
+        for relative, content in bundle_files.items():
             self.assertEqual(
-                archive.extractfile(
-                    "models--Comfy-Org--MiniMax-Music-3/refs/main",
-                ).read(),
-                b"comfyui",
+                (copied / "snapshots" / "comfyui").joinpath(
+                    *relative.split("/"),
+                ).read_bytes(),
+                content,
             )
-            for relative, content in bundle_files.items():
-                member = (
-                    "models--Comfy-Org--MiniMax-Music-3"
-                    f"/snapshots/comfyui/{relative}"
-                )
-                extracted = archive.extractfile(member)
-                self.assertIsNotNone(extracted)
-                self.assertEqual(extracted.read(), content)
         # The transfer copies; the ComfyUI install is left untouched.
         for relative, content in bundle_files.items():
             self.assertEqual(
@@ -2009,7 +2148,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged["size_bytes"], 10_000_000 + bundle_size)
         self.assertEqual(merged["transfer_size_bytes"], bundle_size)
 
-        # 80 MB fits the external payload (2x + reserve) but not the summed
+        # 80 MB fits the external payload plus reserve but not the summed
         # size; the transfer must size against the external bundle alone.
         result = await nas.queue_transfer(
             "Comfy-Org/MiniMax-Music-3", "local", ["worker-a"],
@@ -2509,7 +2648,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_recipe_transfer_preflight_requires_exact_revision_and_capacity(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}
-        required = 20 * 2 + 64 * 1024 * 1024
+        required = 20 + 64 * 1024 * 1024
         manager.model_cache_inventory = AsyncMock(return_value=[
             {
                 "id": "source", "name": "Source", "online": True,
@@ -2570,7 +2709,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_recipe_transfer_preflight_blocks_but_does_not_adopt_other_revision(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}
-        required = 20 * 2 + 64 * 1024 * 1024
+        required = 20 + 64 * 1024 * 1024
         manager.model_cache_inventory = AsyncMock(return_value=[
             {
                 "id": "source", "name": "Source", "online": True,

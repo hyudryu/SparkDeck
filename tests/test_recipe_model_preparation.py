@@ -350,7 +350,7 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Another revision", plan["reason"])
 
     async def test_insufficient_or_unknown_authoritative_capacity_blocks(self):
-        required = MODEL_BYTES * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        required = MODEL_BYTES + TRANSFER_STAGING_RESERVE_BYTES
         source = {
             "node_id": "source", "node_name": "Source",
             "size_bytes": MODEL_BYTES,
@@ -625,9 +625,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             job = queued_job()
             nas.jobs = [job]
             actual_size = 1000
-            actual_required = (
-                actual_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
-            )
+            actual_required = actual_size + TRANSFER_STAGING_RESERVE_BYTES
             nas._node_storage = AsyncMock(side_effect=[
                 {
                     "models": [{

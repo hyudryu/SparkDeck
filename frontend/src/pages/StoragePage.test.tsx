@@ -495,9 +495,9 @@ describe('StoragePage', () => {
 
     const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
     const finalizing = within(nodePanel).getByLabelText('Finalizing on Backup Spark org/finalizing on Backup Spark')
-    expect(within(finalizing).getByText('Syncing archive to disk')).toBeInTheDocument()
-    const phaseBar = within(finalizing).getByRole('progressbar', { name: 'Syncing archive to disk progress' })
-    expect(phaseBar).toHaveAttribute('aria-valuetext', 'Syncing archive to disk')
+    expect(within(finalizing).getByText('Syncing model files to disk')).toBeInTheDocument()
+    const phaseBar = within(finalizing).getByRole('progressbar', { name: 'Syncing model files to disk progress' })
+    expect(phaseBar).toHaveAttribute('aria-valuetext', 'Syncing model files to disk')
     expect(within(finalizing).getByText(/^100%/)).toBeInTheDocument()
   })
 

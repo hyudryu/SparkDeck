@@ -255,6 +255,28 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertEqual(contract["tensor_parallel_size"], 2)
         self.assertEqual(contract["pipeline_parallel_size"], 2)
 
+    def test_sharded_contract_honors_saved_nodes_with_ranks_per_node(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "deployment_mode": "sharded",
+            "node_ids": ["local", "node-2"],
+            "extra_args": ["--tensor-parallel-size", "4",
+                           "--pipeline-parallel-size", "1"],
+        })
+
+        self.assertEqual(contract["deployment_mode"], "sharded")
+        self.assertEqual(contract["required_node_count"], 2)
+        self.assertEqual(contract["tensor_parallel_size"], 4)
+        self.assertEqual(contract["pipeline_parallel_size"], 1)
+
+    def test_sharded_contract_keeps_rank_count_when_nodes_do_not_divide(self):
+        contract = self.manager.recipe_deployment_contract({
+            "engine": "vllm", "deployment_mode": "sharded",
+            "node_ids": ["local", "node-2"],
+            "extra_args": ["--tensor-parallel-size", "3"],
+        })
+
+        self.assertEqual(contract["required_node_count"], 3)
+
     def test_sglang_tp_sets_sharded_node_count(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "sglang", "sg_tp_size": 2,

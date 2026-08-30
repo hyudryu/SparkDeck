@@ -3847,6 +3847,8 @@ class Manager:
             value = controls.get(key)
             if value in (None, ""):
                 return None
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(f"{key} must be a positive integer")
             try:
                 parsed = int(value)
             except (TypeError, ValueError) as exc:
@@ -9134,7 +9136,16 @@ class Manager:
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
-            required_nodes = parallel_nodes if parallel_nodes > 1 else max(2, len(saved_nodes))
+            saved_count = len(saved_nodes)
+            if parallel_nodes > 1 and saved_count > 1 and parallel_nodes % saved_count == 0:
+                # The launch gate accepts layouts with several ranks per node
+                # (e.g. TP4/PP1 on two nodes); honor the saved node count so
+                # restarts do not demand one node per rank.
+                required_nodes = saved_count
+            elif parallel_nodes > 1:
+                required_nodes = parallel_nodes
+            else:
+                required_nodes = max(2, saved_count)
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.

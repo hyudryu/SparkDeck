@@ -5,6 +5,7 @@ import { api } from './api/client'
 import type { OnboardingStatus } from './api/types'
 import { AuthProvider } from './auth/AuthContext'
 import { AppShell } from './components/AppShell'
+import { useConfirmDialog } from './components/useConfirmDialog'
 import { Button, LoadingState, Panel } from './components/ui'
 import { BenchmarksPage } from './pages/BenchmarksPage'
 import { ChatPage } from './pages/ChatPage'
@@ -26,7 +27,9 @@ export default function App() {
   const [onboarding, setOnboarding] = useState<OnboardingStatus>()
   const [connectionError, setConnectionError] = useState<string>()
   const [connectionVersion, setConnectionVersion] = useState(0)
+  const [leavingCluster, setLeavingCluster] = useState(false)
   const retryTimer = useRef<number | undefined>(undefined)
+  const { confirm, confirmationDialog } = useConfirmDialog()
   const retryConnection = useCallback(() => setConnectionVersion((value) => value + 1), [])
 
   useEffect(() => {
@@ -36,8 +39,11 @@ export default function App() {
       if (controller.signal.aborted) return
       setOnboarding(status)
       setConnectionError(undefined)
-      if (status.role === 'worker' && status.controller_reachable === false) {
-        retryTimer.current = window.setTimeout(retryConnection, 5_000)
+      if (status.role === 'worker') {
+        retryTimer.current = window.setTimeout(
+          retryConnection,
+          status.controller_reachable === false ? 5_000 : 15_000,
+        )
       }
     }).catch((reason: unknown) => {
       if (controller.signal.aborted) return
@@ -56,7 +62,27 @@ export default function App() {
   }, [retryConnection])
 
   const controllerUnavailable = onboarding?.role === 'worker' && onboarding.controller_reachable === false
-  const controllerAvailable = Boolean(onboarding) && !controllerUnavailable
+  const controllerAvailable = Boolean(onboarding) && !controllerUnavailable && !connectionError
+
+  const leaveCluster = async () => {
+    if (!await confirm({
+      title: 'Leave this cluster?',
+      message: 'This node will stop using the unavailable controller and become its own standalone controller.',
+      confirmLabel: 'Leave cluster',
+      danger: true,
+    })) return
+    setLeavingCluster(true)
+    setConnectionError(undefined)
+    try {
+      const status = await api.onboarding.leave()
+      window.clearTimeout(retryTimer.current)
+      setOnboarding(status)
+    } catch (reason) {
+      setConnectionError(reason instanceof Error ? reason.message : 'Could not leave the cluster')
+    } finally {
+      setLeavingCluster(false)
+    }
+  }
 
   return (
     <AppShell controllerAvailable={controllerAvailable} nodeName={onboarding?.node?.name}>
@@ -70,6 +96,11 @@ export default function App() {
           <Button type="button" variant="primary" onClick={retryConnection}>
             <RefreshCw size={16} /> Retry now
           </Button>
+          {controllerUnavailable && (
+            <Button type="button" variant="danger" disabled={leavingCluster} onClick={() => void leaveCluster()}>
+              {leavingCluster ? 'Leaving…' : 'Leave cluster'}
+            </Button>
+          )}
         </Panel>
       )}
       {controllerAvailable && <AuthProvider>
@@ -93,6 +124,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AuthProvider>}
+      {confirmationDialog}
     </AppShell>
   )
 }

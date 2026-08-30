@@ -210,6 +210,10 @@ export function AppShell({
     themeInteractedRef.current = true
     persistTheme(next)
     setTheme(next)
+    if (!controllerAvailable) {
+      setThemeStatus(`${next === 'dark' ? 'Dark' : 'Light'} mode applied locally. Controller unavailable.`)
+      return
+    }
     setThemeSyncing(true)
     setThemeStatus('')
     try {

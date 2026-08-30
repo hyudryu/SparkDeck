@@ -83,7 +83,7 @@ const REQUEST_TIMEOUT_MS = 30_000
 // abort a healthy request before the controller's own timeout contract ended.
 const DEPLOYMENTS_TIMEOUT_MS = 60_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
-const CONTROLLER_BOOTSTRAP_TIMEOUT_MS = 5_000
+const CONTROLLER_BOOTSTRAP_TIMEOUT_MS = 10_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
 // return the authoritative result instead of inviting a duplicate retry after

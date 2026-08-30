@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SettingsPage } from './SettingsPage'
-import { AuthProvider, COMMUNITY_SESSION_RENEW_MS, useAuth } from '../auth/AuthContext'
+import { AuthProvider, COMMUNITY_SESSION_RENEW_MS, COMMUNITY_SESSION_RETRY_MS, useAuth } from '../auth/AuthContext'
 import { api } from '../api/client'
 import { THEME_STORAGE_KEY } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
@@ -556,6 +556,42 @@ describe('community features sign-in', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/community/session', expect.objectContaining({
       headers: expect.not.objectContaining({ Authorization: expect.anything() }),
     }))
+  })
+
+  it('retries a transient session restore failure without showing the sign-in form', async () => {
+    const retryCallbacks: Array<() => void> = []
+    const timeout = vi.spyOn(window, 'setTimeout').mockImplementation((handler: TimerHandler, delay?: number) => {
+      if (typeof handler === 'function' && delay === COMMUNITY_SESSION_RETRY_MS) {
+        retryCallbacks.push(handler as () => void)
+      }
+      return 1
+    })
+    let sessionCalls = 0
+    stubSettingsFetch(vi.fn<typeof fetch>(), {
+      sessionResponse: () => {
+        sessionCalls += 1
+        if (sessionCalls === 1) {
+          return new Response(JSON.stringify({ detail: 'community sign-in could not be restored' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        return new Response(JSON.stringify({
+          status: 'signed-in', email: 'driver@example.com', token_invalid: false,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      },
+    })
+
+    render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
+
+    await act(async () => {})
+    expect(screen.getByText('Restoring community session…')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
+    expect(timeout).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RETRY_MS)
+    await act(async () => retryCallbacks.at(-1)?.())
+
+    expect(screen.getByText('driver@example.com')).toBeInTheDocument()
+    expect(screen.getByText('Signed in')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
   })
 
   it('renews a long-open node session before its browser authorization expires', async () => {

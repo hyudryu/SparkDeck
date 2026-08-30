@@ -29,11 +29,13 @@ FORWARD_NODE_HEADER = "x-sparkdeck-forward-node"
 FORWARD_HOP_HEADER = "x-sparkdeck-forward-hop"
 FORWARD_TOKEN_HEADER = "x-sparkdeck-forward-token"
 FORWARD_SCHEME_HEADER = "x-sparkdeck-forward-scheme"
+FORWARD_CLIENT_HEADER = "x-sparkdeck-forward-client"
 FORWARD_HEADERS = {
     FORWARD_NODE_HEADER,
     FORWARD_HOP_HEADER,
     FORWARD_TOKEN_HEADER,
     FORWARD_SCHEME_HEADER,
+    FORWARD_CLIENT_HEADER,
 }
 JOIN_CODE_TTL_SECONDS = 600.0
 JOIN_RATE_LIMIT = 5
@@ -776,6 +778,9 @@ async def forward_management_request(
         FORWARD_HOP_HEADER: "1",
         FORWARD_TOKEN_HEADER: assignment["forward_token"],
         FORWARD_SCHEME_HEADER: request.url.scheme,
+        # The controller may trust this only after validating the one-hop
+        # forwarding credential above. Never relay a caller-supplied value.
+        FORWARD_CLIENT_HEADER: request.client.host if request.client else "unknown",
     })
     try:
         body = await request.body()

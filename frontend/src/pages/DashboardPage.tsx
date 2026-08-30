@@ -320,10 +320,17 @@ function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, po
 
 function SessionRow({ model, request }: { model: string; request: ActiveRequestStats }) {
   const rate = (request.thinking_tok_s ?? 0) + (request.output_tok_s ?? 0)
+  const callers = Object.entries(request.caller_ips ?? {})
+    .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
+    .map(([ip, connections]) => `${connections} from ${ip}`)
   return (
     <div className="dashboard-list-row session-row">
       <span className="status-dot status-running" aria-hidden="true" />
-      <div><strong>{model}</strong><small>{request.connections} active · {request.queued ?? 0} queued</small></div>
+      <div>
+        <strong>{model}</strong>
+        <small>{request.connections} active · {request.queued ?? 0} queued</small>
+        {callers.length > 0 && <small>{callers.join(' · ')}</small>}
+      </div>
       <span className="session-rate">{rate > 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'}</span>
     </div>
   )

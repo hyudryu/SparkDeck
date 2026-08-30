@@ -322,6 +322,24 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('Active session status unavailable')).not.toBeInTheDocument()
   })
 
+  it('lists active inference counts by caller IP', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': {
+          connections: 3,
+          output_tok_s: 12,
+          caller_ips: { '192.0.2.20': 1, '192.0.2.10': 2 },
+        },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('2 from 192.0.2.10 · 1 from 192.0.2.20')).toBeInTheDocument()
+  })
+
   it('prefers fresh local stats over retained local node telemetry', () => {
     const snapshot = clusterResourceSnapshot([{
       id: 'local', name: 'This node', local: true, online: true,

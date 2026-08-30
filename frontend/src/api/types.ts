@@ -588,6 +588,7 @@ export interface GpuStats {
 
 export interface ActiveRequestStats {
   connections: number
+  caller_ips?: Record<string, number>
   queued?: number
   decoded_tokens?: number
   thinking_tok_s?: number

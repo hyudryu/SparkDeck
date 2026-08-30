@@ -40,6 +40,7 @@ from sparkdeck.service import (
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.virtual_nas import FILE_STREAM_CONTENT_TYPE
 from sparkdeck.onboarding import (
+    FORWARD_CLIENT_HEADER,
     FORWARD_HEADERS,
     FORWARD_SCHEME_HEADER,
     OnboardingService,
@@ -93,6 +94,23 @@ def _watch_disconnect(req: Request, event: asyncio.Event) -> asyncio.Task:
         except Exception:
             pass
     return asyncio.create_task(run())
+
+
+def _normalized_caller_ip(value: object) -> str:
+    try:
+        return str(ipaddress.ip_address(str(value).split("%", 1)[0]))
+    except ValueError:
+        return "unknown"
+
+
+def _inference_caller_ip(req: Request) -> str:
+    """Return a normalized caller host, trusting only authenticated forwarding."""
+    value = req.client.host if req.client else "unknown"
+    if req.headers.get(FORWARD_CLIENT_HEADER):
+        valid, _ = onboarding.validate_forward_headers(req.headers)
+        if valid:
+            value = req.headers[FORWARD_CLIENT_HEADER]
+    return _normalized_caller_ip(value)
 
 
 async def _guard_stream(stream, watcher: asyncio.Task):
@@ -1093,6 +1111,7 @@ async def agent_inference(endpoint: str, req: Request):
         raise HTTPException(400, "model is required")
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
+    caller_ip = _normalized_caller_ip(body.pop("_sparkdeck_caller_ip", None))
     cancel = asyncio.Event()
     watcher = _watch_disconnect(req, cancel)
     stream = False
@@ -1101,11 +1120,13 @@ async def agent_inference(endpoint: str, req: Request):
             await manager._vllm_chat(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
+                caller_ip=caller_ip,
             )
             if endpoint == "chat/completions"
             else await manager._vllm_completions(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
+                caller_ip=caller_ip,
             )
         )
         stream = hasattr(result, "__aiter__")
@@ -3743,7 +3764,10 @@ async def v1_chat_completions(req: Request):
     watcher = _watch_disconnect(req, cancel)
     stream = False
     try:
-        result = await sparkdeck.proxy(body, "chat/completions", cancel)
+        result = await sparkdeck.proxy(
+            body, "chat/completions", cancel,
+            caller_ip=_inference_caller_ip(req),
+        )
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         # Client left; upstream request was aborted too. Nothing to send.
@@ -3781,7 +3805,10 @@ async def v1_completions(req: Request):
     watcher = _watch_disconnect(req, cancel)
     stream = False
     try:
-        result = await sparkdeck.proxy(body, "completions", cancel)
+        result = await sparkdeck.proxy(
+            body, "completions", cancel,
+            caller_ip=_inference_caller_ip(req),
+        )
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         return Response(status_code=499)

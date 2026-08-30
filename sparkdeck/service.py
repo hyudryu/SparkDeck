@@ -982,7 +982,9 @@ class SparkDeckService:
                     # containers until its first explicit start.
                     deployment["status"] = "saved"
                     deployment["node_ids"] = list(settings.get("node_ids") or [])
-                    deployment.update(self._saved_layout_contract(settings))
+                    deployment.update(self._saved_layout_contract(
+                        settings, str(deployment.get("runtime") or ""),
+                    ))
                     continue
                 deployment["status"] = "missing"
                 deployment["last_error"] = (
@@ -1440,11 +1442,41 @@ class SparkDeckService:
                     raise ValueError("max_concurrency must be an integer") from exc
             elif "max_concurrency" in controls:
                 settings["parallel_slots" if runtime_is_llama else "max_running_requests"] = None
+            # Saved bookmarks never pass Manager's preflight until their first
+            # Run, so the parallel topology controls must be validated and
+            # normalized here instead of persisting an invalid layout.
+            for key in ("tensor_parallel_size", "pipeline_parallel_size"):
+                value = controls.get(key)
+                if value in (None, ""):
+                    continue
+                if isinstance(value, bool) or (
+                    isinstance(value, float) and not value.is_integer()
+                ):
+                    raise ValueError(f"{key} must be a positive integer")
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{key} must be a positive integer") from exc
+                if parsed <= 0:
+                    raise ValueError(f"{key} must be a positive integer")
+                controls[key] = parsed
             # Persist the complete structured contract: Manager's preflight
             # merges every control (KV dtype, thinking, speculative tokens,
             # cudagraph size, batched tokens) into the launch argv for vLLM
             # and SGLang, including clearing a previously set value.
             settings["launch_controls"] = controls
+            # Keep the saved topology scalar in sync so the launch picker's
+            # node-count contract reflects the edited parallel layout.
+            tp_control = controls.get("tensor_parallel_size")
+            if isinstance(tp_control, int):
+                settings["tensor_parallel_size"] = tp_control
+            elif "tensor_parallel_size" in controls and str(
+                stored.get("runtime")
+            ) == RuntimeKind.VLLM.value:
+                # An explicit clear drops the saved scalar too, or the layout
+                # contract keeps demanding the stale topology. SGLang editors
+                # always submit a null here; their scalar is sg-driven.
+                settings["tensor_parallel_size"] = None
         if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if "sg_mem_fraction" in changes:
@@ -1510,7 +1542,9 @@ class SparkDeckService:
             raise ValueError(
                 "llama.cpp deployments support single and replicated layouts, not sharded"
             )
-        contract = self._saved_layout_contract(settings)
+        contract = self._saved_layout_contract(
+            settings, str(stored.get("runtime") or ""),
+        )
         if contract["deployment_mode"] == "single" and len(effective_nodes) > 1:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
@@ -1721,7 +1755,8 @@ class SparkDeckService:
             "engine": runtime,
             "extra_args": extra_args,
         })
-        controls.update(saved_settings.get("launch_controls") or {})
+        saved_controls = saved_settings.get("launch_controls") or {}
+        controls.update(saved_controls)
         scalar_seeds = {
             "context_window": saved_settings.get("context_length"),
             "max_concurrency": (
@@ -1730,13 +1765,26 @@ class SparkDeckService:
                 else saved_settings.get("max_running_requests")
             ),
         }
+        if runtime == RuntimeKind.VLLM.value:
+            # The Models page saves sharded vLLM bookmarks with a bare
+            # tensor_parallel_size scalar; seed the editor with it so an
+            # unchanged Save cannot submit a null that strips the TP flag.
+            scalar_seeds["tensor_parallel_size"] = saved_settings.get(
+                "tensor_parallel_size"
+            )
         for key, value in scalar_seeds.items():
+            # A key present in the saved controls is an explicit editor value
+            # — including an intentional clear — and must not be re-seeded.
+            if key in saved_controls:
+                continue
             if controls.get(key) is None and value is not None:
                 controls[key] = value
         return controls
 
     @staticmethod
-    def _saved_layout_contract(settings: dict[str, Any]) -> dict[str, Any]:
+    def _saved_layout_contract(
+        settings: dict[str, Any], runtime: str | None = None,
+    ) -> dict[str, Any]:
         """Derive the launch layout contract persisted on a saved bookmark.
 
         Mirrors Manager's contract (replicated = the saved node count, sharded
@@ -1751,13 +1799,36 @@ class SparkDeckService:
             "replicated" if len(node_ids) > 1 else "single"
         )
         if mode == "sharded":
-            parallel = settings.get("tensor_parallel_size")
-            count = (
-                parallel
-                if isinstance(parallel, int) and not isinstance(parallel, bool)
-                and parallel > 1
-                else max(2, len(node_ids))
+            controls = settings.get("launch_controls")
+            if not isinstance(controls, dict):
+                controls = {}
+
+            def _positive_parallel(value: Any) -> int:
+                return (
+                    value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    and value > 0
+                    else 1
+                )
+
+            tensor = _positive_parallel(controls.get("tensor_parallel_size"))
+            if tensor == 1:
+                tensor = _positive_parallel(settings.get("tensor_parallel_size"))
+            world = tensor * _positive_parallel(
+                controls.get("pipeline_parallel_size")
             )
+            if world > 1:
+                # Mirror Manager's launch gate: several ranks per node are
+                # valid for vLLM when the world size divides the saved node
+                # count; SGLang always launches one rank per node.
+                count = (
+                    len(node_ids)
+                    if runtime == RuntimeKind.VLLM.value
+                    and len(node_ids) > 1 and world % len(node_ids) == 0
+                    else world
+                )
+            else:
+                count = max(2, len(node_ids))
         elif mode == "replicated":
             count = max(2, len(node_ids))
         else:
@@ -2019,7 +2090,7 @@ class SparkDeckService:
                         **self._saved_layout_contract({
                             "deployment_mode": mode,
                             "node_ids": requested_node_ids,
-                        }),
+                        }, runtime.value),
                         "selected_nodes": [
                             self.manager.public_target_node(node) for node in selected
                         ],

@@ -52,11 +52,24 @@ function splitFlags(input: string): string[] {
   return values
 }
 
+const flagValue = (args: string[], names: string[]) => {
+  for (let index = 0; index < args.length; index += 1) {
+    if (names.includes(args[index])) return args[index + 1]
+    const name = names.find((candidate) => args[index].startsWith(`${candidate}=`))
+    if (name) return args[index].slice(name.length + 1)
+  }
+  return undefined
+}
+
 type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'extra_args', string>
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
   context_window: detail.launch_controls.context_window?.toString() ?? '',
   max_concurrency: detail.launch_controls.max_concurrency?.toString() ?? '',
+  tensor_parallel_size: detail.launch_controls.tensor_parallel_size?.toString()
+    ?? flagValue(detail.extra_args, ['--tensor-parallel-size', '-tp']) ?? '',
+  pipeline_parallel_size: detail.launch_controls.pipeline_parallel_size?.toString()
+    ?? flagValue(detail.extra_args, ['--pipeline-parallel-size', '-pp']) ?? '',
   kv_cache_dtype: detail.launch_controls.kv_cache_dtype ?? '',
   thinking_mode: detail.launch_controls.thinking_mode ?? 'default',
   dspark_num_speculative_tokens: detail.launch_controls.dspark_num_speculative_tokens?.toString() ?? '',
@@ -77,6 +90,8 @@ function updateInput(editor: Editor): DeploymentUpdateInput {
     launch_controls: {
       context_window: optionalNumber(editor.context_window),
       max_concurrency: optionalNumber(editor.max_concurrency),
+      tensor_parallel_size: optionalNumber(editor.tensor_parallel_size),
+      pipeline_parallel_size: optionalNumber(editor.pipeline_parallel_size),
       kv_cache_dtype: editor.kv_cache_dtype.trim() || null,
       thinking_mode: editor.thinking_mode || 'default',
       dspark_num_speculative_tokens: optionalNumber(editor.dspark_num_speculative_tokens),
@@ -136,13 +151,13 @@ export function DeploymentPage() {
     }
   }
 
-  if (resource.loading && !resource.data) return <LoadingState label="Loading deployment" />
-  if (resource.error && !resource.data) return <ErrorState message={resource.error} onRetry={resource.reload} />
+  if (resource.loading && !resource.data) return <div className="page"><LoadingState label="Loading deployment" /></div>
+  if (resource.error && !resource.data) return <div className="page"><ErrorState message={resource.error} onRetry={resource.reload} /></div>
   const detail = resource.data
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
 
-  return <>
+  return <div className="page">
     <PageHeader
       eyebrow="Deployment"
       title={detail.alias}
@@ -164,6 +179,8 @@ export function DeploymentPage() {
         <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>
         <label className="field"><span>Max batched tokens</span><input disabled={disabled} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} /></label>
         {detail.runtime === 'vllm' && <>
+          <label className="field"><span>Tensor parallel size</span><input disabled={disabled} type="number" min="1" value={editor.tensor_parallel_size} onChange={(event) => set('tensor_parallel_size', event.target.value)} /></label>
+          <label className="field"><span>Pipeline parallel size</span><input disabled={disabled} type="number" min="1" value={editor.pipeline_parallel_size} onChange={(event) => set('pipeline_parallel_size', event.target.value)} /></label>
           <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
           <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
         </>}
@@ -175,5 +192,5 @@ export function DeploymentPage() {
         <div className="settings-save wide-field"><Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button><Button type="button" variant="primary" disabled={disabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button></div>
       </form>
     </Panel>
-  </>
+  </div>
 }

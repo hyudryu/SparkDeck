@@ -2525,7 +2525,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
-                    "--max-model-len", "65536", "--tensor-parallel-size", "2",
+                    "--max-model-len", "65536", "--tensor-parallel-size", "4",
                     "--pipeline-parallel-size", "1", "--headless",
                 ],
             })
@@ -2545,7 +2545,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
                 self.assertEqual(args[args.index("--nnodes") + 1], "2")
-                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "2")
+                self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "4")
                 self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "1")
                 self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.1")
                 self.assertEqual("--headless" in args, rank > 0)
@@ -2683,17 +2683,65 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         instance.cluster_nodes = cluster_nodes
 
-        with self.assertRaisesRegex(ValueError, "multiply to the 2 selected nodes"):
-            await instance.create_deployment({
-                "model": "example/Model",
-                "engine": "vllm",
-                "deployment_mode": "sharded",
-                "node_ids": ["local", "remote-1"],
-                "extra_args": [
-                    "--tensor-parallel-size", "2",
-                    "--pipeline-parallel-size", "2",
-                ],
-            })
+        for tp, pp in ((3, 1), (0, 2)):
+            with self.subTest(tp=tp, pp=pp):
+                with self.assertRaisesRegex(
+                    ValueError, "whole number of ranks per selected node|must be positive"
+                ):
+                    await instance.create_deployment({
+                        "model": "example/Model",
+                        "engine": "vllm",
+                        "deployment_mode": "sharded",
+                        "node_ids": ["local", "remote-1"],
+                        "extra_args": [
+                            "--tensor-parallel-size", str(tp),
+                            "--pipeline-parallel-size", str(pp),
+                        ],
+                    })
+
+        self.assertEqual(instance.deployments, [])
+
+    async def test_vllm_sharded_launch_rejects_layout_beyond_node_gpus(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "cluster_fabric_ip": "169.254.10.1",
+            "cluster_fabric_interface": "cx7-local",
+        }
+        instance.deployments = []
+        inventories = [[{"name": "GB10"}], []]
+
+        async def cluster_nodes(local_stats=None):
+            return [
+                {
+                    "id": "local", "name": "Spark 1", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.1",
+                    "fabric_interface": "cx7-local", "interfaces": [],
+                    "stats": {"gpus": inventories[0]},
+                },
+                {
+                    "id": "remote-1", "name": "Spark 2", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.2",
+                    "fabric_interface": "cx7-remote", "interfaces": [],
+                    "stats": {"gpus": inventories[1]},
+                },
+            ]
+
+        instance.cluster_nodes = cluster_nodes
+
+        for gpus in ([[{"name": "GB10"}], [{"name": "GB10"}]], [[], []]):
+            with self.subTest(gpus=gpus):
+                inventories[:] = gpus
+                with self.assertRaisesRegex(ValueError, "GPU"):
+                    await instance.create_deployment({
+                        "model": "example/Model",
+                        "engine": "vllm",
+                        "deployment_mode": "sharded",
+                        "node_ids": ["local", "remote-1"],
+                        "extra_args": [
+                            "--tensor-parallel-size", "4",
+                            "--pipeline-parallel-size", "1",
+                        ],
+                    })
 
         self.assertEqual(instance.deployments, [])
 
@@ -2729,6 +2777,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "launch_controls": {
                     "context_window": 131072,
                     "max_cudagraph_capture_size": 12,
+                    "tensor_parallel_size": 4,
+                    "pipeline_parallel_size": 1,
                 },
             })
 
@@ -2749,6 +2799,13 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 12,
             )
+            self.assertEqual(
+                instance._cli_option(
+                    updated["launch_settings"]["extra_args"],
+                    {"--tensor-parallel-size", "-tp"}, int,
+                ),
+                4,
+            )
             persisted = json.loads(instance.deployments_path.read_text())
             self.assertEqual(persisted[0]["launch_settings"]["image"], "example/vllm:test")
             self.assertEqual(
@@ -2759,6 +2816,51 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 12,
             )
 
+    def test_stopped_update_without_parallel_controls_preserves_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "api_port": 8000,
+                "members": [],
+                "launch_settings": {
+                    "deployment_name": "cluster",
+                    "model": "example/Model",
+                    "engine": "vllm",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "port": 8000,
+                    "extra_args": [
+                        "--tensor-parallel-size", "2",
+                        "--pipeline-parallel-size", "1",
+                    ],
+                },
+            }]
+
+            # A client that omits the TP/PP keys (e.g. an older frontend)
+            # updates only what it sent instead of clearing the layout.
+            updated = instance.update_deployment_settings("deployment-1", {
+                "launch_controls": {"max_concurrency": 8},
+            })
+
+            args = updated["launch_settings"]["extra_args"]
+            self.assertEqual(
+                instance._cli_option(
+                    args, {"--tensor-parallel-size", "-tp"}, int,
+                ),
+                2,
+            )
+            self.assertEqual(
+                instance._cli_option(args, {"--max-num-seqs"}, int), 8,
+            )
+
     def test_cluster_launch_controls_parse_and_round_trip_dspark_flags(self) -> None:
         instance = Manager.__new__(Manager)
         args = [
@@ -2767,6 +2869,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "--kv-cache-dtype", "nvfp4_ds_mla",
             "--max-cudagraph-capture-size", "72",
             "--max-num-batched-tokens", "8192",
+            "--tensor-parallel-size", "2",
+            "--pipeline-parallel-size", "1",
             "--default-chat-template-kwargs", '{"thinking":true,"tools":true}',
             "--speculative-config",
             '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}',
@@ -2784,6 +2888,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed["dspark_num_speculative_tokens"], 5)
         self.assertEqual(parsed["max_cudagraph_capture_size"], 72)
         self.assertEqual(parsed["max_num_batched_tokens"], 8192)
+        self.assertEqual(parsed["tensor_parallel_size"], 2)
+        self.assertEqual(parsed["pipeline_parallel_size"], 1)
 
         updated = instance._apply_deployment_launch_controls(
             args,
@@ -2796,6 +2902,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "dspark_num_speculative_tokens": 3,
                 "max_cudagraph_capture_size": 48,
                 "max_num_batched_tokens": 4096,
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 1,
             },
         )
 
@@ -2813,6 +2921,12 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             instance._cli_option(updated, {"--max-num-batched-tokens"}, int), 4096
         )
+        self.assertEqual(
+            instance._cli_option(updated, {"--tensor-parallel-size", "-tp"}, int), 4
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--pipeline-parallel-size", "-pp"}, int), 1
+        )
         speculative = json.loads(
             instance._cli_option(updated, {"--speculative-config"})
         )
@@ -2827,6 +2941,22 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             instance._cli_option(updated, {"--image-specific-flag"}), "kept"
         )
+
+    def test_launch_controls_reject_fractional_parallel_sizes(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"tensor_parallel_size": 1.5},
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"pipeline_parallel_size": 2.5},
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"tensor_parallel_size": True},
+            )
 
     def test_vllm_capacity_log_parser_extracts_safe_full_context_limit(self) -> None:
         reports = Manager._parse_vllm_capacity_log("""

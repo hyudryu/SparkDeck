@@ -107,6 +107,8 @@ export interface Deployment {
 export interface DeploymentLaunchControls {
   context_window?: number | null
   max_concurrency?: number | null
+  tensor_parallel_size?: number | null
+  pipeline_parallel_size?: number | null
   kv_cache_dtype?: string | null
   thinking_mode?: string | null
   dspark_num_speculative_tokens?: number | null

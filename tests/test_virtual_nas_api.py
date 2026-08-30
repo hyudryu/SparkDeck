@@ -73,6 +73,116 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertTrue(changed.json()["enabled"])
 
+    async def test_legacy_cluster_create_registers_v1_deployment_before_return(self):
+        cluster = {
+            "id": "manager-hermes", "status": "starting",
+            "sparkdeck_record_id": "record-hermes",
+        }
+        create = AsyncMock(return_value=cluster)
+        register = AsyncMock(return_value={"id": "record-hermes"})
+        with (
+            patch.object(server.manager, "create_deployment", create),
+            patch.object(server.sparkdeck, "register_manager_deployment", register),
+        ):
+            response = await self.client.post("/api/containers", json={
+                "model": "org/model",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "managed_by": "sparkdeck-mcp",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], "manager-hermes")
+        create.assert_awaited_once()
+        register.assert_awaited_once_with(cluster)
+
+    async def test_legacy_cluster_create_rolls_back_when_registration_fails(self):
+        cluster = {"id": "manager-hermes", "status": "starting"}
+        create = AsyncMock(return_value=cluster)
+        remove = AsyncMock(return_value={"ok": True, "errors": []})
+        with (
+            patch.object(server.manager, "create_deployment", create),
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "register_manager_deployment",
+                AsyncMock(side_effect=RuntimeError("store unavailable")),
+            ),
+        ):
+            response = await self.client.post("/api/containers", json={
+                "model": "org/model",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+            })
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("store unavailable", response.json()["detail"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+
+    async def test_legacy_cluster_create_reports_incomplete_rollback(self):
+        cluster = {"id": "manager-hermes", "status": "starting"}
+        create = AsyncMock(return_value=cluster)
+        remove = AsyncMock(return_value={
+            "ok": False, "errors": ["worker-1 is offline"],
+        })
+        with (
+            patch.object(server.manager, "create_deployment", create),
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "register_manager_deployment",
+                AsyncMock(side_effect=RuntimeError("store unavailable")),
+            ),
+        ):
+            response = await self.client.post("/api/containers", json={
+                "model": "org/model",
+                "deployment_mode": "single",
+                "node_ids": ["worker-1"],
+            })
+
+        self.assertEqual(response.status_code, 500)
+        detail = response.json()["detail"]
+        self.assertIn("manager-hermes", detail)
+        self.assertIn("store unavailable", detail)
+        self.assertIn("worker-1 is offline", detail)
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+
+    async def test_legacy_cluster_remove_deletes_linked_v1_registration(self):
+        remove = AsyncMock(return_value={"ok": True, "errors": []})
+        unregister = Mock(return_value="record-hermes")
+        with (
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "remove_manager_deployment_registration",
+                unregister,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/deployments/manager-hermes/remove",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+        unregister.assert_called_once_with("manager-hermes")
+
+    async def test_failed_legacy_cluster_remove_keeps_v1_registration(self):
+        remove = AsyncMock(return_value={"ok": False, "errors": ["busy"]})
+        unregister = Mock()
+        with (
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "remove_manager_deployment_registration",
+                unregister,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/deployments/manager-hermes/remove",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+        unregister.assert_not_called()
+
     async def test_shared_inventory_and_transfer_payloads_are_redacted(self):
         inventory = {
             "enabled": True,

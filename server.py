@@ -1402,7 +1402,10 @@ async def remove_cluster_node(node_id: str):
 @app.post("/api/deployments/{deployment_id}/{action}")
 async def deployment_action(deployment_id: str, action: str):
     try:
-        return await manager.deployment_action(deployment_id, action)
+        result = await manager.deployment_action(deployment_id, action)
+        if action == "remove" and result.get("ok"):
+            sparkdeck.remove_manager_deployment_registration(deployment_id)
+        return result
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1651,7 +1654,27 @@ async def create_container(req: Request):
         # New clients send a deployment mode even for single-node launches.
         # Old clients omit it and retain the original local-container path.
         if body.get("deployment_mode") or body.get("node_ids"):
-            return await manager.create_deployment(body)
+            cluster = await manager.create_deployment(body)
+            try:
+                await sparkdeck.register_manager_deployment(cluster)
+            except Exception as registration_error:
+                try:
+                    rollback = await manager.deployment_action(
+                        cluster["id"], "remove",
+                    )
+                    if not rollback.get("ok"):
+                        errors = "; ".join(
+                            str(item) for item in rollback.get("errors") or []
+                        ) or "Manager did not confirm removal"
+                        raise RuntimeError(errors)
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"deployment {cluster['id']} was created but catalog "
+                        f"registration failed ({registration_error}); rollback "
+                        f"failed: {rollback_error}"
+                    ) from registration_error
+                raise
+            return cluster
         return await manager.create_container(
             model=body["model"],
             port=body.get("port"),

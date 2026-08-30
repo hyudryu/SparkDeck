@@ -167,6 +167,238 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "stopped",
         )
 
+    async def test_remote_only_legacy_manager_deployment_is_adopted_once(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "manager-hermes",
+            "name": "glm53-exl3-2x",
+            "model": "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw",
+            "engine": "vllm",
+            "mode": "sharded",
+            "node_ids": ["worker-1", "worker-2"],
+            "status": "ready",
+            "desired_state": "running",
+            "managed_by": "sparkdeck-mcp",
+            "automation_run_id": "hermes-run-1",
+            "api_port": 8000,
+            "members": [
+                {
+                    "node_id": "worker-1", "rank": 0,
+                    "container_name": "cluster-manager-hermes-r0-glm",
+                },
+                {
+                    "node_id": "worker-2", "rank": 1,
+                    "container_name": "cluster-manager-hermes-r1-glm",
+                },
+            ],
+            "launch_settings": {
+                "deployment_name": "glm53-exl3-2x",
+                "deployment_mode": "sharded",
+                "extra_args": ["--tensor-parallel-size", "2"],
+            },
+        }]
+        self.manager.cluster_nodes.return_value = [
+            cluster_node("worker-1"), cluster_node("worker-2"),
+        ]
+
+        first = await self.service.deployments()
+        second = await self.service.deployments()
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        adopted = first[0]
+        self.assertEqual(adopted["alias"], "glm53-exl3-2x")
+        self.assertEqual(adopted["status"], "running")
+        self.assertEqual(adopted["node_ids"], ["worker-1", "worker-2"])
+        self.assertTrue(adopted["managed"])
+        self.assertEqual(adopted["managed_by"], "sparkdeck-mcp")
+        self.assertEqual(adopted["automation_run_id"], "hermes-run-1")
+        record_id = self.manager.deployments[0]["sparkdeck_record_id"]
+        self.assertEqual(second[0]["id"], record_id)
+        self.assertEqual(
+            self.service.store.deployment(record_id)["settings"][
+                "manager_deployment_id"
+            ],
+            "manager-hermes",
+        )
+        stored_settings = self.service.store.deployment(record_id)["settings"]
+        self.assertEqual(stored_settings["managed_by"], "sparkdeck-mcp")
+        self.assertEqual(stored_settings["automation_run_id"], "hermes-run-1")
+        self.assertEqual(
+            self.manager.deployments[0]["launch_settings"]["sparkdeck_record_id"],
+            record_id,
+        )
+        self.manager._save_deployments.assert_called_once_with()
+
+        await self.service.deployment_action(record_id, "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "manager-hermes", "stop",
+        )
+
+    async def test_completed_legacy_launch_refreshes_early_adoption(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        cluster = {
+            "id": "manager-hermes",
+            "name": "model",
+            "model": "org/model",
+            "engine": "vllm",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "starting",
+            "api_port": None,
+            "members": [],
+            "launch_settings": {"extra_args": []},
+        }
+        self.manager.deployments = [cluster]
+
+        early = await self.service.deployments()
+        record_id = early[0]["id"]
+        self.assertIsNone(
+            self.service.store.deployment(record_id, include_private=True)[
+                "_base_url"
+            ]
+        )
+        cluster.update({
+            "status": "ready",
+            "api_port": 8123,
+            "model_source": "public_repository",
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "manager-hermes-r0",
+            }],
+        })
+
+        registered = await self.service.register_manager_deployment(cluster)
+
+        stored = self.service.store.deployment(record_id, include_private=True)
+        self.assertEqual(registered["_base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(stored["_base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(stored["container_name"], "manager-hermes-r0")
+        self.assertEqual(stored["settings"]["model_source"], "public_repository")
+
+    async def test_llama_adoption_preserves_manager_gguf_artifact(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "manager-llama",
+            "name": "GGUF deployment",
+            "model": "org/gguf-model",
+            "engine": "llama.cpp",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "ready",
+            "api_port": 8124,
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "manager-llama-r0",
+            }],
+            "launch_settings": {
+                "llama_artifact": "weights/model-Q4_K_M.gguf",
+                "extra_args": [],
+            },
+        }]
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(
+            listed[0]["model"]["artifact"], "weights/model-Q4_K_M.gguf",
+        )
+        record_id = listed[0]["id"]
+        model = dict(listed[0]["model"])
+        model["artifact"] = None
+        self.service.store.update_deployment_model(record_id, model)
+
+        registered = await self.service.register_manager_deployment(
+            self.manager.deployments[0],
+        )
+
+        self.assertEqual(
+            registered["model"]["artifact"], "weights/model-Q4_K_M.gguf",
+        )
+
+    async def test_deployment_reads_do_not_wait_for_long_create_lock(self):
+        self.manager.deployments = [{
+            "id": "manager-in-flight", "name": "in-flight",
+            "model": "org/in-flight", "engine": "vllm",
+            "node_ids": ["worker-1"], "members": [],
+            "launch_settings": {},
+        }]
+        await self.service._deployment_create_lock.acquire()
+        try:
+            listed = await asyncio.wait_for(self.service.deployments(), timeout=0.2)
+        finally:
+            self.service._deployment_create_lock.release()
+
+        self.assertEqual(listed[0]["id"], "record-1")
+        self.assertFalse(any(item["alias"] == "in-flight" for item in listed))
+        refreshed = await self.service.deployments()
+        self.assertTrue(any(item["alias"] == "in-flight" for item in refreshed))
+
+    async def test_reverse_link_collision_allocates_a_distinct_record(self):
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "new-manager",
+            "sparkdeck_record_id": "record-1",
+            "name": "Another deployment",
+            "model": "org/other-model",
+            "engine": "vllm",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "ready",
+            "desired_state": "running",
+            "api_port": 8010,
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "new-manager-r0",
+            }],
+            "launch_settings": {"extra_args": []},
+        }]
+
+        listed = await self.service.deployments()
+
+        original = self.service.store.deployment("record-1")
+        self.assertEqual(
+            original["settings"]["manager_deployment_id"], "old-manager",
+        )
+        adopted = next(item for item in listed if item["alias"] == "Another deployment")
+        self.assertNotEqual(adopted["id"], "record-1")
+        self.assertEqual(
+            adopted["settings"]["manager_deployment_id"], "new-manager",
+        )
+        self.assertEqual(
+            self.manager.deployments[0]["sparkdeck_record_id"], adopted["id"],
+        )
+
+        await self.service.deployment_action("record-1", "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "old-manager", "stop",
+        )
+        self.manager.deployment_action.reset_mock()
+        await self.service.deployment_action(adopted["id"], "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "new-manager", "stop",
+        )
+
+    async def test_remove_manager_registration_is_scoped_and_idempotent(self):
+        self.service.store.add_deployment(Deployment(
+            id="record-2", alias="unrelated", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/other"),
+            settings={"manager_deployment_id": "another-manager"},
+        ))
+
+        removed = self.service.remove_manager_deployment_registration(
+            "old-manager",
+        )
+
+        self.assertEqual(removed, "record-1")
+        self.assertIsNone(self.service.store.deployment("record-1"))
+        self.assertIsNotNone(self.service.store.deployment("record-2"))
+        self.assertIsNone(
+            self.service.remove_manager_deployment_registration("old-manager")
+        )
+
     async def test_settings_dirty_start_result_immediately_reconciles_replacement(self):
         self.manager.deployment_action.return_value = {
             "ok": True,

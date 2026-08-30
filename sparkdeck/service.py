@@ -53,6 +53,7 @@ _SAFE_CONFIGURATION_KEYS = {
 }
 _LOCAL_ROUTING_KEYS = {
     "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
+    "managed_by", "automation_run_id",
     # Saved deployments relaunch from the persisted record, so their extra
     # argv must survive persistence alongside the routing keys above.
     "extra_args",
@@ -779,7 +780,10 @@ class SparkDeckService:
         return {"model": model, "aggregates": []}
 
     async def deployments(self) -> list[dict[str, Any]]:
-        registered = self.store.deployments(include_private=True)
+        raw_manager_deployments = getattr(self.manager, "deployments", [])
+        registered = await self._adopt_unlinked_manager_deployments(
+            raw_manager_deployments,
+        )
         by_container = {item.get("container_name"): item for item in registered}
         cluster_state: dict[str, Any] = {}
         if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
@@ -787,7 +791,6 @@ class SparkDeckService:
                 cluster_state = await self.manager.get_state()
             except Exception:
                 cluster_state = {}
-        raw_manager_deployments = getattr(self.manager, "deployments", [])
         manager_deployments = (
             cluster_state.get("deployments")
             or raw_manager_deployments
@@ -899,6 +902,14 @@ class SparkDeckService:
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
+            stored["managed_by"] = (
+                cluster.get("managed_by")
+                or stored.get("settings", {}).get("managed_by")
+            )
+            stored["automation_run_id"] = (
+                cluster.get("automation_run_id")
+                or stored.get("settings", {}).get("automation_run_id")
+            )
             created_at = cluster.get("created_at")
             if isinstance(created_at, (int, float)) and created_at:
                 stored["created_at"] = datetime.fromtimestamp(
@@ -1003,6 +1014,163 @@ class SparkDeckService:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         return registered
+
+    async def register_manager_deployment(
+        self, cluster: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one legacy Manager launch in the v1 deployment catalog."""
+        registered = await self._adopt_unlinked_manager_deployments([cluster])
+        record_id = str(cluster.get("sparkdeck_record_id") or "")
+        adopted = next(
+            (item for item in registered if str(item.get("id") or "") == record_id),
+            None,
+        )
+        if adopted is None:
+            raise RuntimeError("manager deployment could not be registered")
+        return adopted
+
+    async def _adopt_unlinked_manager_deployments(
+        self, manager_deployments: Any,
+    ) -> list[dict[str, Any]]:
+        """Give legacy cluster launches durable cards in the v1 catalog.
+
+        The legacy ``/api/containers`` path returns Manager deployment IDs and
+        remains in use by MCP clients. Remote-only launches have no local
+        container for normal Docker discovery, so without this reconciliation
+        they can be healthy in Manager while remaining invisible in Models.
+        """
+        if not isinstance(manager_deployments, list):
+            return self.store.deployments(include_private=True)
+        async with self._deployment_create_lock:
+            registered = self.store.deployments(include_private=True)
+            by_manager_id = {
+                str((item.get("settings") or {}).get("manager_deployment_id")): item
+                for item in registered
+                if (item.get("settings") or {}).get("manager_deployment_id")
+            }
+            by_record_id = {
+                str(item.get("id")): item for item in registered if item.get("id")
+            }
+            changed = False
+            for cluster in manager_deployments:
+                if not isinstance(cluster, dict) or not cluster.get("id"):
+                    continue
+                manager_id = str(cluster["id"])
+                linked = by_manager_id.get(manager_id)
+                record_id = str(cluster.get("sparkdeck_record_id") or "")
+                if linked is None and record_id:
+                    linked = by_record_id.get(record_id)
+                if linked is not None:
+                    if cluster.get("sparkdeck_record_id") != linked["id"]:
+                        cluster["sparkdeck_record_id"] = linked["id"]
+                        launch_settings = cluster.get("launch_settings")
+                        if isinstance(launch_settings, dict):
+                            launch_settings["sparkdeck_record_id"] = linked["id"]
+                        changed = True
+                    continue
+                model = str(cluster.get("model") or "").strip()
+                try:
+                    runtime = RuntimeKind(str(cluster.get("engine") or "vllm"))
+                except ValueError:
+                    continue
+                if not model:
+                    continue
+                launch_settings = (
+                    dict(cluster.get("launch_settings"))
+                    if isinstance(cluster.get("launch_settings"), dict) else {}
+                )
+                safe_args = list(launch_settings.get("extra_args") or [])
+                sanitize_args = getattr(
+                    self.manager, "_without_sensitive_cli_credentials", None,
+                )
+                if callable(sanitize_args):
+                    safe_args = sanitize_args(safe_args)
+                node_ids = [
+                    str(item) for item in cluster.get("node_ids") or []
+                    if str(item).strip()
+                ]
+                settings = self._local_configuration({
+                    **launch_settings,
+                    "extra_args": safe_args,
+                    "deployment_mode": (
+                        cluster.get("mode")
+                        or launch_settings.get("deployment_mode")
+                        or ("replicated" if len(node_ids) > 1 else "single")
+                    ),
+                    "node_ids": node_ids,
+                    "manager_deployment_id": manager_id,
+                    "model_source": cluster.get("model_source") or "unknown",
+                    "managed_by": cluster.get("managed_by"),
+                    "automation_run_id": cluster.get("automation_run_id"),
+                })
+                alias_base = str(
+                    cluster.get("name")
+                    or launch_settings.get("deployment_name")
+                    or model
+                ).strip() or model
+                record_id = record_id or str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"sparkdeck:manager-deployment:{manager_id}",
+                ))
+                alias = alias_base
+                suffix = 1
+                while self.store.deployment(alias) is not None:
+                    marker = manager_id[:8]
+                    if suffix > 1:
+                        marker = f"{marker}-{suffix}"
+                    alias = f"{alias_base} ({marker})"
+                    suffix += 1
+                members = cluster.get("members") or []
+                primary = members[0] if members and isinstance(members[0], dict) else {}
+                deployment = Deployment(
+                    id=record_id,
+                    alias=alias,
+                    runtime=runtime,
+                    kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity(
+                        repository=model,
+                        revision=self._persisted_revision(launch_settings),
+                        artifact=_optional_string(launch_settings.get("artifact")),
+                        quantization=canonical_quantization(
+                            launch_settings.get("quantization")
+                        ),
+                    ),
+                    container_name=primary.get("container_name"),
+                    settings=settings,
+                    desired_state=(
+                        str(cluster.get("desired_state"))
+                        if cluster.get("desired_state") in {"running", "stopped"}
+                        else "running"
+                    ),
+                )
+                try:
+                    port = int(cluster.get("api_port"))
+                except (TypeError, ValueError):
+                    port = None
+                self.store.add_deployment(
+                    deployment,
+                    f"http://127.0.0.1:{port}" if port else None,
+                    None,
+                )
+                cluster["sparkdeck_record_id"] = record_id
+                if isinstance(cluster.get("launch_settings"), dict):
+                    cluster["launch_settings"]["sparkdeck_record_id"] = record_id
+                adopted = self.store.deployment(record_id, include_private=True)
+                if adopted is not None:
+                    registered.append(adopted)
+                    by_manager_id[manager_id] = adopted
+                    by_record_id[record_id] = adopted
+                changed = True
+            if changed:
+                save_deployments = getattr(self.manager, "_save_deployments", None)
+                if callable(save_deployments):
+                    try:
+                        save_deployments()
+                    except Exception:
+                        # The SQLite forward link is already durable and is
+                        # sufficient to prevent duplicate adoption next time.
+                        pass
+            return registered
 
     async def _probe_external_endpoint(self, deployment: dict[str, Any]) -> None:
         if deployment.get("kind") != DeploymentKind.EXTERNAL.value:

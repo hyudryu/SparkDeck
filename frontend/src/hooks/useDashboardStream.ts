@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { RefObject } from 'react'
-import { deploymentFromWire, syncStatusFromWire } from '../api/client'
+import { api, deploymentFromWire, syncStatusFromWire } from '../api/client'
 import type { WireDeployment } from '../api/client'
 import type {
   AdmissionStats,
@@ -43,6 +43,7 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
     let socket: WebSocket | undefined
     let reconnectTimer: number | undefined
     let closed = false
+    const roleController = new AbortController()
 
     const markFailed = (source: DashboardStreamSource, isFailed: boolean) => {
       setFailed((current) => {
@@ -107,9 +108,19 @@ export function useDashboardStream(resourcesRef: RefObject<DashboardStreamResour
       }
     }
 
-    connect()
+    // Joined workers deliberately reject this local WebSocket and serve the
+    // dashboard through controller-forwarded REST polling instead. Check the
+    // unforwarded onboarding status first so that expected fallback does not
+    // produce a failed-handshake error in the browser console every 5 seconds.
+    void api.onboarding.get(roleController.signal).then((status) => {
+      if (!closed && status.role !== 'worker') connect()
+    }).catch(() => {
+      // Preserve the existing stream-first behavior if role discovery fails.
+      if (!closed) connect()
+    })
     return () => {
       closed = true
+      roleController.abort()
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
       socket?.close()
     }

@@ -35,6 +35,14 @@ beforeEach(() => {
     if (path === '/api/v1/nodes') {
       return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
+    if (path === '/api/v1/runtime-flags/preview' && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({
+        flags: body.extra_args,
+        command_flags: body.extra_args.map(quoteArgForTest).join(' '),
+        environment: body.environment,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
     if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
       return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
@@ -44,6 +52,8 @@ beforeEach(() => {
     return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
   })
 })
+
+const quoteArgForTest = (arg: string) => (/[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg}'` : arg)
 
 afterEach(() => {
   cleanup()
@@ -71,6 +81,8 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
       `--enable-prefix-caching --speculative-config '{"method":"ngram","foo":true}' 'C:\\models\\foo' '' 'owner'\\''s-model'`,
     )
+    const finalFlags = await screen.findByLabelText(/Final runtime flags/)
+    await waitFor(() => expect((finalFlags as HTMLTextAreaElement).value).toContain('--speculative-config'))
     await user.clear(screen.getByLabelText('Max concurrency'))
     await user.type(screen.getByLabelText('Max concurrency'), '6')
     await user.clear(screen.getByLabelText('Tensor parallel size'))
@@ -82,7 +94,10 @@ describe('deployment object page', () => {
     await user.click(screen.getByRole('button', { name: 'Start on 4 nodes' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
-    const mutationCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    const mutationCalls = fetchMock.mock.calls.filter(([input, init]) => (
+      (init?.method === 'PUT' || init?.method === 'POST')
+      && !String(input).includes('/runtime-flags/preview')
+    ))
     expect(mutationCalls.map(([input]) => String(input))).toEqual([
       '/api/v1/deployments/dep-1/settings',
       '/api/v1/deployments/dep-1/start',

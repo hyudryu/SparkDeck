@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -519,6 +520,85 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-tp 2", flags)
         self.assertIn("-pp 1", flags)
         self.assertIn("--max-num-batched-tokens 8192", flags)
+
+    async def test_discovered_vllm_settings_create_and_inline_speculative_environment(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {
+            "name": "vllm-dspark", "image": "example/dspark:latest",
+            "load_settings": {
+                "engine": "vllm", "editable": True,
+                "extra_args": [
+                    "--speculative-config", "${SPECULATIVE_CONFIG}",
+                    "--enable-prefix-caching",
+                ],
+                "thinking_mode": "default", "environment": {"NCCL_DEBUG": "WARN"},
+            },
+        }
+        update = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_settings", update),
+        ):
+            response = await self.client.put(
+                "/api/v1/deployments/container:vllm-dspark/settings",
+                json={
+                    "extra_args": container["load_settings"]["extra_args"],
+                    "environment": {"NCCL_DEBUG": "WARN"},
+                    "launch_controls": {
+                        "speculative_method": "dspark",
+                        "draft_sample_method": "probabilistic",
+                        "dspark_num_speculative_tokens": 5,
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        replacement = update.await_args.args[1]
+        self.assertEqual(
+            json.loads(replacement["environment"]["SPECULATIVE_CONFIG"]),
+            {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            },
+        )
+        self.assertNotIn("${SPECULATIVE_CONFIG}", replacement["command_flags"])
+        self.assertIn("--enable-prefix-caching", replacement["command_flags"])
+
+    async def test_runtime_flags_preview_resolves_environment_backed_speculation(self):
+        response = await self.client.post(
+            "/api/v1/runtime-flags/preview",
+            json={
+                "runtime": "vllm",
+                "extra_args": ["--speculative-config", "${SPECULATIVE_CONFIG}"],
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "launch_controls": {
+                    "speculative_method": "dspark",
+                    "draft_sample_method": "probabilistic",
+                    "dspark_num_speculative_tokens": 5,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertNotIn("${SPECULATIVE_CONFIG}", body["command_flags"])
+        self.assertEqual(
+            json.loads(body["environment"]["SPECULATIVE_CONFIG"]),
+            {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            },
+        )
 
     async def test_discovered_partial_update_preserves_memory_utilization(self):
         card = {

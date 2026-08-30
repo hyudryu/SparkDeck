@@ -2059,6 +2059,44 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     environment={"NCCL_DEBUG": "WARN"},
                 )
 
+    async def test_recipe_update_creates_missing_speculative_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = [{
+                "id": "spec-env",
+                "name": "Speculative",
+                "model": "model/a",
+                "engine": "vllm",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "extra_args": [
+                    "--speculative-config", "${SPECULATIVE_CONFIG}",
+                ],
+                "environment": {},
+            }]
+            instance.recipes_path = Path(directory) / "recipes.json"
+
+            updated = await instance.update_recipe("spec-env", {
+                "launch_controls": {
+                    "speculative_method": "dspark",
+                    "draft_sample_method": "probabilistic",
+                    "dspark_num_speculative_tokens": 5,
+                },
+            })
+
+            self.assertEqual(
+                instance._cli_option(updated["extra_args"], {"--speculative-config"}),
+                "${SPECULATIVE_CONFIG}",
+            )
+            self.assertEqual(json.loads(updated["environment"]["SPECULATIVE_CONFIG"]), {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            })
+            saved = json.loads(instance.recipes_path.read_text())
+            self.assertEqual(saved[0]["environment"], updated["environment"])
+
     async def test_recipe_delete_is_durable_and_clears_transient_launch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
@@ -3037,6 +3075,78 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(speculative["draft_sample_method"], "probabilistic")
         self.assertEqual(speculative["num_speculative_tokens"], 7)
         self.assertTrue(speculative["custom"])
+
+    def test_launch_controls_create_missing_environment_backed_speculative_config(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        args = ["--speculative-config", "${SPECULATIVE_CONFIG}"]
+        environment = {}
+
+        updated = instance._apply_deployment_launch_controls(
+            args,
+            "vllm",
+            {
+                "speculative_method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "dspark_num_speculative_tokens": 5,
+            },
+            environment,
+        )
+
+        self.assertEqual(
+            instance._cli_option(updated, {"--speculative-config"}),
+            "${SPECULATIVE_CONFIG}",
+        )
+        self.assertEqual(json.loads(environment["SPECULATIVE_CONFIG"]), {
+            "method": "dspark",
+            "draft_sample_method": "probabilistic",
+            "num_speculative_tokens": 5,
+        })
+
+        preview = instance.preview_runtime_flags(
+            args,
+            "vllm",
+            {
+                "speculative_method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "dspark_num_speculative_tokens": 5,
+            },
+            {},
+        )
+        self.assertNotIn("${SPECULATIVE_CONFIG}", preview["command_flags"])
+        self.assertEqual(
+            json.loads(instance._cli_option(preview["flags"], {"--speculative-config"})),
+            {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            },
+        )
+
+    def test_runtime_flags_preview_includes_generated_sglang_controls(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        preview = instance.preview_runtime_flags(
+            ["--enable-metrics"],
+            "sglang",
+            {"context_window": 120000, "max_concurrency": 10},
+            {},
+            sg_tp_size=2,
+            sg_mem_fraction=0.85,
+        )
+
+        self.assertEqual(
+            preview["flags"],
+            [
+                "--tp-size", "2",
+                "--context-length", "120000",
+                "--mem-fraction-static", "0.85",
+                "--max-running-requests", "10",
+                "--max-total-tokens", "2400000",
+                "--enable-metrics",
+            ],
+        )
 
     def test_launch_controls_reject_invalid_environment_backed_speculative_config(
         self,

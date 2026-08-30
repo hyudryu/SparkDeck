@@ -4068,9 +4068,20 @@ class Manager:
                 raw_speculative = self._cli_option(
                     current_tokens, {"--speculative-config"}
                 )
-                speculative, environment_key = self._speculative_config(
-                    current_tokens, environment, strict=bool(raw_speculative),
-                )
+                environment_key = self._environment_reference(raw_speculative)
+                if (
+                    environment_key
+                    and environment is not None
+                    and environment_key not in environment
+                ):
+                    # The structured controls are sufficient to create a new
+                    # environment-backed config. Do not reject the missing
+                    # value before those submitted controls can populate it.
+                    speculative = {}
+                else:
+                    speculative, environment_key = self._speculative_config(
+                        current_tokens, environment, strict=bool(raw_speculative),
+                    )
 
                 for control_key, config_key in (
                     ("speculative_method", "method"),
@@ -4117,6 +4128,84 @@ class Manager:
             return shlex.split(flags)
         except ValueError as exc:
             raise ValueError("launch arguments have invalid shell quoting") from exc
+
+    def preview_runtime_flags(
+        self,
+        args: list[str],
+        engine: str,
+        controls: dict,
+        environment: dict[str, str] | None = None,
+        gpu_memory_utilization: Any = None,
+        sg_tp_size: Any = None,
+        sg_mem_fraction: Any = None,
+    ) -> dict[str, Any]:
+        """Return the backend-normalized runtime flags without mutating state."""
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("runtime flag preview supports vllm and sglang")
+        if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
+            raise ValueError("extra_args must be an array of strings")
+        if not isinstance(controls, dict):
+            raise ValueError("launch_controls must be an object")
+        self._reject_hf_cli_credentials(args)
+        normalized_environment = normalize_runtime_environment(environment, engine)
+        final_args = self._apply_deployment_launch_controls(
+            list(args), engine, controls, normalized_environment,
+        )
+        if engine == "vllm":
+            final_args = self._resolve_environment_backed_speculative_args(
+                final_args, normalized_environment,
+            )
+            if gpu_memory_utilization not in (None, ""):
+                try:
+                    utilization = float(gpu_memory_utilization)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "gpu_memory_utilization must be a number"
+                    ) from exc
+                if not 0 < utilization <= 1:
+                    raise ValueError("gpu_memory_utilization must be between 0 and 1")
+                flags = self._replace_command_option(
+                    shlex.join(final_args), {"--gpu-memory-utilization"}, utilization,
+                )
+                final_args = shlex.split(flags)
+        else:
+            tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
+            mem_fraction = self._validated_sg_scalar(
+                "sg_mem_fraction", sg_mem_fraction,
+            )
+            context_length = self._validated_sg_scalar(
+                "sg_context_length", controls.get("context_window"),
+            )
+            max_running = self._validated_sg_scalar(
+                "sg_max_running_requests", controls.get("max_concurrency"),
+            )
+            flags = shlex.join(final_args)
+            for names in (
+                {"--tp-size"}, {"--context-length"}, {"--mem-fraction-static"},
+                {"--max-running-requests"}, {"--max-total-tokens"},
+            ):
+                flags = self._replace_command_option(flags, names, None)
+            generated: list[str] = []
+            if tp_size is not None:
+                generated += ["--tp-size", str(tp_size)]
+            if context_length is not None:
+                generated += ["--context-length", str(context_length)]
+            if mem_fraction is not None:
+                generated += ["--mem-fraction-static", str(mem_fraction)]
+            if max_running is None and context_length is not None:
+                max_running = 8
+            if max_running is not None:
+                generated += ["--max-running-requests", str(max_running)]
+                generated += [
+                    "--max-total-tokens",
+                    str(max_running * (context_length or 32768) * 2),
+                ]
+            final_args = generated + shlex.split(flags)
+        return {
+            "flags": final_args,
+            "command_flags": shlex.join(final_args),
+            "environment": normalized_environment,
+        }
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""

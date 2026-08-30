@@ -42,6 +42,7 @@ import type {
   SavedConfiguration,
   SavedConfigurationDetail,
   RecipeUpdateInput,
+  RuntimeFlagsPreview,
   UsageAnalysis,
   UsageSummary,
   SystemUpdateOverview,
@@ -524,6 +525,15 @@ export const api = {
       })
       return deploymentDetailFromWire(data)
     },
+    previewFlags: (
+      runtime: RuntimeKind,
+      input: DeploymentUpdateInput,
+      signal?: AbortSignal,
+    ) => request<RuntimeFlagsPreview>('/api/v1/runtime-flags/preview', {
+      method: 'POST',
+      body: JSON.stringify({ runtime, ...input }),
+      signal,
+    }),
     create: async (input: CreateDeploymentInput) => {
       const data = await request<WireDeployment>('/api/v1/deployments', {
         method: 'POST',

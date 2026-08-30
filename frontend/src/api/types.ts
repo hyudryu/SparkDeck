@@ -89,6 +89,9 @@ export interface Deployment {
   runtime: RuntimeKind
   status: DeploymentStatus
   managed: boolean
+  controllable?: boolean
+  logs_available?: boolean
+  removable?: boolean
   endpoint_url?: string
   runtime_version?: string
   image?: string

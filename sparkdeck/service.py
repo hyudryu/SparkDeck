@@ -1339,8 +1339,11 @@ class SparkDeckService:
     async def _probe_external_endpoint(self, deployment: dict[str, Any]) -> None:
         if deployment.get("kind") != DeploymentKind.EXTERNAL.value:
             return
+        discovered = str(deployment.get("id") or "").startswith("container:")
+        if discovered and deployment.get("status") not in {"running", "starting"}:
+            return
         base_url = deployment.get("_base_url")
-        if not base_url and str(deployment.get("id") or "").startswith("container:"):
+        if not base_url and discovered:
             # Discovered cards have no stored endpoint: only probe when the
             # container exposes a mappable port, and keep the Docker status
             # otherwise (host-network containers have none).
@@ -1364,6 +1367,11 @@ class SparkDeckService:
             )
             deployment["status"] = "running"
         except Exception:
+            if discovered:
+                # Docker owns lifecycle truth for synthetic container cards.
+                # The endpoint may still be loading or require credentials
+                # that SparkDeck does not have; neither makes it startable.
+                return
             deployment["status"] = "error"
             deployment["last_error"] = "Endpoint health check failed"
 
@@ -1546,6 +1554,7 @@ class SparkDeckService:
             else:
                 gpu_memory_utilization = discovered_settings.get("gpu_memory_utilization")
             image = image or discovered_image
+            environment = discovered_settings.get("environment") or environment
         return {
             **public,
             "settings": public_settings,
@@ -3216,7 +3225,7 @@ class SparkDeckService:
             )
         if not deployment:
             raise LookupError("deployment not found")
-        if deployment["kind"] != DeploymentKind.MANAGED.value:
+        if deployment["kind"] != DeploymentKind.MANAGED.value and discovered is None:
             raise ValueError("external endpoints cannot be started or stopped by SparkDeck")
         container = deployment.get("container_name")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
@@ -3358,12 +3367,23 @@ class SparkDeckService:
                 raise LookupError("managed container is unavailable") from exc
             if current is None:
                 raise LookupError("managed container not found")
+        external_discovered = discovered is not None and not deployment.get("managed")
         if action == "start":
-            await self.manager.start_container(container, explicit=True)
+            if external_discovered:
+                await self.manager.start_container(
+                    container, explicit=True, managed=False,
+                )
+            else:
+                await self.manager.start_container(container, explicit=True)
             if discovered is None:
                 self.store.update_desired_state(deployment_id, "running")
         elif action == "stop":
-            await self.manager.stop_container(container, explicit=True)
+            if external_discovered:
+                await self.manager.stop_container(
+                    container, explicit=True, managed=False,
+                )
+            else:
+                await self.manager.stop_container(container, explicit=True)
         else:
             raise ValueError("action must be start or stop")
         current = self.store.deployment(deployment_id) or deployment
@@ -3691,7 +3711,10 @@ class SparkDeckService:
             )
         if not deployment:
             raise LookupError("deployment not found")
-        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+        if (
+            deployment.get("kind") != DeploymentKind.MANAGED.value
+            and not str(deployment_id).startswith("container:")
+        ):
             raise ValueError("external endpoints have no managed logs")
         try:
             bounded_tail = min(100_000, max(1, int(tail)))
@@ -3773,10 +3796,6 @@ class SparkDeckService:
             discovered = True
         if not deployment:
             raise LookupError("deployment not found")
-        if discovered and deployment["kind"] != DeploymentKind.MANAGED.value:
-            raise ValueError(
-                "unmanaged discovered containers cannot be removed by SparkDeck"
-            )
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
         if manager_id:
@@ -3789,7 +3808,9 @@ class SparkDeckService:
             result = await self.manager.deployment_action(owner["id"], "remove")
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
-        elif deployment["kind"] == DeploymentKind.MANAGED.value and deployment.get("container_name"):
+        elif (
+            deployment["kind"] == DeploymentKind.MANAGED.value or discovered
+        ) and deployment.get("container_name"):
             try:
                 await self.manager.remove_container(deployment["container_name"])
             except Exception as exc:
@@ -3856,7 +3877,13 @@ class SparkDeckService:
     def _discovered_deployment(
         self, container: dict[str, Any], runtime: str, model: str
     ) -> dict[str, Any]:
-        return {
+        phase = container.get("phase") if isinstance(container.get("phase"), dict) else {}
+        status = _managed_container_status(container)
+        if not container.get("managed") and container.get("status") == "created":
+            # Docker-created external containers are idle and startable. The
+            # same state remains a launch phase for SparkDeck-managed runs.
+            status = "stopped"
+        result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify
             # an individual legacy container action safely.
@@ -3868,13 +3895,22 @@ class SparkDeckService:
                 "repository": model, "revision": None, "artifact": None,
                 "quantization": container.get("variant"),
             },
-            "status": _managed_container_status(container),
+            "status": status,
             "container_name": container.get("name"),
             "settings": self._safe_configuration(container.get("load_settings") or {}),
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            "controllable": True,
+            "logs_available": True,
+            "removable": True,
         }
+        if status == "starting" and phase:
+            result.update({
+                "launch_phase": str(phase.get("phase") or "starting"),
+                "launch_message": str(phase.get("message") or "Container is starting"),
+            })
+        return result
 
     async def models(self) -> dict[str, Any]:
         data = []

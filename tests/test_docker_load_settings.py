@@ -84,6 +84,44 @@ class FakeAPI:
 
 
 class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
+    def test_external_summary_combines_entrypoint_and_cmd_and_exposes_safe_environment(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "external-container-id",
+            "external-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": [
+                    "org/model", "--max-model-len", "65536",
+                    "--enable-prefix-caching",
+                ],
+                "Env": [
+                    "VLLM_CACHE_ROOT=/cache/vllm",
+                    "NCCL_DEBUG=INFO",
+                    "HF_TOKEN=must-not-leak",
+                    "SERVICE_API_KEY=must-not-leak",
+                    "DATABASE_URL=postgres://user:password@host/db",
+                    "SENTRY_DSN=https://secret@example.invalid/1",
+                    "FEATURE_FLAG=must-not-be-discovered",
+                ],
+                "Labels": {},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        settings = summary["load_settings"]
+        self.assertEqual(settings["context_window"], 65536)
+        self.assertIn("--enable-prefix-caching", settings["extra_args"])
+        self.assertEqual(settings["environment"], {
+            "VLLM_CACHE_ROOT": "/cache/vllm",
+            "NCCL_DEBUG": "INFO",
+        })
+
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 
@@ -461,6 +499,28 @@ class ContainerToRecipeTests(unittest.IsolatedAsyncioTestCase):
             self.manager._cli_option(args, {"--max-cudagraph-capture-size"}, int), 512
         )
         self.assertIn("--enable-prefix-caching", args)
+
+    async def test_vllm_entrypoint_and_cmd_import_as_one_command(self):
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "entrypoint-cid", "entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-model-len", "65536", "--enable-prefix-caching"],
+                "Labels": {},
+            },
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("entrypoint-vllm")
+
+        self.assertEqual(recipe["model"], "org/model")
+        self.assertEqual(
+            self.manager._cli_option(recipe["extra_args"], {"--max-model-len"}, int),
+            65536,
+        )
+        self.assertIn("--enable-prefix-caching", recipe["extra_args"])
 
     async def test_missing_container_raises_lookup_error(self):
         with self._attach(FakeContainers()):

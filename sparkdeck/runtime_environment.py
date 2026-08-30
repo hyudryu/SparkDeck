@@ -13,6 +13,31 @@ _SECRET_NAME = re.compile(
 )
 _PROTECTED_NAMES = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
+# Docker inspection may expose arbitrary application credentials. Only these
+# known runtime-tuning inputs are safe and useful to carry into a recipe saved
+# from an externally created vLLM container.
+_DISCOVERED_RUNTIME_ENVIRONMENT_NAMES = frozenset({
+    "HF_HUB_OFFLINE",
+    "NCCL_DEBUG",
+    "NCCL_IB_DISABLE",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_HCA",
+    "NCCL_NET",
+    "NCCL_SOCKET_IFNAME",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "UCX_NET_DEVICES",
+    "VLLM_ASSETS_CACHE",
+    "VLLM_ATTENTION_BACKEND",
+    "VLLM_CACHE_ROOT",
+    "VLLM_CONFIG_ROOT",
+    "VLLM_LOGGING_LEVEL",
+    "VLLM_LOG_STATS_INTERVAL",
+    "VLLM_NO_USAGE_STATS",
+    "VLLM_TARGET_DEVICE",
+    "VLLM_USE_V1",
+    "VLLM_WORKER_MULTIPROC_METHOD",
+})
+
 
 def normalize_runtime_environment(
     value: Any, engine: str = "vllm",
@@ -49,4 +74,24 @@ def normalize_runtime_environment(
         if total_size > 65536:
             raise ValueError("environment cannot exceed 64 KiB")
         result[name] = raw_value
+    return result
+
+
+def discovered_runtime_environment(
+    value: Any, engine: str = "vllm",
+) -> dict[str, str]:
+    """Return only allowlisted tuning values found through Docker inspection."""
+    if engine != "vllm" or not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for name, raw_value in value.items():
+        if name not in _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES:
+            continue
+        try:
+            result = normalize_runtime_environment(
+                {**result, name: raw_value}, engine,
+            )
+        except ValueError:
+            # Malformed image defaults should not hide the container itself.
+            continue
     return result

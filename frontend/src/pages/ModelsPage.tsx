@@ -1691,7 +1691,7 @@ export function ModelsPage() {
                     )}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
-                    {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
+                    {(deployment.managed || deployment.controllable) && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
                       ? (supportsAdditionalNodes(deployment)
                         ? <SplitButton
                             label="Stop"
@@ -1701,11 +1701,11 @@ export function ModelsPage() {
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : 'Start'}</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => deployment.managed ? openStartPicker(deployment) : void act(deployment, 'start')}>{deployment.status === 'saved' ? 'Launch' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
-                    {deployment.managed && deployment.status !== 'saved' && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
+                    {(deployment.managed || deployment.logs_available) && deployment.status !== 'saved' && <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Logs for ${deployment.alias}`} title="Logs" onClick={() => openLogs(deployment)}><ScrollText size={16} /></Button>}
                     {deployment.id.startsWith('container:') && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Save ${deployment.alias} as recipe`} title="Save as recipe" onClick={() => void importContainerRecipe(deployment)}><FolderPlus size={16} /></Button>
                     )}

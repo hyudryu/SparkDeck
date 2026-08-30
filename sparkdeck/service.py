@@ -982,7 +982,9 @@ class SparkDeckService:
                     # containers until its first explicit start.
                     deployment["status"] = "saved"
                     deployment["node_ids"] = list(settings.get("node_ids") or [])
-                    deployment.update(self._saved_layout_contract(settings))
+                    deployment.update(self._saved_layout_contract(
+                        settings, str(deployment.get("runtime") or ""),
+                    ))
                     continue
                 deployment["status"] = "missing"
                 deployment["last_error"] = (
@@ -1468,6 +1470,13 @@ class SparkDeckService:
             tp_control = controls.get("tensor_parallel_size")
             if isinstance(tp_control, int):
                 settings["tensor_parallel_size"] = tp_control
+            elif "tensor_parallel_size" in controls and str(
+                stored.get("runtime")
+            ) == RuntimeKind.VLLM.value:
+                # An explicit clear drops the saved scalar too, or the layout
+                # contract keeps demanding the stale topology. SGLang editors
+                # always submit a null here; their scalar is sg-driven.
+                settings["tensor_parallel_size"] = None
         if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if "sg_mem_fraction" in changes:
@@ -1533,7 +1542,9 @@ class SparkDeckService:
             raise ValueError(
                 "llama.cpp deployments support single and replicated layouts, not sharded"
             )
-        contract = self._saved_layout_contract(settings)
+        contract = self._saved_layout_contract(
+            settings, str(stored.get("runtime") or ""),
+        )
         if contract["deployment_mode"] == "single" and len(effective_nodes) > 1:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
@@ -1771,7 +1782,9 @@ class SparkDeckService:
         return controls
 
     @staticmethod
-    def _saved_layout_contract(settings: dict[str, Any]) -> dict[str, Any]:
+    def _saved_layout_contract(
+        settings: dict[str, Any], runtime: str | None = None,
+    ) -> dict[str, Any]:
         """Derive the launch layout contract persisted on a saved bookmark.
 
         Mirrors Manager's contract (replicated = the saved node count, sharded
@@ -1806,10 +1819,12 @@ class SparkDeckService:
             )
             if world > 1:
                 # Mirror Manager's launch gate: several ranks per node are
-                # valid when the world size divides the saved node count.
+                # valid for vLLM when the world size divides the saved node
+                # count; SGLang always launches one rank per node.
                 count = (
                     len(node_ids)
-                    if len(node_ids) > 1 and world % len(node_ids) == 0
+                    if runtime == RuntimeKind.VLLM.value
+                    and len(node_ids) > 1 and world % len(node_ids) == 0
                     else world
                 )
             else:
@@ -2075,7 +2090,7 @@ class SparkDeckService:
                         **self._saved_layout_contract({
                             "deployment_mode": mode,
                             "node_ids": requested_node_ids,
-                        }),
+                        }, runtime.value),
                         "selected_nodes": [
                             self.manager.public_target_node(node) for node in selected
                         ],

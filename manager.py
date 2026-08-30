@@ -3898,16 +3898,21 @@ class Manager:
         )
 
         if engine == "vllm":
-            flags = self._replace_command_option(
-                flags,
-                {"--tensor-parallel-size", "-tp"},
-                positive_int("tensor_parallel_size"),
-            )
-            flags = self._replace_command_option(
-                flags,
-                {"--pipeline-parallel-size", "-pp"},
-                positive_int("pipeline_parallel_size"),
-            )
+            # An absent key means the caller did not submit the control (e.g.
+            # an older client updating an unrelated field): leave the current
+            # flag untouched. Only an explicit null clears it.
+            if "tensor_parallel_size" in controls:
+                flags = self._replace_command_option(
+                    flags,
+                    {"--tensor-parallel-size", "-tp"},
+                    positive_int("tensor_parallel_size"),
+                )
+            if "pipeline_parallel_size" in controls:
+                flags = self._replace_command_option(
+                    flags,
+                    {"--pipeline-parallel-size", "-pp"},
+                    positive_int("pipeline_parallel_size"),
+                )
             flags = self._replace_command_option(
                 flags,
                 {"--max-cudagraph-capture-size"},
@@ -9157,10 +9162,14 @@ class Manager:
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
             saved_count = len(saved_nodes)
-            if parallel_nodes > 1 and saved_count > 1 and parallel_nodes % saved_count == 0:
-                # The launch gate accepts layouts with several ranks per node
-                # (e.g. TP4/PP1 on two nodes); honor the saved node count so
-                # restarts do not demand one node per rank.
+            if (
+                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
+                and parallel_nodes % saved_count == 0
+            ):
+                # The vLLM launch gate accepts layouts with several ranks per
+                # node (e.g. TP4/PP1 on two nodes); honor the saved node count
+                # so restarts do not demand one node per rank. SGLang launches
+                # always use one rank per node and keep the rank-derived count.
                 required_nodes = saved_count
             elif parallel_nodes > 1:
                 required_nodes = parallel_nodes

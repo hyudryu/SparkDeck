@@ -18,6 +18,7 @@ const detail = {
   launch_controls: {
     context_window: 8192, max_concurrency: 4, tensor_parallel_size: 2,
     pipeline_parallel_size: 1, thinking_mode: 'default',
+    speculative_method: 'ngram', draft_sample_method: 'greedy',
   },
   gpu_memory_utilization: 0.9, gpu_memory_gb: null, image: null,
 }
@@ -58,6 +59,8 @@ describe('deployment object page', () => {
     expect(container.querySelector('.page')).toContainElement(screen.getByRole('heading', { name: 'Reasoning server' }))
     expect(screen.getByLabelText('Tensor parallel size')).toHaveValue(2)
     expect(screen.getByLabelText('Pipeline parallel size')).toHaveValue(1)
+    expect(screen.getByLabelText('Speculative method')).toHaveValue('ngram')
+    expect(screen.getByLabelText('Draft sample method')).toHaveValue('greedy')
     expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
       `--enable-prefix-caching --speculative-config '{"method":"ngram","foo":true}' 'C:\\models\\foo' '' 'owner'\\''s-model'`,
     )
@@ -65,6 +68,8 @@ describe('deployment object page', () => {
     await user.type(screen.getByLabelText('Max concurrency'), '6')
     await user.clear(screen.getByLabelText('Tensor parallel size'))
     await user.type(screen.getByLabelText('Tensor parallel size'), '4')
+    await user.selectOptions(screen.getByLabelText('Speculative method'), 'dspark')
+    await user.selectOptions(screen.getByLabelText('Draft sample method'), 'probabilistic')
     await user.click(screen.getByRole('button', { name: 'Run' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
@@ -77,6 +82,8 @@ describe('deployment object page', () => {
     expect(saved.launch_controls.max_concurrency).toBe(6)
     expect(saved.launch_controls.tensor_parallel_size).toBe(4)
     expect(saved.launch_controls.pipeline_parallel_size).toBe(1)
+    expect(saved.launch_controls.speculative_method).toBe('dspark')
+    expect(saved.launch_controls.draft_sample_method).toBe('probabilistic')
     expect(saved.extra_args).toEqual([
       '--enable-prefix-caching', '--speculative-config',
       '{"method":"ngram","foo":true}', 'C:\\models\\foo', '', "owner's-model",

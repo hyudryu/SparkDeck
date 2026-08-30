@@ -235,6 +235,9 @@ type ArgsEditorState = {
   form: ArgsForm
 }
 
+const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
+const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
+
 const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
   const controls = detail.launch_controls ?? {}
   return {
@@ -242,6 +245,8 @@ const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
     max_concurrency: controls.max_concurrency?.toString() ?? '',
     kv_cache_dtype: controls.kv_cache_dtype ?? '',
     thinking_mode: controls.thinking_mode ?? 'default',
+    speculative_method: controls.speculative_method ?? '',
+    draft_sample_method: controls.draft_sample_method ?? '',
     dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens?.toString() ?? '',
     max_cudagraph_capture_size: controls.max_cudagraph_capture_size?.toString() ?? '',
     max_num_batched_tokens: controls.max_num_batched_tokens?.toString() ?? '',
@@ -1403,6 +1408,8 @@ export function ModelsPage() {
         max_concurrency: numeric(editorForm.max_concurrency),
         kv_cache_dtype: editorForm.kv_cache_dtype?.trim() || null,
         thinking_mode: editorForm.thinking_mode || 'default',
+        speculative_method: editorForm.speculative_method || null,
+        draft_sample_method: editorForm.draft_sample_method || null,
         dspark_num_speculative_tokens: numeric(editorForm.dspark_num_speculative_tokens),
         max_cudagraph_capture_size: numeric(editorForm.max_cudagraph_capture_size),
         max_num_batched_tokens: numeric(editorForm.max_num_batched_tokens),
@@ -1780,6 +1787,8 @@ export function ModelsPage() {
                         <label className="field"><span>KV cache dtype</span><input value={editor.form.kv_cache_dtype} placeholder="auto" onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, kv_cache_dtype: event.target.value } })} /></label>
                         <label className="field"><span>Thinking</span><select value={editor.form.thinking_mode} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, thinking_mode: event.target.value } })}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
                         {isVllm && <>
+                          <label className="field"><span>Speculative method</span><select value={editor.form.speculative_method} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, speculative_method: event.target.value } })}><option value="">Auto / unset</option>{editor.form.speculative_method && !SPECULATIVE_METHODS.includes(editor.form.speculative_method) && <option value={editor.form.speculative_method}>{editor.form.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
+                          <label className="field"><span>Draft sample method</span><select value={editor.form.draft_sample_method} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, draft_sample_method: event.target.value } })}><option value="">Default</option>{editor.form.draft_sample_method && !DRAFT_SAMPLE_METHODS.includes(editor.form.draft_sample_method) && <option value={editor.form.draft_sample_method}>{editor.form.draft_sample_method}</option>}{DRAFT_SAMPLE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
                           <label className="field"><span>Speculative tokens</span><input type="number" min="1" value={editor.form.dspark_num_speculative_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, dspark_num_speculative_tokens: event.target.value } })} /></label>
                           <label className="field"><span>Cudagraph capture size</span><input type="number" min="1" value={editor.form.max_cudagraph_capture_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_cudagraph_capture_size: event.target.value } })} /></label>
                           <label className="field"><span>Batched tokens</span><input type="number" min="1" value={editor.form.max_num_batched_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_num_batched_tokens: event.target.value } })} /></label>

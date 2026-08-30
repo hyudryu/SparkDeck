@@ -99,6 +99,7 @@ def _discovered_launch_controls(
     controls = manager._deployment_launch_controls({
         "engine": engine,
         "extra_args": extra_args,
+        "environment": settings.get("environment") or {},
         **(
             {
                 "sg_context_length": settings.get("context_window"),
@@ -1692,8 +1693,14 @@ class SparkDeckService:
             **current_controls,
             **(submitted_controls or {}),
         }
+        original_environment = normalize_runtime_environment(
+            settings.get("environment"), engine,
+        )
+        environment = normalize_runtime_environment(
+            changes.get("environment", original_environment), engine,
+        )
         merged_args = self.manager._apply_deployment_launch_controls(
-            list(args), engine, controls,
+            list(args), engine, controls, environment,
         )
 
         if engine == "sglang":
@@ -1730,8 +1737,8 @@ class SparkDeckService:
             "thinking_mode": controls.get("thinking_mode"),
             "gpu_memory_utilization": utilization,
         }
-        if "environment" in changes:
-            replacement["environment"] = changes.get("environment")
+        if "environment" in changes or environment != original_environment:
+            replacement["environment"] = environment
         await self.manager.update_container_settings(name, replacement)
         return await self.deployment_detail(f"container:{name}")
 
@@ -2208,6 +2215,7 @@ class SparkDeckService:
         controls = self.manager._deployment_launch_controls({
             "engine": runtime,
             "extra_args": extra_args,
+            "environment": saved_settings.get("environment") or {},
         })
         saved_controls = saved_settings.get("launch_controls") or {}
         controls.update(saved_controls)

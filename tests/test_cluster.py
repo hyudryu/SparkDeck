@@ -2921,7 +2921,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "--pipeline-parallel-size", "1",
             "--default-chat-template-kwargs", '{"thinking":true,"tools":true}',
             "--speculative-config",
-            '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}',
+            '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","custom":true}',
             "--image-specific-flag", "kept",
         ]
 
@@ -2933,6 +2933,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed["max_concurrency"], 12)
         self.assertEqual(parsed["kv_cache_dtype"], "nvfp4_ds_mla")
         self.assertEqual(parsed["thinking_mode"], "enabled")
+        self.assertEqual(parsed["speculative_method"], "dspark")
+        self.assertEqual(parsed["draft_sample_method"], "probabilistic")
         self.assertEqual(parsed["dspark_num_speculative_tokens"], 5)
         self.assertEqual(parsed["max_cudagraph_capture_size"], 72)
         self.assertEqual(parsed["max_num_batched_tokens"], 8192)
@@ -2947,6 +2949,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "max_concurrency": 8,
                 "kv_cache_dtype": "fp8_per_token_head",
                 "thinking_mode": "disabled",
+                "speculative_method": "mtp",
+                "draft_sample_method": "greedy",
                 "dspark_num_speculative_tokens": 3,
                 "max_cudagraph_capture_size": 48,
                 "max_num_batched_tokens": 4096,
@@ -2979,8 +2983,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._cli_option(updated, {"--speculative-config"})
         )
         self.assertEqual(speculative["num_speculative_tokens"], 3)
-        self.assertEqual(speculative["method"], "dspark")
-        self.assertEqual(speculative["draft_sample_method"], "probabilistic")
+        self.assertEqual(speculative["method"], "mtp")
+        self.assertEqual(speculative["draft_sample_method"], "greedy")
+        self.assertTrue(speculative["custom"])
         template = json.loads(
             instance._cli_option(updated, {"--default-chat-template-kwargs"})
         )
@@ -2989,6 +2994,65 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             instance._cli_option(updated, {"--image-specific-flag"}), "kept"
         )
+
+    def test_launch_controls_edit_environment_backed_speculative_config(self) -> None:
+        instance = Manager.__new__(Manager)
+        args = [
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+            "--enable-prefix-caching",
+        ]
+        environment = {
+            "SPECULATIVE_CONFIG": (
+                '{"method":"dspark","num_speculative_tokens":5,'
+                '"draft_sample_method":"greedy","custom":true}'
+            ),
+        }
+
+        parsed = instance._deployment_launch_controls({
+            "engine": "vllm",
+            "extra_args": args,
+            "environment": environment,
+        })
+        self.assertEqual(parsed["speculative_method"], "dspark")
+        self.assertEqual(parsed["draft_sample_method"], "greedy")
+        self.assertEqual(parsed["dspark_num_speculative_tokens"], 5)
+
+        updated = instance._apply_deployment_launch_controls(
+            args,
+            "vllm",
+            {
+                "speculative_method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "dspark_num_speculative_tokens": 7,
+            },
+            environment,
+        )
+
+        self.assertEqual(
+            instance._cli_option(updated, {"--speculative-config"}),
+            "${SPECULATIVE_CONFIG}",
+        )
+        speculative = json.loads(environment["SPECULATIVE_CONFIG"])
+        self.assertEqual(speculative["method"], "dspark")
+        self.assertEqual(speculative["draft_sample_method"], "probabilistic")
+        self.assertEqual(speculative["num_speculative_tokens"], 7)
+        self.assertTrue(speculative["custom"])
+
+    def test_launch_controls_reject_invalid_environment_backed_speculative_config(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        args = ["--speculative-config", "${SPECULATIVE_CONFIG}"]
+
+        with self.assertRaisesRegex(
+            ValueError, "environment variable SPECULATIVE_CONFIG must contain valid JSON",
+        ):
+            instance._apply_deployment_launch_controls(
+                args,
+                "vllm",
+                {"speculative_method": "dspark"},
+                {"SPECULATIVE_CONFIG": "not-json"},
+            )
 
     def test_launch_controls_reject_fractional_parallel_sizes(self) -> None:
         instance = Manager.__new__(Manager)
@@ -3836,7 +3900,14 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         first = await instance.create_container(
             "org/first", name="first-r1",
-            environment={"NCCL_DEBUG": "WARN"},
+            environment={
+                "NCCL_DEBUG": "WARN",
+                "SPECULATIVE_CONFIG": (
+                    '{"method":"dspark","num_speculative_tokens":5,'
+                    '"draft_sample_method":"greedy"}'
+                ),
+            },
+            extra_args=["--speculative-config", "${SPECULATIVE_CONFIG}"],
             cluster_member={
                 "deployment_id": "first", "node_id": "remote-1", "rank": 1,
                 "nnodes": 2, "mode": "sharded",
@@ -3857,6 +3928,11 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
         self.assertEqual(run_options[0]["environment"]["NCCL_DEBUG"], "WARN")
+        speculative = json.loads(instance._cli_option(
+            run_options[0]["command"], {"--speculative-config"},
+        ))
+        self.assertEqual(speculative["method"], "dspark")
+        self.assertEqual(speculative["draft_sample_method"], "greedy")
         self.assertEqual(instance._host_port_reservations, set())
 
         instance.evict_other_backends = mock.AsyncMock()

@@ -183,17 +183,32 @@ function defaultGgufWeightSize(model: DisplayCatalogModel, communityMode: boolea
   return defaultArtifact?.weightSize ?? model.weight_size_bytes ?? model.community?.weight_size_bytes
 }
 
-function communityGgufWeightSizes(model: DisplayCatalogModel) {
-  const artifactOptions = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)
+function communityWeightEstimates(model: DisplayCatalogModel, useGgufArtifacts: boolean) {
+  const artifactOptions = useGgufArtifacts
+    ? ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)
+    : []
   const benchmarks = model.communityBenchmarks ?? (model.community ? [model.community] : EMPTY_COMMUNITY_BENCHMARKS)
   return bestCommunityEstimates(benchmarks).flatMap((benchmark) => {
     const quantization = aggregateQuantization(benchmark)
     const artifact = artifactOptions.find((item) => (
       item.quantization.toLocaleLowerCase() === quantization.toLocaleLowerCase()
     ))
-    const weightSize = artifact?.weightSize ?? benchmark.weight_size_bytes
-    return Number.isFinite(weightSize) && Number(weightSize) > 0 ? [Number(weightSize)] : []
+    const weightSize = artifact?.weightSize
+      ?? benchmark.weight_size_bytes
+      ?? (benchmark === model.community ? model.weight_size_bytes : undefined)
+    return Number.isFinite(weightSize) && Number(weightSize) > 0
+      ? [{ benchmark, weightSize: Number(weightSize) }]
+      : []
   })
+}
+
+function largestFittingCommunityEstimate(
+  estimates: ReturnType<typeof communityWeightEstimates>,
+  capacity: number,
+) {
+  return estimates
+    .filter(({ weightSize }) => ['easy', 'tight'].includes(fitTone(weightSize, capacity)))
+    .sort((left, right) => right.weightSize - left.weightSize)[0]
 }
 
 function deployHref(
@@ -503,22 +518,31 @@ export function ExplorePage() {
       ))
     }
     if (tab === 'community') visible = visible.filter((model) => Boolean(model.community))
-    if (fitsOnly) visible = visible.filter((model) => {
+    if (fitsOnly) visible = visible.flatMap((model) => {
       const usesControllerCapacity = activeRuntime === 'llama.cpp'
         || (activeRuntime === '' && requiresControllerCapacity(model))
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
         : memory.capacity
+      if (tab === 'community') {
+        const weightEstimates = communityWeightEstimates(model, usesControllerCapacity)
+        const fittingEstimate = largestFittingCommunityEstimate(
+          weightEstimates,
+          applicableCapacity,
+        )
+        if (fittingEstimate) {
+          return [{
+            ...model,
+            community: fittingEstimate.benchmark,
+            weight_size_bytes: fittingEstimate.weightSize,
+          }]
+        }
+        if (weightEstimates.length > 0) return []
+      }
       const applicableWeightSize = usesControllerCapacity
         ? defaultGgufWeightSize(model, tab === 'community')
         : model.weight_size_bytes
-      const communityWeightSizes = tab === 'community' && usesControllerCapacity
-        ? communityGgufWeightSizes(model)
-        : []
-      if (communityWeightSizes.length > 0) {
-        return communityWeightSizes.some((weightSize) => ['easy', 'tight'].includes(fitTone(weightSize, applicableCapacity)))
-      }
-      return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity))
+      return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity)) ? [model] : []
     })
     if (fitsOnly) {
       visible = [...visible].sort((left, right) => Number(right.weight_size_bytes ?? 0) - Number(left.weight_size_bytes ?? 0))

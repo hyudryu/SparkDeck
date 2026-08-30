@@ -645,6 +645,49 @@ describe('ExplorePage model rows', () => {
     )
   })
 
+  it('filters and sorts grouped non-Llama models by their largest fitting quantization', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models')) return json({ items: [
+        {
+          id: 'org/grouped-vllm', name: 'grouped-vllm', weight_size_bytes: 20 * gib,
+          downloads: 2, likes: 0, runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+        },
+        {
+          id: 'org/twelve-gib', name: 'twelve-gib', weight_size_bytes: 12 * gib,
+          downloads: 1, likes: 0, runtime_compatibility: [{ runtime: 'vllm', supported: true }],
+        },
+      ], total: 2 })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 16 * 1024 }] } },
+      ] })
+      return json({
+        items: [
+          { model_id: 'org/grouped-vllm', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, weight_size_bytes: 20 * gib },
+          { model_id: 'org/grouped-vllm', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, weight_size_bytes: 8 * gib },
+          { model_id: 'org/twelve-gib', quantization: 'FP16', prompt_tokens_bucket: 1000, inference_tokens_per_second: 15, sample_count: 10, weight_size_bytes: 12 * gib },
+        ],
+        availability: 'available', evidence_policy: {},
+      })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('tab', { name: 'Community Run Models' }))
+    await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
+
+    const rows = screen.getAllByRole('button', { name: /^Expand org\// })
+    expect(rows.map((row) => row.getAttribute('aria-label'))).toEqual([
+      'Expand org/twelve-gib',
+      'Expand org/grouped-vllm',
+    ])
+    expect(within(rows[1]).getByText('8.0 GB')).toBeInTheDocument()
+    await user.click(rows[1])
+    expect(screen.getByRole('link', { name: 'Deploy org/grouped-vllm' })).toHaveAttribute(
+      'href', '/models?model=org%2Fgrouped-vllm&runtime=vllm&quantization=Q4_K_M',
+    )
+  })
+
   it('pages large community result sets instead of rendering every model at once', async () => {
     const user = userEvent.setup()
     const items = Array.from({ length: 120 }, (_, index) => ({

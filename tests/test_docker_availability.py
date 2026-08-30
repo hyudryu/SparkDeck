@@ -155,6 +155,18 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(local["docker_ready"])
         self.assertFalse(state["docker_ready"])
 
+    async def test_state_reuses_local_container_inventory_for_node_status(self):
+        manager = self.manager_without_docker()
+        manager.list_containers = AsyncMock(return_value=[])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.get_disk = AsyncMock(return_value={})
+        manager._docker_runtime_status = AsyncMock(return_value=(True, None))
+
+        await manager.get_state()
+
+        manager.list_containers.assert_awaited_once_with()
+
     async def test_docker_inventory_recovers_without_restarting_manager(self):
         manager = self.manager_without_docker()
         manager.client._retry_after = 0.0

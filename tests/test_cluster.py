@@ -650,7 +650,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
                 "node_id": "remote-1",
                 "agent_token": "durable-secret",
                 "name": "Spark 2",
-                "protocol_version": 1,
+                "protocol_version": AGENT_PROTOCOL_VERSION,
             })
 
         with tempfile.TemporaryDirectory() as directory:
@@ -676,7 +676,7 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.headers[COORDINATOR_ID_HEADER], "controller")
             return httpx.Response(200, json={
                 "node_id": "remote-1",
-                "protocol_version": 1,
+                "protocol_version": AGENT_PROTOCOL_VERSION,
                 "docker_ready": docker_ready,
                 "status_message": None if docker_ready else (
                     "SparkDeck's service user cannot access Docker. Add this "

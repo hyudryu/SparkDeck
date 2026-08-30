@@ -265,7 +265,7 @@ class SelectiveSnapshotRoundTripTests(unittest.IsolatedAsyncioTestCase):
             use_fabric=False,
         ):
             if method == "PUT" and path.endswith("/files/import"):
-                assert use_fabric, "selective archive uploads must use the fabric path"
+                assert use_fabric, "selective file uploads must use the fabric path"
                 model_bytes = int(headers["X-SparkDeck-Model-Bytes"])
                 await target.import_model_files(
                     "org/model", content, required_model_bytes=model_bytes,

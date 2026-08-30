@@ -21,7 +21,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_json_wri
 
 
 LOCAL_NODE_ID = "local"
-AGENT_PROTOCOL_VERSION = 1
+AGENT_PROTOCOL_VERSION = 2
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
 AGENT_FABRIC_PORT = 7878
 

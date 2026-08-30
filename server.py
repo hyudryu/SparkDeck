@@ -38,6 +38,7 @@ from sparkdeck.service import (
     _public_community_aggregates,
 )
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
+from sparkdeck.virtual_nas import FILE_STREAM_CONTENT_TYPE
 from sparkdeck.onboarding import (
     FORWARD_HEADERS,
     FORWARD_SCHEME_HEADER,
@@ -914,7 +915,7 @@ async def agent_virtual_nas_files_export(
         stream = manager.virtual_nas.export_model_files(
             model_id, revision, files, requested_revision,
         )
-        return StreamingResponse(stream, media_type="application/x-tar")
+        return StreamingResponse(stream, media_type=FILE_STREAM_CONTENT_TYPE)
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 
@@ -945,7 +946,7 @@ async def agent_virtual_nas_export(model_id: str, req: Request):
     _require_agent(req)
     try:
         stream = manager.virtual_nas.export_model(model_id)
-        return StreamingResponse(stream, media_type="application/x-tar")
+        return StreamingResponse(stream, media_type=FILE_STREAM_CONTENT_TYPE)
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 
@@ -994,7 +995,7 @@ async def agent_virtual_nas_export_direct(model_id: str, req: Request):
         stream = manager.virtual_nas.export_model_with_capability(
             model_id, req.headers.get("X-SparkDeck-Direct-Transfer-Capability", ""),
         )
-        return StreamingResponse(stream, media_type="application/x-tar")
+        return StreamingResponse(stream, media_type=FILE_STREAM_CONTENT_TYPE)
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     except (ValueError, LookupError, RuntimeError) as exc:
@@ -1047,7 +1048,7 @@ async def agent_virtual_nas_peer_import_status(model_id: str, transfer_id: str, 
 async def agent_virtual_nas_cancel_peer_import(model_id: str, transfer_id: str, req: Request):
     _require_agent(req)
     try:
-        return manager.virtual_nas.cancel_peer_import(transfer_id)
+        return await manager.virtual_nas.cancel_peer_import(model_id, transfer_id)
     except LookupError as exc:
         raise _storage_error(exc) from exc
 

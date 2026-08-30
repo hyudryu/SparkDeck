@@ -1061,13 +1061,16 @@ class Manager:
             "online": True,
         }
 
-    async def agent_status(self, stats: dict | None = None) -> dict:
+    async def agent_status(
+        self, stats: dict | None = None, containers: list[dict] | None = None,
+    ) -> dict:
         if stats is None:
             stats = await self.get_stats()
         disk = await self.get_disk()
         docker_ready, docker_status_message = await self._docker_runtime_status()
         try:
-            containers = await self.list_containers()
+            if containers is None:
+                containers = await self.list_containers()
             containers = [
                 {
                     "name": c.get("name"),
@@ -1216,8 +1219,11 @@ class Manager:
         addresses = selected.get("ipv4") or []
         return (addresses[0] if addresses else None), selected.get("name")
 
-    async def cluster_nodes(self, local_stats: dict | None = None) -> list[dict]:
-        local = await self.agent_status(local_stats)
+    async def cluster_nodes(
+        self, local_stats: dict | None = None,
+        local_containers: list[dict] | None = None,
+    ) -> list[dict]:
+        local = await self.agent_status(local_stats, local_containers)
         local["hidden_from_dashboard"] = self.settings.get(
             "cluster_node_hidden_from_dashboard", False,
         ) is True
@@ -14446,7 +14452,10 @@ class Manager:
         containers = [] if containers_unavailable else containers_result
         images = [] if images_unavailable else images_result
         stats = stats_result
-        nodes = await self.cluster_nodes(stats)
+        # Reuse the local inventory gathered above. Calling agent_status without
+        # it would perform the same Docker container scan a second time for
+        # every deployment snapshot.
+        nodes = await self.cluster_nodes(stats, containers)
         local_docker_ready = next(
             (
                 bool(node.get("docker_ready"))

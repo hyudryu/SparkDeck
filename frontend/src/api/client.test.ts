@@ -113,6 +113,8 @@ describe('API client adapters', () => {
       message: 'The request timed out. Check the node connection and retry.',
     })
     await vi.advanceTimersByTimeAsync(30_000)
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(30_000)
     await result
   })
 
@@ -129,7 +131,7 @@ describe('API client adapters', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const result = expect(api.deployments.list()).rejects.toMatchObject({ status: 408 })
-    await vi.advanceTimersByTimeAsync(30_000)
+    await vi.advanceTimersByTimeAsync(60_000)
     await result
   })
 

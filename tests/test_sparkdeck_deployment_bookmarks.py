@@ -684,9 +684,15 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                         {"launch_controls": {"tensor_parallel_size": bad}},
                     )
 
-        # An explicit clear sticks instead of being re-seeded from the scalar.
+        # An explicit clear sticks instead of being re-seeded from the scalar,
+        # even when the editor submits its hidden sg_tp_size field seeded from
+        # the old scalar value.
         await self.service.update_deployment_settings("sharded-bookmark", {
-            "launch_controls": {"tensor_parallel_size": None},
+            "launch_controls": {
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
+            },
+            "sg_tp_size": 3,
         })
         detail = await self.service.deployment_detail(
             self.service.store.deployment("sharded-bookmark")["id"],
@@ -723,6 +729,16 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             self.service.store.deployment("pp-bookmark")["id"],
         )
         self.assertEqual(pp_detail["launch_controls"]["pipeline_parallel_size"], 2)
+
+        # An explicit single-rank layout can never launch as sharded, so the
+        # bookmark must reject it instead of saving an impossible contract.
+        with self.assertRaisesRegex(ValueError, "single mode"):
+            await self.service.update_deployment_settings("sharded-bookmark", {
+                "launch_controls": {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                },
+            })
 
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({

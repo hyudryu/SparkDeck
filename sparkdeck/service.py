@@ -1490,7 +1490,11 @@ class SparkDeckService:
                 stored.get("runtime")
             ) == RuntimeKind.VLLM.value:
                 settings["pipeline_parallel_size"] = None
-        if "sg_tp_size" in changes:
+        if "sg_tp_size" in changes and str(
+            stored.get("runtime")
+        ) == RuntimeKind.SGLANG.value:
+            # SGLang-only field: the editor submits it on every save, and for
+            # vLLM bookmarks it would undo a structured TP clear above.
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if "sg_mem_fraction" in changes:
             settings["mem_fraction_static"] = changes["sg_mem_fraction"]
@@ -1562,6 +1566,21 @@ class SparkDeckService:
             raise ValueError("single deployment requires exactly one node")
         if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
             raise ValueError("sharded deployment requires at least two nodes")
+        if (
+            contract["deployment_mode"] == "sharded"
+            and str(stored.get("runtime")) == RuntimeKind.VLLM.value
+            and isinstance(settings.get("launch_controls"), dict)
+        ):
+            controls = settings["launch_controls"]
+            tp = controls.get("tensor_parallel_size")
+            pp = controls.get("pipeline_parallel_size")
+            if (tp is not None or pp is not None) and (tp or 1) * (pp or 1) == 1:
+                # Manager's preflight rejects an explicit TP1/PP1 layout on a
+                # multi-node sharded launch, so the bookmark would never run.
+                raise ValueError(
+                    "a sharded vLLM deployment needs tensor or pipeline "
+                    "parallelism above 1, or switch to single mode"
+                )
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
                 stored["id"], self._local_configuration(settings), alias,

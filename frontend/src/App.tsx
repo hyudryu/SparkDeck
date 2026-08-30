@@ -26,6 +26,7 @@ import { FanControlPage } from './pages/FanControlPage'
 export default function App() {
   const [onboarding, setOnboarding] = useState<OnboardingStatus>()
   const [connectionError, setConnectionError] = useState<string>()
+  const [leaveError, setLeaveError] = useState<string>()
   const [connectionVersion, setConnectionVersion] = useState(0)
   const [leavingCluster, setLeavingCluster] = useState(false)
   const retryTimer = useRef<number | undefined>(undefined)
@@ -72,13 +73,14 @@ export default function App() {
       danger: true,
     })) return
     setLeavingCluster(true)
-    setConnectionError(undefined)
+    setLeaveError(undefined)
     try {
       const status = await api.onboarding.leave()
       window.clearTimeout(retryTimer.current)
       setOnboarding(status)
+      setLeaveError(undefined)
     } catch (reason) {
-      setConnectionError(reason instanceof Error ? reason.message : 'Could not leave the cluster')
+      setLeaveError(reason instanceof Error ? reason.message : 'Could not leave the cluster')
     } finally {
       setLeavingCluster(false)
     }
@@ -93,6 +95,7 @@ export default function App() {
           <p>{controllerUnavailable
             ? `This node cannot reach ${onboarding?.controller_url || 'its controller'}. SparkDeck will retry automatically.`
             : connectionError}</p>
+          {leaveError && <p className="form-error">Could not leave the cluster: {leaveError}</p>}
           <Button type="button" variant="primary" onClick={retryConnection}>
             <RefreshCw size={16} /> Retry now
           </Button>

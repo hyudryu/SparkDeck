@@ -84,9 +84,9 @@ const REQUEST_TIMEOUT_MS = 30_000
 const DEPLOYMENTS_TIMEOUT_MS = 60_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
 const CONTROLLER_BOOTSTRAP_TIMEOUT_MS = 10_000
-// Update readiness includes a Windows launcher preflight whose backend budget
-// is 45 seconds. Let the server return its authoritative blocker/status.
-const SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS = 60_000
+// Update readiness has a 100-second backend budget for its complete sequential
+// preflight. Let the server return its authoritative blocker/status.
+const SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS = 120_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
 // return the authoritative result instead of inviting a duplicate retry after

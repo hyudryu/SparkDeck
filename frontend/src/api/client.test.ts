@@ -140,9 +140,9 @@ describe('API client adapters', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const result = expect(api.updates.overview()).rejects.toMatchObject({ status: 408 })
-    await vi.advanceTimersByTimeAsync(45_000)
+    await vi.advanceTimersByTimeAsync(100_000)
     expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
-    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.advanceTimersByTimeAsync(20_000)
     await result
   })
 

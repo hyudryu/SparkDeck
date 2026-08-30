@@ -38,10 +38,11 @@ RUNTIME_REVISION_BLOCKER = (
     "Running SparkDeck revision could not be verified; restart SparkDeck before updating"
 )
 OVERVIEW_LOCAL_BLOCKERS_TTL_SECONDS = 30.0
-# The Windows launcher intentionally gives ``process-status`` up to 30 seconds.
-# Keep the overview guard above that command budget so a slow-but-successful
-# launcher check is not converted into a false update blocker.
-OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS = 45.0
+# Local readiness runs two Git commands (20 seconds each), the Windows launcher
+# check (30 seconds), and Node/npm probes (10 seconds each) sequentially. Keep
+# the overview guard above that complete 90-second command budget so a slow but
+# valid installation is not converted into a false update blocker.
+OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS = 100.0
 
 _WINDOWS_HELPER_BOOTSTRAP = r"""
 import json

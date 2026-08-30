@@ -192,6 +192,37 @@ describe('SparkDeck application shell', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/onboarding/leave', expect.objectContaining({ method: 'POST' }))
   })
 
+  it('shows the backend explanation when leaving the offline cluster fails', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding/leave') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ detail: 'Stop the managed deployment before leaving' }), {
+          status: 409, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'Worker Two', port: 7878, access_urls: [] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: false,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Leave cluster' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Leave this cluster?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Leave cluster' }))
+
+    expect(await screen.findByText(/Stop the managed deployment before leaving/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Leave cluster' })).toBeEnabled()
+  })
+
   it('unmounts controller views when a later reachability refresh fails', async () => {
     let onboardingRequests = 0
     fetchMock.mockImplementation(async (input) => {

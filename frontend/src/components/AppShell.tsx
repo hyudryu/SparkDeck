@@ -47,7 +47,15 @@ function resolvedTheme(): ResolvedTheme {
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
 }
 
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({
+  children,
+  controllerAvailable = true,
+  nodeName: entryNodeName,
+}: {
+  children: ReactNode
+  controllerAvailable?: boolean
+  nodeName?: string
+}) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('sparkdeck.sidebar') === 'collapsed')
   const [theme, setTheme] = useState<ResolvedTheme>(resolvedTheme)
@@ -55,7 +63,6 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [themeStatus, setThemeStatus] = useState('')
   const [switchDetected, setSwitchDetected] = useState(false)
   const [fanControlAvailable, setFanControlAvailable] = useState(false)
-  const [nodeName, setNodeName] = useState('')
   const firstLinkRef = useRef<HTMLAnchorElement>(null)
   const openerRef = useRef<HTMLButtonElement>(null)
   const themeInteractedRef = useRef(false)
@@ -65,6 +72,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => setDrawerOpen(false), [location.pathname])
 
   useEffect(() => {
+    if (!controllerAvailable) return
     let disposed = false
     let controller: AbortController | undefined
     let latestRequest = 0
@@ -83,16 +91,6 @@ export function AppShell({ children }: { children: ReactNode }) {
       }).catch(() => {
         // The locally stored preference remains authoritative while offline.
       })
-      // On a joined worker the settings request is forwarded to the controller,
-      // so the sidebar name comes from the unforwarded onboarding status that
-      // whichever node serves the browser answers for itself.
-      api.onboarding.get(requestController.signal).then((status) => {
-        if (!isFresh()) return
-        const name = status.node?.name
-        setNodeName(typeof name === 'string' ? name.trim() : '')
-      }).catch(() => {
-        // The chip stays empty until the next refresh; theme sync is unaffected.
-      })
     }
     refreshSettings()
     window.addEventListener('sparkdeck:node-name-changed', refreshSettings)
@@ -102,9 +100,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       controller?.abort()
       window.removeEventListener('sparkdeck:node-name-changed', refreshSettings)
     }
-  }, [])
+  }, [controllerAvailable])
 
   useEffect(() => {
+    if (!controllerAvailable) return
     let disposed = false
     let controller: AbortController | undefined
     let latestRequest = 0
@@ -132,9 +131,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       window.clearInterval(interval)
       window.removeEventListener('sparkdeck:fan-control-presence-changed', refreshPresence)
     }
-  }, [])
+  }, [controllerAvailable])
 
   useEffect(() => {
+    if (!controllerAvailable) return
     let disposed = false
     let controller: AbortController | undefined
     let latestRequest = 0
@@ -173,7 +173,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       window.clearInterval(interval)
       window.removeEventListener('sparkdeck:routeros-presence-changed', refreshPresence)
     }
-  }, [])
+  }, [controllerAvailable])
 
   useEffect(() => {
     const observer = new MutationObserver(() => setTheme(resolvedTheme()))
@@ -210,6 +210,10 @@ export function AppShell({ children }: { children: ReactNode }) {
     themeInteractedRef.current = true
     persistTheme(next)
     setTheme(next)
+    if (!controllerAvailable) {
+      setThemeStatus(`${next === 'dark' ? 'Dark' : 'Light'} mode applied locally. Controller unavailable.`)
+      return
+    }
     setThemeSyncing(true)
     setThemeStatus('')
     try {
@@ -266,7 +270,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               {/* The leading space separates the node name in the accessible
                   name: JSX strips inter-element whitespace and jsdom has no
                   layout-based word spacing. */}
-              {to === '/' && nodeName && <span className="nav-node-name">{' '}{nodeName}</span>}
+              {to === '/' && entryNodeName && <span className="nav-node-name">{' '}{entryNodeName}</span>}
             </NavLink>
           })}
         </nav>

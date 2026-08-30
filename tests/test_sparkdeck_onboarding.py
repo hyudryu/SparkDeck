@@ -3,6 +3,7 @@ import json
 import socket
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -789,6 +790,72 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["controller_reachable"])
         self.assertNotIn("join_code", status)
         await http.aclose()
+
+    async def test_worker_status_bounds_controller_hostname_resolution(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://spark-controller.test:7878",
+            "controller_node_id": "controller-id",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        release_resolution = threading.Event()
+
+        def blocked_resolution(*_args, **_kwargs):
+            release_resolution.wait(timeout=1)
+            return []
+
+        try:
+            with patch(
+                "sparkdeck.onboarding.CONTROL_DNS_TIMEOUT_SECONDS", 0.01,
+            ), patch(
+                "sparkdeck.onboarding.socket.getaddrinfo",
+                side_effect=blocked_resolution,
+            ) as resolver:
+                status = await asyncio.wait_for(
+                    service.status("http://127.0.0.1:7878"), timeout=0.5,
+                )
+                repeated = await asyncio.wait_for(
+                    service.status("http://127.0.0.1:7878"), timeout=0.5,
+                )
+        finally:
+            release_resolution.set()
+
+        self.assertEqual(status["role"], "worker")
+        self.assertFalse(status["controller_reachable"])
+        self.assertFalse(repeated["controller_reachable"])
+        self.assertEqual(resolver.call_count, 1)
+        self.assertNotIn("join_code", status)
+        await manager.http.aclose()
+
+    async def test_worker_status_bounds_the_entire_controller_probe(self):
+        manager = FakeManager(self.root)
+        service = OnboardingService(manager, self.root)
+        service.assignment.save({
+            "controller_url": "http://100.64.0.10:7878",
+            "controller_node_id": "controller-id",
+            "forward_token": "secret",
+            "node_id": manager.agent_credentials.node_id,
+        })
+        release_probe = asyncio.Event()
+
+        async def blocked_probe(*_args, **_kwargs):
+            await release_probe.wait()
+            return True, None
+
+        try:
+            with patch(
+                "sparkdeck.onboarding.CONTROL_REACHABILITY_TIMEOUT_SECONDS", 0.01,
+            ), patch.object(service, "_controller_status", side_effect=blocked_probe):
+                status = await asyncio.wait_for(
+                    service.status("http://127.0.0.1:7878"), timeout=0.5,
+                )
+        finally:
+            release_probe.set()
+
+        self.assertFalse(status["controller_reachable"])
+        await manager.http.aclose()
 
     async def test_leave_unregisters_then_revokes_before_clearing_assignment(self):
         requests = []

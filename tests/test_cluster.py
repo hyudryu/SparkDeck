@@ -741,6 +741,38 @@ class NodeRegistryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.aclose()
 
+    async def test_update_liveness_snapshot_requests_health_without_details(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"cluster_node_name": "Controller"}
+        instance.agent_health = mock.Mock(return_value={
+            "node_id": "controller-id",
+            "name": "Controller",
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+            "capabilities": ["cluster_update_main_v1"],
+            "app_revision": "a" * 40,
+            "online": True,
+        })
+        remote = {
+            "id": "remote-1", "name": "Spark 2", "local": False,
+            "enabled": True, "online": True,
+            "capabilities": ["cluster_update_main_v1"],
+            "app_revision": "b" * 40,
+        }
+        instance.node_registry = mock.Mock()
+        instance.node_registry.nodes = [{
+            "id": "remote-1", "name": "Spark 2", "enabled": True,
+        }]
+        instance.node_registry.probe = mock.AsyncMock(return_value=remote)
+
+        nodes = await instance.cluster_node_liveness()
+
+        self.assertEqual(nodes[0]["id"], "local")
+        self.assertEqual(nodes[0]["app_revision"], "a" * 40)
+        self.assertEqual(nodes[1], remote)
+        instance.node_registry.probe.assert_awaited_once_with(
+            instance.node_registry.nodes[0], details=False,
+        )
+
 
 class LlamaRpcClusterTests(unittest.IsolatedAsyncioTestCase):
     def test_gguf_variant_size_includes_every_shard(self) -> None:

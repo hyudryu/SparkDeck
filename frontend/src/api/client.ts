@@ -83,6 +83,10 @@ const REQUEST_TIMEOUT_MS = 30_000
 // abort a healthy request before the controller's own timeout contract ended.
 const DEPLOYMENTS_TIMEOUT_MS = 60_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
+const CONTROLLER_BOOTSTRAP_TIMEOUT_MS = 10_000
+// Update readiness has a 100-second backend budget for its complete sequential
+// preflight. Let the server return its authoritative blocker/status.
+const SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS = 120_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
 // return the authoritative result instead of inviting a duplicate retry after
@@ -662,7 +666,9 @@ export const api = {
     ),
   },
   onboarding: {
-    get: (signal?: AbortSignal) => request<OnboardingStatus>('/api/v1/onboarding', { signal }),
+    get: (signal?: AbortSignal) => request<OnboardingStatus>(
+      '/api/v1/onboarding', { signal }, CONTROLLER_BOOTSTRAP_TIMEOUT_MS,
+    ),
     join: (input: JoinClusterInput) => request<OnboardingStatus>('/api/v1/onboarding/join', {
       method: 'POST',
       body: JSON.stringify(input),
@@ -925,7 +931,9 @@ export const api = {
     clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
-    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),
+    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>(
+      '/api/v1/system-update', { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
+    ),
     start: (revision: string) => request<SystemUpdateJob>('/api/v1/system-update', {
       method: 'POST',
       body: JSON.stringify({ confirm: 'update-entire-cluster', revision }),

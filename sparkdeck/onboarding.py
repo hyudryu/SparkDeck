@@ -42,6 +42,10 @@ JOIN_RATE_LIMIT = 5
 JOIN_RATE_WINDOW_SECONDS = 60.0
 PROXY_TIMEOUT_SECONDS = 600.0
 PROXY_DISCONNECT_POLL_SECONDS = 0.1
+CONTROL_DNS_TIMEOUT_SECONDS = 3.0
+CONTROL_REACHABILITY_TIMEOUT_SECONDS = 8.0
+
+_CONTROL_DNS_INFLIGHT: dict[tuple[int, str, int], asyncio.Task] = {}
 
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
@@ -86,10 +90,27 @@ async def _resolve_pinned_connection(url: str) -> ControlConnection:
     try:
         literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError as literal_error:
+        loop = asyncio.get_running_loop()
+        key = (id(loop), host, port)
+        resolution = _CONTROL_DNS_INFLIGHT.get(key)
+        if resolution is None:
+            resolution = asyncio.create_task(asyncio.to_thread(
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM,
+            ))
+            _CONTROL_DNS_INFLIGHT[key] = resolution
+
+            def discard(completed: asyncio.Task) -> None:
+                if _CONTROL_DNS_INFLIGHT.get(key) is completed:
+                    _CONTROL_DNS_INFLIGHT.pop(key, None)
+
+            resolution.add_done_callback(discard)
         try:
-            rows = await asyncio.to_thread(
-                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+            rows = await asyncio.wait_for(
+                asyncio.shield(resolution),
+                timeout=CONTROL_DNS_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError as exc:
+            raise ValueError("URL hostname resolution timed out") from exc
         except OSError as exc:
             raise ValueError("URL hostname could not be resolved") from exc
         addresses = []
@@ -296,6 +317,29 @@ class OnboardingService:
             urls.append(normalized_origin)
         return list(dict.fromkeys(urls))
 
+    async def _controller_status(
+        self, controller_url: str, controller_node_id: str | None,
+    ) -> tuple[bool, str | None]:
+        connection = await resolve_control_connection(controller_url)
+        response = await _send_pinned_control_request(
+            self.manager.http,
+            connection,
+            "GET",
+            "/api/v1/onboarding",
+            timeout=3,
+        )
+        response.raise_for_status()
+        remote = response.json()
+        remote_node_id = str(remote.get("node", {}).get("id") or "")
+        reachable = (
+            remote.get("role") == "controller"
+            and int(remote.get("node", {}).get("protocol_version") or 0)
+            == AGENT_PROTOCOL_VERSION
+            and bool(controller_node_id)
+            and secrets.compare_digest(remote_node_id, str(controller_node_id))
+        )
+        return reachable, remote.get("join_code") if reachable else None
+
     async def status(self, request_origin: str) -> dict[str, Any]:
         assignment = self.assignment.load()
         role = "worker" if assignment else "controller"
@@ -305,26 +349,10 @@ class OnboardingService:
         join_code = None
         if controller_url:
             try:
-                connection = await resolve_control_connection(controller_url)
-                response = await _send_pinned_control_request(
-                    self.manager.http,
-                    connection,
-                    "GET",
-                    "/api/v1/onboarding",
-                    timeout=3,
+                reachable, join_code = await asyncio.wait_for(
+                    self._controller_status(controller_url, controller_node_id),
+                    timeout=CONTROL_REACHABILITY_TIMEOUT_SECONDS,
                 )
-                response.raise_for_status()
-                remote = response.json()
-                remote_node_id = str(remote.get("node", {}).get("id") or "")
-                reachable = (
-                    remote.get("role") == "controller"
-                    and int(remote.get("node", {}).get("protocol_version") or 0)
-                    == AGENT_PROTOCOL_VERSION
-                    and bool(controller_node_id)
-                    and secrets.compare_digest(remote_node_id, str(controller_node_id))
-                )
-                if reachable:
-                    join_code = remote.get("join_code")
             except Exception:
                 reachable = False
         result = {

@@ -339,6 +339,48 @@ describe('settings page', () => {
     expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
+  it('waits for an active update status request to settle before polling again', async () => {
+    let updateRequests = 0
+    const pendingSignals: AbortSignal[] = []
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('system-update')) {
+        updateRequests += 1
+        if (updateRequests > 1) {
+          if (init?.signal) pendingSignals.push(init.signal)
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('Aborted', 'AbortError')),
+              { once: true },
+            )
+          })
+        }
+        return new Response(JSON.stringify({
+          repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
+          target: { branch: 'main', revision: 'b'.repeat(40) },
+          can_update: false, blockers: [], nodes: [],
+          job: {
+            id: 'active-job', active: true, phase: 'preflight', target_branch: 'main',
+            target_revision: 'b'.repeat(40), nodes: [],
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ theme: 'system' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    expect(await screen.findByRole('button', { name: 'Updating…' })).toBeInTheDocument()
+
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 2_700)) })
+    expect(updateRequests).toBe(2)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 2_700)) })
+
+    expect(updateRequests).toBe(2)
+    expect(pendingSignals[0]?.aborted).toBe(false)
+  }, 8_000)
+
   it('does not trust an up-to-date phase saved for an older target', async () => {
     const current = 'b'.repeat(40)
     const old = 'a'.repeat(40)

@@ -1259,6 +1259,39 @@ class Manager:
             self._record_remote_temperature_sample(node)
         return nodes
 
+    async def cluster_node_liveness(self) -> list[dict]:
+        """Return update-relevant node health without Docker or disk telemetry."""
+        local = {
+            "id": LOCAL_NODE_ID,
+            "name": self.settings.get("cluster_node_name") or socket.gethostname(),
+            "local": True,
+            "enabled": True,
+            "status": "online",
+            "online": True,
+            "last_seen": time.time(),
+            **self.agent_health(),
+        }
+        registered = list(self.node_registry.nodes)
+        remote = await asyncio.gather(
+            *(
+                self.node_registry.probe(node, details=False)
+                for node in registered
+            ),
+            return_exceptions=True,
+        )
+        nodes = [local]
+        for node, status in zip(registered, remote):
+            if isinstance(status, Exception):
+                nodes.append({
+                    **self.node_registry.public_config(node),
+                    "status": "unreachable",
+                    "online": False,
+                    "status_message": str(status),
+                })
+            else:
+                nodes.append(status)
+        return nodes
+
     @staticmethod
     def public_target_node(node: dict) -> dict:
         """Return the stable, credential-free node selector contract."""

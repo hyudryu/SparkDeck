@@ -1440,6 +1440,24 @@ class SparkDeckService:
                     raise ValueError("max_concurrency must be an integer") from exc
             elif "max_concurrency" in controls:
                 settings["parallel_slots" if runtime_is_llama else "max_running_requests"] = None
+            # Saved bookmarks never pass Manager's preflight until their first
+            # Run, so the parallel topology controls must be validated and
+            # normalized here instead of persisting an invalid layout.
+            for key in ("tensor_parallel_size", "pipeline_parallel_size"):
+                value = controls.get(key)
+                if value in (None, ""):
+                    continue
+                if isinstance(value, bool) or (
+                    isinstance(value, float) and not value.is_integer()
+                ):
+                    raise ValueError(f"{key} must be a positive integer")
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{key} must be a positive integer") from exc
+                if parsed <= 0:
+                    raise ValueError(f"{key} must be a positive integer")
+                controls[key] = parsed
             # Persist the complete structured contract: Manager's preflight
             # merges every control (KV dtype, thinking, speculative tokens,
             # cudagraph size, batched tokens) into the launch argv for vLLM
@@ -1448,10 +1466,7 @@ class SparkDeckService:
             # Keep the saved topology scalar in sync so the launch picker's
             # node-count contract reflects the edited parallel layout.
             tp_control = controls.get("tensor_parallel_size")
-            if (
-                isinstance(tp_control, int) and not isinstance(tp_control, bool)
-                and tp_control > 0
-            ):
+            if isinstance(tp_control, int):
                 settings["tensor_parallel_size"] = tp_control
         if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
@@ -1729,7 +1744,8 @@ class SparkDeckService:
             "engine": runtime,
             "extra_args": extra_args,
         })
-        controls.update(saved_settings.get("launch_controls") or {})
+        saved_controls = saved_settings.get("launch_controls") or {}
+        controls.update(saved_controls)
         scalar_seeds = {
             "context_window": saved_settings.get("context_length"),
             "max_concurrency": (
@@ -1746,6 +1762,10 @@ class SparkDeckService:
                 "tensor_parallel_size"
             )
         for key, value in scalar_seeds.items():
+            # A key present in the saved controls is an explicit editor value
+            # — including an intentional clear — and must not be re-seeded.
+            if key in saved_controls:
+                continue
             if controls.get(key) is None and value is not None:
                 controls[key] = value
         return controls

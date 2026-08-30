@@ -175,6 +175,22 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out", first["blockers"][0].lower())
         self.assertEqual(blockers.call_count, 1)
 
+    async def test_overview_allows_preflight_to_use_windows_command_budget(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+
+        def slow_but_valid_local_check(_root):
+            time.sleep(0.02)
+            return []
+
+        with patch(
+            "sparkdeck.updater.OVERVIEW_LOCAL_BLOCKERS_TIMEOUT_SECONDS", 0.05,
+        ), patch(
+            "sparkdeck.updater.local_blockers", side_effect=slow_but_valid_local_check,
+        ):
+            overview = await self.service.overview()
+
+        self.assertTrue(overview["can_update"])
+
     async def test_overview_allows_eligible_nodes_when_another_node_is_blocked(self):
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
         self.manager.cluster_node_liveness.return_value = [

@@ -84,6 +84,9 @@ const REQUEST_TIMEOUT_MS = 30_000
 const DEPLOYMENTS_TIMEOUT_MS = 60_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
 const CONTROLLER_BOOTSTRAP_TIMEOUT_MS = 10_000
+// Update readiness includes a Windows launcher preflight whose backend budget
+// is 45 seconds. Let the server return its authoritative blocker/status.
+const SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS = 60_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can
 // return the authoritative result instead of inviting a duplicate retry after
@@ -928,7 +931,9 @@ export const api = {
     clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
-    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>('/api/v1/system-update', { signal }),
+    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>(
+      '/api/v1/system-update', { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
+    ),
     start: (revision: string) => request<SystemUpdateJob>('/api/v1/system-update', {
       method: 'POST',
       body: JSON.stringify({ confirm: 'update-entire-cluster', revision }),

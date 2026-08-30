@@ -4838,8 +4838,11 @@ def _local_benchmark_model_id(
     public_model_id = upload_model_id or _public_model_id(value)
     if public_model_id != "local-model":
         return public_model_id
+    private_model_id = str(value or "").strip()
+    if re.fullmatch(r"Private model [0-9a-f]{8}", private_model_id):
+        return private_model_id
     identity = json.dumps(
-        [str(deployment_id or "").strip(), str(value or "").strip()],
+        [str(deployment_id or "").strip(), private_model_id],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

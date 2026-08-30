@@ -118,9 +118,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
         items, total = self.service.store.benchmarks()
         self.assertEqual(total, 1)
-        self.assertRegex(
-            items[0]["model"]["repository"], r"^Private model [0-9a-f]{8}$"
-        )
+        self.assertEqual(items[0]["model"]["repository"], model)
         self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_passive_telemetry_collects_nothing_when_opted_out(self):

@@ -118,6 +118,44 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("store unavailable", response.json()["detail"])
         remove.assert_awaited_once_with("manager-hermes", "remove")
 
+    async def test_legacy_cluster_remove_deletes_linked_v1_registration(self):
+        remove = AsyncMock(return_value={"ok": True, "errors": []})
+        unregister = Mock(return_value="record-hermes")
+        with (
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "remove_manager_deployment_registration",
+                unregister,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/deployments/manager-hermes/remove",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+        unregister.assert_called_once_with("manager-hermes")
+
+    async def test_failed_legacy_cluster_remove_keeps_v1_registration(self):
+        remove = AsyncMock(return_value={"ok": False, "errors": ["busy"]})
+        unregister = Mock()
+        with (
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "remove_manager_deployment_registration",
+                unregister,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/deployments/manager-hermes/remove",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+        unregister.assert_not_called()
+
     async def test_shared_inventory_and_transfer_payloads_are_redacted(self):
         inventory = {
             "enabled": True,

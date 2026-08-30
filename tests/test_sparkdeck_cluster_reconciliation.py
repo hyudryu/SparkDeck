@@ -236,6 +236,69 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "manager-hermes", "stop",
         )
 
+    async def test_reverse_link_collision_allocates_a_distinct_record(self):
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "new-manager",
+            "sparkdeck_record_id": "record-1",
+            "name": "Another deployment",
+            "model": "org/other-model",
+            "engine": "vllm",
+            "mode": "single",
+            "node_ids": ["worker-1"],
+            "status": "ready",
+            "desired_state": "running",
+            "api_port": 8010,
+            "members": [{
+                "node_id": "worker-1", "rank": 0,
+                "container_name": "new-manager-r0",
+            }],
+            "launch_settings": {"extra_args": []},
+        }]
+
+        listed = await self.service.deployments()
+
+        original = self.service.store.deployment("record-1")
+        self.assertEqual(
+            original["settings"]["manager_deployment_id"], "old-manager",
+        )
+        adopted = next(item for item in listed if item["alias"] == "Another deployment")
+        self.assertNotEqual(adopted["id"], "record-1")
+        self.assertEqual(
+            adopted["settings"]["manager_deployment_id"], "new-manager",
+        )
+        self.assertEqual(
+            self.manager.deployments[0]["sparkdeck_record_id"], adopted["id"],
+        )
+
+        await self.service.deployment_action("record-1", "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "old-manager", "stop",
+        )
+        self.manager.deployment_action.reset_mock()
+        await self.service.deployment_action(adopted["id"], "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "new-manager", "stop",
+        )
+
+    async def test_remove_manager_registration_is_scoped_and_idempotent(self):
+        self.service.store.add_deployment(Deployment(
+            id="record-2", alias="unrelated", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/other"),
+            settings={"manager_deployment_id": "another-manager"},
+        ))
+
+        removed = self.service.remove_manager_deployment_registration(
+            "old-manager",
+        )
+
+        self.assertEqual(removed, "record-1")
+        self.assertIsNone(self.service.store.deployment("record-1"))
+        self.assertIsNotNone(self.service.store.deployment("record-2"))
+        self.assertIsNone(
+            self.service.remove_manager_deployment_registration("old-manager")
+        )
+
     async def test_settings_dirty_start_result_immediately_reconciles_replacement(self):
         self.manager.deployment_action.return_value = {
             "ok": True,

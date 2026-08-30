@@ -636,7 +636,13 @@ describe('ExplorePage model rows', () => {
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
-    expect(screen.getByRole('button', { name: 'Expand org/community-llama' })).toBeInTheDocument()
+    const fittingRow = screen.getByRole('button', { name: 'Expand org/community-llama' })
+    expect(within(fittingRow).getByText('8.0 GB')).toBeInTheDocument()
+    await user.click(fittingRow)
+    expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/community-llama' })).toHaveValue('Q4_K_M\u0000community-q4_k_m.gguf')
+    expect(screen.getByRole('link', { name: 'Deploy org/community-llama' })).toHaveAttribute(
+      'href', '/models?model=org%2Fcommunity-llama&runtime=llama.cpp&quantization=Q4_K_M&artifact=community-q4_k_m.gguf',
+    )
   })
 
   it('pages large community result sets instead of rendering every model at once', async () => {
@@ -756,6 +762,7 @@ describe('ExplorePage model rows', () => {
     await user.click(await screen.findByRole('button', { name: 'Expand org/model' }))
 
     expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
+    expect(screen.queryByText('31.3 tok/s')).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/api/v1/community/aggregates'))).toBe(false)
   })
 

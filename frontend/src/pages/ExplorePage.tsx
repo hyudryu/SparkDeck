@@ -221,6 +221,7 @@ function ModelRow({
   aggregate,
   workerCapacities,
   expanded,
+  fitsOnly,
   communityMode,
   requestedRuntime,
   onToggle,
@@ -233,6 +234,7 @@ function ModelRow({
   aggregate: boolean
   workerCapacities: number[]
   expanded: boolean
+  fitsOnly: boolean
   communityMode: boolean
   requestedRuntime: RuntimeKind | ''
   onToggle: () => void
@@ -288,7 +290,14 @@ function ModelRow({
       : initiallySupported('vllm') ? 'vllm' : initiallySupported('sglang') ? 'sglang' : 'llama.cpp'
   const [deploymentRuntime, setDeploymentRuntime] = useState<RuntimeKind>(initialRuntime)
   const communityQuantization = communityMode && model.community ? aggregateQuantization(model.community) : undefined
-  const preferredArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
+  const communityPreferredArtifact = preferredGgufArtifact(artifactOptions, communityQuantization)
+  const fittingArtifact = fitsOnly && communityMode
+    ? artifactOptions.find((item) => ['easy', 'tight'].includes(fitTone(item.weightSize, localCapacity)))
+    : undefined
+  const preferredArtifact = communityPreferredArtifact
+    && ['easy', 'tight'].includes(fitTone(communityPreferredArtifact.weightSize, localCapacity))
+    ? communityPreferredArtifact
+    : fittingArtifact ?? communityPreferredArtifact
   const [artifactKey, setArtifactKey] = useState(preferredArtifact?.key ?? '')
   const selectedArtifact = artifactOptions.find((item) => item.key === artifactKey) ?? preferredArtifact
   const llamaSupported = compatibilityByRuntime.get('llama.cpp') !== false && artifactOptions.length > 0
@@ -309,10 +318,13 @@ function ModelRow({
   }, [compatibilityByRuntime, requestedRuntime, supportedRuntimes])
 
   useEffect(() => {
-    if (!artifactOptions.some((item) => item.key === artifactKey)) {
+    const currentArtifact = artifactOptions.find((item) => item.key === artifactKey)
+    const currentArtifactFits = currentArtifact
+      && ['easy', 'tight'].includes(fitTone(currentArtifact.weightSize, localCapacity))
+    if (!currentArtifact || (fitsOnly && communityMode && preferredArtifact && !currentArtifactFits)) {
       setArtifactKey(preferredArtifact?.key ?? '')
     }
-  }, [artifactKey, artifactOptions, preferredArtifact?.key])
+  }, [artifactKey, artifactOptions, communityMode, fitsOnly, localCapacity, preferredArtifact])
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
@@ -423,6 +435,7 @@ export function ExplorePage() {
   )
   const nodes = useResource((signal) => api.nodes.list(signal))
   const communityAccess = useCommunityAccess()
+  const communityEnabled = communityAccess.enabled
   const accessHint = communityAccessHint(communityAccess.signedIn)
   const aggregates = useResource(
     (signal) => api.benchmarks.aggregates(signal),
@@ -449,7 +462,7 @@ export function ExplorePage() {
       const current = evidence.get(key)
       if (!current || aggregate.sample_count > current.sample_count) evidence.set(key, aggregate)
     }
-    for (const model of catalogItems) {
+    for (const model of communityEnabled ? catalogItems : []) {
       if (model.community) {
         const key = communityVariantKey(model.community)
         const current = evidence.get(key)
@@ -466,7 +479,7 @@ export function ExplorePage() {
       const aggregate = bestCommunityEstimate(communityBenchmarks)
       return {
         ...model,
-        community: model.community ?? aggregate,
+        community: communityEnabled ? model.community ?? aggregate : undefined,
         communityBenchmarks,
       }
     })
@@ -513,7 +526,7 @@ export function ExplorePage() {
       visible = [...visible].sort((left, right) => Number(right.community?.sample_count ?? 0) - Number(left.community?.sample_count ?? 0))
     }
     return visible
-  }, [activeRuntime, aggregates.data?.items, catalog.data?.items, fitsOnly, memory, query, tab])
+  }, [activeRuntime, aggregates.data?.items, catalog.data?.items, communityEnabled, fitsOnly, memory, query, tab])
   const displayedModels = tab === 'community' ? models.slice(0, communityLimit) : models
   const remainingCommunityModels = tab === 'community' ? models.length - displayedModels.length : 0
 
@@ -561,7 +574,6 @@ export function ExplorePage() {
     }
   }
 
-  const communityEnabled = communityAccess.enabled
   const communityUnavailable = tab === 'community'
     && (Boolean(aggregates.error) || aggregates.data?.availability === 'unavailable')
   const activeError = tab === 'hugging-face' ? catalog.error : aggregates.error
@@ -626,7 +638,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = `${tab}:${model.id}`
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

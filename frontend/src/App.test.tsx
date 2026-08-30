@@ -2141,7 +2141,8 @@ describe('model deployments', () => {
       ],
       launch_controls: {
         context_window: 32768, max_concurrency: null, kv_cache_dtype: null,
-        thinking_mode: 'default', dspark_num_speculative_tokens: 4,
+        thinking_mode: 'default', speculative_method: 'draft_model',
+        draft_sample_method: 'greedy', dspark_num_speculative_tokens: 4,
         max_cudagraph_capture_size: null, max_num_batched_tokens: null,
       },
       gpu_memory_utilization: 0.9, gpu_memory_gb: null,
@@ -2175,9 +2176,13 @@ describe('model deployments', () => {
       `--enable-prefix-caching --speculative-config '{"model":"org/draft","num_speculative_tokens":4,"draft_tensor_parallel_size":2}' '--default-chat-template-kwargs={"thinking":true,"note":"don'\\''t drop"}'`,
     )
     expect(screen.getByRole('spinbutton', { name: 'GPU memory util' })).toHaveValue(0.9)
+    expect(screen.getByRole('combobox', { name: 'Speculative method' })).toHaveValue('draft_model')
+    expect(screen.getByRole('combobox', { name: 'Draft sample method' })).toHaveValue('greedy')
 
     await user.clear(contextWindow)
     await user.type(contextWindow, '65536')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Speculative method' }), 'dspark')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Draft sample method' }), 'probabilistic')
     await user.click(screen.getByRole('button', { name: 'Save settings' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -2195,6 +2200,8 @@ describe('model deployments', () => {
       '--default-chat-template-kwargs={"thinking":true,"note":"don\'t drop"}',
     ])
     expect(payload.launch_controls.context_window).toBe(65536)
+    expect(payload.launch_controls.speculative_method).toBe('dspark')
+    expect(payload.launch_controls.draft_sample_method).toBe('probabilistic')
     expect(payload.gpu_memory_utilization).toBe(0.9)
     expect(await screen.findByText('Saved.')).toBeInTheDocument()
   })

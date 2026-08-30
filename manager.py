@@ -3793,20 +3793,83 @@ class Manager:
             "output_cost_per_1m": settings.get("output_cost_per_1m"),
         }
 
+    @staticmethod
+    def _environment_reference(value: Any) -> str | None:
+        """Return the variable name for an exact ``${NAME}`` reference."""
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value.strip())
+        return match.group(1) if match else None
+
+    @classmethod
+    def _speculative_config(
+        cls,
+        args: list[str],
+        environment: dict[str, str] | None = None,
+        *,
+        strict: bool = False,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Parse inline or environment-backed vLLM speculative config."""
+        raw = cls._cli_option(args, {"--speculative-config"})
+        if not raw:
+            return {}, None
+        environment_key = cls._environment_reference(raw)
+        if environment_key:
+            raw = (environment or {}).get(environment_key)
+            if raw is None:
+                if strict:
+                    raise ValueError(
+                        "--speculative-config references undefined environment "
+                        f"variable {environment_key}"
+                    )
+                return {}, environment_key
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if strict:
+                source = (
+                    f"environment variable {environment_key}"
+                    if environment_key else "--speculative-config"
+                )
+                raise ValueError(f"{source} must contain valid JSON") from exc
+            return {}, environment_key
+        if not isinstance(parsed, dict):
+            if strict:
+                source = (
+                    f"environment variable {environment_key}"
+                    if environment_key else "--speculative-config"
+                )
+                raise ValueError(f"{source} must contain a JSON object")
+            return {}, environment_key
+        return parsed, environment_key
+
+    @classmethod
+    def _resolve_environment_backed_speculative_args(
+        cls, args: list[str], environment: dict[str, str],
+    ) -> list[str]:
+        """Resolve ``${NAME}`` because Docker argv does not perform expansion."""
+        raw = cls._cli_option(args, {"--speculative-config"})
+        environment_key = cls._environment_reference(raw)
+        if not environment_key:
+            return list(args)
+        speculative, _ = cls._speculative_config(
+            args, environment, strict=True,
+        )
+        flags = cls._replace_command_option(
+            shlex.join(args),
+            {"--speculative-config"},
+            shlex.quote(json.dumps(speculative, separators=(",", ":"))),
+        )
+        return shlex.split(flags)
+
     @classmethod
     def _deployment_launch_controls(cls, settings: dict) -> dict:
         """Parse common cluster controls without removing image-specific args."""
         args = list(settings.get("extra_args") or [])
         engine = settings.get("engine") or "vllm"
-        speculative = {}
-        raw_speculative = cls._cli_option(args, {"--speculative-config"})
-        if raw_speculative:
-            try:
-                parsed = json.loads(raw_speculative)
-                if isinstance(parsed, dict):
-                    speculative = parsed
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
+        speculative, _ = cls._speculative_config(
+            args, settings.get("environment") or {},
+        )
         thinking_mode, _, _ = cls._thinking_config(args)
         context_window = cls._cli_option(
             args,
@@ -3837,6 +3900,8 @@ class Manager:
                 "pipeline_parallel_size": None,
                 "kv_cache_dtype": None,
                 "thinking_mode": None,
+                "speculative_method": None,
+                "draft_sample_method": None,
                 "dspark_num_speculative_tokens": None,
                 "max_cudagraph_capture_size": None,
                 "max_num_batched_tokens": None,
@@ -3854,6 +3919,14 @@ class Manager:
             ),
             "kv_cache_dtype": cls._cli_option(args, {"--kv-cache-dtype"}),
             "thinking_mode": thinking_mode,
+            "speculative_method": (
+                speculative.get("method")
+                if isinstance(speculative.get("method"), str) else None
+            ),
+            "draft_sample_method": (
+                speculative.get("draft_sample_method")
+                if isinstance(speculative.get("draft_sample_method"), str) else None
+            ),
             "dspark_num_speculative_tokens": (
                 speculative.get("num_speculative_tokens")
                 if isinstance(speculative.get("num_speculative_tokens"), int)
@@ -3891,7 +3964,11 @@ class Manager:
         return int(number)
 
     def _apply_deployment_launch_controls(
-        self, args: list[str], engine: str, controls: dict
+        self,
+        args: list[str],
+        engine: str,
+        controls: dict,
+        environment: dict[str, str] | None = None,
     ) -> list[str]:
         """Merge structured editor fields back into the complete argv."""
         flags = shlex.join([str(value) for value in args])
@@ -3977,35 +4054,64 @@ class Manager:
                 positive_int("max_num_batched_tokens"),
             )
 
-            speculative_tokens = positive_int("dspark_num_speculative_tokens")
-            try:
-                current_tokens = shlex.split(flags)
-            except ValueError as exc:
-                raise ValueError("launch arguments have invalid shell quoting") from exc
-            raw_speculative = self._cli_option(
-                current_tokens, {"--speculative-config"}
-            )
-            speculative: dict[str, Any] = {}
-            if raw_speculative:
+            speculative_keys = {
+                "speculative_method", "draft_sample_method",
+                "dspark_num_speculative_tokens",
+            }
+            if speculative_keys.intersection(controls):
                 try:
-                    parsed = json.loads(raw_speculative)
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError("--speculative-config must contain valid JSON") from exc
-                if not isinstance(parsed, dict):
-                    raise ValueError("--speculative-config must contain a JSON object")
-                speculative = parsed
-            if speculative_tokens is None:
-                speculative.pop("num_speculative_tokens", None)
-            else:
-                speculative["num_speculative_tokens"] = speculative_tokens
-            speculative_value = None
-            if speculative:
-                speculative_value = shlex.quote(
-                    json.dumps(speculative, separators=(",", ":"))
+                    current_tokens = shlex.split(flags)
+                except ValueError as exc:
+                    raise ValueError(
+                        "launch arguments have invalid shell quoting"
+                    ) from exc
+                raw_speculative = self._cli_option(
+                    current_tokens, {"--speculative-config"}
                 )
-            flags = self._replace_command_option(
-                flags, {"--speculative-config"}, speculative_value
-            )
+                speculative, environment_key = self._speculative_config(
+                    current_tokens, environment, strict=bool(raw_speculative),
+                )
+
+                for control_key, config_key in (
+                    ("speculative_method", "method"),
+                    ("draft_sample_method", "draft_sample_method"),
+                ):
+                    if control_key not in controls:
+                        continue
+                    value = controls.get(control_key)
+                    normalized = str(value).strip() if value not in (None, "") else None
+                    if normalized is None:
+                        speculative.pop(config_key, None)
+                    else:
+                        speculative[config_key] = normalized
+                if "dspark_num_speculative_tokens" in controls:
+                    speculative_tokens = positive_int(
+                        "dspark_num_speculative_tokens"
+                    )
+                    if speculative_tokens is None:
+                        speculative.pop("num_speculative_tokens", None)
+                    else:
+                        speculative["num_speculative_tokens"] = speculative_tokens
+
+                serialized = json.dumps(speculative, separators=(",", ":"))
+                if environment_key:
+                    if environment is None:
+                        raise ValueError(
+                            "environment is required to edit environment-backed "
+                            "--speculative-config"
+                        )
+                    if speculative:
+                        environment[environment_key] = serialized
+                        speculative_value = shlex.quote(
+                            f"${{{environment_key}}}"
+                        )
+                    else:
+                        speculative_value = None
+                else:
+                    speculative_value = shlex.quote(serialized) if speculative else None
+                flags = self._replace_command_option(
+                    flags, {"--speculative-config"}, speculative_value
+                )
 
         try:
             return shlex.split(flags)
@@ -4058,7 +4164,8 @@ class Manager:
             if not isinstance(controls, dict):
                 raise ValueError("launch_controls must be an object")
             settings["extra_args"] = self._apply_deployment_launch_controls(
-                settings["extra_args"], settings["engine"], controls
+                settings["extra_args"], settings["engine"], controls,
+                settings["environment"],
             )
         if not settings["model"]:
             raise ValueError("model is required")
@@ -5022,7 +5129,8 @@ class Manager:
                 if "max_concurrency" in controls:
                     body["sg_max_running_requests"] = controls.get("max_concurrency")
             body["extra_args"] = self._apply_deployment_launch_controls(
-                list(body.get("extra_args") or []), engine, controls
+                list(body.get("extra_args") or []), engine, controls,
+                body["environment"],
             )
         mode = body.get("deployment_mode") or "single"
         if mode not in {"single", "sharded", "replicated"}:
@@ -6094,7 +6202,8 @@ class Manager:
             previous_limit = int(configured)
             controls["max_concurrency"] = safe_limit
             settings["extra_args"] = self._apply_deployment_launch_controls(
-                list(settings.get("extra_args") or []), "vllm", controls
+                list(settings.get("extra_args") or []), "vllm", controls,
+                settings.get("environment") or {},
             )
             adjustment = {
                 "from": previous_limit,
@@ -9408,13 +9517,15 @@ class Manager:
                 **self._deployment_launch_controls({
                     "engine": engine,
                     "extra_args": list(extra_args or []),
+                    "environment": normalized_environment,
                     "sg_context_length": sg_context_length,
                     "sg_max_running_requests": sg_max_running_requests,
                 }),
                 **launch_controls,
             }
             extra_args = self._apply_deployment_launch_controls(
-                list(extra_args or []), engine, launch_controls
+                list(extra_args or []), engine, launch_controls,
+                normalized_environment,
             )
             if engine == "sglang":
                 if "context_window" in launch_controls:
@@ -9558,7 +9669,8 @@ class Manager:
                     **controls,
                 }
                 merged["extra_args"] = self._apply_deployment_launch_controls(
-                    list(merged.get("extra_args") or []), engine, controls
+                    list(merged.get("extra_args") or []), engine, controls,
+                    merged["environment"],
                 )
                 if engine == "sglang":
                     if "context_window" in controls:
@@ -11018,6 +11130,9 @@ class Manager:
             )
             extra = self._with_vllm_prompt_token_details(
                 list(extra_args or [])
+            )
+            extra = self._resolve_environment_backed_speculative_args(
+                extra, runtime_environment,
             )
 
             serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000

@@ -109,6 +109,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Env": [
                     "VLLM_CACHE_ROOT=/cache/vllm",
                     "NCCL_DEBUG=INFO",
+                    'SPECULATIVE_CONFIG={"method":"dspark"}',
                     "HF_TOKEN=must-not-leak",
                     "SERVICE_API_KEY=must-not-leak",
                     "DATABASE_URL=postgres://user:password@host/db",
@@ -129,6 +130,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["environment"], {
             "VLLM_CACHE_ROOT": "/cache/vllm",
             "NCCL_DEBUG": "INFO",
+            "SPECULATIVE_CONFIG": '{"method":"dspark"}',
         })
 
     def test_credential_bearing_discovered_command_is_read_only(self):

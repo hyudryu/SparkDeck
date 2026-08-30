@@ -117,6 +117,8 @@ export interface DeploymentLaunchControls {
   pipeline_parallel_size?: number | null
   kv_cache_dtype?: string | null
   thinking_mode?: string | null
+  speculative_method?: string | null
+  draft_sample_method?: string | null
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null
@@ -789,6 +791,8 @@ export interface LaunchControls {
   max_concurrency?: number | null
   kv_cache_dtype?: string | null
   thinking_mode?: string | null
+  speculative_method?: string | null
+  draft_sample_method?: string | null
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null

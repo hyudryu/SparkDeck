@@ -3847,7 +3847,9 @@ class Manager:
             value = controls.get(key)
             if value in (None, ""):
                 return None
-            if isinstance(value, float) and not value.is_integer():
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not value.is_integer()
+            ):
                 raise ValueError(f"{key} must be a positive integer")
             try:
                 parsed = int(value)
@@ -4988,6 +4990,21 @@ class Manager:
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
                         "and provide a whole number of ranks per selected node"
+                    )
+                ranks_per_node = world_size // len(node_ids)
+                gpu_short = []
+                for nid in node_ids:
+                    gpus = (available[nid].get("stats") or {}).get("gpus") or []
+                    usable = [
+                        gpu for gpu in gpus
+                        if not (isinstance(gpu, dict) and gpu.get("error"))
+                    ]
+                    if gpus and len(usable) < ranks_per_node:
+                        gpu_short.append(available[nid].get("name", nid))
+                if gpu_short:
+                    raise ValueError(
+                        f"layout requires {ranks_per_node} GPU(s) per node; "
+                        f"not enough devices on: {', '.join(gpu_short)}"
                     )
                 vllm_parallel_layout = (tp, pp)
             else:

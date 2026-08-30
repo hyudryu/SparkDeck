@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from mcp.server.mcpserver.exceptions import UnexpectedToolError
 
 from mcp_server import ControllerClient, ControllerError, build_server
 
@@ -63,6 +64,82 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ControllerError, "not created by this MCP"):
             await client.action("user-1", "remove")
         self.assertEqual(methods, ["GET"])
+
+    async def test_storage_operations_reuse_controller_storage_contracts(self) -> None:
+        requests: list[tuple[str, str, bytes, dict | None]] = []
+        storage = {
+            "enabled": True,
+            "nodes": [
+                {"id": "local", "name": "Controller", "models": [{
+                    "model_id": "org/model", "size_bytes": 10,
+                }]},
+                {"id": "worker-1", "name": "Worker", "models": []},
+            ],
+            "jobs": [
+                {"id": "job-1", "status": "running", "progress": 0.5},
+                {"id": "job-2", "status": "completed", "progress": 1.0},
+            ],
+        }
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            requests.append((
+                request.method, request.url.path, request.url.raw_path, body,
+            ))
+            if request.method == "GET":
+                return httpx.Response(200, json=storage)
+            return httpx.Response(202, json={"ok": True, "request": body})
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+
+        inventory = await client.storage_weights("local")
+        running = await client.storage_transfers("RUNNING")
+        job = await client.storage_transfer("job-2")
+        pulled = await client.pull_storage_weights(
+            "org/model", ["local", "worker-1"],
+            revision="release-1", download_node_id="local",
+        )
+        transferred = await client.transfer_storage_weights(
+            "org/model", "local", ["worker-1"], revision="release-1",
+        )
+        deleted = await client.delete_storage_weights("worker-1", "org/model")
+
+        self.assertEqual([node["id"] for node in inventory["nodes"]], ["local"])
+        self.assertEqual([item["id"] for item in running["jobs"]], ["job-1"])
+        self.assertEqual(job["id"], "job-2")
+        self.assertEqual(pulled["request"], {
+            "model_id": "org/model",
+            "node_ids": ["local", "worker-1"],
+            "revision": "release-1",
+            "download_node_id": "local",
+        })
+        self.assertEqual(transferred["request"], {
+            "model_id": "org/model",
+            "source_node_id": "local",
+            "target_node_ids": ["worker-1"],
+            "revision": "release-1",
+        })
+        self.assertTrue(deleted["ok"])
+        self.assertIn(
+            ("DELETE", "/api/v1/storage/nodes/worker-1/models/org/model",
+             b"/api/v1/storage/nodes/worker-1/models/org%2Fmodel", None),
+            requests,
+        )
+
+    async def test_storage_lookups_reject_unknown_node_and_job(self) -> None:
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "enabled": True,
+                "nodes": [{"id": "local", "models": []}],
+                "jobs": [],
+            })
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+
+        with self.assertRaisesRegex(ControllerError, "storage node not found"):
+            await client.storage_weights("missing")
+        with self.assertRaisesRegex(ControllerError, "storage transfer not found"):
+            await client.storage_transfer("missing")
 
     async def test_wait_ready_observes_state_transition(self) -> None:
         calls = 0
@@ -401,6 +478,14 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("benchmark_cluster_deployment", tools)
         self.assertIn("delete_cluster_deployment", tools)
         for name in (
+            "list_storage_weights", "pull_storage_weights",
+            "transfer_storage_weights", "list_storage_transfers",
+            "get_storage_transfer", "delete_storage_weights",
+        ):
+            self.assertIn(name, tools)
+        self.assertIn("confirm", tools["delete_storage_weights"].input_schema["properties"])
+        self.assertIn("Virtual NAS", tools["transfer_storage_weights"].description)
+        for name in (
             "create_cluster_recipe", "update_cluster_recipe",
             "clone_cluster_recipe", "deploy_cluster_recipe", "run_cluster_ab_test",
         ):
@@ -408,6 +493,81 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "ctx", tools["run_cluster_ab_test"].input_schema.get("properties", {})
         )
+
+    async def test_storage_tools_delegate_and_require_delete_confirmation(self) -> None:
+        calls = []
+
+        class FakeClient:
+            async def storage_weights(self, node_id):
+                calls.append(("inventory", node_id))
+                return {"nodes": [{"id": node_id or "local"}]}
+
+            async def pull_storage_weights(self, model_id, node_ids, **kwargs):
+                calls.append(("pull", model_id, node_ids, kwargs))
+                return {"job_ids": ["download-1"]}
+
+            async def transfer_storage_weights(
+                self, model_id, source_node_id, target_node_ids, **kwargs,
+            ):
+                calls.append((
+                    "transfer", model_id, source_node_id, target_node_ids, kwargs,
+                ))
+                return {"job_ids": ["transfer-1"]}
+
+            async def storage_transfers(self, status):
+                calls.append(("transfers", status))
+                return {"jobs": [{"id": "transfer-1"}]}
+
+            async def storage_transfer(self, job_id):
+                calls.append(("status", job_id))
+                return {"id": job_id, "status": "running"}
+
+            async def delete_storage_weights(self, node_id, model_id):
+                calls.append(("delete", node_id, model_id))
+                return {"ok": True}
+
+        server = build_server(FakeClient())
+
+        inventory = await server.call_tool(
+            "list_storage_weights", {"node_id": "local"},
+        )
+        pulled = await server.call_tool("pull_storage_weights", {
+            "model_id": "org/model", "node_ids": ["local", "worker-1"],
+            "revision": "main", "download_node_id": "local",
+        })
+        transferred = await server.call_tool("transfer_storage_weights", {
+            "model_id": "org/model", "source_node_id": "local",
+            "target_node_ids": ["worker-1"],
+        })
+        await server.call_tool("list_storage_transfers", {"status": "running"})
+        status = await server.call_tool(
+            "get_storage_transfer", {"job_id": "transfer-1"},
+        )
+        with self.assertRaisesRegex(UnexpectedToolError, "Error executing tool"):
+            await server.call_tool("delete_storage_weights", {
+                "node_id": "worker-1", "model_id": "org/model",
+            })
+        deleted = await server.call_tool("delete_storage_weights", {
+            "node_id": "worker-1", "model_id": "org/model", "confirm": True,
+        })
+
+        self.assertEqual(inventory.structured_content["nodes"][0]["id"], "local")
+        self.assertEqual(pulled.structured_content["job_ids"], ["download-1"])
+        self.assertEqual(transferred.structured_content["job_ids"], ["transfer-1"])
+        self.assertEqual(status.structured_content["status"], "running")
+        self.assertTrue(deleted.structured_content["ok"])
+        self.assertEqual(calls, [
+            ("inventory", "local"),
+            ("pull", "org/model", ["local", "worker-1"], {
+                "revision": "main", "download_node_id": "local",
+            }),
+            ("transfer", "org/model", "local", ["worker-1"], {
+                "revision": None,
+            }),
+            ("transfers", "running"),
+            ("status", "transfer-1"),
+            ("delete", "worker-1", "org/model"),
+        ])
 
     async def test_ab_tool_runs_variants_sequentially_and_cleans_up(self) -> None:
         events = []

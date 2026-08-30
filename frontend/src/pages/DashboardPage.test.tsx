@@ -305,6 +305,56 @@ describe('DashboardPage', () => {
     expect(screen.getByText('12.0 tok/s')).toBeInTheDocument()
   })
 
+  it('uses fresh admission queue depth instead of stale stats queue depth', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({
+        cpu_pct: 25,
+        mem: {},
+        gpus: [],
+        active_requests: { 'live-model': { connections: 1, queued: 5, output_tok_s: 12 } },
+      })
+      if (path.includes('/api/inference-queue')) return json({
+        target: { model: 'live-model', running: 1, queued: 0 },
+      })
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    const model = await screen.findByText('live-model')
+    expect(model.closest('.session-row')).toHaveTextContent('1 active · 0 queued')
+    expect(screen.queryByText(/5 queued/)).not.toBeInTheDocument()
+  })
+
+  it('keeps healthy retained admission sessions visible during a normal refresh', async () => {
+    let admissionCalls = 0
+    let finishAdmission: ((response: Response) => void) | undefined
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
+      if (path.includes('/api/inference-queue')) {
+        admissionCalls += 1
+        if (admissionCalls === 1) return json({ target: { model: 'healthy-model', running: 1, queued: 0 } })
+        return new Promise<Response>((resolve) => { finishAdmission = resolve })
+      }
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('healthy-model')).toBeInTheDocument()
+
+    act(() => { screen.getByRole('button', { name: 'Refresh' }).click() })
+
+    expect(admissionCalls).toBe(2)
+    expect(screen.getByText('healthy-model')).toBeInTheDocument()
+    await act(async () => { finishAdmission?.(json({ target: { model: 'healthy-model', running: 1, queued: 0 } })) })
+  })
+
   it('renders queued-only admission sessions as waiting', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -355,16 +405,18 @@ describe('DashboardPage', () => {
     MockWebSocket.autoOpen = true
     vi.stubGlobal('WebSocket', MockWebSocket)
     let admissionCalls = 0
+    let finishAdmission: ((response: Response) => void) | undefined
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/stats')) return json({ cpu_pct: 25, mem: {}, gpus: [], active_requests: {} })
       if (path.includes('/api/inference-queue')) {
         admissionCalls += 1
         if (admissionCalls === 1) return json({ target: { model: 'finished-model', running: 1, queued: 0 } })
-        return new Response(JSON.stringify({ detail: 'queue unavailable' }), {
+        if (admissionCalls === 2) return new Response(JSON.stringify({ detail: 'queue unavailable' }), {
           status: 503,
           headers: { 'Content-Type': 'application/json' },
         })
+        return new Promise<Response>((resolve) => { finishAdmission = resolve })
       }
       if (path.includes('/api/v1/deployments')) return json({ items: [] })
       if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
@@ -389,6 +441,16 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('finished-model')).not.toBeInTheDocument()
     expect(screen.queryByText('Processing')).not.toBeInTheDocument()
     expect(screen.getByText('Unavailable', { selector: '.status' })).toBeInTheDocument()
+
+    act(() => { screen.getByRole('button', { name: 'Refresh' }).click() })
+    expect(admissionCalls).toBe(3)
+    expect(screen.queryByText('finished-model')).not.toBeInTheDocument()
+
+    await act(async () => {
+      finishAdmission?.(json({ target: { model: 'replacement-model', running: 0, queued: 1 } }))
+    })
+    expect(await screen.findByText('replacement-model')).toBeInTheDocument()
+    expect(screen.queryByText('finished-model')).not.toBeInTheDocument()
   })
 
   it('marks retained section data stale when an independent refresh fails', async () => {

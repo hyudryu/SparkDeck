@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Activity,
   Cloud,
@@ -138,7 +138,10 @@ export function activeRequestSnapshot(
     snapshot[model] = {
       ...existing,
       connections: Math.max(existing?.connections ?? 0, running),
-      queued: Math.max(existing?.queued ?? 0, queued),
+      // Admission and active_requests share the same queue store. When an
+      // admission value is available it is newer and authoritative, including
+      // a drained queue reported as zero.
+      queued,
     }
   })
   return snapshot
@@ -169,9 +172,21 @@ export function DashboardPage() {
 
   const stats = statsResource.data
   const admission = admissionResource.data
+  const previousAdmission = useRef(admission)
+  const [admissionFailedSinceSuccess, setAdmissionFailedSinceSuccess] = useState(false)
+  useEffect(() => {
+    const replaced = admission !== previousAdmission.current
+    previousAdmission.current = admission
+    if (admissionResource.error) setAdmissionFailedSinceSuccess(true)
+    else if (replaced) setAdmissionFailedSinceSuccess(false)
+  }, [admission, admissionResource.error])
   // Retained queue data is useful for the stale queue summary, but it must not
   // override a newer active-request snapshot after the admission refresh fails.
-  const admissionForSessions = admissionResource.error ? undefined : admission
+  // Keep it excluded while a retry is loading; only replacement data proves
+  // that the admission source recovered.
+  const admissionForSessions = admissionResource.error || admissionFailedSinceSuccess
+    ? undefined
+    : admission
   const deployments = deploymentsResource.data ?? []
   const sync = syncResource.data
   const activeRequests = Object.entries(activeRequestSnapshot(stats, admissionForSessions))

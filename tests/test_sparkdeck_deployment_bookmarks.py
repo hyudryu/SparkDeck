@@ -173,6 +173,110 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         get_key.assert_called_once_with("external-1", "keyring:external-1")
         store_key.assert_called_once_with(cloned["id"], "secret")
 
+    async def test_clone_normalizes_adopted_sglang_controls_for_relaunch(self):
+        self.service.store.add_deployment(Deployment(
+            id="sg-record", alias="SGLang model", runtime=RuntimeKind.SGLANG,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={
+                "manager_deployment_id": "sg-cluster",
+                "node_ids": ["remote-1"],
+                "deployment_mode": "single",
+                "sg_tp_size": 2,
+                "sg_context_length": 262144,
+                "sg_max_running_requests": 10,
+                "sg_mem_fraction": 0.85,
+            },
+        ))
+        self.manager.deployments = [{
+            "id": "sg-cluster",
+            "launch_settings": {
+                "engine": "sglang",
+                "extra_args": ["--enable-metrics"],
+                "sg_tp_size": 2,
+                "sg_context_length": 262144,
+                "sg_max_running_requests": 10,
+                "sg_mem_fraction": 0.85,
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("sg-record")
+
+        self.assertEqual(cloned["settings"]["tensor_parallel_size"], 2)
+        self.assertEqual(cloned["settings"]["context_length"], 262144)
+        self.assertEqual(cloned["settings"]["max_running_requests"], 10)
+        self.assertEqual(cloned["settings"]["mem_fraction_static"], 0.85)
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.SGLANG, "org/model", cloned["alias"], cloned["id"],
+            ModelIdentity("org/model"), cloned["settings"], ["remote-1"],
+            "single", llama_artifact=None,
+        )
+        self.assertEqual(launch["sg_tp_size"], 2)
+        self.assertEqual(launch["sg_context_length"], 262144)
+        self.assertEqual(launch["sg_max_running_requests"], 10)
+        self.assertEqual(launch["sg_mem_fraction"], 0.85)
+
+    async def test_clone_restores_adopted_llama_artifact_and_controls(self):
+        revision = "a" * 40
+        cached_artifact = (
+            f"models--org--model/snapshots/{revision}/GGUF/model-Q4_K_M.gguf"
+        )
+        self.service.store.add_deployment(Deployment(
+            id="llama-record", alias="Llama model", runtime=RuntimeKind.LLAMA_CPP,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity(
+                "org/model", revision=revision, artifact=cached_artifact,
+                quantization="Q4_K_M",
+            ),
+            settings={
+                "manager_deployment_id": "llama-cluster",
+                "node_ids": ["remote-1"],
+                "deployment_mode": "single",
+            },
+        ))
+        self.manager.deployments = [{
+            "id": "llama-cluster",
+            "launch_settings": {
+                "engine": "llama.cpp",
+                "extra_args": [],
+                "llama_artifact": cached_artifact,
+                "llama_context_length": 16384,
+                "llama_parallel_slots": 4,
+                "llama_gpu_layers": 77,
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("llama-record")
+
+        self.assertEqual(
+            cloned["model"]["artifact"], "GGUF/model-Q4_K_M.gguf",
+        )
+        self.assertEqual(cloned["settings"]["context_length"], 16384)
+        self.assertEqual(cloned["settings"]["parallel_slots"], 4)
+        self.assertEqual(cloned["settings"]["gpu_layers"], 77)
+        prepared_artifact = self.service._hub_relative_llama_artifact(
+            "org/model", cloned["model"]["artifact"], revision,
+        )
+        self.assertEqual(prepared_artifact, cached_artifact)
+        self.assertEqual(
+            self.service._clone_llama_artifact(
+                "org/model", r"C:\models\local.gguf",
+            ),
+            r"C:\models\local.gguf",
+        )
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.LLAMA_CPP, "org/model", cloned["alias"], cloned["id"],
+            ModelIdentity(
+                "org/model", revision=revision,
+                artifact=cloned["model"]["artifact"], quantization="Q4_K_M",
+            ),
+            cloned["settings"], ["remote-1"], "single",
+            llama_artifact=prepared_artifact,
+        )
+        self.assertEqual(launch["llama_artifact"], cached_artifact)
+        self.assertEqual(launch["llama_context_length"], 16384)
+        self.assertEqual(launch["llama_parallel_slots"], 4)
+        self.assertEqual(launch["llama_gpu_layers"], 77)
+
     async def test_bookmark_is_reported_as_saved_in_the_deployments_list(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "bookmark", "runtime": "vllm",

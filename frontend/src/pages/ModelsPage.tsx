@@ -1049,11 +1049,17 @@ export function ModelsPage() {
     setActionNotice(undefined)
     try {
       const cloned = await api.deployments.clone(deployment.id)
+      // Keep the accepted row visible if an older list request completes
+      // before the clone appears in the backend's probed deployment list.
+      acceptedDeployments.current.set(cloned.id, cloned)
       resource.setData((current) => [
         cloned,
         ...(current ?? []).filter((item) => item.id !== cloned.id),
       ])
       setActionNotice(`Cloned ${deployment.alias} as ${cloned.alias}.`)
+      // External clone responses are initially "registered"; the list probe
+      // resolves them to their live running/error state.
+      resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not clone deployment')
     } finally {

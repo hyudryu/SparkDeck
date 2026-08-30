@@ -14,7 +14,9 @@ export function parseEnvironment(input: string): Record<string, string> {
     if (PROTECTED_NAMES.has(name)) throw new Error(`${name} is managed in Settings, not deployment environment variables`)
     if (SECRET_NAME.test(name)) throw new Error(`${name} looks secret and cannot be stored in deployment environment variables`)
     if (Object.prototype.hasOwnProperty.call(environment, name)) throw new Error(`Environment variable ${name} is duplicated`)
-    environment[name] = value
+    Object.defineProperty(environment, name, {
+      value, enumerable: true, configurable: true, writable: true,
+    })
   })
   return environment
 }

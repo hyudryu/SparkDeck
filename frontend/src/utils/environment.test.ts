@@ -18,4 +18,10 @@ describe('runtime environment helpers', () => {
     expect(() => parseEnvironment('HF_TOKEN=secret')).toThrow('managed in Settings')
     expect(() => parseEnvironment('SERVICE_API_KEY=secret')).toThrow('looks secret')
   })
+
+  it('preserves __proto__ as an own serializable variable', () => {
+    const environment = parseEnvironment('__proto__=literal')
+    expect(Object.prototype.hasOwnProperty.call(environment, '__proto__')).toBe(true)
+    expect(JSON.stringify(environment)).toBe('{"__proto__":"literal"}')
+  })
 })

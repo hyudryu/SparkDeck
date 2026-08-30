@@ -28,6 +28,7 @@ from .catalog import (
     quantization_from_text,
 )
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
     launch_managed_container,
@@ -1319,7 +1320,7 @@ class SparkDeckService:
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         if "environment" in changes:
-            settings["environment"] = self.manager._normalize_runtime_environment(
+            settings["environment"] = normalize_runtime_environment(
                 changes.get("environment"), str(stored.get("runtime") or "vllm"),
             )
         if "image" in changes:
@@ -1958,7 +1959,7 @@ class SparkDeckService:
         # Saved argv persists in SQLite, so credential-bearing flags are
         # rejected at save time instead of failing (or leaking) at launch.
         self._reject_sensitive_launch_args(settings.get("extra_args"))
-        environment = self.manager._normalize_runtime_environment(
+        environment = normalize_runtime_environment(
             settings.get("environment"), runtime.value,
         )
         if environment:

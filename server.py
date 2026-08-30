@@ -1980,6 +1980,8 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
         if payload.get("sg_image") is None and settings.get("image"):
             payload["sg_image"] = settings["image"]
     else:
+        if payload.get("environment") is None and settings.get("environment") is not None:
+            payload["environment"] = settings["environment"]
         if payload.get("gpu_memory_utilization") is None and settings.get("gpu_memory_utilization") is not None:
             payload["gpu_memory_utilization"] = settings["gpu_memory_utilization"]
         context_length = settings.get("max_model_len") or settings.get("context_length")
@@ -2009,6 +2011,7 @@ async def create_recipe(req: Request):
             extra_args=body.get("extra_args"),
             gpu_memory_utilization=body.get("gpu_memory_utilization"),
             gpu_memory_gb=body.get("gpu_memory_gb"),
+            environment=body.get("environment"),
             engine=body.get("engine", "vllm"),
             sg_tp_size=body.get("sg_tp_size"),
             sg_context_length=body.get("sg_context_length"),
@@ -2210,6 +2213,7 @@ async def v1_update_recipe(recipe_id: str, req: Request):
         raise HTTPException(400, "request body must be an object")
     allowed = {
         "name", "extra_args", "launch_controls",
+        "environment",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_context_length",
         "sg_max_running_requests", "sg_mem_fraction", "sg_image",
@@ -2298,6 +2302,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
         "image": recipe.get("image"),
         "gpu_memory_utilization": recipe.get("gpu_memory_utilization"),
         "gpu_memory_gb": recipe.get("gpu_memory_gb"),
+        "environment": recipe.get("environment"),
     }
     if str(recipe.get("engine") or "vllm") == "sglang":
         settings.update({

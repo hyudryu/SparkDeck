@@ -1630,7 +1630,16 @@ async def create_container(req: Request):
         # New clients send a deployment mode even for single-node launches.
         # Old clients omit it and retain the original local-container path.
         if body.get("deployment_mode") or body.get("node_ids"):
-            return await manager.create_deployment(body)
+            cluster = await manager.create_deployment(body)
+            try:
+                await sparkdeck.register_manager_deployment(cluster)
+            except Exception:
+                try:
+                    await manager.deployment_action(cluster["id"], "remove")
+                except Exception:
+                    pass
+                raise
+            return cluster
         return await manager.create_container(
             model=body["model"],
             port=body.get("port"),

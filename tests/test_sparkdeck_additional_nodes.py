@@ -298,9 +298,9 @@ class ManagerOnlyClusterCardTests(unittest.IsolatedAsyncioTestCase):
             try:
                 listed = await service.deployments()
 
-                cards = [item for item in listed if str(item.get("id", "")).startswith("container:")]
-                self.assertEqual(len(cards), 1)
-                card = cards[0]
+                self.assertEqual(len(listed), 1)
+                card = listed[0]
+                self.assertFalse(str(card["id"]).startswith("container:"))
                 # The card must carry the owning cluster's node set so the UI
                 # can show the running nodes and lock them in an add-nodes
                 # picker instead of treating the card as standalone.

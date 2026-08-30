@@ -167,6 +167,75 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "stopped",
         )
 
+    async def test_remote_only_legacy_manager_deployment_is_adopted_once(self):
+        self.service.store.delete_deployment("record-1")
+        self.manager._save_deployments = Mock()
+        self.manager.deployments = [{
+            "id": "manager-hermes",
+            "name": "glm53-exl3-2x",
+            "model": "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw",
+            "engine": "vllm",
+            "mode": "sharded",
+            "node_ids": ["worker-1", "worker-2"],
+            "status": "ready",
+            "desired_state": "running",
+            "managed_by": "sparkdeck-mcp",
+            "automation_run_id": "hermes-run-1",
+            "api_port": 8000,
+            "members": [
+                {
+                    "node_id": "worker-1", "rank": 0,
+                    "container_name": "cluster-manager-hermes-r0-glm",
+                },
+                {
+                    "node_id": "worker-2", "rank": 1,
+                    "container_name": "cluster-manager-hermes-r1-glm",
+                },
+            ],
+            "launch_settings": {
+                "deployment_name": "glm53-exl3-2x",
+                "deployment_mode": "sharded",
+                "extra_args": ["--tensor-parallel-size", "2"],
+            },
+        }]
+        self.manager.cluster_nodes.return_value = [
+            cluster_node("worker-1"), cluster_node("worker-2"),
+        ]
+
+        first = await self.service.deployments()
+        second = await self.service.deployments()
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        adopted = first[0]
+        self.assertEqual(adopted["alias"], "glm53-exl3-2x")
+        self.assertEqual(adopted["status"], "running")
+        self.assertEqual(adopted["node_ids"], ["worker-1", "worker-2"])
+        self.assertTrue(adopted["managed"])
+        self.assertEqual(adopted["managed_by"], "sparkdeck-mcp")
+        self.assertEqual(adopted["automation_run_id"], "hermes-run-1")
+        record_id = self.manager.deployments[0]["sparkdeck_record_id"]
+        self.assertEqual(second[0]["id"], record_id)
+        self.assertEqual(
+            self.service.store.deployment(record_id)["settings"][
+                "manager_deployment_id"
+            ],
+            "manager-hermes",
+        )
+        stored_settings = self.service.store.deployment(record_id)["settings"]
+        self.assertEqual(stored_settings["managed_by"], "sparkdeck-mcp")
+        self.assertEqual(stored_settings["automation_run_id"], "hermes-run-1")
+        self.assertEqual(
+            self.manager.deployments[0]["launch_settings"]["sparkdeck_record_id"],
+            record_id,
+        )
+        self.manager._save_deployments.assert_called_once_with()
+
+        await self.service.deployment_action(record_id, "stop")
+        self.manager.deployment_action.assert_awaited_once_with(
+            "manager-hermes", "stop",
+        )
+
     async def test_settings_dirty_start_result_immediately_reconciles_replacement(self):
         self.manager.deployment_action.return_value = {
             "ok": True,

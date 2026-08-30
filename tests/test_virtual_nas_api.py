@@ -73,6 +73,51 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertTrue(changed.json()["enabled"])
 
+    async def test_legacy_cluster_create_registers_v1_deployment_before_return(self):
+        cluster = {
+            "id": "manager-hermes", "status": "starting",
+            "sparkdeck_record_id": "record-hermes",
+        }
+        create = AsyncMock(return_value=cluster)
+        register = AsyncMock(return_value={"id": "record-hermes"})
+        with (
+            patch.object(server.manager, "create_deployment", create),
+            patch.object(server.sparkdeck, "register_manager_deployment", register),
+        ):
+            response = await self.client.post("/api/containers", json={
+                "model": "org/model",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "managed_by": "sparkdeck-mcp",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], "manager-hermes")
+        create.assert_awaited_once()
+        register.assert_awaited_once_with(cluster)
+
+    async def test_legacy_cluster_create_rolls_back_when_registration_fails(self):
+        cluster = {"id": "manager-hermes", "status": "starting"}
+        create = AsyncMock(return_value=cluster)
+        remove = AsyncMock(return_value={"ok": True, "errors": []})
+        with (
+            patch.object(server.manager, "create_deployment", create),
+            patch.object(server.manager, "deployment_action", remove),
+            patch.object(
+                server.sparkdeck, "register_manager_deployment",
+                AsyncMock(side_effect=RuntimeError("store unavailable")),
+            ),
+        ):
+            response = await self.client.post("/api/containers", json={
+                "model": "org/model",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+            })
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("store unavailable", response.json()["detail"])
+        remove.assert_awaited_once_with("manager-hermes", "remove")
+
     async def test_shared_inventory_and_transfer_payloads_are_redacted(self):
         inventory = {
             "enabled": True,

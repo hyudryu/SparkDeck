@@ -243,6 +243,16 @@ url = "http://127.0.0.1:7878/mcp"
 
 Set `SPARKDECK_MCP_TOKEN` to require a bearer token and `SPARKDECK_MCP_PUBLIC_URL` when the externally visible MCP URL differs from the local default. Older `VLLM_MCP_TOKEN` and `VLLM_MCP_PUBLIC_URL` values are accepted only as migration fallbacks. Bearer authentication does not provide TLS; keep the endpoint private or place it behind a secure reverse proxy.
 
+The MCP server exposes the same guarded Storage operations as the app:
+
+- `list_storage_weights` shows which model weights and revisions are present on each node;
+- `pull_storage_weights` downloads a model once and fans it out to selected nodes when needed;
+- `transfer_storage_weights` starts an explicit source-to-target Virtual NAS copy;
+- `list_storage_transfers` and `get_storage_transfer` report download/copy progress, live rate, receiver phase, completion, and errors; and
+- `delete_storage_weights` removes one exact node/model copy only when `confirm=true`.
+
+Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. Externally managed weights remain read-only.
+
 MCP-created deployments use the current `managed_by=sparkdeck-mcp` marker. SparkDeck continues to recognize the legacy `managed_by=vllm-controller-mcp` marker solely so deployments created by older releases can still be managed safely.
 
 ## Service installation

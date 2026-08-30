@@ -12,7 +12,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from mcp.server.auth.provider import AccessToken
@@ -270,6 +270,99 @@ class ControllerClient:
                 )
         return await self._request(
             "POST", f"/api/deployments/{deployment_id}/{action}", timeout=300
+        )
+
+    async def storage(self) -> dict[str, Any]:
+        """Return the controller's public cluster-wide Storage snapshot."""
+        result = await self._request("GET", "/api/v1/storage")
+        if not isinstance(result, dict):
+            raise ControllerError("controller returned an invalid Storage response")
+        return result
+
+    async def storage_weights(self, node_id: str | None = None) -> dict[str, Any]:
+        state = await self.storage()
+        nodes = state.get("nodes") or []
+        if node_id is not None:
+            selected = str(node_id).strip()
+            if not selected:
+                raise ControllerError("node_id must not be empty")
+            nodes = [node for node in nodes if str(node.get("id")) == selected]
+            if not nodes:
+                raise ControllerError(f"storage node not found: {selected}")
+        return {"enabled": bool(state.get("enabled")), "nodes": nodes}
+
+    async def storage_transfers(
+        self, status: str | None = None,
+    ) -> dict[str, Any]:
+        jobs = (await self.storage()).get("jobs") or []
+        if status is not None:
+            selected = str(status).strip().casefold()
+            if not selected:
+                raise ControllerError("status must not be empty")
+            jobs = [
+                job for job in jobs
+                if str(job.get("status") or "").casefold() == selected
+            ]
+        return {"jobs": jobs}
+
+    async def storage_transfer(self, job_id: str) -> dict[str, Any]:
+        selected = str(job_id).strip()
+        if not selected:
+            raise ControllerError("job_id must not be empty")
+        jobs = (await self.storage()).get("jobs") or []
+        job = next((job for job in jobs if str(job.get("id")) == selected), None)
+        if not job:
+            raise ControllerError(f"storage transfer not found: {selected}")
+        return job
+
+    async def pull_storage_weights(
+        self,
+        model_id: str,
+        node_ids: list[str],
+        *,
+        revision: str | None = None,
+        download_node_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"model_id": model_id, "node_ids": node_ids}
+        if revision is not None:
+            body["revision"] = revision
+        if download_node_id is not None:
+            body["download_node_id"] = download_node_id
+        return await self._request(
+            "POST", "/api/v1/storage/preparations", json_body=body,
+            timeout=1800,
+        )
+
+    async def transfer_storage_weights(
+        self,
+        model_id: str,
+        source_node_id: str,
+        target_node_ids: list[str],
+        *,
+        revision: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model_id": model_id,
+            "source_node_id": source_node_id,
+            "target_node_ids": target_node_ids,
+        }
+        if revision is not None:
+            body["revision"] = revision
+        return await self._request(
+            "POST", "/api/v1/storage/transfers", json_body=body,
+            timeout=300,
+        )
+
+    async def delete_storage_weights(
+        self, node_id: str, model_id: str,
+    ) -> dict[str, Any]:
+        node = quote(str(node_id).strip(), safe="")
+        model = quote(str(model_id).strip(), safe="")
+        if not node or not model:
+            raise ControllerError("node_id and model_id must not be empty")
+        return await self._request(
+            "DELETE", f"/api/v1/storage/nodes/{node}/models/{model}",
+            timeout=600,
         )
 
     async def wait_ready(
@@ -645,15 +738,20 @@ def build_server(
     server = MCPServer(
         name="sparkdeck",
         title="SparkDeck Cluster Automation",
-        description="Create, tune, benchmark, compare, stop, and remove clustered model deployments.",
+        description=(
+            "Manage clustered model storage and create, tune, benchmark, compare, stop, "
+            "and remove clustered model deployments."
+        ),
         instructions=(
             "Prefer recipe IDs and deployment IDs. Run A/B variants sequentially unless the "
             "selected nodes have enough independent GPUs. Destructive tools protect deployments "
             "not created through this MCP server unless allow_unowned is explicitly set. "
             "For vLLM image-specific runtime variables, use environment as an object of "
             "non-secret string NAME/value pairs; never place credentials in environment."
+            " Storage tools use the controller's Virtual NAS validation and never expose "
+            "cache paths, node credentials, or Hugging Face tokens."
         ),
-        version="1.0.0",
+        version="1.1.0",
         auth=auth,
         token_verifier=verifier,
     )
@@ -674,6 +772,78 @@ def build_server(
     async def get_cluster_state() -> dict[str, Any]:
         """Return nodes, recipes, deployments, and controller summary state."""
         return await client.state()
+
+    @server.tool()
+    async def list_storage_weights(
+        node_id: str | None = None,
+    ) -> dict[str, Any]:
+        """List model weights by storage node, optionally limited to one stable node ID."""
+        return await client.storage_weights(node_id)
+
+    @server.tool()
+    async def pull_storage_weights(
+        model_id: str,
+        node_ids: list[str],
+        revision: str | None = None,
+        download_node_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Ensure Hugging Face weights are present on selected nodes.
+
+        SparkDeck downloads once and uses Virtual NAS fan-out when possible. Pass
+        ``download_node_id`` to choose the seed node; it must also be in
+        ``node_ids``. The result includes workflow and queued job IDs for status
+        checks with the transfer tools.
+        """
+        return await client.pull_storage_weights(
+            model_id,
+            node_ids,
+            revision=revision,
+            download_node_id=download_node_id,
+        )
+
+    @server.tool()
+    async def transfer_storage_weights(
+        model_id: str,
+        source_node_id: str,
+        target_node_ids: list[str],
+        revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue a validated Virtual NAS copy from one node to other nodes."""
+        return await client.transfer_storage_weights(
+            model_id,
+            source_node_id,
+            target_node_ids,
+            revision=revision,
+        )
+
+    @server.tool()
+    async def list_storage_transfers(
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """List weight downloads and transfers, optionally filtered by exact status."""
+        return await client.storage_transfers(status)
+
+    @server.tool()
+    async def get_storage_transfer(job_id: str) -> dict[str, Any]:
+        """Get current progress, rate, phase, and error details for one Storage job ID."""
+        return await client.storage_transfer(job_id)
+
+    @server.tool()
+    async def delete_storage_weights(
+        node_id: str,
+        model_id: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Delete an exact cached model from one node after explicit confirmation.
+
+        Set ``confirm=true``. SparkDeck refuses deletion while the model is serving,
+        participating in a transfer, externally managed, or otherwise unsafe to remove.
+        """
+        if not confirm:
+            raise ControllerError(
+                "refusing to delete weights without confirm=true"
+            )
+        return await client.delete_storage_weights(node_id, model_id)
 
     @server.tool()
     async def list_cluster_recipes() -> list[dict[str, Any]]:

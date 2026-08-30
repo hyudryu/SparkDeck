@@ -83,6 +83,19 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service._community_observation.reset(token)
             self.service._community_observation_end(observation)
 
+    async def test_models_contract_keeps_benchmark_routing_fields(self):
+        self.service.deployments = AsyncMock(return_value=[{
+            "id": "container:legacy", "alias": "legacy-model",
+            "runtime": "vllm", "status": "running",
+            "container_name": "legacy", "port": 8123,
+            "model": {"repository": "org/model", "quantization": None},
+        }])
+
+        result = await self.service.models()
+
+        self.assertEqual(result["data"][0]["container_name"], "legacy")
+        self.assertEqual(result["data"][0]["port"], 8123)
+
     async def test_passive_telemetry_collects_nothing_when_opted_out(self):
         self._record_passive_sample()
         _, total = self.service.store.benchmarks()
@@ -404,7 +417,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "NVFP4",
         )
 
-    async def test_coordinated_run_groups_private_models_by_distinct_opaque_local_ids(self):
+    async def test_coordinated_run_groups_private_models_by_distinct_safe_labels(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
         point_ids = []
@@ -427,17 +440,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 })
 
                 point_ids.append(point["model_id"])
-                self.assertRegex(point["model_id"], r"^local-model-[0-9a-f]{16}$")
+                self.assertRegex(point["model_id"], r"^Private model [0-9a-f]{8}$")
                 self.assertNotIn(model, str(point))
 
         samples, total = self.service.store.benchmarks()
         self.assertEqual(total, 2)
         self.assertEqual(len(set(point_ids)), 2)
-        self.assertTrue(all(
-            sample["model"]["repository"] == "local-model"
-            and not sample["eligible_for_community"]
-            for sample in samples
-        ))
+        self.assertEqual(
+            {sample["model"]["repository"] for sample in samples}, set(point_ids)
+        )
+        self.assertTrue(all(not sample["eligible_for_community"] for sample in samples))
         self.assertEqual(self.service.store.outbox_batch(), [])
         summaries = self.service.store.benchmark_model_summaries()
         self.assertEqual({item["model_id"] for item in summaries}, set(point_ids))
@@ -543,10 +555,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "wall_seconds": 1,
         })
 
-        self.assertRegex(point["model_id"], r"^local-model-[0-9a-f]{16}$")
+        self.assertRegex(point["model_id"], r"^Private model [0-9a-f]{8}$")
         samples, total = self.service.store.benchmarks()
         self.assertEqual(total, 1)
-        self.assertEqual(samples[0]["model"]["repository"], "local-model")
+        self.assertEqual(samples[0]["model"]["repository"], point["model_id"])
         self.assertNotIn("model_source", samples[0]["configuration"])
         self.assertFalse(samples[0]["eligible_for_community"])
         self.assertEqual(self.service.store.outbox_batch(), [])
@@ -1266,7 +1278,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         items, _ = self.service.store.benchmarks()
-        self.assertEqual(items[0]["model"]["repository"], "local-model")
+        self.assertRegex(items[0]["model"]["repository"], r"^Private model [0-9a-f]{8}$")
         self.assertNotIn("image", items[0]["configuration"])
         self.assertFalse(items[0]["eligible_for_community"])
         self.assertEqual(self.service.store.outbox_batch(), [])
@@ -1280,6 +1292,6 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 {"usage": {"prompt_tokens": 24, "completion_tokens": 20}},
             )
         items, _ = self.service.store.benchmarks()
-        self.assertEqual(items[0]["model"]["repository"], "local-model")
+        self.assertRegex(items[0]["model"]["repository"], r"^Private model [0-9a-f]{8}$")
         self.assertFalse(items[0]["eligible_for_community"])
         self.assertEqual(self.service.store.outbox_batch(), [])

@@ -150,10 +150,7 @@ class BenchmarkRunnerService:
         # record precedence when an alias collides with the native llama model
         # id, and Benchy must benchmark the same target the proxy would route
         # that id to.
-        try:
-            served = await self.sparkdeck.models()
-        except Exception:
-            served = {"data": []}
+        served = await self.sparkdeck.models()
         for entry in served.get("data", []):
             model_id = str(entry.get("id") or "")
             if not model_id or model_id in seen:
@@ -239,12 +236,8 @@ class BenchmarkRunnerService:
             port = entry.get("port") or stored.get("port")
             if port:
                 base_url = f"http://127.0.0.1:{int(port)}"
-        if not base_url:
-            return None
-        if not self._managed_primary_is_local(stored):
-            # A remote primary exposes api_port in the worker's host namespace
-            # (see Manager._used_host_ports): the controller cannot reach it,
-            # and a local port squatter would benchmark the wrong service.
+        remote_managed = not self._managed_primary_is_local(stored)
+        if not base_url and not remote_managed:
             return None
         identity = entry.get("model") or {}
         model = self._served_model_id(
@@ -265,9 +258,12 @@ class BenchmarkRunnerService:
         # run. Keyed deployments therefore benchmark through the controller's
         # authenticated proxy, which resolves the key server-side from the
         # deployment alias and needs no auth for local callers.
-        if self.sparkdeck._get_credential(
+        if remote_managed or self.sparkdeck._get_credential(
             target["deployment_id"], stored.get("_credential_ref")
         ):
+            # A remote primary's published port belongs to the worker host.
+            # Benchmark through SparkDeck's controller proxy, which already
+            # routes the deployment alias to the correct cluster member.
             target["base_url"] = CONTROLLER_LOCAL_BASE_URL
             target["model"] = entry["id"]
         return target

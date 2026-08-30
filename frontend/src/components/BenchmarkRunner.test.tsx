@@ -59,6 +59,7 @@ function stubFetch(overrides: {
   runs?: unknown[]
   runDetail?: unknown
   startError?: number
+  modelsError?: number
 } = {}) {
   const state = {
     status: overrides.status ?? { installed: true, version: '0.1.2' },
@@ -73,11 +74,18 @@ function stubFetch(overrides: {
       state.status = { installed: true, version: '0.1.2' }
       body = { installed: true, version: '0.1.2', launch_mode: 'python_module', path_on_host: false }
     }
-    else if (path.endsWith('/api/v1/benchmark-runner/models')) body = { items: [{
-      id: 'unsloth/Qwen3-4B-GGUF', label: 'Qwen3-4B-GGUF', runtime: 'llama.cpp',
-      deployment_id: null, model: 'unsloth/Qwen3-4B-GGUF',
-      quantization: 'Q4_K_M', base_url: 'http://127.0.0.1:8080',
-    }] }
+    else if (path.endsWith('/api/v1/benchmark-runner/models')) {
+      if (overrides.modelsError) {
+        return new Response(JSON.stringify({ detail: 'Model discovery failed' }), {
+          status: overrides.modelsError, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      body = { items: [{
+        id: 'unsloth/Qwen3-4B-GGUF', label: 'Qwen3-4B-GGUF', runtime: 'llama.cpp',
+        deployment_id: null, model: 'unsloth/Qwen3-4B-GGUF',
+        quantization: 'Q4_K_M', base_url: 'http://127.0.0.1:8080',
+      }] }
+    }
     else if (path.endsWith('/api/v1/benchmark-runner/runs') && init?.method === 'POST') {
       if (overrides.startError) {
         return new Response(JSON.stringify({ detail: 'llama-benchy is not installed' }), {
@@ -126,6 +134,7 @@ describe('BenchmarkRunner', () => {
     renderPage()
 
     await screen.findByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })
+    expect(screen.getByLabelText(/Served model/).closest('.runner-config-panel')).not.toBeNull()
     expect(within(screen.getByLabelText(/Served model/)).getByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })).toBeInTheDocument()
 
     await user.clear(screen.getByLabelText(/Concurrency levels/))
@@ -144,6 +153,15 @@ describe('BenchmarkRunner', () => {
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
     expect(within(history).getAllByText('Q4_K_M').length).toBeGreaterThan(0)
+  })
+
+  it('reports model discovery failures instead of claiming no models are served', async () => {
+    stubFetch({ modelsError: 503 })
+    renderPage()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load served models: Model discovery failed')
+    expect(screen.getByLabelText(/Served model/)).toHaveDisplayValue('Served models unavailable')
+    expect(screen.queryByRole('option', { name: 'No models currently served' })).not.toBeInTheDocument()
   })
 
   it('rejects empty configuration with a inline error instead of a request', async () => {

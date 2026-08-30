@@ -599,6 +599,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 }
 
 /* ---------- Benchmark runner (llama-benchy) ---------- */
+.runner-config-panel { padding: 18px; }
 .runner-tool-row { display: flex; align-items: flex-start; gap: 12px; }
 .runner-tool-icon { display: grid; place-items: center; width: 36px; height: 36px; color: var(--accent); background: var(--accent-soft); border-radius: 10px; }
 .runner-tool-info { min-width: 0; flex: 1; }

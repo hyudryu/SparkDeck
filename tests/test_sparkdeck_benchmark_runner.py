@@ -341,7 +341,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
         self.assertEqual(models[0]["model"], "served-model-name")
 
-    async def test_remote_managed_deployment_is_excluded(self):
+    async def test_remote_managed_deployment_uses_controller_proxy(self):
         sparkdeck = FakeSparkdeck(stored={
             "id": "dep-2", "kind": "managed", "_base_url": None,
             "settings": {"manager_deployment_id": "md-1"},
@@ -352,7 +352,9 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
             "model": {"repository": "org/model", "quantization": None},
         }]})
         remote = BenchmarkRunnerService(FakeManager(primary_node_id="node-2"), sparkdeck, Path("data-unused"))
-        self.assertEqual(await remote.served_models(), [])
+        remote_models = await remote.served_models()
+        self.assertEqual(remote_models[0]["base_url"], "http://127.0.0.1:7878")
+        self.assertEqual(remote_models[0]["model"], "alias")
         local = BenchmarkRunnerService(FakeManager(primary_node_id="local"), sparkdeck, Path("data-unused"))
         self.assertEqual(len(await local.served_models()), 1)
 
@@ -740,6 +742,28 @@ class BenchmarkRunnerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("secret-key", response.text)
         self.assertNotIn("_api_key", response.text)
+
+    async def test_local_history_models_returns_consolidated_rows(self):
+        history = Mock(return_value=[{
+            "id": "sample-new", "model": {"repository": "org/model"},
+            "sample_count": 12,
+        }])
+        with patch.object(
+            self.server.sparkdeck.store, "benchmark_history_models", history,
+        ):
+            response = await self.client.get("/api/v1/benchmark-history/models")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0]["sample_count"], 12)
+
+    async def test_delete_local_history_model_deletes_all_samples(self):
+        deleted = AsyncMock(return_value=12)
+        with patch.object(self.server.sparkdeck, "delete_benchmark_model", deleted):
+            response = await self.client.delete(
+                "/api/v1/benchmark-history/models/org%2Fmodel"
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["deleted"], 12)
+        deleted.assert_awaited_once_with("org/model")
 
     async def test_start_run_passes_body_through(self):
         started = AsyncMock(return_value={"id": "run-1", "status": "running"})

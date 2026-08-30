@@ -580,6 +580,29 @@ class SparkDeckStore:
         items = [_benchmark_row(row) for row in rows]
         return items, total
 
+    def benchmark_history_models(self) -> list[dict[str, Any]]:
+        """Return one latest local-history row for each identified model."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT benchmark_samples.*, upload_outbox.status AS sync_state
+                   FROM benchmark_samples
+                   LEFT JOIN upload_outbox ON upload_outbox.sample_id = benchmark_samples.id
+                   ORDER BY benchmark_samples.created_at DESC"""
+            ).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = _benchmark_row(row)
+            model_id = str((item.get("model") or {}).get("repository") or "").strip()
+            if not model_id or model_id.casefold() == "local-model" or model_id.casefold().startswith("local-model-"):
+                continue
+            existing = grouped.get(model_id)
+            if existing is None:
+                item["sample_count"] = 1
+                grouped[model_id] = item
+            else:
+                existing["sample_count"] += 1
+        return list(grouped.values())
+
     def add_benchmark_series_point(self, point: dict[str, Any]) -> None:
         """Persist one coordinated benchmark run without prompts or outputs."""
         with self._lock, self._connection:
@@ -792,6 +815,30 @@ class SparkDeckStore:
         with self._lock, self._connection:
             cursor = self._connection.execute("DELETE FROM benchmark_samples WHERE id = ?", (sample_id,))
         return bool(cursor.rowcount)
+
+    def delete_benchmark_model(self, model_id: str) -> int:
+        """Delete every local sample for one exact displayed model identity."""
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                "SELECT id, model_json FROM benchmark_samples"
+            ).fetchall()
+            sample_ids = []
+            for row in rows:
+                try:
+                    repository = str(
+                        (json.loads(row["model_json"]) or {}).get("repository") or ""
+                    ).strip()
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if repository == model_id:
+                    sample_ids.append(row["id"])
+            if not sample_ids:
+                return 0
+            self._connection.executemany(
+                "DELETE FROM benchmark_samples WHERE id = ?",
+                ((sample_id,) for sample_id in sample_ids),
+            )
+            return len(sample_ids)
 
     def retry_outbox(self) -> int:
         with self._lock, self._connection:

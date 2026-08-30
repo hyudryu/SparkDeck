@@ -44,6 +44,11 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
     if (path.includes('/api/inference-queue')) return json({})
     if (path.includes('/api/v1/deployments')) return json({ items: [] })
     if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+    if (path.includes('/api/v1/onboarding')) return json({
+      role: 'controller',
+      node: { id: 'local', name: 'This node', port: 7878, access_urls: [] },
+      controller_reachable: true,
+    })
     return json({ items: [] })
   })
 }
@@ -213,6 +218,11 @@ describe('DashboardPage', () => {
       if (path.includes('/api/inference-queue')) return json({})
       if (path.includes('/api/v1/deployments')) return json({ items: [] })
       if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      if (path.includes('/api/v1/onboarding')) return json({
+        role: 'controller',
+        node: { id: 'local', name: 'This node', port: 7878, access_urls: [] },
+        controller_reachable: true,
+      })
       nodeInventoryCalls += 1
       nodeInventorySignal ??= init?.signal ?? undefined
       return new Promise<Response>((resolve) => { finishNodeInventory = resolve })
@@ -386,6 +396,62 @@ describe('DashboardPage', () => {
     expect(screen.getAllByText(/3 queued/).length).toBeGreaterThan(0)
     expect(screen.getByText(/· live/)).toBeInTheDocument()
     expect(fetchMock.mock.calls.length).toBe(baselineCalls)
+  })
+
+  it('uses REST polling without opening a rejected stream on joined workers', async () => {
+    MockWebSocket.instances = []
+    const fetchMock = stubDashboardFetch({ cpu_pct: 20, mem: {}, gpus: [], active_requests: {} })
+    const baseImplementation = fetchMock.getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/onboarding')) {
+        return json({
+          role: 'worker',
+          node: { id: 'worker-1', name: 'Worker 1', port: 7878, access_urls: [] },
+          controller_reachable: true,
+        })
+      }
+      return baseImplementation!(input, init)
+    }))
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('20.0%')).toBeInTheDocument()
+    expect(MockWebSocket.instances).toHaveLength(0)
+  })
+
+  it('rechecks the worker role before reconnecting after role discovery recovers', async () => {
+    vi.useFakeTimers()
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    let onboardingCalls = 0
+    const fetchMock = stubDashboardFetch({ cpu_pct: 20, mem: {}, gpus: [], active_requests: {} })
+    const baseImplementation = fetchMock.getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/onboarding')) {
+        onboardingCalls += 1
+        if (onboardingCalls === 1) throw new TypeError('status unavailable')
+        return json({
+          role: 'worker',
+          node: { id: 'worker-1', name: 'Worker 1', port: 7878, access_urls: [] },
+          controller_reachable: true,
+        })
+      }
+      return baseImplementation!(input, init)
+    }))
+    vi.stubGlobal('WebSocket', MockWebSocket)
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(onboardingCalls).toBe(1)
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    act(() => { MockWebSocket.instances[0].close() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+
+    expect(onboardingCalls).toBe(2)
+    expect(MockWebSocket.instances).toHaveLength(1)
   })
 
   it('resumes the 10s polling fallback when the stream closes', async () => {

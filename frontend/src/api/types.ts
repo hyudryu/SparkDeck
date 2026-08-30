@@ -647,6 +647,8 @@ export interface StorageModel {
   // The UI compares the revision a model listing resolved to before marking
   // quantizations or artifacts as already downloaded.
   snapshot_files?: Record<string, string[]>
+  // Quantization markers inferred from cached artifact filenames.
+  quantizations?: string[]
   // Exact files selected for a partial snapshot. Older cache markers may
   // report the already-cached subset instead.
   selective_files_by_revision?: Record<string, string[]>

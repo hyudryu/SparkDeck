@@ -456,7 +456,7 @@ export function StoragePage() {
                       disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
-                    <div><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
+                    <div><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}{model.quantizations?.length ? ` · ${model.quantizations.join(', ')}` : ''}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
                     {model.deletable !== false && <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}

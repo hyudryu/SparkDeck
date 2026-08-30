@@ -148,10 +148,12 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .node-option.selected { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); background: var(--accent-soft); }
 .node-option.unavailable { opacity: .55; cursor: not-allowed; }
 .node-option input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
-.node-option > svg { color: var(--text-tertiary); }
+.node-option-icon { position: relative; display: grid; place-items: center; color: var(--text-tertiary); }
+.node-option-warning { position: absolute; right: -6px; bottom: -5px; color: var(--warning); stroke-width: 2.5; }
 .node-option span { min-width: 0; display: grid; }
 .node-option strong, .node-option small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .node-option strong { font-size: 12px; }.node-option small { color: var(--text-secondary); font-size: 11px; }
+.node-option.warning small { color: var(--warning); }
 .node-selector-state { min-height: 48px; display: flex; align-items: center; gap: 8px; padding: 9px 10px; color: var(--text-secondary); border: 1px dashed var(--border-strong); border-radius: 9px; font-size: 12px; }
 .node-selector-error { justify-content: space-between; color: var(--danger); background: var(--danger-soft); border-style: solid; }
 .node-selection-summary { margin-top: 8px; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }

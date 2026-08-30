@@ -786,6 +786,19 @@ export function ModelsPage() {
     }
     return sets
   }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
+  const createQuantizationsByAvailability = useMemo(() => (
+    createQuantizations
+      .map((variant, index) => ({
+        variant,
+        index,
+        downloaded: artifactFilesDownloaded(variant.files, createCachedFileSets),
+      }))
+      .sort((left, right) => (
+        Number(right.downloaded) - Number(left.downloaded)
+        || left.index - right.index
+      ))
+      .map(({ variant }) => variant)
+  ), [createCachedFileSets, createQuantizations])
 
   // Drop quantization and artifact selections that the current listing does
   // not offer (picked from a previous repository, or renamed away
@@ -1959,6 +1972,9 @@ export function ModelsPage() {
                   ?? target?.transfer_after_download_reason
                   ?? 'Model weights not cached and the node cannot receive them']
           }))
+        const weightWarnings = savedLaunch ? Object.fromEntries((nodes.data ?? [])
+          .filter((node) => allowedIds.includes(node.id) && !weighted.has(node.id))
+          .map((node) => [node.id, 'Weights need to be transferred before launch'])) : undefined
         const sharded = deployment.deployment_mode === 'sharded'
         const exactCount = nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
@@ -1992,6 +2008,7 @@ export function ModelsPage() {
               disabled={startBusy}
               allowedIds={allowedIds}
               unavailableReasons={unavailableReasons}
+              warnings={weightWarnings}
               localLabel={localLabel}
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
@@ -2097,7 +2114,7 @@ export function ModelsPage() {
                   onChange={(event) => updateCreateQuantization(event.target.value)}
                 >
                   <option value="">Full precision (no quantization)</option>
-                  {createQuantizations.map((variant) => (
+                  {createQuantizationsByAvailability.map((variant) => (
                     <option key={variant.name} value={variant.name}>
                       {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFileSets))}
                     </option>

@@ -364,14 +364,14 @@ describe('deployment creator model and quantization pickers', () => {
       revision,
       quantizations: [
         {
-          name: 'Q4_K_M',
-          files: [{ filename: 'Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
-          weight_size_bytes: 807,
-        },
-        {
           name: 'Q8_0',
           files: [{ filename: 'Llama-3.2-1B-Q8_0.gguf', size_bytes: 1200 }],
           weight_size_bytes: 1200,
+        },
+        {
+          name: 'Q4_K_M',
+          files: [{ filename: 'Llama-3.2-1B-Q4_K_M.gguf', size_bytes: 807 }],
+          weight_size_bytes: 807,
         },
       ],
     },
@@ -452,6 +452,9 @@ describe('deployment creator model and quantization pickers', () => {
     const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
     expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B · ✓ Downloaded' })).toBeInTheDocument()
     expect(within(quantSelect).getByRole('option', { name: 'Q8_0 · 1.2 KB' })).toBeInTheDocument()
+    expect(within(quantSelect).getAllByRole('option').map((option) => option.getAttribute('value'))).toEqual([
+      '', 'Q4_K_M', 'Q8_0',
+    ])
 
     const artifactSelect = screen.getByRole('combobox', { name: /GGUF artifact/ })
     expect(within(artifactSelect).getByRole('option', { name: 'Llama-3.2-1B-Q4_K_M.gguf · 807 B · ✓ Downloaded' })).toBeInTheDocument()

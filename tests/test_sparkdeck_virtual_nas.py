@@ -752,6 +752,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 selective_revision: ["model-Q8_0.gguf"],
             })
+            self.assertEqual(models[0]["quantizations"], ["Q4_K_M", "Q8_0"])
             self.assertEqual(models[0]["selective_files_by_revision"], {
                 selective_revision: ["model-Q8_0.gguf"],
             })

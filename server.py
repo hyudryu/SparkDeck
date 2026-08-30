@@ -1048,7 +1048,7 @@ async def agent_virtual_nas_peer_import_status(model_id: str, transfer_id: str, 
 async def agent_virtual_nas_cancel_peer_import(model_id: str, transfer_id: str, req: Request):
     _require_agent(req)
     try:
-        return manager.virtual_nas.cancel_peer_import(transfer_id)
+        return await manager.virtual_nas.cancel_peer_import(model_id, transfer_id)
     except LookupError as exc:
         raise _storage_error(exc) from exc
 

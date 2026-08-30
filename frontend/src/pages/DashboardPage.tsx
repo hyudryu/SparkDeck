@@ -262,6 +262,7 @@ export function DashboardPage() {
                   {activeDeployments.map((deployment) => (
                     <div className="dashboard-list-row" key={deployment.id}>
                       <span className={`status-dot status-${deployment.status}`} aria-hidden="true" />
+                      <span className="sr-only">Status: {deployment.status}</span>
                       <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small></div>
                       <RuntimeMark runtime={deployment.runtime} />
                     </div>

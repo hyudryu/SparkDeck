@@ -371,6 +371,7 @@ interface WireDeploymentDetail extends WireDeployment {
   sg_tp_size?: number | null
   sg_mem_fraction?: number | null
   image?: string | null
+  environment?: Record<string, string>
 }
 
 interface WireBenchmark {
@@ -430,6 +431,7 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     sg_tp_size: item.sg_tp_size,
     sg_mem_fraction: item.sg_mem_fraction,
     image: item.image ?? undefined,
+    environment: item.environment ?? {},
   }
 }
 

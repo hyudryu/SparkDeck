@@ -287,6 +287,13 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 "settings": {"environment": {"HF_TOKEN": "secret"}},
             })
 
+        with self.assertRaisesRegex(ValueError, "cannot contain a newline"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "multiline-env", "runtime": "vllm",
+                "node_ids": ["local"], "deployment_mode": "single",
+                "settings": {"environment": {"VLLM_CONFIG": "first\nsecond"}},
+            })
+
         with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
             await self.service.create_deployment({
                 "model": "org/model", "alias": "sg-env", "runtime": "sglang",

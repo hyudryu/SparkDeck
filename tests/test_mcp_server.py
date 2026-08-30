@@ -31,6 +31,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
                     "recipes": [{
                         "id": "base-1", "name": "Base", "model": "model/a",
                         "engine": "vllm", "extra_args": [],
+                        "environment": {"NCCL_DEBUG": "WARN"},
                         "deployment_mode": "single", "node_ids": ["local"],
                     }]
                 })
@@ -46,6 +47,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["id"], "clone-1")
         self.assertTrue(payload["force_new"])
         self.assertEqual(payload["launch_controls"]["max_concurrency"], 8)
+        self.assertEqual(payload["environment"], {"NCCL_DEBUG": "WARN"})
         self.assertNotIn("id", payload)
 
     async def test_delete_refuses_deployment_not_owned_by_mcp(self) -> None:
@@ -398,6 +400,11 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run_cluster_ab_test", tools)
         self.assertIn("benchmark_cluster_deployment", tools)
         self.assertIn("delete_cluster_deployment", tools)
+        for name in (
+            "create_cluster_recipe", "update_cluster_recipe",
+            "clone_cluster_recipe", "deploy_cluster_recipe", "run_cluster_ab_test",
+        ):
+            self.assertIn("environment", tools[name].description)
         self.assertNotIn(
             "ctx", tools["run_cluster_ab_test"].input_schema.get("properties", {})
         )

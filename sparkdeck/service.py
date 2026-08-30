@@ -3356,12 +3356,23 @@ class SparkDeckService:
                 raise LookupError("managed container is unavailable") from exc
             if current is None:
                 raise LookupError("managed container not found")
+        external_discovered = discovered is not None and not deployment.get("managed")
         if action == "start":
-            await self.manager.start_container(container, explicit=True)
+            if external_discovered:
+                await self.manager.start_container(
+                    container, explicit=True, managed=False,
+                )
+            else:
+                await self.manager.start_container(container, explicit=True)
             if discovered is None:
                 self.store.update_desired_state(deployment_id, "running")
         elif action == "stop":
-            await self.manager.stop_container(container, explicit=True)
+            if external_discovered:
+                await self.manager.stop_container(
+                    container, explicit=True, managed=False,
+                )
+            else:
+                await self.manager.stop_container(container, explicit=True)
         else:
             raise ValueError("action must be start or stop")
         current = self.store.deployment(deployment_id) or deployment
@@ -3857,6 +3868,10 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         phase = container.get("phase") if isinstance(container.get("phase"), dict) else {}
         status = _managed_container_status(container)
+        if not container.get("managed") and container.get("status") == "created":
+            # Docker-created external containers are idle and startable. The
+            # same state remains a launch phase for SparkDeck-managed runs.
+            status = "stopped"
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify

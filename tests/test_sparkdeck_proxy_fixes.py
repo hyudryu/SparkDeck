@@ -105,7 +105,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(stopped["status"], "stopped")
             manager.stop_container.assert_awaited_once_with(
-                "user-container", explicit=True,
+                "user-container", explicit=True, managed=False,
             )
 
             started = await service.deployment_action(
@@ -113,7 +113,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(started["status"], "running")
             manager.start_container.assert_awaited_once_with(
-                "user-container", explicit=True,
+                "user-container", explicit=True, managed=False,
             )
 
             logs = await service.deployment_logs("container:user-container")
@@ -125,6 +125,56 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
 
             await manager.http.aclose()
             await service.close()
+
+    async def test_unmanaged_created_container_is_stopped_and_startable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+
+            deployment = service._discovered_deployment({
+                "name": "created-container", "model": "org/model",
+                "managed": False, "status": "created", "load_settings": {},
+            }, "vllm", "org/model")
+
+            self.assertEqual(deployment["status"], "stopped")
+            self.assertTrue(deployment["controllable"])
+            await manager.http.aclose()
+            await service.close()
+
+
+class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.manager = Manager.__new__(Manager)
+        self.container = Mock()
+        self.container.status = "running"
+        self.manager.client = Mock()
+        self.manager.client.containers.get.return_value = self.container
+        self.manager._try_fit_new_model = Mock()
+        self.manager._explicitly_stopped_containers = set()
+
+    async def test_external_start_preserves_restart_policy_and_skips_eviction(self):
+        self.container.status = "exited"
+
+        await self.manager.start_container(
+            "external-container", explicit=True, managed=False,
+        )
+
+        self.manager._try_fit_new_model.assert_not_called()
+        self.container.update.assert_not_called()
+        self.container.start.assert_called_once_with()
+
+    async def test_external_stop_preserves_restart_policy(self):
+        def stopped(*, timeout):
+            self.container.status = "exited"
+
+        self.container.stop.side_effect = stopped
+
+        await self.manager.stop_container(
+            "external-container", explicit=True, managed=False,
+        )
+
+        self.container.update.assert_not_called()
+        self.container.stop.assert_called_once_with(timeout=10)
 
     async def test_missing_container_is_still_deleted_from_local_store(self):
         class NotFound(Exception):

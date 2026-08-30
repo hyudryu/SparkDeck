@@ -9987,7 +9987,7 @@ class Manager:
         if not engine:
             engine = "sglang" if _is_sglang_image(image_tag) else "vllm"
 
-        cmd = [str(value) for value in (attrs.get("Config", {}).get("Cmd") or [])]
+        cmd = self._container_argv(attrs)
         if not model and engine == "sglang":
             # _cli_option understands both "--model-path x" and "--model-path=x".
             model = self._cli_option(cmd, {"--model-path"}) or ""
@@ -10070,6 +10070,20 @@ class Manager:
         return supported_actions
 
     # ---------- containers ----------
+    @staticmethod
+    def _container_argv(attrs: dict) -> list[str]:
+        """Return the argv Docker executes: Entrypoint followed by Cmd."""
+        config = attrs.get("Config") or {}
+
+        def _parts(value) -> list[str]:
+            if not value:
+                return []
+            if isinstance(value, str):
+                return [value]
+            return [str(item) for item in value]
+
+        return [*_parts(config.get("Entrypoint")), *_parts(config.get("Cmd"))]
+
     def _container_summary(self, c) -> dict | None:
         labels = c.labels or {}
 
@@ -10101,13 +10115,7 @@ class Manager:
         # externally-created containers do not lose flags merely because their
         # image supplies ``vllm serve`` through the entrypoint.
         config = attrs.get("Config", {})
-        entrypoint = config.get("Entrypoint") or []
-        configured_cmd = config.get("Cmd") or []
-        if isinstance(entrypoint, str):
-            entrypoint = [entrypoint]
-        if isinstance(configured_cmd, str):
-            configured_cmd = [configured_cmd]
-        cmd = [str(value) for value in [*entrypoint, *configured_cmd]]
+        cmd = self._container_argv(attrs)
 
         # parse model from cmd or label
         model = _label_value(labels, MODEL_LABEL, "")
@@ -11101,7 +11109,9 @@ class Manager:
                 )
                 raise RuntimeError(safe_error) from exc
 
-    async def start_container(self, name: str, *, explicit: bool = False) -> dict:
+    async def start_container(
+        self, name: str, *, explicit: bool = False, managed: bool = True,
+    ) -> dict:
         stopped = getattr(self, "_explicitly_stopped_containers", set())
         if name in stopped and not explicit:
             raise RuntimeError(
@@ -11109,27 +11119,29 @@ class Manager:
             )
         if explicit:
             stopped.discard(name)
-        # VRAM-aware: evict only if the GPU is full.
-        # Estimate VRAM from the container's model label.
-        try:
-            c = self.client.containers.get(name)
-            model = _label_value(c.labels or {}, MODEL_LABEL, "")
-            params_b, bpp = self._estimate_params_and_quant(model)
-            if params_b > 0:
-                need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
-                labels = c.labels or {}
-                if _label_value(labels, MODE_LABEL) == "sharded":
-                    need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
-            else:
-                need_gb = 30.0  # conservative fallback
-            self._try_fit_new_model(need_gb, protect_name=name)
-        except Exception:
-            pass  # best-effort; if we can't read the container, proceed anyway
+        if managed:
+            # VRAM-aware: evict only if the GPU is full.
+            # Estimate VRAM from the container's model label.
+            try:
+                c = self.client.containers.get(name)
+                model = _label_value(c.labels or {}, MODEL_LABEL, "")
+                params_b, bpp = self._estimate_params_and_quant(model)
+                if params_b > 0:
+                    need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
+                    labels = c.labels or {}
+                    if _label_value(labels, MODE_LABEL) == "sharded":
+                        need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
+                else:
+                    need_gb = 30.0  # conservative fallback
+                self._try_fit_new_model(need_gb, protect_name=name)
+            except Exception:
+                pass  # best-effort; if we can't read the container, proceed anyway
         def _do():
             container = self.client.containers.get(name)
             # A manual Stop disables automatic restarts. Re-enable them only
             # when the user explicitly starts this managed container again.
-            container.update(restart_policy={"Name": "unless-stopped"})
+            if managed:
+                container.update(restart_policy={"Name": "unless-stopped"})
             container.start()
         await asyncio.to_thread(_do)
         return {"ok": True}
@@ -11374,7 +11386,9 @@ class Manager:
         except docker.errors.NotFound:
             return False
 
-    async def stop_container(self, name: str, *, explicit: bool = False) -> dict:
+    async def stop_container(
+        self, name: str, *, explicit: bool = False, managed: bool = True,
+    ) -> dict:
         if explicit:
             stopped = getattr(self, "_explicitly_stopped_containers", None)
             if stopped is None:
@@ -11385,7 +11399,8 @@ class Manager:
             # Prevent Docker's restart policy from resurrecting a model that
             # the user explicitly stopped. Do this before signalling SGLang,
             # whose shutdown can end in SIGKILL under GPU memory pressure.
-            container.update(restart_policy={"Name": "no"})
+            if managed:
+                container.update(restart_policy={"Name": "no"})
             container.reload()
             if container.status in ("running", "restarting", "paused"):
                 container.stop(timeout=10)

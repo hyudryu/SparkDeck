@@ -93,7 +93,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             {
                 "Image": "example/vllm:latest",
                 "Entrypoint": ["vllm", "serve"],
-                "Cmd": ["org/model", "--max-model-len", "65536", "--enable-prefix-caching"],
+                "Cmd": [
+                    "org/model", "--max-model-len", "65536",
+                    "--enable-prefix-caching",
+                ],
                 "Env": [
                     "VLLM_CACHE_ROOT=/cache/vllm",
                     "NCCL_DEBUG=INFO",
@@ -493,6 +496,28 @@ class ContainerToRecipeTests(unittest.IsolatedAsyncioTestCase):
             self.manager._cli_option(args, {"--max-cudagraph-capture-size"}, int), 512
         )
         self.assertIn("--enable-prefix-caching", args)
+
+    async def test_vllm_entrypoint_and_cmd_import_as_one_command(self):
+        containers = FakeContainers()
+        containers.add(FakeContainer(
+            containers, "entrypoint-cid", "entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-model-len", "65536", "--enable-prefix-caching"],
+                "Labels": {},
+            },
+            {},
+        ))
+        with self._attach(containers):
+            recipe = await self.manager.container_to_recipe("entrypoint-vllm")
+
+        self.assertEqual(recipe["model"], "org/model")
+        self.assertEqual(
+            self.manager._cli_option(recipe["extra_args"], {"--max-model-len"}, int),
+            65536,
+        )
+        self.assertIn("--enable-prefix-caching", recipe["extra_args"])
 
     async def test_missing_container_raises_lookup_error(self):
         with self._attach(FakeContainers()):

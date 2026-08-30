@@ -1009,6 +1009,46 @@ describe('model deployments', () => {
     expect(deploymentListCalls).toBeGreaterThanOrEqual(3)
   })
 
+  it('keeps a live deployment row stable when a background refresh fails', async () => {
+    let deploymentListCalls = 0
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        if (deploymentListCalls === 2) {
+          return new Response(JSON.stringify({ detail: 'temporary node timeout' }), {
+            status: 504, headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        const active = deploymentListCalls === 1
+        return new Response(JSON.stringify({ items: [{
+          id: 'dep-background', alias: 'Background model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/background' }, status: active ? 'starting' : 'running', settings: {},
+          node_ids: ['local'], launch_phase: active ? 'loading' : 'ready',
+          launch_message: active ? 'Loading weights' : 'vLLM API ready',
+        }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/model-cache')
+        ? { nodes: [] }
+        : path.includes('/api/v1/nodes') || path.includes('/api/v1/recipes')
+          ? { items: [] }
+          : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    const link = await screen.findByRole('link', { name: 'Background model' })
+    const deploymentRow = link.closest('[role="row"]') as HTMLElement
+
+    await waitFor(() => expect(deploymentListCalls).toBe(2), { timeout: 3500 })
+    expect(screen.getByRole('link', { name: 'Background model' }).closest('[role="row"]')).toBe(deploymentRow)
+    expect(screen.queryByText('temporary node timeout')).not.toBeInTheDocument()
+    expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
+    expect(screen.queryByText('Refreshing deployments…')).not.toBeInTheDocument()
+
+    expect(within(deploymentRow).getByText('Loading weights')).toBeInTheDocument()
+  })
+
   it('keeps an accepted recipe row when an older deployment load finishes afterward', async () => {
     const user = userEvent.setup()
     let deploymentListCalls = 0

@@ -78,7 +78,10 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000
-const DEPLOYMENTS_TIMEOUT_MS = 10_000
+// A deployment snapshot includes detailed remote-node status. Those probes are
+// individually bounded at 15 seconds, so a 10-second browser deadline could
+// abort a healthy request before the controller's own timeout contract ended.
+const DEPLOYMENTS_TIMEOUT_MS = 60_000
 const DASHBOARD_CORE_TIMEOUT_MS = 10_000
 // Long-running mutations and non-streaming inference already have
 // backend-owned limits. Keep their browser connection alive so the server can

@@ -561,7 +561,9 @@ describe('community features sign-in', () => {
   it('retries a transient session restore failure without showing the sign-in form', async () => {
     const retryCallbacks: Array<() => void> = []
     const timeout = vi.spyOn(window, 'setTimeout').mockImplementation((handler: TimerHandler, delay?: number) => {
-      if (typeof handler === 'function' && delay === COMMUNITY_SESSION_RETRY_MS) {
+      if (typeof handler === 'function' && (
+        delay === COMMUNITY_SESSION_RETRY_MS || delay === COMMUNITY_SESSION_RETRY_MS * 2
+      )) {
         retryCallbacks.push(handler as () => void)
       }
       return 1
@@ -570,7 +572,7 @@ describe('community features sign-in', () => {
     stubSettingsFetch(vi.fn<typeof fetch>(), {
       sessionResponse: () => {
         sessionCalls += 1
-        if (sessionCalls === 1) {
+        if (sessionCalls <= 2) {
           return new Response(JSON.stringify({ detail: 'community sign-in could not be restored' }), {
             status: 503, headers: { 'Content-Type': 'application/json' },
           })
@@ -587,7 +589,12 @@ describe('community features sign-in', () => {
     expect(screen.getByText('Restoring community session…')).toBeInTheDocument()
     expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
     expect(timeout).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RETRY_MS)
-    await act(async () => retryCallbacks.at(-1)?.())
+    await act(async () => retryCallbacks[0]?.())
+
+    expect(screen.getByText('Restoring community session…')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Email')).not.toBeInTheDocument()
+    expect(timeout).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RETRY_MS * 2)
+    await act(async () => retryCallbacks[1]?.())
 
     expect(screen.getByText('driver@example.com')).toBeInTheDocument()
     expect(screen.getByText('Signed in')).toBeInTheDocument()

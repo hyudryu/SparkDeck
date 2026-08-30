@@ -674,6 +674,25 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         listed = (await self.service.deployments())[0]
         self.assertEqual(listed["required_node_count"], 3)
 
+        # Fractional and boolean controls are rejected before they persist;
+        # bookmarks never see Manager's validators until their first Run.
+        for bad in (1.5, True):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    await self.service.update_deployment_settings(
+                        "sharded-bookmark",
+                        {"launch_controls": {"tensor_parallel_size": bad}},
+                    )
+
+        # An explicit clear sticks instead of being re-seeded from the scalar.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {"tensor_parallel_size": None},
+        })
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("sharded-bookmark")["id"],
+        )
+        self.assertIsNone(detail["launch_controls"]["tensor_parallel_size"])
+
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "fresh", "runtime": "vllm",

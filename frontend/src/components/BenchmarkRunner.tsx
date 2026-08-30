@@ -43,7 +43,10 @@ function configSummary(run: BenchmarkRunnerRunSummary) {
   const prompt = config.prompt_sizes.map((size) => size.toLocaleString()).join(', ')
   const response = config.response_sizes.map((size) => size.toLocaleString()).join(', ')
   const depths = config.context_depths.map((depth) => depth.toLocaleString()).join(', ')
-  return `${prompt} → ${response} tok · ${concurrency} · depth ${depths}`
+  const prefixCaching = config.enable_prefix_caching === true
+    ? 'prefix cache on'
+    : config.enable_prefix_caching === false ? 'prefix cache off' : 'prefix cache unknown'
+  return `${prompt} → ${response} tok · ${concurrency} · depth ${depths} · ${prefixCaching}`
 }
 
 const RUN_STATUS_LABEL: Record<string, string> = {

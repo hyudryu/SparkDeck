@@ -4633,6 +4633,7 @@ class Manager:
         cancel: asyncio.Event | None,
         initial_member: dict,
         route_observation: dict | None,
+        caller_ip: str | None = None,
     ):
         """Relay a stream, failing over until its first real SSE event.
 
@@ -4664,6 +4665,7 @@ class Manager:
                         try:
                             current = await self._proxy_cluster_member(
                                 deployment, member, model, body, endpoint, cancel,
+                                caller_ip=caller_ip,
                             )
                             current_member = member
                         except ClientAbort:
@@ -4739,6 +4741,7 @@ class Manager:
         endpoint: str,
         cancel: asyncio.Event | None = None,
         route_observation: dict | None = None,
+        caller_ip: str | None = None,
     ):
         """Proxy to a cluster member, balancing replicas and failing over."""
         deployment = self._deployment(deployment_id)
@@ -4753,11 +4756,13 @@ class Manager:
             try:
                 result = await self._proxy_cluster_member(
                     deployment, member, model, body, endpoint, cancel,
+                    caller_ip=caller_ip,
                 )
                 if body.get("stream"):
                     return self._cluster_stream_with_failover(
                         result, candidates[index + 1:], deployment, model,
                         body, endpoint, cancel, member, route_observation,
+                        caller_ip,
                     )
                 self._observe_cluster_serving_member(
                     route_observation, member,
@@ -4786,6 +4791,8 @@ class Manager:
         body: dict,
         endpoint: str,
         cancel: asyncio.Event | None,
+        *,
+        caller_ip: str | None = None,
     ):
         """Send one request to a specific member without failover.
 
@@ -4813,6 +4820,7 @@ class Manager:
                     model, body, bool(body.get("stream")), cancel,
                     container_name=member.get("container_name"),
                     deployment_id=deployment_id,
+                    caller_ip=caller_ip,
                 )
                 if not body.get("stream"):
                     return result
@@ -4837,6 +4845,14 @@ class Manager:
                 "_sparkdeck_container_name": member.get("container_name"),
                 "_sparkdeck_deployment_id": deployment_id,
             }
+            if caller_ip:
+                remote_body["_sparkdeck_caller_ip"] = caller_ip
+            request_id = (
+                self._track_start(
+                    model, deployment_id=deployment_id, caller_ip=caller_ip,
+                )
+                if caller_ip else None
+            )
             if body.get("stream"):
                 try:
                     response = await self._await_or_cancel(
@@ -4869,6 +4885,8 @@ class Manager:
                             response=response,
                         )
                 except BaseException:
+                    if request_id is not None:
+                        self._track_end(request_id)
                     self._release_inference_slot(admission)
                     raise
                 stream_owns_member = True
@@ -4880,6 +4898,8 @@ class Manager:
                                 yield f"{line}\n\n"
                     finally:
                         await response.aclose()
+                        if request_id is not None:
+                            self._track_end(request_id)
                         self._release_inference_slot(admission)
                         self._release_cluster_member(deployment_id, member)
 
@@ -4893,6 +4913,8 @@ class Manager:
                     cancel,
                 )
             finally:
+                if request_id is not None:
+                    self._track_end(request_id)
                 self._release_inference_slot(admission)
         finally:
             if not stream_owns_member:
@@ -8101,6 +8123,7 @@ class Manager:
         admission_target: str | None = None,
         nudge_event: asyncio.Event | None = None,
         deployment_id: str | None = None,
+        caller_ip: str | None = None,
     ) -> int:
         self._req_seq += 1
         rid = self._req_seq
@@ -8115,6 +8138,7 @@ class Manager:
             "admission_target": admission_target,
             "nudge_event": nudge_event,
             "deployment_id": deployment_id,
+            "caller_ip": caller_ip,
             "paused": False,
         }
         self._mark_deployment_used(deployment_id)
@@ -8185,6 +8209,10 @@ class Manager:
                 "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
             })
             e["connections"] += 1
+            caller_ip = rec.get("caller_ip")
+            if caller_ip:
+                caller_ips = e.setdefault("caller_ips", {})
+                caller_ips[caller_ip] = caller_ips.get(caller_ip, 0) + 1
             e["decoded_tokens"] += int(rec.get("total_tokens") or 0)
             if rec.get("pp_tokens") and rec.get("pp_time_s"):
                 e["pp_tokens"] += int(rec["pp_tokens"])
@@ -12736,32 +12764,49 @@ class Manager:
                 })
         return {"object": "list", "data": models}
 
-    async def proxy_chat_completions(self, body: dict, cancel: asyncio.Event | None = None):
+    async def proxy_chat_completions(
+        self, body: dict, cancel: asyncio.Event | None = None, *,
+        caller_ip: str | None = None,
+    ):
         """Route /v1/chat/completions to a supported managed backend."""
         model = body.get("model", "")
         stream = body.get("stream", False)
 
         loaded_unsloth = await self._unsloth_loaded_model()
+        caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
         if loaded_unsloth and loaded_unsloth == model:
-            return await self._unsloth_chat(model, body, stream, cancel)
+            return await self._unsloth_chat(
+                model, body, stream, cancel, **caller_kwargs,
+            )
 
-        return await self._vllm_chat(model, body, stream, cancel)
+        return await self._vllm_chat(
+            model, body, stream, cancel, **caller_kwargs,
+        )
 
-    async def proxy_completions(self, body: dict, cancel: asyncio.Event | None = None):
+    async def proxy_completions(
+        self, body: dict, cancel: asyncio.Event | None = None, *,
+        caller_ip: str | None = None,
+    ):
         """Route /v1/completions to a supported managed backend."""
         model = body.get("model", "")
         stream = body.get("stream", False)
 
         loaded_unsloth = await self._unsloth_loaded_model()
+        caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
         if loaded_unsloth and loaded_unsloth == model:
-            return await self._unsloth_completions(model, body, stream, cancel)
+            return await self._unsloth_completions(
+                model, body, stream, cancel, **caller_kwargs,
+            )
 
-        return await self._vllm_completions(model, body, stream, cancel)
+        return await self._vllm_completions(
+            model, body, stream, cancel, **caller_kwargs,
+        )
 
     async def _vllm_chat(self, model: str, body: dict, stream: bool,
                          cancel: asyncio.Event | None = None, *,
                          container_name: str | None = None,
-                         deployment_id: str | None = None):
+                         deployment_id: str | None = None,
+                         caller_ip: str | None = None):
         """Route /v1/chat/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -12774,6 +12819,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
+                caller_ip=caller_ip,
             )
             await result.prepare()
             return result
@@ -12787,7 +12833,8 @@ class Manager:
             body = {**body, "model": self._upstream_model_id(container, model)}
             url = f"http://localhost:{container['port']}/v1/chat/completions"
             rid = self._track_start(
-                key, deployment_id=container.get("deployment_id")
+                key, deployment_id=container.get("deployment_id"),
+                caller_ip=caller_ip,
             )
             try:
                 r = await self._await_or_cancel(
@@ -12804,7 +12851,8 @@ class Manager:
     async def _vllm_completions(self, model: str, body: dict, stream: bool,
                                 cancel: asyncio.Event | None = None, *,
                                 container_name: str | None = None,
-                                deployment_id: str | None = None):
+                                deployment_id: str | None = None,
+                                caller_ip: str | None = None):
         """Route /v1/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -12817,6 +12865,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
+                caller_ip=caller_ip,
             )
             await result.prepare()
             return result
@@ -12830,7 +12879,8 @@ class Manager:
             body = {**body, "model": self._upstream_model_id(container, model)}
             url = f"http://localhost:{container['port']}/v1/completions"
             rid = self._track_start(
-                key, deployment_id=container.get("deployment_id")
+                key, deployment_id=container.get("deployment_id"),
+                caller_ip=caller_ip,
             )
             try:
                 r = await self._await_or_cancel(
@@ -12849,14 +12899,17 @@ class Manager:
         return f"http://{host}:{self._llama_port}"
 
     async def _unsloth_chat(self, model: str, body: dict, stream: bool,
-                            cancel: asyncio.Event | None = None):
+                            cancel: asyncio.Event | None = None, *,
+                            caller_ip: str | None = None):
         """Route /v1/chat/completions to the running llama-server."""
         url = f"{self._llama_base_url()}/v1/chat/completions"
         key = self._stats_key(model, self._unsloth_variant(model))
         if stream:
-            return self._unsloth_stream(url, body, key, cancel)
+            return self._unsloth_stream(
+                url, body, key, cancel, caller_ip=caller_ip,
+            )
         else:
-            rid = self._track_start(key)
+            rid = self._track_start(key, caller_ip=caller_ip)
             try:
                 r = await self._await_or_cancel(
                     self.http.post(url, json=body, timeout=600), cancel
@@ -12869,14 +12922,17 @@ class Manager:
                 self._track_end(rid)
 
     async def _unsloth_completions(self, model: str, body: dict, stream: bool,
-                                   cancel: asyncio.Event | None = None):
+                                   cancel: asyncio.Event | None = None, *,
+                                   caller_ip: str | None = None):
         """Route /v1/completions to the running llama-server."""
         url = f"{self._llama_base_url()}/v1/completions"
         key = self._stats_key(model, self._unsloth_variant(model))
         if stream:
-            return self._unsloth_stream(url, body, key, cancel)
+            return self._unsloth_stream(
+                url, body, key, cancel, caller_ip=caller_ip,
+            )
         else:
-            rid = self._track_start(key)
+            rid = self._track_start(key, caller_ip=caller_ip)
             try:
                 r = await self._await_or_cancel(
                     self.http.post(url, json=body, timeout=600), cancel
@@ -12889,7 +12945,8 @@ class Manager:
                 self._track_end(rid)
 
     async def _unsloth_stream(self, url: str, body: dict, key: str,
-                              cancel: asyncio.Event | None = None):
+                              cancel: asyncio.Event | None = None, *,
+                              caller_ip: str | None = None):
         """Stream an OpenAI-compatible response from llama-server, passing
         chunks through. `key` is the token-stats key (model id plus variant
         tag). Decode speed is measured from the first to the last output
@@ -12903,7 +12960,7 @@ class Manager:
                 "include_usage": True,
             },
         }
-        rid = self._track_start(key, streaming=True)
+        rid = self._track_start(key, streaming=True, caller_ip=caller_ip)
         retried = False
         try:
             while True:
@@ -13109,10 +13166,12 @@ class Manager:
                      container: dict | None = None,
                      requested_model: str | None = None, *,
                      container_name: str | None = None,
-                     deployment_id: str | None = None):
+                     deployment_id: str | None = None,
+                     caller_ip: str | None = None):
         return PreparedAsyncStream(self._vllm_stream_events(
             url, body, key, cancel, container, requested_model,
             container_name=container_name, deployment_id=deployment_id,
+            caller_ip=caller_ip,
         ))
 
     async def _vllm_stream_events(
@@ -13122,6 +13181,7 @@ class Manager:
         requested_model: str | None = None, *,
         container_name: str | None = None,
         deployment_id: str | None = None,
+        caller_ip: str | None = None,
     ):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
@@ -13171,6 +13231,7 @@ class Manager:
                 admission_target=admission,
                 nudge_event=nudge_event,
                 deployment_id=(container or {}).get("deployment_id"),
+                caller_ip=caller_ip,
             )
             while True:
                 attempt_started_at = time.monotonic()

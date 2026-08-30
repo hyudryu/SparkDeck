@@ -15,6 +15,7 @@ import {
 
 export const COMMUNITY_SESSION_RENEW_MS = 30 * 60 * 1000
 export const COMMUNITY_SESSION_RETRY_MS = 2 * 1000
+export const COMMUNITY_SESSION_RETRY_MAX_MS = 30 * 1000
 
 export interface AuthState {
   status: 'restoring' | 'signed-out' | 'signing-in' | 'signed-in' | 'reauth-required'
@@ -69,6 +70,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false
     let retryTimer: number | undefined
+    let retryDelay = COMMUNITY_SESSION_RETRY_MS
     const restore = async () => {
       try {
         // The node is authoritative. Browser-origin tokens from an older
@@ -79,15 +81,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setClusterSync(null)
         setEmail(session.email)
         setStatus(session.status)
+        retryDelay = COMMUNITY_SESSION_RETRY_MS
       } catch {
         if (cancelled) return
         // A failed request is not an authoritative sign-out. Keep the account
         // UI in its non-interactive restore state and retry so a transient
         // controller, forwarding, or Cognito failure cannot expose the sign-in
         // form for a node that is still paired.
+        const delay = retryDelay
+        retryDelay = Math.min(retryDelay * 2, COMMUNITY_SESSION_RETRY_MAX_MS)
         retryTimer = window.setTimeout(() => {
           void restore()
-        }, COMMUNITY_SESSION_RETRY_MS)
+        }, delay)
       }
     }
     void restore()

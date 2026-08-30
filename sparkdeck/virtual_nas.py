@@ -1246,6 +1246,7 @@ class VirtualNAS:
                 quantization
                 for files in snapshot_files.values()
                 for filename in files
+                if filename.lower().endswith(".gguf")
                 if (quantization := quantization_from_text(filename))
             })
             selective_files = _selective_files_by_revision(

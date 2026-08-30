@@ -713,6 +713,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 (complete / "model-Q4_K_M.gguf").write_bytes(b"gguf-weights")
                 (nested / "tokenizer.json").write_bytes(b"gguf-weights")
+            (complete / "README-AWQ.md").write_text("not weights", encoding="utf-8")
             # A selective snapshot carries its marker and a download lock;
             # its real files still count as cached, the residue does not.
             selective_revision = "d" * 40
@@ -748,6 +749,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(models[0]["snapshot_files"], {
                 complete_revision: [
                     "model-Q4_K_M.gguf",
+                    "README-AWQ.md",
                     "sub/dir/tokenizer.json",
                 ],
                 selective_revision: ["model-Q8_0.gguf"],

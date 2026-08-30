@@ -1935,7 +1935,7 @@ describe('model deployments', () => {
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
       ] } : path.includes('/api/v1/model-cache') ? { nodes: [
-        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'], partial: true }] },
       ] } : {}
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
@@ -1947,6 +1947,7 @@ describe('model deployments', () => {
     expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeChecked()
     expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeEnabled()
     expect(within(dialog).getByLabelText('Weights need to be transferred before launch')).toBeInTheDocument()
+    expect(within(dialog).getAllByLabelText('Weights need to be transferred before launch')).toHaveLength(1)
     expect(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' })).toBeEnabled()
     expect(dialog).toHaveTextContent('Weights will be transferred from Spark Two to Spark One via Virtual NAS before launch.')
     await user.click(within(dialog).getByRole('button', { name: 'Transfer & launch on 1 node' }))

@@ -43,6 +43,11 @@ const quantizationOptionLabel = (variant: GgufQuantization, downloaded: boolean)
 const artifactOptionLabel = (option: GgufArtifactOption, downloaded: boolean) => (
   `${option.filename}${option.weightSize ? ` · ${formatBytes(option.weightSize)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
 )
+const quantizationFilesDownloaded = (
+  variant: GgufQuantization,
+  cachedFileSets: ReadonlyArray<ReadonlySet<string>>,
+) => [variant.files, ...(variant.artifacts ?? []).map((artifact) => artifact.files)]
+  .some((files) => artifactFilesDownloaded(files, cachedFileSets))
 
 function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): CreateDeploymentInput {
   const runtime = isRuntimeKind(settings?.default_runtime) ? settings.default_runtime : initialForm.runtime
@@ -791,7 +796,7 @@ export function ModelsPage() {
       .map((variant, index) => ({
         variant,
         index,
-        downloaded: artifactFilesDownloaded(variant.files, createCachedFileSets),
+        downloaded: quantizationFilesDownloaded(variant, createCachedFileSets),
       }))
       .sort((left, right) => (
         Number(right.downloaded) - Number(left.downloaded)
@@ -1973,7 +1978,8 @@ export function ModelsPage() {
                   ?? 'Model weights not cached and the node cannot receive them']
           }))
         const weightWarnings = savedLaunch ? Object.fromEntries((nodes.data ?? [])
-          .filter((node) => allowedIds.includes(node.id) && !weighted.has(node.id))
+          .filter((node) => allowedIds.includes(node.id)
+            && !(planTargets.get(node.id)?.has_required_weights ?? weighted.has(node.id)))
           .map((node) => [node.id, 'Weights need to be transferred before launch'])) : undefined
         const sharded = deployment.deployment_mode === 'sharded'
         const exactCount = nodeIds.length === required
@@ -2116,7 +2122,7 @@ export function ModelsPage() {
                   <option value="">Full precision (no quantization)</option>
                   {createQuantizationsByAvailability.map((variant) => (
                     <option key={variant.name} value={variant.name}>
-                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFileSets))}
+                      {quantizationOptionLabel(variant, quantizationFilesDownloaded(variant, createCachedFileSets))}
                     </option>
                   ))}
                 </select>

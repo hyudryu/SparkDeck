@@ -2853,6 +2853,18 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._cli_option(updated, {"--image-specific-flag"}), "kept"
         )
 
+    def test_launch_controls_reject_fractional_parallel_sizes(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"tensor_parallel_size": 1.5},
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"pipeline_parallel_size": 2.5},
+            )
+
     def test_vllm_capacity_log_parser_extracts_safe_full_context_limit(self) -> None:
         reports = Manager._parse_vllm_capacity_log("""
             GPU KV cache size: 2,288,000 tokens

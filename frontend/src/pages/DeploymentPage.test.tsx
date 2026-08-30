@@ -5,11 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DeploymentPage } from './DeploymentPage'
 
 const fetchMock = vi.fn<typeof fetch>()
+const nodes = ['local', 'worker-1', 'worker-2', 'worker-3'].map((id, index) => ({
+  id, name: id === 'local' ? 'Controller' : `Node ${index + 1}`,
+  online: true, docker_ready: true, selectable: true,
+}))
 
 const detail = {
   id: 'dep-1', alias: 'Reasoning server', runtime: 'vllm', kind: 'managed',
   model: { repository: 'org/model' }, status: 'stopped', settings: {},
-  node_ids: ['local'], deployment_mode: 'single', desired_state: 'stopped',
+  node_ids: ['local'], deployment_mode: 'sharded', desired_state: 'stopped',
   editable: true, edit_reason: null,
   extra_args: [
     '--enable-prefix-caching', '--speculative-config',
@@ -28,6 +32,9 @@ beforeEach(() => {
   fetchMock.mockClear()
   fetchMock.mockImplementation(async (input, init) => {
     const path = String(input)
+    if (path === '/api/v1/nodes') {
+      return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
     if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
       return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
@@ -71,6 +78,8 @@ describe('deployment object page', () => {
     await user.selectOptions(screen.getByLabelText('Speculative method'), 'dspark')
     await user.selectOptions(screen.getByLabelText('Draft sample method'), 'probabilistic')
     await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('dialog', { name: 'Start Reasoning server' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Start on 4 nodes' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
     const mutationCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
@@ -88,6 +97,89 @@ describe('deployment object page', () => {
       '--enable-prefix-caching', '--speculative-config',
       '{"method":"ngram","foo":true}', 'C:\\models\\foo', '', "owner's-model",
     ])
+    expect(JSON.parse(String(mutationCalls[1][1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+    })
+  })
+
+  it('starts single-node tensor parallel deployments on one physical node', async () => {
+    const user = userEvent.setup()
+    const single = {
+      ...detail,
+      deployment_mode: 'single',
+      launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(single), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('button', { name: 'Start on 1 node' })).toBeInTheDocument()
+    expect(screen.getByText(/single-node layout runs TP4 on one physical node/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Start on 1 node' }))
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({ node_ids: ['local'] })
+  })
+
+  it('uses the persisted node count for replicated deployments', async () => {
+    const user = userEvent.setup()
+    const replicated = {
+      ...detail,
+      deployment_mode: 'replicated',
+      required_node_count: 3,
+      node_ids: ['local', 'worker-1', 'worker-2'],
+      launch_controls: { ...detail.launch_controls, tensor_parallel_size: 1 },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(replicated), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(1)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    const start = await screen.findByRole('button', { name: 'Start on 3 nodes' })
+    expect(screen.getByText(/replicated layout runs on exactly 3 nodes/)).toBeInTheDocument()
+    await user.click(start)
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1', 'worker-2'],
+    })
+  })
+
+  it('preserves a valid saved multi-rank-per-node sharded topology', async () => {
+    const user = userEvent.setup()
+    const sharded = {
+      ...detail,
+      node_ids: ['local', 'worker-1'],
+      required_node_count: 2,
+      launch_controls: {
+        ...detail.launch_controls,
+        tensor_parallel_size: 4,
+        pipeline_parallel_size: 1,
+      },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(sharded), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('button', { name: 'Start on 2 nodes' })).toBeInTheDocument()
+    expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
   })
 
   it('keeps a running deployment read-only', async () => {
@@ -149,7 +241,7 @@ describe('deployment object page', () => {
 
     const flags = await screen.findByLabelText(/Runtime flags/)
     fireEvent.change(flags, { target: { value: '--regex "\\d+" --windows-path "C:\\models\\foo"' } })
-    await user.click(screen.getByRole('button', { name: 'Run' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
 
     const save = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
     expect(save).toBeDefined()

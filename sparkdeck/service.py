@@ -54,7 +54,7 @@ _SAFE_CONFIGURATION_KEYS = {
 }
 _LOCAL_ROUTING_KEYS = {
     "deployment_mode", "node_ids", "manager_deployment_id", "model_source",
-    "managed_by", "automation_run_id",
+    "managed_by", "automation_run_id", "source_container_name",
     # Saved deployments relaunch from the persisted record, so their extra
     # argv must survive persistence alongside the routing keys above.
     "extra_args",
@@ -950,6 +950,11 @@ class SparkDeckService:
         # ownership before scanning Docker so the replacement is not appended
         # again as a synthetic legacy deployment.
         by_container = {item.get("container_name"): item for item in registered}
+        source_container_names = {
+            item.get("settings", {}).get("source_container_name")
+            for item in registered
+            if item.get("settings", {}).get("source_container_name")
+        }
         by_container.update(local_cluster_members)
         for container in containers:
             runtime = self._container_runtime(container)
@@ -965,6 +970,12 @@ class SparkDeckService:
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
+                continue
+            if container.get("name") in source_container_names:
+                # Promotion deliberately leaves the original unmanaged
+                # container available as a fallback. Hide that source card,
+                # but never let it contribute state or routing to the managed
+                # replacement: only Manager's deployment and ranks own those.
                 continue
             model = container.get("model") or container.get("served_model")
             if not model:
@@ -2280,9 +2291,9 @@ class SparkDeckService:
                 controls.get("pipeline_parallel_size")
             )
             if world > 1:
-                # Mirror Manager's launch gate: several ranks per node are
-                # valid for vLLM when the world size divides the saved node
-                # count; SGLang always launches one rank per node.
+                # Mirror Manager's launch gate: vLLM may place several ranks
+                # per saved node when TP x PP divides the node count. SGLang
+                # continues to require one selected host per rank.
                 count = (
                     len(node_ids)
                     if runtime == RuntimeKind.VLLM.value
@@ -3249,6 +3260,11 @@ class SparkDeckService:
             "manager_deployment_id": replacement["id"],
             "node_ids": list(replacement.get("node_ids") or []),
             "model_source": replacement.get("model_source") or "unknown",
+            "source_container_name": (
+                deployment.get("container_name")
+                if str(deployment.get("id") or "").startswith("container:")
+                else None
+            ),
         })
         primary = (replacement.get("members") or [{}])[0]
         port = replacement.get("api_port")
@@ -3258,7 +3274,15 @@ class SparkDeckService:
             runtime=RuntimeKind(str(deployment.get("runtime") or "vllm")),
             kind=DeploymentKind.MANAGED,
             model=ModelIdentity(
-                repository=str(model.get("repository") or replacement.get("model") or ""),
+                # The alias remains the served/inference identity. The model
+                # record must use the executable repository/path so cache and
+                # locality validation remain correct on later restarts.
+                repository=str(
+                    (launch_settings or {}).get("model")
+                    or replacement.get("model")
+                    or model.get("repository")
+                    or ""
+                ),
                 revision=_optional_string(revision),
                 artifact=_optional_string(model.get("artifact")),
                 quantization=_optional_string(model.get("quantization")),
@@ -3316,6 +3340,71 @@ class SparkDeckService:
                 deployment_id, action, node_ids, additional_node_ids,
             )
 
+    async def _promote_discovered_deployment(
+        self, deployment: dict[str, Any], container: dict[str, Any],
+        node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Relaunch one discovered runtime as a managed cluster deployment."""
+        settings = dict(container.get("load_settings") or {})
+        runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
+        try:
+            tensor_parallel = max(1, int(settings.get("tensor_parallel_size") or 1))
+        except (TypeError, ValueError):
+            tensor_parallel = 1
+        if len(set(node_ids)) != len(node_ids):
+            raise ValueError("node_ids must not contain duplicates")
+        if len(node_ids) != tensor_parallel:
+            raise ValueError(
+                f"tensor parallel size {tensor_parallel} requires exactly "
+                f"{tensor_parallel} node(s)"
+            )
+        self._reject_sensitive_launch_args(settings.get("extra_args"))
+        if settings.get("editable") is False:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command contains credentials or unsupported arguments"
+            )
+
+        launch_model = str(settings.get("model") or container.get("model") or "")
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if (
+            launch_model and callable(resolve_local) and resolve_local(launch_model)
+            and any(node_id != LOCAL_NODE_ID for node_id in node_ids)
+        ):
+            raise ValueError(
+                "controller-local model paths can only run on the controller node"
+            )
+
+        recover = getattr(self.manager, "_recovered_deployment_launch_settings", None)
+        if not callable(recover):
+            raise RuntimeError("discovered deployment cannot be promoted on this controller")
+        launch_settings = recover({
+            "name": deployment.get("alias"),
+            "model": launch_model,
+            "engine": runtime,
+            "mode": "sharded" if tensor_parallel > 1 else "single",
+            "node_ids": list(node_ids),
+            "api_port": container.get("port"),
+        }, container)
+        launch_settings.update({
+            "deployment_name": deployment.get("alias"),
+            "model": launch_model,
+            "engine": runtime,
+            "image": container.get("image"),
+            "environment": settings.get("environment") or {},
+            "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
+            "node_ids": list(node_ids),
+        })
+        replacement = await self.manager.create_deployment(launch_settings)
+        adopted_launch_settings = {
+            **launch_settings,
+            **(replacement.get("launch_settings") or {}),
+        }
+        adopted_launch_settings["model"] = launch_model
+        return self._adopt_manager_replacement(
+            deployment, replacement, adopted_launch_settings,
+        )
+
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -3345,6 +3434,26 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
+        if (
+            discovered is not None and not deployment.get("managed")
+            and action == "start" and node_ids
+        ):
+            tensor_parallel = deployment.get("settings", {}).get(
+                "tensor_parallel_size", 1,
+            )
+            try:
+                required_nodes = max(1, int(tensor_parallel or 1))
+            except (TypeError, ValueError):
+                required_nodes = 1
+            if len(node_ids) != required_nodes:
+                raise ValueError(
+                    f"tensor parallel size {required_nodes} requires exactly "
+                    f"{required_nodes} node(s)"
+                )
+            if required_nodes > 1 or node_ids != ["local"]:
+                return await self._promote_discovered_deployment(
+                    deployment, discovered, node_ids,
+                )
         if (
             action == "start" and discovered is None
             and not manager_id and not owner and not container
@@ -3881,6 +3990,8 @@ class SparkDeckService:
         container = deployment.get("container_name")
         if not container:
             raise LookupError("managed container not found")
+        if deployment_id.startswith("container:") and not deployment.get("managed"):
+            return {"logs": await self.manager.get_logs(container, bounded_tail)}
         return {"logs": await self.manager.get_cluster_member_logs(container, bounded_tail)}
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
@@ -4189,6 +4300,16 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
+        try:
+            tensor_parallel = max(
+                1, int(result["settings"].get("tensor_parallel_size") or 1),
+            )
+        except (TypeError, ValueError):
+            tensor_parallel = 1
+        result.update({
+            "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
+            "required_node_count": tensor_parallel,
+        })
         if status == "starting" and phase:
             result.update({
                 "launch_phase": str(phase.get("phase") or "starting"),

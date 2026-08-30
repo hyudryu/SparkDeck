@@ -103,7 +103,8 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Image": "example/vllm:latest",
                 "Entrypoint": ["vllm", "serve"],
                 "Cmd": [
-                    "org/model", "--max-model-len", "65536",
+                    "/cache/models/org--model/snapshots/rev",
+                    "--max-model-len", "65536",
                     "--enable-prefix-caching",
                 ],
                 "Env": [
@@ -116,7 +117,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                     "SENTRY_DSN=https://secret@example.invalid/1",
                     "FEATURE_FLAG=must-not-be-discovered",
                 ],
-                "Labels": {},
+                "Labels": {"io.sparkdeck.model": "served-name"},
             },
             {},
         )
@@ -125,6 +126,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(summary)
         settings = summary["load_settings"]
+        self.assertEqual(summary["model"], "served-name")
+        self.assertEqual(
+            settings["model"], "/cache/models/org--model/snapshots/rev",
+        )
         self.assertEqual(settings["context_window"], 65536)
         self.assertIn("--enable-prefix-caching", settings["extra_args"])
         self.assertEqual(settings["environment"], {
@@ -132,6 +137,27 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "NCCL_DEBUG": "INFO",
             "SPECULATIVE_CONFIG": '{"method":"dspark"}',
         })
+
+    def test_shell_wrapped_summary_retains_launch_model_beside_served_label(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "wrapped-container-id", "wrapped-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "bash", "-lc",
+                    "exec vllm serve /models/actual-model "
+                    "--served-model-name public-name --max-model-len 8192",
+                ],
+                "Labels": {"io.sparkdeck.model": "public-name"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertEqual(summary["model"], "public-name")
+        self.assertEqual(summary["load_settings"]["model"], "/models/actual-model")
 
     def test_credential_bearing_discovered_command_is_read_only(self):
         containers = FakeContainers()

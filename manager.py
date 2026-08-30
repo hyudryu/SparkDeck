@@ -9360,10 +9360,9 @@ class Manager:
                 engine == "vllm" and parallel_nodes > 1 and saved_count > 1
                 and parallel_nodes % saved_count == 0
             ):
-                # The vLLM launch gate accepts layouts with several ranks per
-                # node (e.g. TP4/PP1 on two nodes); honor the saved node count
-                # so restarts do not demand one node per rank. SGLang launches
-                # always use one rank per node and keep the rank-derived count.
+                # vLLM can place several ranks on each selected host. Preserve
+                # a saved topology when it evenly divides TP x PP; launch
+                # preflight verifies that every host has enough GPUs.
                 required_nodes = saved_count
             elif parallel_nodes > 1:
                 required_nodes = parallel_nodes
@@ -10319,6 +10318,25 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        launch_model = ""
+        if engine_label == "sglang":
+            launch_model = self._cli_option(cmd, {"--model-path"}) or ""
+        elif "serve" in cmd:
+            serve_index = cmd.index("serve")
+            if serve_index + 1 < len(cmd):
+                launch_model = cmd[serve_index + 1]
+        elif len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
+            match = self._shell_vllm_command(cmd[-1])
+            if match:
+                try:
+                    launch_model = shlex.split(match.group("model"))[0]
+                except (ValueError, IndexError):
+                    launch_model = match.group("model")
+        if launch_model:
+            # Keep the served-model label for the public card, but retain the
+            # executable model path/repository for promotion into a managed
+            # multi-node deployment.
+            load_settings["model"] = launch_model
         if self._without_sensitive_cli_credentials(
             load_settings.get("extra_args") or []
         ) != list(load_settings.get("extra_args") or []):

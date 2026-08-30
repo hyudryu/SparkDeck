@@ -278,8 +278,6 @@ class SavedConfigurationContractTests(unittest.TestCase):
         self.assertEqual(contract["required_node_count"], 3)
 
     def test_sglang_contract_keeps_rank_count_for_saved_nodes(self):
-        # SGLang launches always use one rank per node, so the ranks-per-node
-        # exception must not relax the required count.
         contract = self.manager.recipe_deployment_contract({
             "engine": "sglang", "deployment_mode": "sharded", "sg_tp_size": 4,
             "node_ids": ["local", "node-2"],

@@ -3,6 +3,7 @@ import { ArrowLeft, Play, Save } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { DeploymentDetail, DeploymentLaunchControls, DeploymentUpdateInput } from '../api/types'
+import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { formatEnvironment, parseEnvironment } from '../utils/environment'
@@ -119,10 +120,12 @@ export function DeploymentPage() {
   const { deploymentId = '' } = useParams()
   const navigate = useNavigate()
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
+  const nodes = useResource((signal) => api.nodes.list(signal))
   const [editor, setEditor] = useState<Editor>()
   const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
+  const [runSelection, setRunSelection] = useState<string[]>()
 
   useEffect(() => {
     if (resource.data) setEditor(editorFrom(resource.data))
@@ -150,12 +153,45 @@ export function DeploymentPage() {
     } finally { setBusy(undefined) }
   }
 
-  const run = async (form: HTMLFormElement | null) => {
+  const requiredRunNodes = () => {
+    if (!editor) return 1
+    const mode = resource.data?.deployment_mode
+    if (mode === 'single') return 1
+    if (mode === 'replicated') {
+      const persisted = Number(resource.data?.required_node_count)
+      return Number.isInteger(persisted) && persisted > 1
+        ? persisted
+        : Math.max(2, resource.data?.node_ids?.length ?? 0)
+    }
+    const tp = Number(resource.data?.runtime === 'sglang'
+      ? editor.sg_tp_size
+      : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1')
+    const tensor = Number.isInteger(tp) && tp > 0 ? tp : 1
+    if (resource.data?.runtime !== 'vllm') return tensor
+    const pp = Number(editor.pipeline_parallel_size)
+    const pipeline = Number.isInteger(pp) && pp > 0 ? pp : 1
+    const world = tensor * pipeline
+    const savedCount = resource.data?.node_ids?.length ?? 0
+    return world > 1 && savedCount > 1 && world % savedCount === 0
+      ? savedCount
+      : world
+  }
+
+  const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
+    const required = requiredRunNodes()
+    const selectable = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
+    const preferred = (resource.data?.node_ids ?? []).filter((id) => selectable.includes(id))
+    setError(undefined); setNotice(undefined)
+    setRunSelection([...new Set([...preferred, ...selectable])].slice(0, required))
+  }
+
+  const run = async () => {
+    if (!runSelection) return
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       if (resource.data?.editable) await persist()
-      await api.deployments.action(deploymentId, 'start')
+      await api.deployments.action(deploymentId, 'start', runSelection)
       navigate('/models')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not run deployment')
@@ -223,9 +259,43 @@ export function DeploymentPage() {
           <Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable
             ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
-            : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => void run(event.currentTarget.form)}><Play size={15} /> {busy === 'run' ? 'Starting…' : 'Run'}</Button>}
+            : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => openRun(event.currentTarget.form)}><Play size={15} /> Run</Button>}
         </div>
       </form>
     </Panel>
+    {runSelection && (() => {
+      const required = requiredRunNodes()
+      const tensor = Number(detail.runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size) || 1
+      const layoutDescription = detail.deployment_mode === 'sharded'
+        ? `TP${tensor} is distributed across exactly ${required} ${required === 1 ? 'node' : 'nodes'}.`
+        : detail.deployment_mode === 'replicated'
+          ? `This replicated layout runs on exactly ${required} nodes.`
+          : `This single-node layout runs TP${tensor} on one physical node.`
+      const exactCount = runSelection.length === required
+      const allSelectable = runSelection.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+      const ready = !nodes.loading && !nodes.error && exactCount && allSelectable
+      return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="run-deployment-title">
+          <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="run-deployment-title">Start {detail.alias}</h2></div><button className="icon-button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)} aria-label="Close dialog">×</button></div>
+          <p className="modal-description">{layoutDescription} Select where SparkDeck should start the deployment.</p>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <NodeSelector
+            nodes={nodes.data ?? []}
+            selectedIds={runSelection}
+            onChange={(next) => setRunSelection(next.length <= required ? next : runSelection)}
+            loading={nodes.loading}
+            error={nodes.error}
+            onRetry={nodes.reload}
+            multiple={required > 1}
+            disabled={Boolean(busy)}
+            primaryId={runSelection[0]}
+            legend="Target nodes"
+            help={`Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}. The first selected node coordinates the deployment.`}
+          />
+          {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+        </section>
+      </div>
+    })()}
   </div>
 }

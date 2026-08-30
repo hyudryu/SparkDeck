@@ -13,7 +13,7 @@ const nodes = ['local', 'worker-1', 'worker-2', 'worker-3'].map((id, index) => (
 const detail = {
   id: 'dep-1', alias: 'Reasoning server', runtime: 'vllm', kind: 'managed',
   model: { repository: 'org/model' }, status: 'stopped', settings: {},
-  node_ids: ['local'], deployment_mode: 'single', desired_state: 'stopped',
+  node_ids: ['local'], deployment_mode: 'sharded', desired_state: 'stopped',
   editable: true, edit_reason: null,
   extra_args: [
     '--enable-prefix-caching', '--speculative-config',
@@ -92,6 +92,57 @@ describe('deployment object page', () => {
     ])
     expect(JSON.parse(String(mutationCalls[1][1]?.body))).toEqual({
       node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+    })
+  })
+
+  it('starts single-node tensor parallel deployments on one physical node', async () => {
+    const user = userEvent.setup()
+    const single = {
+      ...detail,
+      deployment_mode: 'single',
+      launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(single), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('button', { name: 'Start on 1 node' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Start on 1 node' }))
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({ node_ids: ['local'] })
+  })
+
+  it('uses the persisted node count for replicated deployments', async () => {
+    const user = userEvent.setup()
+    const replicated = {
+      ...detail,
+      deployment_mode: 'replicated',
+      required_node_count: 3,
+      node_ids: ['local', 'worker-1', 'worker-2'],
+      launch_controls: { ...detail.launch_controls, tensor_parallel_size: 1 },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(replicated), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(1)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    await user.click(await screen.findByRole('button', { name: 'Start on 3 nodes' }))
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1', 'worker-2'],
     })
   })
 

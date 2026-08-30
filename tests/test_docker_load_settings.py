@@ -136,6 +136,27 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "NCCL_DEBUG": "INFO",
         })
 
+    def test_shell_wrapped_summary_retains_launch_model_beside_served_label(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "wrapped-container-id", "wrapped-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "bash", "-lc",
+                    "exec vllm serve /models/actual-model "
+                    "--served-model-name public-name --max-model-len 8192",
+                ],
+                "Labels": {"io.sparkdeck.model": "public-name"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertEqual(summary["model"], "public-name")
+        self.assertEqual(summary["load_settings"]["model"], "/models/actual-model")
+
     def test_credential_bearing_discovered_command_is_read_only(self):
         containers = FakeContainers()
         container = FakeContainer(

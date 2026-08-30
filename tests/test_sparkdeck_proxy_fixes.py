@@ -220,6 +220,95 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_discovered_local_model_rejects_remote_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "external-local", "model": "served-name",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "load_settings": {
+                    "model": "C:\\models\\actual-model",
+                    "tensor_parallel_size": 2,
+                },
+            }]
+            manager._resolve_local_path = Mock(return_value=Path("C:/models/actual-model"))
+            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            manager.create_deployment = AsyncMock()
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(ValueError, "controller-local model paths"):
+                await service.deployment_action(
+                    "container:external-local", "start", ["local", "worker-1"],
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_promoted_source_container_does_not_mask_missing_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = []
+            manager.list_containers.return_value = [{
+                "name": "external-source", "model": "served-name",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "port": None,
+            }]
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="promoted", alias="served-name", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("served-name"),
+                container_name="replacement-r0",
+                settings={
+                    "manager_deployment_id": "missing-cluster",
+                    "source_container_name": "external-source",
+                },
+            ))
+
+            listed = await service.deployments()
+
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["id"], "promoted")
+            self.assertEqual(listed[0]["status"], "missing")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_promoted_source_container_does_not_overwrite_replacement_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [{
+                "id": "cluster-1", "status": "running", "api_port": 9000,
+                "node_ids": ["local"], "launch_settings": {
+                    "deployment_mode": "single", "node_ids": ["local"],
+                },
+                "members": [{
+                    "node_id": "local", "container_name": "replacement-r0",
+                }],
+            }]
+            manager.list_containers.return_value = [{
+                "name": "external-source", "model": "served-name",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "port": None,
+            }]
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="promoted", alias="served-name", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("served-name"),
+                container_name="replacement-r0",
+                settings={
+                    "manager_deployment_id": "cluster-1",
+                    "source_container_name": "external-source",
+                },
+            ))
+
+            listed = await service.deployments()
+
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["status"], "running")
+            self.assertEqual(listed[0]["port"], 9000)
+            await manager.http.aclose()
+            await service.close()
+
 
 class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

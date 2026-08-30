@@ -949,11 +949,11 @@ class SparkDeckService:
         # ownership before scanning Docker so the replacement is not appended
         # again as a synthetic legacy deployment.
         by_container = {item.get("container_name"): item for item in registered}
-        by_container.update({
-            item.get("settings", {}).get("source_container_name"): item
+        source_container_names = {
+            item.get("settings", {}).get("source_container_name")
             for item in registered
             if item.get("settings", {}).get("source_container_name")
-        })
+        }
         by_container.update(local_cluster_members)
         for container in containers:
             runtime = self._container_runtime(container)
@@ -969,6 +969,12 @@ class SparkDeckService:
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
+                continue
+            if container.get("name") in source_container_names:
+                # Promotion deliberately leaves the original unmanaged
+                # container available as a fallback. Hide that source card,
+                # but never let it contribute state or routing to the managed
+                # replacement: only Manager's deployment and ranks own those.
                 continue
             model = container.get("model") or container.get("served_model")
             if not model:
@@ -3327,12 +3333,22 @@ class SparkDeckService:
                 f"{tensor_parallel} node(s)"
             )
 
+        launch_model = str(settings.get("model") or container.get("model") or "")
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if (
+            launch_model and callable(resolve_local) and resolve_local(launch_model)
+            and any(node_id != LOCAL_NODE_ID for node_id in node_ids)
+        ):
+            raise ValueError(
+                "controller-local model paths can only run on the controller node"
+            )
+
         recover = getattr(self.manager, "_recovered_deployment_launch_settings", None)
         if not callable(recover):
             raise RuntimeError("discovered deployment cannot be promoted on this controller")
         launch_settings = recover({
             "name": deployment.get("alias"),
-            "model": settings.get("model") or container.get("model"),
+            "model": launch_model,
             "engine": runtime,
             "mode": "sharded" if tensor_parallel > 1 else "single",
             "node_ids": list(node_ids),
@@ -3340,7 +3356,7 @@ class SparkDeckService:
         }, container)
         launch_settings.update({
             "deployment_name": deployment.get("alias"),
-            "model": settings.get("model") or container.get("model"),
+            "model": launch_model,
             "engine": runtime,
             "image": container.get("image"),
             "environment": settings.get("environment") or {},

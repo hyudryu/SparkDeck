@@ -148,6 +148,14 @@ export function DeploymentPage() {
 
   const requiredRunNodes = () => {
     if (!editor) return 1
+    const mode = resource.data?.deployment_mode
+    if (mode === 'single') return 1
+    if (mode === 'replicated') {
+      const persisted = Number(resource.data?.required_node_count)
+      return Number.isInteger(persisted) && persisted > 1
+        ? persisted
+        : Math.max(2, resource.data?.node_ids?.length ?? 0)
+    }
     const raw = resource.data?.runtime === 'sglang'
       ? editor.sg_tp_size
       : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1'

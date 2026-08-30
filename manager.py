@@ -10204,6 +10204,13 @@ class Manager:
             serve_index = cmd.index("serve")
             if serve_index + 1 < len(cmd):
                 launch_model = cmd[serve_index + 1]
+        elif len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
+            match = self._shell_vllm_command(cmd[-1])
+            if match:
+                try:
+                    launch_model = shlex.split(match.group("model"))[0]
+                except (ValueError, IndexError):
+                    launch_model = match.group("model")
         if launch_model:
             # Keep the served-model label for the public card, but retain the
             # executable model path/repository for promotion into a managed

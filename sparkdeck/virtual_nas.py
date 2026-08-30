@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import httpx
-import io
 import json
 import os
 import posixpath
@@ -13,7 +12,7 @@ import queue
 import re
 import shutil
 import secrets
-import tarfile
+import struct
 import tempfile
 import threading
 import time
@@ -32,8 +31,14 @@ _HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
-VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-transfer-v1"
-ARCHIVE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
+VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-file-transfer-v2"
+FILE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
+FILE_STREAM_CONTENT_TYPE = "application/vnd.sparkdeck.file-stream"
+_FILE_STREAM_MAGIC = b"SPARKDECK-FILE-STREAM/1\n"
+_FILE_STREAM_HEADER_MAX_BYTES = 1024 * 1024
+_FILE_STREAM_METADATA_MAX_BYTES = 32 * 1024 * 1024
+_FILE_STREAM_MAX_ENTRIES = 100_000
+_FILE_STREAM_PAYLOAD_OVERHEAD_BYTES = 1024 * 1024
 _ACTIVE_TRANSFER_STATES = {"queued", "running"}
 _FINAL_TRANSFER_STATES = {"completed", "failed", "canceled"}
 _WEIGHT_SHARD = re.compile(
@@ -45,9 +50,10 @@ _TOKENIZER_FILES = {
     "tokenizer.json", "tokenizer.model", "spiece.model",
     "sentencepiece.bpe.model", "tekken.json", "vocab.txt",
 }
-# Imports hold both the received tar and the extracted repository until the
-# final atomic rename. Reserve additional room for tar headers, metadata, and
-# filesystem allocation rounding rather than admitting at an exact 2x edge.
+# Transfers write each source file directly into a staging repository, then
+# atomically rename that repository into place. Keep a small reserve for
+# metadata and filesystem allocation rounding rather than admitting at the
+# exact logical model size.
 TRANSFER_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 DOWNLOAD_STAGING_RESERVE_BYTES = 64 * 1024 * 1024
 _SELECTIVE_SNAPSHOT_MARKER = ".sparkdeck-selective.incomplete"
@@ -166,6 +172,11 @@ def download_required_free_bytes(expected_bytes: int, cached_bytes: int = 0) -> 
     return expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
 
 
+def transfer_required_free_bytes(expected_bytes: int) -> int:
+    """Return target capacity for a direct-to-staging file transfer."""
+    return _nonnegative_int(expected_bytes) + TRANSFER_STAGING_RESERVE_BYTES
+
+
 def cached_download_bytes(
     model: dict[str, Any] | None, baseline_bytes: int | None = None,
     revision: str | None = None,
@@ -251,38 +262,152 @@ def _atomic_json_write(path: Path, value: Any) -> None:
             pass
 
 
-class _TarQueueWriter:
-    def __init__(self, chunks: queue.Queue, stopped: threading.Event):
-        self.chunks = chunks
-        self.stopped = stopped
-        self.buffer = bytearray()
+def _file_stream_header(value: dict[str, Any]) -> bytes:
+    raw = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if not raw or len(raw) > _FILE_STREAM_HEADER_MAX_BYTES:
+        raise ValueError("file stream metadata is too large")
+    return struct.pack(">I", len(raw)) + raw
 
-    def _publish(self, data: bytes) -> None:
-        while data and not self.stopped.is_set():
+
+def _file_stream_path_entry(
+    source: Path,
+    name: str,
+    repository: Path | None = None,
+    hardlinks: dict[tuple[int, int], PurePosixPath] | None = None,
+) -> dict[str, Any]:
+    if source.is_symlink():
+        resolved = source.resolve(strict=True)
+        if repository is None:
+            if not resolved.is_file():
+                raise ValueError("external model contains an unsupported directory link")
+            return {
+                "path": name, "type": "file", "size": resolved.stat().st_size,
+                "source": resolved,
+            }
+        try:
+            relative_target = resolved.relative_to(repository.resolve(strict=True))
+        except ValueError as exc:
+            raise ValueError("model link escapes its repository") from exc
+        wire_path = PurePosixPath(name)
+        wire_target = PurePosixPath(wire_path.parts[0], *relative_target.parts)
+        target = posixpath.relpath(str(wire_target), str(wire_path.parent))
+        return {"path": name, "type": "symlink", "target": target}
+    if source.is_dir():
+        return {"path": name, "type": "directory"}
+    if source.is_file():
+        stat = source.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        wire_path = PurePosixPath(name)
+        if hardlinks is not None and stat.st_nlink > 1:
+            previous = hardlinks.get(identity)
+            if previous is not None:
+                return {
+                    "path": name, "type": "hardlink",
+                    "target": posixpath.relpath(
+                        str(previous), str(wire_path.parent),
+                    ),
+                }
+            hardlinks[identity] = wire_path
+        return {
+            "path": name, "type": "file", "size": stat.st_size,
+            "source": source,
+        }
+    raise ValueError("model contains an unsupported special file")
+
+
+def _validate_file_stream_path(name: Any, root_name: str) -> PurePosixPath:
+    if not isinstance(name, str) or not name or "\\" in name:
+        raise ValueError("file stream contains an unsafe path")
+    path = PurePosixPath(name)
+    if (
+        path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or not path.parts
+        or path.parts[0] != root_name
+    ):
+        raise ValueError("file stream contains an unsafe path")
+    return path
+
+
+def _validate_file_stream_link(path: PurePosixPath, target: Any, root_name: str) -> str:
+    if (
+        not isinstance(target, str)
+        or not target
+        or "\\" in target
+        or re.match(r"^[A-Za-z]:", target)
+    ):
+        raise ValueError("file stream contains an unsafe link")
+    link = PurePosixPath(target)
+    if link.is_absolute():
+        raise ValueError("file stream contains an unsafe link")
+    normalized = PurePosixPath(os.path.normpath(str(path.parent / link)).replace("\\", "/"))
+    if not normalized.parts or normalized.parts[0] != root_name or ".." in normalized.parts:
+        raise ValueError("file stream link escapes its repository")
+    return target
+
+
+def _create_file_stream_link(destination: Path, target: str, stage: Path) -> None:
+    """Create a safe relative link, falling back to a zero-copy hardlink."""
+    try:
+        os.symlink(target, destination)
+        return
+    except (NotImplementedError, PermissionError, OSError) as exc:
+        # Windows service accounts commonly lack symlink privileges. Hugging
+        # Face snapshot links point to cache-local blob files, so a hardlink
+        # preserves one physical payload copy without requiring elevation.
+        target_path = (destination.parent / Path(target)).resolve(strict=True)
+        try:
+            target_path.relative_to(stage.resolve(strict=True))
+        except ValueError:
+            raise ValueError("file stream link escapes its repository") from exc
+        if not target_path.is_file():
+            raise RuntimeError(
+                "target filesystem cannot create the model directory link"
+            ) from exc
+        try:
+            os.link(target_path, destination)
+        except OSError:
+            raise exc
+
+
+class _AsyncFileStreamReader:
+    """Read exact framed values from arbitrarily chunked request bodies."""
+
+    def __init__(
+        self, chunks: AsyncIterator[bytes], progress: Callable[[int], None] | None = None,
+    ):
+        self._chunks = chunks.__aiter__()
+        self._buffer = bytearray()
+        self.received = 0
+        self._progress = progress
+
+    async def readexactly(self, size: int) -> bytes:
+        while len(self._buffer) < size:
             try:
-                self.chunks.put(data, timeout=0.1)
-                return
-            except queue.Full:
+                chunk = await self._chunks.__anext__()
+            except StopAsyncIteration as exc:
+                raise ValueError("file stream ended unexpectedly") from exc
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise ValueError("file stream yielded non-bytes data")
+            data = bytes(chunk)
+            if not data:
                 continue
-        if data:
-            raise BrokenPipeError("archive consumer closed")
+            self.received += len(data)
+            if self._progress:
+                self._progress(self.received)
+            self._buffer.extend(data)
+        result = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return result
 
-    def write(self, value: bytes) -> int:
-        data = bytes(value)
-        if data and self.stopped.is_set():
-            raise BrokenPipeError("archive consumer closed")
-        self.buffer.extend(data)
-        while len(self.buffer) >= ARCHIVE_STREAM_CHUNK_BYTES:
-            chunk = bytes(self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES])
-            del self.buffer[:ARCHIVE_STREAM_CHUNK_BYTES]
-            self._publish(chunk)
-        return len(data)
-
-    def flush(self) -> None:
-        if self.buffer:
-            chunk = bytes(self.buffer)
-            self.buffer.clear()
-            self._publish(chunk)
+    async def require_eof(self) -> None:
+        if self._buffer:
+            raise ValueError("file stream contains trailing data")
+        async for chunk in self._chunks:
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise ValueError("file stream yielded non-bytes data")
+            if bytes(chunk):
+                raise ValueError("file stream contains trailing data")
 
 
 class _TrackedExport:
@@ -308,7 +433,7 @@ class _TrackedExport:
 
 
 class VirtualNAS:
-    """Inventory, archive safety, and the controller's durable transfer queue."""
+    """Inventory, safe file streaming, and the controller's durable transfer queue."""
 
     def __init__(
         self,
@@ -1165,57 +1290,147 @@ class VirtualNAS:
             )
             if external_files is None:
                 raise LookupError("cached model not found")
+        entries: list[dict[str, Any]] = []
+        if external_files is None:
+            hardlinks: dict[tuple[int, int], PurePosixPath] = {}
+            entries.append({"path": repository.name, "type": "directory"})
+            for root, directories, files in os.walk(repository, followlinks=False):
+                directories.sort()
+                files.sort()
+                root_path = Path(root)
+                for name in list(directories):
+                    source = root_path / name
+                    relative = source.relative_to(repository).as_posix()
+                    entries.append(_file_stream_path_entry(
+                        source, f"{repository.name}/{relative}", repository,
+                        hardlinks,
+                    ))
+                    if source.is_symlink():
+                        directories.remove(name)
+                for name in files:
+                    source = root_path / name
+                    relative = source.relative_to(repository).as_posix()
+                    entries.append(_file_stream_path_entry(
+                        source, f"{repository.name}/{relative}", repository,
+                        hardlinks,
+                    ))
+        else:
+            root = repository.name
+            snapshot = f"{root}/snapshots/{_EXTERNAL_PSEUDO_REVISION}"
+            entries.extend([
+                {"path": root, "type": "directory"},
+                {"path": f"{root}/snapshots", "type": "directory"},
+                {"path": snapshot, "type": "directory"},
+            ])
+            directories: set[str] = set()
+            for relative in external_files:
+                parts = PurePosixPath(relative).parts
+                for depth in range(1, len(parts)):
+                    directory = "/".join(parts[:depth])
+                    if directory not in directories:
+                        directories.add(directory)
+                        entries.append({
+                            "path": f"{snapshot}/{directory}", "type": "directory",
+                        })
+            for relative, source in external_files.items():
+                entries.append(_file_stream_path_entry(
+                    source, f"{snapshot}/{relative}",
+                ))
+            entries.extend([
+                {
+                    "path": f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}",
+                    "type": "file", "size": len(_EXTERNAL_MARKER_CONTENT),
+                    "content": _EXTERNAL_MARKER_CONTENT,
+                },
+                {"path": f"{root}/refs", "type": "directory"},
+                {
+                    "path": f"{root}/refs/main", "type": "file",
+                    "size": len(_EXTERNAL_PSEUDO_REVISION.encode("utf-8")),
+                    "content": _EXTERNAL_PSEUDO_REVISION.encode("utf-8"),
+                },
+            ])
         self._reserve_stream(model_id)
+        return _TrackedExport(self, model_id, self._export_file_stream(entries))
 
-        async def stream() -> AsyncIterator[bytes]:
-            chunks: queue.Queue[Any] = queue.Queue(maxsize=8)
-            stopped = threading.Event()
-            finished = object()
+    @staticmethod
+    async def _export_file_stream(entries: list[dict[str, Any]]) -> AsyncIterator[bytes]:
+        """Stream file metadata and raw payload bytes directly."""
+        chunks: queue.Queue[Any] = queue.Queue(maxsize=8)
+        stopped = threading.Event()
+        finished = object()
 
-            def produce() -> None:
-                def publish(value: Any) -> None:
-                    while not stopped.is_set():
-                        try:
-                            chunks.put(value, timeout=0.1)
-                            return
-                        except queue.Full:
-                            continue
-
+        def publish(value: Any) -> None:
+            while not stopped.is_set():
                 try:
-                    writer = _TarQueueWriter(chunks, stopped)
-                    # tarfile writes small blocks efficiently. Coalesce them in
-                    # the mutable queue writer so each network yield is large
-                    # without tarfile quadratically rebuilding a huge immutable
-                    # internal buffer.
-                    with tarfile.open(fileobj=writer, mode="w|") as archive:
-                        if external_files is None:
-                            archive.add(repository, arcname=repository.name, recursive=True)
-                        else:
-                            _write_external_bundle_archive(
-                                archive, model_id, external_files,
+                    chunks.put(value, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+            raise BrokenPipeError("file stream consumer closed")
+
+        def produce() -> None:
+            try:
+                publish(_FILE_STREAM_MAGIC)
+                for entry in entries:
+                    public = {
+                        key: value for key, value in entry.items()
+                        if key not in {"source", "content"}
+                    }
+                    publish(_file_stream_header(public))
+                    if entry["type"] != "file":
+                        continue
+                    remaining = int(entry["size"])
+                    content = entry.get("content")
+                    digest = hashlib.sha256()
+                    if content is not None:
+                        data = bytes(content)
+                        if len(data) != remaining:
+                            raise RuntimeError(
+                                "generated model file changed during transfer"
                             )
-                    writer.flush()
+                        if data:
+                            digest.update(data)
+                            publish(data)
+                        publish(digest.digest())
+                        continue
+                    source = entry["source"]
+                    with source.open("rb") as stream:
+                        while remaining:
+                            chunk = stream.read(
+                                min(FILE_STREAM_CHUNK_BYTES, remaining),
+                            )
+                            if not chunk:
+                                raise RuntimeError("model file changed during transfer")
+                            remaining -= len(chunk)
+                            digest.update(chunk)
+                            publish(chunk)
+                    publish(digest.digest())
+                publish(struct.pack(">I", 0))
+            except BrokenPipeError:
+                pass
+            except BaseException as exc:
+                try:
+                    publish(exc)
                 except BrokenPipeError:
                     pass
-                except BaseException as exc:
-                    publish(exc)
-                finally:
-                    publish(finished)
-
-            producer = asyncio.create_task(asyncio.to_thread(produce))
-            try:
-                while True:
-                    item = await asyncio.to_thread(chunks.get)
-                    if item is finished:
-                        break
-                    if isinstance(item, BaseException):
-                        raise item
-                    yield item
             finally:
-                stopped.set()
-                await asyncio.gather(producer, return_exceptions=True)
+                try:
+                    publish(finished)
+                except BrokenPipeError:
+                    pass
 
-        return _TrackedExport(self, model_id, stream())
+        producer = asyncio.create_task(asyncio.to_thread(produce))
+        try:
+            while True:
+                item = await asyncio.to_thread(chunks.get)
+                if item is finished:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stopped.set()
+            await asyncio.gather(producer, return_exceptions=True)
 
     async def import_model(
         self,
@@ -1225,53 +1440,51 @@ class VirtualNAS:
         required_model_bytes: int | None = None,
         progress: Callable[[int], None] | None = None,
         phase: Callable[[str], None] | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         self._reserve_stream(model_id)
         hub = self._hub()
         try:
+            free_bytes = self.free_bytes()
             if required_model_bytes is not None:
                 model_bytes = _nonnegative_int(required_model_bytes)
-                required_free = model_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
-                free_bytes = self.free_bytes()
+                required_free = transfer_required_free_bytes(model_bytes)
                 if free_bytes is None or free_bytes < required_free:
                     raise RuntimeError(
                         "target cache volume no longer has enough free space for import"
                     )
+                max_file_bytes = min(
+                    required_free,
+                    model_bytes + _FILE_STREAM_PAYLOAD_OVERHEAD_BYTES,
+                )
+            else:
+                max_file_bytes = (
+                    max(0, free_bytes - TRANSFER_STAGING_RESERVE_BYTES)
+                    if free_bytes is not None else None
+                )
             hub.mkdir(parents=True, exist_ok=True)
-            archive_name = _cache_name(model_id)
-            if (hub / archive_name).exists():
+            root_name = _cache_name(model_id)
+            if (hub / root_name).exists():
                 raise FileExistsError("cached model already exists on target node")
             stage = Path(tempfile.mkdtemp(prefix=".sparkdeck-vnas-stage-", dir=hub))
-            descriptor, archive_path_value = tempfile.mkstemp(
-                prefix=".sparkdeck-vnas-", suffix=".tar", dir=hub,
-            )
-            archive_path = Path(archive_path_value)
-            received = 0
             try:
                 if phase:
                     phase("receiving")
-                with os.fdopen(descriptor, "wb") as output:
-                    async for chunk in chunks:
-                        if not isinstance(chunk, (bytes, bytearray, memoryview)):
-                            raise ValueError("archive stream yielded non-bytes data")
-                        data = bytes(chunk)
-                        received += len(data)
-                        output.write(data)
-                        if progress:
-                            progress(received)
-                    if phase:
-                        phase("syncing")
-                    output.flush()
-                    os.fsync(output.fileno())
-                if expected_bytes is not None and received != int(expected_bytes):
-                    raise ValueError("archive byte count does not match expected size")
+                received = await self._receive_file_stream(
+                    chunks, stage, root_name, expected_bytes, progress,
+                    max_file_bytes=max_file_bytes, cancel=cancel,
+                )
+                if cancel is not None and cancel.is_set():
+                    raise TransferCanceled()
+                if phase:
+                    phase("syncing")
                 await asyncio.to_thread(
-                    self._extract_and_finalize, archive_path, stage, archive_name, phase,
+                    self._finalize_received_model,
+                    stage, root_name, phase, cancel,
                 )
                 return {"ok": True, "model_id": model_id, "bytes_received": received}
             finally:
-                archive_path.unlink(missing_ok=True)
                 shutil.rmtree(stage, ignore_errors=True)
         finally:
             self._release_stream(model_id)
@@ -1285,7 +1498,7 @@ class VirtualNAS:
         required_model_bytes: int | None = None,
         transfer_id: str | None = None,
     ) -> dict[str, Any]:
-        """Pull an archive from a source agent without relaying it via the controller."""
+        """Pull raw model files from a source agent without controller relaying."""
         model_id = validate_model_id(model_id)
         source_agent_url = str(source_agent_url or "").strip().rstrip("/")
         source_capability = str(source_capability or "").strip()
@@ -1308,18 +1521,38 @@ class VirtualNAS:
                     "X-SparkDeck-Direct-Transfer-Capability": source_capability,
                 }) as response:
                     response.raise_for_status()
+                    async def close_on_cancel() -> None:
+                        await record["cancel"].wait()
+                        await response.aclose()
+
+                    cancel_watcher = asyncio.create_task(close_on_cancel())
                     async def tracked() -> AsyncIterator[bytes]:
-                        async for chunk in response.aiter_bytes(
-                            chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
-                        ):
+                        try:
+                            async for chunk in response.aiter_bytes(
+                                chunk_size=FILE_STREAM_CHUNK_BYTES,
+                            ):
+                                if record["cancel"].is_set():
+                                    raise TransferCanceled()
+                                record["bytes_transferred"] += len(chunk)
+                                yield chunk
+                        except httpx.HTTPError:
                             if record["cancel"].is_set():
                                 raise TransferCanceled()
-                            record["bytes_transferred"] += len(chunk)
-                            yield chunk
-                    result = await self.import_model(
-                        model_id, tracked(), required_model_bytes=required_model_bytes,
-                        phase=lambda value: self._set_peer_import_phase(record, value),
-                    )
+                            raise
+                    try:
+                        result = await self.import_model(
+                            model_id, tracked(), required_model_bytes=required_model_bytes,
+                            phase=lambda value: self._set_peer_import_phase(record, value),
+                            cancel=record["cancel"],
+                        )
+                    finally:
+                        cancel_watcher.cancel()
+                        await asyncio.gather(cancel_watcher, return_exceptions=True)
+                    if record["cancel"].is_set():
+                        destination = self._model_path(model_id)
+                        if destination.is_dir() and not destination.is_symlink():
+                            await asyncio.to_thread(shutil.rmtree, destination)
+                        raise TransferCanceled()
                     record["status"] = "completed"
                     self._set_peer_import_phase(record, "completed")
                     return result
@@ -1335,6 +1568,7 @@ class VirtualNAS:
         finally:
             if record["status"] == "running":
                 record["status"] = "failed"
+            self._peer_imports.pop(transfer_id, None)
 
     def peer_import_status(self, transfer_id: str) -> dict[str, Any]:
         record = self._peer_imports.get(str(transfer_id or ""))
@@ -1384,31 +1618,141 @@ class VirtualNAS:
             raise PermissionError("direct transfer capability is invalid or expired")
         return self.export_model(model_id)
 
-    def _extract_and_finalize(
-        self, archive_path: Path, stage: Path, archive_name: str,
+    async def _receive_file_stream(
+        self,
+        chunks: AsyncIterator[bytes],
+        stage: Path,
+        root_name: str,
+        expected_bytes: int | None = None,
+        progress: Callable[[int], None] | None = None,
+        max_file_bytes: int | None = None,
+        cancel: asyncio.Event | None = None,
+    ) -> int:
+        reader = _AsyncFileStreamReader(chunks, progress)
+        if await reader.readexactly(len(_FILE_STREAM_MAGIC)) != _FILE_STREAM_MAGIC:
+            raise ValueError("model transfer is not a SparkDeck file stream")
+        seen: set[PurePosixPath] = set()
+        links: list[tuple[Path, str, str]] = []
+        declared_file_bytes = 0
+        metadata_bytes = 0
+        entry_count = 0
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise TransferCanceled()
+            header_size = struct.unpack(">I", await reader.readexactly(4))[0]
+            if header_size == 0:
+                break
+            if header_size > _FILE_STREAM_HEADER_MAX_BYTES:
+                raise ValueError("file stream metadata is too large")
+            metadata_bytes += header_size + 4
+            entry_count += 1
+            if (
+                metadata_bytes > _FILE_STREAM_METADATA_MAX_BYTES
+                or entry_count > _FILE_STREAM_MAX_ENTRIES
+            ):
+                raise ValueError("file stream contains too much metadata")
+            try:
+                entry = json.loads((await reader.readexactly(header_size)).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("file stream metadata is invalid") from exc
+            if not isinstance(entry, dict):
+                raise ValueError("file stream metadata is invalid")
+            path = _validate_file_stream_path(entry.get("path"), root_name)
+            if path in seen:
+                raise ValueError("file stream contains a duplicate path")
+            seen.add(path)
+            destination = stage.joinpath(*path.parts)
+            entry_type = entry.get("type")
+            if entry_type == "directory" and set(entry) == {"path", "type"}:
+                destination.mkdir(parents=True, exist_ok=False)
+                continue
+            if entry_type in {"symlink", "hardlink"} and set(entry) == {
+                "path", "type", "target",
+            }:
+                if len(path.parts) == 1:
+                    raise ValueError("file stream repository root cannot be a link")
+                target = _validate_file_stream_link(path, entry.get("target"), root_name)
+                links.append((destination, target, entry_type))
+                continue
+            if entry_type != "file" or set(entry) != {"path", "type", "size"}:
+                raise ValueError("file stream metadata is invalid")
+            size = entry.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError("file stream file size is invalid")
+            declared_file_bytes += size
+            if (
+                max_file_bytes is not None
+                and declared_file_bytes > max_file_bytes
+            ):
+                raise ValueError("file stream exceeds the admitted transfer size")
+            if len(path.parts) == 1:
+                raise ValueError("file stream repository root cannot be a file")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            remaining = size
+            digest = hashlib.sha256()
+            output = await asyncio.to_thread(destination.open, "xb")
+            try:
+                while remaining:
+                    if cancel is not None and cancel.is_set():
+                        raise TransferCanceled()
+                    data = await reader.readexactly(
+                        min(FILE_STREAM_CHUNK_BYTES, remaining),
+                    )
+                    await asyncio.to_thread(output.write, data)
+                    digest.update(data)
+                    remaining -= len(data)
+                await asyncio.to_thread(output.flush)
+                await asyncio.to_thread(os.fsync, output.fileno())
+            finally:
+                await asyncio.to_thread(output.close)
+            expected_digest = await reader.readexactly(hashlib.sha256().digest_size)
+            if not secrets.compare_digest(digest.digest(), expected_digest):
+                raise ValueError("model file failed transfer integrity verification")
+        await reader.require_eof()
+        if expected_bytes is not None and reader.received != int(expected_bytes):
+            raise ValueError("file stream byte count does not match expected size")
+        if not seen:
+            raise ValueError("model file stream is empty")
+        if cancel is not None and cancel.is_set():
+            raise TransferCanceled()
+        for destination, target, link_type in links:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists() or destination.is_symlink():
+                raise ValueError("file stream link conflicts with another entry")
+            if link_type == "hardlink":
+                target_path = (destination.parent / Path(target)).resolve(strict=True)
+                try:
+                    target_path.relative_to(stage.resolve(strict=True))
+                except ValueError as exc:
+                    raise ValueError("file stream link escapes its repository") from exc
+                await asyncio.to_thread(os.link, target_path, destination)
+            else:
+                await asyncio.to_thread(
+                    _create_file_stream_link, destination, target, stage,
+                )
+        return reader.received
+
+    def _finalize_received_model(
+        self, stage: Path, root_name: str,
         phase: Callable[[str], None] | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> None:
-        if phase:
-            phase("extracting")
-        with tarfile.open(archive_path, mode="r:*") as archive:
-            members = archive.getmembers()
-            if not members:
-                raise ValueError("model archive is empty")
-            for member in members:
-                _validate_tar_member(member, archive_name)
-            archive.extractall(stage, members=members, filter="data")
-        extracted = stage / archive_name
+        extracted = stage / root_name
         if phase:
             phase("validating")
         if not extracted.is_dir() or extracted.is_symlink():
-            raise ValueError("model archive does not contain the expected repository")
+            raise ValueError("model stream does not contain the expected repository")
         if not _is_complete_repository(extracted):
-            raise ValueError("model archive does not contain a complete Hugging Face cache")
-        destination = self._hub() / archive_name
+            raise ValueError("model stream does not contain a complete Hugging Face cache")
+        if cancel is not None and cancel.is_set():
+            raise TransferCanceled()
+        destination = self._hub() / root_name
         if destination.exists():
             raise FileExistsError("cached model already exists on target node")
         if phase:
             phase("registering")
+        if cancel is not None and cancel.is_set():
+            raise TransferCanceled()
         os.replace(extracted, destination)
 
     def _selected_snapshot_entries(
@@ -1432,9 +1776,9 @@ class VirtualNAS:
         self, repository: Path, revision: str, filenames: list[str],
         requested_revision: str,
     ) -> tuple[list[Path], list[str], int, bool]:
-        """Collect archive members for one file-scoped snapshot transfer.
+        """Collect entries for one file-scoped snapshot transfer.
 
-        Returns the filesystem paths to archive, their arcnames, the byte
+        Returns the filesystem paths to stream, their destination names, the byte
         total of the real files, and whether the target snapshot must carry
         the selective marker. A file-scoped export is selective unless it
         ships every file of an already-complete source snapshot, otherwise
@@ -1457,7 +1801,7 @@ class VirtualNAS:
         paths: list[Path] = []
         arcnames: list[str] = []
         total = 0
-        archived_reals: set[Path] = set()
+        streamed_reals: set[Path] = set()
         snapshot = repository / "snapshots" / revision
 
         def add(path: Path, arcname: str, *, size: bool) -> None:
@@ -1489,15 +1833,15 @@ class VirtualNAS:
                     )
         for filename, entry in entries.items():
             real = entry.resolve(strict=True)
-            if real.is_file() and real not in archived_reals:
-                archived_reals.add(real)
+            if real.is_file() and real not in streamed_reals:
+                streamed_reals.add(real)
                 blob_relative = real.relative_to(repository).as_posix()
                 add(real, f"{root}/{blob_relative}", size=True)
         for filename, entry in entries.items():
-            if entry in archived_reals:
+            if entry in streamed_reals:
                 # A regular-file entry (degraded symlink layouts) was already
-                # archived under its snapshot path; adding it again would
-                # duplicate the payload in the archive.
+                # streamed under its snapshot path; adding it again would
+                # duplicate the payload.
                 continue
             add(
                 entry,
@@ -1531,7 +1875,7 @@ class VirtualNAS:
         self, model_id: str, revision: str, filenames: list[str],
         requested_revision: str | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream a tar of exactly one snapshot's selected files and blobs."""
+        """Stream exactly one snapshot's selected files and blobs."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
         requested_revision = validate_revision(requested_revision or revision)
@@ -1549,60 +1893,24 @@ class VirtualNAS:
         paths, arcnames, total, synthetic_marker = self._model_files_members(
             repository, revision, selected, requested_revision,
         )
+        hardlinks: dict[tuple[int, int], PurePosixPath] = {}
+        stream_entries = [
+            _file_stream_path_entry(path, name, repository, hardlinks)
+            for path, name in zip(paths, arcnames)
+        ]
+        if synthetic_marker:
+            stream_entries.append({
+                "path": (
+                    f"{repository.name}/snapshots/{revision}/"
+                    f"{_SELECTIVE_SNAPSHOT_MARKER}"
+                ),
+                "type": "file", "size": len(_SELECTIVE_MARKER_CONTENT),
+                "content": _SELECTIVE_MARKER_CONTENT,
+            })
         self._reserve_stream(model_id)
-
-        async def stream() -> AsyncIterator[bytes]:
-            chunks: queue.Queue[Any] = queue.Queue(maxsize=8)
-            stopped = threading.Event()
-            finished = object()
-
-            def produce() -> None:
-                def publish(value: Any) -> None:
-                    while not stopped.is_set():
-                        try:
-                            chunks.put(value, timeout=0.1)
-                            return
-                        except queue.Full:
-                            continue
-
-                try:
-                    writer = _TarQueueWriter(chunks, stopped)
-                    with tarfile.open(fileobj=writer, mode="w|") as archive:
-                        for path, arcname in zip(paths, arcnames):
-                            archive.add(
-                                path, arcname=arcname, recursive=False,
-                            )
-                        if synthetic_marker:
-                            info = tarfile.TarInfo(
-                                f"{repository.name}/snapshots/{revision}/"
-                                f"{_SELECTIVE_SNAPSHOT_MARKER}"
-                            )
-                            info.size = len(_SELECTIVE_MARKER_CONTENT)
-                            archive.addfile(
-                                info, io.BytesIO(_SELECTIVE_MARKER_CONTENT),
-                            )
-                    writer.flush()
-                except BrokenPipeError:
-                    pass
-                except BaseException as exc:
-                    publish(exc)
-                finally:
-                    publish(finished)
-
-            producer = asyncio.create_task(asyncio.to_thread(produce))
-            try:
-                while True:
-                    item = await asyncio.to_thread(chunks.get)
-                    if item is finished:
-                        break
-                    if isinstance(item, BaseException):
-                        raise item
-                    yield item
-            finally:
-                stopped.set()
-                await asyncio.gather(producer, return_exceptions=True)
-
-        return _TrackedExport(self, model_id, stream())
+        return _TrackedExport(
+            self, model_id, self._export_file_stream(stream_entries),
+        )
 
     async def import_model_files(
         self,
@@ -1611,9 +1919,9 @@ class VirtualNAS:
         expected_bytes: int | None = None,
         required_model_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Receive one file-scoped archive, placing or merging it atomically.
+        """Receive selected files directly, placing or merging them atomically.
 
-        Targets without the repository receive the archive as-is; targets
+        Targets without the repository receive the staged tree as-is; targets
         already caching the repository (for example a different GGUF
         quantization) get the missing blobs, snapshot entries, and revision
         refs merged in without touching their existing content.
@@ -1622,73 +1930,59 @@ class VirtualNAS:
         self._reserve_stream(model_id)
         hub = self._hub()
         try:
+            free_bytes = self.free_bytes()
             if required_model_bytes is not None:
                 model_bytes = _nonnegative_int(required_model_bytes)
-                required_free = model_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
-                free_bytes = self.free_bytes()
+                required_free = transfer_required_free_bytes(model_bytes)
                 if free_bytes is None or free_bytes < required_free:
                     raise RuntimeError(
                         "target cache volume no longer has enough free space for import"
                     )
+                max_file_bytes = min(
+                    required_free,
+                    model_bytes + _FILE_STREAM_PAYLOAD_OVERHEAD_BYTES,
+                )
+            else:
+                max_file_bytes = (
+                    max(0, free_bytes - TRANSFER_STAGING_RESERVE_BYTES)
+                    if free_bytes is not None else None
+                )
             hub.mkdir(parents=True, exist_ok=True)
-            archive_name = _cache_name(model_id)
+            root_name = _cache_name(model_id)
             stage = Path(tempfile.mkdtemp(prefix=".sparkdeck-vnas-stage-", dir=hub))
-            descriptor, archive_path_value = tempfile.mkstemp(
-                prefix=".sparkdeck-vnas-", suffix=".tar", dir=hub,
-            )
-            archive_path = Path(archive_path_value)
-            received = 0
             try:
-                with os.fdopen(descriptor, "wb") as output:
-                    async for chunk in chunks:
-                        if not isinstance(chunk, (bytes, bytearray, memoryview)):
-                            raise ValueError("archive stream yielded non-bytes data")
-                        data = bytes(chunk)
-                        received += len(data)
-                        output.write(data)
-                        if expected_bytes is not None and received > int(expected_bytes):
-                            raise ValueError(
-                                "archive byte count exceeds the expected size"
-                            )
-                    output.flush()
-                    os.fsync(output.fileno())
+                received = await self._receive_file_stream(
+                    chunks, stage, root_name, expected_bytes,
+                    max_file_bytes=max_file_bytes,
+                )
                 await asyncio.to_thread(
-                    self._place_or_merge_model_files,
-                    archive_path, stage, archive_name,
+                    self._place_or_merge_model_files, stage, root_name,
                 )
                 return {
                     "ok": True, "model_id": model_id, "bytes_received": received,
                 }
             finally:
-                archive_path.unlink(missing_ok=True)
                 shutil.rmtree(stage, ignore_errors=True)
         finally:
             self._release_stream(model_id)
 
     def _place_or_merge_model_files(
-        self, archive_path: Path, stage: Path, archive_name: str,
+        self, stage: Path, root_name: str,
     ) -> None:
-        with tarfile.open(archive_path, mode="r:*") as archive:
-            members = archive.getmembers()
-            if not members:
-                raise ValueError("model archive is empty")
-            for member in members:
-                _validate_tar_member(member, archive_name)
-            archive.extractall(stage, members=members, filter="data")
-        extracted = stage / archive_name
+        extracted = stage / root_name
         if not extracted.is_dir() or extracted.is_symlink():
-            raise ValueError("model archive does not contain the expected repository")
+            raise ValueError("model stream does not contain the expected repository")
         snapshot_dirs = [
             item for item in (extracted / "snapshots").iterdir()
             if item.is_dir() and not item.is_symlink()
         ]
         if not snapshot_dirs:
-            raise ValueError("model archive does not contain a snapshot")
-        destination = self._hub() / archive_name
+            raise ValueError("model stream does not contain a snapshot")
+        destination = self._hub() / root_name
         if not destination.exists():
             # Capacity was gated before the stream started; the staging copy
             # is already part of that budget, so placement is a rename. The
-            # archive's own marker state defines snapshot completeness.
+            # The stream's own marker state defines snapshot completeness.
             os.replace(extracted, destination)
             return
         # Mirror the download, inventory, and delete paths: a repository
@@ -1707,7 +2001,7 @@ class VirtualNAS:
         snapshot directories (they keep their own marker state so an
         incoming selective subset can never downgrade a complete target
         snapshot), while snapshot directories newly created by this merge
-        take the archive's marker because they hold only the shipped
+        take the stream's marker because they hold only the shipped
         subset. Revision refs are updated to the incoming alias mapping
         when it differs.
         """
@@ -1730,7 +2024,7 @@ class VirtualNAS:
                 # Pre-existing snapshots keep their own marker state so an
                 # incoming selective subset cannot downgrade a complete
                 # target snapshot; newly created snapshots accept the
-                # archive's marker because they hold only a subset.
+                # stream's marker because they hold only a subset.
                 continue
             if source_path.is_dir() and not source_path.is_symlink():
                 target_path.mkdir(parents=True, exist_ok=True)
@@ -1799,11 +2093,12 @@ class VirtualNAS:
         free_bytes = _optional_nonnegative_int(target_storage.get("free_size"))
         if free_bytes is None:
             raise RuntimeError("target node did not report free cache capacity")
-        if free_bytes < expected * 2 + TRANSFER_STAGING_RESERVE_BYTES:
+        required = transfer_required_free_bytes(expected)
+        if free_bytes < required:
             raise RuntimeError(
                 f"target node has insufficient free cache space "
                 f"({free_bytes} bytes available; "
-                f"{expected * 2 + TRANSFER_STAGING_RESERVE_BYTES} bytes required)"
+                f"{required} bytes required)"
             )
         source_response = None
         target_response = None
@@ -1826,7 +2121,7 @@ class VirtualNAS:
                 )
                 await _raise_remote_status(source_response, "source")
                 source = source_response.aiter_bytes(
-                    chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                    chunk_size=FILE_STREAM_CHUNK_BYTES,
                 )
             if target_node_id == LOCAL_NODE_ID:
                 return await self.import_model_files(
@@ -1837,7 +2132,7 @@ class VirtualNAS:
                 self._model_agent_path(model_id, "files/import"),
                 content=source,
                 headers={
-                    "Content-Type": "application/x-tar",
+                    "Content-Type": FILE_STREAM_CONTENT_TYPE,
                     "X-SparkDeck-Model-Bytes": str(expected),
                 },
                 timeout=3600, use_fabric=True,
@@ -1865,7 +2160,7 @@ class VirtualNAS:
         """Report the byte total of the real files backing selected snapshot entries.
 
         Blobs shared by several snapshot entries are counted once, matching
-        what a file-scoped archive actually contains.
+        what a file-scoped stream actually contains.
         """
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
@@ -2072,7 +2367,7 @@ class VirtualNAS:
             raise FileExistsError(
                 f"cached model already exists on target node(s): {', '.join(existing_targets)}"
             )
-        required_free = model_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        required_free = transfer_required_free_bytes(model_size)
         for target in target_statuses:
             raw_free = target_storage[target].get("free_size")
             free_bytes = None if raw_free is None else _nonnegative_int(raw_free)
@@ -2084,7 +2379,7 @@ class VirtualNAS:
                 raise RuntimeError(
                     f"target node '{target}' has insufficient free disk space "
                     f"({free_bytes} bytes available; {required_free} bytes required "
-                    "for archive staging and extraction)"
+                    "for direct file staging)"
                 )
 
         created = time.time()
@@ -2262,7 +2557,7 @@ class VirtualNAS:
             transfer_bytes = _nonnegative_int(source_model.get("size_bytes"))
             if transfer_bytes <= 0:
                 raise RuntimeError("source node did not report a usable cached model size")
-        transfer_required = transfer_bytes * 2 + TRANSFER_STAGING_RESERVE_BYTES
+        transfer_required = transfer_required_free_bytes(transfer_bytes)
         for target in targets:
             storage = await self._node_storage(target)
             if any(item.get("model_id") == model_id for item in storage["models"]):
@@ -2646,8 +2941,8 @@ class VirtualNAS:
         self._cancel_events[job["id"]] = event
         job.update({
             "status": "running", "started_at": time.time(),
-            # Archive copies are not resumable. A requeued attempt streams the
-            # full archive again, so its progress and rate restart at byte zero.
+            # File-stream copies are not resumable. A requeued attempt streams
+            # every file again, so its progress and rate restart at byte zero.
             "bytes_transferred": 0,
             "completed_at": None, "error": None,
         })
@@ -2688,7 +2983,7 @@ class VirtualNAS:
             ):
                 raise FileExistsError("cached model already exists on target node")
             free_bytes = _optional_nonnegative_int(target_storage.get("free_size"))
-            required = actual_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            required = transfer_required_free_bytes(actual_size)
             if free_bytes is None:
                 raise RuntimeError("target node did not report free cache capacity")
             if free_bytes < required:
@@ -2776,13 +3071,11 @@ class VirtualNAS:
                             pass
                     result = await operation
                     received = _nonnegative_int((result or {}).get("bytes_received"))
-                    # The wire payload is a tar archive, so headers, padding,
-                    # and synthetic cache metadata make it larger than the
-                    # source model's logical size. Successful extraction plus
-                    # the inventory verification below establish completion;
-                    # exact archive/model byte equality is invalid.
+                    # File framing and synthetic cache metadata make the wire
+                    # stream slightly larger than the logical model size. The
+                    # inventory verification below establishes completion.
                     if received <= 0:
-                        raise RuntimeError("target did not receive a model archive")
+                        raise RuntimeError("target did not receive model files")
                     job["bytes_transferred"] = actual_size
                     job["phase"] = "verifying"
                     job["phase_started_at"] = time.time()
@@ -2795,7 +3088,7 @@ class VirtualNAS:
                     )
                     await _raise_remote_status(source_response, "source")
                     source = source_response.aiter_bytes(
-                        chunk_size=ARCHIVE_STREAM_CHUNK_BYTES,
+                        chunk_size=FILE_STREAM_CHUNK_BYTES,
                     )
 
             async def tracked() -> AsyncIterator[bytes]:
@@ -2806,8 +3099,8 @@ class VirtualNAS:
                     job["phase"] = "transferring"
                     self._save_progress(job)
                     yield chunk
-                # The receiver still has to fsync, unpack, validate, and register
-                # the archive before its HTTP response can complete.
+                # The receiver still has to fsync, validate, and register the
+                # staged files before its HTTP response can complete.
                 job["phase"] = "finalizing"
                 job["phase_started_at"] = time.time()
                 self._save_progress(job)
@@ -2829,7 +3122,7 @@ class VirtualNAS:
                     self._model_agent_path(job["model_id"], "import"),
                     content=tracked_stream,
                     headers={
-                        "Content-Type": "application/x-tar",
+                        "Content-Type": FILE_STREAM_CONTENT_TYPE,
                         "X-SparkDeck-Model-Bytes": str(actual_size),
                     },
                     timeout=3600, use_fabric=True,
@@ -2896,28 +3189,6 @@ class VirtualNAS:
     @staticmethod
     def _model_agent_path(model_id: str, action: str) -> str:
         return f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/{action}"
-
-
-def _validate_tar_member(member: tarfile.TarInfo, archive_name: str) -> None:
-    if "\\" in member.name or not member.name:
-        raise ValueError("model archive contains an unsafe path")
-    path = PurePosixPath(member.name)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ValueError("model archive contains an unsafe path")
-    if not path.parts or path.parts[0] != archive_name:
-        raise ValueError("model archive contains an unexpected repository")
-    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
-        raise ValueError("model archive contains an unsupported special file")
-    if member.issym() or member.islnk():
-        if "\\" in member.linkname:
-            raise ValueError("model archive contains an unsafe link")
-        link = PurePosixPath(member.linkname)
-        if link.is_absolute():
-            raise ValueError("model archive contains an unsafe link")
-        base = path.parent if member.issym() else PurePosixPath()
-        normalized = PurePosixPath(posixpath.normpath(str(base / link)))
-        if not normalized.parts or normalized.parts[0] != archive_name or ".." in normalized.parts:
-            raise ValueError("model archive link escapes its repository")
 
 
 async def _raise_remote_status(response: Any, role: str) -> None:
@@ -3277,50 +3548,6 @@ def _external_comfyui_bundle_files(
             best = files
             best_size = size
     return best
-
-
-def _write_external_bundle_archive(
-    archive: tarfile.TarFile, model_id: str, files: dict[str, Path],
-) -> None:
-    """Stream external bundle files as a synthetic Hugging Face cache repo.
-
-    The layout matches a regular whole-model export so targets import a
-    normal SparkDeck-managed copy: bundle files land under
-    ``snapshots/<pseudo-revision>/`` alongside a marker that relaxes the
-    config/tokenizer completeness requirement for bare weight bundles, and
-    ``refs/main`` points at the pseudo-revision so consumers resolving the
-    default revision find the snapshot.
-    """
-    root = _cache_name(model_id)
-    snapshot = f"{root}/snapshots/{_EXTERNAL_PSEUDO_REVISION}"
-
-    def add_directory(name: str) -> None:
-        info = tarfile.TarInfo(name)
-        info.type = tarfile.DIRTYPE
-        info.mode = 0o755
-        archive.addfile(info)
-
-    def add_file(name: str, content: bytes) -> None:
-        info = tarfile.TarInfo(name)
-        info.size = len(content)
-        archive.addfile(info, io.BytesIO(content))
-
-    add_directory(root)
-    add_directory(f"{root}/snapshots")
-    add_directory(snapshot)
-    directories: set[str] = set()
-    for relative in files:
-        parts = PurePosixPath(relative).parts
-        for depth in range(1, len(parts)):
-            directory = "/".join(parts[:depth])
-            if directory not in directories:
-                directories.add(directory)
-                add_directory(f"{snapshot}/{directory}")
-    for relative, resolved in files.items():
-        archive.add(resolved, arcname=f"{snapshot}/{relative}", recursive=False)
-    add_file(f"{snapshot}/{_EXTERNAL_SNAPSHOT_MARKER}", _EXTERNAL_MARKER_CONTENT)
-    add_directory(f"{root}/refs")
-    add_file(f"{root}/refs/main", _EXTERNAL_PSEUDO_REVISION.encode("utf-8"))
 
 
 def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:

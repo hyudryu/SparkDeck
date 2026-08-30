@@ -47,6 +47,7 @@ from sparkdeck.virtual_nas import (
     cached_download_bytes,
     download_required_free_bytes,
     partial_download_size_bytes,
+    transfer_required_free_bytes,
     validate_model_id,
     validate_revision,
 )
@@ -1044,7 +1045,7 @@ class Manager:
         """Return agent liveness without touching telemetry, Docker, or storage.
 
         This endpoint backs controller liveness probes, so it must remain safe
-        to answer while the node is unpacking a large model archive.
+        to answer while the node is finalizing a large model transfer.
         """
         return {
             "node_id": self.agent_credentials.node_id,
@@ -2450,11 +2451,11 @@ class Manager:
         sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
         source = sources[0] if sources else None
         required_free = (
-            source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            transfer_required_free_bytes(source["size_bytes"])
             if source else None
         )
         transfer_after_download_required_free = (
-            download_size * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            transfer_required_free_bytes(download_size)
             if download_size else None
         )
         targets = []
@@ -2678,7 +2679,7 @@ class Manager:
         if selected_sources:
             selected_sources.sort(key=lambda item: (item["size_bytes"], str(item["node_id"])))
             source = selected_sources[0]
-            transfer_required = source["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            transfer_required = transfer_required_free_bytes(source["size_bytes"])
             download = preflight.get("download")
             default_download_required = (
                 self._byte_count(download.get("required_free_bytes"))
@@ -2758,7 +2759,7 @@ class Manager:
             }
 
         transfer_required = (
-            download["size_bytes"] * 2 + TRANSFER_STAGING_RESERVE_BYTES
+            transfer_required_free_bytes(download["size_bytes"])
         )
         candidate_reasons: list[str] = []
         chosen = None

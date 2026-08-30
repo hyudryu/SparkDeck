@@ -378,6 +378,19 @@ export function ModelsPage() {
   const linkedArtifactRef = useRef<string | undefined>(undefined)
   const previousModelIdRef = useRef('')
   const reloadDeployments = resource.reload
+  const recoveredStalledInitialLoad = useRef(false)
+
+  useEffect(() => {
+    if (!resource.loading || resource.data || resource.error || recoveredStalledInitialLoad.current) return
+    // A stale browser connection can leave the first request pending even
+    // while a fresh request succeeds. Recover once without shortening the
+    // full timeout contract for the replacement request.
+    const timer = window.setTimeout(() => {
+      recoveredStalledInitialLoad.current = true
+      reloadDeployments()
+    }, 10_000)
+    return () => window.clearTimeout(timer)
+  }, [resource.data, resource.error, resource.loading, reloadDeployments])
 
   useEffect(() => {
     const timer = window.setInterval(() => {

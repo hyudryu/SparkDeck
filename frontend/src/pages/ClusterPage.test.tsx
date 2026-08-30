@@ -25,6 +25,8 @@ afterEach(() => {
 
 describe('ClusterPage', () => {
   it('shows controller access details and joins through the local onboarding API', async () => {
+    const onboardingChanged = vi.fn()
+    window.addEventListener('sparkdeck:onboarding-changed', onboardingChanged)
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
       const body = init?.method === 'POST'
@@ -61,6 +63,8 @@ describe('ClusterPage', () => {
       name: 'Studio Spark',
     })
     expect(screen.getByText('Joined http://100.64.0.10:7878 as Studio Spark.')).toHaveAttribute('role', 'status')
+    expect(onboardingChanged).toHaveBeenCalledOnce()
+    window.removeEventListener('sparkdeck:onboarding-changed', onboardingChanged)
   })
 
   it('lets an online worker invite another node into the existing cluster', async () => {

@@ -68,6 +68,7 @@ export function ClusterPage() {
         name: form.name.trim(),
       })
       resource.setData(status)
+      window.dispatchEvent(new Event('sparkdeck:onboarding-changed'))
       setForm((current) => ({ ...current, join_code: '' }))
       setJoining(false)
       setNotice(`Joined ${status.controller_url ?? 'the controller'} as ${status.node.name}.`)
@@ -91,6 +92,7 @@ export function ClusterPage() {
     try {
       const status = await api.onboarding.leave()
       resource.setData(status)
+      window.dispatchEvent(new Event('sparkdeck:onboarding-changed'))
       setNotice('This node left the cluster and is now a controller.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not leave the cluster')

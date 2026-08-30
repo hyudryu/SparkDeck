@@ -883,6 +883,37 @@ class LocalUpdatePreflightTests(unittest.TestCase):
 
 
 class NodeToolchainTests(unittest.TestCase):
+    @patch("sparkdeck.node_toolchain.subprocess.run")
+    def test_discovery_deadline_bounds_all_toolchain_candidates(self, process_run):
+        process_run.side_effect = [
+            Mock(returncode=0, stdout="v22.12.0\n", stderr=""),
+            Mock(returncode=1, stdout="", stderr="npm stalled"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = []
+            for name in ("first", "second"):
+                candidate = root / name
+                candidate.mkdir()
+                (candidate / "node").write_text("node", encoding="utf-8")
+                (candidate / "npm").write_text("npm", encoding="utf-8")
+                candidates.append((candidate,))
+
+            with patch(
+                "sparkdeck.node_toolchain._candidate_directories",
+                return_value=candidates,
+            ), patch(
+                "sparkdeck.node_toolchain.time.monotonic",
+                side_effect=[0.0, 0.0, 0.0, 31.0],
+            ), self.assertRaisesRegex(RuntimeError, "discovery timed out after 30 seconds"):
+                resolve_node_toolchain(
+                    {"HOME": str(root), "PATH": ""},
+                    home=root,
+                    system="Linux",
+                )
+
+        self.assertEqual(process_run.call_count, 2)
+
     def test_supported_versions_match_frontend_engine(self):
         expected = {
             (20, 18, 9): False,

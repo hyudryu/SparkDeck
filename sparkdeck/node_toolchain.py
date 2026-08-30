@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -124,6 +125,7 @@ def resolve_node_toolchain(
     *,
     home: Path | None = None,
     system: str | None = None,
+    discovery_timeout: float = 30.0,
 ) -> NodeToolchain:
     """Find a supported Node/npm pair visible to the SparkDeck service.
 
@@ -137,6 +139,16 @@ def resolve_node_toolchain(
     unsupported: list[str] = []
 
     npm_name = "npm.cmd" if system == "Windows" else "npm"
+    deadline = time.monotonic() + discovery_timeout
+
+    def probe_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Node.js toolchain discovery timed out after {discovery_timeout:g} seconds"
+            )
+        return min(10.0, remaining)
+
     for path_entries in _candidate_directories(environment, home, system):
         npm = path_entries[0] / npm_name
         node = path_entries[0] / node_name
@@ -148,7 +160,7 @@ def resolve_node_toolchain(
                 [str(node), "--version"],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=probe_timeout(),
                 check=False,
                 env=candidate_environment,
             )
@@ -169,7 +181,7 @@ def resolve_node_toolchain(
                 [str(npm), "--version"],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=probe_timeout(),
                 check=False,
                 env=candidate_environment,
             )
@@ -186,6 +198,10 @@ def resolve_node_toolchain(
             path_entries=path_entries,
         )
 
+    if time.monotonic() >= deadline:
+        raise RuntimeError(
+            f"Node.js toolchain discovery timed out after {discovery_timeout:g} seconds"
+        )
     if unsupported:
         raise RuntimeError(f"{unsupported[0]}; SparkDeck requires {SUPPORTED_NODE}")
     raise RuntimeError(

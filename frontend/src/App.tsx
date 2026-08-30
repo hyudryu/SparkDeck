@@ -30,6 +30,7 @@ export default function App() {
   const [connectionVersion, setConnectionVersion] = useState(0)
   const [leavingCluster, setLeavingCluster] = useState(false)
   const retryTimer = useRef<number | undefined>(undefined)
+  const controllerUnavailableRef = useRef(false)
   const { confirm, confirmationDialog } = useConfirmDialog()
   const retryConnection = useCallback(() => setConnectionVersion((value) => value + 1), [])
 
@@ -59,11 +60,19 @@ export default function App() {
 
   useEffect(() => {
     window.addEventListener('sparkdeck:node-name-changed', retryConnection)
-    return () => window.removeEventListener('sparkdeck:node-name-changed', retryConnection)
+    window.addEventListener('sparkdeck:onboarding-changed', retryConnection)
+    return () => {
+      window.removeEventListener('sparkdeck:node-name-changed', retryConnection)
+      window.removeEventListener('sparkdeck:onboarding-changed', retryConnection)
+    }
   }, [retryConnection])
 
   const controllerUnavailable = onboarding?.role === 'worker' && onboarding.controller_reachable === false
   const controllerAvailable = Boolean(onboarding) && !controllerUnavailable && !connectionError
+
+  useEffect(() => {
+    controllerUnavailableRef.current = controllerUnavailable
+  }, [controllerUnavailable])
 
   const leaveCluster = async () => {
     if (!await confirm({
@@ -72,6 +81,9 @@ export default function App() {
       confirmLabel: 'Leave cluster',
       danger: true,
     })) return
+    // The automatic liveness refresh may have recovered while the confirmation
+    // was open. Never detach from a healthy controller using stale outage UI.
+    if (!controllerUnavailableRef.current) return
     setLeavingCluster(true)
     setLeaveError(undefined)
     try {

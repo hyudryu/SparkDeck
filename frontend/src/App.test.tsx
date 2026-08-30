@@ -223,6 +223,40 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('button', { name: 'Leave cluster' })).toBeEnabled()
   })
 
+  it('does not leave after controller connectivity recovers during confirmation', async () => {
+    const user = userEvent.setup()
+    let controllerReachable = false
+    let leaveRequests = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding/leave') && init?.method === 'POST') {
+        leaveRequests += 1
+      }
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'Worker Two', port: 7878, access_urls: [] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: controllerReachable,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Leave cluster' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Leave this cluster?' })
+
+    controllerReachable = true
+    window.dispatchEvent(new Event('sparkdeck:onboarding-changed'))
+    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Leave cluster' }))
+
+    expect(leaveRequests).toBe(0)
+  })
+
   it('unmounts controller views when a later reachability refresh fails', async () => {
     let onboardingRequests = 0
     fetchMock.mockImplementation(async (input) => {

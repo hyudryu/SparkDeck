@@ -7,6 +7,7 @@ import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Runtim
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
+import { formatEnvironment, parseEnvironment } from '../utils/environment'
 import { formatBytes } from '../utils/format'
 import { artifactFilesDownloaded, ggufArtifactOptions, type GgufArtifactOption, type GgufQuantization } from '../utils/gguf'
 
@@ -363,6 +364,7 @@ export function ModelsPage() {
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
   const [gpuMemoryUtil, setGpuMemoryUtil] = useState('')
+  const [runtimeEnvironment, setRuntimeEnvironment] = useState('')
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
@@ -913,6 +915,7 @@ export function ModelsPage() {
     setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
     setExtraFlags('')
     setGpuMemoryUtil('')
+    setRuntimeEnvironment('')
     resetSelectionProvenance()
     setFormError(undefined)
     setCreating(true)
@@ -923,6 +926,7 @@ export function ModelsPage() {
     setEditingDeployment(deployment)
     setExtraFlags((deployment.settings.extra_args ?? []).map(shellQuote).join(' '))
     setGpuMemoryUtil(deployment.settings.gpu_memory_utilization?.toString() ?? '')
+    setRuntimeEnvironment(formatEnvironment(deployment.settings.environment))
     setForm({
       alias: deployment.alias,
       model_id: deployment.model_id,
@@ -953,12 +957,20 @@ export function ModelsPage() {
     setBusy(editing ? 'edit' : 'create')
     setFormError(undefined)
     setActionNotice(undefined)
-    const settings = { ...form.settings, extra_args: form.managed ? shellSplit(extraFlags) : [] }
-    const utilization = Number(gpuMemoryUtil)
-    if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
-      settings.gpu_memory_utilization = utilization
-    }
     try {
+      const settings = {
+        ...form.settings,
+        extra_args: form.managed ? shellSplit(extraFlags) : [],
+        environment: form.managed && form.runtime === 'vllm'
+          ? (runtimeEnvironment.trim() || editing
+              ? parseEnvironment(runtimeEnvironment)
+              : undefined)
+          : undefined,
+      }
+      const utilization = Number(gpuMemoryUtil)
+      if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
+        settings.gpu_memory_utilization = utilization
+      }
       if (editing) {
         // Saved deployments are editable bookmarks: the same form updates the
         // recorded runtime settings and node preferences without launching.
@@ -974,6 +986,7 @@ export function ModelsPage() {
           quantization: settings.quantization ?? null,
           artifact: settings.artifact ?? null,
           extra_args: settings.extra_args ?? [],
+          environment: settings.environment,
           gpu_memory_utilization: settings.gpu_memory_utilization ?? null,
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
@@ -990,6 +1003,7 @@ export function ModelsPage() {
       setLaunchArgsOpen(false)
       setExtraFlags('')
       setGpuMemoryUtil('')
+      setRuntimeEnvironment('')
       setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
       resource.reload()
     } catch (reason) {
@@ -2138,6 +2152,7 @@ export function ModelsPage() {
                 <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
+                  {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
                 </div>}

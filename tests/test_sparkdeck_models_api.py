@@ -311,6 +311,7 @@ class RecipeLaunchSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "max_model_len": 65536,
                 "max_running_requests": 16,
                 "gpu_memory_utilization": 0.85,
+                "environment": {"NCCL_DEBUG": "WARN"},
             },
         }
         with patch.object(server.manager, "add_recipe", add_recipe):
@@ -319,6 +320,7 @@ class RecipeLaunchSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         kwargs = add_recipe.await_args.kwargs
         self.assertEqual(kwargs["gpu_memory_utilization"], 0.85)
+        self.assertEqual(kwargs["environment"], {"NCCL_DEBUG": "WARN"})
         self.assertEqual(kwargs["launch_controls"], {
             "context_window": 65536, "max_concurrency": 16,
         })

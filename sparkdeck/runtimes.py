@@ -225,6 +225,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             return await manager.create_container(
                 model=model, engine="vllm", image=settings.get("image"),
                 gpu_memory_utilization=settings.get("gpu_memory_utilization"),
+                environment=settings.get("environment"),
                 extra_args=extra,
                 name=safe_container_name(alias, deployment_id),
                 sparkdeck_deployment_id=deployment_id,

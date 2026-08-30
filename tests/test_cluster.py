@@ -1989,7 +1989,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance.recipes_path = Path(directory) / "recipes.json"
 
             base = await instance.add_recipe(
-                "model/a", name="Base", extra_args=[], force_new=True
+                "model/a", name="Base", extra_args=[], force_new=True,
+                environment={"NCCL_DEBUG": "WARN"},
             )
             clone = await instance.add_recipe(
                 "model/a",
@@ -2000,7 +2001,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             updated = await instance.update_recipe(
                 clone["id"],
-                {"launch_controls": {"context_window": 32768}},
+                {
+                    "launch_controls": {"context_window": 32768},
+                    "environment": {"HF_HUB_OFFLINE": "1"},
+                },
             )
 
             self.assertNotEqual(base["id"], clone["id"])
@@ -2014,6 +2018,14 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             saved = json.loads(instance.recipes_path.read_text())
             self.assertEqual(len(saved), 2)
+            self.assertEqual(base["environment"], {"NCCL_DEBUG": "WARN"})
+            self.assertEqual(updated["environment"], {"HF_HUB_OFFLINE": "1"})
+
+            with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
+                await instance.add_recipe(
+                    "model/b", engine="sglang",
+                    environment={"NCCL_DEBUG": "WARN"},
+                )
 
     async def test_recipe_delete_is_durable_and_clears_transient_launch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2522,6 +2534,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             deployment = await instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
+                "environment": {"NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1"},
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
                 "extra_args": [
@@ -2554,6 +2567,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args.count("--pipeline-parallel-size"), 1)
                 self.assertEqual(payload["cluster_member"]["fabric_interface"],
                                  "cx7-local" if node_id == "local" else "cx7-remote")
+                self.assertEqual(payload["environment"], {
+                    "NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1",
+                })
 
     async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3580,6 +3596,18 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan["local_port"], 8000)
 
+    async def test_invalid_environment_is_rejected_before_launch_persistence(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = []
+
+        with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
+            await instance.create_deployment({
+                "model": "example/Model", "engine": "vllm",
+                "environment": {"HF_TOKEN": "secret"},
+            })
+
+        self.assertEqual(instance.deployments, [])
+
     async def test_relaunch_preflight_allows_fixed_port_owned_by_old_rank(
         self,
     ) -> None:
@@ -3776,6 +3804,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         first = await instance.create_container(
             "org/first", name="first-r1",
+            environment={"NCCL_DEBUG": "WARN"},
             cluster_member={
                 "deployment_id": "first", "node_id": "remote-1", "rank": 1,
                 "nnodes": 2, "mode": "sharded",
@@ -3795,6 +3824,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             ["8000", "8001"],
         )
         self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
+        self.assertEqual(run_options[0]["environment"]["NCCL_DEBUG"], "WARN")
         self.assertEqual(instance._host_port_reservations, set())
 
         instance.evict_other_backends = mock.AsyncMock()

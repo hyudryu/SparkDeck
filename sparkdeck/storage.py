@@ -38,6 +38,7 @@ COMMUNITY_API_URL = os.environ.get(
     "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
 )
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
+_LOCAL_HISTORY_MODEL_LIMIT = 500
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:
@@ -580,28 +581,46 @@ class SparkDeckStore:
         items = [_benchmark_row(row) for row in rows]
         return items, total
 
-    def benchmark_history_models(self) -> list[dict[str, Any]]:
+    def benchmark_history_models(
+        self, limit: int = _LOCAL_HISTORY_MODEL_LIMIT,
+    ) -> list[dict[str, Any]]:
         """Return one latest local-history row for each identified model."""
+        limit = min(_LOCAL_HISTORY_MODEL_LIMIT, max(1, int(limit)))
         with self._lock:
             rows = self._connection.execute(
-                """SELECT benchmark_samples.*, upload_outbox.status AS sync_state
-                   FROM benchmark_samples
-                   LEFT JOIN upload_outbox ON upload_outbox.sample_id = benchmark_samples.id
-                   ORDER BY benchmark_samples.created_at DESC"""
+                """WITH samples AS (
+                       SELECT benchmark_samples.*,
+                              upload_outbox.status AS sync_state,
+                              json_extract(model_json, '$.repository') AS model_id
+                       FROM benchmark_samples
+                       LEFT JOIN upload_outbox
+                         ON upload_outbox.sample_id = benchmark_samples.id
+                       WHERE json_valid(model_json)
+                   ), ranked AS (
+                       SELECT samples.*,
+                              COUNT(*) OVER (PARTITION BY model_id) AS sample_count,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY model_id
+                                  ORDER BY created_at DESC, id DESC
+                              ) AS model_rank
+                       FROM samples
+                       WHERE model_id IS NOT NULL
+                         AND TRIM(model_id) != ''
+                         AND LOWER(model_id) != 'local-model'
+                         AND LOWER(model_id) NOT LIKE 'local-model-%'
+                   )
+                   SELECT * FROM ranked
+                   WHERE model_rank = 1
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT ?""",
+                (limit,),
             ).fetchall()
-        grouped: dict[str, dict[str, Any]] = {}
+        items = []
         for row in rows:
             item = _benchmark_row(row)
-            model_id = str((item.get("model") or {}).get("repository") or "").strip()
-            if not model_id or model_id.casefold() == "local-model" or model_id.casefold().startswith("local-model-"):
-                continue
-            existing = grouped.get(model_id)
-            if existing is None:
-                item["sample_count"] = 1
-                grouped[model_id] = item
-            else:
-                existing["sample_count"] += 1
-        return list(grouped.values())
+            item["sample_count"] = int(row["sample_count"])
+            items.append(item)
+        return items
 
     def add_benchmark_series_point(self, point: dict[str, Any]) -> None:
         """Persist one coordinated benchmark run without prompts or outputs."""

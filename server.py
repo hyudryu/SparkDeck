@@ -3029,7 +3029,7 @@ async def v1_benchmarks(limit: int = 100, offset: int = 0):
 
 @app.get("/api/v1/benchmark-history/models")
 async def v1_benchmark_history_models():
-    return {"items": sparkdeck.store.benchmark_history_models()}
+    return {"items": await sparkdeck.benchmark_history_models()}
 
 
 @app.delete("/api/v1/benchmark-history/models/{model_id:path}")

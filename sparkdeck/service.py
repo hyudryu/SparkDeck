@@ -396,6 +396,10 @@ class SparkDeckService:
                 self.store.delete_benchmark_model, model_id
             )
 
+    async def benchmark_history_models(self) -> list[dict[str, Any]]:
+        """Read bounded, consolidated local history off the event loop."""
+        return await asyncio.to_thread(self.store.benchmark_history_models)
+
     async def unpair_community_device(
         self, expected_sub: str,
     ) -> tuple[str, dict[str, Any]]:
@@ -4454,9 +4458,12 @@ class SparkDeckService:
             for container in await self.manager.list_containers():
                 ids = self.manager._container_model_ids(container)
                 if requested_model in ids:
-                    repository = str(
-                        container.get("model") or requested_model
-                    ).strip() or requested_model
+                    repository = str(container.get("model") or "").strip()
+                    if _public_model_id(repository) == "local-model":
+                        repository = _local_benchmark_model_id(
+                            repository or requested_model, None,
+                            upload_model_id="local-model",
+                        )
                     settings = dict(
                         container.get("load_settings")
                         or container.get("settings")

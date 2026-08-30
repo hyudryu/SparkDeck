@@ -148,6 +148,16 @@ const formatLaunchPhase = (phase: string) => phase
   .replaceAll('_', ' ')
   .replace(/\b\w/g, (character) => character.toUpperCase())
 
+const formatInferenceAge = (timestamp: number, now: number) => {
+  const seconds = Math.max(0, Math.round(now - timestamp))
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
 // Scalar flags the structured argument editor manages; everything else in a
 // saved configuration's extra args is shown verbatim in the "Other flags"
 // field. Compound JSON flags (--speculative-config,
@@ -268,6 +278,8 @@ const recipeJobKey = (recipeId: string, modelId: string, targetId: string) => `$
 export function ModelsPage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const [searchParams, setSearchParams] = useSearchParams()
+  // Tick so the relative "last inference" age on running rows stays fresh.
+  const [now, setNow] = useState(() => Date.now() / 1000)
   const [recipeDeployment, setRecipeDeployment] = useState<{ recipe: SavedConfiguration; nodeIds: string[] }>()
   const [recipeSeedNodeId, setRecipeSeedNodeId] = useState<string>()
   const acceptedDeployments = useRef(new Map<string, Deployment>())
@@ -364,6 +376,18 @@ export function ModelsPage() {
   const linkedArtifactRef = useRef<string | undefined>(undefined)
   const previousModelIdRef = useRef('')
   const reloadDeployments = resource.reload
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(Date.now() / 1000)
+      // Running rows otherwise stop polling, which would freeze the
+      // last-inference age at whatever the page first loaded.
+      if (resource.data?.some((deployment) => deployment.status === 'running')) {
+        reloadDeployments()
+      }
+    }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [resource.data, reloadDeployments])
 
   useEffect(() => {
     if (resource.loading || !resource.data?.some(deploymentNeedsPoll)) return
@@ -1619,12 +1643,25 @@ export function ModelsPage() {
                   <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
                   <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}{deploymentTargetLayout(deployment)}</span></div>
-                  <div role="cell" data-label="Status" className="deployment-status-cell" aria-live="polite">
-                    {STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && deploymentRunningNodeNames(deployment).length > 0
-                      ? <Tooltip label={<><strong>{deployment.status === 'starting' || deployment.status === 'launching' ? 'Starting on' : 'Running on'}</strong><span>{deploymentRunningNodeNames(deployment).join(', ')}</span></>}><Status status={deployment.status} /></Tooltip>
-                      : <Status status={deployment.status} />}
-                    {showLaunchDetails(deployment) && deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
-                    {showLaunchDetails(deployment) && deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
+                  <div role="cell" data-label="Status" className="deployment-status-cell">
+                    <span aria-live="polite">
+                      {STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && deploymentRunningNodeNames(deployment).length > 0
+                        ? <Tooltip label={<><strong>{deployment.status === 'starting' || deployment.status === 'launching' ? 'Starting on' : 'Running on'}</strong><span>{deploymentRunningNodeNames(deployment).join(', ')}</span></>}><Status status={deployment.status} /></Tooltip>
+                        : <Status status={deployment.status} />}
+                      {deployment.status !== 'running' && (
+                        <>
+                          {showLaunchDetails(deployment) && deployment.launch_phase && <small className="deployment-launch-phase">{formatLaunchPhase(deployment.launch_phase)}</small>}
+                          {showLaunchDetails(deployment) && deployment.launch_message && <small className="deployment-launch-message">{deployment.launch_message}</small>}
+                        </>
+                      )}
+                    </span>
+                    {deployment.status === 'running' && deployment.last_used_at !== undefined && (
+                      <small className="deployment-launch-message">
+                        {deployment.last_used_at
+                          ? `Last inference ${formatInferenceAge(deployment.last_used_at, now)}`
+                          : 'No inference yet'}
+                      </small>
+                    )}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {deployment.managed && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)

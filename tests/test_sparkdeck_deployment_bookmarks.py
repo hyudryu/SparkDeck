@@ -75,6 +75,9 @@ class FakeBookmarkManager:
 
     # Reuse Manager's real parser so llama.cpp controls surface correctly.
     _deployment_launch_controls = Manager._deployment_launch_controls
+    _normalize_runtime_environment = staticmethod(
+        Manager._normalize_runtime_environment
+    )
 
     @staticmethod
     def public_target_node(value):
@@ -249,6 +252,54 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertEqual(stored["settings"]["context_length"], 16384)
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
+
+    async def test_vllm_environment_round_trips_and_launches_on_every_rank(self):
+        environment = {
+            "HF_HUB_OFFLINE": "1",
+            "VLLM_CACHE_ROOT": "/cache/clusterops-runtime/vllm",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "env-bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"environment": environment},
+        })
+
+        self.assertEqual(created["settings"]["environment"], environment)
+        detail = await self.service.deployment_detail(created["id"])
+        self.assertEqual(detail["environment"], environment)
+
+        updated = {**environment, "NCCL_DEBUG": "WARN"}
+        detail = await self.service.update_deployment_settings(created["id"], {
+            "environment": updated,
+        })
+        self.assertEqual(detail["environment"], updated)
+
+        await self.service.deployment_action(created["id"], "start", ["remote-1"])
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["environment"], updated)
+
+    async def test_runtime_environment_rejects_credentials_and_non_vllm_runtimes(self):
+        with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "secret-env", "runtime": "vllm",
+                "node_ids": ["local"], "deployment_mode": "single",
+                "settings": {"environment": {"HF_TOKEN": "secret"}},
+            })
+
+        with self.assertRaisesRegex(ValueError, "cannot contain a newline"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "multiline-env", "runtime": "vllm",
+                "node_ids": ["local"], "deployment_mode": "single",
+                "settings": {"environment": {"VLLM_CONFIG": "first\nsecond"}},
+            })
+
+        with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": "sg-env", "runtime": "sglang",
+                "node_ids": ["local"], "deployment_mode": "single",
+                "settings": {"environment": {"NCCL_DEBUG": "WARN"}},
+            })
 
     async def test_controller_local_gguf_bookmark_is_saved_for_the_controller(self):
         artifact = Path(self.temp.name) / "local.gguf"

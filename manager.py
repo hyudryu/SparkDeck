@@ -37,6 +37,7 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
+from sparkdeck.runtime_environment import normalize_runtime_environment
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
@@ -3713,6 +3714,9 @@ class Manager:
             "model": body.get("model") or "",
             "engine": engine,
             "image": body.get("image") or None,
+            "environment": cls._normalize_runtime_environment(
+                body.get("environment"), engine,
+            ),
             "extra_args": extra_args,
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
@@ -3739,6 +3743,11 @@ class Manager:
                 body.get("output_cost_per_1m"), "output_cost_per_1m"
             ),
         }
+
+    @staticmethod
+    def _normalize_runtime_environment(value: Any, engine: str = "vllm") -> dict[str, str]:
+        """Validate non-secret environment variables persisted for vLLM."""
+        return normalize_runtime_environment(value, engine)
 
     @staticmethod
     def _deployment_pricing(settings: dict) -> dict:
@@ -4936,6 +4945,9 @@ class Manager:
         engine = str(body.get("engine") or "vllm")
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        body["environment"] = normalize_runtime_environment(
+            body.get("environment"), engine,
+        )
         controls = body.get("launch_controls")
         if controls is not None and engine != "llama.cpp":
             if not isinstance(controls, dict):
@@ -5187,6 +5199,7 @@ class Manager:
             "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
+            "environment": body.get("environment"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
                     list(body.get("extra_args") or [])
@@ -9255,10 +9268,12 @@ class Manager:
     @staticmethod
     def _recipe_key(model: str, image: str | None, extra_args: list | None,
                     engine: str = "vllm", deployment_mode: str = "single",
-                    node_ids: list[str] | None = None) -> tuple:
+                    node_ids: list[str] | None = None,
+                    environment: dict[str, str] | None = None) -> tuple:
         return (
             model or "", image or "", tuple(extra_args or []), engine or "vllm",
             deployment_mode or "single", tuple(node_ids or [LOCAL_NODE_ID]),
+            tuple(sorted((environment or {}).items())),
         )
 
     @staticmethod
@@ -9288,6 +9303,7 @@ class Manager:
         extra_args: list | None = None,
         gpu_memory_utilization: float | None = None,
         gpu_memory_gb: float | None = None,
+        environment: dict[str, str] | None = None,
         engine: str = "vllm",
         # SGLang-specific fields
         sg_tp_size: int | None = None,
@@ -9306,6 +9322,7 @@ class Manager:
             raise ValueError("model is required")
         if engine not in {"vllm", "sglang"}:
             raise ValueError("engine must be vllm or sglang")
+        normalized_environment = normalize_runtime_environment(environment, engine)
         sg_tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
         sg_context_length = self._validated_sg_scalar("sg_context_length", sg_context_length)
         sg_max_running_requests = self._validated_sg_scalar(
@@ -9341,12 +9358,15 @@ class Manager:
                 if "max_concurrency" in launch_controls:
                     sg_max_running_requests = launch_controls.get("max_concurrency")
         async with self.lock:
-            key = self._recipe_key(model, image, extra_args, engine, deployment_mode, node_ids)
+            key = self._recipe_key(
+                model, image, extra_args, engine, deployment_mode, node_ids,
+                normalized_environment,
+            )
             for r in [] if force_new else self.recipes:
                 if self._recipe_key(
                     r.get("model", ""), r.get("image"), r.get("extra_args"),
                     r.get("engine", "vllm"), r.get("deployment_mode", "single"),
-                    r.get("node_ids"),
+                    r.get("node_ids"), r.get("environment"),
                 ) == key:
                     # Update name/gpu_mem/engine if provided so explicit re-saves overwrite metadata.
                     if name:
@@ -9357,6 +9377,8 @@ class Manager:
                         r["gpu_memory_utilization"] = gpu_memory_utilization
                     if gpu_memory_gb is not None:
                         r["gpu_memory_gb"] = gpu_memory_gb
+                    if environment is not None:
+                        r["environment"] = normalized_environment
                     # Update SGLang fields if provided
                     if sg_tp_size is not None:
                         r["sg_tp_size"] = sg_tp_size
@@ -9375,6 +9397,7 @@ class Manager:
                         r["extra_args"] = list(extra_args or [])
                         r["gpu_memory_utilization"] = gpu_memory_utilization
                         r["gpu_memory_gb"] = gpu_memory_gb
+                        r["environment"] = normalized_environment
                         r["sg_tp_size"] = sg_tp_size
                         r["sg_context_length"] = sg_context_length
                         r["sg_max_running_requests"] = sg_max_running_requests
@@ -9392,6 +9415,7 @@ class Manager:
                 "extra_args": list(extra_args or []),
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "gpu_memory_gb": gpu_memory_gb,
+                "environment": normalized_environment,
                 # SGLang-specific fields
                 "sg_tp_size": sg_tp_size,
                 "sg_context_length": sg_context_length,
@@ -9425,6 +9449,7 @@ class Manager:
             "gpu_memory_utilization", "gpu_memory_gb", "sg_tp_size",
             "sg_context_length", "sg_max_running_requests", "sg_mem_fraction",
             "sg_image", "deployment_mode", "node_ids", "launch_controls",
+            "environment",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -9447,6 +9472,9 @@ class Manager:
             engine = merged.get("engine") or "vllm"
             if engine not in {"vllm", "sglang"}:
                 raise ValueError("engine must be vllm or sglang")
+            merged["environment"] = normalize_runtime_environment(
+                merged.get("environment"), engine,
+            )
             mode = merged.get("deployment_mode") or "single"
             if mode not in {"single", "sharded", "replicated"}:
                 raise ValueError("deployment_mode must be single, sharded, or replicated")
@@ -10422,6 +10450,7 @@ class Manager:
         engine: str = "vllm",
         gpu_memory_utilization: float | None = None,
         gpu_memory_gb: float | None = None,
+        environment: dict[str, str] | None = None,
         extra_args: list[str] | None = None,
         name: str | None = None,
         image: str | None = None,
@@ -10454,7 +10483,8 @@ class Manager:
         create_call = self._create_container_with_port(
             model=model, port=port, engine=engine,
             gpu_memory_utilization=gpu_memory_utilization,
-            gpu_memory_gb=gpu_memory_gb, extra_args=extra_args,
+            gpu_memory_gb=gpu_memory_gb, environment=environment,
+            extra_args=extra_args,
             name=name, image=image, sg_tp_size=sg_tp_size,
             sg_context_length=sg_context_length,
             sg_max_running_requests=sg_max_running_requests,
@@ -10669,6 +10699,7 @@ class Manager:
         engine: str = "vllm",
         gpu_memory_utilization: float | None = None,
         gpu_memory_gb: float | None = None,
+        environment: dict[str, str] | None = None,
         extra_args: list[str] | None = None,
         name: str | None = None,
         image: str | None = None,
@@ -10690,6 +10721,7 @@ class Manager:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        runtime_environment = self._normalize_runtime_environment(environment, engine)
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
@@ -10973,9 +11005,11 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                if runtime_environment:
+                    run_options["environment"] = dict(runtime_environment)
                 hf_environment = self._container_hf_environment(hf_token)
                 if hf_environment:
-                    run_options["environment"] = hf_environment
+                    run_options.setdefault("environment", {}).update(hf_environment)
                 if distributed_member:
                     run_options["network_mode"] = "host"
                     run_options["ulimits"] = [

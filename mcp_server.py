@@ -649,7 +649,9 @@ def build_server(
         instructions=(
             "Prefer recipe IDs and deployment IDs. Run A/B variants sequentially unless the "
             "selected nodes have enough independent GPUs. Destructive tools protect deployments "
-            "not created through this MCP server unless allow_unowned is explicitly set."
+            "not created through this MCP server unless allow_unowned is explicitly set. "
+            "For vLLM image-specific runtime variables, use environment as an object of "
+            "non-secret string NAME/value pairs; never place credentials in environment."
         ),
         version="1.0.0",
         auth=auth,
@@ -696,8 +698,11 @@ def build_server(
         accepts ``launch_settings`` with ``context_length``,
         ``max_running_requests``, ``mem_fraction_static``, and
         ``tensor_parallel_size``; vLLM accepts ``max_model_len``,
-        ``max_running_requests``, and ``gpu_memory_utilization``. Values
-        outside these fields are ignored.
+        ``max_running_requests``, ``gpu_memory_utilization``, and
+        ``environment``. Put environment at the recipe top level or inside
+        launch_settings. It must be an object of non-secret string NAME/value
+        pairs, for example ``{"NCCL_DEBUG": "WARN"}``, and is applied to every
+        vLLM rank. Values outside these fields are ignored.
         """
         return await client.create_recipe(recipe)
 
@@ -705,7 +710,7 @@ def build_server(
     async def update_cluster_recipe(
         recipe_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
-        """Modify an existing recipe. Changes may include launch_controls and extra_args."""
+        """Modify a recipe. Changes may include launch_controls, extra_args, and vLLM environment."""
         return await client.update_recipe(recipe_id, changes)
 
     @server.tool()
@@ -714,7 +719,7 @@ def build_server(
         name: str,
         overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Clone a recipe under a new name and apply launch-setting overrides."""
+        """Clone a recipe and apply overrides, including a vLLM environment object."""
         return await client.clone_recipe(recipe_id, name, overrides)
 
     @server.tool()
@@ -724,7 +729,7 @@ def build_server(
         deployment_name: str | None = None,
         automation_run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Launch a recipe with optional non-destructive overrides and MCP ownership metadata."""
+        """Launch a recipe with overrides such as vLLM environment and add MCP ownership metadata."""
         return await client.deploy_recipe(
             recipe_id,
             overrides=overrides,
@@ -811,7 +816,7 @@ def build_server(
         require_idle_cluster: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Sequentially deploy and benchmark A/B recipe variants, then compare throughput."""
+        """Deploy and benchmark A/B variants; overrides may include vLLM environment objects."""
         run_id = uuid.uuid4().hex
         state = await client.state()
         if require_idle_cluster:

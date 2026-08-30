@@ -1495,6 +1495,7 @@ class VirtualNAS:
         progress: Callable[[int], None] | None = None,
         phase: Callable[[str], None] | None = None,
         cancel: asyncio.Event | None = None,
+        registered: Callable[[tuple[int, int]], None] | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         self._reserve_stream(model_id)
@@ -1536,7 +1537,7 @@ class VirtualNAS:
                 await self._await_uncancelable(
                     asyncio.to_thread(
                         self._finalize_received_model,
-                        stage, root_name, phase, cancel,
+                        stage, root_name, phase, cancel, registered,
                     ),
                 )
                 return {"ok": True, "model_id": model_id, "bytes_received": received}
@@ -1566,7 +1567,7 @@ class VirtualNAS:
             "status": "running", "phase": "receiving",
             "phase_started_at": time.time(), "bytes_transferred": 0,
             "cancel": asyncio.Event(), "done": asyncio.Event(),
-            "model_id": model_id,
+            "model_id": model_id, "destination_identity": None,
         }
         self._peer_imports[transfer_id] = record
         url = f"{source_agent_url}/api/agent/virtual-nas/models/{quote(model_id, safe='')}/export-direct"
@@ -1601,16 +1602,15 @@ class VirtualNAS:
                             model_id, tracked(), required_model_bytes=required_model_bytes,
                             phase=lambda value: self._set_peer_import_phase(record, value),
                             cancel=record["cancel"],
+                            registered=lambda identity: record.__setitem__(
+                                "destination_identity", identity,
+                            ),
                         )
                     finally:
                         cancel_watcher.cancel()
                         await asyncio.gather(cancel_watcher, return_exceptions=True)
                     if record["cancel"].is_set():
-                        destination = self._model_path(model_id)
-                        if destination.is_dir() and not destination.is_symlink():
-                            await self._await_uncancelable(
-                                asyncio.to_thread(shutil.rmtree, destination),
-                            )
+                        await self._rollback_peer_import_destination(record)
                         raise TransferCanceled()
                     record["status"] = "completed"
                     self._set_peer_import_phase(record, "completed")
@@ -1638,6 +1638,30 @@ class VirtualNAS:
     ) -> None:
         if self._peer_imports.get(transfer_id) is record:
             self._peer_imports.pop(transfer_id, None)
+
+    async def _rollback_peer_import_destination(
+        self, record: dict[str, Any],
+    ) -> None:
+        identity = record.get("destination_identity")
+        if identity is None:
+            return
+        destination = self._model_path(record["model_id"])
+        try:
+            destination_stat = await asyncio.to_thread(destination.lstat)
+        except FileNotFoundError:
+            record["destination_identity"] = None
+            return
+        if (
+            not stat.S_ISDIR(destination_stat.st_mode)
+            or (destination_stat.st_dev, destination_stat.st_ino) != identity
+        ):
+            raise RuntimeError("direct transfer rollback cannot be confirmed")
+        await self._await_uncancelable(
+            asyncio.to_thread(shutil.rmtree, destination),
+        )
+        if destination.exists() or destination.is_symlink():
+            raise RuntimeError("direct transfer rollback cannot be confirmed")
+        record["destination_identity"] = None
 
     def peer_import_status(self, transfer_id: str) -> dict[str, Any]:
         record = self._peer_imports.get(str(transfer_id or ""))
@@ -1672,12 +1696,7 @@ class VirtualNAS:
         record["cancel"].set()
         if record["status"] == "running":
             await record["done"].wait()
-        if destination.is_dir() and not destination.is_symlink():
-            await self._await_uncancelable(
-                asyncio.to_thread(shutil.rmtree, destination),
-            )
-        elif destination.exists() or destination.is_symlink():
-            raise RuntimeError("direct transfer rollback cannot be confirmed")
+        await self._rollback_peer_import_destination(record)
         record["status"] = "canceled"
         self._set_peer_import_phase(record, "canceled")
         return {"status": "canceled", "rollback_confirmed": True}
@@ -1848,6 +1867,7 @@ class VirtualNAS:
         self, stage: Path, root_name: str,
         phase: Callable[[str], None] | None = None,
         cancel: asyncio.Event | None = None,
+        registered: Callable[[tuple[int, int]], None] | None = None,
     ) -> None:
         extracted = stage / root_name
         if phase:
@@ -1865,7 +1885,11 @@ class VirtualNAS:
             phase("registering")
         if cancel is not None and cancel.is_set():
             raise TransferCanceled()
+        extracted_stat = extracted.lstat()
+        identity = (extracted_stat.st_dev, extracted_stat.st_ino)
         os.replace(extracted, destination)
+        if registered:
+            registered(identity)
 
     def _selected_snapshot_entries(
         self, repository: Path, revision: str, filenames: list[str],

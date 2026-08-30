@@ -116,6 +116,63 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stored["container_name"])
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
 
+    async def test_clone_copies_settings_as_a_stopped_bookmark_with_numbered_names(self):
+        self.service.store.add_deployment(Deployment(
+            id="running-1", alias="Chat model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity(
+                "org/model", revision="revision-1", quantization="fp8",
+            ),
+            container_name="sparkdeck-chat-model",
+            settings={
+                "context_length": 32768,
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "node_ids": ["remote-1"],
+                "deployment_mode": "single",
+                "manager_deployment_id": "cluster-1",
+                "managed_by": "sparkdeck-mcp",
+                "automation_run_id": "run-1",
+            },
+        ))
+
+        first = await self.service.clone_deployment("running-1")
+        second = await self.service.clone_deployment(first["id"])
+
+        self.assertEqual(first["alias"], "(Copy) Chat model")
+        self.assertEqual(second["alias"], "(Copy 2) Chat model")
+        self.assertEqual(first["status"], "saved")
+        self.assertEqual(first["desired_state"], "stopped")
+        self.assertEqual(first["node_ids"], ["remote-1"])
+        self.assertEqual(first["model"]["revision"], "revision-1")
+        self.assertEqual(first["model"]["quantization"], "fp8")
+        self.assertEqual(first["settings"]["context_length"], 32768)
+        self.assertEqual(first["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+        self.assertNotIn("manager_deployment_id", first["settings"])
+        self.assertNotIn("managed_by", first["settings"])
+        self.assertNotIn("automation_run_id", first["settings"])
+        self.assertIsNone(
+            self.service.store.deployment(first["id"], include_private=True)["container_name"],
+        )
+
+    async def test_clone_preserves_external_endpoint_and_credential(self):
+        self.service.store.add_deployment(Deployment(
+            id="external-1", alias="Hosted model", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            settings={"context_length": 8192}, base_url_set=True,
+        ), "https://models.example/v1", "keyring:external-1")
+
+        with (
+            patch.object(self.service, "_get_credential", return_value="secret") as get_key,
+            patch.object(self.service, "_store_credential", return_value="keyring:copy") as store_key,
+        ):
+            cloned = await self.service.clone_deployment("external-1")
+
+        private = self.service.store.deployment(cloned["id"], include_private=True)
+        self.assertEqual(cloned["alias"], "(Copy) Hosted model")
+        self.assertEqual(private["_base_url"], "https://models.example/v1")
+        self.assertEqual(private["_credential_ref"], "keyring:copy")
+        get_key.assert_called_once_with("external-1", "keyring:external-1")
+        store_key.assert_called_once_with(cloned["id"], "secret")
+
     async def test_bookmark_is_reported_as_saved_in_the_deployments_list(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "bookmark", "runtime": "vllm",

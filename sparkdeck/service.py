@@ -3920,6 +3920,85 @@ class SparkDeckService:
             self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
 
+    async def clone_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Copy a persisted deployment's configuration without its live runtime."""
+        if deployment_id.startswith("container:"):
+            raise ValueError("discovered containers cannot be cloned")
+
+        async with self._deployment_create_lock:
+            stored = self.store.deployment(deployment_id, include_private=True)
+            if not stored:
+                raise LookupError("deployment not found")
+
+            root_alias = re.sub(
+                r"^\(Copy(?: \d+)?\)\s+", "", str(stored["alias"]), count=1,
+            ).strip() or str(stored["alias"])
+            aliases = {
+                str(item.get("alias") or "").casefold()
+                for item in self.store.deployments()
+            }
+            copy_number = 1
+            while True:
+                prefix = "(Copy)" if copy_number == 1 else f"(Copy {copy_number})"
+                alias = f"{prefix} {root_alias}"
+                if alias.casefold() not in aliases:
+                    break
+                copy_number += 1
+
+            clone_id = str(uuid.uuid4())
+            settings = copy.deepcopy(stored.get("settings") or {})
+            for runtime_identity_key in (
+                "manager_deployment_id", "managed_by", "automation_run_id",
+            ):
+                settings.pop(runtime_identity_key, None)
+            kind = DeploymentKind(str(stored["kind"]))
+            model = stored.get("model") or {}
+            clone = Deployment(
+                id=clone_id,
+                alias=alias,
+                runtime=RuntimeKind(str(stored["runtime"])),
+                kind=kind,
+                model=ModelIdentity(
+                    repository=str(model.get("repository") or ""),
+                    revision=_optional_string(model.get("revision")),
+                    artifact=_optional_string(model.get("artifact")),
+                    quantization=_optional_string(model.get("quantization")),
+                ),
+                settings=settings,
+                base_url_set=bool(stored.get("_base_url")),
+                desired_state=(
+                    "stopped" if kind is DeploymentKind.MANAGED
+                    else str(stored.get("desired_state") or "running")
+                ),
+            )
+
+            credential_ref = None
+            if stored.get("_credential_ref"):
+                api_key = self._get_credential(
+                    stored["id"], stored.get("_credential_ref"),
+                )
+                if api_key is None:
+                    raise RuntimeError(
+                        "deployment credential could not be read from OS credential storage"
+                    )
+                credential_ref = self._store_credential(clone_id, api_key)
+            try:
+                self.store.add_deployment(
+                    clone, stored.get("_base_url"), credential_ref,
+                )
+            except Exception:
+                self._delete_credential(clone_id, credential_ref)
+                raise
+
+            result = self.store.deployment(clone_id) or clone.to_dict()
+            if kind is DeploymentKind.MANAGED:
+                result["status"] = "saved"
+                node_ids = [str(item) for item in settings.get("node_ids") or []]
+                if node_ids:
+                    result["node_ids"] = node_ids
+                result.update(self._saved_layout_contract(settings, clone.runtime.value))
+            return result
+
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
         if not alias:

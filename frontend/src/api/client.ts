@@ -544,6 +544,12 @@ export const api = {
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
+    clone: async (id: string) => {
+      const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/clone`, {
+        method: 'POST',
+      })
+      return deploymentFromWire(data)
+    },
     preparePreflight: (id: string, nodeIds: string[], signal?: AbortSignal) => request<RecipePreparationPlan>(
       `/api/v1/deployments/${encodeURIComponent(id)}/prepare/preflight`,
       { method: 'POST', body: JSON.stringify({ node_ids: nodeIds }), signal },

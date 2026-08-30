@@ -2954,6 +2954,18 @@ async def v1_deployment_prepare(deployment_id: str, req: Request):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/v1/deployments/{deployment_id}/clone", status_code=201)
+async def v1_clone_deployment(deployment_id: str):
+    try:
+        return await sparkdeck.clone_deployment(deployment_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/api/v1/deployments/{deployment_id}/{action}")
 async def v1_deployment_action(deployment_id: str, action: str, req: Request):
     try:

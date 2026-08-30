@@ -1445,6 +1445,14 @@ class SparkDeckService:
             # cudagraph size, batched tokens) into the launch argv for vLLM
             # and SGLang, including clearing a previously set value.
             settings["launch_controls"] = controls
+            # Keep the saved topology scalar in sync so the launch picker's
+            # node-count contract reflects the edited parallel layout.
+            tp_control = controls.get("tensor_parallel_size")
+            if (
+                isinstance(tp_control, int) and not isinstance(tp_control, bool)
+                and tp_control > 0
+            ):
+                settings["tensor_parallel_size"] = tp_control
         if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if "sg_mem_fraction" in changes:
@@ -1751,13 +1759,34 @@ class SparkDeckService:
             "replicated" if len(node_ids) > 1 else "single"
         )
         if mode == "sharded":
-            parallel = settings.get("tensor_parallel_size")
-            count = (
-                parallel
-                if isinstance(parallel, int) and not isinstance(parallel, bool)
-                and parallel > 1
-                else max(2, len(node_ids))
+            controls = settings.get("launch_controls")
+            if not isinstance(controls, dict):
+                controls = {}
+
+            def _positive_parallel(value: Any) -> int:
+                return (
+                    value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    and value > 0
+                    else 1
+                )
+
+            tensor = _positive_parallel(controls.get("tensor_parallel_size"))
+            if tensor == 1:
+                tensor = _positive_parallel(settings.get("tensor_parallel_size"))
+            world = tensor * _positive_parallel(
+                controls.get("pipeline_parallel_size")
             )
+            if world > 1:
+                # Mirror Manager's launch gate: several ranks per node are
+                # valid when the world size divides the saved node count.
+                count = (
+                    len(node_ids)
+                    if len(node_ids) > 1 and world % len(node_ids) == 0
+                    else world
+                )
+            else:
+                count = max(2, len(node_ids))
         elif mode == "replicated":
             count = max(2, len(node_ids))
         else:

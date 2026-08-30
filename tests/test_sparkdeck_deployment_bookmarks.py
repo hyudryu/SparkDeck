@@ -633,6 +633,42 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             32768,
         )
 
+    async def test_saved_bookmark_launch_controls_update_layout_contract(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "sharded-bookmark", "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "sharded",
+            "settings": {"tensor_parallel_size": 2},
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+        # Editing the structured controls syncs the saved topology scalar and
+        # the picker contract with it: TP4/PP1 fits the two saved nodes at
+        # two ranks per node.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 1,
+            },
+        })
+
+        stored = self.service.store.deployment(
+            "sharded-bookmark", include_private=True,
+        )
+        self.assertEqual(stored["settings"]["tensor_parallel_size"], 4)
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+        # A layout the saved nodes cannot divide requires one node per rank.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 3,
+                "pipeline_parallel_size": 1,
+            },
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 3)
+
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "fresh", "runtime": "vllm",

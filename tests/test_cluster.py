@@ -2701,6 +2701,46 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(instance.deployments, [])
 
+    async def test_vllm_sharded_launch_rejects_layout_beyond_node_gpus(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "cluster_fabric_ip": "169.254.10.1",
+            "cluster_fabric_interface": "cx7-local",
+        }
+        instance.deployments = []
+
+        async def cluster_nodes(local_stats=None):
+            return [
+                {
+                    "id": "local", "name": "Spark 1", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.1",
+                    "fabric_interface": "cx7-local", "interfaces": [],
+                    "stats": {"gpus": [{"name": "GB10"}]},
+                },
+                {
+                    "id": "remote-1", "name": "Spark 2", "online": True,
+                    "docker_ready": True, "fabric_ip": "169.254.10.2",
+                    "fabric_interface": "cx7-remote", "interfaces": [],
+                    "stats": {"gpus": [{"name": "GB10"}]},
+                },
+            ]
+
+        instance.cluster_nodes = cluster_nodes
+
+        with self.assertRaisesRegex(ValueError, "GPU"):
+            await instance.create_deployment({
+                "model": "example/Model",
+                "engine": "vllm",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "extra_args": [
+                    "--tensor-parallel-size", "4",
+                    "--pipeline-parallel-size", "1",
+                ],
+            })
+
+        self.assertEqual(instance.deployments, [])
+
     def test_stopped_deployment_launch_settings_are_saved_and_marked_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
@@ -2863,6 +2903,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             instance._apply_deployment_launch_controls(
                 [], "vllm", {"pipeline_parallel_size": 2.5},
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                [], "vllm", {"tensor_parallel_size": True},
             )
 
     def test_vllm_capacity_log_parser_extracts_safe_full_context_limit(self) -> None:

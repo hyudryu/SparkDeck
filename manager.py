@@ -4994,12 +4994,15 @@ class Manager:
                 ranks_per_node = world_size // len(node_ids)
                 gpu_short = []
                 for nid in node_ids:
-                    gpus = (available[nid].get("stats") or {}).get("gpus") or []
+                    gpus = (available[nid].get("stats") or {}).get("gpus")
+                    if gpus is None:
+                        # No GPU telemetry at all: nothing to validate against.
+                        continue
                     usable = [
                         gpu for gpu in gpus
                         if not (isinstance(gpu, dict) and gpu.get("error"))
                     ]
-                    if gpus and len(usable) < ranks_per_node:
+                    if len(usable) < ranks_per_node:
                         gpu_short.append(available[nid].get("name", nid))
                 if gpu_short:
                     raise ValueError(

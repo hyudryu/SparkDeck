@@ -1738,6 +1738,13 @@ class SparkDeckService:
                 else saved_settings.get("max_running_requests")
             ),
         }
+        if runtime == RuntimeKind.VLLM.value:
+            # The Models page saves sharded vLLM bookmarks with a bare
+            # tensor_parallel_size scalar; seed the editor with it so an
+            # unchanged Save cannot submit a null that strips the TP flag.
+            scalar_seeds["tensor_parallel_size"] = saved_settings.get(
+                "tensor_parallel_size"
+            )
         for key, value in scalar_seeds.items():
             if controls.get(key) is None and value is not None:
                 controls[key] = value

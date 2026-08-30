@@ -2708,6 +2708,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "cluster_fabric_interface": "cx7-local",
         }
         instance.deployments = []
+        inventories = [[{"name": "GB10"}], []]
 
         async def cluster_nodes(local_stats=None):
             return [
@@ -2715,29 +2716,32 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "id": "local", "name": "Spark 1", "online": True,
                     "docker_ready": True, "fabric_ip": "169.254.10.1",
                     "fabric_interface": "cx7-local", "interfaces": [],
-                    "stats": {"gpus": [{"name": "GB10"}]},
+                    "stats": {"gpus": inventories[0]},
                 },
                 {
                     "id": "remote-1", "name": "Spark 2", "online": True,
                     "docker_ready": True, "fabric_ip": "169.254.10.2",
                     "fabric_interface": "cx7-remote", "interfaces": [],
-                    "stats": {"gpus": [{"name": "GB10"}]},
+                    "stats": {"gpus": inventories[1]},
                 },
             ]
 
         instance.cluster_nodes = cluster_nodes
 
-        with self.assertRaisesRegex(ValueError, "GPU"):
-            await instance.create_deployment({
-                "model": "example/Model",
-                "engine": "vllm",
-                "deployment_mode": "sharded",
-                "node_ids": ["local", "remote-1"],
-                "extra_args": [
-                    "--tensor-parallel-size", "4",
-                    "--pipeline-parallel-size", "1",
-                ],
-            })
+        for gpus in ([[{"name": "GB10"}], [{"name": "GB10"}]], [[], []]):
+            with self.subTest(gpus=gpus):
+                inventories[:] = gpus
+                with self.assertRaisesRegex(ValueError, "GPU"):
+                    await instance.create_deployment({
+                        "model": "example/Model",
+                        "engine": "vllm",
+                        "deployment_mode": "sharded",
+                        "node_ids": ["local", "remote-1"],
+                        "extra_args": [
+                            "--tensor-parallel-size", "4",
+                            "--pipeline-parallel-size", "1",
+                        ],
+                    })
 
         self.assertEqual(instance.deployments, [])
 

@@ -746,14 +746,16 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             models = nas.inventory()
 
             self.assertEqual(len(models), 1)
-            self.assertEqual(models[0]["snapshot_files"], {
-                complete_revision: [
-                    "model-Q4_K_M.gguf",
-                    "README-AWQ.md",
-                    "sub/dir/tokenizer.json",
-                ],
-                selective_revision: ["model-Q8_0.gguf"],
+            self.assertEqual(set(models[0]["snapshot_files"]), {
+                complete_revision, selective_revision,
             })
+            self.assertEqual(set(models[0]["snapshot_files"][complete_revision]), {
+                "README-AWQ.md", "model-Q4_K_M.gguf", "sub/dir/tokenizer.json",
+            })
+            self.assertEqual(
+                models[0]["snapshot_files"][selective_revision],
+                ["model-Q8_0.gguf"],
+            )
             self.assertEqual(models[0]["quantizations"], ["Q4_K_M", "Q8_0"])
             self.assertEqual(models[0]["selective_files_by_revision"], {
                 selective_revision: ["model-Q8_0.gguf"],

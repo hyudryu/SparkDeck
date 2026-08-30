@@ -24,6 +24,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
+from .catalog import quantization_from_text
+
 
 LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -1240,6 +1242,19 @@ class VirtualNAS:
                 )
                 partial_revision = aliases[0] if aliases else incomplete_revision
             snapshot_files = _snapshot_files_by_revision(repository)
+            quantizations: set[str] = set()
+            for files in snapshot_files.values():
+                for filename in files:
+                    folded_filename = filename.replace("\\", "/").casefold()
+                    if (
+                        not folded_filename.endswith(".gguf")
+                        or "mmproj" in folded_filename
+                        or folded_filename.startswith("mtp/")
+                        or "/mtp-" in folded_filename
+                    ):
+                        continue
+                    if quantization := quantization_from_text(filename):
+                        quantizations.add(quantization)
             selective_files = _selective_files_by_revision(
                 repository, snapshot_files,
             )
@@ -1249,6 +1264,7 @@ class VirtualNAS:
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
+                "quantizations": sorted(quantizations),
                 "partial": partial,
                 "has_partial_download": (
                     partial or bool(incomplete_revisions)

@@ -43,6 +43,11 @@ const quantizationOptionLabel = (variant: GgufQuantization, downloaded: boolean)
 const artifactOptionLabel = (option: GgufArtifactOption, downloaded: boolean) => (
   `${option.filename}${option.weightSize ? ` · ${formatBytes(option.weightSize)}` : ''}${downloaded ? ' · ✓ Downloaded' : ''}`
 )
+const quantizationFilesDownloaded = (
+  variant: GgufQuantization,
+  cachedFileSets: ReadonlyArray<ReadonlySet<string>>,
+) => [variant.files, ...(variant.artifacts ?? []).map((artifact) => artifact.files)]
+  .some((files) => artifactFilesDownloaded(files, cachedFileSets))
 
 function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): CreateDeploymentInput {
   const runtime = isRuntimeKind(settings?.default_runtime) ? settings.default_runtime : initialForm.runtime
@@ -786,6 +791,19 @@ export function ModelsPage() {
     }
     return sets
   }, [cachedModelSnapshots, createCatalogData, createCatalogUsable, form.model_id])
+  const createQuantizationsByAvailability = useMemo(() => (
+    createQuantizations
+      .map((variant, index) => ({
+        variant,
+        index,
+        downloaded: quantizationFilesDownloaded(variant, createCachedFileSets),
+      }))
+      .sort((left, right) => (
+        Number(right.downloaded) - Number(left.downloaded)
+        || left.index - right.index
+      ))
+      .map(({ variant }) => variant)
+  ), [createCachedFileSets, createQuantizations])
 
   // Drop quantization and artifact selections that the current listing does
   // not offer (picked from a previous repository, or renamed away
@@ -862,7 +880,11 @@ export function ModelsPage() {
     // and clearing the quantization clears a previously linked artifact so
     // a compatible file must be chosen again. Manually entered artifacts
     // are left untouched.
-    const variantArtifact = variant ? ggufArtifactOptions([variant])[0]?.filename : undefined
+    const variantArtifacts = variant ? ggufArtifactOptions([variant]) : []
+    const variantArtifact = (
+      variantArtifacts.find((option) => artifactFilesDownloaded(option.files, createCachedFileSets))
+      ?? variantArtifacts[0]
+    )?.filename
     linkedQuantizationRef.current = variant?.name
     linkedArtifactRef.current = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
     const artifact = variantArtifact ?? (linkedArtifact ? undefined : current.settings.artifact)
@@ -1988,6 +2010,10 @@ export function ModelsPage() {
                   ?? target?.transfer_after_download_reason
                   ?? 'Model weights not cached and the node cannot receive them']
           }))
+        const weightWarnings = savedLaunch ? Object.fromEntries((nodes.data ?? [])
+          .filter((node) => allowedIds.includes(node.id)
+            && !(planTargets.get(node.id)?.has_required_weights ?? weighted.has(node.id)))
+          .map((node) => [node.id, 'Weights need to be transferred before launch'])) : undefined
         const sharded = deployment.deployment_mode === 'sharded'
         const exactCount = nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
@@ -2021,6 +2047,7 @@ export function ModelsPage() {
               disabled={startBusy}
               allowedIds={allowedIds}
               unavailableReasons={unavailableReasons}
+              warnings={weightWarnings}
               localLabel={localLabel}
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
@@ -2126,9 +2153,9 @@ export function ModelsPage() {
                   onChange={(event) => updateCreateQuantization(event.target.value)}
                 >
                   <option value="">Full precision (no quantization)</option>
-                  {createQuantizations.map((variant) => (
+                  {createQuantizationsByAvailability.map((variant) => (
                     <option key={variant.name} value={variant.name}>
-                      {quantizationOptionLabel(variant, artifactFilesDownloaded(variant.files, createCachedFileSets))}
+                      {quantizationOptionLabel(variant, quantizationFilesDownloaded(variant, createCachedFileSets))}
                     </option>
                   ))}
                 </select>

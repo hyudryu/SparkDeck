@@ -713,6 +713,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 (complete / "model-Q4_K_M.gguf").write_bytes(b"gguf-weights")
                 (nested / "tokenizer.json").write_bytes(b"gguf-weights")
+            (complete / "README-AWQ.md").write_text("not weights", encoding="utf-8")
+            (complete / "mmproj-F16.gguf").write_bytes(b"projector")
             # A selective snapshot carries its marker and a download lock;
             # its real files still count as cached, the residue does not.
             selective_revision = "d" * 40
@@ -745,13 +747,18 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             models = nas.inventory()
 
             self.assertEqual(len(models), 1)
-            self.assertEqual(models[0]["snapshot_files"], {
-                complete_revision: [
-                    "model-Q4_K_M.gguf",
-                    "sub/dir/tokenizer.json",
-                ],
-                selective_revision: ["model-Q8_0.gguf"],
+            self.assertEqual(set(models[0]["snapshot_files"]), {
+                complete_revision, selective_revision,
             })
+            self.assertEqual(set(models[0]["snapshot_files"][complete_revision]), {
+                "README-AWQ.md", "mmproj-F16.gguf", "model-Q4_K_M.gguf",
+                "sub/dir/tokenizer.json",
+            })
+            self.assertEqual(
+                models[0]["snapshot_files"][selective_revision],
+                ["model-Q8_0.gguf"],
+            )
+            self.assertEqual(models[0]["quantizations"], ["Q4_K_M", "Q8_0"])
             self.assertEqual(models[0]["selective_files_by_revision"], {
                 selective_revision: ["model-Q8_0.gguf"],
             })

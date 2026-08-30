@@ -1,4 +1,4 @@
-import { HardDrive, RotateCw } from 'lucide-react'
+import { HardDrive, RotateCw, TriangleAlert } from 'lucide-react'
 import type { NodeInventoryItem } from '../api/types'
 import { Button, Tooltip } from './ui'
 
@@ -29,6 +29,7 @@ export function NodeSelector({
   requiredIds = [],
   allowedIds,
   unavailableReasons,
+  warnings,
   localLabel,
   primaryId,
   legend = 'Target nodes',
@@ -45,6 +46,7 @@ export function NodeSelector({
   requiredIds?: string[]
   allowedIds?: string[]
   unavailableReasons?: Record<string, string>
+  warnings?: Record<string, string>
   localLabel?: string
   primaryId?: string
   legend?: string
@@ -72,13 +74,14 @@ export function NodeSelector({
           {nodes.map((node) => {
             const allowed = !allowedIds || allowedIds.includes(node.id)
             const ready = isNodeSelectable(node) && allowed
-            const status = !allowed ? unavailableReasons?.[node.id] ?? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? node.status_message ?? 'Docker unavailable' : node.selectable === false ? node.status_message ?? 'Unavailable' : 'Ready'
+            const warning = ready ? warnings?.[node.id] : undefined
+            const status = !allowed ? unavailableReasons?.[node.id] ?? 'Not available for this runtime' : node.online === false ? 'Offline' : node.docker_ready === false ? node.status_message ?? 'Docker unavailable' : node.selectable === false ? node.status_message ?? 'Unavailable' : warning ?? 'Ready'
             const required = requiredIds.includes(node.id)
             const displayName = nodeLabel(node, node.id, localLabel)
             const primary = primaryId === node.id
             return (
               <Tooltip label={status} key={node.id}>
-              <label title={status} className={`node-option${selectedIds.includes(node.id) ? ' selected' : ''}${!ready ? ' unavailable' : ''}`}>
+              <label title={status} className={`node-option${selectedIds.includes(node.id) ? ' selected' : ''}${!ready ? ' unavailable' : ''}${warning ? ' warning' : ''}`}>
                 <input
                   type={multiple ? 'checkbox' : 'radio'}
                   name={multiple ? undefined : 'target-node'}
@@ -86,7 +89,7 @@ export function NodeSelector({
                   disabled={disabled || !ready || (required && selectedIds.includes(node.id))}
                   onChange={() => toggle(node.id)}
                 />
-                <HardDrive size={17} aria-hidden="true" />
+                <span className="node-option-icon"><HardDrive size={17} aria-hidden="true" />{warning && <TriangleAlert className="node-option-warning" size={13} aria-label={warning} />}</span>
                 <span><strong>{displayName}</strong><small>{displayName !== node.name ? `${node.name} · ` : node.local ? 'This device · ' : `${node.id} · `}{status}{required ? ' · Required' : ''}{primary ? ' · Primary' : ''}</small></span>
               </label>
               </Tooltip>

@@ -146,6 +146,27 @@ describe('StoragePage', () => {
     ])
   })
 
+  it('shows the quantizations cached on each node', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [{
+              model_id: 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF',
+              size_bytes: 68_000_000_000,
+              quantizations: ['Q6_K_XL', 'Q8_0'],
+            }],
+          }
+        : node),
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
+    expect(within(nodePanel).getByText(/Q6_K_XL, Q8_0/)).toBeInTheDocument()
+  })
+
   it('pins newest in-progress tasks above models sorted by descending size', async () => {
     const storage: StorageState = {
       ...enabledStorage,

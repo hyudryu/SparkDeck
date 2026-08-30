@@ -209,7 +209,7 @@ describe('BenchmarkRunner', () => {
     renderPage()
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
-    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2'))
+    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2 · depth 0'))
 
     expect(await screen.findByRole('region', { name: /Processing speed \(generation\)/ })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: /Prompt processing speed/ })).toBeInTheDocument()
@@ -220,6 +220,8 @@ describe('BenchmarkRunner', () => {
     expect(document.querySelectorAll('.chart-series circle').length).toBeGreaterThanOrEqual(4)
 
     const measurements = screen.getByRole('table', { name: 'Run measurements' })
+    expect(within(measurements).getByRole('columnheader', { name: 'Depth' })).toBeInTheDocument()
+    expect(within(measurements).getAllByText('0')).toHaveLength(2)
     expect(within(measurements).getAllByText('42.5 tok/s').length).toBeGreaterThan(0)
     expect(within(measurements).getAllByText('30.0 tok/s').length).toBeGreaterThan(0)
 
@@ -240,7 +242,7 @@ describe('BenchmarkRunner', () => {
     renderPage()
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
-    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2'))
+    await user.click(within(history).getByText('2,048 → 128 tok · C1 C2 · depth 0'))
 
     expect(await screen.findAllByText('C1 · 64 tok').then((items) => items.length)).toBeGreaterThan(0)
     expect(screen.getAllByText('C1 · 128 tok').length).toBeGreaterThan(0)

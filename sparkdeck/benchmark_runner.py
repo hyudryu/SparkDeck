@@ -695,7 +695,8 @@ CSV_COLUMNS = [
     "run_id", "created_at", "model", "model_id", "quantization", "runtime",
     "base_url", "benchy_version", "latency_mode", "latency_ms",
     "prompt_size", "response_size", "context_depth", "concurrency",
-    "runs", "warmup_runs", "exact_tg", "is_context_prefill_phase",
+    "runs", "warmup_runs", "exact_tg", "prefix_caching_enabled",
+    "is_context_prefill_phase",
     "pp_tokens_per_second", "pp_tokens_per_second_std",
     "pp_tokens_per_second_request", "pp_tokens_per_second_request_std",
     "tg_tokens_per_second", "tg_tokens_per_second_std",
@@ -708,6 +709,9 @@ CSV_COLUMNS = [
 def _write_csv(path: Path, run: dict[str, Any]) -> None:
     config = run.get("config") or {}
     report = run.get("report") or {}
+    prefix_caching_enabled = report.get("prefix_caching_enabled")
+    if not isinstance(prefix_caching_enabled, bool):
+        prefix_caching_enabled = config.get("enable_prefix_caching")
     header = {column: None for column in CSV_COLUMNS}
     rows = []
     for result in run.get("results") or []:
@@ -726,6 +730,7 @@ def _write_csv(path: Path, run: dict[str, Any]) -> None:
             "runs": config.get("runs"),
             "warmup_runs": config.get("warmup_runs"),
             "exact_tg": config.get("exact_tg"),
+            "prefix_caching_enabled": prefix_caching_enabled,
             **{key: _round(value) for key, value in result.items()},
         }
         rows.append(row)

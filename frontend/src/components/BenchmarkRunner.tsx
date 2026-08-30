@@ -42,7 +42,8 @@ function configSummary(run: BenchmarkRunnerRunSummary) {
   const concurrency = config.concurrency_levels.map((level) => `C${level}`).join(' ')
   const prompt = config.prompt_sizes.map((size) => size.toLocaleString()).join(', ')
   const response = config.response_sizes.map((size) => size.toLocaleString()).join(', ')
-  return `${prompt} → ${response} tok · ${concurrency}`
+  const depths = config.context_depths.map((depth) => depth.toLocaleString()).join(', ')
+  return `${prompt} → ${response} tok · ${concurrency} · depth ${depths}`
 }
 
 const RUN_STATUS_LABEL: Record<string, string> = {
@@ -456,7 +457,7 @@ export function BenchmarkRunner() {
             <Panel className="table-panel"><div className="responsive-table runner-measure-table" role="table" aria-label="Run measurements">
               <div className="table-row table-header" role="row">
                 <div role="columnheader">Prompt</div><div role="columnheader">Output</div>
-                <div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>
+                <div role="columnheader">Depth</div><div role="columnheader">Concurrency</div><div role="columnheader">Prompt tok/s</div>
                 <div role="columnheader">Generation tok/s</div><div role="columnheader">Per-request tok/s</div>
                 <div role="columnheader">TTFR</div>
               </div>
@@ -464,6 +465,7 @@ export function BenchmarkRunner() {
                 <div className="table-row" role="row" key={index}>
                   <div role="cell" data-label="Prompt">{row.prompt_size?.toLocaleString()}</div>
                   <div role="cell" data-label="Output">{row.response_size}</div>
+                  <div role="cell" data-label="Depth">{row.context_depth?.toLocaleString()}</div>
                   <div role="cell" data-label="Concurrency">C{row.concurrency}</div>
                   <div role="cell" data-label="Prompt tok/s">{formatRate(row.pp_tokens_per_second ?? undefined)}</div>
                   <div role="cell" data-label="Generation tok/s">{formatRate(row.tg_tokens_per_second ?? undefined)}</div>

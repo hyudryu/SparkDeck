@@ -289,8 +289,14 @@ class ReportFlatteningTests(unittest.TestCase):
             "model": "unsloth/Qwen3-4B-GGUF", "model_id": "unsloth/Qwen3-4B-GGUF",
             "quantization": "Q4_K_M", "runtime": "llama.cpp",
             "base_url": "http://127.0.0.1:8080", "benchy_version": "0.1.2",
-            "config": {"runs": 3, "warmup_runs": 1, "exact_tg": False},
-            "report": {"latency_mode": "api", "latency_ms": 12.5},
+            "config": {
+                "runs": 3, "warmup_runs": 1, "exact_tg": False,
+                "enable_prefix_caching": True,
+            },
+            "report": {
+                "latency_mode": "api", "latency_ms": 12.5,
+                "prefix_caching_enabled": False,
+            },
             "results": results,
         }
 
@@ -310,12 +316,24 @@ class ReportFlatteningTests(unittest.TestCase):
         self.assertEqual(first["quantization"], "Q4_K_M")
         self.assertEqual(first["prompt_size"], "2048")
         self.assertEqual(first["concurrency"], "1")
+        self.assertEqual(first["prefix_caching_enabled"], "False")
         self.assertEqual(first["tg_tokens_per_second"], "42.5")
         self.assertEqual(first["pp_tokens_per_second"], "1800.0")
         second = dict(zip(header, lines[2].split(",")))
         self.assertEqual(second["concurrency"], "2")
         self.assertEqual(second["tg_tokens_per_second"], "60.0")
         self.assertEqual(second["tg_tokens_per_second_request"], "30.0")
+
+    def test_csv_falls_back_to_requested_prefix_caching_mode(self):
+        results = _flatten_report("run-1", _report_payload())
+        run = self._run(results)
+        run["report"].pop("prefix_caching_enabled")
+        with TemporaryDirectory() as temp:
+            csv_path = Path(temp) / "results.csv"
+            _write_csv(csv_path, run)
+            lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+        first = dict(zip(lines[0].split(","), lines[1].split(",")))
+        self.assertEqual(first["prefix_caching_enabled"], "True")
 
     def test_missing_metrics_render_as_empty_cells(self):
         report = _report_payload()

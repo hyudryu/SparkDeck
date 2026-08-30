@@ -3960,6 +3960,10 @@ class SparkDeckService:
             if value is not None:
                 normalized[key] = value
 
+        for pricing_key in (
+            "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+        ):
+            preserve(pricing_key, launch_inputs.get(pricing_key))
         preserve("context_length", controls.get("context_window"))
         if runtime is RuntimeKind.SGLANG:
             preserve("tensor_parallel_size", launch_inputs.get("sg_tp_size"))
@@ -4026,6 +4030,8 @@ class SparkDeckService:
             settings, launch_settings = self._clone_launch_configuration(
                 stored, runtime,
             )
+            if kind is DeploymentKind.MANAGED:
+                settings.pop("port", None)
             model = stored.get("model") or {}
             repository = str(model.get("repository") or "")
             artifact = model.get("artifact")

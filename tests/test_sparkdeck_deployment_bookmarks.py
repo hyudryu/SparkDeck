@@ -179,7 +179,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
             settings={
                 "manager_deployment_id": "sg-cluster",
-                "node_ids": ["remote-1"],
+                "node_ids": ["local"],
                 "deployment_mode": "single",
                 "sg_tp_size": 2,
                 "sg_context_length": 262144,
@@ -192,6 +192,10 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             "launch_settings": {
                 "engine": "sglang",
                 "extra_args": ["--enable-metrics"],
+                "port": 8123,
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.0,
+                "output_cost_per_1m": 2.5,
                 "sg_tp_size": 2,
                 "sg_context_length": 262144,
                 "sg_max_running_requests": 10,
@@ -205,15 +209,23 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cloned["settings"]["context_length"], 262144)
         self.assertEqual(cloned["settings"]["max_running_requests"], 10)
         self.assertEqual(cloned["settings"]["mem_fraction_static"], 0.85)
+        self.assertNotIn("port", cloned["settings"])
+        self.assertEqual(cloned["settings"]["input_cost_per_1m"], 1.25)
+        self.assertEqual(cloned["settings"]["cache_cost_per_1m"], 0.0)
+        self.assertEqual(cloned["settings"]["output_cost_per_1m"], 2.5)
         launch = self.service._cluster_launch_body(
             RuntimeKind.SGLANG, "org/model", cloned["alias"], cloned["id"],
-            ModelIdentity("org/model"), cloned["settings"], ["remote-1"],
+            ModelIdentity("org/model"), cloned["settings"], ["local"],
             "single", llama_artifact=None,
         )
         self.assertEqual(launch["sg_tp_size"], 2)
         self.assertEqual(launch["sg_context_length"], 262144)
         self.assertEqual(launch["sg_max_running_requests"], 10)
         self.assertEqual(launch["sg_mem_fraction"], 0.85)
+        self.assertNotIn("port", launch)
+        self.assertEqual(launch["input_cost_per_1m"], 1.25)
+        self.assertEqual(launch["cache_cost_per_1m"], 0.0)
+        self.assertEqual(launch["output_cost_per_1m"], 2.5)
 
     async def test_clone_restores_adopted_llama_artifact_and_controls(self):
         revision = "a" * 40

@@ -992,6 +992,7 @@ describe('model deployments', () => {
 
     await waitFor(() => expect(deploymentListCalls).toBe(2), { timeout: 3500 })
     expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
+    expect(screen.queryByText('Refreshing deployments…')).not.toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Live recipe' })).toBeInTheDocument()
 
     resolveLiveRefresh(new Response(JSON.stringify({ items: [{

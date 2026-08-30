@@ -3780,6 +3780,8 @@ class Manager:
             return {
                 "context_window": context_window,
                 "max_concurrency": max_concurrency,
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
                 "kv_cache_dtype": None,
                 "thinking_mode": None,
                 "dspark_num_speculative_tokens": None,
@@ -3789,6 +3791,14 @@ class Manager:
         return {
             "context_window": context_window,
             "max_concurrency": max_concurrency,
+            "tensor_parallel_size": (
+                cls._cli_option(args, {"--tensor-parallel-size", "-tp"}, int)
+                if engine == "vllm" else None
+            ),
+            "pipeline_parallel_size": (
+                cls._cli_option(args, {"--pipeline-parallel-size", "-pp"}, int)
+                if engine == "vllm" else None
+            ),
             "kv_cache_dtype": cls._cli_option(args, {"--kv-cache-dtype"}),
             "thinking_mode": thinking_mode,
             "dspark_num_speculative_tokens": (
@@ -3837,6 +3847,10 @@ class Manager:
             value = controls.get(key)
             if value in (None, ""):
                 return None
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not value.is_integer()
+            ):
+                raise ValueError(f"{key} must be a positive integer")
             try:
                 parsed = int(value)
             except (TypeError, ValueError) as exc:
@@ -3884,6 +3898,21 @@ class Manager:
         )
 
         if engine == "vllm":
+            # An absent key means the caller did not submit the control (e.g.
+            # an older client updating an unrelated field): leave the current
+            # flag untouched. Only an explicit null clears it.
+            if "tensor_parallel_size" in controls:
+                flags = self._replace_command_option(
+                    flags,
+                    {"--tensor-parallel-size", "-tp"},
+                    positive_int("tensor_parallel_size"),
+                )
+            if "pipeline_parallel_size" in controls:
+                flags = self._replace_command_option(
+                    flags,
+                    {"--pipeline-parallel-size", "-pp"},
+                    positive_int("pipeline_parallel_size"),
+                )
             flags = self._replace_command_option(
                 flags,
                 {"--max-cudagraph-capture-size"},
@@ -3997,12 +4026,13 @@ class Manager:
                 settings["extra_args"], {"--pipeline-parallel-size", "-pp"}, int
             )
             if requested_tp is not None or requested_pp is not None:
-                tp = requested_tp or 1
-                pp = requested_pp or 1
-                if tp < 1 or pp < 1 or tp * pp != len(settings["node_ids"]):
+                tp = requested_tp if requested_tp is not None else 1
+                pp = requested_pp if requested_pp is not None else 1
+                world_size = tp * pp
+                if tp < 1 or pp < 1 or world_size % len(settings["node_ids"]):
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
-                        f"and multiply to the {len(settings['node_ids'])} selected nodes"
+                        "and provide a whole number of ranks per selected node"
                     )
 
         # Preserve the assigned API port unless the editor explicitly changes it.
@@ -4958,12 +4988,31 @@ class Manager:
                 requested_args, {"--pipeline-parallel-size", "-pp"}, int
             )
             if requested_tp is not None or requested_pp is not None:
-                tp = requested_tp or 1
-                pp = requested_pp or 1
-                if tp < 1 or pp < 1 or tp * pp != len(node_ids):
+                tp = requested_tp if requested_tp is not None else 1
+                pp = requested_pp if requested_pp is not None else 1
+                world_size = tp * pp
+                if tp < 1 or pp < 1 or world_size % len(node_ids):
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
-                        f"and multiply to the {len(node_ids)} selected nodes"
+                        "and provide a whole number of ranks per selected node"
+                    )
+                ranks_per_node = world_size // len(node_ids)
+                gpu_short = []
+                for nid in node_ids:
+                    gpus = (available[nid].get("stats") or {}).get("gpus")
+                    if gpus is None:
+                        # No GPU telemetry at all: nothing to validate against.
+                        continue
+                    usable = [
+                        gpu for gpu in gpus
+                        if not (isinstance(gpu, dict) and gpu.get("error"))
+                    ]
+                    if len(usable) < ranks_per_node:
+                        gpu_short.append(available[nid].get("name", nid))
+                if gpu_short:
+                    raise ValueError(
+                        f"layout requires {ranks_per_node} GPU(s) per node; "
+                        f"not enough devices on: {', '.join(gpu_short)}"
                     )
                 vllm_parallel_layout = (tp, pp)
             else:
@@ -9112,7 +9161,20 @@ class Manager:
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
-            required_nodes = parallel_nodes if parallel_nodes > 1 else max(2, len(saved_nodes))
+            saved_count = len(saved_nodes)
+            if (
+                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
+                and parallel_nodes % saved_count == 0
+            ):
+                # The vLLM launch gate accepts layouts with several ranks per
+                # node (e.g. TP4/PP1 on two nodes); honor the saved node count
+                # so restarts do not demand one node per rank. SGLang launches
+                # always use one rank per node and keep the rank-derived count.
+                required_nodes = saved_count
+            elif parallel_nodes > 1:
+                required_nodes = parallel_nodes
+            else:
+                required_nodes = max(2, saved_count)
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.

@@ -633,6 +633,70 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             32768,
         )
 
+    async def test_saved_bookmark_launch_controls_update_layout_contract(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "sharded-bookmark", "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "sharded",
+            "settings": {"tensor_parallel_size": 2},
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+        # The editor is seeded with the saved scalar so an unchanged Save
+        # cannot submit a null that strips the TP flag at first launch.
+        detail = await self.service.deployment_detail(listed["id"])
+        self.assertEqual(detail["launch_controls"]["tensor_parallel_size"], 2)
+
+        # Editing the structured controls syncs the saved topology scalar and
+        # the picker contract with it: TP4/PP1 fits the two saved nodes at
+        # two ranks per node.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 1,
+            },
+        })
+
+        stored = self.service.store.deployment(
+            "sharded-bookmark", include_private=True,
+        )
+        self.assertEqual(stored["settings"]["tensor_parallel_size"], 4)
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+
+        # A layout the saved nodes cannot divide requires one node per rank.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 3,
+                "pipeline_parallel_size": 1,
+            },
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 3)
+
+        # Fractional and boolean controls are rejected before they persist;
+        # bookmarks never see Manager's validators until their first Run.
+        for bad in (1.5, True):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    await self.service.update_deployment_settings(
+                        "sharded-bookmark",
+                        {"launch_controls": {"tensor_parallel_size": bad}},
+                    )
+
+        # An explicit clear sticks instead of being re-seeded from the scalar.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {"tensor_parallel_size": None},
+        })
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("sharded-bookmark")["id"],
+        )
+        self.assertIsNone(detail["launch_controls"]["tensor_parallel_size"])
+        stored = self.service.store.deployment(
+            "sharded-bookmark", include_private=True,
+        )
+        self.assertIsNone(stored["settings"]["tensor_parallel_size"])
+
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "fresh", "runtime": "vllm",

@@ -15,7 +15,10 @@ const detail = {
     '--enable-prefix-caching', '--speculative-config',
     '{"method":"ngram","foo":true}', 'C:\\models\\foo', '', "owner's-model",
   ],
-  launch_controls: { context_window: 8192, max_concurrency: 4, thinking_mode: 'default' },
+  launch_controls: {
+    context_window: 8192, max_concurrency: 4, tensor_parallel_size: 2,
+    pipeline_parallel_size: 1, thinking_mode: 'default',
+  },
   gpu_memory_utilization: 0.9, gpu_memory_gb: null, image: null,
 }
 
@@ -49,14 +52,19 @@ function renderPage() {
 describe('deployment object page', () => {
   it('shows saved flags and saves before running, then returns to Models', async () => {
     const user = userEvent.setup()
-    renderPage()
+    const { container } = renderPage()
 
     expect(await screen.findByRole('heading', { name: 'Reasoning server' })).toBeInTheDocument()
+    expect(container.querySelector('.page')).toContainElement(screen.getByRole('heading', { name: 'Reasoning server' }))
+    expect(screen.getByLabelText('Tensor parallel size')).toHaveValue(2)
+    expect(screen.getByLabelText('Pipeline parallel size')).toHaveValue(1)
     expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
       `--enable-prefix-caching --speculative-config '{"method":"ngram","foo":true}' 'C:\\models\\foo' '' 'owner'\\''s-model'`,
     )
     await user.clear(screen.getByLabelText('Max concurrency'))
     await user.type(screen.getByLabelText('Max concurrency'), '6')
+    await user.clear(screen.getByLabelText('Tensor parallel size'))
+    await user.type(screen.getByLabelText('Tensor parallel size'), '4')
     await user.click(screen.getByRole('button', { name: 'Run' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
@@ -67,6 +75,8 @@ describe('deployment object page', () => {
     ])
     const saved = JSON.parse(String(mutationCalls[0][1]?.body))
     expect(saved.launch_controls.max_concurrency).toBe(6)
+    expect(saved.launch_controls.tensor_parallel_size).toBe(4)
+    expect(saved.launch_controls.pipeline_parallel_size).toBe(1)
     expect(saved.extra_args).toEqual([
       '--enable-prefix-caching', '--speculative-config',
       '{"method":"ngram","foo":true}', 'C:\\models\\foo', '', "owner's-model",

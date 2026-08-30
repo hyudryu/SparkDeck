@@ -1,8 +1,8 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { UsageGroup } from '../api/types'
-import { activityHeatmapCalendar, modelShareItems, UsagePage } from './UsagePage'
+import type { DailyUsagePoint, UsageGroup, UsageSummary } from '../api/types'
+import { activityHeatmapCalendar, modelShareItems, usageMeterSnapshot, UsagePage } from './UsagePage'
 
 const summary = {
   models: {
@@ -72,6 +72,29 @@ describe('UsagePage', () => {
     expect(calendar.months[0]).toMatchObject({ key: '2025-01', label: 'Jan', column: 1 })
     expect(calendar.months.at(-1)).toMatchObject({ key: '2026-01', label: 'Jan' })
     expect(calendar.months.every((month, index) => index === 0 || month.column > calendar.months[index - 1].column)).toBe(true)
+  })
+
+  it('meters lifetime and dated model usage without double-counting cached input', () => {
+    const daily: DailyUsagePoint[] = [
+      { date: '2026-08-29', input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
+      { date: '2026-08-10', input: 200, cached: 50, output: 30, requests: 2, models: { beta: { input: 200, cached: 50, output: 30, requests: 2 } } },
+      { date: '2026-07-01', input: 400, cached: 100, output: 50, requests: 3, models: { gamma: { input: 400, cached: 100, output: 50, requests: 3 } } },
+    ]
+    const reference = new Date('2026-08-30T12:00:00Z')
+
+    const lifetime = usageMeterSnapshot(summary as UsageSummary, daily, 'lifetime', reference)
+    expect(lifetime.totals).toMatchObject({ input: 1500, cached: 500, output: 750, requests: 12 })
+    expect(lifetime.models.map((item) => item.model)).toEqual(['org/model'])
+    expect(lifetime.totals.input + lifetime.totals.output).toBe(2250)
+
+    const week = usageMeterSnapshot(summary as UsageSummary, daily, 7, reference)
+    expect(week.totals).toMatchObject({ input: 100, cached: 40, output: 25, requests: 1 })
+    expect(week.models.map((item) => item.model)).toEqual(['alpha'])
+    expect(week.totals.input + week.totals.output).toBe(125)
+
+    const month = usageMeterSnapshot(summary as UsageSummary, daily, 30, reference)
+    expect(month.totals).toMatchObject({ input: 300, cached: 90, output: 55, requests: 3 })
+    expect(month.models.map((item) => item.model).sort()).toEqual(['alpha', 'beta'])
   })
 
   it('shows the token scale legend and a hover tooltip on heatmap cells', async () => {
@@ -159,9 +182,40 @@ describe('UsagePage', () => {
     await user.click(screen.getByRole('button', { name: 'Erase' }))
     await user.click(within(await screen.findByRole('dialog', { name: 'Erase usage for org/model?' })).getByRole('button', { name: 'Erase usage' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
-    await user.click(screen.getByRole('button', { name: 'Reset lifetime' }))
-    await user.click(within(await screen.findByRole('dialog', { name: 'Reset all usage counters?' })).getByRole('button', { name: 'Reset counters' }))
+    await user.click(screen.getByRole('button', { name: 'Reset metered usage' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
+  })
+
+  it('resets the since-reset meter while preserving dated model history', async () => {
+    let reset = false
+    const today = new Date().toISOString().slice(0, 10)
+    const zeroSummary = { ...summary, models: {}, groups: [], total: { input: 0, cached: 0, output: 0, requests: 0 } }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/token-stats/reset') { reset = true; return json({ ok: true }) }
+      if (path.includes('/api/token-stats/hourly')) return json([])
+      if (path.includes('/api/token-stats/daily')) return json([
+        { date: today, input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
+      ])
+      return json(reset ? zeroSummary : summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    const meter = await screen.findByLabelText('Token usage meter')
+    expect(meter).toHaveTextContent('2,250')
+    expect(within(meter).getByRole('table', { name: 'Measured usage by model' })).toHaveTextContent('org/model')
+
+    await user.click(within(meter).getByRole('button', { name: 'Reset metered usage' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
+    await waitFor(() => expect(meter).toHaveTextContent('No measured model usage'))
+    expect(screen.getByText('Metered usage reset to zero.')).toBeInTheDocument()
+
+    await user.click(within(meter).getByRole('button', { name: '7 days' }))
+    expect(await within(meter).findByText('alpha')).toBeInTheDocument()
+    expect(meter).toHaveTextContent('125')
   })
 
   it('edits and removes usage routing rules from the display dialog', async () => {

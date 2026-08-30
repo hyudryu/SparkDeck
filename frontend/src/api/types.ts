@@ -102,6 +102,7 @@ export interface Deployment {
   desired_state?: 'running' | 'stopped'
   launch_phase?: string
   launch_message?: string
+  last_used_at?: number | null
 }
 
 export interface DeploymentLaunchControls {

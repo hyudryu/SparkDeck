@@ -1567,7 +1567,6 @@ export function ModelsPage() {
         actions={<Button variant="primary" onClick={openCreator}><Plus size={16} /> Create deployment</Button>}
       />
       {resource.loading && !resource.data && <LoadingState label="Loading deployments" />}
-      {resource.loading && resource.data && <p className="field-note" role="status">Refreshing deployments…</p>}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}

@@ -642,6 +642,11 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         listed = (await self.service.deployments())[0]
         self.assertEqual(listed["required_node_count"], 2)
 
+        # The editor is seeded with the saved scalar so an unchanged Save
+        # cannot submit a null that strips the TP flag at first launch.
+        detail = await self.service.deployment_detail(listed["id"])
+        self.assertEqual(detail["launch_controls"]["tensor_parallel_size"], 2)
+
         # Editing the structured controls syncs the saved topology scalar and
         # the picker contract with it: TP4/PP1 fits the two saved nodes at
         # two ranks per node.

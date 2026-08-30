@@ -595,7 +595,9 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "qwen-sglang", "load_settings": {
                 "engine": "sglang", "editable": True,
-                "extra_args": ["--enable-metrics"],
+                "extra_args": [
+                    "--max-total-tokens", "2097152", "--enable-metrics",
+                ],
                 "context_window": 131072, "max_concurrency": 8,
                 "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
                 "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1,
@@ -613,7 +615,6 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.put(
                 "/api/v1/deployments/container:qwen-sglang/settings",
                 json={
-                    "extra_args": ["--enable-metrics"],
                     "launch_controls": {
                         "context_window": 262144, "max_concurrency": 4,
                         "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
@@ -630,6 +631,9 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replacement["max_concurrency"], 4)
         self.assertEqual(replacement["gpu_memory_utilization"], 0.75)
         self.assertIn("--tp-size 2", replacement["command_flags"])
+        self.assertIn(
+            "--max-total-tokens 2097152", replacement["command_flags"]
+        )
 
     async def test_discovered_detail_falls_back_when_container_is_gone(self):
         card = {

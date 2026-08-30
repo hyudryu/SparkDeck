@@ -4308,7 +4308,7 @@ class Manager:
             managed = {
                 "--model-path", "--host", "--port", "--tp-size",
                 "--context-length", "--max-running-requests",
-                "--mem-fraction-static", "--max-total-tokens",
+                "--mem-fraction-static",
                 "--kv-cache-dtype",
             }
             skip_tokens = {"-m", "python", "python3", "sglang.launch_server", model}
@@ -11391,6 +11391,41 @@ class Manager:
                     f"{key}={value}" for key, value in existing_environment.items()
                 ]
             create_config["HostConfig"] = copy.deepcopy(attrs.get("HostConfig") or {})
+            inspected_networks = copy.deepcopy(
+                (attrs.get("NetworkSettings") or {}).get("Networks") or {}
+            )
+            network_mode = str(create_config["HostConfig"].get("NetworkMode") or "")
+            preserve_networks = bool(
+                inspected_networks
+                and network_mode not in {"host", "none"}
+                and not network_mode.startswith("container:")
+            )
+            if preserve_networks:
+                endpoints = {}
+                generated_aliases = {container.id, container.short_id}
+                for network_name, inspected in inspected_networks.items():
+                    inspected = inspected if isinstance(inspected, dict) else {}
+                    endpoint = {}
+                    aliases = [
+                        alias for alias in (inspected.get("Aliases") or [])
+                        if alias not in generated_aliases
+                    ]
+                    if aliases:
+                        endpoint["Aliases"] = aliases
+                    for key in ("Links", "DriverOpts", "MacAddress"):
+                        if inspected.get(key) not in (None, "", [], {}):
+                            endpoint[key] = copy.deepcopy(inspected[key])
+                    ipam = copy.deepcopy(inspected.get("IPAMConfig") or {})
+                    if not ipam and inspected.get("IPAddress"):
+                        ipam["IPv4Address"] = inspected["IPAddress"]
+                    if inspected.get("GlobalIPv6Address"):
+                        ipam.setdefault("IPv6Address", inspected["GlobalIPv6Address"])
+                    if inspected.get("LinkLocalIPs"):
+                        ipam.setdefault("LinkLocalIPs", inspected["LinkLocalIPs"])
+                    if ipam:
+                        endpoint["IPAMConfig"] = ipam
+                    endpoints[str(network_name)] = endpoint
+                create_config["NetworkingConfig"] = {"EndpointsConfig": endpoints}
 
             def _replace():
                 ledger = getattr(self, "managed_workload_ledger", None)
@@ -11404,7 +11439,14 @@ class Manager:
                     if was_running:
                         backup.stop(timeout=30)
                     backup.rename(backup_name)
+                    detached_networks: list[str] = []
                     try:
+                        if preserve_networks:
+                            for network_name in inspected_networks:
+                                self.client.api.disconnect_container_from_network(
+                                    backup.id, network_name, force=True,
+                                )
+                                detached_networks.append(network_name)
                         created = self.client.api.create_container_from_config(
                             create_config, name=name
                         )
@@ -11412,22 +11454,90 @@ class Manager:
                         if was_running:
                             replacement.start()
                         replacement.reload()
+                        if was_running:
+                            deadline = time.monotonic() + 1.0
+                            while True:
+                                status = str(replacement.status or "unknown").lower()
+                                health = str(
+                                    (((replacement.attrs or {}).get("State") or {})
+                                     .get("Health") or {}).get("Status") or ""
+                                ).lower()
+                                if status != "running":
+                                    raise RuntimeError(
+                                        "replacement container exited during startup "
+                                        f"with status {status}"
+                                    )
+                                if health == "unhealthy":
+                                    raise RuntimeError(
+                                        "replacement container became unhealthy during startup"
+                                    )
+                                if health == "healthy" or time.monotonic() >= deadline:
+                                    break
+                                time.sleep(0.1)
+                                replacement.reload()
                         summary = self._container_summary(replacement)
                         if ledger is not None and managed:
                             ledger.confirm(name, deployment_id)
                         backup.remove(force=True)
                         return summary
-                    except Exception:
+                    except Exception as replacement_error:
                         try:
                             self.client.containers.get(name).remove(force=True)
                         except Exception:
                             pass
                         backup = self.client.containers.get(backup_name)
                         backup.rename(name)
+                        restoration_errors = []
+                        for network_name in detached_networks:
+                            inspected = inspected_networks.get(network_name) or {}
+                            ipam = inspected.get("IPAMConfig") or {}
+                            reconnect_options = {
+                                "ipv4_address": (
+                                    ipam.get("IPv4Address") or inspected.get("IPAddress")
+                                ),
+                                "ipv6_address": (
+                                    ipam.get("IPv6Address")
+                                    or inspected.get("GlobalIPv6Address")
+                                ),
+                                "aliases": [
+                                    alias for alias in (inspected.get("Aliases") or [])
+                                    if alias not in {backup.id, backup.short_id}
+                                ],
+                                "links": inspected.get("Links"),
+                                "link_local_ips": (
+                                    ipam.get("LinkLocalIPs")
+                                    or inspected.get("LinkLocalIPs")
+                                ),
+                                "driver_opt": inspected.get("DriverOpts"),
+                                "mac_address": inspected.get("MacAddress"),
+                            }
+                            try:
+                                self.client.api.connect_container_to_network(
+                                    backup.id, network_name,
+                                    **{
+                                        key: value
+                                        for key, value in reconnect_options.items()
+                                        if value not in (None, "", [], {})
+                                    },
+                                )
+                            except Exception as restore_error:
+                                restoration_errors.append(
+                                    f"network {network_name}: {restore_error}"
+                                )
                         if was_running:
-                            backup.start()
+                            try:
+                                backup.start()
+                            except Exception as restore_error:
+                                restoration_errors.append(
+                                    f"container restart: {restore_error}"
+                                )
                         if ledger is not None and managed:
                             ledger.confirm(name, deployment_id)
+                        if restoration_errors and hasattr(replacement_error, "add_note"):
+                            replacement_error.add_note(
+                                "rollback restoration errors: "
+                                + "; ".join(restoration_errors)
+                            )
                         raise
 
                 if ledger is None or not managed:

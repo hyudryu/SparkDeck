@@ -134,6 +134,32 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(nodes, ["remote-1", "remote-2", "remote-1", "remote-2"])
 
+    async def test_remote_request_tracks_and_forwards_original_caller_ip(self):
+        manager = build_manager(replicated_deployment())
+        manager._req_seq = 0
+        manager._active_reqs = {}
+        manager._trailing_window = 5.0
+
+        async def respond(*args, **kwargs):
+            self.assertEqual(
+                manager.active_requests()["org/model"]["caller_ips"],
+                {"192.0.2.45": 1},
+            )
+            self.assertEqual(
+                kwargs["json_body"]["_sparkdeck_caller_ip"], "192.0.2.45",
+            )
+            return {"choices": []}
+
+        manager.node_registry.request = AsyncMock(side_effect=respond)
+
+        await manager.proxy_cluster_inference(
+            "repl-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": False},
+            "chat/completions", caller_ip="192.0.2.45",
+        )
+
+        self.assertNotIn("org/model", manager.active_requests())
+
     async def test_least_loaded_replica_receives_concurrent_request(self):
         manager = build_manager(replicated_deployment())
         first_started = asyncio.Event()

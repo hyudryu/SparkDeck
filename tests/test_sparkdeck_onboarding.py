@@ -14,6 +14,7 @@ from fastapi import Request
 from cluster import AGENT_PROTOCOL_VERSION, AgentCredentials, NodeRegistry
 from manager import Manager
 from sparkdeck.onboarding import (
+    FORWARD_CLIENT_HEADER,
     FORWARD_HOP_HEADER,
     FORWARD_NODE_HEADER,
     FORWARD_SCHEME_HEADER,
@@ -1239,7 +1240,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         manager = Mock(http=http)
         request = request_for(
             "/api/v1/images/pull", query="force=1", body=b'{"image":"x"}',
-            headers={"content-type": "application/json", FORWARD_TOKEN_HEADER: "client-spoof"},
+            headers={"content-type": "application/json", FORWARD_CLIENT_HEADER: "203.0.113.99"},
         )
         # Client-supplied forwarding headers are rejected instead of relayed.
         rejected = await forward_management_request(request, manager, {
@@ -1273,6 +1274,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0].headers[FORWARD_NODE_HEADER], "worker-id")
         self.assertEqual(captured[0].headers[FORWARD_SCHEME_HEADER], "http")
         self.assertEqual(captured[0].headers[FORWARD_TOKEN_HEADER], "worker-secret")
+        self.assertEqual(captured[0].headers[FORWARD_CLIENT_HEADER], "100.100.20.40")
         await http.aclose()
 
     def test_exclusions_and_controller_token_validation(self):
@@ -1312,6 +1314,27 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertFalse(valid)
             self.assertIn("http or https", detail)
+
+    def test_inference_caller_trusts_only_authenticated_forwarding(self):
+        import server
+
+        direct = request_for("/v1/chat/completions")
+        self.assertEqual(server._inference_caller_ip(direct), "100.100.20.40")
+
+        forwarded = request_for(
+            "/v1/chat/completions",
+            headers={FORWARD_CLIENT_HEADER: "192.0.2.90"},
+        )
+        with patch.object(
+            server.onboarding, "validate_forward_headers",
+            return_value=(True, ""),
+        ):
+            self.assertEqual(server._inference_caller_ip(forwarded), "192.0.2.90")
+        with patch.object(
+            server.onboarding, "validate_forward_headers",
+            return_value=(False, "invalid"),
+        ):
+            self.assertEqual(server._inference_caller_ip(forwarded), "100.100.20.40")
 
 
 class WorkerSchedulerTests(unittest.IsolatedAsyncioTestCase):

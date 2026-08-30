@@ -3572,7 +3572,8 @@ class SparkDeckService:
         return {"object": "list", "data": data}
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
-                    cancel: Any = None) -> dict[str, Any] | AsyncIterator[str]:
+                    cancel: Any = None, *, caller_ip: str | None = None,
+                    ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
         deployment = self.store.deployment(requested_model, include_private=True)
         observation = self._community_observation_start(
@@ -3583,17 +3584,22 @@ class SparkDeckService:
         try:
             if deployment:
                 result = await self._proxy_registered(
-                    deployment, body, endpoint, cancel
+                    deployment, body, endpoint, cancel, caller_ip=caller_ip,
                 )
             else:
                 # Compatibility for existing vLLM/SGLang containers. Resolve the
                 # container's source repository rather than publishing an
                 # arbitrary served alias as the model identity.
                 started = time.monotonic()
+                caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
                 result = (
-                    await self.manager.proxy_chat_completions(body, cancel)
+                    await self.manager.proxy_chat_completions(
+                        body, cancel, **caller_kwargs,
+                    )
                     if endpoint == "chat/completions"
-                    else await self.manager.proxy_completions(body, cancel)
+                    else await self.manager.proxy_completions(
+                        body, cancel, **caller_kwargs,
+                    )
                 )
                 model, runtime, settings = await self._legacy_model_identity(
                     requested_model
@@ -3689,7 +3695,9 @@ class SparkDeckService:
             self._community_observation_end(observation)
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
-                                endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
+                                endpoint: str, cancel: Any, *,
+                                caller_ip: str | None = None,
+                                ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
             "manager_deployment_id"
@@ -3717,7 +3725,9 @@ class SparkDeckService:
             deployment.get("kind") == DeploymentKind.MANAGED.value
             and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
         ):
-            return await self._proxy_managed(deployment, body, endpoint, cancel)
+            return await self._proxy_managed(
+                deployment, body, endpoint, cancel, caller_ip=caller_ip,
+            )
         base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
             raise LookupError("deployment endpoint is unavailable")
@@ -3761,7 +3771,9 @@ class SparkDeckService:
         return data
 
     async def _proxy_managed(self, deployment: dict[str, Any], body: dict[str, Any],
-                             endpoint: str, cancel: Any) -> dict[str, Any] | AsyncIterator[str]:
+                             endpoint: str, cancel: Any, *,
+                             caller_ip: str | None = None,
+                             ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
         model = deployment["model"]["repository"]
         upstream_body = {**body, "model": model}
@@ -3770,10 +3782,12 @@ class SparkDeckService:
         settings = self._model_observation_settings(deployment)
         manager_id = settings.get("manager_deployment_id")
         route_observation: dict[str, Any] = {}
+        caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
         result = (
             await self.manager.proxy_cluster_inference(
                 manager_id, model, upstream_body, endpoint, cancel,
                 route_observation=route_observation,
+                **caller_kwargs,
             )
             if manager_id
             else (
@@ -3781,12 +3795,14 @@ class SparkDeckService:
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
+                    **caller_kwargs,
                 )
                 if endpoint == "chat/completions"
                 else await self.manager._vllm_completions(
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
+                    **caller_kwargs,
                 )
             )
         )

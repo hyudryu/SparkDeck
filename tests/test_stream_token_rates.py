@@ -127,6 +127,28 @@ class StreamTokenRateTests(unittest.TestCase):
         instance._track_end(request_id)
         self.assertNotIn("model", instance.active_requests())
 
+    def test_live_requests_are_grouped_by_caller_ip(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._req_seq = 0
+        instance._active_reqs = {}
+        instance._trailing_window = 5.0
+        instance.inference_admission = lambda: {}
+
+        first = instance._track_start("model", caller_ip="192.0.2.10")
+        instance._track_start("model", caller_ip="192.0.2.10")
+        instance._track_start("model", caller_ip="2001:db8::20")
+
+        self.assertEqual(instance.active_requests()["model"]["caller_ips"], {
+            "192.0.2.10": 2,
+            "2001:db8::20": 1,
+        })
+
+        instance._track_end(first)
+        self.assertEqual(instance.active_requests()["model"]["caller_ips"], {
+            "192.0.2.10": 1,
+            "2001:db8::20": 1,
+        })
+
     def test_cluster_request_records_last_used_at_start_and_end(self) -> None:
         instance = Manager.__new__(Manager)
         instance._req_seq = 0

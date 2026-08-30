@@ -269,6 +269,42 @@ describe('models page running actions', () => {
     ))).toBe(true))
   })
 
+  it('selects exactly the tensor parallel node count for a discovered container', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'container:kimi-vllm', alias: 'Kimi vLLM', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
+      settings: { tensor_parallel_size: 2 }, deployment_mode: 'sharded',
+      required_node_count: 2, managed: false, controllable: true,
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Kimi vLLM')
+    await user.click(screen.getByRole('button', { name: 'Start' }))
+    expect(await screen.findByText(/TP2 requires exactly 2 nodes/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Launch on 2 nodes' }))
+
+    await waitFor(() => {
+      const start = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/container%3Akimi-vllm/start')
+        && init?.method === 'POST'
+      ))
+      expect(JSON.parse(String(start?.[1]?.body))).toEqual({
+        node_ids: ['local', 'worker-1'],
+      })
+    })
+  })
+
   it('falls back to a plain start button when stopped', async () => {
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

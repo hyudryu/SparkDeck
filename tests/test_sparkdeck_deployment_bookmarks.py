@@ -725,8 +725,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["launch_controls"]["tensor_parallel_size"], 2)
 
         # Editing the structured controls syncs the saved topology scalar and
-        # the picker contract with it: TP4/PP1 fits the two saved nodes at
-        # two ranks per node.
+        # the picker contract with it: TP4 requires four selected nodes.
         await self.service.update_deployment_settings("sharded-bookmark", {
             "launch_controls": {
                 "tensor_parallel_size": 4,
@@ -739,7 +738,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stored["settings"]["tensor_parallel_size"], 4)
         listed = (await self.service.deployments())[0]
-        self.assertEqual(listed["required_node_count"], 2)
+        self.assertEqual(listed["required_node_count"], 4)
 
         # A layout the saved nodes cannot divide requires one node per rank.
         await self.service.update_deployment_settings("sharded-bookmark", {

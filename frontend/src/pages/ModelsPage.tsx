@@ -1142,7 +1142,7 @@ export function ModelsPage() {
   }
 
   // The backend derives the persisted layout contract (replicated saved-node
-  // count, TP×PP for sharded, single otherwise); unknown layouts start on one.
+  // count, TP for sharded, single otherwise); unknown layouts start on one.
   const deploymentRequiredNodes = (deployment: Deployment) => deployment.required_node_count ?? 1
 
   const deploymentWeightedNodes = (deployment: Deployment) => {
@@ -1163,8 +1163,10 @@ export function ModelsPage() {
     const saved = (deployment.node_ids ?? []).filter((id) => selectableIds.includes(id))
     let nodeIds = saved.slice(0, required)
     if (nodeIds.length < required) {
-      const weighted = nodes.data?.filter((node) => deploymentWeightedNodes(deployment).has(node.id) && isNodeSelectable(node)) ?? []
-      nodeIds = [...new Set([...nodeIds, ...weighted.map((node) => node.id)])].slice(0, required)
+      const candidates = deployment.managed
+        ? nodes.data?.filter((node) => deploymentWeightedNodes(deployment).has(node.id) && isNodeSelectable(node)) ?? []
+        : nodes.data?.filter(isNodeSelectable) ?? []
+      nodeIds = [...new Set([...nodeIds, ...candidates.map((node) => node.id)])].slice(0, required)
     }
     setStartError(undefined)
     setStartNotice(undefined)
@@ -1701,7 +1703,7 @@ export function ModelsPage() {
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => deployment.managed ? openStartPicker(deployment) : void act(deployment, 'start')}>{deployment.status === 'saved' ? 'Launch' : 'Start'}</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
@@ -1936,7 +1938,7 @@ export function ModelsPage() {
             && (target.eligible || target.download_eligible || target.transfer_after_download_eligible))
           .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
-          .filter((node) => weighted.has(node.id) || prepEligible.has(node.id))
+          .filter((node) => !deployment.managed || weighted.has(node.id) || prepEligible.has(node.id))
           .map((node) => node.id)
         const unavailableReasons = Object.fromEntries((nodes.data ?? [])
           .filter((node) => !allowedIds.includes(node.id)).map((node) => {
@@ -1966,7 +1968,7 @@ export function ModelsPage() {
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
             <div className="modal-heading"><div><p className="eyebrow">{savedLaunch ? 'Launch deployment' : 'Start deployment'}</p><h2 id="start-deployment-title">{savedLaunch ? 'Launch' : 'Start'} {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</p>
+            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
             {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
@@ -1986,7 +1988,7 @@ export function ModelsPage() {
               localLabel={localLabel}
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
-              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
+              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />
             {needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
               <select

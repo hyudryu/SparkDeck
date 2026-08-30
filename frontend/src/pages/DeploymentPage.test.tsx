@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DeploymentPage } from './DeploymentPage'
 
 const fetchMock = vi.fn<typeof fetch>()
+const nodes = ['local', 'worker-1', 'worker-2', 'worker-3'].map((id, index) => ({
+  id, name: id === 'local' ? 'Controller' : `Node ${index + 1}`,
+  online: true, docker_ready: true, selectable: true,
+}))
 
 const detail = {
   id: 'dep-1', alias: 'Reasoning server', runtime: 'vllm', kind: 'managed',
@@ -27,6 +31,9 @@ beforeEach(() => {
   fetchMock.mockClear()
   fetchMock.mockImplementation(async (input, init) => {
     const path = String(input)
+    if (path === '/api/v1/nodes') {
+      return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
     if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
       return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
@@ -66,6 +73,8 @@ describe('deployment object page', () => {
     await user.clear(screen.getByLabelText('Tensor parallel size'))
     await user.type(screen.getByLabelText('Tensor parallel size'), '4')
     await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('dialog', { name: 'Start Reasoning server' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Start on 4 nodes' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
     const mutationCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
@@ -81,6 +90,9 @@ describe('deployment object page', () => {
       '--enable-prefix-caching', '--speculative-config',
       '{"method":"ngram","foo":true}', 'C:\\models\\foo', '', "owner's-model",
     ])
+    expect(JSON.parse(String(mutationCalls[1][1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+    })
   })
 
   it('keeps a running deployment read-only', async () => {
@@ -142,7 +154,7 @@ describe('deployment object page', () => {
 
     const flags = await screen.findByLabelText(/Runtime flags/)
     fireEvent.change(flags, { target: { value: '--regex "\\d+" --windows-path "C:\\models\\foo"' } })
-    await user.click(screen.getByRole('button', { name: 'Run' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
 
     const save = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
     expect(save).toBeDefined()

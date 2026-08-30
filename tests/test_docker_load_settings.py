@@ -103,7 +103,8 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Image": "example/vllm:latest",
                 "Entrypoint": ["vllm", "serve"],
                 "Cmd": [
-                    "org/model", "--max-model-len", "65536",
+                    "/cache/models/org--model/snapshots/rev",
+                    "--max-model-len", "65536",
                     "--enable-prefix-caching",
                 ],
                 "Env": [
@@ -115,7 +116,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                     "SENTRY_DSN=https://secret@example.invalid/1",
                     "FEATURE_FLAG=must-not-be-discovered",
                 ],
-                "Labels": {},
+                "Labels": {"io.sparkdeck.model": "served-name"},
             },
             {},
         )
@@ -124,6 +125,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(summary)
         settings = summary["load_settings"]
+        self.assertEqual(summary["model"], "served-name")
+        self.assertEqual(
+            settings["model"], "/cache/models/org--model/snapshots/rev",
+        )
         self.assertEqual(settings["context_window"], 65536)
         self.assertIn("--enable-prefix-caching", settings["extra_args"])
         self.assertEqual(settings["environment"], {

@@ -19,6 +19,7 @@ class FakeManager:
         self.start_container = AsyncMock(return_value={"ok": True})
         self.stop_container = AsyncMock(return_value={"ok": True})
         self.get_cluster_member_logs = AsyncMock(return_value="container output")
+        self.get_logs = AsyncMock(return_value="container output")
         self._vllm_chat = AsyncMock()
         self._vllm_completions = AsyncMock()
         self.proxy_chat_completions = AsyncMock()
@@ -118,6 +119,8 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
 
             logs = await service.deployment_logs("container:user-container")
             self.assertEqual(logs, {"logs": "container output"})
+            manager.get_logs.assert_awaited_once_with("user-container", 300)
+            manager.get_cluster_member_logs.assert_not_awaited()
 
             result = await service.delete_deployment("container:user-container")
             self.assertTrue(result["ok"])
@@ -138,6 +141,82 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(deployment["status"], "stopped")
             self.assertTrue(deployment["controllable"])
+            self.assertEqual(deployment["required_node_count"], 1)
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_discovered_tp_runtime_promotes_to_selected_managed_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "external-tp2", "model": "served-name",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "image": "example/vllm:latest", "port": 8214,
+                "load_settings": {
+                    "model": "/cache/models/org--model/snapshots/rev",
+                    "tensor_parallel_size": 2,
+                    "command_flags": "--tensor-parallel-size 2 --max-model-len 8192",
+                    "environment": {"NCCL_DEBUG": "WARN"},
+                },
+            }
+            manager.list_containers.return_value = [container]
+            manager._recovered_deployment_launch_settings = Mock(return_value={
+                "extra_args": ["--tensor-parallel-size", "2"],
+            })
+            manager.create_deployment = AsyncMock(return_value={
+                "id": "cluster-1", "name": "served-name", "status": "starting",
+                "node_ids": ["local", "worker-1"], "api_port": 8214,
+                "members": [{"container_name": "cluster-1-r0"}],
+                "launch_settings": {
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "worker-1"],
+                    "extra_args": ["--tensor-parallel-size", "2"],
+                },
+            })
+            manager._save_deployments = Mock()
+            service = SparkDeckService(manager, Path(directory))
+
+            listed = service._discovered_deployment(
+                container, "vllm", "served-name",
+            )
+            self.assertEqual(listed["deployment_mode"], "sharded")
+            self.assertEqual(listed["required_node_count"], 2)
+
+            result = await service.deployment_action(
+                "container:external-tp2", "start", ["local", "worker-1"],
+            )
+
+            launch = manager.create_deployment.await_args.args[0]
+            self.assertEqual(launch["node_ids"], ["local", "worker-1"])
+            self.assertEqual(launch["deployment_mode"], "sharded")
+            self.assertEqual(
+                launch["model"], "/cache/models/org--model/snapshots/rev",
+            )
+            self.assertEqual(result["node_ids"], ["local", "worker-1"])
+            stored = service.store.deployment(result["id"], include_private=True)
+            self.assertEqual(
+                stored["settings"]["source_container_name"], "external-tp2",
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_discovered_tp_runtime_rejects_wrong_node_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "external-tp2", "model": "org/model", "engine": "vllm",
+                "managed": False, "status": "exited",
+                "load_settings": {"tensor_parallel_size": 2},
+            }]
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(
+                ValueError, "tensor parallel size 2 requires exactly 2 node",
+            ):
+                await service.deployment_action(
+                    "container:external-tp2", "start", ["local"],
+                )
+
             await manager.http.aclose()
             await service.close()
 

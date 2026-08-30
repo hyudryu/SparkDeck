@@ -9220,7 +9220,7 @@ class Manager:
             )
         tensor_parallel = positive_parallelism(tensor_parallel)
         pipeline_parallel = positive_parallelism(pipeline_parallel)
-        parallel_nodes = tensor_parallel * pipeline_parallel
+        parallel_nodes = tensor_parallel
         persisted_mode = recipe.get("deployment_mode")
         mode = str(persisted_mode or "single")
         mode_error = args_error
@@ -9246,20 +9246,10 @@ class Manager:
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
-            saved_count = len(saved_nodes)
-            if (
-                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
-                and parallel_nodes % saved_count == 0
-            ):
-                # The vLLM launch gate accepts layouts with several ranks per
-                # node (e.g. TP4/PP1 on two nodes); honor the saved node count
-                # so restarts do not demand one node per rank. SGLang launches
-                # always use one rank per node and keep the rank-derived count.
-                required_nodes = saved_count
-            elif parallel_nodes > 1:
-                required_nodes = parallel_nodes
-            else:
-                required_nodes = max(2, saved_count)
+            required_nodes = (
+                parallel_nodes if parallel_nodes > 1
+                else max(2, len(saved_nodes))
+            )
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.
@@ -10207,6 +10197,18 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        launch_model = ""
+        if engine_label == "sglang":
+            launch_model = self._cli_option(cmd, {"--model-path"}) or ""
+        elif "serve" in cmd:
+            serve_index = cmd.index("serve")
+            if serve_index + 1 < len(cmd):
+                launch_model = cmd[serve_index + 1]
+        if launch_model:
+            # Keep the served-model label for the public card, but retain the
+            # executable model path/repository for promotion into a managed
+            # multi-node deployment.
+            load_settings["model"] = launch_model
         if self._without_sensitive_cli_credentials(
             load_settings.get("extra_args") or []
         ) != list(load_settings.get("extra_args") or []):

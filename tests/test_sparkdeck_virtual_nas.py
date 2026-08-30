@@ -1548,11 +1548,17 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             create_cached_model(source_hub)
             source = VirtualNAS(Path(source_dir), lambda: source_hub, FakeRegistry(), lambda: True)
             target = VirtualNAS(Path(target_dir), lambda: target_hub, FakeRegistry(), lambda: True)
+            registered = []
 
-            result = await target.import_model("org/model", source.export_model("org/model"))
+            result = await target.import_model(
+                "org/model", source.export_model("org/model"),
+                registered=registered.append,
+            )
 
             self.assertTrue(result["ok"])
             copied = target_hub / "models--org--model"
+            copied_stat = copied.lstat()
+            self.assertEqual(registered, [(copied_stat.st_dev, copied_stat.st_ino)])
             self.assertEqual((copied / "blobs" / "weights").read_bytes(), b"model-weights")
             self.assertEqual(list(target_hub.glob(".sparkdeck-vnas-*.tar")), [])
             with self.assertRaises(FileExistsError):
@@ -1845,12 +1851,16 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_peer_import_cancel_rolls_back_completed_model(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
-            create_cached_model(hub)
+            repository = create_cached_model(hub)
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            repository_stat = repository.lstat()
             record = {
                 "status": "completed", "phase": "completed",
                 "phase_started_at": 0, "bytes_transferred": 1,
                 "cancel": asyncio.Event(), "model_id": "org/model",
+                "destination_identity": (
+                    repository_stat.st_dev, repository_stat.st_ino,
+                ),
             }
             nas._peer_imports["transfer-1"] = record
 
@@ -1872,7 +1882,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "status": "running", "phase": "receiving",
                 "phase_started_at": 0, "bytes_transferred": 1,
                 "cancel": asyncio.Event(), "done": done,
-                "model_id": "org/model",
+                "model_id": "org/model", "destination_identity": None,
             }
             nas._peer_imports["transfer-1"] = record
 
@@ -1882,8 +1892,12 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertTrue(record["cancel"].is_set())
             self.assertFalse(cancellation.done())
-            create_cached_model(hub)
+            repository = create_cached_model(hub)
+            repository_stat = repository.lstat()
             record["status"] = "completed"
+            record["destination_identity"] = (
+                repository_stat.st_dev, repository_stat.st_ino,
+            )
             done.set()
 
             result = await cancellation
@@ -1892,6 +1906,56 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "status": "canceled", "rollback_confirmed": True,
             })
             self.assertFalse((hub / "models--org--model").exists())
+
+    async def test_failed_peer_cancel_preserves_unowned_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            done = asyncio.Event()
+            done.set()
+            nas._peer_imports["transfer-1"] = {
+                "status": "failed", "phase": "registering",
+                "phase_started_at": 0, "bytes_transferred": 1,
+                "cancel": asyncio.Event(), "done": done,
+                "model_id": "org/model", "destination_identity": None,
+            }
+
+            result = await nas.cancel_peer_import("org/model", "transfer-1")
+
+            self.assertEqual(result, {
+                "status": "canceled", "rollback_confirmed": True,
+            })
+            self.assertTrue(repository.is_dir())
+
+    async def test_peer_cancel_refuses_replaced_owned_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            repository_stat = repository.lstat()
+            repository.rename(hub / "original-model")
+            replacement = create_cached_model(hub)
+            sentinel = replacement / "concurrent-download"
+            sentinel.write_text("keep", encoding="utf-8")
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            done = asyncio.Event()
+            done.set()
+            nas._peer_imports["transfer-1"] = {
+                "status": "completed", "phase": "completed",
+                "phase_started_at": 0, "bytes_transferred": 1,
+                "cancel": asyncio.Event(), "done": done,
+                "model_id": "org/model",
+                "destination_identity": (
+                    repository_stat.st_dev, repository_stat.st_ino,
+                ),
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError, "rollback cannot be confirmed",
+            ):
+                await nas.cancel_peer_import("org/model", "transfer-1")
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits are required")
     async def test_streamed_import_preserves_private_and_executable_modes(self):

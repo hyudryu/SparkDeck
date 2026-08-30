@@ -182,6 +182,7 @@ describe('SparkDeck application shell', () => {
     render(<MemoryRouter initialEntries={['/']}><App /></MemoryRouter>)
 
     const open = screen.getByRole('button', { name: 'Open navigation' })
+    expect(screen.queryByRole('button', { name: 'Close navigation' })).not.toBeInTheDocument()
     await user.click(open)
     expect(open).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getAllByRole('button', { name: 'Close navigation' }).length).toBeGreaterThan(0)

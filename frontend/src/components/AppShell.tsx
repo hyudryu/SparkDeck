@@ -233,9 +233,9 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span className="brand-mark" aria-hidden="true"><span /><span /><span /></span>
             <span className="brand-name">SparkDeck</span>
           </NavLink>
-          <button className="icon-button mobile-close" onClick={() => setDrawerOpen(false)} aria-label="Close navigation">
+          {drawerOpen && <button className="icon-button mobile-close" onClick={() => setDrawerOpen(false)} aria-label="Close navigation">
             <X size={19} />
-          </button>
+          </button>}
         </div>
         <nav className="nav-list">
           {navigation.map(({ to, label, icon: Icon, end }, index) => {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -20,6 +20,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  vi.useRealTimers()
   localStorage.clear()
   delete document.documentElement.dataset.theme
 })
@@ -441,6 +442,48 @@ describe('model discovery', () => {
 })
 
 describe('model deployments', () => {
+  it('retries a stalled initial deployment load once', async () => {
+    vi.useFakeTimers()
+    let deploymentListCalls = 0
+    let initialSignal: AbortSignal | undefined
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        if (deploymentListCalls === 1) {
+          initialSignal = init?.signal ?? undefined
+          return await new Promise<Response>((_resolve, reject) => {
+            initialSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+          })
+        }
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await act(async () => undefined)
+
+    expect(deploymentListCalls).toBe(1)
+    expect(screen.getByText('Loading deployments')).toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999) })
+    expect(deploymentListCalls).toBe(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(initialSignal?.aborted).toBe(true)
+    expect(deploymentListCalls).toBe(2)
+    expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
+    expect(screen.getByText('No deployments yet')).toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(deploymentListCalls).toBe(2)
+  })
+
   it('treats an exited clustered deployment as stopped rather than active launch progress', async () => {
     const timeout = vi.spyOn(window, 'setTimeout')
     let deploymentListCalls = 0

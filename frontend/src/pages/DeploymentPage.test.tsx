@@ -95,15 +95,15 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText(/Runtime flags/)).toBeDisabled()
   })
 
-  it('shows inspected external settings read-only but still allows stopping the container', async () => {
+  it('edits an inspected external deployment and still allows stopping it', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async () => {
       const external = {
         ...detail,
         id: 'container:kimi-vllm', kind: 'external', managed: false,
-        status: 'starting', desired_state: 'running', editable: false,
+        status: 'starting', desired_state: 'running', editable: true,
         controllable: true,
-        edit_reason: 'Discovered deployment settings are read-only.',
+        edit_reason: null,
         environment: { VLLM_CACHE_ROOT: '/cache/vllm', NCCL_DEBUG: 'INFO' },
         extra_args: ['--max-model-len', '400000', '--enable-prefix-caching'],
       }
@@ -120,13 +120,20 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
       '--max-model-len 400000 --enable-prefix-caching',
     )
+    expect(screen.queryByLabelText('GPU memory reserve (GB)')).not.toBeInTheDocument()
+    await user.clear(screen.getByLabelText('Max concurrency'))
+    await user.type(screen.getByLabelText('Max concurrency'), '6')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Deployment settings saved and applied.')
     await user.click(screen.getByRole('button', { name: 'Stop' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
     const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
     expect(mutations.map(([input]) => String(input))).toEqual([
+      '/api/v1/deployments/container%3Akimi-vllm/settings',
       '/api/v1/deployments/container%3Akimi-vllm/stop',
     ])
+    expect(JSON.parse(String(mutations[0][1]?.body)).launch_controls.max_concurrency).toBe(6)
   })
 
   it('preserves literal backslashes in double-quoted flags', async () => {

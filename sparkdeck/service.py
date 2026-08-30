@@ -12,6 +12,7 @@ import json
 import math
 import platform
 import re
+import shlex
 import socket
 import time
 import uuid
@@ -1432,11 +1433,11 @@ class SparkDeckService:
             and manager_deployment is None
             and not stored.get("container_name")
         )
-        # Discovered containers have no saved launch settings, but their
-        # parsed command is still shown read-only so the deployment page
-        # reflects the flags the container actually runs with.
+        # Discovered containers have no saved launch settings, but Manager can
+        # transactionally rebuild commands it knows how to parse.
         discovered_settings: dict[str, Any] | None = None
         discovered_image = None
+        container: dict[str, Any] | None = None
         if launch_settings is None and str(deployment_id).startswith("container:"):
             try:
                 container = await self._resolve_discovered_container(deployment_id)
@@ -1488,6 +1489,13 @@ class SparkDeckService:
         )
         saved_only = bool(saved_only)
         _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp"}
+        discovered_editable = bool(
+            discovered_settings is not None
+            and discovered_settings.get("editable")
+            and not self._owning_cluster_deployment(
+                str((container or {}).get("name") or "")
+            )
+        )
         editable = bool(
             stored is not None
             and manager_id
@@ -1495,15 +1503,16 @@ class SparkDeckService:
             and launch_settings is not None
             and str(public.get("runtime") or "") in _EDITABLE_RUNTIMES
             and (raw_status == "stopped" or repairable_error)
-        ) or saved_only
+        ) or saved_only or discovered_editable
         if editable:
             edit_reason = None
-        elif stored is None or str(deployment_id).startswith("container:"):
+        elif str(deployment_id).startswith("container:"):
             edit_reason = (
-                "Discovered deployments do not have editable saved launch "
-                "settings. The flags below are read-only; use Save as recipe "
-                "on the Models page to import them."
+                "This discovered deployment's launch command cannot be edited "
+                "safely. Save it as a recipe to create editable launch settings."
             )
+        elif stored is None:
+            edit_reason = "Saved launch settings are unavailable for this deployment."
         elif public.get("kind") != DeploymentKind.MANAGED.value:
             edit_reason = "External deployments do not have SparkDeck-managed launch settings."
         elif not manager_id or manager_deployment is None or launch_settings is None:
@@ -1579,6 +1588,9 @@ class SparkDeckService:
         self, deployment_id: str, changes: dict[str, Any],
     ) -> dict[str, Any]:
         """Update a stopped manager-backed deployment by its public record ID."""
+        if str(deployment_id).startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            return await self._update_discovered_deployment(container, changes)
         # Listing first performs the normal manager/store reconciliation, so a
         # settings save cannot target a manager deployment ID that was replaced
         # by an earlier relaunch.
@@ -1639,6 +1651,89 @@ class SparkDeckService:
             stored.get("_base_url"),
         )
         return await self.deployment_detail(deployment_id)
+
+    async def _update_discovered_deployment(
+        self, container: dict[str, Any], changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply the unified deployment editor contract to one Docker command."""
+        settings = dict(container.get("load_settings") or {})
+        name = str(container.get("name") or "")
+        if not name or not settings.get("editable"):
+            raise ValueError("discovered deployment launch settings are not editable")
+        if self._owning_cluster_deployment(name) is not None:
+            raise ValueError("edit the cluster deployment instead of one member")
+
+        allowed = {
+            "extra_args", "launch_controls", "environment",
+            "gpu_memory_utilization", "gpu_memory_gb",
+            "sg_tp_size", "sg_mem_fraction",
+        }
+        unknown = sorted(set(changes) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+        if changes.get("gpu_memory_gb") not in (None, ""):
+            raise ValueError(
+                "GPU memory reserve is not supported for discovered deployments"
+            )
+
+        engine = str(settings.get("engine") or self._container_runtime(container))
+        args = changes.get("extra_args", settings.get("extra_args") or [])
+        if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
+            raise ValueError("extra_args must be an array of strings")
+        self._reject_sensitive_launch_args(args)
+        current_controls = _discovered_launch_controls(
+            self.manager, engine, settings,
+            [str(item) for item in settings.get("extra_args") or []],
+        )
+        submitted_controls = changes.get("launch_controls")
+        if submitted_controls is not None and not isinstance(submitted_controls, dict):
+            raise ValueError("launch_controls must be an object")
+        controls = {
+            **current_controls,
+            **(submitted_controls or {}),
+        }
+        merged_args = self.manager._apply_deployment_launch_controls(
+            list(args), engine, controls,
+        )
+
+        if engine == "sglang":
+            sg_tp_size = self.manager._validated_sg_scalar(
+                "sg_tp_size", (
+                    changes.get("sg_tp_size")
+                    if "sg_tp_size" in changes
+                    else settings.get("tensor_parallel_size")
+                )
+            )
+            flags = self.manager._replace_command_option(
+                shlex.join(merged_args), {"--tp-size"}, sg_tp_size,
+            )
+            merged_args = shlex.split(flags)
+            utilization = self.manager._validated_sg_scalar(
+                "sg_mem_fraction", (
+                    changes.get("sg_mem_fraction")
+                    if "sg_mem_fraction" in changes
+                    else settings.get("gpu_memory_utilization")
+                )
+            )
+        else:
+            utilization = (
+                changes.get("gpu_memory_utilization")
+                if "gpu_memory_utilization" in changes
+                else settings.get("gpu_memory_utilization")
+            )
+
+        replacement = {
+            "command_flags": shlex.join(merged_args),
+            "context_window": controls.get("context_window"),
+            "max_concurrency": controls.get("max_concurrency"),
+            "kv_cache_dtype": controls.get("kv_cache_dtype"),
+            "thinking_mode": controls.get("thinking_mode"),
+            "gpu_memory_utilization": utilization,
+        }
+        if "environment" in changes:
+            replacement["environment"] = changes.get("environment")
+        await self.manager.update_container_settings(name, replacement)
+        return await self.deployment_detail(f"container:{name}")
 
     async def _update_saved_deployment(
         self, stored: dict[str, Any], changes: dict[str, Any],

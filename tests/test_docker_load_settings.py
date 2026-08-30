@@ -34,6 +34,7 @@ class FakeContainer:
 
     def start(self):
         self.status = "running"
+        self.attrs["State"] = {"Health": {"Status": "healthy"}}
 
     def rename(self, name):
         self.collection.items.pop(self.name, None)
@@ -65,6 +66,8 @@ class FakeAPI:
         self.containers = containers
         self.fail = fail
         self.created_config = None
+        self.disconnected = []
+        self.connected = []
 
     def create_container_from_config(self, config, name=None):
         if self.fail:
@@ -81,6 +84,12 @@ class FakeAPI:
         )
         self.containers.add(container)
         return {"Id": cid}
+
+    def disconnect_container_from_network(self, container, network, force=False):
+        self.disconnected.append((container, network, force))
+
+    def connect_container_to_network(self, container, network, **kwargs):
+        self.connected.append((container, network, kwargs))
 
 
 class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
@@ -121,6 +130,24 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "VLLM_CACHE_ROOT": "/cache/vllm",
             "NCCL_DEBUG": "INFO",
         })
+
+    def test_credential_bearing_discovered_command_is_read_only(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "protected-container-id", "protected-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--api-key", "do-not-expose"],
+                "Labels": {},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["load_settings"]["editable"])
 
     def setUp(self):
         self.manager = Manager.__new__(Manager)
@@ -256,6 +283,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "--host", "0.0.0.0", "--port", "8000",
             "--context-length", "131072",
             "--max-running-requests", "8",
+            "--max-total-tokens", "2097152",
             "--mem-fraction-static", "0.9",
             "--kv-cache-dtype", "fp8_e4m3",
             "--enable-cache-report",
@@ -273,6 +301,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["context_window"], 131072)
         self.assertEqual(settings["gpu_memory_utilization"], 0.9)
         self.assertIn("--enable-cache-report", settings["command_flags"])
+        self.assertIn("--max-total-tokens", settings["extra_args"])
         self.assertEqual(
             self.manager._cli_option(updated, {"--max-running-requests"}), "3"
         )
@@ -280,6 +309,9 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             self.manager._cli_option(updated, {"--context-length"}), "65536"
         )
         self.assertIn("--enable-cache-report", updated)
+        self.assertEqual(
+            self.manager._cli_option(updated, {"--max-total-tokens"}), "2097152"
+        )
 
     async def test_update_clones_full_config_and_restores_running_state(self):
         name = "external-vllm"
@@ -290,8 +322,12 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         ]
         config = {
             "Image": "example/vllm:latest",
-            "Cmd": command,
-            "Env": ["SPECIAL_RUNTIME_FLAG=1"],
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
+            "Env": [
+                "SPECIAL_RUNTIME_FLAG=1", "NCCL_DEBUG=INFO",
+                "IMAGE_DEFAULT=keep-private",
+            ],
             "Labels": {"vllm-model": model},
         }
         host_config = {
@@ -320,6 +356,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 {
                     **self.manager._container_load_settings(command, "vllm", model),
                     "max_concurrency": 3,
+                    "environment": {"NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"},
                 },
             )
 
@@ -327,14 +364,152 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(replacement.status, "running")
         self.assertTrue(original.removed)
-        self.assertEqual(api.created_config["Env"], ["SPECIAL_RUNTIME_FLAG=1"])
+        self.assertEqual(api.created_config["Env"], [
+            "SPECIAL_RUNTIME_FLAG=1",
+            "IMAGE_DEFAULT=keep-private",
+            "NCCL_DEBUG=WARN",
+            "VLLM_USE_V1=1",
+        ])
         self.assertEqual(api.created_config["HostConfig"], host_config)
+        self.assertEqual(api.created_config["Entrypoint"], ["vllm", "serve"])
+        self.assertEqual(api.created_config["Cmd"][0], model)
         self.assertEqual(
             self.manager._cli_option(
                 api.created_config["Cmd"], {"--max-num-seqs"}
             ),
             "3",
         )
+
+    async def test_update_preserves_all_docker_network_attachments(self):
+        name = "external-vllm"
+        model = "example/Model"
+        command = ["vllm", "serve", model]
+        config = {
+            "Image": "example/vllm:latest", "Cmd": command,
+            "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config,
+            {"NetworkMode": "frontend"},
+        )
+        original.attrs["NetworkSettings"] = {"Networks": {
+            "frontend": {
+                "Aliases": [original.short_id, name, "model-api"],
+                "IPAMConfig": None,
+            },
+            "metrics": {
+                "Aliases": ["model-metrics"],
+                "IPAMConfig": {
+                    "IPv4Address": "172.30.0.20",
+                    "IPv6Address": "fd00::20",
+                },
+                "DriverOpts": {"com.example.option": "value"},
+            },
+        }}
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {"name": container.name}
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            await self.manager.update_container_settings(name, {
+                **self.manager._container_load_settings(command, "vllm", model),
+                "max_concurrency": 2,
+            })
+
+        self.assertEqual(
+            api.created_config["NetworkingConfig"]["EndpointsConfig"],
+            {
+                "frontend": {"Aliases": [name, "model-api"]},
+                "metrics": {
+                    "Aliases": ["model-metrics"],
+                    "DriverOpts": {"com.example.option": "value"},
+                    "IPAMConfig": {
+                        "IPv4Address": "172.30.0.20",
+                        "IPv6Address": "fd00::20",
+                    },
+                },
+            },
+        )
+        self.assertEqual(api.disconnected, [
+            (original.id, "frontend", True),
+            (original.id, "metrics", True),
+        ])
+
+    async def test_update_infers_unlabelled_sglang_from_image(self):
+        name = "external-sglang"
+        model = "example/SGLang-Model"
+        entrypoint = ["python", "-m", "sglang.launch_server"]
+        command = [
+            *entrypoint, "--model-path", model,
+            "--host", "0.0.0.0", "--port", "8000",
+            "--context-length", "131072", "--enable-metrics",
+        ]
+        config = {
+            "Image": "lmsysorg/sglang:latest",
+            "Entrypoint": entrypoint,
+            "Cmd": command[len(entrypoint):],
+            "Env": [], "Labels": {},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(containers, "sglang-id", name, config, {})
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status,
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            await self.manager.update_container_settings(name, {
+                **self.manager._container_load_settings(command, "sglang", model),
+                "context_window": 262144,
+            })
+
+        self.assertEqual(api.created_config["Entrypoint"], entrypoint)
+        self.assertEqual(api.created_config["Cmd"][:2], ["--model-path", model])
+        self.assertEqual(
+            self.manager._cli_option(
+                api.created_config["Cmd"], {"--context-length"}, int,
+            ),
+            262144,
+        )
+
+    async def test_update_rejects_hidden_credential_flags_without_replacement(self):
+        name = "protected-vllm"
+        model = "example/Model"
+        command = ["vllm", "serve", model, "--api-key", "do-not-expose"]
+        config = {
+            "Image": "example/vllm:latest", "Cmd": command,
+            "Env": [], "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(containers, "protected-id", name, config, {})
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaisesRegex(ValueError, "credential-bearing"):
+                await self.manager.update_container_settings(name, {
+                    "command_flags": "--max-num-seqs 4",
+                })
+
+        self.assertIsNone(api.created_config)
+        self.assertIs(containers.get(name), original)
 
     async def test_failed_replacement_restores_original_container(self):
         name = "external-vllm"
@@ -349,9 +524,16 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         original = FakeContainer(
             containers, "original-container-id", name, config, {}, status="running"
         )
+        original.attrs["NetworkSettings"] = {"Networks": {
+            "inference": {
+                "Aliases": [name, "model-api"],
+                "IPAMConfig": {"IPv4Address": "172.31.0.10"},
+            },
+        }}
         containers.add(original)
+        api = FakeAPI(containers, fail=True)
         self.manager.client = SimpleNamespace(
-            containers=containers, api=FakeAPI(containers, fail=True)
+            containers=containers, api=api
         )
         self.manager.lock = asyncio.Lock()
 
@@ -368,6 +550,76 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
+        self.assertIs(containers.get(name), original)
+        self.assertEqual(original.status, "running")
+        self.assertFalse(original.removed)
+        self.assertEqual(api.disconnected, [(original.id, "inference", True)])
+        self.assertEqual(api.connected, [(
+            original.id,
+            "inference",
+            {
+                "ipv4_address": "172.31.0.10",
+                "aliases": [name, "model-api"],
+            },
+        )])
+
+    async def test_replacement_that_exits_after_start_rolls_back(self):
+        class DelayedExitContainer(FakeContainer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.reload_count = 0
+                self.started = False
+
+            def start(self):
+                self.started = True
+                self.status = "running"
+
+            def reload(self):
+                if self.started:
+                    self.reload_count += 1
+                    if self.reload_count >= 2:
+                        self.status = "exited"
+
+        class DelayedExitAPI(FakeAPI):
+            def create_container_from_config(self, config, name=None):
+                self.created_config = copy.deepcopy(config)
+                cid = "exiting-replacement-id"
+                replacement = DelayedExitContainer(
+                    self.containers, cid, name, config,
+                    config.get("HostConfig") or {}, status="created",
+                )
+                self.containers.add(replacement)
+                self.replacement = replacement
+                return {"Id": cid}
+
+        name = "external-vllm"
+        model = "example/Model"
+        command = ["vllm", "serve", model]
+        config = {
+            "Image": "example/vllm:latest", "Cmd": command,
+            "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {}, status="running"
+        )
+        containers.add(original)
+        api = DelayedExitAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                await self.manager.update_container_settings(name, {
+                    **self.manager._container_load_settings(command, "vllm", model),
+                    "max_concurrency": 2,
+                })
+
+        self.assertGreaterEqual(api.replacement.reload_count, 2)
+        self.assertTrue(api.replacement.removed)
         self.assertIs(containers.get(name), original)
         self.assertEqual(original.status, "running")
         self.assertFalse(original.removed)

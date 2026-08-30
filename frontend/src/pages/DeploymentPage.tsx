@@ -135,7 +135,9 @@ export function DeploymentPage() {
     setBusy('save'); setError(undefined); setNotice(undefined)
     try {
       await persist()
-      setNotice('Deployment settings saved. They will be applied on the next run.')
+      setNotice(deploymentId.startsWith('container:')
+        ? 'Deployment settings saved and applied.'
+        : 'Deployment settings saved. They will be applied on the next run.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save deployment settings')
     } finally { setBusy(undefined) }
@@ -198,7 +200,7 @@ export function DeploymentPage() {
           <label className="field"><span>Tensor parallel size</span><input disabled={disabled} type="number" min="1" value={editor.tensor_parallel_size} onChange={(event) => set('tensor_parallel_size', event.target.value)} /></label>
           <label className="field"><span>Pipeline parallel size</span><input disabled={disabled} type="number" min="1" value={editor.pipeline_parallel_size} onChange={(event) => set('pipeline_parallel_size', event.target.value)} /></label>
           <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
-          <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>
+          {!detail.id.startsWith('container:') && <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>}
           <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder="VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>
         </>}
         {detail.runtime === 'sglang' && <>

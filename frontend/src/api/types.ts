@@ -912,6 +912,7 @@ export interface BenchmarkRunnerRunConfig {
   context_depths: number[]
   runs: number
   warmup_runs: number
+  enable_prefix_caching: boolean
   exact_tg: boolean
 }
 

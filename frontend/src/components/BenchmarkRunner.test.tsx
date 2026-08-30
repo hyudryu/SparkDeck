@@ -24,6 +24,7 @@ const completedRun = {
     context_depths: [0],
     runs: 3,
     warmup_runs: 1,
+    enable_prefix_caching: true,
     exact_tg: false,
   },
   benchy_version: '0.1.2',
@@ -136,6 +137,9 @@ describe('BenchmarkRunner', () => {
     await screen.findByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })
     expect(screen.getByLabelText(/Served model/).closest('.runner-config-panel')).not.toBeNull()
     expect(within(screen.getByLabelText(/Served model/)).getByRole('option', { name: /Qwen3-4B-GGUF · Q4_K_M/ })).toBeInTheDocument()
+    expect(screen.getByLabelText(/Concurrency levels/)).toHaveValue('1, 2, 5, 10')
+    expect(screen.getByLabelText(/Context depths/)).toHaveValue('0, 4096, 8192, 16384, 32768, 65535, 100000')
+    expect(screen.getByLabelText(/Enable prefix caching/)).toBeChecked()
 
     await user.clear(screen.getByLabelText(/Concurrency levels/))
     await user.type(screen.getByLabelText(/Concurrency levels/), '1, 2, 4')
@@ -150,6 +154,8 @@ describe('BenchmarkRunner', () => {
     expect(body.concurrency_levels).toEqual([1, 2, 4])
     expect(body.prompt_sizes).toEqual([2048])
     expect(body.response_sizes).toEqual([128])
+    expect(body.context_depths).toEqual([0, 4096, 8192, 16384, 32768, 65535, 100000])
+    expect(body.enable_prefix_caching).toBe(true)
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
     expect(within(history).getAllByText('Q4_K_M').length).toBeGreaterThan(0)

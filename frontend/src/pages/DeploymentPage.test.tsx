@@ -120,6 +120,7 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText(/Runtime flags/)).toHaveValue(
       '--max-model-len 400000 --enable-prefix-caching',
     )
+    expect(screen.queryByLabelText('GPU memory reserve (GB)')).not.toBeInTheDocument()
     await user.clear(screen.getByLabelText('Max concurrency'))
     await user.type(screen.getByLabelText('Max concurrency'), '6')
     await user.click(screen.getByRole('button', { name: 'Save' }))

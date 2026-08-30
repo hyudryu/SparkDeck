@@ -122,6 +122,24 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "NCCL_DEBUG": "INFO",
         })
 
+    def test_credential_bearing_discovered_command_is_read_only(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "protected-container-id", "protected-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--api-key", "do-not-expose"],
+                "Labels": {},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["load_settings"]["editable"])
+
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 
@@ -290,7 +308,8 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         ]
         config = {
             "Image": "example/vllm:latest",
-            "Cmd": command,
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
             "Env": [
                 "SPECIAL_RUNTIME_FLAG=1", "NCCL_DEBUG=INFO",
                 "IMAGE_DEFAULT=keep-private",
@@ -338,12 +357,84 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "VLLM_USE_V1=1",
         ])
         self.assertEqual(api.created_config["HostConfig"], host_config)
+        self.assertEqual(api.created_config["Entrypoint"], ["vllm", "serve"])
+        self.assertEqual(api.created_config["Cmd"][0], model)
         self.assertEqual(
             self.manager._cli_option(
                 api.created_config["Cmd"], {"--max-num-seqs"}
             ),
             "3",
         )
+
+    async def test_update_infers_unlabelled_sglang_from_image(self):
+        name = "external-sglang"
+        model = "example/SGLang-Model"
+        entrypoint = ["python", "-m", "sglang.launch_server"]
+        command = [
+            *entrypoint, "--model-path", model,
+            "--host", "0.0.0.0", "--port", "8000",
+            "--context-length", "131072", "--enable-metrics",
+        ]
+        config = {
+            "Image": "lmsysorg/sglang:latest",
+            "Entrypoint": entrypoint,
+            "Cmd": command[len(entrypoint):],
+            "Env": [], "Labels": {},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(containers, "sglang-id", name, config, {})
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status,
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            await self.manager.update_container_settings(name, {
+                **self.manager._container_load_settings(command, "sglang", model),
+                "context_window": 262144,
+            })
+
+        self.assertEqual(api.created_config["Entrypoint"], entrypoint)
+        self.assertEqual(api.created_config["Cmd"][:2], ["--model-path", model])
+        self.assertEqual(
+            self.manager._cli_option(
+                api.created_config["Cmd"], {"--context-length"}, int,
+            ),
+            262144,
+        )
+
+    async def test_update_rejects_hidden_credential_flags_without_replacement(self):
+        name = "protected-vllm"
+        model = "example/Model"
+        command = ["vllm", "serve", model, "--api-key", "do-not-expose"]
+        config = {
+            "Image": "example/vllm:latest", "Cmd": command,
+            "Env": [], "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(containers, "protected-id", name, config, {})
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaisesRegex(ValueError, "credential-bearing"):
+                await self.manager.update_container_settings(name, {
+                    "command_flags": "--max-num-seqs 4",
+                })
+
+        self.assertIsNone(api.created_config)
+        self.assertIs(containers.get(name), original)
 
     async def test_failed_replacement_restores_original_container(self):
         name = "external-vllm"

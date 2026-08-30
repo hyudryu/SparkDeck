@@ -10174,6 +10174,13 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        if self._without_sensitive_cli_credentials(
+            load_settings.get("extra_args") or []
+        ) != list(load_settings.get("extra_args") or []):
+            # The editor must never echo credentials back to the browser. A
+            # sanitized save could otherwise recreate the container without
+            # its authentication flag, so keep this command read-only.
+            load_settings["editable"] = False
         load_settings["environment"] = runtime_environment
 
         summary = {
@@ -11322,10 +11329,35 @@ class Manager:
                 raise ValueError("edit the deployment recipe instead of one cluster member")
             attrs = copy.deepcopy(container.attrs or {})
             config = copy.deepcopy(attrs.get("Config") or {})
-            cmd = config.get("Cmd") or []
-            engine = _label_value(labels, ENGINE_LABEL, "vllm")
+            entrypoint = self._container_argv({
+                "Config": {"Entrypoint": config.get("Entrypoint")},
+            })
+            cmd = self._container_argv(attrs)
+            image = str(config.get("Image") or attrs.get("Image") or "")
+            engine = _label_value(labels, ENGINE_LABEL, "")
+            if not engine:
+                engine = "sglang" if _is_sglang_image(image) else "vllm"
             model = _label_value(labels, MODEL_LABEL, "")
-            new_cmd = self._updated_container_command(cmd, engine, model, settings)
+            if not model:
+                if engine == "sglang" and "--model-path" in cmd:
+                    index = cmd.index("--model-path")
+                    if index + 1 < len(cmd):
+                        model = cmd[index + 1]
+                elif "serve" in cmd:
+                    index = cmd.index("serve")
+                    if index + 1 < len(cmd):
+                        model = cmd[index + 1]
+            current_settings = self._container_load_settings(cmd, engine, model)
+            if self._without_sensitive_cli_credentials(
+                current_settings.get("extra_args") or []
+            ) != list(current_settings.get("extra_args") or []):
+                raise ValueError(
+                    "containers with credential-bearing launch arguments are read-only"
+                )
+            new_argv = self._updated_container_command(cmd, engine, model, settings)
+            if new_argv[:len(entrypoint)] != entrypoint:
+                raise ValueError("container entrypoint cannot be changed by the settings editor")
+            new_cmd = new_argv[len(entrypoint):]
             requested_environment = None
             if "environment" in settings:
                 requested_environment = normalize_runtime_environment(

@@ -1681,28 +1681,46 @@ class SparkDeckService:
         if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
             raise ValueError("extra_args must be an array of strings")
         self._reject_sensitive_launch_args(args)
-        controls = changes.get("launch_controls")
-        if controls is None:
-            controls = _discovered_launch_controls(self.manager, engine, settings, args)
-        if not isinstance(controls, dict):
+        current_controls = _discovered_launch_controls(
+            self.manager, engine, settings,
+            [str(item) for item in settings.get("extra_args") or []],
+        )
+        submitted_controls = changes.get("launch_controls")
+        if submitted_controls is not None and not isinstance(submitted_controls, dict):
             raise ValueError("launch_controls must be an object")
+        controls = {
+            **current_controls,
+            **(submitted_controls or {}),
+        }
         merged_args = self.manager._apply_deployment_launch_controls(
             list(args), engine, controls,
         )
 
         if engine == "sglang":
             sg_tp_size = self.manager._validated_sg_scalar(
-                "sg_tp_size", changes.get("sg_tp_size")
+                "sg_tp_size", (
+                    changes.get("sg_tp_size")
+                    if "sg_tp_size" in changes
+                    else settings.get("tensor_parallel_size")
+                )
             )
             flags = self.manager._replace_command_option(
                 shlex.join(merged_args), {"--tp-size"}, sg_tp_size,
             )
             merged_args = shlex.split(flags)
             utilization = self.manager._validated_sg_scalar(
-                "sg_mem_fraction", changes.get("sg_mem_fraction")
+                "sg_mem_fraction", (
+                    changes.get("sg_mem_fraction")
+                    if "sg_mem_fraction" in changes
+                    else settings.get("gpu_memory_utilization")
+                )
             )
         else:
-            utilization = changes.get("gpu_memory_utilization")
+            utilization = (
+                changes.get("gpu_memory_utilization")
+                if "gpu_memory_utilization" in changes
+                else settings.get("gpu_memory_utilization")
+            )
 
         replacement = {
             "command_flags": shlex.join(merged_args),

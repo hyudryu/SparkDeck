@@ -498,6 +498,42 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-pp 1", flags)
         self.assertIn("--max-num-batched-tokens 8192", flags)
 
+    async def test_discovered_partial_update_preserves_memory_utilization(self):
+        card = {
+            "id": "container:vllm-partial", "alias": "partial", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "running", "settings": {},
+        }
+        container = {
+            "name": "vllm-partial", "load_settings": {
+                "engine": "vllm", "editable": True, "extra_args": [],
+                "context_window": 65536, "max_concurrency": 8,
+                "thinking_mode": "default", "gpu_memory_utilization": 0.85,
+            },
+        }
+        update = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_settings", update),
+        ):
+            response = await self.client.put(
+                "/api/v1/deployments/container:vllm-partial/settings",
+                json={
+                    "environment": {"NCCL_DEBUG": "WARN"},
+                    "launch_controls": {"context_window": 131072},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        replacement = update.await_args.args[1]
+        self.assertEqual(replacement["gpu_memory_utilization"], 0.85)
+        self.assertEqual(replacement["context_window"], 131072)
+        self.assertEqual(replacement["max_concurrency"], 8)
+
     async def test_unparseable_discovered_settings_remain_read_only(self):
         card = {
             "id": "container:custom", "alias": "custom", "runtime": "vllm",

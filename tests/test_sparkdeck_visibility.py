@@ -244,18 +244,18 @@ class SavedConfigurationContractTests(unittest.TestCase):
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 
-    def test_vllm_tensor_parallelism_sets_sharded_node_count(self):
+    def test_vllm_tp_and_pp_product_sets_sharded_node_count(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "vllm",
             "extra_args": ["--tensor-parallel-size=2", "-pp", "2"],
         })
 
         self.assertEqual(contract["deployment_mode"], "sharded")
-        self.assertEqual(contract["required_node_count"], 2)
+        self.assertEqual(contract["required_node_count"], 4)
         self.assertEqual(contract["tensor_parallel_size"], 2)
         self.assertEqual(contract["pipeline_parallel_size"], 2)
 
-    def test_sharded_contract_requires_one_node_per_tensor_rank(self):
+    def test_sharded_contract_honors_saved_nodes_with_ranks_per_node(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "vllm", "deployment_mode": "sharded",
             "node_ids": ["local", "node-2"],
@@ -264,11 +264,11 @@ class SavedConfigurationContractTests(unittest.TestCase):
         })
 
         self.assertEqual(contract["deployment_mode"], "sharded")
-        self.assertEqual(contract["required_node_count"], 4)
+        self.assertEqual(contract["required_node_count"], 2)
         self.assertEqual(contract["tensor_parallel_size"], 4)
         self.assertEqual(contract["pipeline_parallel_size"], 1)
 
-    def test_sharded_contract_uses_tensor_parallel_node_count(self):
+    def test_sharded_contract_keeps_rank_count_when_nodes_do_not_divide(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "vllm", "deployment_mode": "sharded",
             "node_ids": ["local", "node-2"],
@@ -277,7 +277,7 @@ class SavedConfigurationContractTests(unittest.TestCase):
 
         self.assertEqual(contract["required_node_count"], 3)
 
-    def test_sglang_contract_uses_tensor_parallel_node_count(self):
+    def test_sglang_contract_keeps_rank_count_for_saved_nodes(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "sglang", "deployment_mode": "sharded", "sg_tp_size": 4,
             "node_ids": ["local", "node-2"],

@@ -195,7 +195,24 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["node_ids"], ["local", "worker-1"])
             stored = service.store.deployment(result["id"], include_private=True)
             self.assertEqual(
+                stored["model"]["repository"],
+                "/cache/models/org--model/snapshots/rev",
+            )
+            self.assertEqual(
                 stored["settings"]["source_container_name"], "external-tp2",
+            )
+            manager.model_cache_inventory = AsyncMock(return_value=[
+                {
+                    "id": node_id,
+                    "models": [{
+                        "model_id": "/cache/models/org--model/snapshots/rev",
+                        "revisions": ["main"],
+                    }],
+                }
+                for node_id in ("local", "worker-1")
+            ])
+            await service._validate_start_selection(
+                stored, ["local", "worker-1"], launch,
             )
             await manager.http.aclose()
             await service.close()
@@ -241,6 +258,32 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
                     "container:external-local", "start", ["local", "worker-1"],
                 )
 
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_credential_bearing_discovered_runtime_rejects_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "external-protected", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "load_settings": {
+                    "editable": False,
+                    "tensor_parallel_size": 2,
+                    "extra_args": ["--api-key", "do-not-drop"],
+                },
+            }]
+            manager._recovered_deployment_launch_settings = Mock()
+            manager.create_deployment = AsyncMock()
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(ValueError, "cannot be promoted safely"):
+                await service.deployment_action(
+                    "container:external-protected", "start", ["local", "worker-1"],
+                )
+
+            manager._recovered_deployment_launch_settings.assert_not_called()
             manager.create_deployment.assert_not_awaited()
             await manager.http.aclose()
             await service.close()

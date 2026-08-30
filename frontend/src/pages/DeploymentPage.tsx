@@ -156,11 +156,18 @@ export function DeploymentPage() {
         ? persisted
         : Math.max(2, resource.data?.node_ids?.length ?? 0)
     }
-    const raw = resource.data?.runtime === 'sglang'
+    const tp = Number(resource.data?.runtime === 'sglang'
       ? editor.sg_tp_size
-      : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1'
-    const parsed = Number(raw)
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : 1
+      : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1')
+    const tensor = Number.isInteger(tp) && tp > 0 ? tp : 1
+    if (resource.data?.runtime !== 'vllm') return tensor
+    const pp = Number(editor.pipeline_parallel_size)
+    const pipeline = Number.isInteger(pp) && pp > 0 ? pp : 1
+    const world = tensor * pipeline
+    const savedCount = resource.data?.node_ids?.length ?? 0
+    return world > 1 && savedCount > 1 && world % savedCount === 0
+      ? savedCount
+      : world
   }
 
   const openRun = (form: HTMLFormElement | null) => {
@@ -247,13 +254,19 @@ export function DeploymentPage() {
     </Panel>
     {runSelection && (() => {
       const required = requiredRunNodes()
+      const tensor = Number(detail.runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size) || 1
+      const layoutDescription = detail.deployment_mode === 'sharded'
+        ? `TP${tensor} is distributed across exactly ${required} ${required === 1 ? 'node' : 'nodes'}.`
+        : detail.deployment_mode === 'replicated'
+          ? `This replicated layout runs on exactly ${required} nodes.`
+          : `This single-node layout runs TP${tensor} on one physical node.`
       const exactCount = runSelection.length === required
       const allSelectable = runSelection.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
       const ready = !nodes.loading && !nodes.error && exactCount && allSelectable
       return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="run-deployment-title">
           <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="run-deployment-title">Start {detail.alias}</h2></div><button className="icon-button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)} aria-label="Close dialog">×</button></div>
-          <p className="modal-description">Tensor parallel size {required} requires exactly {required} {required === 1 ? 'node' : 'nodes'}. Select where SparkDeck should start the deployment.</p>
+          <p className="modal-description">{layoutDescription} Select where SparkDeck should start the deployment.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <NodeSelector
             nodes={nodes.data ?? []}

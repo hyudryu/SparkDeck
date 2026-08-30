@@ -113,6 +113,7 @@ describe('deployment object page', () => {
     expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
     await user.click(screen.getByRole('button', { name: 'Run' }))
     expect(await screen.findByRole('button', { name: 'Start on 1 node' })).toBeInTheDocument()
+    expect(screen.getByText(/single-node layout runs TP4 on one physical node/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Start on 1 node' }))
 
     const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
@@ -138,12 +139,40 @@ describe('deployment object page', () => {
 
     expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(1)
     await user.click(screen.getByRole('button', { name: 'Run' }))
-    await user.click(await screen.findByRole('button', { name: 'Start on 3 nodes' }))
+    const start = await screen.findByRole('button', { name: 'Start on 3 nodes' })
+    expect(screen.getByText(/replicated layout runs on exactly 3 nodes/)).toBeInTheDocument()
+    await user.click(start)
 
     const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
     expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({
       node_ids: ['local', 'worker-1', 'worker-2'],
     })
+  })
+
+  it('preserves a valid saved multi-rank-per-node sharded topology', async () => {
+    const user = userEvent.setup()
+    const sharded = {
+      ...detail,
+      node_ids: ['local', 'worker-1'],
+      required_node_count: 2,
+      launch_controls: {
+        ...detail.launch_controls,
+        tensor_parallel_size: 4,
+        pipeline_parallel_size: 1,
+      },
+    }
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(sharded), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('button', { name: 'Start on 2 nodes' })).toBeInTheDocument()
+    expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
   })
 
   it('keeps a running deployment read-only', async () => {

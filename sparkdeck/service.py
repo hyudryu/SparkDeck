@@ -2279,9 +2279,19 @@ class SparkDeckService:
             tensor = _positive_parallel(controls.get("tensor_parallel_size"))
             if tensor == 1:
                 tensor = _positive_parallel(settings.get("tensor_parallel_size"))
-            parallel_nodes = tensor
-            if parallel_nodes > 1:
-                count = parallel_nodes
+            world = tensor * _positive_parallel(
+                controls.get("pipeline_parallel_size")
+            )
+            if world > 1:
+                # Mirror Manager's launch gate: vLLM may place several ranks
+                # per saved node when TP x PP divides the node count. SGLang
+                # continues to require one selected host per rank.
+                count = (
+                    len(node_ids)
+                    if runtime == RuntimeKind.VLLM.value
+                    and len(node_ids) > 1 and world % len(node_ids) == 0
+                    else world
+                )
             else:
                 count = max(2, len(node_ids))
         elif mode == "replicated":
@@ -3256,7 +3266,15 @@ class SparkDeckService:
             runtime=RuntimeKind(str(deployment.get("runtime") or "vllm")),
             kind=DeploymentKind.MANAGED,
             model=ModelIdentity(
-                repository=str(model.get("repository") or replacement.get("model") or ""),
+                # The alias remains the served/inference identity. The model
+                # record must use the executable repository/path so cache and
+                # locality validation remain correct on later restarts.
+                repository=str(
+                    (launch_settings or {}).get("model")
+                    or replacement.get("model")
+                    or model.get("repository")
+                    or ""
+                ),
                 revision=_optional_string(revision),
                 artifact=_optional_string(model.get("artifact")),
                 quantization=_optional_string(model.get("quantization")),
@@ -3332,6 +3350,12 @@ class SparkDeckService:
                 f"tensor parallel size {tensor_parallel} requires exactly "
                 f"{tensor_parallel} node(s)"
             )
+        self._reject_sensitive_launch_args(settings.get("extra_args"))
+        if settings.get("editable") is False:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command contains credentials or unsupported arguments"
+            )
 
         launch_model = str(settings.get("model") or container.get("model") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
@@ -3364,8 +3388,13 @@ class SparkDeckService:
             "node_ids": list(node_ids),
         })
         replacement = await self.manager.create_deployment(launch_settings)
+        adopted_launch_settings = {
+            **launch_settings,
+            **(replacement.get("launch_settings") or {}),
+        }
+        adopted_launch_settings["model"] = launch_model
         return self._adopt_manager_replacement(
-            deployment, replacement, replacement.get("launch_settings") or launch_settings,
+            deployment, replacement, adopted_launch_settings,
         )
 
     async def _deployment_action_locked(

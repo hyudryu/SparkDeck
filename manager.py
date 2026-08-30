@@ -9220,7 +9220,7 @@ class Manager:
             )
         tensor_parallel = positive_parallelism(tensor_parallel)
         pipeline_parallel = positive_parallelism(pipeline_parallel)
-        parallel_nodes = tensor_parallel
+        parallel_nodes = tensor_parallel * pipeline_parallel
         persisted_mode = recipe.get("deployment_mode")
         mode = str(persisted_mode or "single")
         mode_error = args_error
@@ -9246,10 +9246,19 @@ class Manager:
         if mode == "replicated":
             required_nodes = max(2, len(saved_nodes))
         elif mode == "sharded":
-            required_nodes = (
-                parallel_nodes if parallel_nodes > 1
-                else max(2, len(saved_nodes))
-            )
+            saved_count = len(saved_nodes)
+            if (
+                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
+                and parallel_nodes % saved_count == 0
+            ):
+                # vLLM can place several ranks on each selected host. Preserve
+                # a saved topology when it evenly divides TP x PP; launch
+                # preflight verifies that every host has enough GPUs.
+                required_nodes = saved_count
+            elif parallel_nodes > 1:
+                required_nodes = parallel_nodes
+            else:
+                required_nodes = max(2, saved_count)
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.

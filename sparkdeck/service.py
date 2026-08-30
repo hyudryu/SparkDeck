@@ -1423,6 +1423,12 @@ class SparkDeckService:
             controls = changes.get("launch_controls")
             if not isinstance(controls, dict):
                 raise ValueError("launch_controls must be an object")
+            saved_controls = settings.get("launch_controls")
+            if isinstance(saved_controls, dict):
+                # Clients that omit newer keys (an older frontend, a minimal
+                # API caller) must not drop the saved values; only an
+                # explicitly present null is a clear.
+                controls = {**saved_controls, **controls}
             context_window = controls.get("context_window")
             if context_window not in (None, ""):
                 try:
@@ -1477,6 +1483,13 @@ class SparkDeckService:
                 # contract keeps demanding the stale topology. SGLang editors
                 # always submit a null here; their scalar is sg-driven.
                 settings["tensor_parallel_size"] = None
+            pp_control = controls.get("pipeline_parallel_size")
+            if isinstance(pp_control, int):
+                settings["pipeline_parallel_size"] = pp_control
+            elif "pipeline_parallel_size" in controls and str(
+                stored.get("runtime")
+            ) == RuntimeKind.VLLM.value:
+                settings["pipeline_parallel_size"] = None
         if "sg_tp_size" in changes:
             settings["tensor_parallel_size"] = changes["sg_tp_size"]
         if "sg_mem_fraction" in changes:
@@ -1766,11 +1779,14 @@ class SparkDeckService:
             ),
         }
         if runtime == RuntimeKind.VLLM.value:
-            # The Models page saves sharded vLLM bookmarks with a bare
-            # tensor_parallel_size scalar; seed the editor with it so an
-            # unchanged Save cannot submit a null that strips the TP flag.
+            # The Models page saves sharded vLLM bookmarks with bare
+            # parallel-size scalars; seed the editor with them so an
+            # unchanged Save cannot submit nulls that strip the TP/PP flags.
             scalar_seeds["tensor_parallel_size"] = saved_settings.get(
                 "tensor_parallel_size"
+            )
+            scalar_seeds["pipeline_parallel_size"] = saved_settings.get(
+                "pipeline_parallel_size"
             )
         for key, value in scalar_seeds.items():
             # A key present in the saved controls is an explicit editor value
@@ -1814,9 +1830,12 @@ class SparkDeckService:
             tensor = _positive_parallel(controls.get("tensor_parallel_size"))
             if tensor == 1:
                 tensor = _positive_parallel(settings.get("tensor_parallel_size"))
-            world = tensor * _positive_parallel(
-                controls.get("pipeline_parallel_size")
-            )
+            pipeline = _positive_parallel(controls.get("pipeline_parallel_size"))
+            if pipeline == 1:
+                pipeline = _positive_parallel(
+                    settings.get("pipeline_parallel_size")
+                )
+            world = tensor * pipeline
             if world > 1:
                 # Mirror Manager's launch gate: several ranks per node are
                 # valid for vLLM when the world size divides the saved node

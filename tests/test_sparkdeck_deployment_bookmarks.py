@@ -697,6 +697,33 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(stored["settings"]["tensor_parallel_size"])
 
+        # Omitted keys keep their saved values on partial control updates.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {"pipeline_parallel_size": 2},
+        })
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {"max_concurrency": 6},
+        })
+        detail = await self.service.deployment_detail(
+            self.service.store.deployment("sharded-bookmark")["id"],
+        )
+        self.assertEqual(detail["launch_controls"]["pipeline_parallel_size"], 2)
+        stored = self.service.store.deployment(
+            "sharded-bookmark", include_private=True,
+        )
+        self.assertEqual(stored["settings"]["pipeline_parallel_size"], 2)
+
+        # The pipeline scalar seeds the editor the same way as tensor.
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "pp-bookmark", "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "sharded",
+            "settings": {"pipeline_parallel_size": 2},
+        })
+        pp_detail = await self.service.deployment_detail(
+            self.service.store.deployment("pp-bookmark")["id"],
+        )
+        self.assertEqual(pp_detail["launch_controls"]["pipeline_parallel_size"], 2)
+
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "fresh", "runtime": "vllm",

@@ -132,7 +132,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 "managed_by": "sparkdeck-mcp",
                 "automation_run_id": "run-1",
             },
-        ))
+        ), "http://127.0.0.1:8000")
 
         first = await self.service.clone_deployment("running-1")
         second = await self.service.clone_deployment(first["id"])
@@ -146,12 +146,13 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["model"]["quantization"], "fp8")
         self.assertEqual(first["settings"]["context_length"], 32768)
         self.assertEqual(first["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+        self.assertFalse(first["base_url_set"])
         self.assertNotIn("manager_deployment_id", first["settings"])
         self.assertNotIn("managed_by", first["settings"])
         self.assertNotIn("automation_run_id", first["settings"])
-        self.assertIsNone(
-            self.service.store.deployment(first["id"], include_private=True)["container_name"],
-        )
+        private = self.service.store.deployment(first["id"], include_private=True)
+        self.assertIsNone(private["container_name"])
+        self.assertIsNone(private.get("_base_url"))
 
     async def test_clone_preserves_external_endpoint_and_credential(self):
         self.service.store.add_deployment(Deployment(
@@ -236,7 +237,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             id="llama-record", alias="Llama model", runtime=RuntimeKind.LLAMA_CPP,
             kind=DeploymentKind.MANAGED,
             model=ModelIdentity(
-                "org/model", revision=revision, artifact=cached_artifact,
+                "org/model", artifact=cached_artifact,
                 quantization="Q4_K_M",
             ),
             settings={
@@ -262,6 +263,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             cloned["model"]["artifact"], "GGUF/model-Q4_K_M.gguf",
         )
+        self.assertEqual(cloned["model"]["revision"], revision)
         self.assertEqual(cloned["settings"]["context_length"], 16384)
         self.assertEqual(cloned["settings"]["parallel_slots"], 4)
         self.assertEqual(cloned["settings"]["gpu_layers"], 77)
@@ -270,10 +272,10 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(prepared_artifact, cached_artifact)
         self.assertEqual(
-            self.service._clone_llama_artifact(
+            self.service._clone_llama_artifact_identity(
                 "org/model", r"C:\models\local.gguf",
             ),
-            r"C:\models\local.gguf",
+            (r"C:\models\local.gguf", None),
         )
         launch = self.service._cluster_launch_body(
             RuntimeKind.LLAMA_CPP, "org/model", cloned["alias"], cloned["id"],

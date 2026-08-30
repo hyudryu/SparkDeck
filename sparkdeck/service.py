@@ -3979,11 +3979,13 @@ class SparkDeckService:
             normalized.pop(runtime_identity_key, None)
         return normalized, launch_settings
 
-    def _clone_llama_artifact(self, repository: str, artifact: Any) -> str | None:
-        """Restore a Manager cache reference to its repository-relative GGUF path."""
+    def _clone_llama_artifact_identity(
+        self, repository: str, artifact: Any,
+    ) -> tuple[str | None, str | None]:
+        """Restore a Manager cache reference and its pinned snapshot revision."""
         value = _optional_string(artifact)
         if value is None:
-            return None
+            return None, None
         normalized = value.replace("\\", "/")
         parts = PurePosixPath(normalized).parts
         encoded_repository = "models--" + repository.replace("/", "--")
@@ -3994,10 +3996,13 @@ class SparkDeckService:
             and re.fullmatch(r"[0-9a-f]{40}", parts[2], re.IGNORECASE)
         ):
             relative = "/".join(parts[3:])
-            return self._validate_public_gguf_artifact(
-                repository, relative, None,
-            ).as_posix()
-        return value
+            return (
+                self._validate_public_gguf_artifact(
+                    repository, relative, None,
+                ).as_posix(),
+                parts[2],
+            )
+        return value, None
 
     async def clone_deployment(self, deployment_id: str) -> dict[str, Any]:
         """Copy a persisted deployment's configuration without its live runtime."""
@@ -4035,11 +4040,17 @@ class SparkDeckService:
             model = stored.get("model") or {}
             repository = str(model.get("repository") or "")
             artifact = model.get("artifact")
+            revision = _optional_string(model.get("revision"))
             if runtime is RuntimeKind.LLAMA_CPP:
-                artifact = self._clone_llama_artifact(
+                artifact, snapshot_revision = self._clone_llama_artifact_identity(
                     repository,
                     launch_settings.get("llama_artifact") or artifact,
                 )
+                revision = snapshot_revision or revision
+            clone_base_url = (
+                stored.get("_base_url")
+                if kind is DeploymentKind.EXTERNAL else None
+            )
             clone = Deployment(
                 id=clone_id,
                 alias=alias,
@@ -4047,12 +4058,12 @@ class SparkDeckService:
                 kind=kind,
                 model=ModelIdentity(
                     repository=repository,
-                    revision=_optional_string(model.get("revision")),
+                    revision=revision,
                     artifact=artifact,
                     quantization=_optional_string(model.get("quantization")),
                 ),
                 settings=settings,
-                base_url_set=bool(stored.get("_base_url")),
+                base_url_set=bool(clone_base_url),
                 desired_state=(
                     "stopped" if kind is DeploymentKind.MANAGED
                     else str(stored.get("desired_state") or "running")
@@ -4071,7 +4082,7 @@ class SparkDeckService:
                 credential_ref = self._store_credential(clone_id, api_key)
             try:
                 self.store.add_deployment(
-                    clone, stored.get("_base_url"), credential_ref,
+                    clone, clone_base_url, credential_ref,
                 )
             except Exception:
                 self._delete_credential(clone_id, credential_ref)

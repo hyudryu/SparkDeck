@@ -3793,11 +3793,10 @@ async def community_upload_once() -> dict:
                 or current_pairing.get("refresh_token") != refresh_token
             ):
                 break
-            # The batch is only a scheduling snapshot; re-read the row at the
-            # outbound boundary so a deleted or transitioned sample never sends.
-            current = store.outbox_entry(
-                sample_id, prepared_payload=entry["payload"],
-            )
+            # The batch is only a scheduling snapshot. Recompute the cohort
+            # average inside the same mutation lock used by deletion so every
+            # measurement folded into this payload still exists when POST begins.
+            current = store.outbox_entry(sample_id)
             if current is None:
                 continue
             response = await _post_community_sample(

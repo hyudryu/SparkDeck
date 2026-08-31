@@ -410,6 +410,48 @@ class SparkDeckStoreTests(unittest.TestCase):
             self.store.community_consent_snapshot()["generation"], 1,
         )
 
+    def test_migration_backfills_current_consent_epoch_only_for_unsent_rows(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="synced-old", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            base, consent["generation"],
+        ))
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            replace(base, id="pending-current"), consent["generation"],
+        ))
+        self.store.mark_outbox_synced(["synced-old"])
+
+        database = self.store.path
+        self.store.close()
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("DROP INDEX benchmark_samples_community_cohort")
+            connection.execute(
+                "ALTER TABLE benchmark_samples DROP COLUMN consent_generation"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.store = SparkDeckStore(database)
+
+        generations = dict(self.store._connection.execute(
+            "SELECT id, consent_generation FROM benchmark_samples"
+        ).fetchall())
+        self.assertIsNone(generations["synced-old"])
+        self.assertEqual(
+            generations["pending-current"], consent["generation"],
+        )
+
     def test_migration_adds_cluster_id_column_to_legacy_benchmark_table(self):
         database = Path(self.temp.name) / "legacy-benchmarks.sqlite3"
         connection = sqlite3.connect(database)
@@ -1038,6 +1080,22 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(
             {payload["inference_tokens_per_second"] for payload in payloads},
             {30.0},
+        )
+        plan = self.store._connection.execute(
+            """EXPLAIN QUERY PLAN SELECT * FROM benchmark_samples
+               WHERE eligible = 1 AND consent_generation = ?
+                 AND community_model_id = ?
+                 AND community_quantization = ?
+                 AND community_prompt_bucket = ?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (
+                consent["generation"], "deepseek-r1", "Q4_K_M", 400,
+                256,
+            ),
+        ).fetchall()
+        self.assertIn(
+            "benchmark_samples_community_cohort",
+            " ".join(str(column) for row in plan for column in row),
         )
 
     def test_upload_average_excludes_measurements_from_prior_consent_epoch(self):

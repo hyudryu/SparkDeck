@@ -3080,6 +3080,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         instance = Manager.__new__(Manager)
+        instance.settings = {"default_gpu_memory_utilization": 0.9}
         args = ["--speculative-config", "${SPECULATIVE_CONFIG}"]
         environment = {}
 
@@ -3151,6 +3152,61 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(preview["flags"].count("--max-total-tokens"), 1)
         self.assertNotIn("999", preview["flags"])
+
+    def test_sglang_runtime_controls_preserve_standalone_token_limit(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        flags = instance._with_sglang_runtime_controls(
+            ["--max-total-tokens", "999", "--enable-metrics"],
+            None, None, None, None,
+        )
+
+        self.assertEqual(
+            flags, ["--max-total-tokens", "999", "--enable-metrics"],
+        )
+
+    def test_managed_vllm_preview_includes_launch_defaults_and_identity(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"default_gpu_memory_utilization": 0.91}
+
+        preview = instance.preview_runtime_flags(
+            ["--enable-prefix-caching"], "vllm", {}, {}, managed=True,
+            model_revision="rev-123", quantization="awq", dtype="bfloat16",
+        )
+
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--gpu-memory-utilization"}),
+            "0.91",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--revision"}), "rev-123",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--quantization"}), "awq",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--dtype"}), "bfloat16",
+        )
+
+    def test_unrelated_controls_do_not_repair_missing_speculative_environment(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+
+        with self.assertRaisesRegex(
+            ValueError, "references undefined environment variable SPECULATIVE_CONFIG",
+        ):
+            instance._apply_deployment_launch_controls(
+                ["--speculative-config", "${SPECULATIVE_CONFIG}"],
+                "vllm",
+                {
+                    "context_window": 65536,
+                    "speculative_method": None,
+                    "draft_sample_method": None,
+                    "dspark_num_speculative_tokens": None,
+                },
+                {},
+            )
 
     def test_launch_controls_reject_invalid_environment_backed_speculative_config(
         self,

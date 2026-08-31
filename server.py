@@ -2132,6 +2132,7 @@ async def v1_runtime_flags_preview(req: Request):
     allowed = {
         "runtime", "extra_args", "launch_controls", "environment",
         "gpu_memory_utilization", "sg_tp_size", "sg_mem_fraction", "managed",
+        "model_revision", "quantization", "dtype",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -2146,6 +2147,9 @@ async def v1_runtime_flags_preview(req: Request):
             body.get("sg_tp_size"),
             body.get("sg_mem_fraction"),
             body.get("managed") is True,
+            body.get("model_revision"),
+            body.get("quantization"),
+            body.get("dtype"),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

@@ -4069,10 +4069,15 @@ class Manager:
                     current_tokens, {"--speculative-config"}
                 )
                 environment_key = self._environment_reference(raw_speculative)
+                submitted_speculative_value = any(
+                    controls.get(key) not in (None, "")
+                    for key in speculative_keys
+                )
                 if (
                     environment_key
                     and environment is not None
                     and environment_key not in environment
+                    and submitted_speculative_value
                 ):
                     # The structured controls are sufficient to create a new
                     # environment-backed config. Do not reject the missing
@@ -4139,6 +4144,9 @@ class Manager:
         sg_tp_size: Any = None,
         sg_mem_fraction: Any = None,
         managed: bool = False,
+        model_revision: Any = None,
+        quantization: Any = None,
+        dtype: Any = None,
     ) -> dict[str, Any]:
         """Return the backend-normalized runtime flags without mutating state."""
         if engine not in {"vllm", "sglang"}:
@@ -4152,15 +4160,22 @@ class Manager:
         final_args = self._apply_deployment_launch_controls(
             list(args), engine, controls, normalized_environment,
         )
+        if managed:
+            final_args = self._with_saved_launch_identity(
+                final_args, engine, model_revision, quantization, dtype,
+            )
         if engine == "vllm":
             if managed:
                 final_args = self._with_vllm_prompt_token_details(final_args)
             final_args = self._resolve_environment_backed_speculative_args(
                 final_args, normalized_environment,
             )
-            if gpu_memory_utilization not in (None, ""):
+            utilization_value = gpu_memory_utilization
+            if managed and utilization_value in (None, ""):
+                utilization_value = self.settings["default_gpu_memory_utilization"]
+            if utilization_value not in (None, ""):
                 try:
-                    utilization = float(gpu_memory_utilization)
+                    utilization = float(utilization_value)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
                         "gpu_memory_utilization must be a number"
@@ -4185,6 +4200,33 @@ class Manager:
             "environment": normalized_environment,
         }
 
+    @staticmethod
+    def _with_saved_launch_identity(
+        args: list[str],
+        engine: str,
+        model_revision: Any = None,
+        quantization: Any = None,
+        dtype: Any = None,
+    ) -> list[str]:
+        """Append immutable saved-model flags shared by preview and launch."""
+        final_args = list(args)
+        if engine == "vllm":
+            for value, flag in (
+                (quantization, "--quantization"), (dtype, "--dtype"),
+            ):
+                normalized = str(value).strip() if value not in (None, "") else None
+                if normalized:
+                    final_args += [flag, normalized]
+        revision = (
+            str(model_revision).strip()
+            if model_revision not in (None, "") else None
+        )
+        if revision and engine != "llama.cpp":
+            final_args += ["--revision", revision]
+        if engine == "sglang" and quantization not in (None, ""):
+            final_args += ["--quantization", str(quantization).strip()]
+        return final_args
+
     def _with_sglang_runtime_controls(
         self,
         args: list[str],
@@ -4204,12 +4246,18 @@ class Manager:
         max_running = self._validated_sg_scalar(
             "sg_max_running_requests", max_running_requests,
         )
+        if max_running is None and context_length is not None:
+            max_running = 8
         flags = shlex.join(args)
         for names in (
             {"--tp-size"}, {"--context-length"}, {"--mem-fraction-static"},
-            {"--max-running-requests"}, {"--max-total-tokens"},
+            {"--max-running-requests"},
         ):
             flags = self._replace_command_option(flags, names, None)
+        if max_running is not None:
+            flags = self._replace_command_option(
+                flags, {"--max-total-tokens"}, None,
+            )
         generated: list[str] = []
         if tp_size is not None:
             generated += ["--tp-size", str(tp_size)]
@@ -4217,8 +4265,6 @@ class Manager:
             generated += ["--context-length", str(context_length)]
         if mem_fraction is not None:
             generated += ["--mem-fraction-static", str(mem_fraction)]
-        if max_running is None and context_length is not None:
-            max_running = 8
         if max_running is not None:
             generated += ["--max-running-requests", str(max_running)]
             generated += [

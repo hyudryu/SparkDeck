@@ -12,7 +12,8 @@ const nodes = ['local', 'worker-1', 'worker-2', 'worker-3'].map((id, index) => (
 
 const detail = {
   id: 'dep-1', alias: 'Reasoning server', runtime: 'vllm', kind: 'managed',
-  model: { repository: 'org/model' }, status: 'stopped', settings: {},
+  model: { repository: 'org/model', quantization: 'awq' }, model_revision: 'rev-123', status: 'stopped',
+  settings: { quantization: 'awq', dtype: 'bfloat16' },
   node_ids: ['local'], deployment_mode: 'sharded', desired_state: 'stopped',
   editable: true, edit_reason: null,
   extra_args: [
@@ -87,6 +88,9 @@ describe('deployment object page', () => {
       ([input]) => String(input) === '/api/v1/runtime-flags/preview',
     )?.[1]?.body))
     expect(previewBody.managed).toBe(true)
+    expect(previewBody.model_revision).toBe('rev-123')
+    expect(previewBody.quantization).toBe('awq')
+    expect(previewBody.dtype).toBe('bfloat16')
     expect(previewBody).not.toHaveProperty('gpu_memory_gb')
     await user.clear(screen.getByLabelText('Max concurrency'))
     await user.type(screen.getByLabelText('Max concurrency'), '6')

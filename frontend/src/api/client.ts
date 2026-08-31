@@ -528,13 +528,16 @@ export const api = {
     previewFlags: (
       runtime: RuntimeKind,
       input: DeploymentUpdateInput,
-      managed: boolean,
+      deployment: Pick<DeploymentDetail, 'managed' | 'model_revision' | 'settings'>,
       signal?: AbortSignal,
     ) => request<RuntimeFlagsPreview>('/api/v1/runtime-flags/preview', {
       method: 'POST',
       body: JSON.stringify({
         runtime,
-        managed,
+        managed: deployment.managed,
+        model_revision: deployment.managed ? deployment.model_revision : undefined,
+        quantization: deployment.managed ? deployment.settings.quantization : undefined,
+        dtype: deployment.managed ? deployment.settings.dtype : undefined,
         extra_args: input.extra_args,
         environment: input.environment,
         launch_controls: input.launch_controls,

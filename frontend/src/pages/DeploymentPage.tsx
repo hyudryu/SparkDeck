@@ -139,13 +139,14 @@ export function DeploymentPage() {
       setPreviewError(undefined)
       return
     }
-    const runtime = resource.data.runtime
+    const deployment = resource.data
+    const runtime = deployment.runtime
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       try {
         const input = updateInput(editor)
         void api.deployments.previewFlags(
-          runtime, input, Boolean(resource.data?.managed), controller.signal,
+          runtime, input, deployment, controller.signal,
         )
           .then((preview) => {
             setFinalFlags(preview.command_flags)

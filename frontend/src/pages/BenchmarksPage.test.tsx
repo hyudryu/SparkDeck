@@ -160,7 +160,7 @@ describe('BenchmarksPage community privacy', () => {
     expect(screen.getAllByText('1,000 tokens')).toHaveLength(2)
     expect(screen.getByText('NVFP4')).toBeInTheDocument()
     expect(screen.getByText('Q4_K_M')).toBeInTheDocument()
-    expect(screen.getByText('12 samples')).toBeInTheDocument()
+    expect(screen.getByText('12 contributors')).toBeInTheDocument()
     expect(screen.getByText(/matched only on model name, quantization, and prompt-length bucket/)).toBeInTheDocument()
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sqlite3
+import statistics
 import threading
 import uuid
 from contextlib import contextmanager
@@ -38,7 +39,20 @@ COMMUNITY_API_URL = os.environ.get(
     "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
 )
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
+_COMMUNITY_AGGREGATE_ROW_LIMIT = 100_000
+_COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT = 256
 _LOCAL_HISTORY_MODEL_LIMIT = 500
+
+
+def _outlier_filtered_mean(values: list[float]) -> float:
+    """Return a Tukey-IQR mean without discarding small sample sets."""
+    if len(values) < 4:
+        return statistics.fmean(values)
+    q1, _, q3 = statistics.quantiles(values, n=4, method="inclusive")
+    spread = q3 - q1
+    lower, upper = q1 - 1.5 * spread, q3 + 1.5 * spread
+    retained = [value for value in values if lower <= value <= upper]
+    return statistics.fmean(retained or values)
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:
@@ -59,6 +73,16 @@ class SparkDeckStore:
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        self._connection.create_function(
+            "sparkdeck_community_quantization", 1,
+            lambda value: canonical_quantization(value) or "UNKNOWN",
+            deterministic=True,
+        )
+        self._connection.create_function(
+            "sparkdeck_community_prompt_bucket", 1,
+            _community_prompt_bucket,
+            deterministic=True,
+        )
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._migrate()
@@ -120,7 +144,11 @@ class SparkDeckStore:
                     prompt_tps REAL,
                     cold_start INTEGER,
                     eligible INTEGER NOT NULL,
-                    telemetry_cluster_id TEXT
+                    telemetry_cluster_id TEXT,
+                    consent_generation INTEGER,
+                    community_model_id TEXT,
+                    community_quantization TEXT,
+                    community_prompt_bucket INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
@@ -202,6 +230,17 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
             )
+            pairing = self.get_setting("device_pairing", {})
+            if (
+                isinstance(pairing, dict)
+                and pairing.get("status") == "paired"
+                and isinstance(pairing.get("sub"), str)
+                and pairing["sub"]
+            ):
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
+                    ("community_contributor_sub", json.dumps(pairing["sub"])),
+                )
             deployment_columns = {
                 row[1] for row in self._connection.execute(
                     "PRAGMA table_info(deployments)"
@@ -245,6 +284,56 @@ class SparkDeckStore:
                     "ALTER TABLE benchmark_samples "
                     "ADD COLUMN telemetry_cluster_id TEXT"
                 )
+            if "consent_generation" not in benchmark_columns:
+                self._connection.execute(
+                    "ALTER TABLE benchmark_samples "
+                    "ADD COLUMN consent_generation INTEGER"
+                )
+                # Ownerless legacy instructions cannot safely be attributed to
+                # whichever account happens to be paired during this upgrade.
+                # Preserve the benchmark history but fail closed on uploading it.
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+            for column_name, column_type in (
+                ("community_model_id", "TEXT"),
+                ("community_quantization", "TEXT"),
+                ("community_prompt_bucket", "INTEGER"),
+            ):
+                if column_name not in benchmark_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE benchmark_samples ADD COLUMN "
+                        f"{column_name} {column_type}"
+                    )
+            self._connection.execute(
+                """UPDATE benchmark_samples
+                   SET community_model_id = CASE
+                         WHEN json_valid(model_json)
+                         THEN TRIM(json_extract(model_json, '$.repository'))
+                       END,
+                       community_quantization = CASE
+                         WHEN json_valid(model_json)
+                         THEN sparkdeck_community_quantization(
+                           json_extract(model_json, '$.quantization')
+                         )
+                       END,
+                       community_prompt_bucket =
+                         sparkdeck_community_prompt_bucket(input_tokens)
+                   WHERE eligible = 1 AND (
+                     community_model_id IS NULL
+                     OR community_quantization IS NULL
+                     OR community_prompt_bucket IS NULL
+                   )"""
+            )
+            self._connection.execute(
+                """CREATE INDEX IF NOT EXISTS benchmark_samples_community_cohort
+                   ON benchmark_samples(
+                     consent_generation, community_model_id,
+                     community_quantization, community_prompt_bucket,
+                     created_at DESC, id DESC
+                   ) WHERE eligible = 1"""
+            )
             self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
@@ -323,6 +412,33 @@ class SparkDeckStore:
                 "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
                 (key, json.dumps(value)),
             )
+
+    def bind_community_contributor(self, sub: str) -> bool:
+        """Bind telemetry to one account, starting a new epoch on change."""
+        if not isinstance(sub, str) or not sub:
+            raise ValueError("community contributor subject is required")
+        with self._lock, self._connection:
+            previous = self.get_setting("community_contributor_sub")
+            changed = isinstance(previous, str) and previous != sub
+            if changed:
+                generation = int(self.get_setting(
+                    "community_consent_generation", 0,
+                )) + 1
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    ("community_consent_generation", json.dumps(generation)),
+                )
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                ("community_contributor_sub", json.dumps(sub)),
+            )
+            return changed
 
     def add_deployment(self, deployment: Deployment, base_url: str | None = None,
                        credential_ref: str | None = None) -> None:
@@ -469,6 +585,7 @@ class SparkDeckStore:
             )
             community_eligible = self._insert_benchmark_locked(
                 sample, cluster_id,
+                consent["generation"] if cluster_id else None,
             )
             self._link_benchmark_series_point(sample)
             if queue and community_eligible:
@@ -494,7 +611,7 @@ class SparkDeckStore:
             ):
                 return False
             if not self._insert_benchmark_locked(
-                sample, consent["telemetry_cluster_id"],
+                sample, consent["telemetry_cluster_id"], consent["generation"],
             ):
                 return False
             self._link_benchmark_series_point(sample)
@@ -503,6 +620,7 @@ class SparkDeckStore:
 
     def _insert_benchmark_locked(
         self, sample: BenchmarkSample, telemetry_cluster_id: str | None,
+        consent_generation: int | None,
     ) -> bool:
         value = sample.to_dict()
         community_eligible = bool(
@@ -514,8 +632,9 @@ class SparkDeckStore:
                 runtime_version, hardware_json, configuration_json,
                 input_tokens, output_tokens, latency_ms, ttft_ms,
                 generation_tps, prompt_tps, cold_start, eligible,
-                telemetry_cluster_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                telemetry_cluster_id, consent_generation, community_model_id,
+                community_quantization, community_prompt_bucket
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sample.id, sample.created_at, sample.deployment_id,
                 json.dumps(value["model"]), sample.runtime.value,
@@ -526,6 +645,19 @@ class SparkDeckStore:
                 sample.prompt_tokens_per_second,
                 None if sample.cold_start is None else int(sample.cold_start),
                 int(community_eligible), telemetry_cluster_id,
+                consent_generation if community_eligible else None,
+                (
+                    str(value["model"].get("repository") or "").strip()
+                    if community_eligible else None
+                ),
+                (
+                    _community_quantization(value["model"])
+                    if community_eligible else None
+                ),
+                (
+                    _community_prompt_bucket(sample.input_tokens)
+                    if community_eligible else None
+                ),
             ),
         )
         return community_eligible
@@ -652,6 +784,7 @@ class SparkDeckStore:
             )
             community_eligible = self._insert_benchmark_locked(
                 sample, cluster_id,
+                consent["generation"] if cluster_id else None,
             )
             self._insert_benchmark_series_point_locked(point, sample.id)
             if queue and community_eligible:
@@ -672,7 +805,7 @@ class SparkDeckStore:
             ):
                 return False
             if not self._insert_benchmark_locked(
-                sample, consent["telemetry_cluster_id"],
+                sample, consent["telemetry_cluster_id"], consent["generation"],
             ):
                 return False
             self._insert_benchmark_series_point_locked(point, sample.id)
@@ -764,12 +897,13 @@ class SparkDeckStore:
         dimensions cannot be represented by this community contract. Manual
         benchmark detail remains available from ``benchmark_series_points``.
         """
-        grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
+        grouped: dict[tuple[str, str, int], dict[str, list[float]]] = {}
         with self._lock:
             cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, input_tokens, "
                 "generation_tps, telemetry_cluster_id "
-                "FROM benchmark_samples WHERE eligible = 1"
+                "FROM benchmark_samples WHERE eligible = 1 "
+                f"ORDER BY created_at DESC LIMIT {_COMMUNITY_AGGREGATE_ROW_LIMIT}"
             )
             while True:
                 rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
@@ -804,24 +938,28 @@ class SparkDeckStore:
                     ):
                         continue
                     key = (model_id, quantization, prompt_bucket)
-                    aggregate = grouped.setdefault(key, {
-                        "total": 0.0, "count": 0, "clusters": set(),
-                    })
-                    aggregate["total"] += speed
-                    aggregate["count"] += 1
-                    aggregate["clusters"].add(cluster_id)
+                    values = grouped.setdefault(key, {}).setdefault(
+                        str(cluster_id), []
+                    )
+                    if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
+                        values.append(speed)
 
-        items = [
-            {
+        items = []
+        for (model_id, quantization, prompt_bucket), contributors in grouped.items():
+            contributor_means = [
+                _outlier_filtered_mean(values)
+                for values in contributors.values()
+            ]
+            items.append({
                 "model_id": model_id,
                 "quantization": quantization,
                 "prompt_tokens_bucket": prompt_bucket,
-                "inference_tokens_per_second": value["total"] / value["count"],
-                "sample_count": value["count"],
-                "unique_cluster_count": len(value["clusters"]),
-            }
-            for (model_id, quantization, prompt_bucket), value in grouped.items()
-        ]
+                "inference_tokens_per_second": statistics.fmean(contributor_means),
+                # The evidence threshold counts equal-weight contributors, not
+                # raw inference requests from a potentially busy installation.
+                "sample_count": len(contributor_means),
+                "unique_cluster_count": len(contributor_means),
+            })
         return sorted(
             items,
             key=lambda item: (
@@ -904,11 +1042,23 @@ class SparkDeckStore:
                 f"SELECT * FROM benchmark_samples WHERE id IN ({marks})",
                 tuple(wanted),
             ).fetchall()
-        by_id = {
-            row["id"]: payload
-            for row in sample_rows
-            if (payload := _upload_row(row)) is not None
-        }
+        by_id = {}
+        payloads_by_id = {}
+        required_keys: set[tuple[str, str, int]] = set()
+        for row in sample_rows:
+            payload = _upload_row(row)
+            if payload is None:
+                continue
+            key = (
+                payload["model_id"], payload["quantization"],
+                payload["prompt_tokens_bucket"],
+            )
+            required_keys.add(key)
+            payloads_by_id[row["id"]] = (payload, key)
+        contribution_averages = self._community_contribution_averages(required_keys)
+        for sample_id, (payload, key) in payloads_by_id.items():
+            payload["inference_tokens_per_second"] = contribution_averages[key]
+            by_id[sample_id] = payload
         return [
             {"sample_id": sample_id, "payload": by_id[sample_id]}
             for sample_id in wanted if sample_id in by_id
@@ -916,6 +1066,7 @@ class SparkDeckStore:
 
     def outbox_entry(
         self, sample_id: str, now: str | None = None,
+        prepared_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Re-read one currently uploadable sample at the outbound boundary."""
         now = now or datetime.now(timezone.utc).isoformat()
@@ -934,7 +1085,85 @@ class SparkDeckStore:
             ).fetchone()
         if row is None or (payload := _upload_row(row)) is None:
             return None
+        if prepared_payload is not None:
+            key_fields = (
+                "model_id", "quantization", "prompt_tokens_bucket",
+                "telemetry_cluster_id", "concurrency",
+            )
+            if any(
+                prepared_payload.get(field) != payload.get(field)
+                for field in key_fields
+            ):
+                return None
+            payload["inference_tokens_per_second"] = prepared_payload[
+                "inference_tokens_per_second"
+            ]
+        else:
+            key = (
+                payload["model_id"], payload["quantization"],
+                payload["prompt_tokens_bucket"],
+            )
+            payload["inference_tokens_per_second"] = (
+                self._community_contribution_averages({key})[key]
+            )
         return {"sample_id": sample_id, "payload": payload}
+
+    def _community_contribution_averages(
+        self, required_keys: set[tuple[str, str, int]] | None = None,
+    ) -> dict[tuple[str, str, int], float]:
+        """Build bounded robust C1 means, including requested pending cohorts."""
+        grouped: dict[tuple[str, str, int], list[float]] = {}
+        with self._lock:
+            generation = int(self.get_setting(
+                "community_consent_generation", 0,
+            ))
+            if required_keys:
+                for model_id, quantization, prompt_bucket in required_keys:
+                    rows = self._connection.execute(
+                        """SELECT * FROM benchmark_samples
+                           WHERE eligible = 1 AND consent_generation = ?
+                             AND community_model_id = ?
+                             AND community_quantization = ?
+                             AND community_prompt_bucket = ?
+                           ORDER BY created_at DESC, id DESC LIMIT ?""",
+                        (
+                            generation, model_id, quantization, prompt_bucket,
+                            _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT,
+                        ),
+                    ).fetchall()
+                    values = grouped.setdefault(
+                        (model_id, quantization, prompt_bucket), [],
+                    )
+                    for row in rows:
+                        payload = _upload_row(row)
+                        if payload is not None:
+                            values.append(payload["inference_tokens_per_second"])
+            else:
+                cursor = self._connection.execute(
+                    "SELECT * FROM benchmark_samples "
+                    "WHERE eligible = 1 AND consent_generation = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (generation, _COMMUNITY_AGGREGATE_ROW_LIMIT),
+                )
+                while True:
+                    rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
+                    if not rows:
+                        break
+                    for row in rows:
+                        payload = _upload_row(row)
+                        if payload is None:
+                            continue
+                        key = (
+                            payload["model_id"], payload["quantization"],
+                            payload["prompt_tokens_bucket"],
+                        )
+                        values = grouped.setdefault(key, [])
+                        if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
+                            values.append(payload["inference_tokens_per_second"])
+        return {
+            key: _outlier_filtered_mean(values)
+            for key, values in grouped.items() if values
+        }
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
         if not sample_ids:
@@ -1159,9 +1388,16 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     model_id = str(model.get("repository") or "").strip()
     quantization = _community_quantization(model)
     cluster_id = row["telemetry_cluster_id"]
+    raw_concurrency = value.get("configuration", {}).get(
+        "benchmark_concurrency"
+    )
     if (
         not model_id or prompt_bucket is None or speed is None
         or not _valid_telemetry_cluster_id(cluster_id)
+        or (
+            raw_concurrency is not None
+            and _positive_integer(raw_concurrency) != 1
+        )
     ):
         return None
     payload = {

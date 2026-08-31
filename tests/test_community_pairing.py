@@ -79,6 +79,11 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             Mock(return_value=0),
         )
         self.promote = self.promote_patch.start()
+        self.bind_patch = patch.object(
+            server.sparkdeck.store, "bind_community_contributor",
+            Mock(return_value=False),
+        )
+        self.bind = self.bind_patch.start()
         self.push_pair_patch = patch.object(
             server.manager, "push_community_pairing",
             AsyncMock(return_value={"applied": [], "conflicts": [], "errors": []}),
@@ -94,6 +99,7 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.push_unpair_patch.stop()
         self.push_pair_patch.stop()
+        self.bind_patch.stop()
         self.promote_patch.stop()
         self.get_setting_patch.stop()
         self.set_setting_patch.stop()
@@ -264,6 +270,7 @@ class CommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "sub": "user-sub-123",
             "email": "user@example.com",
         })
+        self.bind.assert_called_once_with("user-sub-123")
         self.promote.assert_called_once_with()
         self.push_pair.assert_awaited_once_with("user-sub-123", "user@example.com", None)
 
@@ -678,9 +685,15 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             Mock(return_value=0),
         )
         self.promote = self.promote_patch.start()
+        self.bind_patch = patch.object(
+            server.sparkdeck.store, "bind_community_contributor",
+            Mock(return_value=False),
+        )
+        self.bind = self.bind_patch.start()
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.bind_patch.stop()
         self.promote_patch.stop()
         self.set_setting_patch.stop()
         self.get_setting_patch.stop()
@@ -704,6 +717,7 @@ class AgentCommunityPairingTests(unittest.IsolatedAsyncioTestCase):
             "status": "paired", "sub": "user-sub-123",
             "email": "user@example.com",
         })
+        self.bind.assert_called_once_with("user-sub-123")
         self.promote.assert_called_once_with()
 
     async def test_applies_pairing_with_a_refresh_token(self):

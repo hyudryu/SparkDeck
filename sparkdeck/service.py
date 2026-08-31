@@ -3373,6 +3373,29 @@ class SparkDeckService:
         })
         return result
 
+    async def _rollback_manager_promotion(
+        self, replacement: dict[str, Any] | None, promotion_record_id: str,
+    ) -> str | None:
+        """Remove a partially-created Manager deployment after promotion fails."""
+        rollback_target = replacement or next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict)
+            and item.get("sparkdeck_record_id") == promotion_record_id
+        ), None)
+        if not isinstance(rollback_target, dict) or not rollback_target.get("id"):
+            return None
+        try:
+            rollback = await self.manager.deployment_action(
+                str(rollback_target["id"]), "remove",
+            )
+            if not rollback.get("ok"):
+                return "; ".join(
+                    rollback.get("errors") or ["cluster removal failed"]
+                )
+        except Exception as cleanup_exc:
+            return str(cleanup_exc)
+        return None
+
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -3467,24 +3490,24 @@ class SparkDeckService:
             return self._adopt_manager_replacement(
                 deployment, replacement, adopted_launch_settings,
             )
+        except asyncio.CancelledError as exc:
+            # Manager persists a recovering deployment before propagating
+            # cancellation. Shield its removal so a cancelled request cannot
+            # leave an untracked remote runtime consuming resources.
+            rollback_error = await asyncio.shield(
+                self._rollback_manager_promotion(
+                    replacement, promotion_record_id,
+                )
+            )
+            if rollback_error:
+                exc.add_note(
+                    f"managed promotion rollback failed: {rollback_error}"
+                )
+            raise
         except Exception as exc:
-            rollback_target = replacement or next((
-                item for item in getattr(self.manager, "deployments", [])
-                if isinstance(item, dict)
-                and item.get("sparkdeck_record_id") == promotion_record_id
-            ), None)
-            rollback_error = None
-            if isinstance(rollback_target, dict) and rollback_target.get("id"):
-                try:
-                    rollback = await self.manager.deployment_action(
-                        str(rollback_target["id"]), "remove",
-                    )
-                    if not rollback.get("ok"):
-                        rollback_error = "; ".join(
-                            rollback.get("errors") or ["cluster removal failed"]
-                        )
-                except Exception as cleanup_exc:
-                    rollback_error = str(cleanup_exc)
+            rollback_error = await self._rollback_manager_promotion(
+                replacement, promotion_record_id,
+            )
             if rollback_error:
                 raise RuntimeError(
                     f"{exc}; managed promotion rollback failed: {rollback_error}"

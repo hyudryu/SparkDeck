@@ -350,6 +350,41 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_promotion_rolls_back_persisted_manager_launch_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "external-single", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "image": "example/vllm:latest", "port": 8214,
+                "load_settings": {"model": "org/model", "tensor_parallel_size": 1},
+            }
+            manager.list_containers.return_value = [container]
+            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            manager.deployments = []
+
+            async def cancel_after_persisting(body):
+                manager.deployments.append({
+                    "id": "cancelled-cluster",
+                    "sparkdeck_record_id": body["sparkdeck_record_id"],
+                })
+                raise asyncio.CancelledError()
+
+            manager.create_deployment = AsyncMock(side_effect=cancel_after_persisting)
+            manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaises(asyncio.CancelledError):
+                await service.deployment_action(
+                    "container:external-single", "start", ["local"], promote=True,
+                )
+
+            manager.deployment_action.assert_awaited_once_with(
+                "cancelled-cluster", "remove",
+            )
+            await manager.http.aclose()
+            await service.close()
+
     async def test_discovered_local_model_rejects_remote_promotion(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()

@@ -4382,6 +4382,7 @@ class Manager:
         self, deployment: dict, primary_container: dict | None = None,
     ) -> dict:
         load_settings = (primary_container or {}).get("load_settings") or {}
+        engine = deployment.get("engine", "vllm")
         try:
             recovered_args = shlex.split(load_settings.get("command_flags") or "")
         except ValueError:
@@ -4391,10 +4392,10 @@ class Manager:
             {"--host", "--port", "--gpu-memory-utilization",
              "--gpu_memory_utilization"},
         )
-        return self._deployment_launch_settings({
+        recovered = {
             "deployment_name": deployment.get("name"),
             "model": deployment.get("model"),
-            "engine": deployment.get("engine", "vllm"),
+            "engine": engine,
             "image": (primary_container or {}).get("image"),
             "extra_args": recovered_args,
             "gpu_memory_utilization": load_settings.get(
@@ -4403,7 +4404,32 @@ class Manager:
             "deployment_mode": deployment.get("mode", "single"),
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
-        })
+        }
+        if engine == "sglang":
+            # SGLang's managed container builder removes these flags from
+            # extra_args and regenerates them from the structured fields.
+            # Preserve discovered runtime controls when promoting/recovering.
+            def discovered_control(key: str, flag: str, cast):
+                value = load_settings.get(key)
+                return value if value is not None else self._cli_option(
+                    recovered_args, {flag}, cast,
+                )
+
+            recovered.update({
+                "sg_tp_size": discovered_control(
+                    "tensor_parallel_size", "--tp-size", int,
+                ),
+                "sg_context_length": discovered_control(
+                    "context_window", "--context-length", int,
+                ),
+                "sg_max_running_requests": discovered_control(
+                    "max_concurrency", "--max-running-requests", int,
+                ),
+                "sg_mem_fraction": discovered_control(
+                    "gpu_memory_utilization", "--mem-fraction-static", float,
+                ),
+            })
+        return self._deployment_launch_settings(recovered)
 
     @classmethod
     def _deployment_pricing_model_key(cls, deployment: dict) -> str:

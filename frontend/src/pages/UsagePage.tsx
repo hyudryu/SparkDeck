@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react'
 import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember, UsageSummary } from '../api/types'
@@ -162,6 +162,8 @@ export function UsagePage() {
   const [meterBaseline, setMeterBaseline] = useState<UsageSummary>()
   const [meterCurrent, setMeterCurrent] = useState<UsageSummary>()
   const [meterRunning, setMeterRunning] = useState(false)
+  const [meterError, setMeterError] = useState<string>()
+  const meterStopping = useRef(false)
   const [sortKey, setSortKey] = useState<SortKey>('output'); const [sortAscending, setSortAscending] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set()); const [editing, setEditing] = useState<UsageMember>()
   const [alias, setAlias] = useState(''); const [mergeGroup, setMergeGroup] = useState(''); const [routeTo, setRouteTo] = useState(''); const [busy, setBusy] = useState<string>()
@@ -183,26 +185,35 @@ export function UsagePage() {
       controller = new AbortController()
       try {
         const next = await api.usage.get(controller.signal)
-        if (active) setMeterCurrent(next)
+        if (active && !meterStopping.current) {
+          setMeterCurrent(next)
+          setMeterError(undefined)
+        }
       } catch (reason) {
-        if (active && !(reason instanceof DOMException && reason.name === 'AbortError')) setActionError(reason instanceof Error ? reason.message : 'Could not update the token meter')
+        if (active && !(reason instanceof DOMException && reason.name === 'AbortError')) setMeterError(reason instanceof Error ? reason.message : 'Could not update the token meter')
       }
     }
     const timer = window.setInterval(() => void sample(), 2_000)
-    return () => { active = false; controller?.abort(); window.clearInterval(timer) }
+    return () => { active = false; meterStopping.current = false; controller?.abort(); window.clearInterval(timer) }
   }, [meterRunning])
   const startMeter = async () => {
-    setBusy('meter:start'); setActionError(undefined); setNotice(undefined)
+    meterStopping.current = false; setBusy('meter:start'); setMeterError(undefined); setNotice(undefined)
     try {
       const baseline = await api.usage.get()
       setMeterBaseline(baseline); setMeterCurrent(baseline); setMeterRunning(true)
-    } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not start the token meter') } finally { setBusy(undefined) }
+    } catch (reason) { setMeterError(reason instanceof Error ? reason.message : 'Could not start the token meter') } finally { setBusy(undefined) }
   }
   const stopMeter = async () => {
-    setMeterRunning(false); setBusy('meter:stop'); setActionError(undefined)
+    meterStopping.current = true; setBusy('meter:stop'); setMeterError(undefined)
     try {
-      setMeterCurrent(await api.usage.get())
-    } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not capture the final token meter reading') } finally { setBusy(undefined) }
+      setMeterCurrent(await api.usage.sync())
+      setMeterRunning(false)
+    } catch (reason) {
+      meterStopping.current = false
+      setMeterError(reason instanceof Error ? reason.message : 'Could not capture the final token meter reading')
+    } finally {
+      setBusy(undefined)
+    }
   }
   // member.merge_group holds the destination's resolved group for routed
   // sources; only summary.merge_groups carries the source's own setting.
@@ -262,6 +273,7 @@ export function UsagePage() {
         {routingRules.length ? <ul className="usage-routing-list" aria-label="Current model routing rules">{routingRules.map(([source, destination]) => <li key={source} aria-label={`${source} routes to ${destination}`}><code>{source}</code><ArrowRight size={14} aria-hidden="true" /><code>{destination}</code><Button type="button" variant="tertiary" aria-label={`Remove routing rule for ${source}`} disabled={busy?.startsWith('route:')} onClick={() => void removeRoute(source)}><Trash2 size={14} /> Remove</Button></li>)}</ul> : <p className="usage-routing-empty">No routing rules yet. Add one to combine a source model into a destination model.</p>}
       </Panel>
       <Panel className="usage-meter-panel" aria-label="Token usage meter"><div className="usage-panel-heading usage-meter-heading"><div><h2>Token meter</h2><p>{meterRunning ? 'Measuring tokens used since you pressed Start' : meterBaseline ? 'Measurement stopped — press Start to begin a new interval' : 'Press Start to measure token use during a specific time period'}</p></div><div className="usage-meter-actions"><Button variant="primary" disabled={meterRunning || busy?.startsWith('meter:')} onClick={() => void startMeter()}><RefreshCw size={15} /> {busy === 'meter:start' ? 'Starting…' : 'Start'}</Button><Button variant="danger" disabled={!meterRunning || busy?.startsWith('meter:')} onClick={() => void stopMeter()}><Square size={14} /> {busy === 'meter:stop' ? 'Stopping…' : 'Stop'}</Button></div></div>
+        {meterError && <p className="inline-error" role="alert">{meterError}</p>}
         <div className="usage-meter-totals"><div><strong>{formatTokens(totalTokens(meter.totals))}</strong><span>Total tokens</span></div><div><strong>{formatTokens(meter.totals.input)}</strong><span>Input tokens</span></div><div><strong>{formatTokens(meter.totals.cached)}</strong><span>Cached input</span></div><div><strong>{formatTokens(meter.totals.output)}</strong><span>Output tokens</span></div><div><strong>{formatTokens(meter.totals.requests)}</strong><span>Requests</span></div></div>
         {!meterModels.length ? <EmptyState title={meterBaseline ? 'No tokens measured' : 'Meter not started'} description={meterBaseline ? 'Token totals will appear here when models are used during this measurement.' : 'Press Start, use your models, then press Stop to capture the interval.'} /> : <div className="usage-meter-models" role="table" aria-label="Measured usage by model"><div className="usage-meter-model usage-meter-model-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Input</span><span role="columnheader">Output</span><span role="columnheader">Total</span><span role="columnheader">Requests</span></div>{meterModels.map(({ model, counters }) => <div className="usage-meter-model" role="row" key={model}><strong role="cell">{model}</strong><span role="cell" data-label="Input">{formatTokens(counters.input)}</span><span role="cell" data-label="Output">{formatTokens(counters.output)}</span><span role="cell" data-label="Total">{formatTokens(totalTokens(counters))}</span><span role="cell" data-label="Requests">{formatTokens(counters.requests)}</span></div>)}</div>}
       </Panel>

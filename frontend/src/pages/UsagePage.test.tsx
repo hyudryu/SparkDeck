@@ -176,18 +176,20 @@ describe('UsagePage', () => {
   })
 
   it('starts and stops an interval meter at the bottom of the page', async () => {
-    let summaryReads = 0
     const current = {
       ...summary,
       models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
       total: { input: 1700, cached: 550, output: 825, requests: 15 },
     }
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('/api/token-stats/hourly')) return json([])
       if (path.includes('/api/token-stats/daily')) return json([])
-      summaryReads += 1
-      return json(summaryReads >= 3 ? current : summary)
+      if (path === '/api/token-stats/sync') {
+        expect(init?.method).toBe('POST')
+        return json(current)
+      }
+      return json(summary)
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
@@ -212,6 +214,70 @@ describe('UsagePage', () => {
     expect(meter).toHaveTextContent('75')
     expect(within(meter).getByRole('table', { name: 'Measured usage by model' })).toHaveTextContent('org/model')
     expect(fetchMock.mock.calls.every(([path]) => String(path) !== '/api/token-stats/reset')).toBe(true)
+  })
+
+  it('keeps measuring when the final cluster sync fails and allows Stop to retry', async () => {
+    let syncAttempts = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
+      total: { input: 1600, cached: 525, output: 800, requests: 13 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') {
+        syncAttempts += 1
+        return syncAttempts === 1 ? json({ detail: 'Worker: timed out' }, 503) : json(current)
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    const meter = await screen.findByLabelText('Token usage meter')
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+    await waitFor(() => expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled())
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+
+    expect(await within(meter).findByRole('alert')).toHaveTextContent('Worker: timed out')
+    expect(meter).toHaveTextContent('Measuring tokens used since you pressed Start')
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled()
+
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(meter).toHaveTextContent('Measurement stopped'))
+    expect(meter).toHaveTextContent('150')
+    expect(within(meter).queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('clears a transient polling error after the next successful sample', async () => {
+    let summaryReads = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
+      total: { input: 1600, cached: 525, output: 800, requests: 13 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats') {
+        summaryReads += 1
+        if (summaryReads === 3) return json({ detail: 'Temporary sample failure' }, 503)
+        return json(summaryReads >= 4 ? current : summary)
+      }
+      return json(current)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    const meter = await screen.findByLabelText('Token usage meter')
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+
+    expect(await within(meter).findByRole('alert', {}, { timeout: 4_000 })).toHaveTextContent('Temporary sample failure')
+    await waitFor(() => expect(within(meter).queryByRole('alert')).not.toBeInTheDocument(), { timeout: 4_000 })
+    expect(meter).toHaveTextContent('150')
   })
 
   it('edits and removes usage routing rules from the display dialog', async () => {

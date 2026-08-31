@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { UsageGroup, UsageSummary } from '../api/types'
@@ -34,6 +34,7 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('UsagePage', () => {
@@ -181,13 +182,15 @@ describe('UsagePage', () => {
       models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
       total: { input: 1700, cached: 550, output: 825, requests: 15 },
     }
+    let syncReads = 0
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.includes('/api/token-stats/hourly')) return json([])
       if (path.includes('/api/token-stats/daily')) return json([])
       if (path === '/api/token-stats/sync') {
         expect(init?.method).toBe('POST')
-        return json(current)
+        syncReads += 1
+        return json(syncReads === 1 ? summary : current)
       }
       return json(summary)
     })
@@ -217,7 +220,7 @@ describe('UsagePage', () => {
   })
 
   it('keeps measuring when the final cluster sync fails and allows Stop to retry', async () => {
-    let syncAttempts = 0
+    let stopAttempts = 0
     const current = {
       ...summary,
       models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
@@ -227,8 +230,12 @@ describe('UsagePage', () => {
       const path = String(input)
       if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
       if (path === '/api/token-stats/sync') {
-        syncAttempts += 1
-        return syncAttempts === 1 ? json({ detail: 'Worker: timed out' }, 503) : json(current)
+        if (stopAttempts === 0) {
+          stopAttempts += 1
+          return json(summary)
+        }
+        stopAttempts += 1
+        return stopAttempts === 2 ? json({ detail: 'Worker: timed out' }, 503) : json(current)
       }
       return json(summary)
     })
@@ -251,22 +258,12 @@ describe('UsagePage', () => {
     expect(within(meter).queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  it('clears a transient polling error after the next successful sample', async () => {
-    let summaryReads = 0
-    const current = {
-      ...summary,
-      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
-      total: { input: 1600, cached: 525, output: 800, requests: 13 },
-    }
+  it('leaves the meter stopped when the authoritative baseline sync fails', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
-      if (path === '/api/token-stats') {
-        summaryReads += 1
-        if (summaryReads === 3) return json({ detail: 'Temporary sample failure' }, 503)
-        return json(summaryReads >= 4 ? current : summary)
-      }
-      return json(current)
+      if (path === '/api/token-stats/sync') return json({ detail: 'Worker: timed out' }, 503)
+      return json(summary)
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
@@ -275,9 +272,90 @@ describe('UsagePage', () => {
     const meter = await screen.findByLabelText('Token usage meter')
     await user.click(within(meter).getByRole('button', { name: 'Start' }))
 
-    expect(await within(meter).findByRole('alert', {}, { timeout: 4_000 })).toHaveTextContent('Temporary sample failure')
-    await waitFor(() => expect(within(meter).queryByRole('alert')).not.toBeInTheDocument(), { timeout: 4_000 })
+    expect(await within(meter).findByRole('alert')).toHaveTextContent('Worker: timed out')
+    expect(meter).toHaveTextContent('Meter not started')
+    expect(within(meter).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('clears a transient polling error after the next successful sample', async () => {
+    vi.useFakeTimers()
+    let meterStarted = false
+    let pollReads = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
+      total: { input: 1600, cached: 525, output: 800, requests: 13 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') {
+        meterStarted = true
+        return json(summary)
+      }
+      if (path === '/api/token-stats' && meterStarted) {
+        pollReads += 1
+        if (pollReads === 1) return json({ detail: 'Temporary sample failure' }, 503)
+        return json(current)
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsagePage />)
+    await act(async () => { await Promise.resolve() })
+
+    const meter = screen.getByLabelText('Token usage meter')
+    await act(async () => {
+      fireEvent.click(within(meter).getByRole('button', { name: 'Start' }))
+      await Promise.resolve()
+    })
+
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(within(meter).getByRole('alert')).toHaveTextContent('Temporary sample failure')
+
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(within(meter).queryByRole('alert')).not.toBeInTheDocument()
     expect(meter).toHaveTextContent('150')
+  })
+
+  it('waits for a slow token sample to settle before scheduling another poll', async () => {
+    vi.useFakeTimers()
+    let summaryReads = 0
+    let resolveSlowSample!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') return json(summary)
+      if (path === '/api/token-stats') {
+        summaryReads += 1
+        if (summaryReads === 2) return new Promise<Response>((resolve) => { resolveSlowSample = resolve })
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsagePage />)
+    await act(async () => { await Promise.resolve() })
+
+    const meter = screen.getByLabelText('Token usage meter')
+    await act(async () => {
+      fireEvent.click(within(meter).getByRole('button', { name: 'Start' }))
+      await Promise.resolve()
+    })
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(summaryReads).toBe(2)
+
+    await act(() => vi.advanceTimersByTimeAsync(6_000))
+    expect(summaryReads).toBe(2)
+
+    await act(async () => {
+      resolveSlowSample(json(summary))
+      await Promise.resolve()
+    })
+    await act(() => vi.advanceTimersByTimeAsync(1_999))
+    expect(summaryReads).toBe(2)
+    await act(() => vi.advanceTimersByTimeAsync(1))
+    expect(summaryReads).toBe(3)
   })
 
   it('edits and removes usage routing rules from the display dialog', async () => {

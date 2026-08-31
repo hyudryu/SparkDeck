@@ -180,8 +180,8 @@ export function UsagePage() {
     if (!meterRunning) return
     let active = true
     let controller: AbortController | undefined
+    let timer: number | undefined
     const sample = async () => {
-      controller?.abort()
       controller = new AbortController()
       try {
         const next = await api.usage.get(controller.signal)
@@ -191,15 +191,18 @@ export function UsagePage() {
         }
       } catch (reason) {
         if (active && !(reason instanceof DOMException && reason.name === 'AbortError')) setMeterError(reason instanceof Error ? reason.message : 'Could not update the token meter')
+      } finally {
+        controller = undefined
+        if (active) timer = window.setTimeout(() => void sample(), 2_000)
       }
     }
-    const timer = window.setInterval(() => void sample(), 2_000)
-    return () => { active = false; meterStopping.current = false; controller?.abort(); window.clearInterval(timer) }
+    timer = window.setTimeout(() => void sample(), 2_000)
+    return () => { active = false; meterStopping.current = false; controller?.abort(); if (timer !== undefined) window.clearTimeout(timer) }
   }, [meterRunning])
   const startMeter = async () => {
     meterStopping.current = false; setBusy('meter:start'); setMeterError(undefined); setNotice(undefined)
     try {
-      const baseline = await api.usage.get()
+      const baseline = await api.usage.sync()
       setMeterBaseline(baseline); setMeterCurrent(baseline); setMeterRunning(true)
     } catch (reason) { setMeterError(reason instanceof Error ? reason.message : 'Could not start the token meter') } finally { setBusy(undefined) }
   }

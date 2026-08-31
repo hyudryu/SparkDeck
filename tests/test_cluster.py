@@ -1316,6 +1316,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             class Registry:
                 nodes = [{"id": "worker", "name": "Worker", "enabled": True}]
+                fail_push = False
 
                 async def request(self, node_id, method, path, **kwargs):
                     requests.append((node_id, method, path, kwargs))
@@ -1326,6 +1327,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                             **worker.token_usage_sync_snapshot(),
                             "enabled": False,
                         }
+                    if self.fail_push:
+                        raise TimeoutError("push timed out")
                     worker.merge_token_usage_sync(kwargs["json_body"])
                     return {"enabled": True, "changed": True}
 
@@ -1352,6 +1355,14 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 [("GET", "/api/agent/token-usage"),
                  ("POST", "/api/agent/token-usage")],
             )
+
+            controller.node_registry.fail_push = True
+            status = await controller.sync_token_usage_once()
+
+            self.assertIsNone(status["pull_error"])
+            self.assertIn("push timed out", status["push_error"])
+            self.assertIn("push timed out", status["error"])
+            self.assertEqual(controller.token_stats["model/b"]["input"], 20)
 
     def test_legacy_usage_sync_opt_out_is_discarded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

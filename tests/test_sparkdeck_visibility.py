@@ -368,7 +368,7 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 server.manager, "sync_token_usage_once",
-                AsyncMock(return_value={"error": None, "peers": 1}),
+                AsyncMock(return_value={"error": None, "pull_error": None, "peers": 1}),
             ) as sync,
             patch.object(server.manager, "get_token_stats", return_value=summary),
         ):
@@ -382,7 +382,10 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 server.manager, "sync_token_usage_once",
-                AsyncMock(return_value={"error": "Worker: timed out", "peers": 0}),
+                AsyncMock(return_value={
+                    "error": "Worker: timed out", "pull_error": "Worker: timed out",
+                    "peers": 0,
+                }),
             ),
             patch.object(server.manager, "get_token_stats") as get_stats,
         ):
@@ -391,6 +394,23 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertIn("Worker: timed out", response.json()["detail"])
         get_stats.assert_not_called()
+
+    async def test_token_stats_sync_returns_reading_after_fanout_failure(self):
+        summary = {"models": {}, "groups": [], "total": {"input": 10}}
+        with (
+            patch.object(
+                server.manager, "sync_token_usage_once",
+                AsyncMock(return_value={
+                    "error": "Worker: push timed out", "pull_error": None,
+                    "push_error": "Worker: push timed out", "peers": 1,
+                }),
+            ),
+            patch.object(server.manager, "get_token_stats", return_value=summary),
+        ):
+            response = await self.client.post("/api/token-stats/sync")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), summary)
 
     async def test_deployment_start_route_forwards_node_selection(self):
         with patch.object(server.sparkdeck, "deployment_action", AsyncMock(return_value={"ok": True})) as action:

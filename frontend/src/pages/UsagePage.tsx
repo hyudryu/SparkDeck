@@ -1,5 +1,5 @@
-import { useMemo, useState, type CSSProperties, type FormEvent } from 'react'
-import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, RotateCcw, Trash2, X } from 'lucide-react'
+import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from 'react'
+import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember, UsageSummary } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
@@ -8,7 +8,6 @@ import { useResource } from '../hooks/useResource'
 
 type SortKey = 'model' | 'input' | 'cached' | 'output' | 'requests' | 'speed' | 'cost'
 type RangeDays = 7 | 30
-type MeterRange = 'lifetime' | 7 | 30 | 365
 
 const chartColors = ['#4a9eff', '#48c774', '#8c6bff', '#ff626a', '#ff9238', '#4cc9c0', '#d66efd', '#e4c34e']
 const modelShareLimit = 7
@@ -31,38 +30,25 @@ function formatDuration(seconds = 0) {
 function inputMisses(row: UsageGroup) { return Math.max(0, Number(row.stats.input_miss ?? row.stats.input - row.stats.cached)) }
 function totalTokens(counters?: UsageCounters) { return counters ? Number(counters.input ?? 0) + Number(counters.output ?? 0) : 0 }
 function emptyCounters(): UsageCounters { return { input: 0, cached: 0, output: 0, requests: 0 } }
-function addCounters(target: UsageCounters, source?: UsageCounters) {
-  if (!source) return target
-  target.input += Number(source.input ?? 0)
-  target.cached += Number(source.cached ?? 0)
-  target.output += Number(source.output ?? 0)
-  target.requests += Number(source.requests ?? 0)
-  return target
+
+function subtractCounters(current?: UsageCounters, baseline?: UsageCounters): UsageCounters {
+  return {
+    input: Math.max(0, Number(current?.input ?? 0) - Number(baseline?.input ?? 0)),
+    cached: Math.max(0, Number(current?.cached ?? 0) - Number(baseline?.cached ?? 0)),
+    output: Math.max(0, Number(current?.output ?? 0) - Number(baseline?.output ?? 0)),
+    requests: Math.max(0, Number(current?.requests ?? 0) - Number(baseline?.requests ?? 0)),
+  }
 }
 
-export function usageMeterSnapshot(
-  summary: UsageSummary | undefined,
-  daily: DailyUsagePoint[],
-  range: MeterRange,
-  reference = new Date(),
-) {
-  if (range === 'lifetime') {
-    return {
-      totals: addCounters(emptyCounters(), summary?.total),
-      models: Object.entries(summary?.models ?? {}).map(([model, counters]) => ({ model, counters: addCounters(emptyCounters(), counters) })),
-    }
+export function usageMeterDifference(current?: UsageSummary, baseline?: UsageSummary) {
+  if (!current || !baseline) return { totals: emptyCounters(), models: [] }
+  const modelNames = new Set([...Object.keys(current.models ?? {}), ...Object.keys(baseline.models ?? {})])
+  return {
+    totals: subtractCounters(current.total, baseline.total),
+    models: [...modelNames]
+      .map((model) => ({ model, counters: subtractCounters(current.models?.[model], baseline.models?.[model]) }))
+      .filter(({ counters }) => totalTokens(counters) > 0 || counters.requests > 0),
   }
-  const end = new Date(reference); end.setUTCHours(0, 0, 0, 0)
-  const start = new Date(end); start.setUTCDate(end.getUTCDate() - range + 1)
-  const startDate = isoDate(start); const endDate = isoDate(end)
-  const totals = emptyCounters(); const models = new Map<string, UsageCounters>()
-  daily.filter((point) => point.date >= startDate && point.date <= endDate).forEach((point) => {
-    addCounters(totals, point)
-    Object.entries(point.models ?? {}).forEach(([model, counters]) => {
-      models.set(model, addCounters(models.get(model) ?? emptyCounters(), counters))
-    })
-  })
-  return { totals, models: [...models].map(([model, counters]) => ({ model, counters })) }
 }
 function sortValue(row: UsageGroup, key: SortKey): string | number {
   if (key === 'model') return row.label.toLocaleLowerCase()
@@ -173,7 +159,9 @@ export function UsagePage() {
   const summary = useResource((signal) => api.usage.get(signal))
   const analysis = useResource((signal) => api.usage.analysis(daysAgo(364), daysAgo(0), signal))
   const [range, setRange] = useState<RangeDays>(30)
-  const [meterRange, setMeterRange] = useState<MeterRange>('lifetime')
+  const [meterBaseline, setMeterBaseline] = useState<UsageSummary>()
+  const [meterCurrent, setMeterCurrent] = useState<UsageSummary>()
+  const [meterRunning, setMeterRunning] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>('output'); const [sortAscending, setSortAscending] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(new Set()); const [editing, setEditing] = useState<UsageMember>()
   const [alias, setAlias] = useState(''); const [mergeGroup, setMergeGroup] = useState(''); const [routeTo, setRouteTo] = useState(''); const [busy, setBusy] = useState<string>()
@@ -182,11 +170,40 @@ export function UsagePage() {
   const rows = useMemo(() => [...(summary.data?.groups ?? [])].sort((left, right) => { const a = sortValue(left, sortKey); const b = sortValue(right, sortKey); const result = typeof a === 'string' ? a.localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' }) : Number(a) - Number(b); return (result || left.key.localeCompare(right.key)) * (sortAscending ? 1 : -1) }), [sortAscending, sortKey, summary.data?.groups])
   const totals = useMemo(() => rows.reduce((value, row) => ({ input: value.input + inputMisses(row), cached: value.cached + Number(row.stats.cached || 0), output: value.output + Number(row.stats.output || 0), requests: value.requests + Number(row.stats.requests || 0), cost: value.cost + Number(row.total_cost || 0) }), { input: 0, cached: 0, output: 0, requests: 0, cost: 0 }), [rows])
   const daily = useMemo(() => analysis.data?.daily ?? [], [analysis.data?.daily]); const streaks = usageStreaks(daily); const peak = Math.max(0, ...daily.map((point) => totalTokens(point)))
-  const meter = useMemo(() => usageMeterSnapshot(summary.data, daily, meterRange), [daily, meterRange, summary.data])
+  const meter = useMemo(() => usageMeterDifference(meterCurrent, meterBaseline), [meterBaseline, meterCurrent])
   const meterModels = useMemo(() => [...meter.models].sort((left, right) => totalTokens(right.counters) - totalTokens(left.counters) || left.model.localeCompare(right.model, undefined, { numeric: true, sensitivity: 'base' })), [meter.models])
   const setSort = (next: SortKey) => { if (next === sortKey) setSortAscending((value) => !value); else { setSortKey(next); setSortAscending(next === 'model') } }
   const reload = () => { summary.reload(); analysis.reload() }
-  const reset = async () => { if (!await confirm({ title: 'Reset metered usage?', message: 'This resets the cluster-wide lifetime meter to zero for every model. Dated history remains available in the 7, 30, and 365 day views.', confirmLabel: 'Reset meter', danger: true })) return; setBusy('reset'); setActionError(undefined); try { await api.usage.reset(); setMeterRange('lifetime'); setNotice('Metered usage reset to zero.'); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not reset metered usage') } finally { setBusy(undefined) } }
+  useEffect(() => {
+    if (!meterRunning) return
+    let active = true
+    let controller: AbortController | undefined
+    const sample = async () => {
+      controller?.abort()
+      controller = new AbortController()
+      try {
+        const next = await api.usage.get(controller.signal)
+        if (active) setMeterCurrent(next)
+      } catch (reason) {
+        if (active && !(reason instanceof DOMException && reason.name === 'AbortError')) setActionError(reason instanceof Error ? reason.message : 'Could not update the token meter')
+      }
+    }
+    const timer = window.setInterval(() => void sample(), 2_000)
+    return () => { active = false; controller?.abort(); window.clearInterval(timer) }
+  }, [meterRunning])
+  const startMeter = async () => {
+    setBusy('meter:start'); setActionError(undefined); setNotice(undefined)
+    try {
+      const baseline = await api.usage.get()
+      setMeterBaseline(baseline); setMeterCurrent(baseline); setMeterRunning(true)
+    } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not start the token meter') } finally { setBusy(undefined) }
+  }
+  const stopMeter = async () => {
+    setMeterRunning(false); setBusy('meter:stop'); setActionError(undefined)
+    try {
+      setMeterCurrent(await api.usage.get())
+    } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not capture the final token meter reading') } finally { setBusy(undefined) }
+  }
   // member.merge_group holds the destination's resolved group for routed
   // sources; only summary.merge_groups carries the source's own setting.
   const beginEdit = (member: UsageMember) => { setEditing(member); setAlias(member.alias ?? ''); setMergeGroup(summary.data?.merge_groups?.[member.model] ?? ''); setRouteTo(summary.data?.routing_rules?.[member.model] ?? ''); setActionError(undefined) }
@@ -231,11 +248,6 @@ export function UsagePage() {
     {(summary.loading || analysis.loading) && !summary.data && <LoadingState label="Loading usage stats" />}{summary.error && !summary.data && <ErrorState message={summary.error} onRetry={reload} />}
     {analysis.error && <ErrorState message={`Historical usage: ${analysis.error}`} onRetry={analysis.reload} />}
     {summary.data && <><Panel className="usage-overview-metrics" aria-label="Usage overview"><div><strong>{formatTokens(totals.input + totals.cached + totals.output)}</strong><span>Total tokens</span></div><div><strong>{formatTokens(peak)}</strong><span>Peak day</span></div><div><strong>{streaks.activeDays}</strong><span>Active days</span></div><div><strong>{streaks.current} d</strong><span>Current streak</span></div><div><strong>{streaks.longest} d</strong><span>Longest streak</span></div></Panel>
-      <Panel className="usage-meter-panel" aria-label="Token usage meter"><div className="usage-panel-heading usage-meter-heading"><div><h2>Token meter</h2><p>{meterRange === 'lifetime' ? 'Measured since the lifetime meter was last reset' : `Measured over the last ${meterRange} days`}</p></div><Button variant="danger" disabled={busy === 'reset'} onClick={() => void reset()}><RotateCcw size={15} /> {busy === 'reset' ? 'Resetting…' : 'Reset metered usage'}</Button></div>
-        <div className="segmented-control usage-meter-range" aria-label="Token meter timeframe"><button aria-pressed={meterRange === 'lifetime'} onClick={() => setMeterRange('lifetime')}>Since reset</button><button aria-pressed={meterRange === 7} onClick={() => setMeterRange(7)}>7 days</button><button aria-pressed={meterRange === 30} onClick={() => setMeterRange(30)}>30 days</button><button aria-pressed={meterRange === 365} onClick={() => setMeterRange(365)}>365 days</button></div>
-        <div className="usage-meter-totals"><div><strong>{formatTokens(totalTokens(meter.totals))}</strong><span>Total tokens</span></div><div><strong>{formatTokens(meter.totals.input)}</strong><span>Input tokens</span></div><div><strong>{formatTokens(meter.totals.cached)}</strong><span>Cached input</span></div><div><strong>{formatTokens(meter.totals.output)}</strong><span>Output tokens</span></div><div><strong>{formatTokens(meter.totals.requests)}</strong><span>Requests</span></div></div>
-        {!meterModels.length ? <EmptyState title="No measured model usage" description="Models appear here as SparkDeck records calls in this timeframe." /> : <div className="usage-meter-models" role="table" aria-label="Measured usage by model"><div className="usage-meter-model usage-meter-model-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Input</span><span role="columnheader">Output</span><span role="columnheader">Total</span><span role="columnheader">Requests</span></div>{meterModels.map(({ model, counters }) => <div className="usage-meter-model" role="row" key={model}><strong role="cell">{model}</strong><span role="cell" data-label="Input">{formatTokens(counters.input)}</span><span role="cell" data-label="Output">{formatTokens(counters.output)}</span><span role="cell" data-label="Total">{formatTokens(totalTokens(counters))}</span><span role="cell" data-label="Requests">{formatTokens(counters.requests)}</span></div>)}</div>}
-      </Panel>
       <Panel className="usage-activity-panel"><div className="usage-panel-heading"><div><h2>Token activity</h2><p>Daily usage over the last year</p></div></div><ActivityHeatmap points={daily} /></Panel>
       <div className="usage-time-heading"><h2>Time range</h2><div className="segmented-control" aria-label="Usage time range"><button aria-pressed={range === 7} onClick={() => setRange(7)}>Last 7 days</button><button aria-pressed={range === 30} onClick={() => setRange(30)}>Last 30 days</button></div></div>
       <Panel className="usage-trend-panel"><div className="usage-panel-heading"><div><h2>Daily token trend</h2><p>Input and output tokens by model</p></div></div><TrendChart points={daily} range={range} /></Panel>
@@ -248,6 +260,10 @@ export function UsagePage() {
         <form className="usage-routing-form" aria-label="Add model routing rule" onSubmit={(event) => void saveRoute(event)}><label className="field"><span>Source model</span><select value={routeSource} disabled={busy?.startsWith('route:')} onChange={(event) => { const source = event.target.value; setRouteSource(source); setRouteDestination(summary.data?.routing_rules?.[source] ?? ''); setRouteError(undefined) }}><option value="">Select a model</option>{routeModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label className="field"><span>Destination model</span><select value={routeDestination} onChange={(event) => { setRouteDestination(event.target.value); setRouteError(undefined) }} disabled={!routeSource || busy?.startsWith('route:')}><option value="">Select a model</option>{routeModels.filter((model) => model !== routeSource).map((model) => <option key={model} value={model}>{model}</option>)}</select></label><Button type="submit" variant="primary" disabled={!routeSource || !routeDestination || routeSource === routeDestination || busy?.startsWith('route:')}>{summary.data?.routing_rules?.[routeSource] ? 'Update rule' : 'Add rule'}</Button></form>
         {routeError && <p className="inline-error usage-routing-error" role="alert">{routeError}</p>}
         {routingRules.length ? <ul className="usage-routing-list" aria-label="Current model routing rules">{routingRules.map(([source, destination]) => <li key={source} aria-label={`${source} routes to ${destination}`}><code>{source}</code><ArrowRight size={14} aria-hidden="true" /><code>{destination}</code><Button type="button" variant="tertiary" aria-label={`Remove routing rule for ${source}`} disabled={busy?.startsWith('route:')} onClick={() => void removeRoute(source)}><Trash2 size={14} /> Remove</Button></li>)}</ul> : <p className="usage-routing-empty">No routing rules yet. Add one to combine a source model into a destination model.</p>}
+      </Panel>
+      <Panel className="usage-meter-panel" aria-label="Token usage meter"><div className="usage-panel-heading usage-meter-heading"><div><h2>Token meter</h2><p>{meterRunning ? 'Measuring tokens used since you pressed Start' : meterBaseline ? 'Measurement stopped — press Start to begin a new interval' : 'Press Start to measure token use during a specific time period'}</p></div><div className="usage-meter-actions"><Button variant="primary" disabled={meterRunning || busy?.startsWith('meter:')} onClick={() => void startMeter()}><RefreshCw size={15} /> {busy === 'meter:start' ? 'Starting…' : 'Start'}</Button><Button variant="danger" disabled={!meterRunning || busy?.startsWith('meter:')} onClick={() => void stopMeter()}><Square size={14} /> {busy === 'meter:stop' ? 'Stopping…' : 'Stop'}</Button></div></div>
+        <div className="usage-meter-totals"><div><strong>{formatTokens(totalTokens(meter.totals))}</strong><span>Total tokens</span></div><div><strong>{formatTokens(meter.totals.input)}</strong><span>Input tokens</span></div><div><strong>{formatTokens(meter.totals.cached)}</strong><span>Cached input</span></div><div><strong>{formatTokens(meter.totals.output)}</strong><span>Output tokens</span></div><div><strong>{formatTokens(meter.totals.requests)}</strong><span>Requests</span></div></div>
+        {!meterModels.length ? <EmptyState title={meterBaseline ? 'No tokens measured' : 'Meter not started'} description={meterBaseline ? 'Token totals will appear here when models are used during this measurement.' : 'Press Start, use your models, then press Stop to capture the interval.'} /> : <div className="usage-meter-models" role="table" aria-label="Measured usage by model"><div className="usage-meter-model usage-meter-model-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Input</span><span role="columnheader">Output</span><span role="columnheader">Total</span><span role="columnheader">Requests</span></div>{meterModels.map(({ model, counters }) => <div className="usage-meter-model" role="row" key={model}><strong role="cell">{model}</strong><span role="cell" data-label="Input">{formatTokens(counters.input)}</span><span role="cell" data-label="Output">{formatTokens(counters.output)}</span><span role="cell" data-label="Total">{formatTokens(totalTokens(counters))}</span><span role="cell" data-label="Requests">{formatTokens(counters.requests)}</span></div>)}</div>}
       </Panel>
     </>}
     {editing && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setEditing(undefined)}><section className="modal usage-alias-modal" role="dialog" aria-modal="true" aria-labelledby="usage-alias-title"><div className="modal-heading"><div><p className="eyebrow">Display settings</p><h2 id="usage-alias-title">Edit usage model</h2></div><button className="icon-button" onClick={() => setEditing(undefined)} aria-label="Close dialog"><X size={17} /></button></div><code>{editing.model}</code><form onSubmit={(event) => void saveDisplay(event)}><label className="field"><span>Display alias</span><input maxLength={120} value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Optional friendly name" /></label><label className="field"><span>Merge group</span><input maxLength={120} value={mergeGroup} onChange={(event) => setMergeGroup(event.target.value)} placeholder="Optional group name" /></label><label className="field"><span>Route usage to</span><input maxLength={512} list="usage-route-destinations" value={routeTo} onChange={(event) => setRouteTo(event.target.value)} placeholder="Leave empty to keep this model's own row" /></label><datalist id="usage-route-destinations">{routeOptions.map((model) => <option key={model} value={model} />)}</datalist>{actionError && <p className="inline-error" role="alert">{actionError}</p>}<p>Routing forwards this model's usage totals to another model's row and merge groups combine rows; neither rewrites the underlying counters.</p><div className="modal-actions"><Button type="button" onClick={() => setEditing(undefined)}>Cancel</Button><Button type="submit" variant="primary" disabled={busy === `alias:${editing.model}`}>Save usage display</Button></div></form></section></div>}

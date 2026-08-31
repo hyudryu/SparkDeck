@@ -1,8 +1,8 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { DailyUsagePoint, UsageGroup, UsageSummary } from '../api/types'
-import { activityHeatmapCalendar, modelShareItems, usageMeterSnapshot, UsagePage } from './UsagePage'
+import type { UsageGroup, UsageSummary } from '../api/types'
+import { activityHeatmapCalendar, modelShareItems, usageMeterDifference, UsagePage } from './UsagePage'
 
 const summary = {
   models: {
@@ -74,27 +74,18 @@ describe('UsagePage', () => {
     expect(calendar.months.every((month, index) => index === 0 || month.column > calendar.months[index - 1].column)).toBe(true)
   })
 
-  it('meters lifetime and dated model usage without double-counting cached input', () => {
-    const daily: DailyUsagePoint[] = [
-      { date: '2026-08-29', input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
-      { date: '2026-08-10', input: 200, cached: 50, output: 30, requests: 2, models: { beta: { input: 200, cached: 50, output: 30, requests: 2 } } },
-      { date: '2026-07-01', input: 400, cached: 100, output: 50, requests: 3, models: { gamma: { input: 400, cached: 100, output: 50, requests: 3 } } },
-    ]
-    const reference = new Date('2026-08-30T12:00:00Z')
+  it('measures only counters added after the interval baseline', () => {
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
+      total: { input: 1700, cached: 550, output: 825, requests: 15 },
+    }
 
-    const lifetime = usageMeterSnapshot(summary as UsageSummary, daily, 'lifetime', reference)
-    expect(lifetime.totals).toMatchObject({ input: 1500, cached: 500, output: 750, requests: 12 })
-    expect(lifetime.models.map((item) => item.model)).toEqual(['org/model'])
-    expect(lifetime.totals.input + lifetime.totals.output).toBe(2250)
+    const measured = usageMeterDifference(current as UsageSummary, summary as UsageSummary)
 
-    const week = usageMeterSnapshot(summary as UsageSummary, daily, 7, reference)
-    expect(week.totals).toMatchObject({ input: 100, cached: 40, output: 25, requests: 1 })
-    expect(week.models.map((item) => item.model)).toEqual(['alpha'])
-    expect(week.totals.input + week.totals.output).toBe(125)
-
-    const month = usageMeterSnapshot(summary as UsageSummary, daily, 30, reference)
-    expect(month.totals).toMatchObject({ input: 300, cached: 90, output: 55, requests: 3 })
-    expect(month.models.map((item) => item.model).sort()).toEqual(['alpha', 'beta'])
+    expect(measured.totals).toMatchObject({ input: 200, cached: 50, output: 75, requests: 3 })
+    expect(measured.models).toEqual([{ model: 'org/model', counters: { input: 200, cached: 50, output: 75, requests: 3 } }])
+    expect(measured.totals.input + measured.totals.output).toBe(275)
   })
 
   it('shows the token scale legend and a hover tooltip on heatmap cells', async () => {
@@ -156,7 +147,7 @@ describe('UsagePage', () => {
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/token-stats/daily?start='), expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
-  it('keeps alias, erase, and lifetime reset controls connected to the old APIs', async () => {
+  it('keeps alias and erase controls connected to the existing APIs', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (init?.method) return json({ ok: true })
       const path = String(input)
@@ -182,40 +173,45 @@ describe('UsagePage', () => {
     await user.click(screen.getByRole('button', { name: 'Erase' }))
     await user.click(within(await screen.findByRole('dialog', { name: 'Erase usage for org/model?' })).getByRole('button', { name: 'Erase usage' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
-    await user.click(screen.getByRole('button', { name: 'Reset metered usage' }))
-    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
   })
 
-  it('resets the since-reset meter while preserving dated model history', async () => {
-    let reset = false
-    const today = new Date().toISOString().slice(0, 10)
-    const zeroSummary = { ...summary, models: {}, groups: [], total: { input: 0, cached: 0, output: 0, requests: 0 } }
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+  it('starts and stops an interval meter at the bottom of the page', async () => {
+    let summaryReads = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
+      total: { input: 1700, cached: 550, output: 825, requests: 15 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
-      if (init?.method === 'POST' && path === '/api/token-stats/reset') { reset = true; return json({ ok: true }) }
       if (path.includes('/api/token-stats/hourly')) return json([])
-      if (path.includes('/api/token-stats/daily')) return json([
-        { date: today, input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
-      ])
-      return json(reset ? zeroSummary : summary)
+      if (path.includes('/api/token-stats/daily')) return json([])
+      summaryReads += 1
+      return json(summaryReads >= 3 ? current : summary)
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
     render(<UsagePage />)
 
     const meter = await screen.findByLabelText('Token usage meter')
-    expect(meter).toHaveTextContent('2,250')
+    const routing = screen.getByRole('heading', { name: 'Model routing rules' }).closest('.usage-routing-panel')
+    expect(routing).not.toBeNull()
+    expect((routing as Element).compareDocumentPosition(meter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(meter).toHaveTextContent('Meter not started')
+    expect(within(meter).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeDisabled()
+
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+    await waitFor(() => expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled())
+    expect(meter).toHaveTextContent('Measuring tokens used since you pressed Start')
+
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(meter).toHaveTextContent('Measurement stopped'))
+    expect(meter).toHaveTextContent('275')
+    expect(meter).toHaveTextContent('200')
+    expect(meter).toHaveTextContent('75')
     expect(within(meter).getByRole('table', { name: 'Measured usage by model' })).toHaveTextContent('org/model')
-
-    await user.click(within(meter).getByRole('button', { name: 'Reset metered usage' }))
-    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
-    await waitFor(() => expect(meter).toHaveTextContent('No measured model usage'))
-    expect(screen.getByText('Metered usage reset to zero.')).toBeInTheDocument()
-
-    await user.click(within(meter).getByRole('button', { name: '7 days' }))
-    expect(await within(meter).findByText('alpha')).toBeInTheDocument()
-    expect(meter).toHaveTextContent('125')
+    expect(fetchMock.mock.calls.every(([path]) => String(path) !== '/api/token-stats/reset')).toBe(true)
   })
 
   it('edits and removes usage routing rules from the display dialog', async () => {

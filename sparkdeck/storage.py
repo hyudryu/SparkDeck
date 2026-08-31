@@ -39,6 +39,8 @@ COMMUNITY_API_URL = os.environ.get(
     "https://oqft567ar3.execute-api.us-east-2.amazonaws.com",
 )
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
+_COMMUNITY_AGGREGATE_ROW_LIMIT = 100_000
+_COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT = 256
 _LOCAL_HISTORY_MODEL_LIMIT = 500
 
 
@@ -781,7 +783,8 @@ class SparkDeckStore:
             cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, input_tokens, "
                 "generation_tps, telemetry_cluster_id "
-                "FROM benchmark_samples WHERE eligible = 1"
+                "FROM benchmark_samples WHERE eligible = 1 "
+                f"ORDER BY created_at DESC LIMIT {_COMMUNITY_AGGREGATE_ROW_LIMIT}"
             )
             while True:
                 rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
@@ -816,9 +819,11 @@ class SparkDeckStore:
                     ):
                         continue
                     key = (model_id, quantization, prompt_bucket)
-                    grouped.setdefault(key, {}).setdefault(
+                    values = grouped.setdefault(key, {}).setdefault(
                         str(cluster_id), []
-                    ).append(speed)
+                    )
+                    if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
+                        values.append(speed)
 
         items = []
         for (model_id, quantization, prompt_bucket), contributors in grouped.items():
@@ -971,7 +976,8 @@ class SparkDeckStore:
         grouped: dict[tuple[str, str, int], list[float]] = {}
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT * FROM benchmark_samples WHERE eligible = 1"
+                "SELECT * FROM benchmark_samples WHERE eligible = 1 "
+                f"ORDER BY created_at DESC LIMIT {_COMMUNITY_AGGREGATE_ROW_LIMIT}"
             )
             while True:
                 rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
@@ -985,9 +991,9 @@ class SparkDeckStore:
                         payload["model_id"], payload["quantization"],
                         payload["prompt_tokens_bucket"],
                     )
-                    grouped.setdefault(key, []).append(
-                        payload["inference_tokens_per_second"]
-                    )
+                    values = grouped.setdefault(key, [])
+                    if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
+                        values.append(payload["inference_tokens_per_second"])
         return {
             key: _outlier_filtered_mean(values)
             for key, values in grouped.items()

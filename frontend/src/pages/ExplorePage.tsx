@@ -374,7 +374,7 @@ function ModelRow({
       {communityMode
         ? <>
           <span className="catalog-model-stat"><small>Output speed</small><strong>{communityRateRange(communityBenchmarks)}</strong></span>
-          <span className="catalog-model-stat"><small>Max contributors</small><strong>{formatNumber(Math.max(...communityBenchmarks.map((item) => item.unique_cluster_count ?? 0)))}</strong></span>
+          <span className="catalog-model-stat"><small>Max contributors</small><strong>{formatNumber(Math.max(...communityBenchmarks.map((item) => item.sample_count ?? 0)))}</strong></span>
         </>
         : <>
           <span className="catalog-model-stat"><small>Downloads</small><strong><Download size={13} aria-hidden="true" /> {formatNumber(model.downloads)}</strong></span>

@@ -2571,6 +2571,29 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(instance.deployments, [])
             self.assertEqual(json.loads(instance.deployments_path.read_text()), [])
 
+    async def test_remove_orphaned_members_is_locked_and_node_aware(self) -> None:
+        instance = Manager.__new__(Manager)
+        members = [
+            {"node_id": "local", "container_name": "missing-r0"},
+            {"node_id": "remote-1", "container_name": "missing-r1"},
+        ]
+        calls = []
+
+        async def member_action(member, action):
+            calls.append((member, action))
+            if member["node_id"] == "remote-1":
+                raise RuntimeError("Worker agent is offline")
+            return {"ok": True}
+
+        instance._member_action = member_action
+
+        result = await instance.remove_orphaned_deployment_members(members)
+
+        self.assertEqual(result, {
+            "ok": False, "errors": ["Worker agent is offline"],
+        })
+        self.assertEqual(calls, [(member, "remove") for member in members])
+
     async def test_vllm_sharded_launch_generates_coordinated_rank_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

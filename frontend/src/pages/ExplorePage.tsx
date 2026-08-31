@@ -374,7 +374,7 @@ function ModelRow({
       {communityMode
         ? <>
           <span className="catalog-model-stat"><small>Output speed</small><strong>{communityRateRange(communityBenchmarks)}</strong></span>
-          <span className="catalog-model-stat"><small>Max clusters</small><strong>{formatNumber(Math.max(...communityBenchmarks.map((item) => item.unique_cluster_count ?? 0)))}</strong></span>
+          <span className="catalog-model-stat"><small>Max contributors</small><strong>{formatNumber(Math.max(...communityBenchmarks.map((item) => item.sample_count ?? 0)))}</strong></span>
         </>
         : <>
           <span className="catalog-model-stat"><small>Downloads</small><strong><Download size={13} aria-hidden="true" /> {formatNumber(model.downloads)}</strong></span>
@@ -659,7 +659,7 @@ export function ExplorePage() {
         />
       )}
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
-        <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max clusters</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
+        <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max contributors</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = `${tab}:${model.id}`
           return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />

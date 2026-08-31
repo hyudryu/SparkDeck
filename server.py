@@ -1201,6 +1201,7 @@ async def agent_apply_community_pairing(req: Request):
             # Stored locally (never echoed back) so this node's uploader can
             # mint ID tokens for consented telemetry uploads.
             pairing["refresh_token"] = refresh_token
+        sparkdeck.store.bind_community_contributor(sub)
         sparkdeck.store.set_setting("device_pairing", pairing)
         sparkdeck.store.promote_outbox_for_pairing()
     return {"applied": True}
@@ -3487,6 +3488,7 @@ async def v1_community_pair(req: Request):
         }
         if effective_refresh_token:
             pairing["refresh_token"] = effective_refresh_token
+        sparkdeck.store.bind_community_contributor(pairing["sub"])
         sparkdeck.store.set_setting("device_pairing", pairing)
         sparkdeck.store.promote_outbox_for_pairing()
     # Best-effort cluster propagation; failures are reported, never raised.
@@ -3793,8 +3795,9 @@ async def community_upload_once() -> dict:
                 or current_pairing.get("refresh_token") != refresh_token
             ):
                 break
-            # The batch is only a scheduling snapshot; re-read the row at the
-            # outbound boundary so a deleted or transitioned sample never sends.
+            # The batch is only a scheduling snapshot. Recompute the cohort
+            # average inside the same mutation lock used by deletion so every
+            # measurement folded into this payload still exists when POST begins.
             current = store.outbox_entry(sample_id)
             if current is None:
                 continue

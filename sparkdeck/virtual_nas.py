@@ -2379,11 +2379,50 @@ class VirtualNAS:
                     self._external_model_roots_provider(), model_id,
                 ) is None
             ):
-                shutil.rmtree(repository)
+                self._delete_cached_repository(repository)
                 return {"ok": True, "model_id": model_id}
             # The hub copy is partial residue while inventory displays the
             # complete external install: delete the externally managed files.
         return self._delete_external_model(model_id)
+
+    @staticmethod
+    def _delete_cached_repository(repository: Path) -> None:
+        """Delete a validated cache tree, repairing exact failed paths."""
+
+        def repair_failed_path(_function, raw_path, exc_info) -> None:
+            path = Path(raw_path)
+            try:
+                metadata = path.lstat()
+                reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                if stat.S_ISLNK(metadata.st_mode) or (
+                    reparse_flag
+                    and getattr(metadata, "st_file_attributes", 0) & reparse_flag
+                ):
+                    raise OSError(
+                        "refusing to change permissions through a link or reparse point"
+                    )
+                permissions = stat.S_IWUSR
+                if stat.S_ISDIR(metadata.st_mode):
+                    permissions |= stat.S_IRUSR | stat.S_IXUSR
+                path.chmod(metadata.st_mode | permissions)
+            except OSError as repair_error:
+                raise repair_error from exc_info[1]
+
+        try:
+            # A scandir permission failure cannot resume traversal from an
+            # onerror callback. The first pass repairs only paths reported by
+            # rmtree; a second pass then traverses the now-accessible tree.
+            for _attempt in range(2):
+                if not repository.exists():
+                    return
+                shutil.rmtree(repository, onerror=repair_failed_path)
+            if repository.exists():
+                raise PermissionError("cached model repository remains")
+        except OSError as exc:
+            raise RuntimeError(
+                "could not delete cached model files; check cache ownership "
+                "and permissions"
+            ) from exc
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.

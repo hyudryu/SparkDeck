@@ -5793,6 +5793,18 @@ class Manager:
                 errors.append(message)
         return errors
 
+    async def remove_orphaned_deployment_members(
+        self, members: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Remove a persisted cluster layout after its deployment record vanished."""
+        async with self._cluster_action_lock():
+            results = await asyncio.gather(
+                *(self._member_action(member, "remove") for member in members),
+                return_exceptions=True,
+            )
+            errors = self._member_action_errors(results, "remove")
+            return {"ok": not errors, "errors": errors}
+
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,

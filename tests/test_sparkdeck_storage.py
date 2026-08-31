@@ -410,6 +410,48 @@ class SparkDeckStoreTests(unittest.TestCase):
             self.store.community_consent_snapshot()["generation"], 1,
         )
 
+    def test_migration_discards_ownerless_legacy_upload_instructions(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="synced-old", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            base, consent["generation"],
+        ))
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            replace(base, id="pending-current"), consent["generation"],
+        ))
+        self.store.mark_outbox_synced(["synced-old"])
+
+        database = self.store.path
+        self.store.close()
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("DROP INDEX benchmark_samples_community_cohort")
+            connection.execute(
+                "ALTER TABLE benchmark_samples DROP COLUMN consent_generation"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.store = SparkDeckStore(database)
+
+        generations = dict(self.store._connection.execute(
+            "SELECT id, consent_generation FROM benchmark_samples"
+        ).fetchall())
+        self.assertIsNone(generations["synced-old"])
+        self.assertIsNone(generations["pending-current"])
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.benchmarks()[1], 2)
+
     def test_migration_adds_cluster_id_column_to_legacy_benchmark_table(self):
         database = Path(self.temp.name) / "legacy-benchmarks.sqlite3"
         connection = sqlite3.connect(database)
@@ -844,8 +886,8 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 400,
-                "inference_tokens_per_second": 226.66666666666666,
-                "sample_count": 3,
+                "inference_tokens_per_second": 195.0,
+                "sample_count": 2,
                 "unique_cluster_count": 2,
             },
             {
@@ -902,11 +944,223 @@ class SparkDeckStoreTests(unittest.TestCase):
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
-            "sample_count": row_count,
+            "sample_count": 1,
             "unique_cluster_count": 1,
         }])
         self.assertGreater(len(cursor.batch_sizes), 20)
         self.assertEqual(set(cursor.batch_sizes), {_COMMUNITY_AGGREGATE_BATCH_SIZE})
+
+    def test_local_community_aggregate_filters_outliers_then_weights_contributors_equally(self):
+        consent = self.store.set_community_consent(
+            True, "11111111-1111-4111-8111-111111111111",
+        )
+        sample = BenchmarkSample(
+            id="sample-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=512, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        contributor_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ]
+        speeds = [29, 30, 30, 31, 300, 60, 40]
+        clusters = [contributor_ids[0]] * 5 + contributor_ids[1:]
+        for index, (speed, cluster_id) in enumerate(zip(speeds, clusters)):
+            candidate = replace(
+                sample, id=f"sample-{index}",
+                generation_tokens_per_second=speed,
+            )
+            self.store.add_benchmark_if_consented(
+                candidate, consent["generation"],
+            )
+            with self.store._connection:
+                self.store._connection.execute(
+                    "UPDATE benchmark_samples SET telemetry_cluster_id = ? WHERE id = ?",
+                    (cluster_id, candidate.id),
+                )
+
+        self.assertEqual(self.store.community_aggregates(), [{
+            "model_id": "deepseek-r1",
+            "quantization": "Q4_K_M",
+            "prompt_tokens_bucket": 400,
+            "inference_tokens_per_second": 43.333333333333336,
+            "sample_count": 3,
+            "unique_cluster_count": 3,
+        }])
+
+    def test_outbox_contributes_the_users_outlier_filtered_mean(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(
+            True, "11111111-1111-4111-8111-111111111111",
+        )
+        base = BenchmarkSample(
+            id="mean-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        for index, speed in enumerate([29, 30, 30, 31, 300]):
+            self.store.add_benchmark_if_consented(
+                replace(
+                    base, id=f"mean-{index}",
+                    generation_tokens_per_second=speed,
+                ),
+                consent["generation"],
+            )
+
+        payloads = self.store.outbox_batch()
+
+        self.assertEqual(len(payloads), 5)
+        self.assertEqual(
+            {payload["inference_tokens_per_second"] for payload in payloads},
+            {30.0},
+        )
+        prepared = self.store.outbox_entries()[0]
+        self.store._community_contribution_averages = lambda *_: (_ for _ in ()).throw(
+            AssertionError("prepared entries must not rescan history")
+        )
+        self.assertEqual(
+            self.store.outbox_entry(
+                prepared["sample_id"], prepared_payload=prepared["payload"],
+            ),
+            prepared,
+        )
+
+    def test_outbox_computes_robust_mean_for_pending_cohort_outside_recent_rows(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="old-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        for index, speed in enumerate([29, 30, 30, 31, 300]):
+            self.store.add_benchmark_if_consented(
+                replace(
+                    base, id=f"old-{index}",
+                    generation_tokens_per_second=speed,
+                ),
+                consent["generation"],
+            )
+        self.store.add_benchmark_if_consented(
+            replace(
+                base, id="new-other", created_at="2026-08-26T00:00:00+00:00",
+                model=ModelIdentity("other-model", quantization="Q4_K_M"),
+            ),
+            consent["generation"],
+        )
+
+        import sparkdeck.storage as storage_module
+        original_limit = storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT
+        storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT = 1
+        try:
+            payloads = self.store.outbox_batch(limit=5)
+        finally:
+            storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT = original_limit
+
+        self.assertEqual(len(payloads), 5)
+        self.assertEqual(
+            {payload["inference_tokens_per_second"] for payload in payloads},
+            {30.0},
+        )
+        plan = self.store._connection.execute(
+            """EXPLAIN QUERY PLAN SELECT * FROM benchmark_samples
+               WHERE eligible = 1 AND consent_generation = ?
+                 AND community_model_id = ?
+                 AND community_quantization = ?
+                 AND community_prompt_bucket = ?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (
+                consent["generation"], "deepseek-r1", "Q4_K_M", 400,
+                256,
+            ),
+        ).fetchall()
+        self.assertIn(
+            "benchmark_samples_community_cohort",
+            " ".join(str(column) for row in plan for column in row),
+        )
+
+    def test_upload_average_excludes_measurements_from_prior_consent_epoch(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        first = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="old-epoch", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.add_benchmark_if_consented(base, first["generation"])
+        self.store.set_community_consent(False)
+        current = self.store.set_community_consent(True)
+        self.store.add_benchmark_if_consented(
+            replace(
+                base, id="current-epoch",
+                generation_tokens_per_second=30,
+            ),
+            current["generation"],
+        )
+
+        self.assertEqual(
+            self.store.outbox_batch()[0]["inference_tokens_per_second"],
+            30.0,
+        )
+
+    def test_account_change_starts_a_new_contribution_epoch(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        self.assertFalse(self.store.bind_community_contributor("account-a"))
+        base = BenchmarkSample(
+            id="account-a-sample", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            base, consent["generation"],
+        ))
+        self.store.mark_outbox_synced([base.id])
+
+        self.assertTrue(self.store.bind_community_contributor("account-b"))
+        current = self.store.community_consent_snapshot()
+        self.assertEqual(current["generation"], consent["generation"] + 1)
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            replace(
+                base, id="account-b-sample",
+                generation_tokens_per_second=30,
+            ),
+            current["generation"],
+        ))
+
+        self.assertEqual(
+            self.store.outbox_batch()[0]["inference_tokens_per_second"],
+            30.0,
+        )
 
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(

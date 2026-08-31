@@ -16,6 +16,7 @@ import shlex
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
@@ -363,6 +364,8 @@ class SparkDeckService:
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
+        self._deployment_action_lock_users: dict[str, int] = {}
+        self._deployment_action_lock_registry_lock = asyncio.Lock()
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
@@ -3402,10 +3405,7 @@ class SparkDeckService:
         additional_node_ids: list[str] | None = None,
         promote: bool = False,
     ) -> dict[str, Any]:
-        lock = self._deployment_action_locks.setdefault(
-            deployment_id, asyncio.Lock(),
-        )
-        async with lock:
+        async with self._deployment_lifecycle_lock(deployment_id):
             launch_task = self._deployment_launch_tasks.get(deployment_id)
             if launch_task is not None and not launch_task.done():
                 raise RuntimeError(
@@ -3414,6 +3414,31 @@ class SparkDeckService:
             return await self._deployment_action_locked(
                 deployment_id, action, node_ids, additional_node_ids, promote,
             )
+
+    @asynccontextmanager
+    async def _deployment_lifecycle_lock(
+        self, deployment_id: str,
+    ) -> AsyncIterator[None]:
+        """Serialize one record's lifecycle and retire its lock after the last user."""
+        async with self._deployment_action_lock_registry_lock:
+            lock = self._deployment_action_locks.setdefault(
+                deployment_id, asyncio.Lock(),
+            )
+            self._deployment_action_lock_users[deployment_id] = (
+                self._deployment_action_lock_users.get(deployment_id, 0) + 1
+            )
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._deployment_action_lock_registry_lock:
+                remaining = self._deployment_action_lock_users[deployment_id] - 1
+                if remaining:
+                    self._deployment_action_lock_users[deployment_id] = remaining
+                else:
+                    self._deployment_action_lock_users.pop(deployment_id, None)
+                    if self._deployment_action_locks.get(deployment_id) is lock:
+                        self._deployment_action_locks.pop(deployment_id, None)
 
     async def _promote_discovered_deployment(
         self, deployment: dict[str, Any], container: dict[str, Any],
@@ -4137,6 +4162,15 @@ class SparkDeckService:
         return {"logs": await self.manager.get_cluster_member_logs(container, bounded_tail)}
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
+        # Start/stop can replace the Manager deployment and its member names.
+        # Take the same record lock before reading either catalog so deletion
+        # cannot act on a stale pre-relaunch snapshot.
+        async with self._deployment_lifecycle_lock(deployment_id):
+            return await self._delete_deployment_locked(deployment_id)
+
+    async def _delete_deployment_locked(
+        self, deployment_id: str,
+    ) -> dict[str, Any]:
         # A provisional row is visible while Docker launch is in flight. Wait
         # only for that deployment to settle; unrelated removals must remain
         # responsive during a slow image pull or container startup.
@@ -4157,18 +4191,77 @@ class SparkDeckService:
         if not deployment:
             raise LookupError("deployment not found")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        linked = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict) and item.get("id")
+            and item.get("sparkdeck_record_id") == deployment.get("id")
+        ), None)
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
+        cluster_removed = False
+        manager_missing = False
         if manager_id:
-            result = await self.manager.deployment_action(manager_id, "remove")
-            if not result.get("ok"):
-                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
-        elif owner:
+            try:
+                result = await self.manager.deployment_action(manager_id, "remove")
+            except (LookupError, ValueError) as exc:
+                if not _is_missing_deployment_error(exc):
+                    raise
+                manager_missing = True
+            else:
+                if not result.get("ok"):
+                    raise RuntimeError(
+                        "; ".join(result.get("errors") or ["cluster removal failed"])
+                    )
+                cluster_removed = True
+        if manager_missing:
+            # Manager can replace a deployment under its own lifecycle lock
+            # (for example, an automatic vLLM capacity adjustment) without
+            # taking this service's record lock. Refresh both catalogs after
+            # the old ID is confirmed absent so its replacement is not orphaned.
+            deployment = (
+                self.store.deployment(deployment_id, include_private=True)
+                or deployment
+            )
+            refreshed_manager_id = (
+                deployment.get("settings", {}).get("manager_deployment_id")
+            )
+            linked = next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") and (
+                    item.get("sparkdeck_record_id") == deployment.get("id")
+                    or item.get("id") == refreshed_manager_id
+                )
+            ), None)
+            owner = self._owning_cluster_deployment(
+                deployment.get("container_name"),
+            )
+            manager_id = refreshed_manager_id or manager_id
+        current_owner = linked or owner
+        if (
+            not cluster_removed and current_owner
+            and (manager_missing or current_owner["id"] != manager_id)
+        ):
             # Removing one rank of a cluster would leave the health monitor to
-            # resurrect the deployment; remove the whole cluster instead.
-            result = await self.manager.deployment_action(owner["id"], "remove")
-            if not result.get("ok"):
-                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
-        elif (
+            # resurrect the deployment. This also covers a stale saved Manager
+            # ID when the container has since been adopted by another cluster.
+            try:
+                result = await self.manager.deployment_action(
+                    current_owner["id"], "remove",
+                )
+            except (LookupError, ValueError) as exc:
+                if not _is_missing_deployment_error(exc):
+                    raise
+                cluster_removed = True
+            else:
+                if not result.get("ok"):
+                    raise RuntimeError(
+                        "; ".join(result.get("errors") or ["cluster removal failed"])
+                    )
+                cluster_removed = True
+        if not cluster_removed and manager_id:
+            cluster_removed = await self._remove_orphaned_cluster_members(
+                deployment, str(manager_id),
+            )
+        if not cluster_removed and (
             deployment["kind"] == DeploymentKind.MANAGED.value or discovered
         ) and deployment.get("container_name"):
             try:
@@ -4180,6 +4273,47 @@ class SparkDeckService:
             self._delete_credential(deployment_id, deployment.get("_credential_ref"))
             self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
+
+    async def _remove_orphaned_cluster_members(
+        self, deployment: dict[str, Any], manager_id: str,
+    ) -> bool:
+        """Remove every persisted rank after its Manager record disappeared."""
+        node_ids = [
+            str(node_id).strip()
+            for node_id in (deployment.get("settings") or {}).get("node_ids") or []
+            if str(node_id).strip()
+        ]
+        if not node_ids:
+            return False
+        primary_name = str(deployment.get("container_name") or "")
+        primary_prefix = f"cluster-{manager_id}-r0-"
+        suffix = (
+            primary_name[len(primary_prefix):]
+            if primary_name.startswith(primary_prefix) else ""
+        )
+        if not suffix:
+            if len(node_ids) > 1 or any(
+                node_id != LOCAL_NODE_ID for node_id in node_ids
+            ):
+                raise RuntimeError(
+                    "saved cluster member names are unavailable; refusing to "
+                    "delete the deployment record while remote ranks may remain"
+                )
+            return False
+        members = [
+            {
+                "node_id": node_id,
+                "rank": rank,
+                "container_name": f"cluster-{manager_id}-r{rank}-{suffix}",
+            }
+            for rank, node_id in enumerate(node_ids)
+        ]
+        result = await self.manager.remove_orphaned_deployment_members(members)
+        if not result.get("ok"):
+            raise RuntimeError(
+                "; ".join(result.get("errors") or ["cluster removal failed"])
+            )
+        return True
 
     def _clone_launch_configuration(
         self, stored: dict[str, Any], runtime: RuntimeKind,
@@ -5385,6 +5519,13 @@ def _is_missing_container_error(exc: Exception) -> bool:
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
     return status == 404
+
+
+def _is_missing_deployment_error(exc: Exception) -> bool:
+    return str(exc).strip().casefold() in {
+        "deployment not found",
+        "cluster deployment not found",
+    }
 
 
 def _artifact_is_controller_local(artifact: str | None) -> bool:

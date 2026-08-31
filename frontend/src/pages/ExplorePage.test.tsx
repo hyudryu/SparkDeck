@@ -745,7 +745,7 @@ describe('ExplorePage model rows', () => {
 
     const header = document.querySelector('.catalog-model-header')
     expect(header).toHaveTextContent('Output speed')
-    expect(header).toHaveTextContent('Max clusters')
+    expect(header).toHaveTextContent('Max contributors')
     expect(screen.queryByText('Downloads')).not.toBeInTheDocument()
     expect(screen.queryByText('Likes')).not.toBeInTheDocument()
     const row = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B' })

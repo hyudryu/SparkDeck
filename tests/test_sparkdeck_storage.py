@@ -1127,6 +1127,41 @@ class SparkDeckStoreTests(unittest.TestCase):
             30.0,
         )
 
+    def test_account_change_starts_a_new_contribution_epoch(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        self.assertFalse(self.store.bind_community_contributor("account-a"))
+        base = BenchmarkSample(
+            id="account-a-sample", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            base, consent["generation"],
+        ))
+        self.store.mark_outbox_synced([base.id])
+
+        self.assertTrue(self.store.bind_community_contributor("account-b"))
+        current = self.store.community_consent_snapshot()
+        self.assertEqual(current["generation"], consent["generation"] + 1)
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            replace(
+                base, id="account-b-sample",
+                generation_tokens_per_second=30,
+            ),
+            current["generation"],
+        ))
+
+        self.assertEqual(
+            self.store.outbox_batch()[0]["inference_tokens_per_second"],
+            30.0,
+        )
+
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(
             id="legacy-invalid", created_at="2026-08-25T00:00:00+00:00",

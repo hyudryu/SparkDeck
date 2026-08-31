@@ -230,6 +230,17 @@ class SparkDeckStore:
                 "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
                 ("device_pairing", json.dumps({"status": "not_paired"})),
             )
+            pairing = self.get_setting("device_pairing", {})
+            if (
+                isinstance(pairing, dict)
+                and pairing.get("status") == "paired"
+                and isinstance(pairing.get("sub"), str)
+                and pairing["sub"]
+            ):
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO settings(key, value_json) VALUES (?, ?)",
+                    ("community_contributor_sub", json.dumps(pairing["sub"])),
+                )
             deployment_columns = {
                 row[1] for row in self._connection.execute(
                     "PRAGMA table_info(deployments)"
@@ -403,6 +414,33 @@ class SparkDeckStore:
                 "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
                 (key, json.dumps(value)),
             )
+
+    def bind_community_contributor(self, sub: str) -> bool:
+        """Bind telemetry to one account, starting a new epoch on change."""
+        if not isinstance(sub, str) or not sub:
+            raise ValueError("community contributor subject is required")
+        with self._lock, self._connection:
+            previous = self.get_setting("community_contributor_sub")
+            changed = isinstance(previous, str) and previous != sub
+            if changed:
+                generation = int(self.get_setting(
+                    "community_consent_generation", 0,
+                )) + 1
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    ("community_consent_generation", json.dumps(generation)),
+                )
+                self._connection.execute(
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
+                )
+            self._connection.execute(
+                "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                ("community_contributor_sub", json.dumps(sub)),
+            )
+            return changed
 
     def add_deployment(self, deployment: Deployment, base_url: str | None = None,
                        credential_ref: str | None = None) -> None:

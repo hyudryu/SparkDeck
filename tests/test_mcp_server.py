@@ -65,6 +65,117 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             await client.action("user-1", "remove")
         self.assertEqual(methods, ["GET"])
 
+    async def test_deployment_configuration_and_lifecycle_use_stable_v1_id(self) -> None:
+        requests: list[tuple[str, str, dict | None]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            requests.append((request.method, request.url.path, body))
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{
+                        "id": "manager-1",
+                        "sparkdeck_record_id": "record-1",
+                        "managed_by": "sparkdeck-mcp",
+                    }],
+                })
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "id": "record-1", "editable": True,
+                    "desired_state": "stopped", "extra_args": [],
+                    "environment": {}, "launch_controls": {},
+                })
+            return httpx.Response(200, json={
+                "ok": True, "id": "record-1", "changes": body,
+            })
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+        configuration = await client.deployment_configuration("manager-1")
+        updated = await client.update_deployment_configuration(
+            "record-1",
+            {
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "extra_args": ["--enable-prefix-caching"],
+                "launch_controls": {"max_concurrency": 8},
+            },
+        )
+        started = await client.action("manager-1", "start")
+        stopped = await client.action("record-1", "stop")
+        removed = await client.action("record-1", "remove")
+
+        self.assertTrue(configuration["editable"])
+        self.assertEqual(updated["changes"]["environment"], {"NCCL_DEBUG": "WARN"})
+        self.assertTrue(started["ok"])
+        self.assertTrue(stopped["ok"])
+        self.assertTrue(removed["ok"])
+        non_state = [request for request in requests if request[1] != "/api/state"]
+        self.assertEqual(non_state, [
+            ("GET", "/api/v1/deployments/record-1", None),
+            ("PUT", "/api/v1/deployments/record-1/settings", {
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "extra_args": ["--enable-prefix-caching"],
+                "launch_controls": {"max_concurrency": 8},
+            }),
+            ("POST", "/api/v1/deployments/record-1/start", None),
+            ("POST", "/api/v1/deployments/record-1/stop", None),
+            ("POST", "/api/deployments/manager-1/remove", None),
+        ])
+
+    async def test_configuration_update_requires_explicit_unowned_override(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{
+                        "id": "user-manager",
+                        "sparkdeck_record_id": "user-record",
+                        "managed_by": None,
+                    }],
+                })
+            return httpx.Response(200, json={"id": "user-record", "editable": True})
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+        with self.assertRaisesRegex(ControllerError, "not created by this MCP"):
+            await client.update_deployment_configuration(
+                "user-manager", {"environment": {}},
+            )
+        updated = await client.update_deployment_configuration(
+            "user-record", {"environment": {}}, require_owned=False,
+        )
+
+        self.assertTrue(updated["editable"])
+        self.assertEqual(requests, [
+            ("GET", "/api/state"),
+            ("GET", "/api/state"),
+            ("PUT", "/api/v1/deployments/user-record/settings"),
+        ])
+
+    async def test_configuration_update_surfaces_stopped_state_requirement(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{
+                        "id": "manager-1",
+                        "sparkdeck_record_id": "record-1",
+                        "managed_by": "sparkdeck-mcp",
+                    }],
+                })
+            return httpx.Response(
+                409,
+                json={"detail": "Stop the cluster before changing launch settings"},
+            )
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+
+        with self.assertRaisesRegex(
+            ControllerError, "409.*Stop the cluster",
+        ):
+            await client.update_deployment_configuration(
+                "manager-1", {"extra_args": []},
+            )
+
     async def test_storage_operations_reuse_controller_storage_contracts(self) -> None:
         requests: list[tuple[str, str, bytes, dict | None]] = []
         storage = {
@@ -478,6 +589,20 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("benchmark_cluster_deployment", tools)
         self.assertIn("delete_cluster_deployment", tools)
         for name in (
+            "get_cluster_deployment_configuration",
+            "update_cluster_deployment_configuration",
+            "start_cluster_deployment", "stop_cluster_deployment",
+        ):
+            self.assertIn(name, tools)
+        update = tools["update_cluster_deployment_configuration"]
+        self.assertIn("allow_unowned", update.input_schema["properties"])
+        self.assertIn("environment", update.description)
+        self.assertIn("extra_args", update.description)
+        self.assertIn(
+            "launch_controls",
+            tools["get_cluster_deployment_configuration"].description,
+        )
+        for name in (
             "list_storage_weights", "pull_storage_weights",
             "transfer_storage_weights", "list_storage_transfers",
             "get_storage_transfer", "delete_storage_weights",
@@ -493,6 +618,54 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "ctx", tools["run_cluster_ab_test"].input_schema.get("properties", {})
         )
+
+    async def test_deployment_configuration_and_lifecycle_tools_delegate(self) -> None:
+        calls = []
+
+        class FakeClient:
+            async def deployment_configuration(self, deployment_id):
+                calls.append(("get", deployment_id))
+                return {"id": deployment_id, "editable": True}
+
+            async def update_deployment_configuration(
+                self, deployment_id, changes, *, require_owned,
+            ):
+                calls.append(("update", deployment_id, changes, require_owned))
+                return {"id": deployment_id, "environment": changes["environment"]}
+
+            async def action(self, deployment_id, action, *, require_owned):
+                calls.append((action, deployment_id, require_owned))
+                return {"ok": True, "id": deployment_id}
+
+        server = build_server(FakeClient())
+        viewed = await server.call_tool(
+            "get_cluster_deployment_configuration", {"deployment_id": "dep-1"},
+        )
+        updated = await server.call_tool(
+            "update_cluster_deployment_configuration", {
+                "deployment_id": "dep-1",
+                "changes": {"environment": {"NCCL_DEBUG": "WARN"}},
+            },
+        )
+        started = await server.call_tool("start_cluster_deployment", {
+            "deployment_id": "dep-1", "allow_unowned": True,
+        })
+        stopped = await server.call_tool("stop_cluster_deployment", {
+            "deployment_id": "dep-1",
+        })
+
+        self.assertTrue(viewed.structured_content["editable"])
+        self.assertEqual(
+            updated.structured_content["environment"], {"NCCL_DEBUG": "WARN"},
+        )
+        self.assertTrue(started.structured_content["ok"])
+        self.assertTrue(stopped.structured_content["ok"])
+        self.assertEqual(calls, [
+            ("get", "dep-1"),
+            ("update", "dep-1", {"environment": {"NCCL_DEBUG": "WARN"}}, True),
+            ("start", "dep-1", False),
+            ("stop", "dep-1", True),
+        ])
 
     async def test_storage_tools_delegate_and_require_delete_confirmation(self) -> None:
         calls = []

@@ -173,13 +173,81 @@ class ControllerClient:
             (
                 item
                 for item in state.get("deployments", [])
-                if item.get("id") == deployment_id
+                if (
+                    item.get("id") == deployment_id
+                    or item.get("sparkdeck_record_id") == deployment_id
+                )
             ),
             None,
         )
         if not deployment:
             raise ControllerError(f"deployment not found: {deployment_id}")
         return deployment
+
+    async def _deployment_record_id(
+        self, deployment_id: str, *, require_owned: bool,
+    ) -> str:
+        """Resolve either a Manager ID or stable SparkDeck record ID."""
+        state = await self.state()
+        deployment = next(
+            (
+                item for item in state.get("deployments", [])
+                if (
+                    item.get("id") == deployment_id
+                    or item.get("sparkdeck_record_id") == deployment_id
+                )
+            ),
+            None,
+        )
+        if deployment is not None:
+            if (
+                require_owned
+                and deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}
+            ):
+                raise ControllerError(
+                    f"refusing to modify deployment {deployment_id}: "
+                    "it was not created by this MCP server"
+                )
+            return str(deployment.get("sparkdeck_record_id") or deployment_id)
+        if require_owned:
+            # Distinguish an existing non-MCP record from an invalid ID while
+            # preserving the default fail-closed ownership policy.
+            detail = await self._request(
+                "GET", f"/api/v1/deployments/{quote(deployment_id, safe='')}",
+            )
+            if detail.get("managed_by") not in {OWNER, *LEGACY_OWNERS}:
+                raise ControllerError(
+                    f"refusing to modify deployment {deployment_id}: "
+                    "it was not created by this MCP server"
+                )
+        return deployment_id
+
+    async def deployment_configuration(
+        self, deployment_id: str,
+    ) -> dict[str, Any]:
+        record_id = await self._deployment_record_id(
+            deployment_id, require_owned=False,
+        )
+        return await self._request(
+            "GET", f"/api/v1/deployments/{quote(record_id, safe='')}",
+        )
+
+    async def update_deployment_configuration(
+        self,
+        deployment_id: str,
+        changes: dict[str, Any],
+        *,
+        require_owned: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(changes, dict):
+            raise ControllerError("changes must be an object")
+        record_id = await self._deployment_record_id(
+            deployment_id, require_owned=require_owned,
+        )
+        return await self._request(
+            "PUT", f"/api/v1/deployments/{quote(record_id, safe='')}/settings",
+            json_body=changes,
+        )
 
     async def create_recipe(self, recipe: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/api/recipes", json_body=recipe)
@@ -262,14 +330,32 @@ class ControllerClient:
         *,
         require_owned: bool = True,
     ) -> dict[str, Any]:
-        if require_owned:
+        if action == "remove":
+            # Preserve the legacy Manager removal contract used by A/B cleanup
+            # and delete_cluster_deployment. v1 record deletion has a distinct
+            # DELETE route and must not be conflated with start/stop actions.
             deployment = await self.deployment(deployment_id)
-            if deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}:
+            if (
+                require_owned
+                and deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}
+            ):
                 raise ControllerError(
-                    f"refusing to {action} deployment {deployment_id}: it was not created by this MCP server"
+                    f"refusing to remove deployment {deployment_id}: "
+                    "it was not created by this MCP server"
                 )
+            return await self._request(
+                "POST",
+                f"/api/deployments/{quote(str(deployment['id']), safe='')}/remove",
+                timeout=300,
+            )
+        if action not in {"start", "stop"}:
+            raise ControllerError(f"unsupported deployment action: {action}")
+        record_id = await self._deployment_record_id(
+            deployment_id, require_owned=require_owned,
+        )
         return await self._request(
-            "POST", f"/api/deployments/{deployment_id}/{action}", timeout=300
+            "POST", f"/api/v1/deployments/{quote(record_id, safe='')}/{action}",
+            timeout=300,
         )
 
     async def storage(self) -> dict[str, Any]:
@@ -739,8 +825,8 @@ def build_server(
         name="sparkdeck",
         title="SparkDeck Cluster Automation",
         description=(
-            "Manage clustered model storage and create, tune, benchmark, compare, stop, "
-            "and remove clustered model deployments."
+            "Manage clustered model storage and create, configure, start, stop, tune, "
+            "benchmark, compare, and remove clustered model deployments."
         ),
         instructions=(
             "Prefer recipe IDs and deployment IDs. Run A/B variants sequentially unless the "
@@ -748,10 +834,12 @@ def build_server(
             "not created through this MCP server unless allow_unowned is explicitly set. "
             "For vLLM image-specific runtime variables, use environment as an object of "
             "non-secret string NAME/value pairs; never place credentials in environment."
+            " Stop a running deployment before changing its saved configuration, then "
+            "start it again to apply the updated environment, launch_controls, or extra_args."
             " Storage tools use the controller's Virtual NAS validation and never expose "
             "cache paths, node credentials, or Hugging Face tokens."
         ),
-        version="1.1.0",
+        version="1.2.0",
         auth=auth,
         token_verifier=verifier,
     )
@@ -857,8 +945,43 @@ def build_server(
 
     @server.tool()
     async def get_cluster_deployment(deployment_id: str) -> dict[str, Any]:
-        """Get one deployment by its stable deployment ID."""
+        """Get one Manager deployment by its Manager or stable SparkDeck deployment ID."""
         return await client.deployment(deployment_id)
+
+    @server.tool()
+    async def get_cluster_deployment_configuration(
+        deployment_id: str,
+    ) -> dict[str, Any]:
+        """View one deployment's safe editable configuration by Manager or stable ID.
+
+        Returns whether the deployment is editable, why it may not be editable,
+        its desired state, sanitized ``extra_args`` runtime flags, non-secret
+        ``environment``, structured ``launch_controls``, and runtime-specific
+        memory settings. Credentials and controller-local routing are omitted.
+        """
+        return await client.deployment_configuration(deployment_id)
+
+    @server.tool()
+    async def update_cluster_deployment_configuration(
+        deployment_id: str,
+        changes: dict[str, Any],
+        allow_unowned: bool = False,
+    ) -> dict[str, Any]:
+        """Modify a stopped deployment's saved runtime configuration.
+
+        ``changes`` may contain sanitized runtime flags as an ``extra_args``
+        token array, non-secret string ``environment`` values, structured
+        ``launch_controls`` (for example ``context_window``,
+        ``max_concurrency``, tensor/pipeline parallel size, KV cache dtype,
+        thinking mode, or speculative decoding controls), and supported vLLM
+        or SGLang memory fields. Stop a running deployment first, update it,
+        then start it to apply the new settings. Unknown fields, secrets, and
+        unsafe flags are rejected by SparkDeck. Deployments not created by this
+        MCP server require ``allow_unowned=true``.
+        """
+        return await client.update_deployment_configuration(
+            deployment_id, changes, require_owned=not allow_unowned,
+        )
 
     @server.tool()
     async def create_cluster_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
@@ -959,6 +1082,19 @@ def build_server(
         """Stop a deployment by ID. Non-MCP deployments require allow_unowned=true."""
         return await client.action(
             deployment_id, "stop", require_owned=not allow_unowned
+        )
+
+    @server.tool()
+    async def start_cluster_deployment(
+        deployment_id: str, allow_unowned: bool = False
+    ) -> dict[str, Any]:
+        """Start a deployment by Manager or stable ID.
+
+        This applies its currently saved configuration. Non-MCP deployments
+        require ``allow_unowned=true``.
+        """
+        return await client.action(
+            deployment_id, "start", require_owned=not allow_unowned
         )
 
     @server.tool()

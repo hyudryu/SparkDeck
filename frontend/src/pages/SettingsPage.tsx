@@ -111,9 +111,13 @@ function CommunitySignInForm() {
   const [notice, setNotice] = useState<string>()
   const [ageConfirmed, setAgeConfirmed] = useState(false)
   const [privacyAccepted, setPrivacyAccepted] = useState(false)
+  const [termsAccepted, setTermsAccepted] = useState(false)
 
   const switchMode = (next: CommunityAuthMode) => {
     setMode(next)
+    setAgeConfirmed(false)
+    setPrivacyAccepted(false)
+    setTermsAccepted(false)
     setError(undefined)
     setNotice(undefined)
   }
@@ -150,6 +154,10 @@ function CommunitySignInForm() {
     }
     if (!privacyAccepted) {
       setError('You must agree to the Privacy Policy')
+      return
+    }
+    if (!termsAccepted) {
+      setError('You must agree to the Terms & Conditions')
       return
     }
     if (password !== confirmPassword) {
@@ -217,7 +225,8 @@ function CommunitySignInForm() {
         <label className="field"><span>Confirm password</span><input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} onKeyDown={onEnter} /></label>
         <small className="muted">At least 8 characters with upper and lower case letters and a number.</small>
         <label className="check-field community-signup-confirm"><input type="checkbox" checked={ageConfirmed} onChange={(event) => setAgeConfirmed(event.target.checked)} /><span><strong>I confirm that I am at least 18 years old.</strong><small>SparkDeck Community Features are intended only for adults.</small></span></label>
-        <label className="check-field community-signup-confirm"><input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} /><span><strong>I agree to the Privacy Policy.</strong><small>The Privacy Policy and Terms & Conditions are available in Support & legal below.</small></span></label>
+        <label className="check-field community-signup-confirm"><input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} /><span><strong>I agree to the Privacy Policy.</strong><small>The policy is available in Support & legal below.</small></span></label>
+        <label className="check-field community-signup-confirm"><input type="checkbox" checked={termsAccepted} onChange={(event) => setTermsAccepted(event.target.checked)} /><span><strong>I agree to the Terms & Conditions.</strong><small>The terms are available in Support & legal below.</small></span></label>
       </>}
       {(mode === 'confirm' || mode === 'reset-confirm') && <label className="field"><span>Confirmation code</span><input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} onKeyDown={onEnter} /></label>}
       {mode === 'reset-confirm' && <>
@@ -234,7 +243,7 @@ function CommunitySignInForm() {
           <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('reset-request')}>Forgot password?</Button>
         </>}
         {mode === 'sign-up' && <>
-          <Button type="button" variant="primary" disabled={busy || !email.trim() || !password || !confirmPassword || !ageConfirmed || !privacyAccepted} onClick={submitSignUp}>{busy ? 'Creating…' : 'Create account'}</Button>
+          <Button type="button" variant="primary" disabled={busy || !email.trim() || !password || !confirmPassword || !ageConfirmed || !privacyAccepted || !termsAccepted} onClick={submitSignUp}>{busy ? 'Creating…' : 'Create account'}</Button>
           <Button type="button" variant="tertiary" disabled={busy} onClick={() => switchMode('sign-in')}>Back to sign in</Button>
         </>}
         {mode === 'confirm' && <>
@@ -572,7 +581,7 @@ export function SettingsPage() {
         <p className="legal-effective">Effective August 30, 2026</p>
         <section><h3>Local-first by default</h3><p>SparkDeck's core app runs on systems you control. It keeps benchmark history, runtime details, settings, and operational records locally on your device or cluster. Local storage is not collection by SparkDeck's hosted Community Features service.</p><p>If you do not create or sign in to a Community Features account, SparkDeck does not send account data or benchmark telemetry to the Community Features service.</p></section>
         <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data. Your browser removes its token copy after pairing, while each paired SparkDeck node privately stores a refresh credential so signed-in status can be shared across your joined cluster without returning that credential to the browser.</p></section>
-        <section><h3>Where information is stored</h3><p>Core SparkDeck data, including prompts, model outputs, runtime records, settings, and local benchmark history, is stored on the SparkDeck device or cluster you control. Hosted account and Community Features data is stored and processed on Amazon Web Services infrastructure in the US East (Ohio) Region (us-east-2), including account profile data in Amazon Cognito and consented benchmark telemetry received by the Community Features API. AWS may process limited service, security, backup, and diagnostic records under its applicable service terms.</p></section>
+        <section><h3>Where information is stored</h3><p>Core SparkDeck data, including prompts, model outputs, runtime records, settings, and local benchmark history, is stored on the SparkDeck device or cluster you control. SparkDeck's default hosted account and Community Features services store and process data on Amazon Web Services infrastructure in the US East (Ohio) Region (us-east-2), including account profile data in Amazon Cognito and consented benchmark telemetry received by the Community Features API. AWS may process limited service, security, backup, and diagnostic records under its applicable service terms. Development, fork, or operator-configured deployments can replace the authentication or Community Features endpoints; in that case, data is stored and processed in the locations selected by that deployment's operator, whose privacy disclosures should be reviewed.</p></section>
         <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly enable it under Community Features in Settings. Only samples captured after you enable sharing are eligible for upload; existing benchmark history stays local and is never queued retroactively. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>canonical model identifier;</li><li>model quantization;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>prompt-length/context-occupancy bucket; and</li><li>a stable opaque telemetry cluster identifier used to count unique contributing clusters.</li></ul><p>The opaque identifier is randomly generated and does not contain an account ID, hostname, node name, or endpoint alias. Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
         <section><h3>How information is used</h3><p>Account information authenticates Community Features. Benchmark telemetry is used to group comparable results, show expected performance for the same model and configuration, detect invalid submissions, and operate the service. Published results may be aggregated with other users' results.</p><p>Telemetry uploads use a node-scoped credential and idempotency identifier. Hosting and network providers may also process ordinary connection metadata such as IP address, request time, and user agent for security and service operation. This metadata is not part of the benchmark JSON.</p></section>
         <section><h3>AI features and processing</h3><p>SparkDeck is software for running and interacting with artificial intelligence models. When you submit a prompt, the model runtime you select processes the prompt and generates its response on infrastructure you operate or choose. SparkDeck's hosted Community Features service does not receive prompts, model responses, uploaded content, or retrieved context, and it does not use account information or submitted benchmark telemetry to train generative AI models. Community benchmark comparisons are based on aggregated performance measurements; they are not automated decisions that determine access to employment, credit, housing, insurance, health care, or other similarly significant services.</p></section>

@@ -986,9 +986,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             {30.0},
         )
         prepared = self.store.outbox_entries()[0]
-        self.store._community_contribution_averages = lambda: {}
-        self.assertEqual(len(self.store.outbox_entries()), 5)
-        self.store._community_contribution_averages = lambda: (_ for _ in ()).throw(
+        self.store._community_contribution_averages = lambda *_: (_ for _ in ()).throw(
             AssertionError("prepared entries must not rescan history")
         )
         self.assertEqual(
@@ -996,6 +994,50 @@ class SparkDeckStoreTests(unittest.TestCase):
                 prepared["sample_id"], prepared_payload=prepared["payload"],
             ),
             prepared,
+        )
+
+    def test_outbox_computes_robust_mean_for_pending_cohort_outside_recent_rows(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="old-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        for index, speed in enumerate([29, 30, 30, 31, 300]):
+            self.store.add_benchmark_if_consented(
+                replace(
+                    base, id=f"old-{index}",
+                    generation_tokens_per_second=speed,
+                ),
+                consent["generation"],
+            )
+        self.store.add_benchmark_if_consented(
+            replace(
+                base, id="new-other", created_at="2026-08-26T00:00:00+00:00",
+                model=ModelIdentity("other-model", quantization="Q4_K_M"),
+            ),
+            consent["generation"],
+        )
+
+        import sparkdeck.storage as storage_module
+        original_limit = storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT
+        storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT = 1
+        try:
+            payloads = self.store.outbox_batch(limit=5)
+        finally:
+            storage_module._COMMUNITY_AGGREGATE_ROW_LIMIT = original_limit
+
+        self.assertEqual(len(payloads), 5)
+        self.assertEqual(
+            {payload["inference_tokens_per_second"] for payload in payloads},
+            {30.0},
         )
 
     def test_upload_average_excludes_measurements_from_prior_consent_epoch(self):

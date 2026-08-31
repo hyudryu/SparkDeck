@@ -73,6 +73,16 @@ class SparkDeckStore:
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        self._connection.create_function(
+            "sparkdeck_community_quantization", 1,
+            lambda value: canonical_quantization(value) or "UNKNOWN",
+            deterministic=True,
+        )
+        self._connection.create_function(
+            "sparkdeck_community_prompt_bucket", 1,
+            _community_prompt_bucket,
+            deterministic=True,
+        )
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._migrate()
@@ -934,7 +944,6 @@ class SparkDeckStore:
             ).fetchall()
         if not rows:
             return []
-        contribution_averages = self._community_contribution_averages()
         wanted = [row["sample_id"] for row in rows]
         marks = ",".join("?" for _ in wanted)
         with self._lock:
@@ -943,6 +952,8 @@ class SparkDeckStore:
                 tuple(wanted),
             ).fetchall()
         by_id = {}
+        payloads_by_id = {}
+        required_keys: set[tuple[str, str, int]] = set()
         for row in sample_rows:
             payload = _upload_row(row)
             if payload is None:
@@ -951,10 +962,12 @@ class SparkDeckStore:
                 payload["model_id"], payload["quantization"],
                 payload["prompt_tokens_bucket"],
             )
-            payload["inference_tokens_per_second"] = contribution_averages.get(
-                key, payload["inference_tokens_per_second"],
-            )
-            by_id[row["id"]] = payload
+            required_keys.add(key)
+            payloads_by_id[row["id"]] = (payload, key)
+        contribution_averages = self._community_contribution_averages(required_keys)
+        for sample_id, (payload, key) in payloads_by_id.items():
+            payload["inference_tokens_per_second"] = contribution_averages[key]
+            by_id[sample_id] = payload
         return [
             {"sample_id": sample_id, "payload": by_id[sample_id]}
             for sample_id in wanted if sample_id in by_id
@@ -1000,16 +1013,14 @@ class SparkDeckStore:
                 payload["prompt_tokens_bucket"],
             )
             payload["inference_tokens_per_second"] = (
-                self._community_contribution_averages().get(
-                    key, payload["inference_tokens_per_second"],
-                )
+                self._community_contribution_averages({key})[key]
             )
         return {"sample_id": sample_id, "payload": payload}
 
     def _community_contribution_averages(
-        self,
+        self, required_keys: set[tuple[str, str, int]] | None = None,
     ) -> dict[tuple[str, str, int], float]:
-        """Build this user's robust C1 mean for each upload dimension."""
+        """Build bounded robust C1 means, including requested pending cohorts."""
         grouped: dict[tuple[str, str, int], list[float]] = {}
         with self._lock:
             generation = int(self.get_setting(
@@ -1035,9 +1046,36 @@ class SparkDeckStore:
                     values = grouped.setdefault(key, [])
                     if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
                         values.append(payload["inference_tokens_per_second"])
+            # The global recent-row bound can omit an old cohort that is still
+            # pending. Fetch only the latest bounded evidence for each such
+            # requested dimension so every queued upload carries a robust mean.
+            for model_id, quantization, prompt_bucket in (
+                (required_keys or set()) - grouped.keys()
+            ):
+                cohort_rows = self._connection.execute(
+                    """SELECT * FROM benchmark_samples
+                       WHERE eligible = 1 AND consent_generation = ?
+                         AND json_extract(model_json, '$.repository') = ?
+                         AND sparkdeck_community_quantization(
+                               json_extract(model_json, '$.quantization')
+                             ) = ?
+                         AND sparkdeck_community_prompt_bucket(input_tokens) = ?
+                       ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (
+                        generation, model_id, quantization, prompt_bucket,
+                        _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT,
+                    ),
+                ).fetchall()
+                values = grouped.setdefault(
+                    (model_id, quantization, prompt_bucket), [],
+                )
+                for row in cohort_rows:
+                    payload = _upload_row(row)
+                    if payload is not None:
+                        values.append(payload["inference_tokens_per_second"])
         return {
             key: _outlier_filtered_mean(values)
-            for key, values in grouped.items()
+            for key, values in grouped.items() if values
         }
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:

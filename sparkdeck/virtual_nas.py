@@ -2379,11 +2379,43 @@ class VirtualNAS:
                     self._external_model_roots_provider(), model_id,
                 ) is None
             ):
-                shutil.rmtree(repository)
+                self._delete_cached_repository(repository)
                 return {"ok": True, "model_id": model_id}
             # The hub copy is partial residue while inventory displays the
             # complete external install: delete the externally managed files.
         return self._delete_external_model(model_id)
+
+    @staticmethod
+    def _delete_cached_repository(repository: Path) -> None:
+        """Delete a validated cache tree, retrying read-only artifacts once."""
+        try:
+            shutil.rmtree(repository)
+            return
+        except PermissionError:
+            # Cached files can inherit read-only modes from their source. The
+            # repository has already been resolved and constrained to the HF
+            # hub above, so it is safe to make only this tree owner-writable.
+            try:
+                for root, directories, files in os.walk(
+                    repository, topdown=False, followlinks=False,
+                ):
+                    for name in (*files, *directories):
+                        path = Path(root) / name
+                        if not path.is_symlink():
+                            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+                repository.chmod(repository.stat().st_mode | stat.S_IWUSR)
+                shutil.rmtree(repository)
+                return
+            except OSError as exc:
+                raise RuntimeError(
+                    "could not delete cached model files; check cache ownership "
+                    "and permissions"
+                ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                "could not delete cached model files; check cache ownership "
+                "and permissions"
+            ) from exc
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.

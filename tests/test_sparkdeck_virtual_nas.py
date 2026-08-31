@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import stat
 import struct
 import tempfile
@@ -2015,6 +2016,45 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             await stream.aclose()
 
             self.assertTrue(nas.delete_model("org/model")["ok"])
+
+    def test_delete_retries_after_making_cached_tree_owner_writable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            real_rmtree = shutil.rmtree
+            calls = 0
+
+            def readonly_once(path):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("simulated read-only cache")
+                return real_rmtree(path)
+
+            with patch("sparkdeck.virtual_nas.shutil.rmtree", readonly_once):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, 2)
+            self.assertFalse(repository.exists())
+
+    def test_delete_reports_actionable_error_for_cache_permission_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            with patch(
+                "sparkdeck.virtual_nas.shutil.rmtree",
+                side_effect=PermissionError("simulated owner mismatch"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "check cache ownership and permissions",
+                ):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(repository.exists())
 
     async def test_import_rejects_traversal_and_escaping_symlink(self):
         with tempfile.TemporaryDirectory() as directory:

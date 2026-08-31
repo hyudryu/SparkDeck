@@ -2022,14 +2022,22 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             hub = Path(directory) / "hub"
             repository = create_cached_model(hub)
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            locked = repository / "snapshots" / "revision-1"
+            locked.chmod(0o400)
             real_rmtree = shutil.rmtree
             calls = 0
 
-            def readonly_once(path):
+            def readonly_once(path, *, onerror):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
-                    raise PermissionError("simulated read-only cache")
+                    error = PermissionError("simulated non-traversable cache")
+                    onerror(os.scandir, locked, (PermissionError, error, None))
+                    return None
+                mode = locked.stat().st_mode
+                self.assertTrue(mode & stat.S_IRUSR)
+                self.assertTrue(mode & stat.S_IWUSR)
+                self.assertTrue(mode & stat.S_IXUSR)
                 return real_rmtree(path)
 
             with patch("sparkdeck.virtual_nas.shutil.rmtree", readonly_once):
@@ -2038,6 +2046,31 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(calls, 2)
             self.assertFalse(repository.exists())
+
+    def test_delete_permission_repair_refuses_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            link = repository / "outside-link"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            def fail_on_link(_path, *, onerror):
+                error = PermissionError("simulated link failure")
+                onerror(os.scandir, link, (PermissionError, error, None))
+
+            with patch("sparkdeck.virtual_nas.shutil.rmtree", fail_on_link):
+                with self.assertRaisesRegex(
+                    RuntimeError, "check cache ownership and permissions",
+                ):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(outside.exists())
 
     def test_delete_reports_actionable_error_for_cache_permission_failure(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2387,30 +2387,37 @@ class VirtualNAS:
 
     @staticmethod
     def _delete_cached_repository(repository: Path) -> None:
-        """Delete a validated cache tree, retrying read-only artifacts once."""
-        try:
-            shutil.rmtree(repository)
-            return
-        except PermissionError:
-            # Cached files can inherit read-only modes from their source. The
-            # repository has already been resolved and constrained to the HF
-            # hub above, so it is safe to make only this tree owner-writable.
+        """Delete a validated cache tree, repairing exact failed paths."""
+
+        def repair_failed_path(_function, raw_path, exc_info) -> None:
+            path = Path(raw_path)
             try:
-                for root, directories, files in os.walk(
-                    repository, topdown=False, followlinks=False,
+                metadata = path.lstat()
+                reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                if stat.S_ISLNK(metadata.st_mode) or (
+                    reparse_flag
+                    and getattr(metadata, "st_file_attributes", 0) & reparse_flag
                 ):
-                    for name in (*files, *directories):
-                        path = Path(root) / name
-                        if not path.is_symlink():
-                            path.chmod(path.stat().st_mode | stat.S_IWUSR)
-                repository.chmod(repository.stat().st_mode | stat.S_IWUSR)
-                shutil.rmtree(repository)
-                return
-            except OSError as exc:
-                raise RuntimeError(
-                    "could not delete cached model files; check cache ownership "
-                    "and permissions"
-                ) from exc
+                    raise OSError(
+                        "refusing to change permissions through a link or reparse point"
+                    )
+                permissions = stat.S_IWUSR
+                if stat.S_ISDIR(metadata.st_mode):
+                    permissions |= stat.S_IRUSR | stat.S_IXUSR
+                path.chmod(metadata.st_mode | permissions)
+            except OSError as repair_error:
+                raise repair_error from exc_info[1]
+
+        try:
+            # A scandir permission failure cannot resume traversal from an
+            # onerror callback. The first pass repairs only paths reported by
+            # rmtree; a second pass then traverses the now-accessible tree.
+            for _attempt in range(2):
+                if not repository.exists():
+                    return
+                shutil.rmtree(repository, onerror=repair_failed_path)
+            if repository.exists():
+                raise PermissionError("cached model repository remains")
         except OSError as exc:
             raise RuntimeError(
                 "could not delete cached model files; check cache ownership "

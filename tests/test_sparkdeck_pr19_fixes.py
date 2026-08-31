@@ -898,6 +898,38 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(self.service.store.deployment("live-record"))
 
+    async def test_delete_stale_manager_id_removes_current_container_owner(self):
+        self.service.store.add_deployment(Deployment(
+            id="adopted-record",
+            alias="adopted",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="replacement-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            {"ok": True, "errors": []},
+        ])
+
+        result = await self.service.delete_deployment("adopted-record")
+
+        self.assertEqual(result, {"ok": True, "id": "adopted-record"})
+        self.assertIsNone(self.service.store.deployment("adopted-record"))
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [
+                ("stale-manager-deployment", "remove"),
+                ("replacement-manager-deployment", "remove"),
+            ],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_sglang_forwards_max_running_requests(self):

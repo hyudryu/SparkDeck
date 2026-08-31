@@ -4158,6 +4158,7 @@ class SparkDeckService:
             raise LookupError("deployment not found")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
+        cluster_removed = False
         if manager_id:
             try:
                 result = await self.manager.deployment_action(manager_id, "remove")
@@ -4169,13 +4170,16 @@ class SparkDeckService:
                     raise RuntimeError(
                         "; ".join(result.get("errors") or ["cluster removal failed"])
                     )
-        elif owner:
+                cluster_removed = True
+        if not cluster_removed and owner and owner["id"] != manager_id:
             # Removing one rank of a cluster would leave the health monitor to
-            # resurrect the deployment; remove the whole cluster instead.
+            # resurrect the deployment. This also covers a stale saved Manager
+            # ID when the container has since been adopted by another cluster.
             result = await self.manager.deployment_action(owner["id"], "remove")
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
-        elif (
+            cluster_removed = True
+        elif not cluster_removed and (
             deployment["kind"] == DeploymentKind.MANAGED.value or discovered
         ) and deployment.get("container_name"):
             try:

@@ -3154,12 +3154,16 @@ class Manager:
         ), return_exceptions=True)
         participating: list[dict] = []
         reconciling: set[str] = set()
-        errors: list[str] = []
+        pull_errors: list[str] = []
+        push_errors: list[str] = []
         for node, result in zip(nodes, pulls):
             if isinstance(result, Exception):
-                errors.append(f"{node.get('name', node['id'])}: {result}")
+                pull_errors.append(f"{node.get('name', node['id'])}: {result}")
                 continue
             if not isinstance(result, dict):
+                pull_errors.append(
+                    f"{node.get('name', node['id'])}: invalid token usage response"
+                )
                 continue
             try:
                 if node.get("usage_reconciled") is True:
@@ -3169,7 +3173,7 @@ class Manager:
                     reconciling.add(node["id"])
                 participating.append(node)
             except (OSError, ValueError) as exc:
-                errors.append(f"{node.get('name', node['id'])}: {exc}")
+                pull_errors.append(f"{node.get('name', node['id'])}: {exc}")
 
         snapshot = self.token_usage_sync_snapshot()
         pushes = await asyncio.gather(*(
@@ -3188,14 +3192,17 @@ class Manager:
         ), return_exceptions=True)
         for node, result in zip(participating, pushes):
             if isinstance(result, Exception):
-                errors.append(f"{node.get('name', node['id'])}: {result}")
+                push_errors.append(f"{node.get('name', node['id'])}: {result}")
             elif node["id"] in reconciling:
                 self.node_registry.mark_usage_reconciled(node["id"])
 
+        errors = pull_errors + push_errors
         status.update({
             "last_sync_at": time.time(),
             "peers": len(participating),
             "error": "; ".join(errors) if errors else None,
+            "pull_error": "; ".join(pull_errors) if pull_errors else None,
+            "push_error": "; ".join(push_errors) if push_errors else None,
         })
         return dict(status)
 

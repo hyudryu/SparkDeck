@@ -921,6 +921,7 @@ export const api = {
   },
   usage: {
     get: (signal?: AbortSignal) => request<UsageSummary>('/api/token-stats', { signal }),
+    sync: () => request<UsageSummary>('/api/token-stats/sync', { method: 'POST' }, NO_REQUEST_TIMEOUT),
     analysis: async (start = '', end = '', signal?: AbortSignal): Promise<UsageAnalysis> => {
       const query = queryString({ start, end })
       const [hourly, daily] = await Promise.all([

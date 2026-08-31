@@ -1,8 +1,8 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { DailyUsagePoint, UsageGroup, UsageSummary } from '../api/types'
-import { activityHeatmapCalendar, modelShareItems, usageMeterSnapshot, UsagePage } from './UsagePage'
+import type { UsageGroup, UsageSummary } from '../api/types'
+import { activityHeatmapCalendar, modelShareItems, usageMeterDifference, UsagePage } from './UsagePage'
 
 const summary = {
   models: {
@@ -34,6 +34,7 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('UsagePage', () => {
@@ -74,27 +75,18 @@ describe('UsagePage', () => {
     expect(calendar.months.every((month, index) => index === 0 || month.column > calendar.months[index - 1].column)).toBe(true)
   })
 
-  it('meters lifetime and dated model usage without double-counting cached input', () => {
-    const daily: DailyUsagePoint[] = [
-      { date: '2026-08-29', input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
-      { date: '2026-08-10', input: 200, cached: 50, output: 30, requests: 2, models: { beta: { input: 200, cached: 50, output: 30, requests: 2 } } },
-      { date: '2026-07-01', input: 400, cached: 100, output: 50, requests: 3, models: { gamma: { input: 400, cached: 100, output: 50, requests: 3 } } },
-    ]
-    const reference = new Date('2026-08-30T12:00:00Z')
+  it('measures only counters added after the interval baseline', () => {
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
+      total: { input: 1700, cached: 550, output: 825, requests: 15 },
+    }
 
-    const lifetime = usageMeterSnapshot(summary as UsageSummary, daily, 'lifetime', reference)
-    expect(lifetime.totals).toMatchObject({ input: 1500, cached: 500, output: 750, requests: 12 })
-    expect(lifetime.models.map((item) => item.model)).toEqual(['org/model'])
-    expect(lifetime.totals.input + lifetime.totals.output).toBe(2250)
+    const measured = usageMeterDifference(current as UsageSummary, summary as UsageSummary)
 
-    const week = usageMeterSnapshot(summary as UsageSummary, daily, 7, reference)
-    expect(week.totals).toMatchObject({ input: 100, cached: 40, output: 25, requests: 1 })
-    expect(week.models.map((item) => item.model)).toEqual(['alpha'])
-    expect(week.totals.input + week.totals.output).toBe(125)
-
-    const month = usageMeterSnapshot(summary as UsageSummary, daily, 30, reference)
-    expect(month.totals).toMatchObject({ input: 300, cached: 90, output: 55, requests: 3 })
-    expect(month.models.map((item) => item.model).sort()).toEqual(['alpha', 'beta'])
+    expect(measured.totals).toMatchObject({ input: 200, cached: 50, output: 75, requests: 3 })
+    expect(measured.models).toEqual([{ model: 'org/model', counters: { input: 200, cached: 50, output: 75, requests: 3 } }])
+    expect(measured.totals.input + measured.totals.output).toBe(275)
   })
 
   it('shows the token scale legend and a hover tooltip on heatmap cells', async () => {
@@ -156,7 +148,7 @@ describe('UsagePage', () => {
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/token-stats/daily?start='), expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
-  it('keeps alias, erase, and lifetime reset controls connected to the old APIs', async () => {
+  it('keeps alias and erase controls connected to the existing APIs', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (init?.method) return json({ ok: true })
       const path = String(input)
@@ -182,40 +174,188 @@ describe('UsagePage', () => {
     await user.click(screen.getByRole('button', { name: 'Erase' }))
     await user.click(within(await screen.findByRole('dialog', { name: 'Erase usage for org/model?' })).getByRole('button', { name: 'Erase usage' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
-    await user.click(screen.getByRole('button', { name: 'Reset metered usage' }))
-    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/reset', expect.objectContaining({ method: 'POST' })))
   })
 
-  it('resets the since-reset meter while preserving dated model history', async () => {
-    let reset = false
-    const today = new Date().toISOString().slice(0, 10)
-    const zeroSummary = { ...summary, models: {}, groups: [], total: { input: 0, cached: 0, output: 0, requests: 0 } }
+  it('starts and stops an interval meter at the bottom of the page', async () => {
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1700, cached: 550, output: 825, requests: 15 } },
+      total: { input: 1700, cached: 550, output: 825, requests: 15 },
+    }
+    let syncReads = 0
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
-      if (init?.method === 'POST' && path === '/api/token-stats/reset') { reset = true; return json({ ok: true }) }
       if (path.includes('/api/token-stats/hourly')) return json([])
-      if (path.includes('/api/token-stats/daily')) return json([
-        { date: today, input: 100, cached: 40, output: 25, requests: 1, models: { alpha: { input: 100, cached: 40, output: 25, requests: 1 } } },
-      ])
-      return json(reset ? zeroSummary : summary)
+      if (path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') {
+        expect(init?.method).toBe('POST')
+        syncReads += 1
+        return json(syncReads === 1 ? summary : current)
+      }
+      return json(summary)
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
     render(<UsagePage />)
 
     const meter = await screen.findByLabelText('Token usage meter')
-    expect(meter).toHaveTextContent('2,250')
+    const routing = screen.getByRole('heading', { name: 'Model routing rules' }).closest('.usage-routing-panel')
+    expect(routing).not.toBeNull()
+    expect((routing as Element).compareDocumentPosition(meter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(meter).toHaveTextContent('Meter not started')
+    expect(within(meter).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeDisabled()
+
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+    await waitFor(() => expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled())
+    expect(meter).toHaveTextContent('Measuring tokens used since you pressed Start')
+
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(meter).toHaveTextContent('Measurement stopped'))
+    expect(meter).toHaveTextContent('275')
+    expect(meter).toHaveTextContent('200')
+    expect(meter).toHaveTextContent('75')
     expect(within(meter).getByRole('table', { name: 'Measured usage by model' })).toHaveTextContent('org/model')
+    expect(fetchMock.mock.calls.every(([path]) => String(path) !== '/api/token-stats/reset')).toBe(true)
+  })
 
-    await user.click(within(meter).getByRole('button', { name: 'Reset metered usage' }))
-    await user.click(within(await screen.findByRole('dialog', { name: 'Reset metered usage?' })).getByRole('button', { name: 'Reset meter' }))
-    await waitFor(() => expect(meter).toHaveTextContent('No measured model usage'))
-    expect(screen.getByText('Metered usage reset to zero.')).toBeInTheDocument()
+  it('keeps measuring when the final cluster sync fails and allows Stop to retry', async () => {
+    let stopAttempts = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
+      total: { input: 1600, cached: 525, output: 800, requests: 13 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') {
+        if (stopAttempts === 0) {
+          stopAttempts += 1
+          return json(summary)
+        }
+        stopAttempts += 1
+        return stopAttempts === 2 ? json({ detail: 'Worker: timed out' }, 503) : json(current)
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
 
-    await user.click(within(meter).getByRole('button', { name: '7 days' }))
-    expect(await within(meter).findByText('alpha')).toBeInTheDocument()
-    expect(meter).toHaveTextContent('125')
+    const meter = await screen.findByLabelText('Token usage meter')
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+    await waitFor(() => expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled())
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+
+    expect(await within(meter).findByRole('alert')).toHaveTextContent('Worker: timed out')
+    expect(meter).toHaveTextContent('Measuring tokens used since you pressed Start')
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeEnabled()
+
+    await user.click(within(meter).getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(meter).toHaveTextContent('Measurement stopped'))
+    expect(meter).toHaveTextContent('150')
+    expect(within(meter).queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('leaves the meter stopped when the authoritative baseline sync fails', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') return json({ detail: 'Worker: timed out' }, 503)
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    const meter = await screen.findByLabelText('Token usage meter')
+    await user.click(within(meter).getByRole('button', { name: 'Start' }))
+
+    expect(await within(meter).findByRole('alert')).toHaveTextContent('Worker: timed out')
+    expect(meter).toHaveTextContent('Meter not started')
+    expect(within(meter).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(within(meter).getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('clears a transient polling error after the next successful sample', async () => {
+    vi.useFakeTimers()
+    let meterStarted = false
+    let pollReads = 0
+    const current = {
+      ...summary,
+      models: { 'org/model': { input: 1600, cached: 525, output: 800, requests: 13 } },
+      total: { input: 1600, cached: 525, output: 800, requests: 13 },
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') {
+        meterStarted = true
+        return json(summary)
+      }
+      if (path === '/api/token-stats' && meterStarted) {
+        pollReads += 1
+        if (pollReads === 1) return json({ detail: 'Temporary sample failure' }, 503)
+        return json(current)
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsagePage />)
+    await act(async () => { await Promise.resolve() })
+
+    const meter = screen.getByLabelText('Token usage meter')
+    await act(async () => {
+      fireEvent.click(within(meter).getByRole('button', { name: 'Start' }))
+      await Promise.resolve()
+    })
+
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(within(meter).getByRole('alert')).toHaveTextContent('Temporary sample failure')
+
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(within(meter).queryByRole('alert')).not.toBeInTheDocument()
+    expect(meter).toHaveTextContent('150')
+  })
+
+  it('waits for a slow token sample to settle before scheduling another poll', async () => {
+    vi.useFakeTimers()
+    let summaryReads = 0
+    let resolveSlowSample!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      if (path === '/api/token-stats/sync') return json(summary)
+      if (path === '/api/token-stats') {
+        summaryReads += 1
+        if (summaryReads === 2) return new Promise<Response>((resolve) => { resolveSlowSample = resolve })
+      }
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<UsagePage />)
+    await act(async () => { await Promise.resolve() })
+
+    const meter = screen.getByLabelText('Token usage meter')
+    await act(async () => {
+      fireEvent.click(within(meter).getByRole('button', { name: 'Start' }))
+      await Promise.resolve()
+    })
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+    expect(summaryReads).toBe(2)
+
+    await act(() => vi.advanceTimersByTimeAsync(6_000))
+    expect(summaryReads).toBe(2)
+
+    await act(async () => {
+      resolveSlowSample(json(summary))
+      await Promise.resolve()
+    })
+    await act(() => vi.advanceTimersByTimeAsync(1_999))
+    expect(summaryReads).toBe(2)
+    await act(() => vi.advanceTimersByTimeAsync(1))
+    expect(summaryReads).toBe(3)
   })
 
   it('edits and removes usage routing rules from the display dialog', async () => {

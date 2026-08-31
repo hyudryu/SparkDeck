@@ -360,6 +360,58 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.assignment_patch.stop()
 
+    async def test_token_stats_sync_waits_for_cluster_counters(self):
+        summary = {
+            "models": {"org/model": {"input": 10, "output": 2}},
+            "groups": [], "total": {"input": 10, "output": 2},
+        }
+        with (
+            patch.object(
+                server.manager, "sync_token_usage_once",
+                AsyncMock(return_value={"error": None, "pull_error": None, "peers": 1}),
+            ) as sync,
+            patch.object(server.manager, "get_token_stats", return_value=summary),
+        ):
+            response = await self.client.post("/api/token-stats/sync")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), summary)
+        sync.assert_awaited_once_with()
+
+    async def test_token_stats_sync_rejects_a_partial_cluster_reading(self):
+        with (
+            patch.object(
+                server.manager, "sync_token_usage_once",
+                AsyncMock(return_value={
+                    "error": "Worker: timed out", "pull_error": "Worker: timed out",
+                    "peers": 0,
+                }),
+            ),
+            patch.object(server.manager, "get_token_stats") as get_stats,
+        ):
+            response = await self.client.post("/api/token-stats/sync")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Worker: timed out", response.json()["detail"])
+        get_stats.assert_not_called()
+
+    async def test_token_stats_sync_returns_reading_after_fanout_failure(self):
+        summary = {"models": {}, "groups": [], "total": {"input": 10}}
+        with (
+            patch.object(
+                server.manager, "sync_token_usage_once",
+                AsyncMock(return_value={
+                    "error": "Worker: push timed out", "pull_error": None,
+                    "push_error": "Worker: push timed out", "peers": 1,
+                }),
+            ),
+            patch.object(server.manager, "get_token_stats", return_value=summary),
+        ):
+            response = await self.client.post("/api/token-stats/sync")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), summary)
+
     async def test_deployment_start_route_forwards_node_selection(self):
         with patch.object(server.sparkdeck, "deployment_action", AsyncMock(return_value={"ok": True})) as action:
             without_body = await self.client.post("/api/v1/deployments/dep-1/start")

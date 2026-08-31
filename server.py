@@ -1500,6 +1500,19 @@ async def get_token_stats():
     return manager.get_token_stats()
 
 
+@app.post("/api/token-stats/sync")
+async def sync_token_stats():
+    """Synchronize paired-node counters before returning a final reading."""
+    status = await manager.sync_token_usage_once()
+    # Pull/merge failures make this reading incomplete. A fan-out failure does
+    # not: the controller has already incorporated every peer's counters.
+    if status.get("pull_error"):
+        raise HTTPException(
+            503, f"Could not synchronize token usage: {status['pull_error']}",
+        )
+    return manager.get_token_stats()
+
+
 @app.post("/api/token-stats/reset")
 async def reset_token_stats():
     return manager.reset_token_stats()

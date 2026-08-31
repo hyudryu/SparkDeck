@@ -365,6 +365,7 @@ export interface WireDeployment {
   launch_phase?: string
   launch_message?: string
   last_used_at?: number | null
+  promotable?: boolean
   controllable?: boolean
   logs_available?: boolean
   removable?: boolean
@@ -411,6 +412,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     runtime: item.runtime,
     status: item.status,
     managed: item.kind === 'managed',
+    promotable: item.promotable,
     controllable: item.controllable,
     logs_available: item.logs_available,
     removable: item.removable,

@@ -91,6 +91,7 @@ export interface Deployment {
   runtime: RuntimeKind
   status: DeploymentStatus
   managed: boolean
+  promotable?: boolean
   controllable?: boolean
   logs_available?: boolean
   removable?: boolean

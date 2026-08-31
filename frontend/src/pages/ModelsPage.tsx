@@ -183,6 +183,14 @@ const deploymentConcurrency = (deployment: Deployment) => (
   ?? deployment.settings.parallel_slots
 )
 
+const isDiscoveredExternal = (deployment: Deployment) => (
+  !deployment.managed && deployment.id.startsWith('container:')
+)
+
+const canPromoteDiscovered = (deployment: Deployment) => (
+  isDiscoveredExternal(deployment) && deployment.promotable !== false
+)
+
 // Scalar flags the structured argument editor manages; everything else in a
 // saved configuration's extra args is shown verbatim in the "Other flags"
 // field. Compound JSON flags (--speculative-config,
@@ -1197,7 +1205,7 @@ export function ModelsPage() {
           }
         }
       }
-      const promote = !deployment.managed && deployment.id.startsWith('container:')
+      const promote = canPromoteDiscovered(deployment)
       await api.deployments.action(deployment.id, 'start', nodeIds, undefined, promote)
       setActionNotice(`${promote ? 'Converting' : 'Starting'} ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
       setStartSelection(undefined)
@@ -1788,7 +1796,13 @@ export function ModelsPage() {
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : !deployment.managed && deployment.id.startsWith('container:') ? 'Make managed' : 'Start'}</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => {
+                        if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
+                          void act(deployment, 'start')
+                        } else {
+                          openStartPicker(deployment)
+                        }
+                      }}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) ? 'Make managed' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
@@ -2014,7 +2028,7 @@ export function ModelsPage() {
         const { deployment, nodeIds } = startSelection
         const required = deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
-        const converting = !deployment.managed && deployment.id.startsWith('container:')
+        const converting = canPromoteDiscovered(deployment)
         const controllerArtifact = isControllerArtifact(deployment)
         const weighted = deploymentWeightedNodes(deployment)
         const plan = savedLaunch && !controllerArtifact ? startPreflight.data : undefined

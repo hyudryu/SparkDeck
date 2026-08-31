@@ -15276,7 +15276,7 @@ class Manager:
             deployment["last_deployed_at"] = (
                 primary_container.get("started_at")
                 if primary_container
-                else deployment.get("last_deployed_at") or deployment.get("created_at")
+                else deployment.get("last_deployed_at")
             )
             if not deployment.get("last_used_at") and deployment["stats_key"]:
                 prior_samples = self.speed_samples.get(

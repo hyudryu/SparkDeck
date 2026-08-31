@@ -952,9 +952,15 @@ class SparkDeckService:
                 cluster.get("automation_run_id")
                 or stored.get("settings", {}).get("automation_run_id")
             )
-            last_deployed_at = (
-                cluster.get("last_deployed_at") or cluster.get("created_at")
-            )
+            last_deployed_at = cluster.get("last_deployed_at")
+            if (
+                not last_deployed_at
+                and _deployment_status(cluster.get("status")) == "running"
+            ):
+                # Pre-timestamp Manager records can prove a successful launch
+                # by being live. Never apply this fallback to first-launch
+                # errors, which retain created_at only for diagnostics.
+                last_deployed_at = cluster.get("created_at")
             if isinstance(last_deployed_at, (int, float)) and last_deployed_at:
                 stored["last_deployed_at"] = datetime.fromtimestamp(
                     last_deployed_at, timezone.utc
@@ -3275,7 +3281,11 @@ class SparkDeckService:
         launch_settings: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Create durable SparkDeck routing for a relocated Manager-only card."""
-        record_id = str(uuid.uuid4())
+        record_id = str(
+            replacement.get("sparkdeck_record_id")
+            or (launch_settings or {}).get("sparkdeck_record_id")
+            or uuid.uuid4()
+        )
         alias = str(
             deployment.get("alias") or replacement.get("name")
             or (deployment.get("model") or {}).get("repository") or record_id
@@ -3428,6 +3438,7 @@ class SparkDeckService:
             "node_ids": list(node_ids),
             "api_port": container.get("port"),
         }, container)
+        promotion_record_id = str(uuid.uuid4())
         launch_settings.update({
             "deployment_name": deployment.get("alias"),
             "model": launch_model,
@@ -3436,21 +3447,49 @@ class SparkDeckService:
             "environment": settings.get("environment") or {},
             "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
             "node_ids": list(node_ids),
+            # This stable reverse link identifies a partially-created Manager
+            # record if launch or SQLite adoption fails and must be rolled back.
+            "sparkdeck_record_id": promotion_record_id,
         })
-        if node_ids[0] == LOCAL_NODE_ID:
+        if LOCAL_NODE_ID in node_ids:
             # The source Docker container still owns its controller port even
             # while stopped. Let Manager allocate a fresh port for the managed
             # replacement instead of failing preflight on that binding.
             launch_settings.pop("port", None)
-        replacement = await self.manager.create_deployment(launch_settings)
-        adopted_launch_settings = {
-            **launch_settings,
-            **(replacement.get("launch_settings") or {}),
-        }
-        adopted_launch_settings["model"] = launch_model
-        return self._adopt_manager_replacement(
-            deployment, replacement, adopted_launch_settings,
-        )
+        replacement = None
+        try:
+            replacement = await self.manager.create_deployment(launch_settings)
+            adopted_launch_settings = {
+                **launch_settings,
+                **(replacement.get("launch_settings") or {}),
+            }
+            adopted_launch_settings["model"] = launch_model
+            return self._adopt_manager_replacement(
+                deployment, replacement, adopted_launch_settings,
+            )
+        except Exception as exc:
+            rollback_target = replacement or next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict)
+                and item.get("sparkdeck_record_id") == promotion_record_id
+            ), None)
+            rollback_error = None
+            if isinstance(rollback_target, dict) and rollback_target.get("id"):
+                try:
+                    rollback = await self.manager.deployment_action(
+                        str(rollback_target["id"]), "remove",
+                    )
+                    if not rollback.get("ok"):
+                        rollback_error = "; ".join(
+                            rollback.get("errors") or ["cluster removal failed"]
+                        )
+                except Exception as cleanup_exc:
+                    rollback_error = str(cleanup_exc)
+            if rollback_error:
+                raise RuntimeError(
+                    f"{exc}; managed promotion rollback failed: {rollback_error}"
+                ) from exc
+            raise
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
@@ -4347,6 +4386,9 @@ class SparkDeckService:
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            "promotable": (
+                (container.get("load_settings") or {}).get("editable") is not False
+            ),
             "controllable": True,
             "logs_available": True,
             "removable": True,

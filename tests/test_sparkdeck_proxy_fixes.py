@@ -165,7 +165,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             }
             manager.list_containers.return_value = [container]
             manager._recovered_deployment_launch_settings = Mock(return_value={
-                "extra_args": ["--tensor-parallel-size", "2"],
+                "extra_args": ["--tensor-parallel-size", "2"], "port": 8214,
             })
             manager.create_deployment = AsyncMock(return_value={
                 "id": "cluster-1", "name": "served-name", "status": "starting",
@@ -187,11 +187,12 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(listed["required_node_count"], 2)
 
             result = await service.deployment_action(
-                "container:external-tp2", "start", ["local", "worker-1"],
+                "container:external-tp2", "start", ["worker-1", "local"],
             )
 
             launch = manager.create_deployment.await_args.args[0]
-            self.assertEqual(launch["node_ids"], ["local", "worker-1"])
+            self.assertEqual(launch["node_ids"], ["worker-1", "local"])
+            self.assertNotIn("port", launch)
             self.assertEqual(launch["deployment_mode"], "sharded")
             self.assertEqual(
                 launch["model"], "/cache/models/org--model/snapshots/rev",
@@ -272,8 +273,80 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
 
             manager.create_deployment.assert_awaited_once()
             self.assertNotIn("port", manager.create_deployment.await_args.args[0])
+            self.assertEqual(
+                result["id"],
+                manager.create_deployment.await_args.args[0]["sparkdeck_record_id"],
+            )
             self.assertEqual(result["kind"], "managed")
             self.assertEqual(result["node_ids"], ["local"])
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_promotion_rolls_back_manager_record_when_adoption_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "external-single", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "image": "example/vllm:latest", "port": 8214,
+                "load_settings": {"model": "org/model", "tensor_parallel_size": 1},
+            }
+            manager.list_containers.return_value = [container]
+            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            replacement = {
+                "id": "cluster-single", "name": "org/model", "status": "starting",
+                "node_ids": ["local"], "api_port": 8215,
+                "members": [{"container_name": "cluster-single-r0"}],
+                "launch_settings": {"deployment_mode": "single", "node_ids": ["local"]},
+            }
+            manager.create_deployment = AsyncMock(return_value=replacement)
+            manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+            service = SparkDeckService(manager, Path(directory))
+            service._adopt_manager_replacement = Mock(side_effect=RuntimeError("SQLite failed"))
+
+            with self.assertRaisesRegex(RuntimeError, "SQLite failed"):
+                await service.deployment_action(
+                    "container:external-single", "start", ["local"], promote=True,
+                )
+
+            manager.deployment_action.assert_awaited_once_with(
+                "cluster-single", "remove",
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_promotion_rolls_back_persisted_manager_launch_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "external-single", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "image": "example/vllm:latest", "port": 8214,
+                "load_settings": {"model": "org/model", "tensor_parallel_size": 1},
+            }
+            manager.list_containers.return_value = [container]
+            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            manager.deployments = []
+
+            async def fail_after_persisting(body):
+                manager.deployments.append({
+                    "id": "failed-cluster",
+                    "sparkdeck_record_id": body["sparkdeck_record_id"],
+                })
+                raise RuntimeError("member launch failed")
+
+            manager.create_deployment = AsyncMock(side_effect=fail_after_persisting)
+            manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(RuntimeError, "member launch failed"):
+                await service.deployment_action(
+                    "container:external-single", "start", ["local"], promote=True,
+                )
+
+            manager.deployment_action.assert_awaited_once_with(
+                "failed-cluster", "remove",
+            )
             await manager.http.aclose()
             await service.close()
 
@@ -317,6 +390,11 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             manager._recovered_deployment_launch_settings = Mock()
             manager.create_deployment = AsyncMock()
             service = SparkDeckService(manager, Path(directory))
+
+            listed = service._discovered_deployment(
+                manager.list_containers.return_value[0], "vllm", "org/model",
+            )
+            self.assertFalse(listed["promotable"])
 
             with self.assertRaisesRegex(ValueError, "cannot be promoted safely"):
                 await service.deployment_action(
@@ -422,6 +500,29 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 listed[0]["last_deployed_at"], "2026-08-30T12:34:56Z",
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_failed_first_launch_has_no_deployment_recency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [{
+                "id": "failed-cluster", "status": "error",
+                "created_at": 1_787_918_400, "sparkdeck_record_id": "failed",
+                "node_ids": ["local"], "members": [],
+                "launch_settings": {"node_ids": ["local"]},
+            }]
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="failed", alias="Failed", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                settings={"manager_deployment_id": "failed-cluster"},
+            ))
+
+            listed = await service.deployments()
+
+            self.assertEqual(len(listed), 1)
+            self.assertNotIn("last_deployed_at", listed[0])
             await manager.http.aclose()
             await service.close()
 

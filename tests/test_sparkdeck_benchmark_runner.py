@@ -72,7 +72,7 @@ def _target():
         "id": "unsloth/Qwen3-4B-GGUF", "label": "Qwen3-4B-GGUF",
         "runtime": "llama.cpp", "deployment_id": None,
         "model": "unsloth/Qwen3-4B-GGUF", "quantization": "Q4_K_M",
-        "base_url": "http://127.0.0.1:8080",
+        "base_url": "http://127.0.0.1:8080/v1",
     }
 
 
@@ -263,6 +263,28 @@ class ValidateConfigTests(unittest.TestCase):
             )
         self.assertIn("--no-warmup", argv)
 
+    def test_argv_uses_openai_v1_endpoint_and_repository_tokenizer(self):
+        config = self.service._validate_config({"model_id": "m"})
+        with patch.object(self.service, "_argv_prefix", return_value=["llama-benchy"]):
+            argv = self.service._build_argv(
+                {"config": config},
+                {
+                    "base_url": "http://localhost:8000/",
+                    "model": "DeepSeek-V4-Flash-0731-TP4",
+                    "tokenizer": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                },
+                Path("run"),
+                {},
+            )
+
+        self.assertEqual(
+            argv[argv.index("--base-url") + 1], "http://localhost:8000/v1",
+        )
+        self.assertEqual(
+            argv[argv.index("--tokenizer") + 1],
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+        )
+
     def test_rejects_explosive_shape_combinations(self):
         body = {
             "model_id": "m",
@@ -355,7 +377,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(models), 1)
         self.assertEqual(models[0]["id"], "unsloth/Qwen3-4B-GGUF")
         self.assertEqual(models[0]["quantization"], "Q4_K_M")
-        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8080")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8080/v1")
 
     async def test_external_deployment_uses_private_base_url(self):
         sparkdeck = FakeSparkdeck(stored={
@@ -367,7 +389,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
+        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000/v1")
         self.assertEqual(models[0]["model"], "org/model")
         self.assertEqual(models[0]["quantization"], "FP8")
 
@@ -382,7 +404,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:7878")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:7878/v1")
         # The proxy resolves the alias to the upstream model server-side.
         self.assertEqual(models[0]["model"], "org/model")
 
@@ -396,7 +418,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
+        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000/v1")
 
     async def test_managed_deployment_uses_served_model_id(self):
         sparkdeck = FakeSparkdeck(stored={
@@ -412,8 +434,9 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         ])
         service = BenchmarkRunnerService(manager, sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123/v1")
         self.assertEqual(models[0]["model"], "served-model-name")
+        self.assertEqual(models[0]["tokenizer"], "org/model")
 
     async def test_remote_managed_deployment_uses_controller_proxy(self):
         sparkdeck = FakeSparkdeck(stored={
@@ -427,7 +450,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         remote = BenchmarkRunnerService(FakeManager(primary_node_id="node-2"), sparkdeck, Path("data-unused"))
         remote_models = await remote.served_models()
-        self.assertEqual(remote_models[0]["base_url"], "http://127.0.0.1:7878")
+        self.assertEqual(remote_models[0]["base_url"], "http://127.0.0.1:7878/v1")
         self.assertEqual(remote_models[0]["model"], "alias")
         local = BenchmarkRunnerService(FakeManager(primary_node_id="local"), sparkdeck, Path("data-unused"))
         self.assertEqual(len(await local.served_models()), 1)
@@ -445,7 +468,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         ])
         service = BenchmarkRunnerService(manager, sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8222")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8222/v1")
         self.assertEqual(models[0]["model"], "legacy-served")
 
     async def test_registered_deployment_wins_over_native_llama_alias(self):
@@ -459,7 +482,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         service = BenchmarkRunnerService(FakeManager(llama_running=True), sparkdeck, Path("data-unused"))
         models = await service.served_models()
         self.assertEqual(len(models), 1)
-        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000")
+        self.assertEqual(models[0]["base_url"], "http://10.0.0.9:8000/v1")
 
     async def test_managed_deployment_uses_local_port(self):
         sparkdeck = FakeSparkdeck(stored={"id": "dep-2", "kind": "managed", "_base_url": None})
@@ -469,7 +492,7 @@ class ServedModelTests(unittest.IsolatedAsyncioTestCase):
         }]})
         service = BenchmarkRunnerService(FakeManager(), sparkdeck, Path("data-unused"))
         models = await service.served_models()
-        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123")
+        self.assertEqual(models[0]["base_url"], "http://127.0.0.1:8123/v1")
 
     async def test_unreachable_deployment_is_skipped(self):
         sparkdeck = FakeSparkdeck(stored={"id": "dep-3", "kind": "external", "_base_url": None})

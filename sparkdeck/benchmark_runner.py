@@ -29,7 +29,7 @@ _MAX_POSITIVE = 2_000_000
 # The controller's own OpenAI-compatible endpoint (same convention as the MCP
 # client and onboarding service in server.py). Keyed deployments benchmark
 # through it so their stored credential never appears on a command line.
-CONTROLLER_LOCAL_BASE_URL = "http://127.0.0.1:7878"
+CONTROLLER_LOCAL_BASE_URL = "http://127.0.0.1:7878/v1"
 
 
 class BenchmarkRunnerError(ValueError):
@@ -192,8 +192,9 @@ class BenchmarkRunnerService:
             "runtime": "llama.cpp",
             "deployment_id": None,
             "model": model,
+            "tokenizer": model,
             "quantization": variant or None,
-            "base_url": f"http://{host}:{int(port)}",
+            "base_url": self._openai_base_url(f"http://{host}:{int(port)}"),
         }
 
     def _build_target(
@@ -214,17 +215,21 @@ class BenchmarkRunnerService:
         if not container_name or not port:
             return None
         identity = entry.get("model") or {}
+        model = self._served_model_id(
+            containers_by_name, container_name,
+            identity.get("repository") or entry["id"],
+        )
         return {
             "id": entry["id"],
             "label": entry.get("id"),
             "runtime": entry.get("runtime"),
             "deployment_id": deployment_id,
-            "model": self._served_model_id(
-                containers_by_name, container_name,
-                identity.get("repository") or entry["id"],
-            ),
+            "model": model,
+            "tokenizer": identity.get("repository") or model,
             "quantization": identity.get("quantization"),
-            "base_url": f"http://127.0.0.1:{int(port)}",
+            "base_url": self._openai_base_url(
+                f"http://127.0.0.1:{int(port)}"
+            ),
         }
 
     def _stored_target(
@@ -250,8 +255,9 @@ class BenchmarkRunnerService:
             "runtime": entry.get("runtime"),
             "deployment_id": entry.get("deployment_id"),
             "model": model,
+            "tokenizer": identity.get("repository") or model,
             "quantization": identity.get("quantization"),
-            "base_url": base_url,
+            "base_url": self._openai_base_url(base_url),
         }
         # llama-benchy only accepts credentials as a --api-key argv flag, which
         # would expose the stored secret via /proc/<pid>/cmdline for the whole
@@ -267,6 +273,13 @@ class BenchmarkRunnerService:
             target["base_url"] = CONTROLLER_LOCAL_BASE_URL
             target["model"] = entry["id"]
         return target
+
+    @staticmethod
+    def _openai_base_url(base_url: str) -> str:
+        base_url = str(base_url or "").rstrip("/")
+        if not base_url or base_url.endswith("/v1"):
+            return base_url
+        return f"{base_url}/v1"
 
     def _served_model_id(
         self, containers_by_name: dict[str, dict[str, Any]],
@@ -367,7 +380,7 @@ class BenchmarkRunnerService:
     ) -> list[str]:
         config = run["config"]
         argv = self._argv_prefix(detection) + [
-            "--base-url", target["base_url"],
+            "--base-url", self._openai_base_url(target["base_url"]),
             "--model", target["model"],
             # Benchy's default ``api`` latency probe calls ``GET /v1/models``.
             # That measures SparkDeck's cluster-wide discovery path rather than
@@ -385,6 +398,9 @@ class BenchmarkRunnerService:
             "--save-result", str(run_dir / "report.json"),
             "--emit-progress", str(run_dir / "progress.jsonl"),
         ]
+        tokenizer = str(target.get("tokenizer") or target["model"])
+        if tokenizer != target["model"]:
+            argv.extend(["--tokenizer", tokenizer])
         if config.get("enable_prefix_caching"):
             argv.append("--enable-prefix-caching")
         if config["warmup_runs"] == 0:

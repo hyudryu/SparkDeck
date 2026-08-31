@@ -349,6 +349,16 @@ export function TemperatureRuns() {
       setDetailError(undefined)
     } catch (reason) {
       setDetailError(reason instanceof Error ? `Could not load temperature run: ${reason.message}` : 'Could not load temperature run')
+      // A failed terminal refetch must not keep the pre-completion cache
+      // entry: drop it so the lazy loader retries on the next selection.
+      if (force) {
+        setDetails((current) => {
+          if (!(runId in current)) return current
+          const next = { ...current }
+          delete next[runId]
+          return next
+        })
+      }
     } finally {
       detailRequestsRef.current.delete(runId)
     }
@@ -449,6 +459,12 @@ export function TemperatureRuns() {
       })
       setDetails((current) => ({ ...current, [run.id]: run }))
       setSelected((current) => ({ ...current, [run.id]: true }))
+      // Seed the list snapshot from the arm response: if the immediate reload
+      // below fails, the UI must still observe the active run so polling
+      // starts and the Cancel control appears.
+      runs.setData((current) => current
+        ? { ...current, active_run_id: run.id, runs: [run, ...current.runs.filter((item) => item.id !== run.id)] }
+        : { active_run_id: run.id, runs: [run] })
       reloadRuns()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not arm the temperature run')
@@ -479,6 +495,9 @@ export function TemperatureRuns() {
     setActionError(undefined)
     try {
       const run = await api.temperatureRuns.rename(runId, name)
+      // Advance the detail version so a detail GET that was in flight during
+      // the rename (carrying the old name) is discarded when it resolves.
+      detailVersionsRef.current.set(runId, (detailVersionsRef.current.get(runId) ?? 0) + 1)
       setDetails((current) => ({ ...current, [runId]: run }))
       setRenameId(undefined)
       reloadRuns()
@@ -579,7 +598,7 @@ export function TemperatureRuns() {
           <Button variant="primary" disabled={selectedRuns.length === 0} onClick={() => void exportPNG()}>Export PNG</Button>
         </div>
       </div>
-      {runs.loading && <LoadingState label="Loading temperature runs" />}
+      {runs.loading && !runs.data && <LoadingState label="Loading temperature runs" />}
       {runs.error && <ErrorState message={runs.error} onRetry={reloadRuns} />}
       {state && <>
         <Panel className="temperature-recorder-card">

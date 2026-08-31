@@ -24,6 +24,52 @@ afterEach(() => {
 })
 
 describe('ClusterPage', () => {
+  it('copies join details over HTTP and shows visual feedback', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    const execCommand = vi.fn().mockReturnValue(true)
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    const user = userEvent.setup()
+
+    try {
+      render(<ClusterPage />)
+
+      const urlButton = await screen.findByRole('button', {
+        name: 'Copy http://100.64.0.10:7878',
+      })
+      await user.click(urlButton)
+
+      expect(execCommand).toHaveBeenCalledWith('copy')
+      expect(urlButton).toHaveTextContent('Copied')
+      expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+      await user.click(screen.getByRole('button', { name: /^Copy$/ }))
+      expect(execCommand).toHaveBeenCalledTimes(2)
+      expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument()
+
+      execCommand.mockImplementationOnce(() => { throw new Error('blocked') })
+      await user.click(urlButton)
+      expect(screen.getByRole('alert')).toHaveTextContent('Copy was blocked')
+      expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull()
+      expect(urlButton).toHaveFocus()
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', {
+        configurable: true,
+        value: originalSecureContext,
+      })
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: originalExecCommand,
+      })
+    }
+  })
+
   it('shows controller access details and joins through the local onboarding API', async () => {
     const onboardingChanged = vi.fn()
     window.addEventListener('sparkdeck:onboarding-changed', onboardingChanged)
@@ -108,6 +154,21 @@ describe('ClusterPage', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Pairing code expired')
     expect(screen.getByRole('button', { name: 'Join controller' })).toBeInTheDocument()
+
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn().mockReturnValue(true) })
+    try {
+      await user.click(screen.getByRole('button', { name: 'Cancel' }))
+      await user.click(screen.getByRole('button', {
+        name: 'Copy http://100.64.0.10:7878',
+      }))
+      expect(screen.getByRole('alert')).toHaveTextContent('Pairing code expired')
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
   })
 
   it('renames any node inline and keeps worker gateway role labels accurate', async () => {

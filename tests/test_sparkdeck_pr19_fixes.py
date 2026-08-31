@@ -857,6 +857,321 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.remove_container.assert_awaited_once_with("sparkdeck-existing")
 
+    async def test_delete_removes_stale_row_when_manager_deployment_is_absent(self):
+        self.service.store.add_deployment(Deployment(
+            id="stale-record",
+            alias="stale",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="stale-r0",
+            settings={"manager_deployment_id": "missing-manager-deployment"},
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+
+        result = await self.service.delete_deployment("stale-record")
+
+        self.assertEqual(result, {"ok": True, "id": "stale-record"})
+        self.assertIsNone(self.service.store.deployment("stale-record"))
+        self.manager.deployment_action.assert_awaited_once_with(
+            "missing-manager-deployment", "remove",
+        )
+
+    async def test_delete_preserves_row_for_real_manager_removal_failure(self):
+        self.service.store.add_deployment(Deployment(
+            id="live-record",
+            alias="live",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="live-r0",
+            settings={"manager_deployment_id": "live-manager-deployment"},
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("selected node is unavailable"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "selected node is unavailable"):
+            await self.service.delete_deployment("live-record")
+
+        self.assertIsNotNone(self.service.store.deployment("live-record"))
+
+    async def test_delete_stale_manager_id_removes_current_container_owner(self):
+        self.service.store.add_deployment(Deployment(
+            id="adopted-record",
+            alias="adopted",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="replacement-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            {"ok": True, "errors": []},
+        ])
+
+        result = await self.service.delete_deployment("adopted-record")
+
+        self.assertEqual(result, {"ok": True, "id": "adopted-record"})
+        self.assertIsNone(self.service.store.deployment("adopted-record"))
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [
+                ("stale-manager-deployment", "remove"),
+                ("replacement-manager-deployment", "remove"),
+            ],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_stale_manager_id_uses_reverse_linked_owner(self):
+        self.service.store.add_deployment(Deployment(
+            id="linked-record",
+            alias="linked",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-primary-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "sparkdeck_record_id": "linked-record",
+            "members": [{"container_name": "new-primary-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            {"ok": True, "errors": []},
+        ])
+
+        result = await self.service.delete_deployment("linked-record")
+
+        self.assertEqual(result, {"ok": True, "id": "linked-record"})
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [
+                ("stale-manager-deployment", "remove"),
+                ("replacement-manager-deployment", "remove"),
+            ],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_refreshes_owner_after_manager_side_redeployment(self):
+        self.service.store.add_deployment(Deployment(
+            id="auto-redeployed-record",
+            alias="auto-redeployed",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-primary-r0",
+            settings={"manager_deployment_id": "old-manager"},
+        ))
+        self.manager.deployments = [{
+            "id": "old-manager",
+            "sparkdeck_record_id": "auto-redeployed-record",
+            "members": [{"container_name": "old-primary-r0"}],
+        }]
+
+        async def remove_manager(deployment_id, action):
+            if deployment_id == "old-manager":
+                self.service.store.update_managed_routing(
+                    "auto-redeployed-record",
+                    {"manager_deployment_id": "replacement-manager"},
+                    "replacement-primary-r0",
+                    None,
+                )
+                self.manager.deployments = [{
+                    "id": "replacement-manager",
+                    "sparkdeck_record_id": "auto-redeployed-record",
+                    "members": [{"container_name": "replacement-primary-r0"}],
+                }]
+                raise ValueError("deployment not found")
+            return {"ok": True, "errors": []}
+
+        self.manager.deployment_action = AsyncMock(side_effect=remove_manager)
+
+        result = await self.service.delete_deployment("auto-redeployed-record")
+
+        self.assertEqual(result, {"ok": True, "id": "auto-redeployed-record"})
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [("old-manager", "remove"), ("replacement-manager", "remove")],
+        )
+        self.assertIsNone(
+            self.service.store.deployment("auto-redeployed-record"),
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_accepts_current_owner_removed_concurrently(self):
+        self.service.store.add_deployment(Deployment(
+            id="racing-record",
+            alias="racing",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="replacement-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            ValueError("deployment not found"),
+        ])
+
+        result = await self.service.delete_deployment("racing-record")
+
+        self.assertEqual(result, {"ok": True, "id": "racing-record"})
+        self.assertIsNone(self.service.store.deployment("racing-record"))
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_refreshes_routing_after_same_record_action(self):
+        self.service.store.add_deployment(Deployment(
+            id="relaunching-record",
+            alias="relaunching",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-r0",
+            settings={"manager_deployment_id": "old-manager"},
+        ))
+        lock = self.service._deployment_action_locks.setdefault(
+            "relaunching-record", asyncio.Lock(),
+        )
+        await lock.acquire()
+        delete_task = asyncio.create_task(
+            self.service.delete_deployment("relaunching-record"),
+        )
+        await asyncio.sleep(0)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+        self.service.store.update_managed_routing(
+            "relaunching-record",
+            {"manager_deployment_id": "replacement-manager"},
+            "replacement-r0",
+            None,
+        )
+        self.manager.deployments = [{
+            "id": "replacement-manager",
+            "sparkdeck_record_id": "relaunching-record",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        lock.release()
+
+        result = await delete_task
+
+        self.assertEqual(result, {"ok": True, "id": "relaunching-record"})
+        self.manager.deployment_action.assert_awaited_once_with(
+            "replacement-manager", "remove",
+        )
+        self.assertIsNone(self.service.store.deployment("relaunching-record"))
+        self.assertNotIn(
+            "relaunching-record", self.service._deployment_action_locks,
+        )
+
+    async def test_missing_delete_does_not_retain_lifecycle_lock(self):
+        with self.assertRaisesRegex(LookupError, "deployment not found"):
+            await self.service.delete_deployment("never-existed")
+
+        self.assertNotIn("never-existed", self.service._deployment_action_locks)
+        self.assertNotIn(
+            "never-existed", self.service._deployment_action_lock_users,
+        )
+
+    async def test_delete_removes_every_persisted_orphaned_cluster_rank(self):
+        self.service.store.add_deployment(Deployment(
+            id="orphaned-record",
+            alias="orphaned",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="cluster-missing-manager-r0-org-model",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+
+        result = await self.service.delete_deployment("orphaned-record")
+
+        self.assertEqual(result, {"ok": True, "id": "orphaned-record"})
+        self.assertIsNone(self.service.store.deployment("orphaned-record"))
+        self.assertEqual(
+            self.manager.remove_orphaned_deployment_members.await_args.args[0],
+            [{
+                "node_id": "local", "rank": 0,
+                "container_name": "cluster-missing-manager-r0-org-model",
+            }, {
+                "node_id": "worker-1", "rank": 1,
+                "container_name": "cluster-missing-manager-r1-org-model",
+            }],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_preserves_row_when_orphaned_rank_cannot_be_removed(self):
+        self.service.store.add_deployment(Deployment(
+            id="unreachable-record",
+            alias="unreachable",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="cluster-missing-manager-r0-org-model",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock(
+            return_value={"ok": False, "errors": ["Worker agent is offline"]},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Worker agent is offline"):
+            await self.service.delete_deployment("unreachable-record")
+
+        self.assertIsNotNone(self.service.store.deployment("unreachable-record"))
+
+    async def test_delete_keeps_remote_orphan_with_unverifiable_member_names(self):
+        self.service.store.add_deployment(Deployment(
+            id="unsafe-record",
+            alias="unsafe",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="legacy-primary",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "remote ranks may remain"):
+            await self.service.delete_deployment("unsafe-record")
+
+        self.assertIsNotNone(self.service.store.deployment("unsafe-record"))
+        self.manager.remove_orphaned_deployment_members.assert_not_awaited()
+
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_sglang_forwards_max_running_requests(self):

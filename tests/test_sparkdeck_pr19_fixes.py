@@ -930,6 +930,148 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager.remove_container.assert_not_awaited()
 
+    async def test_delete_stale_manager_id_uses_reverse_linked_owner(self):
+        self.service.store.add_deployment(Deployment(
+            id="linked-record",
+            alias="linked",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-primary-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "sparkdeck_record_id": "linked-record",
+            "members": [{"container_name": "new-primary-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            {"ok": True, "errors": []},
+        ])
+
+        result = await self.service.delete_deployment("linked-record")
+
+        self.assertEqual(result, {"ok": True, "id": "linked-record"})
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [
+                ("stale-manager-deployment", "remove"),
+                ("replacement-manager-deployment", "remove"),
+            ],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_accepts_current_owner_removed_concurrently(self):
+        self.service.store.add_deployment(Deployment(
+            id="racing-record",
+            alias="racing",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="replacement-r0",
+            settings={"manager_deployment_id": "stale-manager-deployment"},
+        ))
+        self.manager.deployments = [{
+            "id": "replacement-manager-deployment",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        self.manager.deployment_action = AsyncMock(side_effect=[
+            ValueError("deployment not found"),
+            ValueError("deployment not found"),
+        ])
+
+        result = await self.service.delete_deployment("racing-record")
+
+        self.assertEqual(result, {"ok": True, "id": "racing-record"})
+        self.assertIsNone(self.service.store.deployment("racing-record"))
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_removes_every_persisted_orphaned_cluster_rank(self):
+        self.service.store.add_deployment(Deployment(
+            id="orphaned-record",
+            alias="orphaned",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="cluster-missing-manager-r0-org-model",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+
+        result = await self.service.delete_deployment("orphaned-record")
+
+        self.assertEqual(result, {"ok": True, "id": "orphaned-record"})
+        self.assertIsNone(self.service.store.deployment("orphaned-record"))
+        self.assertEqual(
+            self.manager.remove_orphaned_deployment_members.await_args.args[0],
+            [{
+                "node_id": "local", "rank": 0,
+                "container_name": "cluster-missing-manager-r0-org-model",
+            }, {
+                "node_id": "worker-1", "rank": 1,
+                "container_name": "cluster-missing-manager-r1-org-model",
+            }],
+        )
+        self.manager.remove_container.assert_not_awaited()
+
+    async def test_delete_preserves_row_when_orphaned_rank_cannot_be_removed(self):
+        self.service.store.add_deployment(Deployment(
+            id="unreachable-record",
+            alias="unreachable",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="cluster-missing-manager-r0-org-model",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock(
+            return_value={"ok": False, "errors": ["Worker agent is offline"]},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Worker agent is offline"):
+            await self.service.delete_deployment("unreachable-record")
+
+        self.assertIsNotNone(self.service.store.deployment("unreachable-record"))
+
+    async def test_delete_keeps_remote_orphan_with_unverifiable_member_names(self):
+        self.service.store.add_deployment(Deployment(
+            id="unsafe-record",
+            alias="unsafe",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="legacy-primary",
+            settings={
+                "manager_deployment_id": "missing-manager",
+                "node_ids": ["local", "worker-1"],
+            },
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+        self.manager.remove_orphaned_deployment_members = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "remote ranks may remain"):
+            await self.service.delete_deployment("unsafe-record")
+
+        self.assertIsNotNone(self.service.store.deployment("unsafe-record"))
+        self.manager.remove_orphaned_deployment_members.assert_not_awaited()
+
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_sglang_forwards_max_running_requests(self):

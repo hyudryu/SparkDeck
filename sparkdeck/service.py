@@ -4157,6 +4157,11 @@ class SparkDeckService:
         if not deployment:
             raise LookupError("deployment not found")
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
+        linked = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict) and item.get("id")
+            and item.get("sparkdeck_record_id") == deployment.get("id")
+        ), None)
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
         cluster_removed = False
         if manager_id:
@@ -4171,15 +4176,33 @@ class SparkDeckService:
                         "; ".join(result.get("errors") or ["cluster removal failed"])
                     )
                 cluster_removed = True
-        if not cluster_removed and owner and owner["id"] != manager_id:
+        current_owner = linked or owner
+        if (
+            not cluster_removed and current_owner
+            and current_owner["id"] != manager_id
+        ):
             # Removing one rank of a cluster would leave the health monitor to
             # resurrect the deployment. This also covers a stale saved Manager
             # ID when the container has since been adopted by another cluster.
-            result = await self.manager.deployment_action(owner["id"], "remove")
-            if not result.get("ok"):
-                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
-            cluster_removed = True
-        elif not cluster_removed and (
+            try:
+                result = await self.manager.deployment_action(
+                    current_owner["id"], "remove",
+                )
+            except (LookupError, ValueError) as exc:
+                if not _is_missing_deployment_error(exc):
+                    raise
+                cluster_removed = True
+            else:
+                if not result.get("ok"):
+                    raise RuntimeError(
+                        "; ".join(result.get("errors") or ["cluster removal failed"])
+                    )
+                cluster_removed = True
+        if not cluster_removed and manager_id:
+            cluster_removed = await self._remove_orphaned_cluster_members(
+                deployment, str(manager_id),
+            )
+        if not cluster_removed and (
             deployment["kind"] == DeploymentKind.MANAGED.value or discovered
         ) and deployment.get("container_name"):
             try:
@@ -4191,6 +4214,47 @@ class SparkDeckService:
             self._delete_credential(deployment_id, deployment.get("_credential_ref"))
             self.store.delete_deployment(deployment_id)
         return {"ok": True, "id": deployment_id}
+
+    async def _remove_orphaned_cluster_members(
+        self, deployment: dict[str, Any], manager_id: str,
+    ) -> bool:
+        """Remove every persisted rank after its Manager record disappeared."""
+        node_ids = [
+            str(node_id).strip()
+            for node_id in (deployment.get("settings") or {}).get("node_ids") or []
+            if str(node_id).strip()
+        ]
+        if not node_ids:
+            return False
+        primary_name = str(deployment.get("container_name") or "")
+        primary_prefix = f"cluster-{manager_id}-r0-"
+        suffix = (
+            primary_name[len(primary_prefix):]
+            if primary_name.startswith(primary_prefix) else ""
+        )
+        if not suffix:
+            if len(node_ids) > 1 or any(
+                node_id != LOCAL_NODE_ID for node_id in node_ids
+            ):
+                raise RuntimeError(
+                    "saved cluster member names are unavailable; refusing to "
+                    "delete the deployment record while remote ranks may remain"
+                )
+            return False
+        members = [
+            {
+                "node_id": node_id,
+                "rank": rank,
+                "container_name": f"cluster-{manager_id}-r{rank}-{suffix}",
+            }
+            for rank, node_id in enumerate(node_ids)
+        ]
+        result = await self.manager.remove_orphaned_deployment_members(members)
+        if not result.get("ok"):
+            raise RuntimeError(
+                "; ".join(result.get("errors") or ["cluster removal failed"])
+            )
+        return True
 
     def _clone_launch_configuration(
         self, stored: dict[str, Any], runtime: RuntimeKind,

@@ -555,6 +555,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .model-grid, .aggregate-grid, .benchmark-summary-grid, .comparison-grid { grid-template-columns: 1fr; }
   .benchmark-model-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; }.benchmark-model-row > span:not(.benchmark-model-icon):not(.benchmark-model-main) { display: none; }.benchmark-chart-stack { grid-template-columns: 1fr; }.benchmark-chart { overflow-x: auto; }.benchmark-chart svg { min-width: 520px; }
   .temperature-recorder-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .temperature-panel-head { flex-wrap: wrap; }
+  .temperature-viewer-controls { justify-content: flex-start; }
+  .temperature-viewer-controls label { flex: 1 1 160px; }
+  .temperature-viewer-controls input { min-width: 0; flex: 1; }
   .dashboard-grid { grid-template-columns: 1fr; }
   .dashboard-refresh > span { display: none; }
   .community-strip { grid-template-columns: auto minmax(0, 1fr) auto; }.community-strip .status { grid-column: 2; justify-self: start; }.community-counts { grid-column: 2; }.community-strip > .text-link { grid-column: 3; grid-row: 1 / 4; align-self: center; }

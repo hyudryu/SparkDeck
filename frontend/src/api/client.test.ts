@@ -583,6 +583,26 @@ describe('API client adapters', () => {
     ])
   })
 
+  it('preserves structured per-node deployment logs', async () => {
+    const response = {
+      logs: 'combined logs',
+      members: [
+        { node_id: 'local', node_name: 'Control Spark', rank: 0, container_name: 'rank-0', status: 'running', logs: 'primary logs' },
+        { node_id: 'node-2', node_name: 'Render Spark', rank: 1, container_name: 'rank-1', status: 'running', logs: 'worker logs' },
+      ],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(response), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.deployments.logs('dep/1')).resolves.toEqual(response)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep%2F1/logs?tail=300',
+      expect.objectContaining({ headers: expect.anything() }),
+    )
+  })
+
   it('parses legacy log levels and defaults unstructured lines to info', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response('{}', { status: 404, statusText: 'Not Found', headers: { 'Content-Type': 'application/json' } }))

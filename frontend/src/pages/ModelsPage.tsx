@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, CreateDeploymentInput, Deployment, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
@@ -170,11 +170,20 @@ const deploymentTimestampMs = (timestamp: string | number | undefined) => {
   return Number.isNaN(value) ? 0 : value
 }
 
-const formatDeploymentTimestamp = (timestamp: string | number) => {
-  const date = new Date(deploymentTimestampMs(timestamp))
-  return Number.isNaN(date.getTime()) ? undefined : date.toLocaleString([], {
-    dateStyle: 'medium', timeStyle: 'short',
-  })
+export const formatDeploymentTimestamp = (timestamp: string | number, now = Date.now() / 1000) => {
+  const timestampMs = deploymentTimestampMs(timestamp)
+  if (!timestampMs) return undefined
+  const date = new Date(timestampMs)
+  if (Number.isNaN(date.getTime())) return undefined
+  const ageSeconds = Math.max(0, Math.floor(now - date.getTime() / 1000))
+  if (ageSeconds < 60) return 'just now'
+  const minutes = Math.floor(ageSeconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days <= 7) return `${days}d ago`
+  return date.toLocaleDateString([], { dateStyle: 'medium' })
 }
 
 const deploymentConcurrency = (deployment: Deployment) => (
@@ -366,8 +375,9 @@ export function ModelsPage() {
   const [expandedGroups, setExpandedGroups] = useState<string[]>([])
   const [renaming, setRenaming] = useState<{ id: string; value: string }>()
   const logRequestRef = useRef(0)
-  const [logViewer, setLogViewer] = useState<{ id: string; alias: string }>()
-  const [logText, setLogText] = useState('')
+  const [logViewer, setLogViewer] = useState<Deployment>()
+  const [logData, setLogData] = useState<DeploymentLogsResponse>()
+  const [selectedLogNodeId, setSelectedLogNodeId] = useState<string>()
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState<string>()
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
@@ -1328,7 +1338,13 @@ export function ModelsPage() {
     try {
       const logs = await api.deployments.logs(id)
       if (logRequestRef.current !== requestId) return
-      setLogText(logs)
+      setLogData(logs)
+      const members = [...(logs.members ?? [])].sort((left, right) => (left.rank ?? Number.MAX_SAFE_INTEGER) - (right.rank ?? Number.MAX_SAFE_INTEGER))
+      setSelectedLogNodeId((current) => (
+        current && members.some((member) => member.node_id === current)
+          ? current
+          : members[0]?.node_id
+      ))
     } catch (reason) {
       if (logRequestRef.current !== requestId) return
       setLogError(reason instanceof Error ? reason.message : 'Could not load logs')
@@ -1338,9 +1354,32 @@ export function ModelsPage() {
   }
 
   const openLogs = (deployment: Deployment) => {
-    setLogViewer({ id: deployment.id, alias: deployment.alias })
-    setLogText('')
+    setLogViewer(deployment)
+    setLogData(undefined)
+    setSelectedLogNodeId(undefined)
+    setLogError(undefined)
     void loadLogs(deployment.id)
+  }
+
+  const logMembers = [...(logData?.members ?? [])].sort((left, right) => (
+    (left.rank ?? Number.MAX_SAFE_INTEGER) - (right.rank ?? Number.MAX_SAFE_INTEGER)
+  ))
+  const selectedLogMember = logMembers.find((member) => member.node_id === selectedLogNodeId) ?? logMembers[0]
+  const logNodeLabel = (nodeId: string, nodeName?: string) => (
+    nodeName
+    ?? logViewer?.selected_nodes?.find((node) => node.id === nodeId)?.name
+    ?? (nodeId === 'local' ? localLabel : nodeId)
+  )
+  const selectLogTabFromKeyboard = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex: number | undefined
+    if (event.key === 'ArrowRight') nextIndex = (index + 1) % logMembers.length
+    else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + logMembers.length) % logMembers.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = logMembers.length - 1
+    if (nextIndex === undefined) return
+    event.preventDefault()
+    setSelectedLogNodeId(logMembers[nextIndex].node_id)
+    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus()
   }
 
   const changeSortMode = (mode: SortMode) => {
@@ -1779,9 +1818,9 @@ export function ModelsPage() {
                           : 'No inference yet'}
                       </small>
                     )}
-                    {deployment.status === 'stopped' && deployment.last_deployed_at && formatDeploymentTimestamp(deployment.last_deployed_at) && (
+                    {deployment.status === 'stopped' && deployment.last_deployed_at && formatDeploymentTimestamp(deployment.last_deployed_at, now) && (
                       <small className="deployment-launch-message">
-                        Last deployed {formatDeploymentTimestamp(deployment.last_deployed_at)}
+                        Last deployed {formatDeploymentTimestamp(deployment.last_deployed_at, now)}
                       </small>
                     )}
                   </div>
@@ -2293,13 +2332,39 @@ export function ModelsPage() {
           <section className="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="deployment-logs-title">
             <div className="modal-heading"><div><p className="eyebrow">Deployment logs</p><h2 id="deployment-logs-title">{logViewer.alias}</h2></div><button className="icon-button" onClick={() => setLogViewer(undefined)} aria-label="Close dialog">×</button></div>
             {logError && <p className="form-error" role="alert">{logError}</p>}
-            <div className="log-view deployment-log-view" aria-label={`Logs for ${logViewer.alias}`} tabIndex={0}>
-              {logLoading
+            {logMembers.length > 1 && (
+              <div className="deployment-log-tabs" role="tablist" aria-label="Deployment log nodes">
+                {logMembers.map((member, index) => {
+                  const selected = member.node_id === selectedLogMember?.node_id
+                  const detail = member.rank === 0 ? 'Primary' : member.rank === undefined ? 'Node' : `Rank ${member.rank}`
+                  return <button
+                    type="button"
+                    role="tab"
+                    id={`deployment-log-tab-${index}`}
+                    aria-controls="deployment-log-panel"
+                    aria-selected={selected}
+                    tabIndex={selected ? 0 : -1}
+                    key={`${member.node_id}-${member.rank ?? index}`}
+                    onClick={() => setSelectedLogNodeId(member.node_id)}
+                    onKeyDown={(event) => selectLogTabFromKeyboard(event, index)}
+                  ><span>{logNodeLabel(member.node_id, member.node_name)}</span><small>{detail}</small></button>
+                })}
+              </div>
+            )}
+            <div
+              id="deployment-log-panel"
+              className="log-view deployment-log-view"
+              role={logMembers.length > 1 ? 'tabpanel' : undefined}
+              aria-labelledby={logMembers.length > 1 ? `deployment-log-tab-${Math.max(0, logMembers.indexOf(selectedLogMember!))}` : undefined}
+              aria-label={logMembers.length > 1 ? undefined : `Logs for ${logViewer.alias}`}
+              tabIndex={0}
+            >
+              {!logData && logLoading
                 ? <span className="deployment-log-status">Loading logs…</span>
-                : <pre>{logText || 'No log output.'}</pre>}
+                : <pre>{selectedLogMember?.logs || logData?.logs || 'No log output.'}</pre>}
             </div>
             <div className="modal-actions">
-              <Button type="button" disabled={logLoading} onClick={() => void loadLogs(logViewer.id)}><ScrollText size={15} /> Refresh</Button>
+              <Button type="button" disabled={logLoading} onClick={() => void loadLogs(logViewer.id)}><ScrollText size={15} /> {logLoading ? 'Refreshing…' : 'Refresh'}</Button>
               <Button type="button" onClick={() => setLogViewer(undefined)}>Close</Button>
             </div>
           </section>

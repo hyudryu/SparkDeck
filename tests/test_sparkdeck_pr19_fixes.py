@@ -181,8 +181,16 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployments = [{
             "id": "cluster-1", "status": "running",
             "members": [
-                {"node_id": "local", "container_name": "cluster-1-r0-model", "rank": 0},
-                {"node_id": "node-2", "container_name": "cluster-1-r1-model", "rank": 1},
+                {
+                    "node_id": "node-2", "node_name": "Worker", "rank": 1,
+                    "container_name": "cluster-1-r1-model", "status": "running",
+                    "agent_token": "must-not-leak", "phase": {"private": True},
+                },
+                {
+                    "node_id": "local", "node_name": "Controller", "rank": 0,
+                    "container_name": "cluster-1-r0-model", "status": "running",
+                    "container_id": "must-not-leak",
+                },
             ],
         }]
         tails = []
@@ -203,6 +211,21 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("logs from cluster-1-r0-model", result["logs"])
         self.assertIn("rank 1 · node node-2", result["logs"])
         self.assertIn("logs from cluster-1-r1-model", result["logs"])
+        self.assertEqual(result["members"], [
+            {
+                "node_id": "local", "node_name": "Controller", "rank": 0,
+                "container_name": "cluster-1-r0-model", "status": "running",
+                "logs": "logs from cluster-1-r0-model",
+            },
+            {
+                "node_id": "node-2", "node_name": "Worker", "rank": 1,
+                "container_name": "cluster-1-r1-model", "status": "running",
+                "logs": "logs from cluster-1-r1-model",
+            },
+        ])
+        self.assertNotIn("agent_token", result["members"][1])
+        self.assertNotIn("phase", result["members"][1])
+        self.assertNotIn("container_id", result["members"][0])
         self.assertEqual(sorted(tails), [
             ("cluster-1-r0-model", "logs", 150),
             ("cluster-1-r1-model", "logs", 150),
@@ -238,6 +261,18 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pulling runtime image", result["logs"])
         self.assertIn("Agent log request: agent returned 404", result["logs"])
         self.assertNotIn("logs unavailable", result["logs"])
+        self.assertEqual(result["members"][0]["logs"], "docker logs here")
+        self.assertNotIn("error", result["members"][0])
+        self.assertEqual(
+            result["members"][1]["logs"],
+            "=== Coordinator launch status ===\npulling runtime image"
+            "\n\nAgent log request: agent returned 404",
+        )
+        self.assertEqual(result["members"][1]["error"], "agent returned 404")
+        self.assertEqual(
+            set(result["members"][1]),
+            {"node_id", "rank", "container_name", "status", "logs", "error"},
+        )
 
     async def test_deployment_logs_read_single_container(self):
         self.manager.list_containers.return_value = [{

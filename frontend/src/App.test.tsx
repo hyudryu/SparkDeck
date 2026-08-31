@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { ExplorePage } from './pages/ExplorePage'
-import { ModelsPage } from './pages/ModelsPage'
+import { formatDeploymentTimestamp, ModelsPage } from './pages/ModelsPage'
 
 const fetchMock = vi.fn<typeof fetch>()
 
@@ -1743,6 +1743,7 @@ describe('model deployments', () => {
     await user.click(await screen.findByRole('button', { name: 'Logs for Loud model' }))
     const dialog = await screen.findByRole('dialog', { name: 'Loud model' })
     expect(await within(dialog).findByText(/INFO model weights loaded/)).toBeInTheDocument()
+    expect(within(dialog).queryByRole('tablist', { name: 'Deployment log nodes' })).not.toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments/dep-1/logs?tail=300',
       expect.objectContaining({ headers: expect.anything() }),
@@ -1752,6 +1753,79 @@ describe('model deployments', () => {
 
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog', { name: 'Loud model' })).not.toBeInTheDocument()
+  })
+
+  it('switches multi-node deployment logs locally and preserves the selected node on refresh', async () => {
+    const user = userEvent.setup()
+    let logRequests = 0
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments/dep-logs/logs')) {
+        logRequests += 1
+        return new Response(JSON.stringify({
+          logs: 'combined output',
+          members: [
+            { node_id: 'node-2', node_name: 'Render Spark', rank: 1, logs: logRequests === 1 ? 'worker first output' : 'worker refreshed output' },
+            { node_id: 'local', rank: 0, logs: 'primary output' },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-logs', alias: 'Parallel model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'running', settings: {},
+        node_ids: ['local', 'node-2'],
+        selected_nodes: [{ id: 'local', name: 'Control Spark' }, { id: 'node-2', name: 'Saved worker name' }],
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Logs for Parallel model' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Parallel model' })
+    const tablist = await within(dialog).findByRole('tablist', { name: 'Deployment log nodes' })
+    const tabs = within(tablist).getAllByRole('tab')
+    expect(tabs).toHaveLength(2)
+    expect(tabs[0]).toHaveTextContent('Control Spark')
+    expect(tabs[0]).toHaveTextContent('Primary')
+    expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
+    expect(tabs[1]).toHaveTextContent('Render Spark')
+    expect(tabs[1]).toHaveTextContent('Rank 1')
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('primary output')
+    expect(within(dialog).queryByText('worker first output')).not.toBeInTheDocument()
+
+    await user.click(tabs[1])
+    expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('worker first output')
+    expect(logRequests).toBe(1)
+
+    tabs[1].focus()
+    await user.keyboard('{ArrowLeft}')
+    expect(tabs[0]).toHaveFocus()
+    expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
+    await user.keyboard('{End}')
+    expect(tabs[1]).toHaveFocus()
+    expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
+
+    await user.click(within(dialog).getByRole('button', { name: 'Refresh' }))
+    expect(await within(dialog).findByText('worker refreshed output')).toBeInTheDocument()
+    expect(within(tablist).getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true')
+    expect(logRequests).toBe(2)
+  })
+
+  it('formats recent deployment times compactly and uses a date after seven days', () => {
+    const now = Date.UTC(2026, 7, 30, 12, 0, 0) / 1000
+    expect(formatDeploymentTimestamp(now - 30, now)).toBe('just now')
+    expect(formatDeploymentTimestamp(now + 30, now)).toBe('just now')
+    expect(formatDeploymentTimestamp(now - 12 * 60, now)).toBe('12m ago')
+    expect(formatDeploymentTimestamp(now - 3 * 60 * 60, now)).toBe('3h ago')
+    expect(formatDeploymentTimestamp(now - 4 * 24 * 60 * 60, now)).toBe('4d ago')
+    expect(formatDeploymentTimestamp(now - 7 * 24 * 60 * 60, now)).toBe('7d ago')
+    const older = now - 8 * 24 * 60 * 60
+    expect(formatDeploymentTimestamp(older, now)).toBe(new Date(older * 1000).toLocaleDateString([], { dateStyle: 'medium' }))
   })
 
   it('asks which nodes to start on and defaults to the weighted ones', async () => {

@@ -225,6 +225,11 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .deployment-log-view { margin-top: 4px; }
 .deployment-log-view pre { margin: 0; padding: 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .deployment-log-status { display: block; padding: 3px 12px; color: #89898f; }
+.deployment-log-tabs { max-width: 100%; display: flex; gap: 4px; padding: 4px; margin-bottom: 10px; overflow-x: auto; background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 9px; }
+.deployment-log-tabs button { min-width: max-content; min-height: 38px; display: grid; justify-items: start; gap: 1px; padding: 5px 11px; color: var(--text-secondary); background: transparent; border: 0; border-radius: 6px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.deployment-log-tabs button small { color: var(--text-tertiary); font-size: 9px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.deployment-log-tabs button[aria-selected="true"] { color: var(--text-primary); background: var(--bg-surface); box-shadow: 0 1px 4px rgba(0, 0, 0, .08); }
+.deployment-log-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .chat-page { min-height: 100dvh; display: flex; flex-direction: column; padding-bottom: 28px; }
 .chat-page .page-header { margin-bottom: 20px; }

@@ -4064,38 +4064,70 @@ class SparkDeckService:
                 if isinstance(member, dict) and member.get("container_name")
             ]
             if members:
+                def member_rank(member: dict[str, Any]) -> int:
+                    try:
+                        rank = member.get("rank")
+                        return int(rank) if rank is not None else 2 ** 31
+                    except (TypeError, ValueError):
+                        return 2 ** 31
+
+                members.sort(key=member_rank)
                 results = await asyncio.gather(
                     *(self.manager._member_action(member, "logs", log_tail=bounded_tail)
                       for member in members),
                     return_exceptions=True,
                 )
 
-                def member_section(member: dict[str, Any], result: Any) -> str:
-                    label = f"rank {member.get('rank')} · node {member.get('node_id')}"
+                def member_body(
+                    member: dict[str, Any], result: Any,
+                ) -> tuple[str, str | None]:
+                    error = None
                     logs = result.get("logs") if isinstance(result, dict) else None
                     if isinstance(logs, str) and logs:
-                        body = logs
-                    else:
-                        # Ranks still queued/creating — and older agents that
-                        # reply 404 until Docker creates the container — have
-                        # no logs yet; the coordinator's launch status is the
-                        # useful signal there.
-                        phase = member.get("phase") or {}
-                        message = phase.get("message") or (
-                            "Waiting for the node agent to begin launch"
-                            if member.get("status") in {"queued", "creating"}
-                            else "No output has been reported yet"
-                        )
-                        body = f"=== Coordinator launch status ===\n{message}"
-                        if isinstance(result, Exception):
-                            body += f"\n\nAgent log request: {result}"
+                        return logs, error
+                    # Ranks still queued/creating — and older agents that
+                    # reply 404 until Docker creates the container — have
+                    # no logs yet; the coordinator's launch status is the
+                    # useful signal there.
+                    phase = member.get("phase") or {}
+                    message = phase.get("message") or (
+                        "Waiting for the node agent to begin launch"
+                        if member.get("status") in {"queued", "creating"}
+                        else "No output has been reported yet"
+                    )
+                    body = f"=== Coordinator launch status ===\n{message}"
+                    if isinstance(result, Exception):
+                        error = str(result)
+                        body += f"\n\nAgent log request: {error}"
+                    return body, error
+
+                def member_section(member: dict[str, Any], body: str) -> str:
+                    label = f"rank {member.get('rank')} · node {member.get('node_id')}"
                     return f"===== {label} ({member.get('container_name')}) =====\n{body}"
 
-                sections = [
-                    member_section(member, result)
-                    for member, result in zip(members, results)
-                ]
-                return {"logs": "\n\n".join(sections)}
+                sections = []
+                public_members = []
+                for member, result in zip(members, results):
+                    body, error = member_body(member, result)
+                    sections.append(member_section(member, body))
+                    public_member = {
+                        "node_id": member.get("node_id"),
+                        "rank": member.get("rank"),
+                        "container_name": member.get("container_name"),
+                        "logs": body,
+                    }
+                    for field in ("node_name", "status"):
+                        if member.get(field) is not None:
+                            public_member[field] = member[field]
+                    if error is not None:
+                        # This is the same transport detail already present in
+                        # the backward-compatible aggregate fallback above.
+                        public_member["error"] = error
+                    public_members.append(public_member)
+                return {
+                    "logs": "\n\n".join(sections),
+                    "members": public_members,
+                }
 
         container = deployment.get("container_name")
         if not container:

@@ -114,6 +114,21 @@ export interface Deployment {
   last_used_at?: number | null
 }
 
+export interface DeploymentLogMember {
+  node_id: string
+  node_name?: string
+  rank?: number
+  container_name?: string
+  status?: string
+  logs: string
+  error?: string | null
+}
+
+export interface DeploymentLogsResponse {
+  logs: string
+  members?: DeploymentLogMember[]
+}
+
 export interface DeploymentLaunchControls {
   context_window?: number | null
   max_concurrency?: number | null

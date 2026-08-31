@@ -16,6 +16,7 @@ import type {
   CreateDeploymentInput,
   Deployment,
   DeploymentDetail,
+  DeploymentLogsResponse,
   DeploymentLaunchControls,
   DeploymentUpdateInput,
   SystemStats,
@@ -609,9 +610,8 @@ export const api = {
       }, NO_REQUEST_TIMEOUT)
       return deploymentFromWire(data)
     },
-    logs: async (id: string, tail = 300) => {
-      const data = await request<{ logs: string }>(`/api/v1/deployments/${encodeURIComponent(id)}/logs?tail=${tail}`)
-      return data.logs
+    logs: async (id: string, tail = 300): Promise<DeploymentLogsResponse> => {
+      return request<DeploymentLogsResponse>(`/api/v1/deployments/${encodeURIComponent(id)}/logs?tail=${tail}`)
     },
     rename: async (id: string, alias: string) => {
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}`, {

@@ -24,6 +24,35 @@ afterEach(() => {
 })
 
 describe('BenchmarksPage community privacy', () => {
+  it('switches between the Speed and Temp panes', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown
+      if (path.endsWith('/api/temperature-runs')) body = { runs: [], active_run_id: null }
+      else if (path.endsWith('/api/v1/nodes')) body = { items: [] }
+      else if (path.endsWith('/api/v1/benchmark-models')) body = { items: [] }
+      else if (path.includes('/api/v1/benchmark-history/models')) body = { items: [] }
+      else if (path.endsWith('/api/v1/community/aggregates')) body = { items: [], availability: 'available', evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' } }
+      else body = { consent: true, pairing: { status: 'paired' }, upload_configured: true, outbox: {} }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Benchmark runs by model')).toBeInTheDocument()
+    expect(screen.queryByText('Temperature runs')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Temp' }))
+    expect(await screen.findByText('Temperature runs')).toBeInTheDocument()
+    expect(screen.getByText('No temperature runs yet')).toBeInTheDocument()
+    expect(screen.queryByText('Benchmark runs by model')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Speed' }))
+    expect(await screen.findByText('Benchmark runs by model')).toBeInTheDocument()
+    expect(screen.queryByText('Temperature runs')).not.toBeInTheDocument()
+  })
+
   it('opens per-model C1/C2/C5/C10 charts and filters by TP size', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)

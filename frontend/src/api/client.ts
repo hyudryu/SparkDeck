@@ -65,6 +65,8 @@ import type {
   BenchmarkRunnerRunConfig,
   BenchmarkRunnerRunSummary,
   BenchmarkRunnerRunDetail,
+  TemperatureRun,
+  TemperatureRunsState,
 } from './types'
 import type { RuntimeKind } from './types'
 
@@ -808,6 +810,22 @@ export const api = {
     },
     deleteLocal: (id: string) =>
       request<void>(`/api/v1/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  },
+  temperatureRuns: {
+    list: (signal?: AbortSignal) => request<TemperatureRunsState>('/api/temperature-runs', { signal }),
+    get: (id: string, signal?: AbortSignal) =>
+      request<TemperatureRun>(`/api/temperature-runs/${encodeURIComponent(id)}`, { signal }),
+    arm: (input: { node_id: string; target_temp_c: number; trigger_margin_pct: number }) =>
+      request<TemperatureRun>('/api/temperature-runs', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    cancel: () => request<TemperatureRun>('/api/temperature-runs/cancel', { method: 'POST' }),
+    rename: (id: string, name: string) =>
+      request<TemperatureRun>(`/api/temperature-runs/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name }),
+      }),
   },
   community: {
     authConfig: () => request<CommunityAuthConfig>('/api/v1/community/auth-config'),

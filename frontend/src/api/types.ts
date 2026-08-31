@@ -437,6 +437,38 @@ export interface BenchmarkModelDetail {
   points: BenchmarkSeriesPoint[]
 }
 
+export interface TemperatureRunSample {
+  elapsed_seconds: number
+  cpu_temp_c?: number | null
+  gpu_temp_c?: number | null
+}
+
+export interface TemperatureRun {
+  id: string
+  name: string
+  node_id: string
+  node_name?: string
+  status: 'armed' | 'recording' | 'complete' | 'cancelled' | 'interrupted'
+  armed_at?: number
+  started_at?: number | null
+  stopped_at?: number | null
+  target_temp_c: number
+  trigger_margin_pct: number
+  trigger_temp_c: number
+  sample_count: number
+  duration_seconds: number
+  last_error?: string
+  interruption_reason?: string
+  // Present only on the single-run endpoint.
+  samples?: TemperatureRunSample[]
+}
+
+export interface TemperatureRunsState {
+  sample_interval_seconds?: number
+  active_run_id: string | null
+  runs: TemperatureRun[]
+}
+
 export interface DevicePairing {
   status: 'paired' | 'not_paired'
   sub?: string

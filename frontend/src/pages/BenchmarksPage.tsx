@@ -7,9 +7,11 @@ import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { BenchmarkLineChart } from '../components/BenchmarkLineChart'
 import { BenchmarkRunner } from '../components/BenchmarkRunner'
+import { TemperatureRuns } from '../components/TemperatureRuns'
 import { LegalDialog } from '../components/LegalDialog'
 
 export function BenchmarksPage() {
+  const [tab, setTab] = useState<'speed' | 'temp'>('speed')
   const samples = useResource((signal) => api.benchmarks.list(signal))
   const benchmarkModels = useResource((signal) => api.benchmarks.models(signal))
   const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
@@ -84,6 +86,11 @@ export function BenchmarksPage() {
   return (
     <div className="page">
       <PageHeader eyebrow="Performance evidence" title="Benchmarks" description="Run llama-benchy against served models, review measurements captured from SparkDeck requests, and compare them with privacy-preserving community results." />
+      <div className="benchmark-tp-tabs benchmark-page-tabs" role="tablist" aria-label="Benchmark view">
+        <button type="button" role="tab" aria-selected={tab === 'speed'} onClick={() => setTab('speed')}>Speed</button>
+        <button type="button" role="tab" aria-selected={tab === 'temp'} onClick={() => setTab('temp')}>Temp</button>
+      </div>
+      {tab === 'speed' && <>
       <BenchmarkRunner />
       <div className="benchmark-summary-grid">
         <Panel className="sync-panel">
@@ -180,6 +187,8 @@ export function BenchmarksPage() {
         </>}
       </LegalDialog>}
       {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Benchmark JSON:</strong> canonical model identifier, quantization, prompt-length/context-occupancy bucket, measured inference tok/s, concurrency when recorded, and a stable opaque telemetry cluster ID. The authenticated account, not the cluster ID, defines one equal-weight contributor.</p><p><strong>Eligibility:</strong> only samples captured after you enable sharing can be uploaded; existing benchmark history stays local.</p><p><strong>The opaque ID:</strong> is randomly generated and contains no account ID, hostname, node name, or endpoint alias.</p><p><strong>Never in benchmark JSON:</strong> prompts or outputs, runtime, revision, hardware, settings, account email, paths, or endpoint aliases. The service still receives ordinary authenticated request and network metadata.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
+      </>}
+      {tab === 'temp' && <TemperatureRuns />}
     </div>
   )
 }

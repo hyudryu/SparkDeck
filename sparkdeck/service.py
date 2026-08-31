@@ -4159,9 +4159,16 @@ class SparkDeckService:
         manager_id = deployment.get("settings", {}).get("manager_deployment_id")
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
         if manager_id:
-            result = await self.manager.deployment_action(manager_id, "remove")
-            if not result.get("ok"):
-                raise RuntimeError("; ".join(result.get("errors") or ["cluster removal failed"]))
+            try:
+                result = await self.manager.deployment_action(manager_id, "remove")
+            except (LookupError, ValueError) as exc:
+                if not _is_missing_deployment_error(exc):
+                    raise
+            else:
+                if not result.get("ok"):
+                    raise RuntimeError(
+                        "; ".join(result.get("errors") or ["cluster removal failed"])
+                    )
         elif owner:
             # Removing one rank of a cluster would leave the health monitor to
             # resurrect the deployment; remove the whole cluster instead.
@@ -5385,6 +5392,13 @@ def _is_missing_container_error(exc: Exception) -> bool:
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
     return status == 404
+
+
+def _is_missing_deployment_error(exc: Exception) -> bool:
+    return str(exc).strip().casefold() in {
+        "deployment not found",
+        "cluster deployment not found",
+    }
 
 
 def _artifact_is_controller_local(artifact: str | None) -> bool:

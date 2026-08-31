@@ -857,6 +857,47 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.remove_container.assert_awaited_once_with("sparkdeck-existing")
 
+    async def test_delete_removes_stale_row_when_manager_deployment_is_absent(self):
+        self.service.store.add_deployment(Deployment(
+            id="stale-record",
+            alias="stale",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="stale-r0",
+            settings={"manager_deployment_id": "missing-manager-deployment"},
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("deployment not found"),
+        )
+
+        result = await self.service.delete_deployment("stale-record")
+
+        self.assertEqual(result, {"ok": True, "id": "stale-record"})
+        self.assertIsNone(self.service.store.deployment("stale-record"))
+        self.manager.deployment_action.assert_awaited_once_with(
+            "missing-manager-deployment", "remove",
+        )
+
+    async def test_delete_preserves_row_for_real_manager_removal_failure(self):
+        self.service.store.add_deployment(Deployment(
+            id="live-record",
+            alias="live",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="live-r0",
+            settings={"manager_deployment_id": "live-manager-deployment"},
+        ))
+        self.manager.deployment_action = AsyncMock(
+            side_effect=ValueError("selected node is unavailable"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "selected node is unavailable"):
+            await self.service.delete_deployment("live-record")
+
+        self.assertIsNotNone(self.service.store.deployment("live-record"))
+
 
 class RuntimeForwardingFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_sglang_forwards_max_running_requests(self):

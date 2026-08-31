@@ -4138,6 +4138,7 @@ class Manager:
         gpu_memory_utilization: Any = None,
         sg_tp_size: Any = None,
         sg_mem_fraction: Any = None,
+        managed: bool = False,
     ) -> dict[str, Any]:
         """Return the backend-normalized runtime flags without mutating state."""
         if engine not in {"vllm", "sglang"}:
@@ -4152,6 +4153,8 @@ class Manager:
             list(args), engine, controls, normalized_environment,
         )
         if engine == "vllm":
+            if managed:
+                final_args = self._with_vllm_prompt_token_details(final_args)
             final_args = self._resolve_environment_backed_speculative_args(
                 final_args, normalized_environment,
             )
@@ -4169,43 +4172,60 @@ class Manager:
                 )
                 final_args = shlex.split(flags)
         else:
-            tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
-            mem_fraction = self._validated_sg_scalar(
-                "sg_mem_fraction", sg_mem_fraction,
+            final_args = self._with_sglang_runtime_controls(
+                final_args,
+                controls.get("context_window"),
+                controls.get("max_concurrency"),
+                sg_tp_size,
+                sg_mem_fraction,
             )
-            context_length = self._validated_sg_scalar(
-                "sg_context_length", controls.get("context_window"),
-            )
-            max_running = self._validated_sg_scalar(
-                "sg_max_running_requests", controls.get("max_concurrency"),
-            )
-            flags = shlex.join(final_args)
-            for names in (
-                {"--tp-size"}, {"--context-length"}, {"--mem-fraction-static"},
-                {"--max-running-requests"}, {"--max-total-tokens"},
-            ):
-                flags = self._replace_command_option(flags, names, None)
-            generated: list[str] = []
-            if tp_size is not None:
-                generated += ["--tp-size", str(tp_size)]
-            if context_length is not None:
-                generated += ["--context-length", str(context_length)]
-            if mem_fraction is not None:
-                generated += ["--mem-fraction-static", str(mem_fraction)]
-            if max_running is None and context_length is not None:
-                max_running = 8
-            if max_running is not None:
-                generated += ["--max-running-requests", str(max_running)]
-                generated += [
-                    "--max-total-tokens",
-                    str(max_running * (context_length or 32768) * 2),
-                ]
-            final_args = generated + shlex.split(flags)
         return {
             "flags": final_args,
             "command_flags": shlex.join(final_args),
             "environment": normalized_environment,
         }
+
+    def _with_sglang_runtime_controls(
+        self,
+        args: list[str],
+        context_length: Any,
+        max_running_requests: Any,
+        tp_size: Any,
+        mem_fraction: Any,
+    ) -> list[str]:
+        """Build the generated SGLang flags shared by preview and container save."""
+        tp_size = self._validated_sg_scalar("sg_tp_size", tp_size)
+        mem_fraction = self._validated_sg_scalar(
+            "sg_mem_fraction", mem_fraction,
+        )
+        context_length = self._validated_sg_scalar(
+            "sg_context_length", context_length,
+        )
+        max_running = self._validated_sg_scalar(
+            "sg_max_running_requests", max_running_requests,
+        )
+        flags = shlex.join(args)
+        for names in (
+            {"--tp-size"}, {"--context-length"}, {"--mem-fraction-static"},
+            {"--max-running-requests"}, {"--max-total-tokens"},
+        ):
+            flags = self._replace_command_option(flags, names, None)
+        generated: list[str] = []
+        if tp_size is not None:
+            generated += ["--tp-size", str(tp_size)]
+        if context_length is not None:
+            generated += ["--context-length", str(context_length)]
+        if mem_fraction is not None:
+            generated += ["--mem-fraction-static", str(mem_fraction)]
+        if max_running is None and context_length is not None:
+            max_running = 8
+        if max_running is not None:
+            generated += ["--max-running-requests", str(max_running)]
+            generated += [
+                "--max-total-tokens",
+                str(max_running * (context_length or 32768) * 2),
+            ]
+        return generated + shlex.split(flags)
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""
@@ -11083,31 +11103,17 @@ class Manager:
                 name, "preparing", "Preparing SGLang launch",
                 model=model, cluster_member=cluster_member,
             )
-            extra = list(extra_args or [])
             sg_cmd = ["-m", "sglang.launch_server", "--model-path", model]
             sg_cmd += ["--host", "0.0.0.0"]
             serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             sg_cmd += ["--port", str(serve_port)]
-            if sg_tp_size and sg_tp_size > 0:
-                sg_cmd += ["--tp-size", str(sg_tp_size)]
-            if sg_context_length and sg_context_length > 0:
-                sg_cmd += ["--context-length", str(sg_context_length)]
-            if sg_mem_fraction and sg_mem_fraction > 0:
-                sg_cmd += ["--mem-fraction-static", str(sg_mem_fraction)]
-            if sg_max_running_requests and sg_max_running_requests > 0:
-                # Calculate max-total-tokens as max_running_requests * context_length * 2
-                ctx = sg_context_length or 32768
-                max_total = sg_max_running_requests * ctx * 2
-                sg_cmd += ["--max-running-requests", str(sg_max_running_requests)]
-                sg_cmd += ["--max-total-tokens", str(max_total)]
-            else:
-                if sg_context_length and sg_context_length > 0:
-                    # Default to 8 running requests if not specified
-                    default_running = 8
-                    sg_cmd += ["--max-running-requests", str(default_running)]
-                    max_total = default_running * sg_context_length * 2
-                    sg_cmd += ["--max-total-tokens", str(max_total)]
-            sg_cmd += extra
+            sg_cmd += self._with_sglang_runtime_controls(
+                list(extra_args or []),
+                sg_context_length,
+                sg_max_running_requests,
+                sg_tp_size,
+                sg_mem_fraction,
+            )
 
             def _create():
                 # docker-py does not pull a missing image as part of

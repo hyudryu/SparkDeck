@@ -2131,7 +2131,7 @@ async def v1_runtime_flags_preview(req: Request):
         raise HTTPException(400, "request body must be an object")
     allowed = {
         "runtime", "extra_args", "launch_controls", "environment",
-        "gpu_memory_utilization", "sg_tp_size", "sg_mem_fraction",
+        "gpu_memory_utilization", "sg_tp_size", "sg_mem_fraction", "managed",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -2145,6 +2145,7 @@ async def v1_runtime_flags_preview(req: Request):
             body.get("gpu_memory_utilization"),
             body.get("sg_tp_size"),
             body.get("sg_mem_fraction"),
+            body.get("managed") is True,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

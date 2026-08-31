@@ -1730,17 +1730,19 @@ class SparkDeckService:
                     else settings.get("tensor_parallel_size")
                 )
             )
-            flags = self.manager._replace_command_option(
-                shlex.join(merged_args), {"--tp-size"}, sg_tp_size,
-            )
-            merged_args = shlex.split(flags)
-            command_args = merged_args
             utilization = self.manager._validated_sg_scalar(
                 "sg_mem_fraction", (
                     changes.get("sg_mem_fraction")
                     if "sg_mem_fraction" in changes
                     else settings.get("gpu_memory_utilization")
                 )
+            )
+            command_args = self.manager._with_sglang_runtime_controls(
+                merged_args,
+                controls.get("context_window"),
+                controls.get("max_concurrency"),
+                sg_tp_size,
+                utilization,
             )
         else:
             utilization = (

@@ -528,10 +528,20 @@ export const api = {
     previewFlags: (
       runtime: RuntimeKind,
       input: DeploymentUpdateInput,
+      managed: boolean,
       signal?: AbortSignal,
     ) => request<RuntimeFlagsPreview>('/api/v1/runtime-flags/preview', {
       method: 'POST',
-      body: JSON.stringify({ runtime, ...input }),
+      body: JSON.stringify({
+        runtime,
+        managed,
+        extra_args: input.extra_args,
+        environment: input.environment,
+        launch_controls: input.launch_controls,
+        gpu_memory_utilization: input.gpu_memory_utilization,
+        sg_tp_size: input.sg_tp_size,
+        sg_mem_fraction: input.sg_mem_fraction,
+      }),
       signal,
     }),
     create: async (input: CreateDeploymentInput) => {

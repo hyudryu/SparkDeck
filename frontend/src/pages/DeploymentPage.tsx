@@ -144,7 +144,9 @@ export function DeploymentPage() {
     const timer = window.setTimeout(() => {
       try {
         const input = updateInput(editor)
-        void api.deployments.previewFlags(runtime, input, controller.signal)
+        void api.deployments.previewFlags(
+          runtime, input, Boolean(resource.data?.managed), controller.signal,
+        )
           .then((preview) => {
             setFinalFlags(preview.command_flags)
             setPreviewError(undefined)

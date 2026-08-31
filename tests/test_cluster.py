@@ -3113,8 +3113,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "dspark_num_speculative_tokens": 5,
             },
             {},
+            managed=True,
         )
         self.assertNotIn("${SPECULATIVE_CONFIG}", preview["command_flags"])
+        self.assertIn("--enable-prompt-tokens-details", preview["flags"])
         self.assertEqual(
             json.loads(instance._cli_option(preview["flags"], {"--speculative-config"})),
             {
@@ -3128,7 +3130,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         instance = Manager.__new__(Manager)
 
         preview = instance.preview_runtime_flags(
-            ["--enable-metrics"],
+            ["--max-total-tokens", "999", "--enable-metrics"],
             "sglang",
             {"context_window": 120000, "max_concurrency": 10},
             {},
@@ -3147,6 +3149,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "--enable-metrics",
             ],
         )
+        self.assertEqual(preview["flags"].count("--max-total-tokens"), 1)
+        self.assertNotIn("999", preview["flags"])
 
     def test_launch_controls_reject_invalid_environment_backed_speculative_config(
         self,

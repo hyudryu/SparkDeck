@@ -83,6 +83,11 @@ describe('deployment object page', () => {
     )
     const finalFlags = await screen.findByLabelText(/Final runtime flags/)
     await waitFor(() => expect((finalFlags as HTMLTextAreaElement).value).toContain('--speculative-config'))
+    const previewBody = JSON.parse(String(fetchMock.mock.calls.find(
+      ([input]) => String(input) === '/api/v1/runtime-flags/preview',
+    )?.[1]?.body))
+    expect(previewBody.managed).toBe(true)
+    expect(previewBody).not.toHaveProperty('gpu_memory_gb')
     await user.clear(screen.getByLabelText('Max concurrency'))
     await user.type(screen.getByLabelText('Max concurrency'), '6')
     await user.clear(screen.getByLabelText('Tensor parallel size'))

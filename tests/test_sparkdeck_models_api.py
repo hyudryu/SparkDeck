@@ -698,7 +698,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             "name": "qwen-sglang", "load_settings": {
                 "engine": "sglang", "editable": True,
                 "extra_args": [
-                    "--max-total-tokens", "2097152", "--enable-metrics",
+                    "--max-total-tokens", "999", "--enable-metrics",
                 ],
                 "context_window": 131072, "max_concurrency": 8,
                 "kv_cache_dtype": "fp8_e4m3", "thinking_mode": "default",
@@ -733,6 +733,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replacement["max_concurrency"], 4)
         self.assertEqual(replacement["gpu_memory_utilization"], 0.75)
         self.assertIn("--tp-size 2", replacement["command_flags"])
+        self.assertNotIn("--max-total-tokens 999", replacement["command_flags"])
         self.assertIn(
             "--max-total-tokens 2097152", replacement["command_flags"]
         )

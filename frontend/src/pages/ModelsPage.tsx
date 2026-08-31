@@ -164,6 +164,33 @@ const formatInferenceAge = (timestamp: number, now: number) => {
   return `${Math.floor(hours / 24)}d ago`
 }
 
+const deploymentTimestampMs = (timestamp: string | number | undefined) => {
+  if (timestamp === undefined) return 0
+  const value = new Date(typeof timestamp === 'number' ? timestamp * 1000 : timestamp).getTime()
+  return Number.isNaN(value) ? 0 : value
+}
+
+const formatDeploymentTimestamp = (timestamp: string | number) => {
+  const date = new Date(deploymentTimestampMs(timestamp))
+  return Number.isNaN(date.getTime()) ? undefined : date.toLocaleString([], {
+    dateStyle: 'medium', timeStyle: 'short',
+  })
+}
+
+const deploymentConcurrency = (deployment: Deployment) => (
+  deployment.settings.max_concurrency
+  ?? deployment.settings.max_running_requests
+  ?? deployment.settings.parallel_slots
+)
+
+const isDiscoveredExternal = (deployment: Deployment) => (
+  !deployment.managed && deployment.id.startsWith('container:')
+)
+
+const canPromoteDiscovered = (deployment: Deployment) => (
+  isDiscoveredExternal(deployment) && deployment.promotable !== false
+)
+
 // Scalar flags the structured argument editor manages; everything else in a
 // saved configuration's extra args is shown verbatim in the "Other flags"
 // field. Compound JSON flags (--speculative-config,
@@ -1178,8 +1205,9 @@ export function ModelsPage() {
           }
         }
       }
-      await api.deployments.action(deployment.id, 'start', nodeIds)
-      setActionNotice(`Starting ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
+      const promote = canPromoteDiscovered(deployment)
+      await api.deployments.action(deployment.id, 'start', nodeIds, undefined, promote)
+      setActionNotice(`${promote ? 'Converting' : 'Starting'} ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
       setStartSelection(undefined)
       resource.reload()
     } catch (reason) {
@@ -1376,8 +1404,12 @@ export function ModelsPage() {
       items.sort((a, b) => a.alias.localeCompare(b.alias, undefined, { sensitivity: 'base' }))
       if (sortMode === 'name-desc') items.reverse()
     } else {
-      // Stable sort: deployments without a timestamp keep their existing order.
-      items.sort((a, b) => (Date.parse(b.created_at ?? '') || 0) - (Date.parse(a.created_at ?? '') || 0))
+      // Stable sort: never-run deployments stay after deployments with an
+      // observed launch time while preserving their existing relative order.
+      items.sort((a, b) => (
+        deploymentTimestampMs(b.last_deployed_at)
+        - deploymentTimestampMs(a.last_deployed_at)
+      ))
     }
     return items
   }, [resource.data, sortMode])
@@ -1684,12 +1716,15 @@ export function ModelsPage() {
         <section className="deployments" aria-labelledby="deployments-title">
           <div className="section-heading">
             <div><h2 id="deployments-title">Deployments</h2></div>
-            <label className="sort-field"><span>Sort</span>
-              <select value={sortMode} onChange={(event) => changeSortMode(event.target.value as SortMode)} aria-label="Sort deployments">
-                <option value="recent">Most recent</option>
-                <option value="name-asc">Name A–Z</option>
-                <option value="name-desc">Name Z–A</option>
-              </select>
+            <label className="sort-field"><span>Sort by</span>
+              <span className="sort-control">
+                <select value={sortMode} onChange={(event) => changeSortMode(event.target.value as SortMode)} aria-label="Sort deployments">
+                  <option value="recent">Most recently deployed</option>
+                  <option value="name-asc">Name A–Z</option>
+                  <option value="name-desc">Name Z–A</option>
+                </select>
+                <ChevronDown size={15} aria-hidden="true" />
+              </span>
             </label>
           </div>
           <Panel className="table-panel">
@@ -1723,7 +1758,7 @@ export function ModelsPage() {
                     <small className="model-disk-usage"><HardDrive size={12} /> {modelStorage(deployment)}</small>
                   </div>
                   <div role="cell" data-label="Runtime"><RuntimeMark runtime={deployment.runtime} /><small>{deployment.runtime_version ?? (deployment.managed ? 'Managed' : 'External')}</small></div>
-                  <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} ctx</span><small>{deployment.settings.quantization ?? 'Default precision'}</small></div>
+                  <div role="cell" data-label="Configuration"><span>{deployment.settings.context_length?.toLocaleString() ?? '—'} CTX</span><small>{deploymentConcurrency(deployment)?.toLocaleString() ?? '—'} concurrent · {deployment.settings.quantization ?? 'Default precision'}</small></div>
                   <div role="cell" data-label="Target"><span>{deployment.selected_nodes?.map((node, index) => `${node.id === 'local' ? localLabel : node.name}${deployment.selected_nodes!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || deployment.node_ids?.map((id, index) => `${id === 'local' ? localLabel : id}${deployment.node_ids!.length > 1 && index === 0 ? ' (primary)' : ''}`).join(', ') || localLabel}{deploymentTargetLayout(deployment)}</span></div>
                   <div role="cell" data-label="Status" className="deployment-status-cell">
                     <span aria-live="polite">
@@ -1744,6 +1779,11 @@ export function ModelsPage() {
                           : 'No inference yet'}
                       </small>
                     )}
+                    {deployment.status === 'stopped' && deployment.last_deployed_at && formatDeploymentTimestamp(deployment.last_deployed_at) && (
+                      <small className="deployment-launch-message">
+                        Last deployed {formatDeploymentTimestamp(deployment.last_deployed_at)}
+                      </small>
+                    )}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
                     {(deployment.managed || deployment.controllable) && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
@@ -1756,7 +1796,13 @@ export function ModelsPage() {
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : 'Start'}</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => {
+                        if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
+                          void act(deployment, 'start')
+                        } else {
+                          openStartPicker(deployment)
+                        }
+                      }}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) ? 'Make managed' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
@@ -1982,6 +2028,7 @@ export function ModelsPage() {
         const { deployment, nodeIds } = startSelection
         const required = deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
+        const converting = canPromoteDiscovered(deployment)
         const controllerArtifact = isControllerArtifact(deployment)
         const weighted = deploymentWeightedNodes(deployment)
         const plan = savedLaunch && !controllerArtifact ? startPreflight.data : undefined
@@ -2029,7 +2076,7 @@ export function ModelsPage() {
         const startBusy = busy === deployment.id
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
-            <div className="modal-heading"><div><p className="eyebrow">{savedLaunch ? 'Launch deployment' : 'Start deployment'}</p><h2 id="start-deployment-title">{savedLaunch ? 'Launch' : 'Start'} {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
+            <div className="modal-heading"><div><p className="eyebrow">{converting ? 'Convert deployment' : savedLaunch ? 'Launch deployment' : 'Start deployment'}</p><h2 id="start-deployment-title">{converting ? 'Make managed' : savedLaunch ? 'Launch' : 'Start'} {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
@@ -2068,7 +2115,7 @@ export function ModelsPage() {
             </label>}
             {allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
             {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
-            <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : 'Starting…') : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+            <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : converting ? 'Converting…' : 'Starting…') : converting ? `Make managed on ${required} ${required === 1 ? 'node' : 'nodes'}` : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

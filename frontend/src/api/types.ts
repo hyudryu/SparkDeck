@@ -71,6 +71,8 @@ export interface DeploymentSettings {
   pipeline_parallel_size?: number
   gpu_layers?: number
   parallel_slots?: number
+  max_concurrency?: number
+  max_running_requests?: number
   gpu_split?: string
   quantization?: string
   artifact?: string
@@ -89,6 +91,7 @@ export interface Deployment {
   runtime: RuntimeKind
   status: DeploymentStatus
   managed: boolean
+  promotable?: boolean
   controllable?: boolean
   logs_available?: boolean
   removable?: boolean
@@ -102,6 +105,7 @@ export interface Deployment {
   last_error?: string
   created_at?: string
   updated_at?: string
+  last_deployed_at?: string | number
   node_ids?: string[]
   selected_nodes?: NodeSummary[]
   desired_state?: 'running' | 'stopped'
@@ -931,6 +935,7 @@ export interface BenchmarkRunnerRunConfig {
 export interface BenchmarkRunnerRunProgress {
   requests_done: number
   requests_failed: number
+  log_lines?: string[]
   current?: {
     prompt_size?: number
     response_size?: number

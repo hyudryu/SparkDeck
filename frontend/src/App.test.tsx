@@ -2086,13 +2086,16 @@ describe('model deployments', () => {
       const body = path.includes('/api/v1/deployments') ? { items: [
         {
           id: 'dep-1', alias: 'Zulu', runtime: 'vllm', kind: 'managed',
-          model: { repository: 'org/zulu' }, status: 'running', settings: {},
+          model: { repository: 'org/zulu' }, status: 'running',
+          settings: { context_length: 8192, max_running_requests: 16 },
           created_at: '2026-08-25T00:00:00+00:00',
+          last_deployed_at: '2026-08-20T00:00:00+00:00',
         },
         {
           id: 'dep-2', alias: 'Alpha', runtime: 'vllm', kind: 'managed',
           model: { repository: 'org/alpha' }, status: 'stopped', settings: {},
           created_at: '2026-08-20T00:00:00+00:00',
+          last_deployed_at: '2026-08-25T00:00:00+00:00',
         },
       ] } : path.includes('/api/v1/recipes') ? { items: [] }
         : path.includes('/api/v1/nodes') ? { items: [
@@ -2105,8 +2108,12 @@ describe('model deployments', () => {
 
     // Default: most recently deployed first.
     let rows = await screen.findAllByRole('row')
-    expect(within(rows[1]).getByText('Zulu')).toBeInTheDocument()
-    expect(within(rows[2]).getByText('Alpha')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('Alpha')).toBeInTheDocument()
+    expect(within(rows[1]).getByText(/Last deployed/)).toBeInTheDocument()
+    expect(within(rows[2]).getByText('Zulu')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('8,192 CTX')).toBeInTheDocument()
+    expect(within(rows[2]).getByText(/16 concurrent/)).toBeInTheDocument()
+    expect(within(rows[2]).queryByText(/Last deployed/)).not.toBeInTheDocument()
 
     await user.selectOptions(screen.getByRole('combobox', { name: 'Sort deployments' }), 'name-asc')
     rows = screen.getAllByRole('row')

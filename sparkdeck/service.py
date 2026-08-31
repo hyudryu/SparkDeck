@@ -46,10 +46,10 @@ from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 
 _SAFE_CONFIGURATION_KEYS = {
-    "context_size", "context_length", "max_model_len", "parallel", "parallel_slots",
+    "context_size", "context_window", "context_length", "max_model_len", "parallel", "parallel_slots",
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
-    "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
+    "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {
@@ -85,6 +85,16 @@ _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
     r"(?P<count>\d{5})(?P<suffix>\.gguf)$",
     re.IGNORECASE,
 )
+
+
+def _container_last_deployed_at(container: dict[str, Any]) -> str | float | None:
+    """Return a usable Docker launch timestamp for deployment recency."""
+    value = container.get("started_at") or container.get("created")
+    if isinstance(value, (int, float)):
+        return value if value > 0 else None
+    if isinstance(value, str) and value and not value.startswith("0001-"):
+        return value
+    return None
 
 
 def _discovered_launch_controls(
@@ -914,6 +924,21 @@ class SparkDeckService:
             stored["status"] = _deployment_status(cluster.get("status"))
             stored.update(_deployment_launch_progress(cluster))
             stored["last_used_at"] = cluster.get("last_used_at")
+            launch_controls = cluster.get("launch_controls")
+            if not isinstance(launch_controls, dict):
+                controls_from_settings = getattr(
+                    self.manager, "_deployment_launch_controls", None,
+                )
+                launch_controls = (
+                    controls_from_settings(cluster.get("launch_settings") or {})
+                    if callable(controls_from_settings) else {}
+                )
+            public_settings = dict(stored.get("settings") or {})
+            if launch_controls.get("context_window") is not None:
+                public_settings["context_length"] = launch_controls["context_window"]
+            if launch_controls.get("max_concurrency") is not None:
+                public_settings["max_concurrency"] = launch_controls["max_concurrency"]
+            stored["settings"] = public_settings
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
@@ -927,13 +952,21 @@ class SparkDeckService:
                 cluster.get("automation_run_id")
                 or stored.get("settings", {}).get("automation_run_id")
             )
-            created_at = cluster.get("created_at")
-            if isinstance(created_at, (int, float)) and created_at:
-                stored["created_at"] = datetime.fromtimestamp(
-                    created_at, timezone.utc
+            last_deployed_at = cluster.get("last_deployed_at")
+            if (
+                not last_deployed_at
+                and _deployment_status(cluster.get("status")) == "running"
+            ):
+                # Pre-timestamp Manager records can prove a successful launch
+                # by being live. Never apply this fallback to first-launch
+                # errors, which retain created_at only for diagnostics.
+                last_deployed_at = cluster.get("created_at")
+            if isinstance(last_deployed_at, (int, float)) and last_deployed_at:
+                stored["last_deployed_at"] = datetime.fromtimestamp(
+                    last_deployed_at, timezone.utc
                 ).isoformat()
-            elif isinstance(created_at, str) and created_at:
-                stored["created_at"] = created_at
+            elif isinstance(last_deployed_at, str) and last_deployed_at:
+                stored["last_deployed_at"] = last_deployed_at
             stored["node_ids"] = list(cluster.get("node_ids") or [])
             stored["selected_nodes"] = [
                 self.manager.public_target_node(cluster_nodes[node_id])
@@ -967,6 +1000,9 @@ class SparkDeckService:
                 # pulling, starting, or failing.
                 if not stored.get("settings", {}).get("manager_deployment_id"):
                     stored["status"] = _managed_container_status(container)
+                    last_deployed_at = _container_last_deployed_at(container)
+                    if last_deployed_at is not None:
+                        stored["last_deployed_at"] = last_deployed_at
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -3245,7 +3281,11 @@ class SparkDeckService:
         launch_settings: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Create durable SparkDeck routing for a relocated Manager-only card."""
-        record_id = str(uuid.uuid4())
+        record_id = str(
+            replacement.get("sparkdeck_record_id")
+            or (launch_settings or {}).get("sparkdeck_record_id")
+            or uuid.uuid4()
+        )
         alias = str(
             deployment.get("alias") or replacement.get("name")
             or (deployment.get("model") or {}).get("repository") or record_id
@@ -3333,10 +3373,34 @@ class SparkDeckService:
         })
         return result
 
+    async def _rollback_manager_promotion(
+        self, replacement: dict[str, Any] | None, promotion_record_id: str,
+    ) -> str | None:
+        """Remove a partially-created Manager deployment after promotion fails."""
+        rollback_target = replacement or next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict)
+            and item.get("sparkdeck_record_id") == promotion_record_id
+        ), None)
+        if not isinstance(rollback_target, dict) or not rollback_target.get("id"):
+            return None
+        try:
+            rollback = await self.manager.deployment_action(
+                str(rollback_target["id"]), "remove",
+            )
+            if not rollback.get("ok"):
+                return "; ".join(
+                    rollback.get("errors") or ["cluster removal failed"]
+                )
+        except Exception as cleanup_exc:
+            return str(cleanup_exc)
+        return None
+
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
+        promote: bool = False,
     ) -> dict[str, Any]:
         lock = self._deployment_action_locks.setdefault(
             deployment_id, asyncio.Lock(),
@@ -3348,7 +3412,7 @@ class SparkDeckService:
                     "deployment launch is still in progress; wait for container creation"
                 )
             return await self._deployment_action_locked(
-                deployment_id, action, node_ids, additional_node_ids,
+                deployment_id, action, node_ids, additional_node_ids, promote,
             )
 
     async def _promote_discovered_deployment(
@@ -3397,6 +3461,7 @@ class SparkDeckService:
             "node_ids": list(node_ids),
             "api_port": container.get("port"),
         }, container)
+        promotion_record_id = str(uuid.uuid4())
         launch_settings.update({
             "deployment_name": deployment.get("alias"),
             "model": launch_model,
@@ -3405,21 +3470,55 @@ class SparkDeckService:
             "environment": settings.get("environment") or {},
             "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
             "node_ids": list(node_ids),
+            # This stable reverse link identifies a partially-created Manager
+            # record if launch or SQLite adoption fails and must be rolled back.
+            "sparkdeck_record_id": promotion_record_id,
         })
-        replacement = await self.manager.create_deployment(launch_settings)
-        adopted_launch_settings = {
-            **launch_settings,
-            **(replacement.get("launch_settings") or {}),
-        }
-        adopted_launch_settings["model"] = launch_model
-        return self._adopt_manager_replacement(
-            deployment, replacement, adopted_launch_settings,
-        )
+        if LOCAL_NODE_ID in node_ids:
+            # The source Docker container still owns its controller port even
+            # while stopped. Let Manager allocate a fresh port for the managed
+            # replacement instead of failing preflight on that binding.
+            launch_settings.pop("port", None)
+        replacement = None
+        try:
+            replacement = await self.manager.create_deployment(launch_settings)
+            adopted_launch_settings = {
+                **launch_settings,
+                **(replacement.get("launch_settings") or {}),
+            }
+            adopted_launch_settings["model"] = launch_model
+            return self._adopt_manager_replacement(
+                deployment, replacement, adopted_launch_settings,
+            )
+        except asyncio.CancelledError as exc:
+            # Manager persists a recovering deployment before propagating
+            # cancellation. Shield its removal so a cancelled request cannot
+            # leave an untracked remote runtime consuming resources.
+            rollback_error = await asyncio.shield(
+                self._rollback_manager_promotion(
+                    replacement, promotion_record_id,
+                )
+            )
+            if rollback_error:
+                exc.add_note(
+                    f"managed promotion rollback failed: {rollback_error}"
+                )
+            raise
+        except Exception as exc:
+            rollback_error = await self._rollback_manager_promotion(
+                replacement, promotion_record_id,
+            )
+            if rollback_error:
+                raise RuntimeError(
+                    f"{exc}; managed promotion rollback failed: {rollback_error}"
+                ) from exc
+            raise
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
+        promote: bool = False,
     ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
@@ -3461,7 +3560,7 @@ class SparkDeckService:
                     f"tensor parallel size {required_nodes} requires exactly "
                     f"{required_nodes} node(s)"
                 )
-            if required_nodes > 1 or node_ids != ["local"]:
+            if promote or required_nodes > 1 or node_ids != ["local"]:
                 return await self._promote_discovered_deployment(
                     deployment, discovered, node_ids,
                 )
@@ -4289,6 +4388,9 @@ class SparkDeckService:
             # Docker-created external containers are idle and startable. The
             # same state remains a launch phase for SparkDeck-managed runs.
             status = "stopped"
+        settings = self._safe_configuration(container.get("load_settings") or {})
+        if settings.get("context_length") is None and settings.get("context_window") is not None:
+            settings["context_length"] = settings["context_window"]
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify
@@ -4303,14 +4405,20 @@ class SparkDeckService:
             },
             "status": status,
             "container_name": container.get("name"),
-            "settings": self._safe_configuration(container.get("load_settings") or {}),
+            "settings": settings,
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            "promotable": (
+                (container.get("load_settings") or {}).get("editable") is not False
+            ),
             "controllable": True,
             "logs_available": True,
             "removable": True,
         }
+        last_deployed_at = _container_last_deployed_at(container)
+        if last_deployed_at is not None:
+            result["last_deployed_at"] = last_deployed_at
         try:
             tensor_parallel = max(
                 1, int(result["settings"].get("tensor_parallel_size") or 1),

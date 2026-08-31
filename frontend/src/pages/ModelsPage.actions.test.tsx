@@ -375,9 +375,10 @@ describe('models page running actions', () => {
     renderPage()
 
     await screen.findByText('Kimi vLLM')
-    await user.click(screen.getByRole('button', { name: 'Start' }))
+    expect(screen.queryByRole('button', { name: 'Clone Kimi vLLM' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Make managed' }))
     expect(await screen.findByText(/TP2 requires exactly 2 nodes/)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Launch on 2 nodes' }))
+    await user.click(screen.getByRole('button', { name: 'Make managed on 2 nodes' }))
 
     await waitFor(() => {
       const start = fetchMock.mock.calls.find(([path, init]) => (
@@ -386,8 +387,38 @@ describe('models page running actions', () => {
       ))
       expect(JSON.parse(String(start?.[1]?.body))).toEqual({
         node_ids: ['local', 'worker-1'],
+        promote: true,
       })
     })
+  })
+
+  it('preserves Start for a discovered container that cannot be promoted safely', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'container:protected-vllm', alias: 'Protected vLLM', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
+      settings: { tensor_parallel_size: 2 }, deployment_mode: 'sharded',
+      required_node_count: 2, managed: false, controllable: true, promotable: false,
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/container%3Aprotected-vllm/start',
+      expect.objectContaining({ method: 'POST', body: undefined }),
+    ))
+    expect(screen.queryByRole('dialog', { name: /Protected vLLM/ })).not.toBeInTheDocument()
   })
 
   it('falls back to a plain start button when stopped', async () => {

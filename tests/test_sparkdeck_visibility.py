@@ -371,6 +371,10 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/deployments/dep-1/start",
                 json={"additional_node_ids": ["node-3"]},
             )
+            with_promotion = await self.client.post(
+                "/api/v1/deployments/container%3Aexternal/start",
+                json={"node_ids": ["local"], "promote": True},
+            )
             with_invalid = await self.client.post(
                 "/api/v1/deployments/dep-1/start",
                 json={"node_ids": []},
@@ -388,12 +392,16 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(without_body.status_code, 200)
         self.assertEqual(with_nodes.status_code, 200)
         self.assertEqual(with_additional.status_code, 200)
+        self.assertEqual(with_promotion.status_code, 200)
         self.assertEqual(with_invalid.status_code, 400)
         self.assertEqual(with_invalid_additional.status_code, 400)
         self.assertEqual(invalid_utf8.status_code, 400)
-        action.assert_any_await("dep-1", "start", None, None)
-        action.assert_any_await("dep-1", "start", ["local", "node-2"], None)
-        action.assert_any_await("dep-1", "start", None, ["node-3"])
+        action.assert_any_await("dep-1", "start", None, None, False)
+        action.assert_any_await("dep-1", "start", ["local", "node-2"], None, False)
+        action.assert_any_await("dep-1", "start", None, ["node-3"], False)
+        action.assert_any_await(
+            "container:external", "start", ["local"], None, True,
+        )
 
     async def test_legacy_recipe_defaults_are_visible_and_launch_through_sparkdeck(self):
         recipe = {

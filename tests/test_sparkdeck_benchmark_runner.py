@@ -506,6 +506,61 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "model_id": "unsloth/Qwen3-4B-GGUF",
         })
 
+    def test_progress_stream_builds_a_bounded_sanitized_live_log(self):
+        service = self._service()
+        progress_path = Path(self.temp.name) / "progress.jsonl"
+        events = [
+            {"type": "header", "llama_benchy_version": "0.4.0"},
+            {"type": "latency_measured", "latency_s": 0.0125, "mode": "generation"},
+            {
+                "type": "request_start", "request_id": 7,
+                "model": "secret-model", "base_url": "http://secret.internal/v1",
+                "prompt_size": 2048, "response_size": 128,
+                "context_size": 4096, "concurrency": 2, "run_index": 0,
+            },
+            {"type": "request_first_token", "request_id": 7, "ttft_s": 0.25},
+            {"type": "tokens", "request_id": 7, "count": 1, "snippet": "private output"},
+            {"type": "request_end", "request_id": 7, "total_tokens": 128, "error": ""},
+            {"type": "bench_complete", "status": "ok"},
+        ]
+        events.extend(
+            {"type": "request_end", "request_id": index, "total_tokens": 1, "error": ""}
+            for index in range(8, 213)
+        )
+        progress_path.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+        run = {"progress": {"requests_done": 0, "requests_failed": 0}}
+
+        offset = service._consume_progress(run, progress_path, 0)
+
+        self.assertEqual(offset, progress_path.stat().st_size)
+        self.assertEqual(run["progress"]["requests_done"], 206)
+        self.assertEqual(len(run["progress"]["log_lines"]), 200)
+        rendered = "\n".join(run["progress"]["log_lines"])
+        self.assertNotIn("private output", rendered)
+        self.assertNotIn("secret.internal", rendered)
+        self.assertIn("Request #212 completed: 1 tokens", rendered)
+
+    def test_progress_stream_treats_invalid_token_count_as_unknown(self):
+        service = self._service()
+        progress_path = Path(self.temp.name) / "invalid-token-progress.jsonl"
+        progress_path.write_text(json.dumps({
+            "type": "request_end", "request_id": 7,
+            "total_tokens": "not-a-number", "error": "",
+        }) + "\n", encoding="utf-8")
+        run = {"progress": {"requests_done": 0, "requests_failed": 0}}
+
+        offset = service._consume_progress(run, progress_path, 0)
+
+        self.assertEqual(offset, progress_path.stat().st_size)
+        self.assertEqual(run["progress"]["requests_done"], 1)
+        self.assertEqual(
+            run["progress"]["log_lines"],
+            ["Request #7 completed: token count unavailable"],
+        )
+
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
 

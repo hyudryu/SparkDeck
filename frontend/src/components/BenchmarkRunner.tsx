@@ -76,6 +76,7 @@ export function BenchmarkRunner() {
   const [installing, setInstalling] = useState(false)
   const [actionError, setActionError] = useState<string>()
   const [selectedRunId, setSelectedRunId] = useState<string>()
+  const liveLogRef = useRef<HTMLPreElement>(null)
 
   const activeRunId = status.data?.active_run_id
   const activeRun = useResource(
@@ -187,6 +188,12 @@ export function BenchmarkRunner() {
   const detailIsStale = detail.data !== undefined && detail.data.id !== selectedRunId
   const activeDetail = detailIsStale ? undefined : detail.data
   const activeData = activeRun.data?.id === activeRunId ? activeRun.data : undefined
+  const liveLogLines = activeData?.progress?.log_lines
+
+  useEffect(() => {
+    const log = liveLogRef.current
+    if (log) log.scrollTop = log.scrollHeight
+  }, [liveLogLines])
 
   return (
     <div className="benchmark-runner">
@@ -197,7 +204,7 @@ export function BenchmarkRunner() {
             <h2>llama-benchy</h2>
             {status.loading && <p className="muted">Checking for llama-benchy…</p>}
             {status.data && (status.data.installed
-              ? <p>Installed{status.data.version ? ` · v${status.data.version}` : ''}{status.data.launch_mode === 'python_module' ? ' · Python module' : ''}</p>
+              ? <p className="runner-install-badge">Installed{status.data.version ? ` · v${status.data.version}` : ''}{status.data.launch_mode === 'python_module' ? ' · Python module' : ''}</p>
               : <p>Not installed. llama-benchy drives benchmark requests against a running model endpoint and reports llama-bench style statistics. Install it to enable the runner below.</p>)}
             {status.error && <p className="inline-error">{status.error}</p>}
           </div>
@@ -342,6 +349,12 @@ export function BenchmarkRunner() {
                 {activeData.progress?.requests_done ?? 0} requests completed
                 {(activeData.progress?.requests_failed ?? 0) > 0 && <> · {activeData.progress?.requests_failed} failed</>}
               </p>
+              <progress className="runner-progress" aria-label="Benchmark progress" />
+              {liveLogLines && liveLogLines.length > 0 && (
+                <pre ref={liveLogRef} className="runner-live-log" role="log" aria-live="polite" aria-label="Benchmark live log">
+                  {liveLogLines.join('\n')}
+                </pre>
+              )}
             </>}
           </Panel>
         )}

@@ -3026,8 +3026,11 @@ async def v1_deployment_action(deployment_id: str, action: str, req: Request):
             ):
                 raise ValueError("additional_node_ids must contain non-empty node IDs")
             additional_node_ids = [item.strip() for item in additional_node_ids]
+        promote = body.get("promote", False)
+        if not isinstance(promote, bool):
+            raise ValueError("promote must be a boolean")
         return await sparkdeck.deployment_action(
-            deployment_id, action, node_ids, additional_node_ids,
+            deployment_id, action, node_ids, additional_node_ids, promote,
         )
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "request body must be valid JSON")

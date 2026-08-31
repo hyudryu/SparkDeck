@@ -31,10 +31,14 @@ function copyWithSelection(value: string) {
     ? document.activeElement
     : undefined
   document.body.appendChild(input)
-  input.select()
-  const copied = document.execCommand('copy')
-  input.remove()
-  activeElement?.focus()
+  let copied: boolean
+  try {
+    input.select()
+    copied = document.execCommand('copy')
+  } finally {
+    input.remove()
+    activeElement?.focus()
+  }
   if (!copied) throw new Error('Browser rejected the copy command')
 }
 

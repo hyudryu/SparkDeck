@@ -16,6 +16,7 @@ import shlex
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
@@ -363,6 +364,8 @@ class SparkDeckService:
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
+        self._deployment_action_lock_users: dict[str, int] = {}
+        self._deployment_action_lock_registry_lock = asyncio.Lock()
         # Serializes community state mutations (consent, unpair, deletion,
         # coordinated-benchmark insertion) into one critical section.
         self._community_upload_lock = asyncio.Lock()
@@ -3402,10 +3405,7 @@ class SparkDeckService:
         additional_node_ids: list[str] | None = None,
         promote: bool = False,
     ) -> dict[str, Any]:
-        lock = self._deployment_action_locks.setdefault(
-            deployment_id, asyncio.Lock(),
-        )
-        async with lock:
+        async with self._deployment_lifecycle_lock(deployment_id):
             launch_task = self._deployment_launch_tasks.get(deployment_id)
             if launch_task is not None and not launch_task.done():
                 raise RuntimeError(
@@ -3414,6 +3414,31 @@ class SparkDeckService:
             return await self._deployment_action_locked(
                 deployment_id, action, node_ids, additional_node_ids, promote,
             )
+
+    @asynccontextmanager
+    async def _deployment_lifecycle_lock(
+        self, deployment_id: str,
+    ) -> AsyncIterator[None]:
+        """Serialize one record's lifecycle and retire its lock after the last user."""
+        async with self._deployment_action_lock_registry_lock:
+            lock = self._deployment_action_locks.setdefault(
+                deployment_id, asyncio.Lock(),
+            )
+            self._deployment_action_lock_users[deployment_id] = (
+                self._deployment_action_lock_users.get(deployment_id, 0) + 1
+            )
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._deployment_action_lock_registry_lock:
+                remaining = self._deployment_action_lock_users[deployment_id] - 1
+                if remaining:
+                    self._deployment_action_lock_users[deployment_id] = remaining
+                else:
+                    self._deployment_action_lock_users.pop(deployment_id, None)
+                    if self._deployment_action_locks.get(deployment_id) is lock:
+                        self._deployment_action_locks.pop(deployment_id, None)
 
     async def _promote_discovered_deployment(
         self, deployment: dict[str, Any], container: dict[str, Any],
@@ -4140,10 +4165,7 @@ class SparkDeckService:
         # Start/stop can replace the Manager deployment and its member names.
         # Take the same record lock before reading either catalog so deletion
         # cannot act on a stale pre-relaunch snapshot.
-        lock = self._deployment_action_locks.setdefault(
-            deployment_id, asyncio.Lock(),
-        )
-        async with lock:
+        async with self._deployment_lifecycle_lock(deployment_id):
             return await self._delete_deployment_locked(deployment_id)
 
     async def _delete_deployment_locked(

@@ -1074,6 +1074,18 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             "replacement-manager", "remove",
         )
         self.assertIsNone(self.service.store.deployment("relaunching-record"))
+        self.assertNotIn(
+            "relaunching-record", self.service._deployment_action_locks,
+        )
+
+    async def test_missing_delete_does_not_retain_lifecycle_lock(self):
+        with self.assertRaisesRegex(LookupError, "deployment not found"):
+            await self.service.delete_deployment("never-existed")
+
+        self.assertNotIn("never-existed", self.service._deployment_action_locks)
+        self.assertNotIn(
+            "never-existed", self.service._deployment_action_lock_users,
+        )
 
     async def test_delete_removes_every_persisted_orphaned_cluster_rank(self):
         self.service.store.add_deployment(Deployment(

@@ -52,6 +52,12 @@ describe('ClusterPage', () => {
       await user.click(screen.getByRole('button', { name: /^Copy$/ }))
       expect(execCommand).toHaveBeenCalledTimes(2)
       expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument()
+
+      execCommand.mockImplementationOnce(() => { throw new Error('blocked') })
+      await user.click(urlButton)
+      expect(screen.getByRole('alert')).toHaveTextContent('Copy was blocked')
+      expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull()
+      expect(urlButton).toHaveFocus()
     } finally {
       Object.defineProperty(window, 'isSecureContext', {
         configurable: true,

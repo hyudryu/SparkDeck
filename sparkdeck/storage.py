@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sqlite3
+import statistics
 import threading
 import uuid
 from contextlib import contextmanager
@@ -39,6 +40,17 @@ COMMUNITY_API_URL = os.environ.get(
 )
 _COMMUNITY_AGGREGATE_BATCH_SIZE = 256
 _LOCAL_HISTORY_MODEL_LIMIT = 500
+
+
+def _outlier_filtered_mean(values: list[float]) -> float:
+    """Return a Tukey-IQR mean without discarding small sample sets."""
+    if len(values) < 4:
+        return statistics.fmean(values)
+    q1, _, q3 = statistics.quantiles(values, n=4, method="inclusive")
+    spread = q3 - q1
+    lower, upper = q1 - 1.5 * spread, q3 + 1.5 * spread
+    retained = [value for value in values if lower <= value <= upper]
+    return statistics.fmean(retained or values)
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:
@@ -764,7 +776,7 @@ class SparkDeckStore:
         dimensions cannot be represented by this community contract. Manual
         benchmark detail remains available from ``benchmark_series_points``.
         """
-        grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
+        grouped: dict[tuple[str, str, int], dict[str, list[float]]] = {}
         with self._lock:
             cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, input_tokens, "
@@ -804,24 +816,26 @@ class SparkDeckStore:
                     ):
                         continue
                     key = (model_id, quantization, prompt_bucket)
-                    aggregate = grouped.setdefault(key, {
-                        "total": 0.0, "count": 0, "clusters": set(),
-                    })
-                    aggregate["total"] += speed
-                    aggregate["count"] += 1
-                    aggregate["clusters"].add(cluster_id)
+                    grouped.setdefault(key, {}).setdefault(
+                        str(cluster_id), []
+                    ).append(speed)
 
-        items = [
-            {
+        items = []
+        for (model_id, quantization, prompt_bucket), contributors in grouped.items():
+            contributor_means = [
+                _outlier_filtered_mean(values)
+                for values in contributors.values()
+            ]
+            items.append({
                 "model_id": model_id,
                 "quantization": quantization,
                 "prompt_tokens_bucket": prompt_bucket,
-                "inference_tokens_per_second": value["total"] / value["count"],
-                "sample_count": value["count"],
-                "unique_cluster_count": len(value["clusters"]),
-            }
-            for (model_id, quantization, prompt_bucket), value in grouped.items()
-        ]
+                "inference_tokens_per_second": statistics.fmean(contributor_means),
+                # The evidence threshold counts equal-weight contributors, not
+                # raw inference requests from a potentially busy installation.
+                "sample_count": len(contributor_means),
+                "unique_cluster_count": len(contributor_means),
+            })
         return sorted(
             items,
             key=lambda item: (

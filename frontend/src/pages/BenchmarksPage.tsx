@@ -145,11 +145,11 @@ export function BenchmarksPage() {
       {communityAccess.enabled && aggregateResponse && aggregateResponse.items.length > 0 && <div className="aggregate-grid">{aggregateResponse.items.map((item) => (
         <Panel className="aggregate-item" key={`${item.model_id}-${item.quantization}-${item.prompt_tokens_bucket}`}>
           <div><div><p className="aggregate-model">{item.model_id}</p><small className="aggregate-quantization">{item.quantization}</small></div><span className="estimate-label">{localAggregates ? 'Local estimate' : 'Community estimate'}</span></div>
-          <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Prompt-length bucket</dt><dd>{item.prompt_tokens_bucket.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} samples</dd></div></dl>
+          <dl><div><dt>Inference speed</dt><dd>{formatRate(item.inference_tokens_per_second)}</dd></div><div><dt>Prompt-length bucket</dt><dd>{item.prompt_tokens_bucket.toLocaleString()} tokens</dd></div><div><dt>Evidence</dt><dd>{item.sample_count} contributors</dd></div></dl>
           {item.sample_count >= aggregateResponse.evidence_policy.minimum_samples ? <span className="proven"><Check size={14} /> Evidence threshold met</span> : <span className="muted">Collecting more evidence</span>}
         </Panel>
       ))}</div>}
-      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} samples, matched only on model name, quantization, and prompt-length bucket. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
+      {communityAccess.enabled && aggregateResponse && <p className="aggregate-policy">Evidence threshold: {aggregateResponse.evidence_policy.minimum_samples} contributors, matched only on model name, quantization, and prompt-length bucket. Each contributor is averaged once after output-speed outliers are removed, and only single-stream inference is included. Inference speed is {localAggregates ? 'aggregated from this controller' : 'a community estimate'} and may differ on your system.</p>}
 
       <div className="section-heading"><div><h2>Local history</h2><p>One latest result per identified model. Eligible results stay local while signed out and upload after Community sign-in when sharing is enabled.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}

@@ -844,8 +844,8 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 400,
-                "inference_tokens_per_second": 226.66666666666666,
-                "sample_count": 3,
+                "inference_tokens_per_second": 195.0,
+                "sample_count": 2,
                 "unique_cluster_count": 2,
             },
             {
@@ -902,11 +902,56 @@ class SparkDeckStoreTests(unittest.TestCase):
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 80.0,
-            "sample_count": row_count,
+            "sample_count": 1,
             "unique_cluster_count": 1,
         }])
         self.assertGreater(len(cursor.batch_sizes), 20)
         self.assertEqual(set(cursor.batch_sizes), {_COMMUNITY_AGGREGATE_BATCH_SIZE})
+
+    def test_local_community_aggregate_filters_outliers_then_weights_contributors_equally(self):
+        consent = self.store.set_community_consent(
+            True, "11111111-1111-4111-8111-111111111111",
+        )
+        sample = BenchmarkSample(
+            id="sample-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=512, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        contributor_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ]
+        speeds = [29, 30, 30, 31, 300, 60, 40]
+        clusters = [contributor_ids[0]] * 5 + contributor_ids[1:]
+        for index, (speed, cluster_id) in enumerate(zip(speeds, clusters)):
+            candidate = replace(
+                sample, id=f"sample-{index}",
+                generation_tokens_per_second=speed,
+            )
+            self.store.add_benchmark_if_consented(
+                candidate, consent["generation"],
+            )
+            with self.store._connection:
+                self.store._connection.execute(
+                    "UPDATE benchmark_samples SET telemetry_cluster_id = ? WHERE id = ?",
+                    (cluster_id, candidate.id),
+                )
+
+        self.assertEqual(self.store.community_aggregates(), [{
+            "model_id": "deepseek-r1",
+            "quantization": "Q4_K_M",
+            "prompt_tokens_bucket": 400,
+            "inference_tokens_per_second": 43.333333333333336,
+            "sample_count": 3,
+            "unique_cluster_count": 3,
+        }])
 
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(

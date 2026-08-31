@@ -375,9 +375,10 @@ describe('models page running actions', () => {
     renderPage()
 
     await screen.findByText('Kimi vLLM')
-    await user.click(screen.getByRole('button', { name: 'Start' }))
+    expect(screen.queryByRole('button', { name: 'Clone Kimi vLLM' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Make managed' }))
     expect(await screen.findByText(/TP2 requires exactly 2 nodes/)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Launch on 2 nodes' }))
+    await user.click(screen.getByRole('button', { name: 'Make managed on 2 nodes' }))
 
     await waitFor(() => {
       const start = fetchMock.mock.calls.find(([path, init]) => (
@@ -386,6 +387,7 @@ describe('models page running actions', () => {
       ))
       expect(JSON.parse(String(start?.[1]?.body))).toEqual({
         node_ids: ['local', 'worker-1'],
+        promote: true,
       })
     })
   })

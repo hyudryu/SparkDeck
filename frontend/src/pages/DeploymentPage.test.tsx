@@ -69,6 +69,27 @@ function renderPage() {
 }
 
 describe('deployment object page', () => {
+  it('only enables Save while deployment settings differ from the saved values', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const maxConcurrency = await screen.findByLabelText('Max concurrency')
+    const save = screen.getByRole('button', { name: 'Save' })
+    expect(save).toBeDisabled()
+
+    await user.clear(maxConcurrency)
+    await user.type(maxConcurrency, '6')
+    expect(save).toBeEnabled()
+
+    await user.click(save)
+    await screen.findByText('Deployment settings saved. They will be applied on the next run.')
+    expect(save).toBeDisabled()
+
+    await user.clear(maxConcurrency)
+    await user.type(maxConcurrency, '7')
+    expect(save).toBeEnabled()
+  })
+
   it('shows saved flags and saves before running, then returns to Models', async () => {
     const user = userEvent.setup()
     const { container } = renderPage()

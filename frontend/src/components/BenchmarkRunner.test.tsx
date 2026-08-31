@@ -56,7 +56,7 @@ const completedRun = {
 }
 
 function stubFetch(overrides: {
-  status?: { installed: boolean; version?: string }
+  status?: { installed: boolean; version?: string; active_run_id?: string | null }
   runs?: unknown[]
   runDetail?: unknown
   startError?: number
@@ -70,7 +70,7 @@ function stubFetch(overrides: {
   const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const path = String(input)
     let body: unknown
-    if (path.endsWith('/api/v1/benchmark-runner/status')) body = { ...state.status, active_run_id: null }
+    if (path.endsWith('/api/v1/benchmark-runner/status')) body = { ...state.status, active_run_id: state.status.active_run_id ?? null }
     else if (path.endsWith('/api/v1/benchmark-runner/install')) {
       state.status = { installed: true, version: '0.1.2' }
       body = { installed: true, version: '0.1.2', launch_mode: 'python_module', path_on_host: false }
@@ -159,6 +159,37 @@ describe('BenchmarkRunner', () => {
 
     const history = await screen.findByRole('table', { name: 'Benchmark run history' })
     expect(within(history).getAllByText('Q4_K_M').length).toBeGreaterThan(0)
+  })
+
+  it('shows an indeterminate progress bar and sanitized live log while a run is active', async () => {
+    const activeRun = {
+      ...completedRun,
+      id: 'run-live',
+      status: 'running',
+      finished_at: null,
+      results: [],
+      progress: {
+        requests_done: 3,
+        requests_failed: 1,
+        current: { prompt_size: 2048, response_size: 128, context_depth: 0, concurrency: 2 },
+        log_lines: [
+          'Latency probe complete: 12.5 ms (generation)',
+          'Request #3 completed: 128 tokens',
+        ],
+      },
+    }
+    stubFetch({
+      status: { installed: true, version: '0.4.0', active_run_id: 'run-live' },
+      runs: [activeRun],
+      runDetail: activeRun,
+    })
+    renderPage()
+
+    expect(await screen.findByRole('progressbar', { name: 'Benchmark progress' })).not.toHaveAttribute('value')
+    const log = screen.getByRole('log', { name: 'Benchmark live log' })
+    expect(log).toHaveTextContent('Latency probe complete: 12.5 ms')
+    expect(log).toHaveTextContent('Request #3 completed: 128 tokens')
+    expect(screen.getByText(/Installed · v0\.4\.0/)).toHaveClass('runner-install-badge')
   })
 
   it('distinguishes prefix-caching mode in run history', async () => {

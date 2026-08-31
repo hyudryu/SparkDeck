@@ -360,6 +360,7 @@ export interface WireDeployment {
   required_node_count?: number
   model_revision?: string
   created_at?: string
+  last_deployed_at?: string | number
   desired_state?: 'running' | 'stopped'
   launch_phase?: string
   launch_message?: string
@@ -424,6 +425,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
+    last_deployed_at: item.last_deployed_at,
     desired_state: item.desired_state,
     launch_phase: item.launch_phase,
     launch_message: item.launch_message,
@@ -588,7 +590,7 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[]) => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[], promote = false) => {
       if (action === 'remove') {
         return request<void>(
           `/api/v1/deployments/${encodeURIComponent(id)}`,
@@ -598,7 +600,7 @@ export const api = {
       }
       const payload = action === 'start' && additionalNodeIds?.length
         ? { additional_node_ids: additionalNodeIds }
-        : action === 'start' && nodeIds?.length ? { node_ids: nodeIds } : undefined
+        : action === 'start' && nodeIds?.length ? { node_ids: nodeIds, promote: promote || undefined } : undefined
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
         body: payload ? JSON.stringify(payload) : undefined,

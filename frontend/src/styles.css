@@ -370,7 +370,12 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .recipe-transfer-options > div:first-child > strong, .recipe-transfer-options > div:first-child > small { display: block; }.recipe-transfer-options > div:first-child > strong { font-size: 12px; }.recipe-transfer-options > div:first-child > small, .recipe-transfer-options > p { color: var(--text-secondary); font-size: 11px; }
 .recipe-transfer-targets { display: grid; gap: 6px; }.recipe-transfer-target { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px; background: var(--panel); border: 1px solid var(--border-subtle); border-radius: 7px; }.recipe-transfer-target.unavailable { opacity: .7; }.recipe-transfer-target span { min-width: 0; }.recipe-transfer-target strong, .recipe-transfer-target small { display: block; }.recipe-transfer-target strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.recipe-transfer-target small { margin-top: 2px; color: var(--text-secondary); font-size: 10px; }.recipe-transfer-error { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--danger); font-size: 11px; }
 .args-editor-actions { display: flex; align-items: center; gap: 10px; }
-.sort-field { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+.sort-field { display: flex; align-items: center; gap: 9px; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+.sort-control { position: relative; display: inline-flex; align-items: center; }
+.sort-control select { min-height: 36px; appearance: none; padding: 7px 34px 7px 12px; color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 9px; box-shadow: 0 1px 2px rgba(0, 0, 0, .05); font: inherit; font-size: 12px; cursor: pointer; }
+.sort-control select:hover { border-color: color-mix(in srgb, var(--accent) 48%, var(--border-strong)); background: var(--bg-subtle); }
+.sort-control select:focus-visible { outline: 3px solid var(--accent-soft); border-color: var(--accent); }
+.sort-control > svg { position: absolute; right: 10px; color: var(--text-tertiary); pointer-events: none; }
 .rename-row { display: flex; align-items: center; gap: 6px; }
 .rename-input { min-width: 0; width: 100%; padding: 6px 8px; font-size: 13px; color: inherit; background: var(--bg-subtle); border: 1px solid var(--border-strong); border-radius: 8px; outline: none; }
 .rename-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -610,6 +615,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .runner-tool-info { min-width: 0; flex: 1; }
 .runner-tool-info h2 { margin: 0 0 2px; font-size: 14px; }
 .runner-tool-info p { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.runner-tool-info .runner-install-badge { width: max-content; max-width: 100%; margin-top: 5px; padding: 5px 9px; color: var(--success); background: color-mix(in srgb, var(--success) 11%, var(--bg-subtle)); border: 1px solid color-mix(in srgb, var(--success) 28%, var(--border-subtle)); border-radius: 999px; line-height: 1.2; }
 .runner-tool-panel .button { align-self: center; }
 .runner-run-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
 .runner-checkbox { display: flex; align-items: center; gap: 8px; min-height: 40px; }
@@ -617,6 +623,8 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .runner-active-panel { padding: 18px; border-color: var(--accent); }
 .runner-active-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .runner-active-shape { margin: 10px 0 2px; font-weight: 600; }
+.runner-progress { width: 100%; height: 7px; margin-top: 12px; overflow: hidden; accent-color: var(--accent); border: 0; border-radius: 999px; }
+.runner-live-log { max-height: 230px; overflow: auto; margin: 12px 0 0; padding: 13px 14px; color: var(--text-primary); background: color-mix(in srgb, var(--bg-subtle) 76%, black); border: 1px solid var(--border-subtle); border-radius: 9px; font: 11px/1.6 "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .runner-run-row { cursor: pointer; }
 .runner-run-row:hover { background: var(--bg-subtle); }
 .runner-run-row-selected { box-shadow: inset 3px 0 0 var(--accent); }

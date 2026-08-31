@@ -334,7 +334,12 @@ class BenchmarkRunnerService:
             "config": config,
             "benchy_version": detection.get("version"),
             "error": None,
-            "progress": {"requests_done": 0, "requests_failed": 0, "current": None},
+            "progress": {
+                "requests_done": 0,
+                "requests_failed": 0,
+                "current": None,
+                "log_lines": ["Benchmark process started"],
+            },
             "results": [],
             "result_count": 0,
             "csv_filename": None,
@@ -501,6 +506,7 @@ class BenchmarkRunnerService:
         except OSError:
             return offset
         progress = run.get("progress") or {}
+        log_lines = list(progress.get("log_lines") or [])
         for line in raw.decode(errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -509,18 +515,60 @@ class BenchmarkRunnerService:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("type") == "request_start":
+            event_type = event.get("type")
+            request_id = event.get("request_id")
+            if event_type == "header":
+                version = str(event.get("llama_benchy_version") or "unknown")
+                log_lines.append(f"llama-benchy v{version} initialized")
+            elif event_type == "latency_measured":
+                try:
+                    latency_ms = float(event.get("latency_s") or 0) * 1000
+                except (TypeError, ValueError):
+                    latency_ms = 0
+                mode = str(event.get("mode") or "unknown")
+                log_lines.append(
+                    f"Latency probe complete: {latency_ms:.1f} ms ({mode})"
+                )
+            elif event_type == "request_start":
                 progress["current"] = {
                     "prompt_size": event.get("prompt_size"),
                     "response_size": event.get("response_size"),
                     "context_depth": event.get("context_size"),
                     "concurrency": event.get("concurrency"),
                 }
-            elif event.get("type") == "request_end":
+                run_index = event.get("run_index")
+                run_number = run_index + 1 if isinstance(run_index, int) else "?"
+                log_lines.append(
+                    f"Request #{request_id} started: "
+                    f"PP {event.get('prompt_size')} -> TG {event.get('response_size')}, "
+                    f"depth {event.get('context_size')}, C{event.get('concurrency')}, "
+                    f"run {run_number}"
+                )
+            elif event_type == "request_first_token":
+                try:
+                    ttft_ms = float(event.get("ttft_s") or 0) * 1000
+                except (TypeError, ValueError):
+                    ttft_ms = 0
+                log_lines.append(
+                    f"Request #{request_id} received first token in {ttft_ms:.1f} ms"
+                )
+            elif event_type == "request_end":
                 if event.get("error"):
                     progress["requests_failed"] = int(progress.get("requests_failed") or 0) + 1
+                    log_lines.append(f"Request #{request_id} failed")
                 else:
                     progress["requests_done"] = int(progress.get("requests_done") or 0) + 1
+                    log_lines.append(
+                        f"Request #{request_id} completed: "
+                        f"{int(event.get('total_tokens') or 0)} tokens"
+                    )
+            elif event_type == "bench_complete":
+                log_lines.append(
+                    f"Benchmark stream finished: {str(event.get('status') or 'unknown')}"
+                )
+            # Deliberately ignore tokens events: their snippet field contains
+            # generated model output and is both noisy and unsafe to echo.
+        progress["log_lines"] = log_lines[-200:]
         run["progress"] = progress
         return offset
 

@@ -5676,6 +5676,8 @@ class Manager:
                 ],
                 return_exceptions=True,
             )
+        else:
+            deployment["last_deployed_at"] = time.time()
         self._save_deployments()
         if errors:
             raise RuntimeError(deployment["error"])
@@ -5885,6 +5887,8 @@ class Manager:
                 deployment["status"] = "degraded" if action == "start" else "error"
             else:
                 deployment["status"] = "starting" if action == "start" else "stopped"
+                if action == "start":
+                    deployment["last_deployed_at"] = time.time()
             deployment["error"] = "; ".join(errors) if errors else None
         self._save_deployments()
         return {"ok": not errors, "errors": errors}
@@ -15268,6 +15272,11 @@ class Manager:
                 primary_container.get("stats_key")
                 if primary_container
                 else None
+            )
+            deployment["last_deployed_at"] = (
+                primary_container.get("started_at")
+                if primary_container
+                else deployment.get("last_deployed_at") or deployment.get("created_at")
             )
             if not deployment.get("last_used_at") and deployment["stats_key"]:
                 prior_samples = self.speed_samples.get(

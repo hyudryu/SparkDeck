@@ -87,6 +87,8 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   extra_args: detail.extra_args.map(quoteArg).join(' '),
 })
 
+const editorFingerprint = (editor: Editor) => JSON.stringify(editor)
+
 const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
 const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
@@ -122,6 +124,7 @@ export function DeploymentPage() {
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const nodes = useResource((signal) => api.nodes.list(signal))
   const [editor, setEditor] = useState<Editor>()
+  const [savedEditorFingerprint, setSavedEditorFingerprint] = useState<string>()
   const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
@@ -130,7 +133,11 @@ export function DeploymentPage() {
   const [previewError, setPreviewError] = useState<string>()
 
   useEffect(() => {
-    if (resource.data) setEditor(editorFrom(resource.data))
+    if (resource.data) {
+      const savedEditor = editorFrom(resource.data)
+      setEditor(savedEditor)
+      setSavedEditorFingerprint(editorFingerprint(savedEditor))
+    }
   }, [resource.data])
 
   useEffect(() => {
@@ -173,7 +180,9 @@ export function DeploymentPage() {
   const persist = async () => {
     if (!editor) throw new Error('Deployment settings are not loaded')
     const updated = await api.deployments.update(deploymentId, updateInput(editor))
-    setEditor(editorFrom(updated))
+    const savedEditor = editorFrom(updated)
+    setEditor(savedEditor)
+    setSavedEditorFingerprint(editorFingerprint(savedEditor))
     return updated
   }
 
@@ -252,6 +261,7 @@ export function DeploymentPage() {
   const detail = resource.data
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
+  const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
   const active = ['launching', 'starting', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || (!detail.editable && !detail.controllable)
 
@@ -294,7 +304,7 @@ export function DeploymentPage() {
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
         {detail.runtime !== 'llama.cpp' && <label className="field wide-field"><span>Final runtime flags (preview only)</span><textarea readOnly rows={6} spellCheck={false} value={finalFlags} /><small>Backend-normalized flags after dropdown values and environment references are resolved. This field is not submitted.</small>{previewError && <small className="form-error" role="alert">{previewError}</small>}</label>}
         <div className="settings-save wide-field">
-          <Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
+          <Button type="submit" disabled={disabled || !hasUnsavedChanges}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable
             ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
             : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => openRun(event.currentTarget.form)}><Play size={15} /> Run</Button>}

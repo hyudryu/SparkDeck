@@ -46,10 +46,10 @@ from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 
 _SAFE_CONFIGURATION_KEYS = {
-    "context_size", "context_length", "max_model_len", "parallel", "parallel_slots",
+    "context_size", "context_window", "context_length", "max_model_len", "parallel", "parallel_slots",
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
-    "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
+    "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {
@@ -914,6 +914,21 @@ class SparkDeckService:
             stored["status"] = _deployment_status(cluster.get("status"))
             stored.update(_deployment_launch_progress(cluster))
             stored["last_used_at"] = cluster.get("last_used_at")
+            launch_controls = cluster.get("launch_controls")
+            if not isinstance(launch_controls, dict):
+                controls_from_settings = getattr(
+                    self.manager, "_deployment_launch_controls", None,
+                )
+                launch_controls = (
+                    controls_from_settings(cluster.get("launch_settings") or {})
+                    if callable(controls_from_settings) else {}
+                )
+            public_settings = dict(stored.get("settings") or {})
+            if launch_controls.get("context_window") is not None:
+                public_settings["context_length"] = launch_controls["context_window"]
+            if launch_controls.get("max_concurrency") is not None:
+                public_settings["max_concurrency"] = launch_controls["max_concurrency"]
+            stored["settings"] = public_settings
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
@@ -927,13 +942,15 @@ class SparkDeckService:
                 cluster.get("automation_run_id")
                 or stored.get("settings", {}).get("automation_run_id")
             )
-            created_at = cluster.get("created_at")
-            if isinstance(created_at, (int, float)) and created_at:
-                stored["created_at"] = datetime.fromtimestamp(
-                    created_at, timezone.utc
+            last_deployed_at = (
+                cluster.get("last_deployed_at") or cluster.get("created_at")
+            )
+            if isinstance(last_deployed_at, (int, float)) and last_deployed_at:
+                stored["last_deployed_at"] = datetime.fromtimestamp(
+                    last_deployed_at, timezone.utc
                 ).isoformat()
-            elif isinstance(created_at, str) and created_at:
-                stored["created_at"] = created_at
+            elif isinstance(last_deployed_at, str) and last_deployed_at:
+                stored["last_deployed_at"] = last_deployed_at
             stored["node_ids"] = list(cluster.get("node_ids") or [])
             stored["selected_nodes"] = [
                 self.manager.public_target_node(cluster_nodes[node_id])
@@ -3337,6 +3354,7 @@ class SparkDeckService:
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
+        promote: bool = False,
     ) -> dict[str, Any]:
         lock = self._deployment_action_locks.setdefault(
             deployment_id, asyncio.Lock(),
@@ -3348,7 +3366,7 @@ class SparkDeckService:
                     "deployment launch is still in progress; wait for container creation"
                 )
             return await self._deployment_action_locked(
-                deployment_id, action, node_ids, additional_node_ids,
+                deployment_id, action, node_ids, additional_node_ids, promote,
             )
 
     async def _promote_discovered_deployment(
@@ -3420,6 +3438,7 @@ class SparkDeckService:
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
+        promote: bool = False,
     ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
@@ -3461,7 +3480,7 @@ class SparkDeckService:
                     f"tensor parallel size {required_nodes} requires exactly "
                     f"{required_nodes} node(s)"
                 )
-            if required_nodes > 1 or node_ids != ["local"]:
+            if promote or required_nodes > 1 or node_ids != ["local"]:
                 return await self._promote_discovered_deployment(
                     deployment, discovered, node_ids,
                 )
@@ -4289,6 +4308,9 @@ class SparkDeckService:
             # Docker-created external containers are idle and startable. The
             # same state remains a launch phase for SparkDeck-managed runs.
             status = "stopped"
+        settings = self._safe_configuration(container.get("load_settings") or {})
+        if settings.get("context_length") is None and settings.get("context_window") is not None:
+            settings["context_length"] = settings["context_window"]
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify
@@ -4303,7 +4325,7 @@ class SparkDeckService:
             },
             "status": status,
             "container_name": container.get("name"),
-            "settings": self._safe_configuration(container.get("load_settings") or {}),
+            "settings": settings,
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
@@ -4311,6 +4333,15 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
+        last_deployed_at = container.get("started_at") or container.get("created")
+        if (
+            isinstance(last_deployed_at, (int, float)) and last_deployed_at > 0
+        ) or (
+            isinstance(last_deployed_at, str)
+            and last_deployed_at
+            and not last_deployed_at.startswith("0001-")
+        ):
+            result["last_deployed_at"] = last_deployed_at
         try:
             tensor_parallel = max(
                 1, int(result["settings"].get("tensor_parallel_size") or 1),

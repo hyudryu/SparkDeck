@@ -137,11 +137,15 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             deployment = service._discovered_deployment({
                 "name": "created-container", "model": "org/model",
                 "managed": False, "status": "created", "load_settings": {},
+                "started_at": "2026-08-30T12:34:56Z",
             }, "vllm", "org/model")
 
             self.assertEqual(deployment["status"], "stopped")
             self.assertTrue(deployment["controllable"])
             self.assertEqual(deployment["required_node_count"], 1)
+            self.assertEqual(
+                deployment["last_deployed_at"], "2026-08-30T12:34:56Z",
+            )
             await manager.http.aclose()
             await service.close()
 
@@ -237,6 +241,39 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_explicit_promotion_converts_single_node_discovered_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "external-single", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "image": "example/vllm:latest", "port": 8214,
+                "load_settings": {
+                    "model": "org/model", "tensor_parallel_size": 1,
+                    "extra_args": [],
+                },
+            }
+            manager.list_containers.return_value = [container]
+            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            manager.create_deployment = AsyncMock(return_value={
+                "id": "cluster-single", "name": "org/model", "status": "starting",
+                "node_ids": ["local"], "api_port": 8214,
+                "members": [{"container_name": "cluster-single-r0"}],
+                "launch_settings": {"deployment_mode": "single", "node_ids": ["local"]},
+            })
+            manager._save_deployments = Mock()
+            service = SparkDeckService(manager, Path(directory))
+
+            result = await service.deployment_action(
+                "container:external-single", "start", ["local"], promote=True,
+            )
+
+            manager.create_deployment.assert_awaited_once()
+            self.assertEqual(result["kind"], "managed")
+            self.assertEqual(result["node_ids"], ["local"])
+            await manager.http.aclose()
+            await service.close()
+
     async def test_discovered_local_model_rejects_remote_promotion(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
@@ -321,6 +358,10 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             manager = FakeManager()
             manager.deployments = [{
                 "id": "cluster-1", "status": "running", "api_port": 9000,
+                "created_at": 1_787_918_400,
+                "launch_controls": {
+                    "context_window": 131072, "max_concurrency": 32,
+                },
                 "node_ids": ["local"], "launch_settings": {
                     "deployment_mode": "single", "node_ids": ["local"],
                 },
@@ -349,6 +390,11 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(listed), 1)
             self.assertEqual(listed[0]["status"], "running")
             self.assertEqual(listed[0]["port"], 9000)
+            self.assertEqual(listed[0]["settings"]["context_length"], 131072)
+            self.assertEqual(listed[0]["settings"]["max_concurrency"], 32)
+            self.assertEqual(
+                listed[0]["last_deployed_at"], "2026-08-28T12:00:00+00:00",
+            )
             await manager.http.aclose()
             await service.close()
 

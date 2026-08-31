@@ -242,6 +242,45 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_recovered_sglang_promotion_preserves_managed_controls(self):
+        manager = Manager.__new__(Manager)
+
+        settings = manager._recovered_deployment_launch_settings(
+            {
+                "name": "served-name", "model": "org/model",
+                "engine": "sglang", "mode": "single",
+                "node_ids": ["local"], "api_port": 8214,
+            },
+            {
+                "image": "example/sglang:latest",
+                "load_settings": {
+                    "tensor_parallel_size": 1,
+                    "command_flags": (
+                        "--context-length 65536 --max-running-requests 6 "
+                        "--mem-fraction-static 0.82"
+                    ),
+                },
+            },
+        )
+
+        self.assertEqual(settings["sg_tp_size"], 1)
+        self.assertEqual(settings["sg_context_length"], 65536)
+        self.assertEqual(settings["sg_max_running_requests"], 6)
+        self.assertEqual(settings["sg_mem_fraction"], 0.82)
+        regenerated = manager._with_sglang_runtime_controls(
+            settings["extra_args"],
+            settings["sg_context_length"],
+            settings["sg_max_running_requests"],
+            settings["sg_tp_size"],
+            settings["sg_mem_fraction"],
+        )
+        self.assertEqual(regenerated.count("--context-length"), 1)
+        self.assertIn("65536", regenerated)
+        self.assertEqual(regenerated.count("--max-running-requests"), 1)
+        self.assertIn("6", regenerated)
+        self.assertEqual(regenerated.count("--mem-fraction-static"), 1)
+        self.assertIn("0.82", regenerated)
+
     async def test_explicit_promotion_converts_single_node_discovered_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()

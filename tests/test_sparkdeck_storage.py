@@ -953,6 +953,39 @@ class SparkDeckStoreTests(unittest.TestCase):
             "unique_cluster_count": 3,
         }])
 
+    def test_outbox_contributes_the_users_outlier_filtered_mean(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(
+            True, "11111111-1111-4111-8111-111111111111",
+        )
+        base = BenchmarkSample(
+            id="mean-0", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        for index, speed in enumerate([29, 30, 30, 31, 300]):
+            self.store.add_benchmark_if_consented(
+                replace(
+                    base, id=f"mean-{index}",
+                    generation_tokens_per_second=speed,
+                ),
+                consent["generation"],
+            )
+
+        payloads = self.store.outbox_batch()
+
+        self.assertEqual(len(payloads), 5)
+        self.assertEqual(
+            {payload["inference_tokens_per_second"] for payload in payloads},
+            {30.0},
+        )
+
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(
             id="legacy-invalid", created_at="2026-08-25T00:00:00+00:00",

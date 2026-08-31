@@ -911,6 +911,7 @@ class SparkDeckStore:
             ).fetchall()
         if not rows:
             return []
+        contribution_averages = self._community_contribution_averages()
         wanted = [row["sample_id"] for row in rows]
         marks = ",".join("?" for _ in wanted)
         with self._lock:
@@ -918,11 +919,17 @@ class SparkDeckStore:
                 f"SELECT * FROM benchmark_samples WHERE id IN ({marks})",
                 tuple(wanted),
             ).fetchall()
-        by_id = {
-            row["id"]: payload
-            for row in sample_rows
-            if (payload := _upload_row(row)) is not None
-        }
+        by_id = {}
+        for row in sample_rows:
+            payload = _upload_row(row)
+            if payload is None:
+                continue
+            key = (
+                payload["model_id"], payload["quantization"],
+                payload["prompt_tokens_bucket"],
+            )
+            payload["inference_tokens_per_second"] = contribution_averages[key]
+            by_id[row["id"]] = payload
         return [
             {"sample_id": sample_id, "payload": by_id[sample_id]}
             for sample_id in wanted if sample_id in by_id
@@ -948,7 +955,43 @@ class SparkDeckStore:
             ).fetchone()
         if row is None or (payload := _upload_row(row)) is None:
             return None
+        key = (
+            payload["model_id"], payload["quantization"],
+            payload["prompt_tokens_bucket"],
+        )
+        payload["inference_tokens_per_second"] = (
+            self._community_contribution_averages()[key]
+        )
         return {"sample_id": sample_id, "payload": payload}
+
+    def _community_contribution_averages(
+        self,
+    ) -> dict[tuple[str, str, int], float]:
+        """Build this user's robust C1 mean for each upload dimension."""
+        grouped: dict[tuple[str, str, int], list[float]] = {}
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT * FROM benchmark_samples WHERE eligible = 1"
+            )
+            while True:
+                rows = cursor.fetchmany(_COMMUNITY_AGGREGATE_BATCH_SIZE)
+                if not rows:
+                    break
+                for row in rows:
+                    payload = _upload_row(row)
+                    if payload is None:
+                        continue
+                    key = (
+                        payload["model_id"], payload["quantization"],
+                        payload["prompt_tokens_bucket"],
+                    )
+                    grouped.setdefault(key, []).append(
+                        payload["inference_tokens_per_second"]
+                    )
+        return {
+            key: _outlier_filtered_mean(values)
+            for key, values in grouped.items()
+        }
 
     def mark_outbox_synced(self, sample_ids: list[str]) -> int:
         if not sample_ids:
@@ -1173,9 +1216,16 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     model_id = str(model.get("repository") or "").strip()
     quantization = _community_quantization(model)
     cluster_id = row["telemetry_cluster_id"]
+    raw_concurrency = value.get("configuration", {}).get(
+        "benchmark_concurrency"
+    )
     if (
         not model_id or prompt_bucket is None or speed is None
         or not _valid_telemetry_cluster_id(cluster_id)
+        or (
+            raw_concurrency is not None
+            and _positive_integer(raw_concurrency) != 1
+        )
     ):
         return None
     payload = {

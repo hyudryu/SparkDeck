@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from sparkdeck.web import (
     SPA_PATHS,
+    SPA_ROUTE_PATTERNS,
     configure_static_asset_mime_types,
     register_spa_routes,
 )
@@ -22,6 +23,9 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/storage", SPA_PATHS)
         self.assertIn("/usage", SPA_PATHS)
         self.assertIn("/switch", SPA_PATHS)
+
+    def test_deployment_detail_route_is_in_direct_refresh_allowlist(self):
+        self.assertIn("/models/{deployment_id}", SPA_ROUTE_PATTERNS)
 
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -73,6 +77,19 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_primary_browser_route_serves_the_spa_entry(self) -> None:
         for path in SPA_PATHS:
+            with self.subTest(path=path):
+                response = await self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("sparkdeck-spa", response.text)
+                self.assertEqual(
+                    response.headers["cache-control"], "no-store, max-age=0"
+                )
+
+    async def test_deployment_detail_refresh_serves_the_spa_entry(self) -> None:
+        for path in (
+            "/models/351eb304-0297-52c3-898b-33821ae59110",
+            "/models/container%3Akimi-vllm",
+        ):
             with self.subTest(path=path):
                 response = await self.client.get(path)
                 self.assertEqual(response.status_code, 200)

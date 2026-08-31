@@ -554,6 +554,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .result-heading { align-items: flex-start; }.result-heading p { display: none; }
   .model-grid, .aggregate-grid, .benchmark-summary-grid, .comparison-grid { grid-template-columns: 1fr; }
   .benchmark-model-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; }.benchmark-model-row > span:not(.benchmark-model-icon):not(.benchmark-model-main) { display: none; }.benchmark-chart-stack { grid-template-columns: 1fr; }.benchmark-chart { overflow-x: auto; }.benchmark-chart svg { min-width: 520px; }
+  .temperature-recorder-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-grid { grid-template-columns: 1fr; }
   .dashboard-refresh > span { display: none; }
   .community-strip { grid-template-columns: auto minmax(0, 1fr) auto; }.community-strip .status { grid-column: 2; justify-self: start; }.community-counts { grid-column: 2; }.community-strip > .text-link { grid-column: 3; grid-row: 1 / 4; align-self: center; }
@@ -607,6 +608,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .catalog-filters { grid-template-columns: 1fr; }.catalog-filters > .button { grid-column: 1; }.catalog-model-actions { display: grid; grid-template-columns: 1fr 1fr; }.catalog-model-actions .button { min-height: 44px; }.catalog-deployment-type, .catalog-artifact-select { min-width: 0; }.catalog-artifact-select { grid-column: 1 / -1; }
   .compare-submit { align-items: stretch; flex-direction: column; }.compare-submit p { max-width: none; }.compare-submit .button { width: 100%; }
   .log-filters { grid-template-columns: 1fr; }
+  .temperature-recorder-controls { grid-template-columns: 1fr; }
   .metric-grid { grid-template-columns: 1fr 1fr; gap: 8px; }.metric-panel { padding: 13px; }.metric-panel > strong { font-size: 23px; }.metric-context { font-size: 11px; }.community-strip { grid-template-columns: auto minmax(0, 1fr); }.community-strip > .text-link { grid-column: 2; grid-row: auto; justify-self: start; }.dashboard-list-row { padding-inline: 13px; }
   .usage-tabs { width: 100%; }.usage-tabs button { flex: 1; }
   .usage-overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.usage-overview-metrics > div, .usage-overview-metrics > div:nth-child(3) { border-right: 1px solid var(--border-subtle); border-bottom: 1px solid var(--border-subtle); }.usage-overview-metrics > div:nth-child(2n) { border-right: 0; }.usage-overview-metrics > div:last-child { grid-column: 1 / -1; border-right: 0; border-bottom: 0; }.usage-activity-panel, .usage-trend-panel, .usage-share-panel { padding: 13px; }.usage-time-heading { align-items: flex-start; flex-direction: column; }.usage-trend svg { height: 160px; }.usage-chart-legend { gap: 8px 12px; }

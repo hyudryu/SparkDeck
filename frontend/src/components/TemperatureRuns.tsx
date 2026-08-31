@@ -146,21 +146,27 @@ interface ChartGeometry {
 }
 
 function chartGeometry(runs: TemperatureRun[], colorFor: (runId: string) => string): ChartGeometry {
-  const allValues: number[] = []
+  // Track extrema incrementally: spreading a long sample history into
+  // Math.min/max blows past the engine's argument limit and crashes the pane.
+  let minObserved = Infinity
+  let maxObserved = -Infinity
   let maxSeconds = 1
   for (const run of runs) {
     for (const sample of run.samples ?? []) {
       maxSeconds = Math.max(maxSeconds, Number(sample.elapsed_seconds) || 0)
       for (const key of ['cpu_temp_c', 'gpu_temp_c'] as const) {
         const rawValue = sample[key]
-        if (typeof rawValue === 'number' && Number.isFinite(rawValue)) allValues.push(rawValue)
+        if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+          if (rawValue < minObserved) minObserved = rawValue
+          if (rawValue > maxObserved) maxObserved = rawValue
+        }
       }
     }
   }
 
   // Snap the y domain to 10°C steps padded by 5°C, with a 20°C minimum span.
-  let minTemp = allValues.length ? Math.min(...allValues) : 30
-  let maxTemp = allValues.length ? Math.max(...allValues) : 90
+  let minTemp = Number.isFinite(minObserved) ? minObserved : 30
+  let maxTemp = Number.isFinite(maxObserved) ? maxObserved : 90
   minTemp = Math.max(0, Math.floor((minTemp - 5) / 10) * 10)
   maxTemp = Math.min(130, Math.ceil((maxTemp + 5) / 10) * 10)
   if (maxTemp - minTemp < 20) maxTemp = Math.min(130, minTemp + 20)
@@ -169,8 +175,10 @@ function chartGeometry(runs: TemperatureRun[], colorFor: (runId: string) => stri
   const right = 878
   const legendColumns = 3
   const legendRows = Math.max(1, Math.ceil(runs.length / legendColumns))
-  const top = 42 + legendRows * 27
   const bottom = 426
+  // Clamp the legend reservation so the plot keeps a usable height (and the
+  // temperature scale never inverts) when very many runs are selected.
+  const top = Math.min(42 + legendRows * 27, bottom - 160)
   const x = (seconds: number) => left + Math.max(0, Math.min(1, seconds / maxSeconds)) * (right - left)
   const y = (value: number) => bottom - ((value - minTemp) / (maxTemp - minTemp)) * (bottom - top)
   const pathFor = (samples: TemperatureRunSample[] | undefined, key: 'cpu_temp_c' | 'gpu_temp_c') => {
@@ -303,18 +311,25 @@ export function TemperatureRuns() {
   const chartRef = useRef<SVGSVGElement>(null)
   const chartWrapRef = useRef<HTMLDivElement>(null)
   const detailRequestsRef = useRef(new Set<string>())
+  const detailVersionsRef = useRef(new Map<string, number>())
 
   const state = runs.data
   const runList = state?.runs ?? []
   const activeRun = runList.find((run) => run.id === state?.active_run_id)
   const targetNodes = (nodes.data ?? []).filter((node) => node.online !== false)
 
-  const loadRunDetail = useCallback(async (runId: string) => {
-    if (detailRequestsRef.current.has(runId)) return
+  const loadRunDetail = useCallback(async (runId: string, force = false) => {
+    if (!force && detailRequestsRef.current.has(runId)) return
     detailRequestsRef.current.add(runId)
+    // Only the newest request for a run may write its detail, so a slow
+    // pre-completion response cannot overwrite fresher samples.
+    const version = (detailVersionsRef.current.get(runId) ?? 0) + 1
+    detailVersionsRef.current.set(runId, version)
     try {
       const detail = await api.temperatureRuns.get(runId)
-      setDetails((current) => ({ ...current, [runId]: detail }))
+      if (detailVersionsRef.current.get(runId) === version) {
+        setDetails((current) => ({ ...current, [runId]: detail }))
+      }
     } catch (reason) {
       setActionError(reason instanceof Error ? `Could not load temperature run: ${reason.message}` : 'Could not load temperature run')
     } finally {
@@ -356,6 +371,18 @@ export function TemperatureRuns() {
     }, 2000)
     return () => clearInterval(interval)
   }, [polling, activeRunId, reloadRuns, loadRunDetail])
+
+  // Once the list shows a previously active run has finished, force one final
+  // detail refetch: the last in-flight poll may have returned pre-completion
+  // samples, and the lazy loader will not refetch a cached detail on its own.
+  const previousActiveRef = useRef<string | null>(null)
+  useEffect(() => {
+    const previous = previousActiveRef.current
+    previousActiveRef.current = activeRunId ?? null
+    if (previous && previous !== activeRunId && selected[previous]) {
+      void loadRunDetail(previous, true)
+    }
+  }, [activeRunId, selected, loadRunDetail])
 
   // Chromium anchors its native color panel to the input, so keep the
   // invisible input directly below the legend dot instead of off-screen.

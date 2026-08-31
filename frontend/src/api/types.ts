@@ -147,6 +147,12 @@ export interface DeploymentUpdateInput {
   sg_mem_fraction?: number | null
 }
 
+export interface RuntimeFlagsPreview {
+  flags: string[]
+  command_flags: string
+  environment: Record<string, string>
+}
+
 // Editable fields of a saved deployment bookmark (before its first launch).
 export interface SavedDeploymentUpdateInput {
   alias?: string

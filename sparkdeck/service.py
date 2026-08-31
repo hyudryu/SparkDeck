@@ -1713,6 +1713,14 @@ class SparkDeckService:
         merged_args = self.manager._apply_deployment_launch_controls(
             list(args), engine, controls, environment,
         )
+        command_args = merged_args
+        if engine == "vllm":
+            # Docker exec-form argv never expands ${NAME}. Persist the readable
+            # reference in managed settings, but rebuild discovered containers
+            # with the same resolved JSON argv used by managed vLLM launches.
+            command_args = self.manager._resolve_environment_backed_speculative_args(
+                merged_args, environment,
+            )
 
         if engine == "sglang":
             sg_tp_size = self.manager._validated_sg_scalar(
@@ -1722,16 +1730,19 @@ class SparkDeckService:
                     else settings.get("tensor_parallel_size")
                 )
             )
-            flags = self.manager._replace_command_option(
-                shlex.join(merged_args), {"--tp-size"}, sg_tp_size,
-            )
-            merged_args = shlex.split(flags)
             utilization = self.manager._validated_sg_scalar(
                 "sg_mem_fraction", (
                     changes.get("sg_mem_fraction")
                     if "sg_mem_fraction" in changes
                     else settings.get("gpu_memory_utilization")
                 )
+            )
+            command_args = self.manager._with_sglang_runtime_controls(
+                merged_args,
+                controls.get("context_window"),
+                controls.get("max_concurrency"),
+                sg_tp_size,
+                utilization,
             )
         else:
             utilization = (
@@ -1741,7 +1752,7 @@ class SparkDeckService:
             )
 
         replacement = {
-            "command_flags": shlex.join(merged_args),
+            "command_flags": shlex.join(command_args),
             "context_window": controls.get("context_window"),
             "max_concurrency": controls.get("max_concurrency"),
             "kv_cache_dtype": controls.get("kv_cache_dtype"),

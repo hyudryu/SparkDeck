@@ -2059,6 +2059,44 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     environment={"NCCL_DEBUG": "WARN"},
                 )
 
+    async def test_recipe_update_creates_missing_speculative_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.lock = asyncio.Lock()
+            instance.recipes = [{
+                "id": "spec-env",
+                "name": "Speculative",
+                "model": "model/a",
+                "engine": "vllm",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "extra_args": [
+                    "--speculative-config", "${SPECULATIVE_CONFIG}",
+                ],
+                "environment": {},
+            }]
+            instance.recipes_path = Path(directory) / "recipes.json"
+
+            updated = await instance.update_recipe("spec-env", {
+                "launch_controls": {
+                    "speculative_method": "dspark",
+                    "draft_sample_method": "probabilistic",
+                    "dspark_num_speculative_tokens": 5,
+                },
+            })
+
+            self.assertEqual(
+                instance._cli_option(updated["extra_args"], {"--speculative-config"}),
+                "${SPECULATIVE_CONFIG}",
+            )
+            self.assertEqual(json.loads(updated["environment"]["SPECULATIVE_CONFIG"]), {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            })
+            saved = json.loads(instance.recipes_path.read_text())
+            self.assertEqual(saved[0]["environment"], updated["environment"])
+
     async def test_recipe_delete_is_durable_and_clears_transient_launch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
@@ -3037,6 +3075,138 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(speculative["draft_sample_method"], "probabilistic")
         self.assertEqual(speculative["num_speculative_tokens"], 7)
         self.assertTrue(speculative["custom"])
+
+    def test_launch_controls_create_missing_environment_backed_speculative_config(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"default_gpu_memory_utilization": 0.9}
+        args = ["--speculative-config", "${SPECULATIVE_CONFIG}"]
+        environment = {}
+
+        updated = instance._apply_deployment_launch_controls(
+            args,
+            "vllm",
+            {
+                "speculative_method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "dspark_num_speculative_tokens": 5,
+            },
+            environment,
+        )
+
+        self.assertEqual(
+            instance._cli_option(updated, {"--speculative-config"}),
+            "${SPECULATIVE_CONFIG}",
+        )
+        self.assertEqual(json.loads(environment["SPECULATIVE_CONFIG"]), {
+            "method": "dspark",
+            "draft_sample_method": "probabilistic",
+            "num_speculative_tokens": 5,
+        })
+
+        preview = instance.preview_runtime_flags(
+            args,
+            "vllm",
+            {
+                "speculative_method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "dspark_num_speculative_tokens": 5,
+            },
+            {},
+            managed=True,
+        )
+        self.assertNotIn("${SPECULATIVE_CONFIG}", preview["command_flags"])
+        self.assertIn("--enable-prompt-tokens-details", preview["flags"])
+        self.assertEqual(
+            json.loads(instance._cli_option(preview["flags"], {"--speculative-config"})),
+            {
+                "method": "dspark",
+                "draft_sample_method": "probabilistic",
+                "num_speculative_tokens": 5,
+            },
+        )
+
+    def test_runtime_flags_preview_includes_generated_sglang_controls(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        preview = instance.preview_runtime_flags(
+            ["--max-total-tokens", "999", "--enable-metrics"],
+            "sglang",
+            {"context_window": 120000, "max_concurrency": 10},
+            {},
+            sg_tp_size=2,
+            sg_mem_fraction=0.85,
+        )
+
+        self.assertEqual(
+            preview["flags"],
+            [
+                "--tp-size", "2",
+                "--context-length", "120000",
+                "--mem-fraction-static", "0.85",
+                "--max-running-requests", "10",
+                "--max-total-tokens", "2400000",
+                "--enable-metrics",
+            ],
+        )
+        self.assertEqual(preview["flags"].count("--max-total-tokens"), 1)
+        self.assertNotIn("999", preview["flags"])
+
+    def test_sglang_runtime_controls_preserve_standalone_token_limit(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        flags = instance._with_sglang_runtime_controls(
+            ["--max-total-tokens", "999", "--enable-metrics"],
+            None, None, None, None,
+        )
+
+        self.assertEqual(
+            flags, ["--max-total-tokens", "999", "--enable-metrics"],
+        )
+
+    def test_managed_vllm_preview_includes_launch_defaults_and_identity(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"default_gpu_memory_utilization": 0.91}
+
+        preview = instance.preview_runtime_flags(
+            ["--enable-prefix-caching"], "vllm", {}, {}, managed=True,
+            model_revision="rev-123", quantization="awq", dtype="bfloat16",
+        )
+
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--gpu-memory-utilization"}),
+            "0.91",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--revision"}), "rev-123",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--quantization"}), "awq",
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--dtype"}), "bfloat16",
+        )
+
+    def test_unrelated_controls_do_not_repair_missing_speculative_environment(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+
+        with self.assertRaisesRegex(
+            ValueError, "references undefined environment variable SPECULATIVE_CONFIG",
+        ):
+            instance._apply_deployment_launch_controls(
+                ["--speculative-config", "${SPECULATIVE_CONFIG}"],
+                "vllm",
+                {
+                    "context_window": 65536,
+                    "speculative_method": None,
+                    "draft_sample_method": None,
+                    "dspark_num_speculative_tokens": None,
+                },
+                {},
+            )
 
     def test_launch_controls_reject_invalid_environment_backed_speculative_config(
         self,

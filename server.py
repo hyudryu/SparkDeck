@@ -2120,6 +2120,41 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
+@app.post("/api/v1/runtime-flags/preview")
+async def v1_runtime_flags_preview(req: Request):
+    """Preview the exact editable argv after backend normalization."""
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "runtime", "extra_args", "launch_controls", "environment",
+        "gpu_memory_utilization", "sg_tp_size", "sg_mem_fraction", "managed",
+        "model_revision", "quantization", "dtype",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        return manager.preview_runtime_flags(
+            body.get("extra_args", []),
+            str(body.get("runtime") or ""),
+            body.get("launch_controls", {}),
+            body.get("environment"),
+            body.get("gpu_memory_utilization"),
+            body.get("sg_tp_size"),
+            body.get("sg_mem_fraction"),
+            body.get("managed") is True,
+            body.get("model_revision"),
+            body.get("quantization"),
+            body.get("dtype"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/v1/deployments/{deployment_id}")
 async def v1_deployment_detail(deployment_id: str):
     try:

@@ -4068,9 +4068,25 @@ class Manager:
                 raw_speculative = self._cli_option(
                     current_tokens, {"--speculative-config"}
                 )
-                speculative, environment_key = self._speculative_config(
-                    current_tokens, environment, strict=bool(raw_speculative),
+                environment_key = self._environment_reference(raw_speculative)
+                submitted_speculative_value = any(
+                    controls.get(key) not in (None, "")
+                    for key in speculative_keys
                 )
+                if (
+                    environment_key
+                    and environment is not None
+                    and environment_key not in environment
+                    and submitted_speculative_value
+                ):
+                    # The structured controls are sufficient to create a new
+                    # environment-backed config. Do not reject the missing
+                    # value before those submitted controls can populate it.
+                    speculative = {}
+                else:
+                    speculative, environment_key = self._speculative_config(
+                        current_tokens, environment, strict=bool(raw_speculative),
+                    )
 
                 for control_key, config_key in (
                     ("speculative_method", "method"),
@@ -4117,6 +4133,145 @@ class Manager:
             return shlex.split(flags)
         except ValueError as exc:
             raise ValueError("launch arguments have invalid shell quoting") from exc
+
+    def preview_runtime_flags(
+        self,
+        args: list[str],
+        engine: str,
+        controls: dict,
+        environment: dict[str, str] | None = None,
+        gpu_memory_utilization: Any = None,
+        sg_tp_size: Any = None,
+        sg_mem_fraction: Any = None,
+        managed: bool = False,
+        model_revision: Any = None,
+        quantization: Any = None,
+        dtype: Any = None,
+    ) -> dict[str, Any]:
+        """Return the backend-normalized runtime flags without mutating state."""
+        if engine not in {"vllm", "sglang"}:
+            raise ValueError("runtime flag preview supports vllm and sglang")
+        if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
+            raise ValueError("extra_args must be an array of strings")
+        if not isinstance(controls, dict):
+            raise ValueError("launch_controls must be an object")
+        self._reject_hf_cli_credentials(args)
+        normalized_environment = normalize_runtime_environment(environment, engine)
+        final_args = self._apply_deployment_launch_controls(
+            list(args), engine, controls, normalized_environment,
+        )
+        if managed:
+            final_args = self._with_saved_launch_identity(
+                final_args, engine, model_revision, quantization, dtype,
+            )
+        if engine == "vllm":
+            if managed:
+                final_args = self._with_vllm_prompt_token_details(final_args)
+            final_args = self._resolve_environment_backed_speculative_args(
+                final_args, normalized_environment,
+            )
+            utilization_value = gpu_memory_utilization
+            if managed and utilization_value in (None, ""):
+                utilization_value = self.settings["default_gpu_memory_utilization"]
+            if utilization_value not in (None, ""):
+                try:
+                    utilization = float(utilization_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "gpu_memory_utilization must be a number"
+                    ) from exc
+                if not 0 < utilization <= 1:
+                    raise ValueError("gpu_memory_utilization must be between 0 and 1")
+                flags = self._replace_command_option(
+                    shlex.join(final_args), {"--gpu-memory-utilization"}, utilization,
+                )
+                final_args = shlex.split(flags)
+        else:
+            final_args = self._with_sglang_runtime_controls(
+                final_args,
+                controls.get("context_window"),
+                controls.get("max_concurrency"),
+                sg_tp_size,
+                sg_mem_fraction,
+            )
+        return {
+            "flags": final_args,
+            "command_flags": shlex.join(final_args),
+            "environment": normalized_environment,
+        }
+
+    @staticmethod
+    def _with_saved_launch_identity(
+        args: list[str],
+        engine: str,
+        model_revision: Any = None,
+        quantization: Any = None,
+        dtype: Any = None,
+    ) -> list[str]:
+        """Append immutable saved-model flags shared by preview and launch."""
+        final_args = list(args)
+        if engine == "vllm":
+            for value, flag in (
+                (quantization, "--quantization"), (dtype, "--dtype"),
+            ):
+                normalized = str(value).strip() if value not in (None, "") else None
+                if normalized:
+                    final_args += [flag, normalized]
+        revision = (
+            str(model_revision).strip()
+            if model_revision not in (None, "") else None
+        )
+        if revision and engine != "llama.cpp":
+            final_args += ["--revision", revision]
+        if engine == "sglang" and quantization not in (None, ""):
+            final_args += ["--quantization", str(quantization).strip()]
+        return final_args
+
+    def _with_sglang_runtime_controls(
+        self,
+        args: list[str],
+        context_length: Any,
+        max_running_requests: Any,
+        tp_size: Any,
+        mem_fraction: Any,
+    ) -> list[str]:
+        """Build the generated SGLang flags shared by preview and container save."""
+        tp_size = self._validated_sg_scalar("sg_tp_size", tp_size)
+        mem_fraction = self._validated_sg_scalar(
+            "sg_mem_fraction", mem_fraction,
+        )
+        context_length = self._validated_sg_scalar(
+            "sg_context_length", context_length,
+        )
+        max_running = self._validated_sg_scalar(
+            "sg_max_running_requests", max_running_requests,
+        )
+        if max_running is None and context_length is not None:
+            max_running = 8
+        flags = shlex.join(args)
+        for names in (
+            {"--tp-size"}, {"--context-length"}, {"--mem-fraction-static"},
+            {"--max-running-requests"},
+        ):
+            flags = self._replace_command_option(flags, names, None)
+        if max_running is not None:
+            flags = self._replace_command_option(
+                flags, {"--max-total-tokens"}, None,
+            )
+        generated: list[str] = []
+        if tp_size is not None:
+            generated += ["--tp-size", str(tp_size)]
+        if context_length is not None:
+            generated += ["--context-length", str(context_length)]
+        if mem_fraction is not None:
+            generated += ["--mem-fraction-static", str(mem_fraction)]
+        if max_running is not None:
+            generated += ["--max-running-requests", str(max_running)]
+            generated += [
+                "--max-total-tokens",
+                str(max_running * (context_length or 32768) * 2),
+            ]
+        return generated + shlex.split(flags)
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:
         """Save the inputs used to rebuild a stopped clustered deployment."""
@@ -10994,31 +11149,17 @@ class Manager:
                 name, "preparing", "Preparing SGLang launch",
                 model=model, cluster_member=cluster_member,
             )
-            extra = list(extra_args or [])
             sg_cmd = ["-m", "sglang.launch_server", "--model-path", model]
             sg_cmd += ["--host", "0.0.0.0"]
             serve_port = int(cluster_member.get("serve_port") or port or 8000) if distributed_member else 8000
             sg_cmd += ["--port", str(serve_port)]
-            if sg_tp_size and sg_tp_size > 0:
-                sg_cmd += ["--tp-size", str(sg_tp_size)]
-            if sg_context_length and sg_context_length > 0:
-                sg_cmd += ["--context-length", str(sg_context_length)]
-            if sg_mem_fraction and sg_mem_fraction > 0:
-                sg_cmd += ["--mem-fraction-static", str(sg_mem_fraction)]
-            if sg_max_running_requests and sg_max_running_requests > 0:
-                # Calculate max-total-tokens as max_running_requests * context_length * 2
-                ctx = sg_context_length or 32768
-                max_total = sg_max_running_requests * ctx * 2
-                sg_cmd += ["--max-running-requests", str(sg_max_running_requests)]
-                sg_cmd += ["--max-total-tokens", str(max_total)]
-            else:
-                if sg_context_length and sg_context_length > 0:
-                    # Default to 8 running requests if not specified
-                    default_running = 8
-                    sg_cmd += ["--max-running-requests", str(default_running)]
-                    max_total = default_running * sg_context_length * 2
-                    sg_cmd += ["--max-total-tokens", str(max_total)]
-            sg_cmd += extra
+            sg_cmd += self._with_sglang_runtime_controls(
+                list(extra_args or []),
+                sg_context_length,
+                sg_max_running_requests,
+                sg_tp_size,
+                sg_mem_fraction,
+            )
 
             def _create():
                 # docker-py does not pull a missing image as part of

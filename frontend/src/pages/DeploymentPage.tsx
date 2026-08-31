@@ -126,10 +126,47 @@ export function DeploymentPage() {
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [runSelection, setRunSelection] = useState<string[]>()
+  const [finalFlags, setFinalFlags] = useState('')
+  const [previewError, setPreviewError] = useState<string>()
 
   useEffect(() => {
     if (resource.data) setEditor(editorFrom(resource.data))
   }, [resource.data])
+
+  useEffect(() => {
+    if (!editor || !resource.data || resource.data.runtime === 'llama.cpp') {
+      setFinalFlags('')
+      setPreviewError(undefined)
+      return
+    }
+    const deployment = resource.data
+    const runtime = deployment.runtime
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      try {
+        const input = updateInput(editor)
+        void api.deployments.previewFlags(
+          runtime, input, deployment, controller.signal,
+        )
+          .then((preview) => {
+            setFinalFlags(preview.command_flags)
+            setPreviewError(undefined)
+          })
+          .catch((reason) => {
+            if (controller.signal.aborted) return
+            setFinalFlags('')
+            setPreviewError(reason instanceof Error ? reason.message : 'Could not preview runtime flags')
+          })
+      } catch (reason) {
+        setFinalFlags('')
+        setPreviewError(reason instanceof Error ? reason.message : 'Could not preview runtime flags')
+      }
+    }, 200)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [editor, resource.data])
 
   const set = (key: keyof Editor, value: string) => setEditor((current) => current ? { ...current, [key]: value } : current)
 
@@ -255,6 +292,7 @@ export function DeploymentPage() {
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
         </>}
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
+        {detail.runtime !== 'llama.cpp' && <label className="field wide-field"><span>Final runtime flags (preview only)</span><textarea readOnly rows={6} spellCheck={false} value={finalFlags} /><small>Backend-normalized flags after dropdown values and environment references are resolved. This field is not submitted.</small>{previewError && <small className="form-error" role="alert">{previewError}</small>}</label>}
         <div className="settings-save wide-field">
           <Button type="submit" disabled={disabled}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable

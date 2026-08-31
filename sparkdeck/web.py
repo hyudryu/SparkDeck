@@ -27,6 +27,10 @@ SPA_PATHS = (
     "/logs",
 )
 
+SPA_ROUTE_PATTERNS = (
+    "/models/{deployment_id}",
+)
+
 
 def configure_static_asset_mime_types() -> None:
     """Keep browser module assets executable across host MIME registries.
@@ -66,8 +70,14 @@ def register_spa_routes(app: FastAPI, frontend_dist: Path) -> None:
             media_type="text/plain",
         )
 
-    for path in SPA_PATHS:
-        slug = path.strip("/").replace("/", "_") or "root"
+    for path in (*SPA_PATHS, *SPA_ROUTE_PATTERNS):
+        slug = (
+            path.strip("/")
+            .replace("/", "_")
+            .replace("{", "")
+            .replace("}", "")
+            or "root"
+        )
         app.add_api_route(
             path,
             spa_entry,

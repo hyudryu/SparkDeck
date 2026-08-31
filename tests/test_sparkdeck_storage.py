@@ -985,6 +985,47 @@ class SparkDeckStoreTests(unittest.TestCase):
             {payload["inference_tokens_per_second"] for payload in payloads},
             {30.0},
         )
+        prepared = self.store.outbox_entries()[0]
+        self.store._community_contribution_averages = lambda: {}
+        self.assertEqual(len(self.store.outbox_entries()), 5)
+        self.store._community_contribution_averages = lambda: (_ for _ in ()).throw(
+            AssertionError("prepared entries must not rescan history")
+        )
+        self.assertEqual(
+            self.store.outbox_entry(
+                prepared["sample_id"], prepared_payload=prepared["payload"],
+            ),
+            prepared,
+        )
+
+    def test_upload_average_excludes_measurements_from_prior_consent_epoch(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        first = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="old-epoch", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=300,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.add_benchmark_if_consented(base, first["generation"])
+        self.store.set_community_consent(False)
+        current = self.store.set_community_consent(True)
+        self.store.add_benchmark_if_consented(
+            replace(
+                base, id="current-epoch",
+                generation_tokens_per_second=30,
+            ),
+            current["generation"],
+        )
+
+        self.assertEqual(
+            self.store.outbox_batch()[0]["inference_tokens_per_second"],
+            30.0,
+        )
 
     def test_migration_removes_invalid_legacy_upload_but_keeps_local_sample(self):
         sample = BenchmarkSample(

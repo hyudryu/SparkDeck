@@ -134,7 +134,8 @@ class SparkDeckStore:
                     prompt_tps REAL,
                     cold_start INTEGER,
                     eligible INTEGER NOT NULL,
-                    telemetry_cluster_id TEXT
+                    telemetry_cluster_id TEXT,
+                    consent_generation INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
@@ -258,6 +259,19 @@ class SparkDeckStore:
                 self._connection.execute(
                     "ALTER TABLE benchmark_samples "
                     "ADD COLUMN telemetry_cluster_id TEXT"
+                )
+            if "consent_generation" not in benchmark_columns:
+                self._connection.execute(
+                    "ALTER TABLE benchmark_samples "
+                    "ADD COLUMN consent_generation INTEGER"
+                )
+                current_generation = int(self.get_setting(
+                    "community_consent_generation", 0,
+                ))
+                self._connection.execute(
+                    "UPDATE benchmark_samples SET consent_generation = ? "
+                    "WHERE id IN (SELECT sample_id FROM upload_outbox)",
+                    (current_generation,),
                 )
             self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
@@ -483,6 +497,7 @@ class SparkDeckStore:
             )
             community_eligible = self._insert_benchmark_locked(
                 sample, cluster_id,
+                consent["generation"] if cluster_id else None,
             )
             self._link_benchmark_series_point(sample)
             if queue and community_eligible:
@@ -508,7 +523,7 @@ class SparkDeckStore:
             ):
                 return False
             if not self._insert_benchmark_locked(
-                sample, consent["telemetry_cluster_id"],
+                sample, consent["telemetry_cluster_id"], consent["generation"],
             ):
                 return False
             self._link_benchmark_series_point(sample)
@@ -517,6 +532,7 @@ class SparkDeckStore:
 
     def _insert_benchmark_locked(
         self, sample: BenchmarkSample, telemetry_cluster_id: str | None,
+        consent_generation: int | None,
     ) -> bool:
         value = sample.to_dict()
         community_eligible = bool(
@@ -528,8 +544,8 @@ class SparkDeckStore:
                 runtime_version, hardware_json, configuration_json,
                 input_tokens, output_tokens, latency_ms, ttft_ms,
                 generation_tps, prompt_tps, cold_start, eligible,
-                telemetry_cluster_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                telemetry_cluster_id, consent_generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sample.id, sample.created_at, sample.deployment_id,
                 json.dumps(value["model"]), sample.runtime.value,
@@ -540,6 +556,7 @@ class SparkDeckStore:
                 sample.prompt_tokens_per_second,
                 None if sample.cold_start is None else int(sample.cold_start),
                 int(community_eligible), telemetry_cluster_id,
+                consent_generation if community_eligible else None,
             ),
         )
         return community_eligible
@@ -666,6 +683,7 @@ class SparkDeckStore:
             )
             community_eligible = self._insert_benchmark_locked(
                 sample, cluster_id,
+                consent["generation"] if cluster_id else None,
             )
             self._insert_benchmark_series_point_locked(point, sample.id)
             if queue and community_eligible:
@@ -686,7 +704,7 @@ class SparkDeckStore:
             ):
                 return False
             if not self._insert_benchmark_locked(
-                sample, consent["telemetry_cluster_id"],
+                sample, consent["telemetry_cluster_id"], consent["generation"],
             ):
                 return False
             self._insert_benchmark_series_point_locked(point, sample.id)
@@ -933,7 +951,9 @@ class SparkDeckStore:
                 payload["model_id"], payload["quantization"],
                 payload["prompt_tokens_bucket"],
             )
-            payload["inference_tokens_per_second"] = contribution_averages[key]
+            payload["inference_tokens_per_second"] = contribution_averages.get(
+                key, payload["inference_tokens_per_second"],
+            )
             by_id[row["id"]] = payload
         return [
             {"sample_id": sample_id, "payload": by_id[sample_id]}
@@ -942,6 +962,7 @@ class SparkDeckStore:
 
     def outbox_entry(
         self, sample_id: str, now: str | None = None,
+        prepared_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Re-read one currently uploadable sample at the outbound boundary."""
         now = now or datetime.now(timezone.utc).isoformat()
@@ -960,13 +981,29 @@ class SparkDeckStore:
             ).fetchone()
         if row is None or (payload := _upload_row(row)) is None:
             return None
-        key = (
-            payload["model_id"], payload["quantization"],
-            payload["prompt_tokens_bucket"],
-        )
-        payload["inference_tokens_per_second"] = (
-            self._community_contribution_averages()[key]
-        )
+        if prepared_payload is not None:
+            key_fields = (
+                "model_id", "quantization", "prompt_tokens_bucket",
+                "telemetry_cluster_id", "concurrency",
+            )
+            if any(
+                prepared_payload.get(field) != payload.get(field)
+                for field in key_fields
+            ):
+                return None
+            payload["inference_tokens_per_second"] = prepared_payload[
+                "inference_tokens_per_second"
+            ]
+        else:
+            key = (
+                payload["model_id"], payload["quantization"],
+                payload["prompt_tokens_bucket"],
+            )
+            payload["inference_tokens_per_second"] = (
+                self._community_contribution_averages().get(
+                    key, payload["inference_tokens_per_second"],
+                )
+            )
         return {"sample_id": sample_id, "payload": payload}
 
     def _community_contribution_averages(
@@ -975,8 +1012,12 @@ class SparkDeckStore:
         """Build this user's robust C1 mean for each upload dimension."""
         grouped: dict[tuple[str, str, int], list[float]] = {}
         with self._lock:
+            generation = int(self.get_setting(
+                "community_consent_generation", 0,
+            ))
             cursor = self._connection.execute(
-                "SELECT * FROM benchmark_samples WHERE eligible = 1 "
+                "SELECT * FROM benchmark_samples "
+                f"WHERE eligible = 1 AND consent_generation = {generation} "
                 f"ORDER BY created_at DESC LIMIT {_COMMUNITY_AGGREGATE_ROW_LIMIT}"
             )
             while True:

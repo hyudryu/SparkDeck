@@ -3795,7 +3795,9 @@ async def community_upload_once() -> dict:
                 break
             # The batch is only a scheduling snapshot; re-read the row at the
             # outbound boundary so a deleted or transitioned sample never sends.
-            current = store.outbox_entry(sample_id)
+            current = store.outbox_entry(
+                sample_id, prepared_payload=entry["payload"],
+            )
             if current is None:
                 continue
             response = await _post_community_sample(

@@ -987,6 +987,48 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.store.deployment("racing-record"))
         self.manager.remove_container.assert_not_awaited()
 
+    async def test_delete_refreshes_routing_after_same_record_action(self):
+        self.service.store.add_deployment(Deployment(
+            id="relaunching-record",
+            alias="relaunching",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-r0",
+            settings={"manager_deployment_id": "old-manager"},
+        ))
+        lock = self.service._deployment_action_locks.setdefault(
+            "relaunching-record", asyncio.Lock(),
+        )
+        await lock.acquire()
+        delete_task = asyncio.create_task(
+            self.service.delete_deployment("relaunching-record"),
+        )
+        await asyncio.sleep(0)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+        self.service.store.update_managed_routing(
+            "relaunching-record",
+            {"manager_deployment_id": "replacement-manager"},
+            "replacement-r0",
+            None,
+        )
+        self.manager.deployments = [{
+            "id": "replacement-manager",
+            "sparkdeck_record_id": "relaunching-record",
+            "members": [{"container_name": "replacement-r0"}],
+        }]
+        lock.release()
+
+        result = await delete_task
+
+        self.assertEqual(result, {"ok": True, "id": "relaunching-record"})
+        self.manager.deployment_action.assert_awaited_once_with(
+            "replacement-manager", "remove",
+        )
+        self.assertIsNone(self.service.store.deployment("relaunching-record"))
+
     async def test_delete_removes_every_persisted_orphaned_cluster_rank(self):
         self.service.store.add_deployment(Deployment(
             id="orphaned-record",

@@ -4137,6 +4137,18 @@ class SparkDeckService:
         return {"logs": await self.manager.get_cluster_member_logs(container, bounded_tail)}
 
     async def delete_deployment(self, deployment_id: str) -> dict[str, Any]:
+        # Start/stop can replace the Manager deployment and its member names.
+        # Take the same record lock before reading either catalog so deletion
+        # cannot act on a stale pre-relaunch snapshot.
+        lock = self._deployment_action_locks.setdefault(
+            deployment_id, asyncio.Lock(),
+        )
+        async with lock:
+            return await self._delete_deployment_locked(deployment_id)
+
+    async def _delete_deployment_locked(
+        self, deployment_id: str,
+    ) -> dict[str, Any]:
         # A provisional row is visible while Docker launch is in flight. Wait
         # only for that deployment to settle; unrelated removals must remain
         # responsive during a slow image pull or container startup.

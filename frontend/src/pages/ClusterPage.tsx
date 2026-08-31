@@ -59,6 +59,7 @@ export function ClusterPage() {
   const [form, setForm] = useState(emptyJoin)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const [copyError, setCopyError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [copied, setCopied] = useState<string>()
   const [editingNodeId, setEditingNodeId] = useState<string>()
@@ -80,11 +81,11 @@ export function ClusterPage() {
   const copy = async (value: string, label: string) => {
     try {
       await copyToClipboard(value)
-      setError(undefined)
+      setCopyError(undefined)
       setCopied(label)
       window.setTimeout(() => setCopied(undefined), 1800)
     } catch {
-      setError('Copy was blocked by the browser. Select the value and copy it manually.')
+      setCopyError('Copy was blocked by the browser. Select the value and copy it manually.')
     }
   }
 
@@ -244,6 +245,7 @@ export function ClusterPage() {
       {resource.loading && <LoadingState label="Loading cluster status" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
       {error && <p className="form-error" role="alert">{error}</p>}
+      {copyError && <p className="form-error" role="alert">{copyError}</p>}
       {notice && <p className="inline-success" role="status">{notice}</p>}
 
       {status && <>

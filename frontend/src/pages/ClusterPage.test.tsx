@@ -148,6 +148,21 @@ describe('ClusterPage', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Pairing code expired')
     expect(screen.getByRole('button', { name: 'Join controller' })).toBeInTheDocument()
+
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn().mockReturnValue(true) })
+    try {
+      await user.click(screen.getByRole('button', { name: 'Cancel' }))
+      await user.click(screen.getByRole('button', {
+        name: 'Copy http://100.64.0.10:7878',
+      }))
+      expect(screen.getByRole('alert')).toHaveTextContent('Pairing code expired')
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
   })
 
   it('renames any node inline and keeps worker gateway role labels accurate', async () => {

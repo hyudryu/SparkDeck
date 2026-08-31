@@ -962,6 +962,52 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager.remove_container.assert_not_awaited()
 
+    async def test_delete_refreshes_owner_after_manager_side_redeployment(self):
+        self.service.store.add_deployment(Deployment(
+            id="auto-redeployed-record",
+            alias="auto-redeployed",
+            runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"),
+            container_name="old-primary-r0",
+            settings={"manager_deployment_id": "old-manager"},
+        ))
+        self.manager.deployments = [{
+            "id": "old-manager",
+            "sparkdeck_record_id": "auto-redeployed-record",
+            "members": [{"container_name": "old-primary-r0"}],
+        }]
+
+        async def remove_manager(deployment_id, action):
+            if deployment_id == "old-manager":
+                self.service.store.update_managed_routing(
+                    "auto-redeployed-record",
+                    {"manager_deployment_id": "replacement-manager"},
+                    "replacement-primary-r0",
+                    None,
+                )
+                self.manager.deployments = [{
+                    "id": "replacement-manager",
+                    "sparkdeck_record_id": "auto-redeployed-record",
+                    "members": [{"container_name": "replacement-primary-r0"}],
+                }]
+                raise ValueError("deployment not found")
+            return {"ok": True, "errors": []}
+
+        self.manager.deployment_action = AsyncMock(side_effect=remove_manager)
+
+        result = await self.service.delete_deployment("auto-redeployed-record")
+
+        self.assertEqual(result, {"ok": True, "id": "auto-redeployed-record"})
+        self.assertEqual(
+            [call.args for call in self.manager.deployment_action.await_args_list],
+            [("old-manager", "remove"), ("replacement-manager", "remove")],
+        )
+        self.assertIsNone(
+            self.service.store.deployment("auto-redeployed-record"),
+        )
+        self.manager.remove_container.assert_not_awaited()
+
     async def test_delete_accepts_current_owner_removed_concurrently(self):
         self.service.store.add_deployment(Deployment(
             id="racing-record",

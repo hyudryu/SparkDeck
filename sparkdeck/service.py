@@ -4176,22 +4176,47 @@ class SparkDeckService:
         ), None)
         owner = self._owning_cluster_deployment(deployment.get("container_name"))
         cluster_removed = False
+        manager_missing = False
         if manager_id:
             try:
                 result = await self.manager.deployment_action(manager_id, "remove")
             except (LookupError, ValueError) as exc:
                 if not _is_missing_deployment_error(exc):
                     raise
+                manager_missing = True
             else:
                 if not result.get("ok"):
                     raise RuntimeError(
                         "; ".join(result.get("errors") or ["cluster removal failed"])
                     )
                 cluster_removed = True
+        if manager_missing:
+            # Manager can replace a deployment under its own lifecycle lock
+            # (for example, an automatic vLLM capacity adjustment) without
+            # taking this service's record lock. Refresh both catalogs after
+            # the old ID is confirmed absent so its replacement is not orphaned.
+            deployment = (
+                self.store.deployment(deployment_id, include_private=True)
+                or deployment
+            )
+            refreshed_manager_id = (
+                deployment.get("settings", {}).get("manager_deployment_id")
+            )
+            linked = next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id") and (
+                    item.get("sparkdeck_record_id") == deployment.get("id")
+                    or item.get("id") == refreshed_manager_id
+                )
+            ), None)
+            owner = self._owning_cluster_deployment(
+                deployment.get("container_name"),
+            )
+            manager_id = refreshed_manager_id or manager_id
         current_owner = linked or owner
         if (
             not cluster_removed and current_owner
-            and current_owner["id"] != manager_id
+            and (manager_missing or current_owner["id"] != manager_id)
         ):
             # Removing one rank of a cluster would leave the health monitor to
             # resurrect the deployment. This also covers a stale saved Manager

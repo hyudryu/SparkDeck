@@ -68,6 +68,11 @@ describe('settings page', () => {
     expect(policy).toHaveTextContent('stable opaque telemetry cluster identifier')
     expect(policy).toHaveTextContent('randomly generated and does not contain an account ID, hostname, node name, or endpoint alias')
     expect(policy).toHaveTextContent('Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included')
+    expect(policy).toHaveTextContent('Amazon Web Services infrastructure in the US East (Ohio) Region (us-east-2)')
+    expect(policy).toHaveTextContent('operator-configured deployments can replace the authentication or Community Features endpoints')
+    expect(policy).toHaveTextContent('software for running and interacting with artificial intelligence models')
+    expect(policy).toHaveTextContent('does not use account information or submitted benchmark telemetry to train generative AI models')
+    expect(policy).toHaveTextContent('request access, correction, or deletion of your hosted account and associated Community Features data')
     expect(policy).not.toHaveTextContent('tensor-parallel (TP) size')
     expect(policy).toHaveTextContent('California residents may have rights')
     await user.keyboard('{Escape}')
@@ -968,6 +973,10 @@ describe('community features sign-in', () => {
     await user.type(screen.getByLabelText('Confirm password'), 'Password1')
     expect(screen.getByRole('button', { name: 'Create account' })).toBeDisabled()
     await user.click(screen.getByRole('checkbox', { name: /at least 18 years old/ }))
+    expect(screen.getByRole('button', { name: 'Create account' })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Privacy Policy/ }))
+    expect(screen.getByRole('button', { name: 'Create account' })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Terms & Conditions/ }))
     await user.click(screen.getByRole('button', { name: 'Create account' }))
 
     expect(await screen.findByLabelText('Confirmation code')).toBeInTheDocument()
@@ -995,10 +1004,30 @@ describe('community features sign-in', () => {
     await user.type(screen.getByLabelText('Password'), 'Password1')
     await user.type(screen.getByLabelText('Confirm password'), 'Password2')
     await user.click(screen.getByRole('checkbox', { name: /at least 18 years old/ }))
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Privacy Policy/ }))
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Terms & Conditions/ }))
     await user.click(screen.getByRole('button', { name: 'Create account' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Passwords do not match')
     expect(cognitoCalls(fetchMock, 'SignUp')).toHaveLength(0)
+  })
+
+  it('requires fresh signup agreements after leaving the signup flow', async () => {
+    stubSettingsFetch(vi.fn<typeof fetch>())
+    const user = userEvent.setup()
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Create account' }))
+    await user.click(screen.getByRole('checkbox', { name: /at least 18 years old/ }))
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Privacy Policy/ }))
+    await user.click(screen.getByRole('checkbox', { name: /agree to the Terms & Conditions/ }))
+    await user.click(screen.getByRole('button', { name: 'Back to sign in' }))
+    await user.click(screen.getByRole('button', { name: 'Create account' }))
+
+    expect(screen.getByRole('checkbox', { name: /at least 18 years old/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /agree to the Privacy Policy/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /agree to the Terms & Conditions/ })).not.toBeChecked()
   })
 
   it('shows a friendly message when the password is wrong', async () => {

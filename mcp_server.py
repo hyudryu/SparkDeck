@@ -189,7 +189,7 @@ class ControllerClient:
     ) -> str:
         """Resolve either a Manager ID or stable SparkDeck record ID."""
         state = await self.state()
-        deployment = next(
+        manager_deployment = next(
             (
                 item for item in state.get("deployments", [])
                 if (
@@ -199,28 +199,49 @@ class ControllerClient:
             ),
             None,
         )
-        if deployment is not None:
-            if (
-                require_owned
-                and deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}
-            ):
-                raise ControllerError(
-                    f"refusing to modify deployment {deployment_id}: "
-                    "it was not created by this MCP server"
+        # Listing is intentional: it performs SparkDeck's Manager/catalog
+        # reconciliation and gives pre-stable-ID deployments a record ID on
+        # their first MCP request. The catalog also retains durable ownership
+        # when Manager replaces a deployment during a configuration relaunch.
+        catalog = await self._request("GET", "/api/v1/deployments")
+        records = catalog.get("items") if isinstance(catalog, dict) else None
+        if not isinstance(records, list):
+            raise ControllerError("controller returned an invalid deployment catalog")
+        manager_id = (
+            str(manager_deployment.get("id"))
+            if isinstance(manager_deployment, dict) and manager_deployment.get("id")
+            else None
+        )
+        reverse_id = (
+            str(manager_deployment.get("sparkdeck_record_id"))
+            if isinstance(manager_deployment, dict)
+            and manager_deployment.get("sparkdeck_record_id") else None
+        )
+        record = next((
+            item for item in records
+            if isinstance(item, dict) and (
+                str(item.get("id") or "") == deployment_id
+                or (reverse_id and str(item.get("id") or "") == reverse_id)
+                or (
+                    manager_id
+                    and str((item.get("settings") or {}).get(
+                        "manager_deployment_id"
+                    ) or "") == manager_id
                 )
-            return str(deployment.get("sparkdeck_record_id") or deployment_id)
-        if require_owned:
-            # Distinguish an existing non-MCP record from an invalid ID while
-            # preserving the default fail-closed ownership policy.
-            detail = await self._request(
-                "GET", f"/api/v1/deployments/{quote(deployment_id, safe='')}",
             )
-            if detail.get("managed_by") not in {OWNER, *LEGACY_OWNERS}:
-                raise ControllerError(
-                    f"refusing to modify deployment {deployment_id}: "
-                    "it was not created by this MCP server"
-                )
-        return deployment_id
+        ), None)
+        if record is None or not record.get("id"):
+            raise ControllerError(f"deployment not found: {deployment_id}")
+        owner = record.get("managed_by") or (
+            manager_deployment.get("managed_by")
+            if isinstance(manager_deployment, dict) else None
+        )
+        if require_owned and owner not in {OWNER, *LEGACY_OWNERS}:
+            raise ControllerError(
+                f"refusing to modify deployment {deployment_id}: "
+                "it was not created by this MCP server"
+            )
+        return str(record["id"])
 
     async def deployment_configuration(
         self, deployment_id: str,
@@ -334,15 +355,10 @@ class ControllerClient:
             # Preserve the legacy Manager removal contract used by A/B cleanup
             # and delete_cluster_deployment. v1 record deletion has a distinct
             # DELETE route and must not be conflated with start/stop actions.
+            await self._deployment_record_id(
+                deployment_id, require_owned=require_owned,
+            )
             deployment = await self.deployment(deployment_id)
-            if (
-                require_owned
-                and deployment.get("managed_by") not in {OWNER, *LEGACY_OWNERS}
-            ):
-                raise ControllerError(
-                    f"refusing to remove deployment {deployment_id}: "
-                    "it was not created by this MCP server"
-                )
             return await self._request(
                 "POST",
                 f"/api/deployments/{quote(str(deployment['id']), safe='')}/remove",
@@ -355,7 +371,7 @@ class ControllerClient:
         )
         return await self._request(
             "POST", f"/api/v1/deployments/{quote(record_id, safe='')}/{action}",
-            timeout=300,
+            timeout=1800 if action == "start" else 300,
         )
 
     async def storage(self) -> dict[str, Any]:

@@ -56,29 +56,47 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def handler(request: httpx.Request) -> httpx.Response:
             methods.append(request.method)
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{"id": "user-1", "managed_by": None}]
+                })
             return httpx.Response(200, json={
-                "deployments": [{"id": "user-1", "managed_by": None}]
+                "items": [{"id": "user-record", "managed_by": None,
+                           "settings": {"manager_deployment_id": "user-1"}}],
             })
 
         client = ControllerClient(transport=httpx.MockTransport(handler))
         with self.assertRaisesRegex(ControllerError, "not created by this MCP"):
             await client.action("user-1", "remove")
-        self.assertEqual(methods, ["GET"])
+        self.assertEqual(methods, ["GET", "GET"])
 
     async def test_deployment_configuration_and_lifecycle_use_stable_v1_id(self) -> None:
         requests: list[tuple[str, str, dict | None]] = []
+        timeouts: list[tuple[str, float]] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content) if request.content else None
             requests.append((request.method, request.url.path, body))
+            if request.method == "POST":
+                timeouts.append((
+                    request.url.path,
+                    request.extensions["timeout"]["read"],
+                ))
             if request.url.path == "/api/state":
                 return httpx.Response(200, json={
                     "deployments": [{
                         "id": "manager-1",
                         "sparkdeck_record_id": "record-1",
-                        "managed_by": "sparkdeck-mcp",
+                        # Manager can lose this during a settings relaunch; the
+                        # durable catalog record remains authoritative.
+                        "managed_by": None,
                     }],
                 })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "record-1", "managed_by": "sparkdeck-mcp",
+                    "settings": {"manager_deployment_id": "manager-1"},
+                }]})
             if request.method == "GET":
                 return httpx.Response(200, json={
                     "id": "record-1", "editable": True,
@@ -108,9 +126,8 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(started["ok"])
         self.assertTrue(stopped["ok"])
         self.assertTrue(removed["ok"])
-        non_state = [request for request in requests if request[1] != "/api/state"]
-        self.assertEqual(non_state, [
-            ("GET", "/api/v1/deployments/record-1", None),
+        mutations = [request for request in requests if request[0] != "GET"]
+        self.assertEqual(mutations, [
             ("PUT", "/api/v1/deployments/record-1/settings", {
                 "environment": {"NCCL_DEBUG": "WARN"},
                 "extra_args": ["--enable-prefix-caching"],
@@ -119,6 +136,46 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/api/v1/deployments/record-1/start", None),
             ("POST", "/api/v1/deployments/record-1/stop", None),
             ("POST", "/api/deployments/manager-1/remove", None),
+        ])
+        self.assertEqual(
+            sum(path == "/api/v1/deployments" for _, path, _ in requests), 5,
+        )
+        self.assertIn(
+            ("GET", "/api/v1/deployments/record-1", None), requests,
+        )
+        self.assertEqual(timeouts, [
+            ("/api/v1/deployments/record-1/start", 1800),
+            ("/api/v1/deployments/record-1/stop", 300),
+            ("/api/deployments/manager-1/remove", 300),
+        ])
+
+    async def test_legacy_manager_id_is_reconciled_before_v1_action(self) -> None:
+        paths = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            paths.append((request.method, request.url.path))
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{
+                        "id": "legacy-manager", "managed_by": "sparkdeck-mcp",
+                    }],
+                })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "adopted-record", "managed_by": "sparkdeck-mcp",
+                    "settings": {"manager_deployment_id": "legacy-manager"},
+                }]})
+            return httpx.Response(200, json={"ok": True})
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+
+        result = await client.action("legacy-manager", "start")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(paths, [
+            ("GET", "/api/state"),
+            ("GET", "/api/v1/deployments"),
+            ("POST", "/api/v1/deployments/adopted-record/start"),
         ])
 
     async def test_configuration_update_requires_explicit_unowned_override(self) -> None:
@@ -134,6 +191,11 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
                         "managed_by": None,
                     }],
                 })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "user-record", "managed_by": None,
+                    "settings": {"manager_deployment_id": "user-manager"},
+                }]})
             return httpx.Response(200, json={"id": "user-record", "editable": True})
 
         client = ControllerClient(transport=httpx.MockTransport(handler))
@@ -148,7 +210,9 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(updated["editable"])
         self.assertEqual(requests, [
             ("GET", "/api/state"),
+            ("GET", "/api/v1/deployments"),
             ("GET", "/api/state"),
+            ("GET", "/api/v1/deployments"),
             ("PUT", "/api/v1/deployments/user-record/settings"),
         ])
 
@@ -162,6 +226,11 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
                         "managed_by": "sparkdeck-mcp",
                     }],
                 })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "record-1", "managed_by": "sparkdeck-mcp",
+                    "settings": {"manager_deployment_id": "manager-1"},
+                }]})
             return httpx.Response(
                 409,
                 json={"detail": "Stop the cluster before changing launch settings"},

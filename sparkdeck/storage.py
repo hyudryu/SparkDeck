@@ -289,14 +289,12 @@ class SparkDeckStore:
                     "ALTER TABLE benchmark_samples "
                     "ADD COLUMN consent_generation INTEGER"
                 )
-                current_generation = int(self.get_setting(
-                    "community_consent_generation", 0,
-                ))
+                # Ownerless legacy instructions cannot safely be attributed to
+                # whichever account happens to be paired during this upgrade.
+                # Preserve the benchmark history but fail closed on uploading it.
                 self._connection.execute(
-                    "UPDATE benchmark_samples SET consent_generation = ? "
-                    "WHERE id IN (SELECT sample_id FROM upload_outbox "
-                    "WHERE status IN ('pending', 'failed', 'waiting_for_account'))",
-                    (current_generation,),
+                    "DELETE FROM upload_outbox WHERE status IN "
+                    "('pending', 'failed', 'waiting_for_account')"
                 )
             for column_name, column_type in (
                 ("community_model_id", "TEXT"),

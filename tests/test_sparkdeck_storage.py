@@ -410,7 +410,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             self.store.community_consent_snapshot()["generation"], 1,
         )
 
-    def test_migration_backfills_current_consent_epoch_only_for_unsent_rows(self):
+    def test_migration_discards_ownerless_legacy_upload_instructions(self):
         self.store.set_setting("device_pairing", {"status": "paired"})
         consent = self.store.set_community_consent(True)
         base = BenchmarkSample(
@@ -448,9 +448,9 @@ class SparkDeckStoreTests(unittest.TestCase):
             "SELECT id, consent_generation FROM benchmark_samples"
         ).fetchall())
         self.assertIsNone(generations["synced-old"])
-        self.assertEqual(
-            generations["pending-current"], consent["generation"],
-        )
+        self.assertIsNone(generations["pending-current"])
+        self.assertEqual(self.store.outbox_batch(), [])
+        self.assertEqual(self.store.benchmarks()[1], 2)
 
     def test_migration_adds_cluster_id_column_to_legacy_benchmark_table(self):
         database = Path(self.temp.name) / "legacy-benchmarks.sqlite3"

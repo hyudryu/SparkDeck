@@ -142,6 +142,8 @@ interface ChartGeometry {
   maxSeconds: number
   ticks: { value: number; y: number; label: string }[]
   series: ChartSeries[]
+  legendSeries: ChartSeries[]
+  legendOverflow: number
   maxMarkers: ChartMarker[]
 }
 
@@ -170,6 +172,11 @@ function chartGeometry(runs: TemperatureRun[], colorFor: (runId: string) => stri
   minTemp = Math.max(0, Math.floor((minTemp - 5) / 10) * 10)
   maxTemp = Math.min(130, Math.ceil((maxTemp + 5) / 10) * 10)
   if (maxTemp - minTemp < 20) maxTemp = Math.min(130, minTemp + 20)
+  // The 0–130 clamp must never exclude stored samples: anomalous readings
+  // (e.g. 255°C from a disconnected sensor) are valid data, so extend the
+  // domain to cover whatever was actually observed.
+  if (Number.isFinite(minObserved)) minTemp = Math.min(minTemp, Math.floor((minObserved - 5) / 10) * 10)
+  if (Number.isFinite(maxObserved)) maxTemp = Math.max(maxTemp, Math.ceil((maxObserved + 5) / 10) * 10)
 
   const left = 62
   const right = 878
@@ -209,6 +216,12 @@ function chartGeometry(runs: TemperatureRun[], colorFor: (runId: string) => stri
     legendX: left + (index % legendColumns) * 272,
     legendY: 48 + Math.floor(index / legendColumns) * 27,
   }))
+  // Only render legend entries that fit above the (clamped) plot top; the
+  // remaining runs still plot, and a "+N more" indicator takes the last slot.
+  const maxLegendRows = Math.max(1, Math.floor((top - 42) / 27))
+  const maxLegendEntries = legendColumns * maxLegendRows
+  const legendOverflow = series.length > maxLegendEntries ? series.length - maxLegendEntries + 1 : 0
+  const legendSeries = series.slice(0, legendOverflow ? maxLegendEntries - 1 : maxLegendEntries)
   const maximumFor = (key: 'cpu_temp_c' | 'gpu_temp_c', kind: 'CPU' | 'GPU', markerIndex: number): ChartMarker | null => {
     let maximum: { value: number; seconds: number; runId: string; runName: string } | null = null
     for (const run of runs) {
@@ -250,7 +263,7 @@ function chartGeometry(runs: TemperatureRun[], colorFor: (runId: string) => stri
     const value = maxTemp - (index * (maxTemp - minTemp) / (tickCount - 1))
     return { value, y: y(value), label: `${Math.round(value)}°C` }
   })
-  return { left, right, top, bottom, maxSeconds, ticks, series, maxMarkers }
+  return { left, right, top, bottom, maxSeconds, ticks, series, legendSeries, legendOverflow, maxMarkers }
 }
 
 // The live chart inherits the document theme through CSS classes. A serialized
@@ -300,6 +313,9 @@ export function TemperatureRuns() {
   const [armBusy, setArmBusy] = useState(false)
   const [cancelBusy, setCancelBusy] = useState(false)
   const [actionError, setActionError] = useState<string>()
+  // Background sample polls fail separately from arm/cancel/rename actions so
+  // a recovered poll can clear its own alert without clobbering theirs.
+  const [detailError, setDetailError] = useState<string>()
   const [renameId, setRenameId] = useState<string>()
   const [renameValue, setRenameValue] = useState('')
   const [renameBusy, setRenameBusy] = useState(false)
@@ -330,8 +346,9 @@ export function TemperatureRuns() {
       if (detailVersionsRef.current.get(runId) === version) {
         setDetails((current) => ({ ...current, [runId]: detail }))
       }
+      setDetailError(undefined)
     } catch (reason) {
-      setActionError(reason instanceof Error ? `Could not load temperature run: ${reason.message}` : 'Could not load temperature run')
+      setDetailError(reason instanceof Error ? `Could not load temperature run: ${reason.message}` : 'Could not load temperature run')
     } finally {
       detailRequestsRef.current.delete(runId)
     }
@@ -375,14 +392,16 @@ export function TemperatureRuns() {
   // Once the list shows a previously active run has finished, force one final
   // detail refetch: the last in-flight poll may have returned pre-completion
   // samples, and the lazy loader will not refetch a cached detail on its own.
+  // This runs even when the run is deselected, so a later reselection never
+  // resurrects a partial cache entry.
   const previousActiveRef = useRef<string | null>(null)
   useEffect(() => {
     const previous = previousActiveRef.current
     previousActiveRef.current = activeRunId ?? null
-    if (previous && previous !== activeRunId && selected[previous]) {
+    if (previous && previous !== activeRunId) {
       void loadRunDetail(previous, true)
     }
-  }, [activeRunId, selected, loadRunDetail])
+  }, [activeRunId, loadRunDetail])
 
   // Chromium anchors its native color panel to the input, so keep the
   // invisible input directly below the legend dot instead of off-screen.
@@ -600,6 +619,7 @@ export function TemperatureRuns() {
             {activeRun.status === 'recording' && <span>{`Recording ${activeRun.node_name} every second; it will stop automatically below ${activeRun.target_temp_c?.toFixed?.(1)}°C.`}</span>}
           </div>}
           {actionError && <p className="inline-error" role="alert">{actionError}</p>}
+          {detailError && <p className="inline-error" role="alert">{detailError}</p>}
         </Panel>
 
         <div className="temperature-runs-workspace">
@@ -615,7 +635,14 @@ export function TemperatureRuns() {
                 role="button"
                 tabIndex={0}
                 onClick={() => toggleRun(run.id)}
-                onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); toggleRun(run.id) } }}
+                onKeyDown={(event) => {
+                  // Enter inside the nested rename form must submit the form,
+                  // not toggle the run's selection.
+                  if (event.key !== 'Enter') return
+                  if ((event.target as HTMLElement).closest('input, button, form')) return
+                  event.preventDefault()
+                  toggleRun(run.id)
+                }}
               >
                 <span className="temperature-run-check">{selected[run.id] ? '✓' : ''}</span>
                 <div className="temperature-run-copy">
@@ -678,7 +705,7 @@ export function TemperatureRuns() {
                     : <circle cx={marker.x} cy={marker.y} r={4.5} fill={marker.color} className="temperature-max-circle" strokeWidth={1.5} />}
                   <text x={marker.labelX} y={marker.labelY} textAnchor={marker.textAnchor} className="temperature-max-label">{`${marker.kind} max ${marker.value.toFixed(1)}°C · ${truncate(marker.runName, 15)}`}</text>
                 </g>)}
-                {geometry.series.map((series) => <g key={`legend-${series.id}`} transform={`translate(${series.legendX} ${series.legendY})`}>
+                {geometry.legendSeries.map((series) => <g key={`legend-${series.id}`} transform={`translate(${series.legendX} ${series.legendY})`}>
                   <circle
                     cx={4} cy={0} r={5} fill={series.color}
                     className="temperature-run-color-dot"
@@ -694,6 +721,11 @@ export function TemperatureRuns() {
                   <line x1={202} y1={0} x2={221} y2={0} stroke={series.color} strokeWidth={2.5} strokeDasharray="4 5" />
                   <text x={225} y={4} className="chart-axis-label">GPU</text>
                 </g>)}
+                {geometry.legendOverflow > 0 && <text
+                  x={geometry.left + (geometry.legendSeries.length % 3) * 272}
+                  y={48 + Math.floor(geometry.legendSeries.length / 3) * 27 + 4}
+                  className="chart-axis-label"
+                >{`+${geometry.legendOverflow} more`}</text>}
                 {geometry.series.length === 0 && <text x={450} y={244} textAnchor="middle" className="chart-axis-label">Select one or more runs to graph.</text>}
                 <line className="temperature-chart-axis" x1={geometry.left} y1={geometry.top} x2={geometry.left} y2={geometry.bottom} />
                 <line className="temperature-chart-axis" x1={geometry.left} y1={geometry.bottom} x2={geometry.right} y2={geometry.bottom} />

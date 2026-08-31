@@ -87,6 +87,16 @@ _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
 )
 
 
+def _container_last_deployed_at(container: dict[str, Any]) -> str | float | None:
+    """Return a usable Docker launch timestamp for deployment recency."""
+    value = container.get("started_at") or container.get("created")
+    if isinstance(value, (int, float)):
+        return value if value > 0 else None
+    if isinstance(value, str) and value and not value.startswith("0001-"):
+        return value
+    return None
+
+
 def _discovered_launch_controls(
     manager: Any, engine: str, settings: dict[str, Any], extra_args: list[str],
 ) -> dict[str, Any]:
@@ -984,6 +994,9 @@ class SparkDeckService:
                 # pulling, starting, or failing.
                 if not stored.get("settings", {}).get("manager_deployment_id"):
                     stored["status"] = _managed_container_status(container)
+                    last_deployed_at = _container_last_deployed_at(container)
+                    if last_deployed_at is not None:
+                        stored["last_deployed_at"] = last_deployed_at
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -3424,6 +3437,11 @@ class SparkDeckService:
             "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
             "node_ids": list(node_ids),
         })
+        if node_ids[0] == LOCAL_NODE_ID:
+            # The source Docker container still owns its controller port even
+            # while stopped. Let Manager allocate a fresh port for the managed
+            # replacement instead of failing preflight on that binding.
+            launch_settings.pop("port", None)
         replacement = await self.manager.create_deployment(launch_settings)
         adopted_launch_settings = {
             **launch_settings,
@@ -4333,14 +4351,8 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
-        last_deployed_at = container.get("started_at") or container.get("created")
-        if (
-            isinstance(last_deployed_at, (int, float)) and last_deployed_at > 0
-        ) or (
-            isinstance(last_deployed_at, str)
-            and last_deployed_at
-            and not last_deployed_at.startswith("0001-")
-        ):
+        last_deployed_at = _container_last_deployed_at(container)
+        if last_deployed_at is not None:
             result["last_deployed_at"] = last_deployed_at
         try:
             tensor_parallel = max(

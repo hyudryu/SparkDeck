@@ -254,10 +254,12 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
             manager.list_containers.return_value = [container]
-            manager._recovered_deployment_launch_settings = Mock(return_value={})
+            manager._recovered_deployment_launch_settings = Mock(return_value={
+                "port": 8214,
+            })
             manager.create_deployment = AsyncMock(return_value={
                 "id": "cluster-single", "name": "org/model", "status": "starting",
-                "node_ids": ["local"], "api_port": 8214,
+                "node_ids": ["local"], "api_port": 8215,
                 "members": [{"container_name": "cluster-single-r0"}],
                 "launch_settings": {"deployment_mode": "single", "node_ids": ["local"]},
             })
@@ -269,6 +271,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             )
 
             manager.create_deployment.assert_awaited_once()
+            self.assertNotIn("port", manager.create_deployment.await_args.args[0])
             self.assertEqual(result["kind"], "managed")
             self.assertEqual(result["node_ids"], ["local"])
             await manager.http.aclose()
@@ -394,6 +397,30 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(listed[0]["settings"]["max_concurrency"], 32)
             self.assertEqual(
                 listed[0]["last_deployed_at"], "2026-08-28T12:00:00+00:00",
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_registered_standalone_uses_container_start_for_recency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "legacy-managed", "model": "org/model",
+                "engine": "vllm", "managed": True, "status": "exited",
+                "port": 8000, "started_at": "2026-08-30T12:34:56Z",
+            }]
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="legacy", alias="Legacy", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                container_name="legacy-managed",
+            ))
+
+            listed = await service.deployments()
+
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(
+                listed[0]["last_deployed_at"], "2026-08-30T12:34:56Z",
             )
             await manager.http.aclose()
             await service.close()

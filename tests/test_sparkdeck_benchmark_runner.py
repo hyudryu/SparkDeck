@@ -543,6 +543,24 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret.internal", rendered)
         self.assertIn("Request #212 completed: 1 tokens", rendered)
 
+    def test_progress_stream_treats_invalid_token_count_as_unknown(self):
+        service = self._service()
+        progress_path = Path(self.temp.name) / "invalid-token-progress.jsonl"
+        progress_path.write_text(json.dumps({
+            "type": "request_end", "request_id": 7,
+            "total_tokens": "not-a-number", "error": "",
+        }) + "\n", encoding="utf-8")
+        run = {"progress": {"requests_done": 0, "requests_failed": 0}}
+
+        offset = service._consume_progress(run, progress_path, 0)
+
+        self.assertEqual(offset, progress_path.stat().st_size)
+        self.assertEqual(run["progress"]["requests_done"], 1)
+        self.assertEqual(
+            run["progress"]["log_lines"],
+            ["Request #7 completed: token count unavailable"],
+        )
+
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
 

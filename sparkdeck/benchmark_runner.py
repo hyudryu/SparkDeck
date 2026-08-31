@@ -558,9 +558,17 @@ class BenchmarkRunnerService:
                     log_lines.append(f"Request #{request_id} failed")
                 else:
                     progress["requests_done"] = int(progress.get("requests_done") or 0) + 1
+                    try:
+                        total_tokens = int(event.get("total_tokens"))
+                    except (TypeError, ValueError):
+                        total_tokens = None
+                    token_summary = (
+                        f"{total_tokens} tokens"
+                        if total_tokens is not None else "token count unavailable"
+                    )
                     log_lines.append(
                         f"Request #{request_id} completed: "
-                        f"{int(event.get('total_tokens') or 0)} tokens"
+                        f"{token_summary}"
                     )
             elif event_type == "bench_complete":
                 log_lines.append(

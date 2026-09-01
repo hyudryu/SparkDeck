@@ -1370,11 +1370,25 @@ export function ModelsPage() {
   }
 
   // Tailing refreshes the open viewer on an interval and pins the panel to
-  // the newest output, like `logs --follow`.
+  // the newest output, like `logs --follow`. The next refresh is scheduled
+  // only after the current one settles so a slow log request cannot pile up
+  // overlapping requests that discard each other as stale.
   useEffect(() => {
     if (!logTailing || !logViewer) return
-    const timer = window.setInterval(() => void loadLogs(logViewer.id), 2000)
-    return () => window.clearInterval(timer)
+    let cancelled = false
+    let timer: number | undefined
+    const schedule = () => {
+      timer = window.setTimeout(() => {
+        void loadLogs(logViewer.id).finally(() => {
+          if (!cancelled) schedule()
+        })
+      }, 2000)
+    }
+    schedule()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [logTailing, logViewer, loadLogs])
 
   useEffect(() => {

@@ -3,6 +3,7 @@ import { ArrowDownToLine, Bookmark, Check, ChevronDown, ChevronRight, Copy, Fold
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
@@ -1966,7 +1967,7 @@ export function ModelsPage() {
                       <div className="field-grid">
                         <label className="field"><span>Context window</span><input type="number" min="1" value={editor.form.context_window} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, context_window: event.target.value } })} /></label>
                         <label className="field"><span>Max concurrency</span><input type="number" min="1" value={editor.form.max_concurrency} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, max_concurrency: event.target.value } })} /></label>
-                        <label className="field"><span>KV cache dtype</span><input value={editor.form.kv_cache_dtype} placeholder="auto" onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, kv_cache_dtype: event.target.value } })} /></label>
+                        <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={recipe.engine || 'vllm'} value={editor.form.kv_cache_dtype} onChange={(value) => setArgsEditor(recipe.id, { form: { ...editor.form, kv_cache_dtype: value } })} /></label>
                         <label className="field"><span>Thinking</span><select value={editor.form.thinking_mode} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, thinking_mode: event.target.value } })}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
                         {isVllm && <>
                           <label className="field"><span>Speculative method</span><select value={editor.form.speculative_method} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, speculative_method: event.target.value } })}><option value="">Auto / unset</option>{editor.form.speculative_method && !SPECULATIVE_METHODS.includes(editor.form.speculative_method) && <option value={editor.form.speculative_method}>{editor.form.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>

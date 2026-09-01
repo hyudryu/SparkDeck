@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -112,6 +112,76 @@ describe('deployment object page', () => {
     await user.clear(maxConcurrency)
     await user.type(maxConcurrency, '7')
     expect(save).toBeEnabled()
+  })
+
+  it('offers KV cache dtype choices and saves the selected value', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const kvCacheDtype = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(kvCacheDtype).toHaveValue('')
+    expect(within(kvCacheDtype).getByRole('option', { name: 'Auto / unset' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'fp8' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'fp8_e4m3' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'nvfp4_ds_mla' })).toBeInTheDocument()
+
+    await user.selectOptions(kvCacheDtype, 'fp8_e4m3')
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input) === '/api/v1/runtime-flags/preview'
+      && JSON.parse(String(init?.body)).launch_controls.kv_cache_dtype === 'fp8_e4m3'
+    ))).toBe(true))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const saveCall = await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input) === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT'
+      ))
+      expect(call).toBeDefined()
+      return call
+    })
+    expect(JSON.parse(String(saveCall?.[1]?.body)).launch_controls.kv_cache_dtype).toBe('fp8_e4m3')
+  })
+
+  it('preserves a custom KV cache dtype as a selectable current value', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const body = String(input) === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'future_dtype' } }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const kvCacheDtype = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(kvCacheDtype).toHaveValue('future_dtype')
+    expect(within(kvCacheDtype).getByRole('option', { name: 'future_dtype (current)' })).toBeInTheDocument()
+  })
+
+  it('uses SGLang KV choices and hides the unsupported llama.cpp control', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, runtime: 'sglang', launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'bf16' } }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    const rendered = renderPage()
+
+    const sglangKv = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(sglangKv).toHaveValue('bf16')
+    expect(within(sglangKv).getByRole('option', { name: 'fp4_mx_block16' })).toBeInTheDocument()
+    expect(within(sglangKv).queryByRole('option', { name: 'nvfp4_ds_mla' })).not.toBeInTheDocument()
+
+    rendered.unmount()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, runtime: 'llama.cpp' }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+    await screen.findByRole('heading', { name: 'Reasoning server' })
+    expect(screen.queryByLabelText('KV cache dtype')).not.toBeInTheDocument()
   })
 
   it('shows saved flags and saves before running, then returns to Models', async () => {

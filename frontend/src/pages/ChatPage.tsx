@@ -1,5 +1,5 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { ArrowUp, Bot, Gauge, Square, Trash2 } from 'lucide-react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent } from 'react'
+import { ArrowUp, Bot, Gauge, ImagePlus, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { ChatMessage, ChatResponseMetrics } from '../api/types'
 import { Button, ErrorState, PageHeader, RuntimeMark } from '../components/ui'
@@ -9,14 +9,59 @@ const MarkdownContent = lazy(() => import('../components/MarkdownContent').then(
   default: module.MarkdownContent,
 })))
 
-interface ConversationMessage extends ChatMessage {
+interface ChatImageAttachment {
   id: string
+  name: string
+  type: string
+  size: number
+  dataUrl: string
+}
+
+interface ConversationMessage {
+  id: string
+  role: ChatMessage['role']
+  content: string
+  images?: ChatImageAttachment[]
   model?: string
   reasoning?: string
   metrics?: ChatResponseMetrics
   streaming?: boolean
   stopped?: boolean
   failed?: boolean
+}
+
+const ACCEPTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+const ACCEPTED_IMAGE_INPUT = [...ACCEPTED_IMAGE_TYPES].join(',')
+const MAX_IMAGES_PER_MESSAGE = 4
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+const MAX_CONVERSATION_IMAGE_BYTES = 20 * 1024 * 1024
+
+const formatImageSize = (bytes: number) => bytes < 1024 * 1024
+  ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+  : `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+
+const hasImageSignature = async (file: File) => {
+  const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer())
+  if (file.type === 'image/png') return [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => bytes[index] === byte)
+  if (file.type === 'image/jpeg') return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+  if (file.type === 'image/gif') return new TextDecoder().decode(bytes.slice(0, 6)) === 'GIF87a' || new TextDecoder().decode(bytes.slice(0, 6)) === 'GIF89a'
+  return new TextDecoder().decode(bytes.slice(0, 4)) === 'RIFF' && new TextDecoder().decode(bytes.slice(8, 12)) === 'WEBP'
+}
+
+const readImage = async (file: File, id: string): Promise<ChatImageAttachment> => {
+  if (!await hasImageSignature(file)) throw new Error(`${file.name || 'Image'} does not contain valid ${file.type.replace('image/', '').toUpperCase()} image data.`)
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}`))
+    reader.onload = () => {
+      if (typeof reader.result !== 'string' || !reader.result.startsWith(`data:${file.type};base64,`)) {
+        reject(new Error(`Could not read ${file.name} as an image`))
+        return
+      }
+      resolve({ id, name: file.name || 'Pasted image', type: file.type, size: file.size, dataUrl: reader.result })
+    }
+    reader.readAsDataURL(file)
+  })
 }
 
 function formatRate(value: number | undefined, streaming?: boolean) {
@@ -45,10 +90,15 @@ export function ChatPage() {
   const [model, setModel] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])
+  const [images, setImages] = useState<ChatImageAttachment[]>([])
+  const [imageError, setImageError] = useState<string>()
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string>()
   const abortRef = useRef<AbortController | null>(null)
   const messageIdRef = useRef(0)
+  const imageIdRef = useRef(0)
+  const imagesRef = useRef<ChatImageAttachment[]>([])
+  const imageInputRef = useRef<HTMLInputElement>(null)
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
   const selectedModel = model || running[0]?.alias || ''
@@ -63,15 +113,71 @@ export function ChatPage() {
     setMessages((current) => current.map((message) => message.id === id ? update(message) : message))
   }
 
+  const replaceImages = (next: ChatImageAttachment[]) => {
+    imagesRef.current = next
+    setImages(next)
+  }
+
+  const addImages = async (files: File[]) => {
+    let next = [...imagesRef.current]
+    const failures: string[] = []
+    const historyBytes = messages.reduce(
+      (total, message) => total + (message.images?.reduce((sum, image) => sum + image.size, 0) ?? 0),
+      0,
+    )
+    for (const file of files) {
+      if (!ACCEPTED_IMAGE_TYPES.has(file.type)) {
+        failures.push(`${file.name || 'Image'} is not a PNG, JPEG, WebP, or GIF image.`)
+        continue
+      }
+      if (next.length >= MAX_IMAGES_PER_MESSAGE) {
+        failures.push(`You can attach up to ${MAX_IMAGES_PER_MESSAGE} images per message.`)
+        break
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        failures.push(`${file.name || 'Image'} exceeds the 10 MB per-image limit.`)
+        continue
+      }
+      if (historyBytes + next.reduce((total, image) => total + image.size, 0) + file.size > MAX_CONVERSATION_IMAGE_BYTES) {
+        failures.push('Images exceed the 20 MB conversation limit. Clear the chat to attach more.')
+        continue
+      }
+      try {
+        next = [...next, await readImage(file, `image-${++imageIdRef.current}`)]
+      } catch (reason) {
+        failures.push(reason instanceof Error ? reason.message : `Could not read ${file.name || 'image'}.`)
+      }
+    }
+    replaceImages(next)
+    setImageError(failures.length ? failures.join(' ') : undefined)
+  }
+
+  const removeImage = (id: string) => {
+    replaceImages(imagesRef.current.filter((image) => image.id !== id))
+    setImageError(undefined)
+  }
+
+  const pasteImages = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null)
+    if (!files.length) return
+    event.preventDefault()
+    void addImages(files)
+  }
+
   const send = async (event: FormEvent) => {
     event.preventDefault()
     const content = draft.trim()
-    if (!content || !selectedModel || sending) return
+    const attachedImages = [...imagesRef.current]
+    if ((!content && !attachedImages.length) || !selectedModel || sending) return
 
     const userMessage: ConversationMessage = {
       id: `message-${++messageIdRef.current}`,
       role: 'user',
       content,
+      images: attachedImages,
     }
     const assistantId = `message-${++messageIdRef.current}`
     const assistantMessage: ConversationMessage = {
@@ -84,12 +190,23 @@ export function ChatPage() {
     const history = [...messages, userMessage]
     const requestMessages: ChatMessage[] = history
       .filter((message) => message.role !== 'assistant' || (message.content.trim() && !message.failed))
-      .map(({ role, content: messageContent }) => ({ role, content: messageContent }))
+      .map(({ role, content: messageContent, images: messageImages }) => ({
+        role,
+        content: messageImages?.length ? [
+          ...(messageContent ? [{ type: 'text' as const, text: messageContent }] : []),
+          ...messageImages.map((image) => ({
+            type: 'image_url' as const,
+            image_url: { url: image.dataUrl },
+          })),
+        ] : messageContent,
+      }))
     const controller = new AbortController()
     abortRef.current = controller
     shouldAutoScrollRef.current = true
     setMessages([...history, assistantMessage])
     setDraft('')
+    replaceImages([])
+    setImageError(undefined)
     setSending(true)
     setError(undefined)
 
@@ -128,6 +245,8 @@ export function ChatPage() {
   const clear = () => {
     abortRef.current?.abort()
     setMessages([])
+    replaceImages([])
+    setImageError(undefined)
     setError(undefined)
   }
 
@@ -154,7 +273,10 @@ export function ChatPage() {
           <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
         ) : messages.map((message) => message.role === 'user' ? (
           <article className="message message-user" key={message.id}>
-            <div className="user-message-content">{message.content}</div>
+            <div className="user-message-content">
+              {message.images?.length ? <div className="user-message-images">{message.images.map((image) => <img key={image.id} src={image.dataUrl} alt={`Attached ${image.name}`} />)}</div> : null}
+              {message.content && <div className="user-message-text">{message.content}</div>}
+            </div>
           </article>
         ) : (
           <article className="message message-assistant" key={message.id}>
@@ -179,13 +301,25 @@ export function ChatPage() {
         {error && <p className="inline-error chat-error" role="alert">{error}</p>}
       </section>
       <form className="composer" onSubmit={(event) => void send(event)}>
-        <label><span className="sr-only">Message</span><textarea rows={2} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder={running.length ? `Message ${selectedModel || 'your model'}…` : 'Start a model to begin'} disabled={!running.length} /></label>
+        {images.length > 0 && <div className="composer-attachments" aria-label="Attached images">{images.map((image) => <div className="composer-attachment" key={image.id}>
+          <img src={image.dataUrl} alt="" />
+          <span><strong>{image.name}</strong><small>{formatImageSize(image.size)}</small></span>
+          <button type="button" aria-label={`Remove ${image.name}`} onClick={() => removeImage(image.id)}><X size={14} /></button>
+        </div>)}</div>}
+        {imageError && <p className="composer-image-error" role="alert">{imageError}</p>}
+        <input ref={imageInputRef} className="sr-only" type="file" accept={ACCEPTED_IMAGE_INPUT} multiple aria-label="Choose image files" onChange={(event) => {
+          const files = Array.from(event.currentTarget.files ?? [])
+          event.currentTarget.value = ''
+          void addImages(files)
+        }} disabled={!running.length} />
+        <button type="button" className="attach-button" aria-label="Upload images" disabled={!running.length} onClick={() => imageInputRef.current?.click()}><ImagePlus size={18} /></button>
+        <label><span className="sr-only">Message</span><textarea rows={2} value={draft} onChange={(event) => setDraft(event.target.value)} onPaste={pasteImages} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder={running.length ? `Message ${selectedModel || 'your model'}…` : 'Start a model to begin'} disabled={!running.length} /></label>
         {sending ? (
           <button type="button" className="send-button stop-button" aria-label="Stop generating" onClick={stop}><Square size={15} fill="currentColor" /></button>
         ) : (
-          <button type="submit" className="send-button" aria-label="Send message" disabled={!draft.trim() || !selectedModel}><ArrowUp size={18} /></button>
+          <button type="submit" className="send-button" aria-label="Send message" disabled={(!draft.trim() && !images.length) || !selectedModel}><ArrowUp size={18} /></button>
         )}
-        <p className="composer-hint">Enter to send · Shift + Enter for a new line</p>
+        <p className="composer-hint">Paste or upload images · Enter to send · Shift + Enter for a new line</p>
       </form>
     </div>
   )

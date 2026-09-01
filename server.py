@@ -37,6 +37,11 @@ from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
 )
+from sparkdeck.request_limits import (
+    MAX_INFERENCE_REQUEST_BYTES,
+    RequestBodyTooLarge,
+    read_limited_json,
+)
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
 from sparkdeck.virtual_nas import FILE_STREAM_CONTENT_TYPE
 from sparkdeck.onboarding import (
@@ -1085,7 +1090,7 @@ async def agent_virtual_nas_delete(model_id: str, req: Request):
 @app.post("/api/agent/inference/health")
 async def agent_inference_health(req: Request):
     _require_agent(req)
-    body = await req.json()
+    body = await _inference_json(req)
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
@@ -1105,7 +1110,7 @@ async def agent_inference(endpoint: str, req: Request):
     _require_agent(req)
     if endpoint not in {"chat/completions", "completions"}:
         raise HTTPException(404, "inference endpoint not found")
-    body = await req.json()
+    body = await _inference_json(req)
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
@@ -3849,6 +3854,15 @@ async def community_upload_loop() -> None:
 
 
 # ---------- OpenAI-compatible /v1 proxy ----------
+async def _inference_json(req: Request):
+    try:
+        return await read_limited_json(req, MAX_INFERENCE_REQUEST_BYTES)
+    except RequestBodyTooLarge as exc:
+        raise HTTPException(413, "inference request exceeds the 32 MB limit") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+
+
 @app.get("/v1/models")
 async def v1_models():
     return await sparkdeck.models()
@@ -3856,10 +3870,7 @@ async def v1_models():
 
 @app.post("/v1/chat/completions")
 async def v1_chat_completions(req: Request):
-    try:
-        body = await req.json()
-    except json.JSONDecodeError:
-        raise HTTPException(400, "request body is not valid JSON")
+    body = await _inference_json(req)
     if not isinstance(body, dict) or not body.get("model"):
         raise HTTPException(400, "model is required")
     cancel = asyncio.Event()
@@ -3897,10 +3908,7 @@ async def v1_chat_completions(req: Request):
 
 @app.post("/v1/completions")
 async def v1_completions(req: Request):
-    try:
-        body = await req.json()
-    except json.JSONDecodeError:
-        raise HTTPException(400, "request body is not valid JSON")
+    body = await _inference_json(req)
     if not isinstance(body, dict) or not body.get("model"):
         raise HTTPException(400, "model is required")
     cancel = asyncio.Event()

@@ -1094,6 +1094,13 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setActionError(undefined)
     try {
+      if (action === 'stop') {
+        // The stop request awaits every rank; show the transition at once
+        // instead of leaving the row looking runnable until it resolves.
+        resource.setData((current) => current?.map((item) => (
+          item.id === deployment.id ? { ...item, status: 'stopping' } : item
+        )))
+      }
       await api.deployments.action(deployment.id, action)
       if (action === 'remove') {
         acceptedDeployments.current.delete(deployment.id)
@@ -1102,6 +1109,7 @@ export function ModelsPage() {
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
+      if (action === 'stop') resource.reload()
     } finally {
       setBusy(undefined)
     }

@@ -4906,6 +4906,32 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(deployment["status"], "stopped")
 
+    async def test_startup_retries_interrupted_stop_after_member_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment(status="stopping")
+            deployment["desired_state"] = "stopped"
+            instance.deployments = [deployment]
+            instance._wait_for_interrupted_launch_retry = mock.AsyncMock()
+            attempts = 0
+
+            async def member_action(_member, action):
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 2:
+                    raise RuntimeError("worker unreachable")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            await instance._resume_interrupted_stops()
+
+            # Both members fail on the first pass; the deployment must stay
+            # resumable ("stopping", not "error") until the retry succeeds.
+            self.assertEqual(attempts, 4)
+            instance._wait_for_interrupted_launch_retry.assert_awaited_once()
+            self.assertEqual(deployment["status"], "stopped")
+
     async def test_failed_manual_stop_remains_explicitly_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

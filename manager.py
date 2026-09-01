@@ -672,6 +672,7 @@ class Manager:
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
         self.deployment_resume_task: asyncio.Task | None = None
+        self.deployment_stop_resume_task: asyncio.Task | None = None
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
@@ -5958,24 +5959,47 @@ class Manager:
 
         A persisted "stopping" deployment has no in-flight stop after a
         restart; without re-issuing it, get_state would preserve "stopping"
-        indefinitely while the ranks keep running.
+        indefinitely while the ranks keep running. A member stop that fails
+        against a temporarily unreachable worker must stay resumable instead
+        of landing in an unactionable error, so failed passes are retried.
         """
-        candidates = [
-            deployment for deployment in list(self.deployments)
+        pending = {
+            deployment["id"] for deployment in list(self.deployments)
             if isinstance(deployment, dict)
             and deployment.get("status") == "stopping"
-        ]
-        for deployment in candidates:
-            try:
-                await self.deployment_action(deployment["id"], "stop")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                current = self._deployment(deployment.get("id"))
-                if current is not None:
-                    current["status"] = "error"
-                    current["error"] = f"Could not finish interrupted stop: {exc}"
-                    self._save_deployments()
+            and deployment.get("id")
+        }
+        while pending:
+            retry_later = set()
+            for deployment_id in pending:
+                deployment = self._deployment(deployment_id)
+                if deployment is None or deployment.get("status") == "stopped":
+                    continue
+                try:
+                    result = await self.deployment_action(deployment_id, "stop")
+                    stop_failed = not result.get("ok")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    stop_failed = True
+                    current = self._deployment(deployment_id)
+                    if current is not None:
+                        current["error"] = (
+                            f"Could not finish interrupted stop: {exc}"
+                        )
+                if stop_failed:
+                    # deployment_action reports member failures as an "error"
+                    # status; keep the resume-owned deployment resumable so
+                    # the next pass can stop ranks whose worker reconnected.
+                    current = self._deployment(deployment_id)
+                    if current is not None and current.get("status") != "stopped":
+                        current["status"] = "stopping"
+                        self._save_deployments()
+                        retry_later.add(deployment_id)
+            if not retry_later:
+                return
+            pending = retry_later
+            await self._wait_for_interrupted_launch_retry()
 
     async def _resume_interrupted_deployments(self) -> None:
         """Relaunch accepted work whose request died before containers existed."""

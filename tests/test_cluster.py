@@ -4889,6 +4889,23 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(deployment["status"], "stopped")
 
+    async def test_startup_finishes_interrupted_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment(status="stopping")
+            deployment["desired_state"] = "stopped"
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+
+            await instance._resume_interrupted_stops()
+
+            self.assertEqual(
+                [call.args[1] for call in instance._member_action.await_args_list],
+                ["stop", "stop"],
+            )
+            self.assertEqual(deployment["status"], "stopped")
+
     async def test_failed_manual_stop_remains_explicitly_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

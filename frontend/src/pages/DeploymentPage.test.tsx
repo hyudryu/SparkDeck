@@ -69,6 +69,30 @@ function renderPage() {
 }
 
 describe('deployment object page', () => {
+  it('polls the detail while a stop is in flight and updates once stopped', async () => {
+    let detailRequests = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1' && (!init?.method || init.method === 'GET')) {
+        detailRequests += 1
+        const body = detailRequests === 1
+          ? { ...detail, status: 'stopping', desired_state: 'stopped', editable: false, controllable: true }
+          : detail
+        return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByRole('button', { name: 'Stopping…' })).toBeDisabled()
+
+    await waitFor(() => expect(detailRequests).toBeGreaterThanOrEqual(2), { timeout: 5000 })
+    expect(await screen.findByRole('button', { name: 'Run' })).toBeInTheDocument()
+  })
+
   it('only enables Save while deployment settings differ from the saved values', async () => {
     const user = userEvent.setup()
     renderPage()

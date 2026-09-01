@@ -93,6 +93,7 @@ const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
 const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
+const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
 function updateInput(editor: Editor): DeploymentUpdateInput {
   return {
@@ -139,6 +140,14 @@ export function DeploymentPage() {
       setSavedEditorFingerprint(editorFingerprint(savedEditor))
     }
   }, [resource.data])
+
+  // Transitional statuses resolve without user input; keep the detail view
+  // live so a finished stop/start is reflected without a manual reload.
+  useEffect(() => {
+    if (resource.loading || !resource.data || !TRANSITIONAL_DEPLOYMENT_STATUSES.has(resource.data.status)) return
+    const timer = window.setTimeout(resource.reload, 2000)
+    return () => window.clearTimeout(timer)
+  }, [resource.data, resource.loading, resource.reload])
 
   useEffect(() => {
     if (!editor || !resource.data || resource.data.runtime === 'llama.cpp') {

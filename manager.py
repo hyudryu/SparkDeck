@@ -844,6 +844,7 @@ class Manager:
     def _start_controller_tasks(self) -> None:
         task_factories = (
             ("deployment_resume_task", self._resume_interrupted_deployments),
+            ("deployment_stop_resume_task", self._resume_interrupted_stops),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
@@ -863,6 +864,7 @@ class Manager:
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
+            "deployment_stop_resume_task",
         ):
             task = getattr(self, field, None)
             if task and not task.done():
@@ -909,6 +911,7 @@ class Manager:
             self.inference_nudger_task,
             self.token_usage_sync_task,
             self.deployment_resume_task,
+            self.deployment_stop_resume_task,
         ):
             if t:
                 t.cancel()
@@ -5949,6 +5952,30 @@ class Manager:
             return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _resume_interrupted_stops(self) -> None:
+        """Finish member stops interrupted by a manager restart.
+
+        A persisted "stopping" deployment has no in-flight stop after a
+        restart; without re-issuing it, get_state would preserve "stopping"
+        indefinitely while the ranks keep running.
+        """
+        candidates = [
+            deployment for deployment in list(self.deployments)
+            if isinstance(deployment, dict)
+            and deployment.get("status") == "stopping"
+        ]
+        for deployment in candidates:
+            try:
+                await self.deployment_action(deployment["id"], "stop")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                current = self._deployment(deployment.get("id"))
+                if current is not None:
+                    current["status"] = "error"
+                    current["error"] = f"Could not finish interrupted stop: {exc}"
+                    self._save_deployments()
 
     async def _resume_interrupted_deployments(self) -> None:
         """Relaunch accepted work whose request died before containers existed."""

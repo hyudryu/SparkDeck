@@ -569,6 +569,21 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
             ("delete", "worker-1", "org/model"),
         ])
 
+    async def test_ab_tool_rejects_cluster_with_stopping_deployment(self) -> None:
+        class FakeClient:
+            async def state(self):
+                return {"deployments": [{"id": "dep-1", "status": "stopping"}]}
+
+        server = build_server(FakeClient())
+        with self.assertRaises(UnexpectedToolError) as raised:
+            await server.call_tool("run_cluster_ab_test", {
+                "recipe_id": "recipe-1",
+                "variant_a_overrides": {},
+                "variant_b_overrides": {},
+            })
+        self.assertIsInstance(raised.exception.__cause__, ControllerError)
+        self.assertIn("cluster is not idle", str(raised.exception.__cause__))
+
     async def test_ab_tool_runs_variants_sequentially_and_cleans_up(self) -> None:
         events = []
 

@@ -3,6 +3,7 @@ import { ArrowLeft, Play, Save } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { DeploymentDetail, DeploymentLaunchControls, DeploymentUpdateInput } from '../api/types'
+import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
@@ -294,7 +295,7 @@ export function DeploymentPage() {
         {notice && <p className="muted wide-field" role="status">{notice}</p>}
         <label className="field"><span>Context window</span><input disabled={disabled} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} /></label>
         <label className="field"><span>Max concurrency</span><input disabled={disabled} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} /></label>
-        <label className="field"><span>KV cache dtype</span><input disabled={disabled} value={editor.kv_cache_dtype} onChange={(event) => set('kv_cache_dtype', event.target.value)} placeholder="auto" /></label>
+        {detail.runtime !== 'llama.cpp' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={disabled} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} /></label>}
         <label className="field"><span>Thinking mode</span><select disabled={disabled} value={editor.thinking_mode} onChange={(event) => set('thinking_mode', event.target.value)}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
         {detail.runtime === 'vllm' && <>
           <label className="field"><span>Speculative method</span><select disabled={disabled} value={editor.speculative_method} onChange={(event) => set('speculative_method', event.target.value)}><option value="">Auto / unset</option>{editor.speculative_method && !SPECULATIVE_METHODS.includes(editor.speculative_method) && <option value={editor.speculative_method}>{editor.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>

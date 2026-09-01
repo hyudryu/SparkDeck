@@ -519,11 +519,13 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
 
     Only safetensors files are summed: repositories that also publish
     alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
-    variants) must not have every copy counted into one total. Repositories
-    can likewise hold several safetensors checkpoints (a full-precision root
-    checkpoint plus quantized copies in subdirectories); only one is ever
-    loaded, so root-level files win, otherwise the largest single directory
-    group (typically the full-precision primary) is used.
+    variants) must not have every copy counted into one total. Subdirectories
+    are split by name: directories carrying a quantization marker (``awq/``,
+    ``bf16/``, …) are alternative checkpoints that are never co-loaded, while
+    unmarked directories (``transformer/``, ``text_encoder/``, ``vae/``) are
+    required components of the one primary checkpoint and are summed with the
+    root files. When only quantization variants exist (quant-collection
+    repos), the largest single checkpoint is reported.
     """
     groups: dict[str, int] = {}
     for entry in tree:
@@ -542,8 +544,12 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
         groups[directory] = groups.get(directory, 0) + size
     if not groups:
         return None
-    if "" in groups:
-        return groups[""]
+    primary = {
+        directory: size for directory, size in groups.items()
+        if not quantization_from_text(directory)
+    }
+    if primary:
+        return sum(primary.values())
     return max(groups.values())
 
 

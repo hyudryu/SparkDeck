@@ -602,6 +602,33 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["weight_size_source"], "tree")
         await http.aclose()
 
+    async def test_details_sums_all_component_directories_of_one_checkpoint(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "transformer/model.safetensors", "size": 200},
+                    {"type": "file", "path": "text_encoder/model.safetensors", "size": 30},
+                    {"type": "file", "path": "vae/model.safetensors", "size": 10},
+                    {"type": "file", "path": "awq/model.safetensors", "size": 60},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "transformer/model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        # Component directories belong to the primary checkpoint; the AWQ
+        # copy is an alternative that is never co-loaded.
+        self.assertEqual(item["weight_size_bytes"], 240)
+        self.assertEqual(item["weight_size_source"], "tree")
+        await http.aclose()
+
     async def test_search_enriches_safetensors_weight_size_from_tree(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/tree/main"):

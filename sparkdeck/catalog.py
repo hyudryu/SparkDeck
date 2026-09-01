@@ -32,7 +32,9 @@ _GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
 )
-_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt", ".pth")
+_REVISION_PATTERN = re.compile(r"[0-9a-f]{4,64}$", re.IGNORECASE)
+# Bound the per-search enrichment fan-out to the first visible results page.
+_SEARCH_ENRICH_LIMIT = 24
 
 
 @asynccontextmanager
@@ -119,25 +121,27 @@ class HuggingFaceCatalog:
 
         Hub safetensors metadata double-counts tensors shared across shards,
         so sizes derived from element counts can be far larger than the real
-        download. Failures keep the estimate; search must never fail here.
+        download. Only the first page of visible results is enriched, with one
+        tree request per model; failures keep the estimate so search never
+        fails here.
         """
         candidates = [
             item for item in items
             if item.get("weight_size_source") == "safetensors"
-        ]
+        ][:_SEARCH_ENRICH_LIMIT]
         if not candidates:
             return
+        token = str(self.token_provider() or "") if self.token_provider else ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         semaphore = asyncio.Semaphore(8)
 
         async def load(item: dict[str, Any]) -> None:
             async with semaphore:
                 try:
-                    detail = await self.details(str(item["id"]))
-                except (httpx.HTTPError, TypeError, ValueError):
+                    tree = await self._fetch_tree(str(item["id"]), headers)
+                except (httpx.HTTPError, ValueError):
                     return
-            if detail.get("weight_size_source") != "tree":
-                return
-            size = _positive_int(detail.get("weight_size_bytes"))
+            size = _tree_weight_size(tree)
             if size:
                 item["weight_size_bytes"] = size
                 item["weight_size_source"] = "tree"
@@ -205,11 +209,18 @@ class HuggingFaceCatalog:
                 raise ValueError("Hugging Face returned an invalid public model")
             raw.setdefault("id", repository)
             detail_repository = str(raw.get("id") or repository)
+            # Pin the tree fetch to the metadata response's commit so the
+            # weight size and the advertised revision stay consistent.
+            revision = str(raw.get("sha") or "")
+            if not _REVISION_PATTERN.fullmatch(revision):
+                revision = "main"
             siblings = raw.get("siblings")
             item = self._public_item(raw)
             tree: list[dict[str, Any]] | None = None
             if _gguf_sizes_missing(siblings):
-                tree = await self._fetch_tree(detail_repository, request_headers)
+                tree = await self._fetch_tree(
+                    detail_repository, request_headers, revision,
+                )
                 sizes = {
                     str(entry.get("path") or ""): _positive_int(entry.get("size"))
                     for entry in tree
@@ -233,7 +244,9 @@ class HuggingFaceCatalog:
                 # shards, inflating any size derived from element counts.
                 # Prefer real weight-file sizes; keep the estimate on failure.
                 try:
-                    tree = await self._fetch_tree(detail_repository, request_headers)
+                    tree = await self._fetch_tree(
+                        detail_repository, request_headers, revision,
+                    )
                 except (httpx.HTTPError, ValueError):
                     tree = None
             if tree is not None and item["weight_size_source"] == "safetensors":
@@ -246,10 +259,16 @@ class HuggingFaceCatalog:
             return item
 
     async def _fetch_tree(
-        self, repository: str, headers: dict[str, str],
+        self,
+        repository: str,
+        headers: dict[str, str],
+        revision: str = "main",
     ) -> list[dict[str, Any]]:
         """Return the full recursive file listing for a model repository."""
-        tree_path = f"/api/models/{quote(repository, safe='/')}/tree/main"
+        tree_path = (
+            f"/api/models/{quote(repository, safe='/')}"
+            f"/tree/{quote(revision, safe='')}"
+        )
         tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
         tree_params: dict[str, Any] | None = {"recursive": "true", "limit": 1000}
         tree: list[dict[str, Any]] = []
@@ -495,7 +514,12 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
 
 
 def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
-    """Sum real weight-file sizes from a repository tree listing."""
+    """Sum real safetensors weight sizes from a repository tree listing.
+
+    Only safetensors files are summed: repositories that also publish
+    alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
+    variants) must not have every copy counted into one total.
+    """
     total = 0
     for entry in tree:
         if not isinstance(entry, dict):
@@ -503,7 +527,7 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
         if str(entry.get("type") or "file") != "file":
             continue
         path = str(entry.get("path") or "").casefold()
-        if not path.endswith(_WEIGHT_FILE_SUFFIXES):
+        if not path.endswith(".safetensors"):
             continue
         size = _positive_int(entry.get("size"))
         if size is None:

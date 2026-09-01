@@ -136,7 +136,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             ["model-one", "model-two"],
         )
 
-    async def test_inactive_deployment_reserves_its_served_name(self):
+    async def test_inactive_deployment_does_not_reserve_its_served_name(self):
         self.service.deployments = AsyncMock(return_value=[
             {
                 "id": "active", "alias": "active-alias", "runtime": "vllm",
@@ -153,7 +153,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.models()
 
-        self.assertEqual([item["id"] for item in result["data"]], ["active-alias"])
+        self.assertEqual([item["id"] for item in result["data"]], ["shared-name"])
 
     async def test_discovered_alias_is_not_restored_after_served_name_collision(self):
         self.service._native_llama_model = AsyncMock(return_value="shared-name")

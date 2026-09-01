@@ -4627,10 +4627,10 @@ class SparkDeckService:
         ]
         public_ids = {
             deployment["id"]: self._deployment_public_model_ids(deployment)
-            for deployment in all_deployments
+            for deployment in deployments
         }
         request_owners = self._deployment_request_owners(
-            all_deployments, public_ids,
+            deployments, public_ids,
         )
         for deployment in deployments:
             model_ids = [
@@ -4739,21 +4739,33 @@ class SparkDeckService:
     ) -> bool:
         """Return whether gateway lookup selects exactly this deployment."""
         exact = self.store.deployment(model_id, include_private=True)
-        if exact is not None:
+        owners = request_owners.get(model_id, set())
+        if exact is not None and exact["id"] in owners:
             return exact["id"] == deployment["id"]
-        return request_owners.get(model_id) == {deployment["id"]}
+        return owners == {deployment["id"]}
 
-    async def _registered_deployment_for_served_model(
+    async def _live_deployment_for_model_id(
         self, model_id: str,
     ) -> dict[str, Any] | None:
-        """Resolve a live served id to one registered deployment."""
-        deployments = await self.deployments()
-        live_by_id = {
-            deployment["id"]: deployment for deployment in deployments
+        """Resolve a request id to the live deployment that owns it."""
+        deployments = [
+            deployment for deployment in await self.deployments()
+            if deployment.get("status") in ("running", "registered")
+        ]
+        live_by_id = {deployment["id"]: deployment for deployment in deployments}
+        stored_deployments = self.store.deployments(include_private=True)
+        stored_by_id = {
+            deployment["id"]: deployment for deployment in stored_deployments
         }
+        exact = self.store.deployment(model_id, include_private=True)
+        if exact is not None and exact["id"] in live_by_id:
+            return {**exact, **live_by_id[exact["id"]]}
+
         matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for stored in self.store.deployments(include_private=True):
-            live = live_by_id.get(stored["id"], stored)
+        for stored in stored_deployments:
+            live = live_by_id.get(stored["id"])
+            if live is None:
+                continue
             if model_id in self._deployment_public_model_ids(live):
                 matches.append((stored, live))
         if len(matches) > 1:
@@ -4761,7 +4773,19 @@ class SparkDeckService:
                 "served model name is ambiguous; use a deployment alias"
             )
         if not matches:
-            return None
+            discovered = [
+                deployment for deployment in deployments
+                if deployment["id"] not in stored_by_id
+                and (
+                    model_id in self._deployment_public_model_ids(deployment)
+                    or model_id == str(deployment.get("alias") or "").strip()
+                )
+            ]
+            if len(discovered) > 1:
+                raise LookupError(
+                    "served model name is ambiguous; use a deployment alias"
+                )
+            return discovered[0] if discovered else None
         stored, live = matches[0]
         return {**stored, **live}
 
@@ -4769,11 +4793,14 @@ class SparkDeckService:
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
-        deployment = self.store.deployment(requested_model, include_private=True)
+        stored_deployment = self.store.deployment(
+            requested_model, include_private=True,
+        )
+        deployment = await self._live_deployment_for_model_id(
+            requested_model
+        )
         if deployment is None:
-            deployment = await self._registered_deployment_for_served_model(
-                requested_model
-            )
+            deployment = stored_deployment
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )
@@ -4919,9 +4946,15 @@ class SparkDeckService:
             raise RuntimeError(
                 "deployment is stopped; start it before sending inference requests"
             )
+        local_container = str(deployment.get("id") or "").startswith("container:")
         if (
-            deployment.get("kind") == DeploymentKind.MANAGED.value
-            and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            (
+                deployment.get("kind") == DeploymentKind.MANAGED.value
+                or local_container
+            )
+            and deployment.get("runtime") in (
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+            )
         ):
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,

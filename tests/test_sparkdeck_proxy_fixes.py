@@ -71,6 +71,122 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_registered_served_name_uses_exact_cluster_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [{
+                "id": "cluster-deepseek",
+                "sparkdeck_record_id": "record-deepseek",
+                "launch_settings": {
+                    "extra_args": [
+                        "--served-model-name", "DeepSeek-V4-Flash-0731",
+                    ],
+                },
+            }]
+            manager._deployment_served_models = Manager._deployment_served_models
+            manager.proxy_cluster_inference = AsyncMock(return_value={
+                "model": "DeepSeek-V4-Flash-0731", "choices": [], "usage": {},
+            })
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="record-deepseek", alias="deepseek-v4-flash-dspark",
+                runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/deepseek-v4"),
+                container_name="deepseek-rank-0",
+                settings={"manager_deployment_id": "cluster-deepseek"},
+            ))
+
+            response = await service.proxy(
+                {
+                    "model": "DeepSeek-V4-Flash-0731",
+                    "messages": [],
+                    "stream": False,
+                },
+                "chat/completions",
+            )
+
+            self.assertEqual(response["model"], "DeepSeek-V4-Flash-0731")
+            manager.proxy_cluster_inference.assert_awaited_once()
+            args = manager.proxy_cluster_inference.await_args.args
+            self.assertEqual(args[0], "cluster-deepseek")
+            self.assertEqual(args[1], "org/deepseek-v4")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_ambiguous_served_name_requires_deployment_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [
+                {
+                    "id": "cluster-one", "sparkdeck_record_id": "record-one",
+                    "launch_settings": {
+                        "extra_args": ["--served-model-name", "shared-name"],
+                    },
+                },
+                {
+                    "id": "cluster-two", "sparkdeck_record_id": "record-two",
+                    "launch_settings": {
+                        "extra_args": ["--served-model-name", "shared-name"],
+                    },
+                },
+            ]
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            for record_id, alias, manager_id in (
+                ("record-one", "model-one", "cluster-one"),
+                ("record-two", "model-two", "cluster-two"),
+            ):
+                service.store.add_deployment(Deployment(
+                    id=record_id, alias=alias, runtime=RuntimeKind.VLLM,
+                    kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity(f"org/{alias}"),
+                    settings={"manager_deployment_id": manager_id},
+                ))
+
+            with self.assertRaisesRegex(LookupError, "ambiguous"):
+                await service.proxy(
+                    {"model": "shared-name", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_exact_alias_wins_over_another_deployments_served_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [{
+                "id": "cluster-one", "sparkdeck_record_id": "record-one",
+                "launch_settings": {
+                    "extra_args": ["--served-model-name", "model-two"],
+                },
+            }]
+            manager._deployment_served_models = Manager._deployment_served_models
+            manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="record-one", alias="model-one", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/one"),
+                settings={"manager_deployment_id": "cluster-one"},
+            ))
+            service.store.add_deployment(Deployment(
+                id="record-two", alias="model-two", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/two"),
+                container_name="model-two-container",
+            ))
+
+            await service.proxy(
+                {"model": "model-two", "messages": [], "stream": False},
+                "chat/completions",
+            )
+
+            self.assertEqual(manager._vllm_chat.await_args.kwargs, {
+                "container_name": "model-two-container",
+                "deployment_id": "record-two",
+            })
+            await manager.http.aclose()
+            await service.close()
+
     async def test_manager_resolves_duplicate_repository_by_exact_identity(self):
         manager = Manager.__new__(Manager)
         manager._capacity_redeploying_models = set()

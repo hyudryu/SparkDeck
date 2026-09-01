@@ -136,6 +136,49 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             ["model-one", "model-two"],
         )
 
+    async def test_inactive_deployment_reserves_its_served_name(self):
+        self.service.deployments = AsyncMock(return_value=[
+            {
+                "id": "active", "alias": "active-alias", "runtime": "vllm",
+                "status": "running", "served_models": ["shared-name"],
+                "model": {"repository": "org/active"},
+            },
+            {
+                "id": "inactive", "alias": "inactive-alias",
+                "runtime": "vllm", "status": "stopped",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/inactive"},
+            },
+        ])
+
+        result = await self.service.models()
+
+        self.assertEqual([item["id"] for item in result["data"]], ["active-alias"])
+
+    async def test_discovered_alias_is_not_restored_after_served_name_collision(self):
+        self.service._native_llama_model = AsyncMock(return_value="shared-name")
+        self.service.deployments = AsyncMock(return_value=[
+            {
+                "id": "registered", "alias": "registered-alias",
+                "runtime": "vllm", "status": "running",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/registered"},
+            },
+            {
+                "id": "container:external", "alias": "shared-name",
+                "runtime": "vllm", "status": "running",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/external"},
+            },
+        ])
+
+        result = await self.service.models()
+
+        self.assertEqual(
+            [(item["id"], item["deployment_id"]) for item in result["data"]],
+            [("registered-alias", "registered")],
+        )
+
     def test_discovered_deployment_preserves_all_served_names(self):
         deployment = self.service._discovered_deployment(
             {

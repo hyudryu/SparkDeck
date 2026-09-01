@@ -4620,33 +4620,30 @@ class SparkDeckService:
     async def models(self) -> dict[str, Any]:
         data = []
         seen = set()
+        all_deployments = await self.deployments()
         deployments = [
-            deployment for deployment in await self.deployments()
+            deployment for deployment in all_deployments
             if deployment.get("status") in ("running", "registered")
         ]
         public_ids = {
             deployment["id"]: self._deployment_public_model_ids(deployment)
-            for deployment in deployments
+            for deployment in all_deployments
         }
-        exact_owners = {
-            selector: deployment["id"]
-            for deployment in deployments
-            for selector in (deployment.get("id"), deployment.get("alias"))
-            if selector
-        }
-        served_owners: dict[str, set[str]] = {}
-        for deployment in deployments:
-            for model_id in public_ids[deployment["id"]]:
-                served_owners.setdefault(model_id, set()).add(deployment["id"])
+        request_owners = self._deployment_request_owners(
+            all_deployments, public_ids,
+        )
         for deployment in deployments:
             model_ids = [
                 model_id for model_id in public_ids[deployment["id"]]
-                if len(served_owners[model_id]) == 1
-                and exact_owners.get(model_id, deployment["id"]) == deployment["id"]
+                if self._model_id_routes_to_deployment(
+                    model_id, deployment, request_owners,
+                )
             ]
             if not model_ids:
                 alias = str(deployment.get("alias") or "").strip()
-                if alias:
+                if alias and self._model_id_routes_to_deployment(
+                    alias, deployment, request_owners,
+                ):
                     model_ids = [alias]
             for model_id in model_ids:
                 if model_id in seen:
@@ -4660,7 +4657,12 @@ class SparkDeckService:
                     "port": deployment.get("port"),
                 })
         loaded_llama = await self._native_llama_model()
-        if loaded_llama and loaded_llama not in seen:
+        if (
+            loaded_llama
+            and loaded_llama not in seen
+            and not request_owners.get(loaded_llama)
+            and self.store.deployment(loaded_llama, include_private=True) is None
+        ):
             data.append({
                 "id": loaded_llama, "object": "model", "created": 0,
                 "owned_by": "llama.cpp", "runtime": RuntimeKind.LLAMA_CPP.value,
@@ -4708,20 +4710,60 @@ class SparkDeckService:
         alias = str(deployment.get("alias") or "").strip()
         return normalized or ([alias] if alias else [])
 
-    def _registered_deployment_for_served_model(
+    def _deployment_request_owners(
+        self,
+        deployments: list[dict[str, Any]],
+        public_ids: dict[str, list[str]] | None = None,
+    ) -> dict[str, set[str]]:
+        """Map every served name and compatibility alias to its owners."""
+        owners: dict[str, set[str]] = {}
+        public_ids = public_ids or {
+            deployment["id"]: self._deployment_public_model_ids(deployment)
+            for deployment in deployments
+        }
+        for deployment in deployments:
+            deployment_id = deployment["id"]
+            request_ids = list(public_ids[deployment_id])
+            alias = str(deployment.get("alias") or "").strip()
+            if alias:
+                request_ids.append(alias)
+            for model_id in request_ids:
+                owners.setdefault(model_id, set()).add(deployment_id)
+        return owners
+
+    def _model_id_routes_to_deployment(
+        self,
+        model_id: str,
+        deployment: dict[str, Any],
+        request_owners: dict[str, set[str]],
+    ) -> bool:
+        """Return whether gateway lookup selects exactly this deployment."""
+        exact = self.store.deployment(model_id, include_private=True)
+        if exact is not None:
+            return exact["id"] == deployment["id"]
+        return request_owners.get(model_id) == {deployment["id"]}
+
+    async def _registered_deployment_for_served_model(
         self, model_id: str,
     ) -> dict[str, Any] | None:
-        """Resolve a served id to its registered deployment without live I/O."""
-        matches = [
-            deployment
-            for deployment in self.store.deployments(include_private=True)
-            if model_id in self._deployment_public_model_ids(deployment)
-        ]
+        """Resolve a live served id to one registered deployment."""
+        deployments = await self.deployments()
+        live_by_id = {
+            deployment["id"]: deployment for deployment in deployments
+        }
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for stored in self.store.deployments(include_private=True):
+            live = live_by_id.get(stored["id"], stored)
+            if model_id in self._deployment_public_model_ids(live):
+                matches.append((stored, live))
         if len(matches) > 1:
             raise LookupError(
                 "served model name is ambiguous; use a deployment alias"
             )
-        return matches[0] if matches else None
+        if not matches:
+            return None
+        stored, live = matches[0]
+        return {**stored, **live}
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
@@ -4729,7 +4771,7 @@ class SparkDeckService:
         requested_model = str(body.get("model") or "")
         deployment = self.store.deployment(requested_model, include_private=True)
         if deployment is None:
-            deployment = self._registered_deployment_for_served_model(
+            deployment = await self._registered_deployment_for_served_model(
                 requested_model
             )
         observation = self._community_observation_start(

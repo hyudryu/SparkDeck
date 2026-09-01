@@ -125,7 +125,6 @@ export function ChatPage() {
     const invocationEpoch = imageMutationEpochRef.current
     imageReadQueueRef.current = imageReadQueueRef.current.then(async () => {
       if (invocationEpoch !== imageMutationEpochRef.current) return
-      let next = [...imagesRef.current]
       const additions: ChatImageAttachment[] = []
       const failures: string[] = []
       const historyBytes = messages.reduce(
@@ -133,11 +132,12 @@ export function ChatPage() {
         0,
       )
       for (const file of files) {
+        const currentImages = [...imagesRef.current, ...additions]
         if (!ACCEPTED_IMAGE_TYPES.has(file.type)) {
           failures.push(`${file.name || 'Image'} is not a PNG, JPEG, WebP, or GIF image.`)
           continue
         }
-        if (next.length >= MAX_IMAGES_PER_MESSAGE) {
+        if (currentImages.length >= MAX_IMAGES_PER_MESSAGE) {
           failures.push(`You can attach up to ${MAX_IMAGES_PER_MESSAGE} images per message.`)
           break
         }
@@ -145,14 +145,13 @@ export function ChatPage() {
           failures.push(`${file.name || 'Image'} exceeds the 10 MB per-image limit.`)
           continue
         }
-        if (historyBytes + next.reduce((total, image) => total + image.size, 0) + file.size > MAX_CONVERSATION_IMAGE_BYTES) {
+        if (historyBytes + currentImages.reduce((total, image) => total + image.size, 0) + file.size > MAX_CONVERSATION_IMAGE_BYTES) {
           failures.push('Images exceed the 20 MB conversation limit. Clear the chat to attach more.')
           continue
         }
         try {
           const image = await readImage(file, `image-${++imageIdRef.current}`)
           additions.push(image)
-          next = [...next, image]
         } catch (reason) {
           failures.push(reason instanceof Error ? reason.message : `Could not read ${file.name || 'image'}.`)
         }

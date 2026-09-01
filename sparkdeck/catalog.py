@@ -63,6 +63,7 @@ class HuggingFaceCatalog:
         self.http = http
         self.ttl_seconds = ttl_seconds
         self.token_provider = token_provider
+        self._enrich_timeout = 8.0
         self._cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
         self._detail_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
         # Deduplicate only identical requests. Different repositories must be
@@ -111,25 +112,28 @@ class HuggingFaceCatalog:
                     continue
                 public["quantizations"] = _gguf_quantizations(item.get("siblings"))
                 items.append(public)
-            await self._enrich_tree_weight_sizes(items)
-            self._cache[key] = (time.monotonic(), items)
+            if await self._enrich_tree_weight_sizes(items):
+                # A partially enriched (timed-out) result still carries
+                # inflated estimates, so it must not be cached as complete.
+                self._cache[key] = (time.monotonic(), items)
             return items
 
-    async def _enrich_tree_weight_sizes(self, items: list[dict[str, Any]]) -> None:
+    async def _enrich_tree_weight_sizes(self, items: list[dict[str, Any]]) -> bool:
         """Replace inflated safetensors metadata estimates with tree sizes.
 
         Hub safetensors metadata double-counts tensors shared across shards,
         so sizes derived from element counts can be far larger than the real
         download. Each candidate costs one tree request, pinned to the search
         result's revision; failures keep the estimate so search never fails
-        here.
+        here. Returns True when every candidate finished, meaning the result
+        is complete enough to cache.
         """
         candidates = [
             item for item in items
             if item.get("weight_size_source") == "safetensors"
         ]
         if not candidates:
-            return
+            return True
         token = str(self.token_provider() or "") if self.token_provider else ""
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         semaphore = asyncio.Semaphore(8)
@@ -149,11 +153,13 @@ class HuggingFaceCatalog:
                 item["weight_size_source"] = "tree"
 
         tasks = [asyncio.create_task(load(item)) for item in candidates]
-        _, pending = await asyncio.wait(tasks, timeout=8)
+        _, pending = await asyncio.wait(tasks, timeout=self._enrich_timeout)
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+            return False
+        return True
 
     async def details(self, repository: str) -> dict[str, Any]:
         """Return public Hub metadata plus every downloadable GGUF quantization."""
@@ -520,20 +526,17 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
 
     Only safetensors files are summed: repositories that also publish
     alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
-    variants) must not have every copy counted into one total. Files whose
-    path carries a quantization marker — whether in a directory (``awq/``,
-    ``bf16/``) or in the filename (``model.fp16.safetensors``) — are
-    alternative checkpoints that are never co-loaded; one dtype variant can
-    span several component directories, so variants aggregate by marker
-    alone. Unmarked files belong to the one primary checkpoint and are summed
-    together across component directories (``transformer/``,
-    ``text_encoder/``, ``vae/``) and the root, except training snapshots in
-    ``checkpoint-N`` directories, which a normal deployment never loads. When
-    only variants exist (quant-collection repos), the largest single variant
-    is reported.
+    variants) must not have every copy counted into one total. Resolution is
+    per directory: files with an unmarked sibling are alternatives, a
+    quantization-named directory (``awq/``, ``bf16/``) is always an
+    alternative, and a component directory whose files exist in only one
+    dtype (``unet/model.fp16.safetensors`` with no unmarked counterpart) is a
+    required part of the pipeline. Training snapshots in ``checkpoint-N``
+    directories are never loaded by a normal deployment and are skipped. When
+    nothing qualifies as primary (quant-collection repos), the largest
+    single variant, aggregated across component directories, is reported.
     """
-    primary = 0
-    variants: dict[str, int] = {}
+    per_directory: dict[str, dict[str, Any]] = {}
     for entry in tree:
         if not isinstance(entry, dict):
             continue
@@ -548,10 +551,24 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
             return None
         if _SNAPSHOT_DIRECTORY_PATTERN.search(path):
             continue
+        directory = path.rpartition("/")[0]
+        info = per_directory.setdefault(directory, {"unmarked": 0, "marked": {}})
         marker = quantization_from_text(path)
         if marker is None:
-            primary += size
+            info["unmarked"] += size
         else:
+            info["marked"][marker] = info["marked"].get(marker, 0) + size
+    primary = 0
+    variants: dict[str, int] = {}
+    for directory, info in per_directory.items():
+        marked: dict[str, int] = info["marked"]
+        if info["unmarked"]:
+            primary += info["unmarked"]
+        elif directory and quantization_from_text(directory) is None and marked:
+            # A component directory existing in only one dtype is required.
+            best = max(marked, key=marked.get)
+            primary += marked.pop(best)
+        for marker, size in marked.items():
             variants[marker] = variants.get(marker, 0) + size
     if primary:
         return primary

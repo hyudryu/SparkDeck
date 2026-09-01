@@ -660,7 +660,7 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json=[
                     {"type": "file", "path": "unet/model.fp16.safetensors", "size": 100},
                     {"type": "file", "path": "text_encoder/model.fp16.safetensors", "size": 30},
-                    {"type": "file", "path": "vae/model.fp8.safetensors", "size": 5},
+                    {"type": "file", "path": "vae/model.safetensors", "size": 5},
                 ])
             return httpx.Response(200, json={
                 "id": "org/model", "tags": ["safetensors"],
@@ -674,9 +674,9 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         item = await HuggingFaceCatalog(http).details("org/model")
 
-        # The fp16 variant spans two component directories and aggregates;
-        # the smaller fp8 variant is an alternative.
-        self.assertEqual(item["weight_size_bytes"], 130)
+        # Component directories existing in only one dtype are required parts
+        # of the pipeline and sum with the unmarked component.
+        self.assertEqual(item["weight_size_bytes"], 135)
         self.assertEqual(item["weight_size_source"], "tree")
         await http.aclose()
 
@@ -753,6 +753,36 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(items[0]["weight_size_bytes"], 304)
         self.assertEqual(items[0]["weight_size_source"], "safetensors")
+        await http.aclose()
+
+    async def test_search_does_not_cache_partially_enriched_results(self):
+        list_requests = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal list_requests
+            if "/tree/" in request.url.path:
+                await asyncio.sleep(5)
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors", "size": 100},
+                ])
+            list_requests += 1
+            return httpx.Response(200, json=[{
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {"total": 300, "parameters": {"I8": 296, "BF16": 4}},
+                "siblings": [{"rfilename": "model.safetensors"}],
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http)
+        catalog._enrich_timeout = 0.05
+
+        items = await catalog.search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 304)
+        self.assertEqual(items[0]["weight_size_source"], "safetensors")
+        self.assertEqual(catalog._cache, {})
+        await catalog.search("model", 5)
+        self.assertEqual(list_requests, 2)
         await http.aclose()
 
 

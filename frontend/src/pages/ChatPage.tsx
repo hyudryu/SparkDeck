@@ -98,6 +98,8 @@ export function ChatPage() {
   const messageIdRef = useRef(0)
   const imageIdRef = useRef(0)
   const imagesRef = useRef<ChatImageAttachment[]>([])
+  const imageMutationEpochRef = useRef(0)
+  const imageReadQueueRef = useRef(Promise.resolve())
   const imageInputRef = useRef<HTMLInputElement>(null)
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
@@ -113,43 +115,49 @@ export function ChatPage() {
     setMessages((current) => current.map((message) => message.id === id ? update(message) : message))
   }
 
-  const replaceImages = (next: ChatImageAttachment[]) => {
+  const replaceImages = (next: ChatImageAttachment[], cancelPendingReads = true) => {
+    if (cancelPendingReads) imageMutationEpochRef.current += 1
     imagesRef.current = next
     setImages(next)
   }
 
-  const addImages = async (files: File[]) => {
-    let next = [...imagesRef.current]
-    const failures: string[] = []
-    const historyBytes = messages.reduce(
-      (total, message) => total + (message.images?.reduce((sum, image) => sum + image.size, 0) ?? 0),
-      0,
-    )
-    for (const file of files) {
-      if (!ACCEPTED_IMAGE_TYPES.has(file.type)) {
-        failures.push(`${file.name || 'Image'} is not a PNG, JPEG, WebP, or GIF image.`)
-        continue
+  const addImages = (files: File[]) => {
+    const invocationEpoch = imageMutationEpochRef.current
+    imageReadQueueRef.current = imageReadQueueRef.current.then(async () => {
+      if (invocationEpoch !== imageMutationEpochRef.current) return
+      let next = [...imagesRef.current]
+      const failures: string[] = []
+      const historyBytes = messages.reduce(
+        (total, message) => total + (message.images?.reduce((sum, image) => sum + image.size, 0) ?? 0),
+        0,
+      )
+      for (const file of files) {
+        if (!ACCEPTED_IMAGE_TYPES.has(file.type)) {
+          failures.push(`${file.name || 'Image'} is not a PNG, JPEG, WebP, or GIF image.`)
+          continue
+        }
+        if (next.length >= MAX_IMAGES_PER_MESSAGE) {
+          failures.push(`You can attach up to ${MAX_IMAGES_PER_MESSAGE} images per message.`)
+          break
+        }
+        if (file.size > MAX_IMAGE_BYTES) {
+          failures.push(`${file.name || 'Image'} exceeds the 10 MB per-image limit.`)
+          continue
+        }
+        if (historyBytes + next.reduce((total, image) => total + image.size, 0) + file.size > MAX_CONVERSATION_IMAGE_BYTES) {
+          failures.push('Images exceed the 20 MB conversation limit. Clear the chat to attach more.')
+          continue
+        }
+        try {
+          next = [...next, await readImage(file, `image-${++imageIdRef.current}`)]
+        } catch (reason) {
+          failures.push(reason instanceof Error ? reason.message : `Could not read ${file.name || 'image'}.`)
+        }
+        if (invocationEpoch !== imageMutationEpochRef.current) return
       }
-      if (next.length >= MAX_IMAGES_PER_MESSAGE) {
-        failures.push(`You can attach up to ${MAX_IMAGES_PER_MESSAGE} images per message.`)
-        break
-      }
-      if (file.size > MAX_IMAGE_BYTES) {
-        failures.push(`${file.name || 'Image'} exceeds the 10 MB per-image limit.`)
-        continue
-      }
-      if (historyBytes + next.reduce((total, image) => total + image.size, 0) + file.size > MAX_CONVERSATION_IMAGE_BYTES) {
-        failures.push('Images exceed the 20 MB conversation limit. Clear the chat to attach more.')
-        continue
-      }
-      try {
-        next = [...next, await readImage(file, `image-${++imageIdRef.current}`)]
-      } catch (reason) {
-        failures.push(reason instanceof Error ? reason.message : `Could not read ${file.name || 'image'}.`)
-      }
-    }
-    replaceImages(next)
-    setImageError(failures.length ? failures.join(' ') : undefined)
+      replaceImages(next, false)
+      setImageError(failures.length ? failures.join(' ') : undefined)
+    })
   }
 
   const removeImage = (id: string) => {

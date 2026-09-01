@@ -38,6 +38,7 @@ from sparkdeck.service import (
     _public_community_aggregates,
 )
 from sparkdeck.request_limits import (
+    MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
     RequestBodyTooLarge,
     read_limited_json,
@@ -1090,7 +1091,9 @@ async def agent_virtual_nas_delete(model_id: str, req: Request):
 @app.post("/api/agent/inference/health")
 async def agent_inference_health(req: Request):
     _require_agent(req)
-    body = await _inference_json(req)
+    body = await _inference_json(
+        req, MAX_INFERENCE_REQUEST_BYTES + MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
+    )
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
@@ -1110,7 +1113,9 @@ async def agent_inference(endpoint: str, req: Request):
     _require_agent(req)
     if endpoint not in {"chat/completions", "completions"}:
         raise HTTPException(404, "inference endpoint not found")
-    body = await _inference_json(req)
+    body = await _inference_json(
+        req, MAX_INFERENCE_REQUEST_BYTES + MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
+    )
     model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
@@ -3854,9 +3859,14 @@ async def community_upload_loop() -> None:
 
 
 # ---------- OpenAI-compatible /v1 proxy ----------
-async def _inference_json(req: Request):
+async def _inference_json(
+    req: Request, max_bytes: int | None = None,
+):
     try:
-        return await read_limited_json(req, MAX_INFERENCE_REQUEST_BYTES)
+        return await read_limited_json(
+            req,
+            MAX_INFERENCE_REQUEST_BYTES if max_bytes is None else max_bytes,
+        )
     except RequestBodyTooLarge as exc:
         raise HTTPException(413, "inference request exceeds the 32 MB limit") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

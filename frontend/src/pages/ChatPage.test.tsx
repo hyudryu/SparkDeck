@@ -184,6 +184,47 @@ describe('ChatPage', () => {
     ])
   })
 
+  it('serializes overlapping attachment reads without dropping either image', async () => {
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    fireEvent.change(picker, { target: { files: [png('first.png')] } })
+    fireEvent.change(picker, { target: { files: [png('second.png')] } })
+
+    const attachments = await screen.findByLabelText('Attached images')
+    expect(await within(attachments).findByText('first.png')).toBeInTheDocument()
+    expect(await within(attachments).findByText('second.png')).toBeInTheDocument()
+  })
+
+  it('does not attach an image whose read finishes after sending', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Done' },
+      reasoning: '', metrics: {},
+    })
+    render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    fireEvent.change(composer, { target: { value: 'Send immediately' } })
+    const image = new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      'late.png',
+      { type: 'image/png' },
+    )
+    fireEvent.change(screen.getByLabelText('Choose image files'), { target: { files: [image] } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await screen.findByText('Done')
+    await waitFor(() => expect(screen.queryByText('late.png')).not.toBeInTheDocument())
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user', content: 'Send immediately',
+    }])
+  })
+
   it('rejects unsupported and excess pasted images with an accessible error', async () => {
     const user = userEvent.setup()
     render(<ChatPage />)

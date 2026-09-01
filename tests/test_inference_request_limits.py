@@ -6,6 +6,7 @@ import httpx
 
 import server
 from sparkdeck.request_limits import (
+    MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     RequestBodyTooLarge,
     read_limited_json,
     read_limited_request_body,
@@ -113,6 +114,27 @@ class InferenceRequestEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 413)
         self.assertEqual(response.json()["detail"], "inference request exceeds the 32 MB limit")
         proxy.assert_not_awaited()
+
+    async def test_agent_limit_reserves_space_for_cluster_routing_envelope(self):
+        request = FakeRequest([b"{}"])
+
+        with (
+            patch.object(server, "MAX_INFERENCE_REQUEST_BYTES", 128),
+            patch.object(server, "read_limited_json", AsyncMock(return_value={
+                "model": "vision",
+                "_sparkdeck_container_name": "replica-0",
+            })) as read_json,
+            patch.object(server.manager, "_vllm_chat", AsyncMock(return_value={
+                "choices": [],
+            })),
+            patch.object(server, "_require_agent"),
+        ):
+            await server.agent_inference("chat/completions", request)
+
+        self.assertEqual(
+            read_json.await_args.args[1],
+            128 + MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
+        )
 
 
 if __name__ == "__main__":

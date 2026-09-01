@@ -4,6 +4,10 @@ import json
 from typing import Any
 
 MAX_INFERENCE_REQUEST_BYTES = 32 * 1024 * 1024
+# Cluster routing adds a few trusted private fields after the public request has
+# passed the limit. Give authenticated agent requests enough headroom for that
+# envelope without increasing the client-facing payload allowance.
+MAX_CLUSTER_ROUTING_ENVELOPE_BYTES = 64 * 1024
 
 
 class RequestBodyTooLarge(ValueError):

@@ -280,6 +280,10 @@ class HuggingFaceCatalog:
                 if tree_weight_size:
                     item["weight_size_bytes"] = tree_weight_size
                     item["weight_size_source"] = "tree"
+                else:
+                    # An unusable tree response leaves the inflated estimate
+                    # in place and must be retried, not cached as complete.
+                    tree_failed = True
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
             if not tree_failed:
                 # A fallback produced after a transient tree error must be

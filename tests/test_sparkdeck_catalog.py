@@ -473,10 +473,13 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             })
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        item = await HuggingFaceCatalog(http).details("org/model")
+        catalog = HuggingFaceCatalog(http)
+        item = await catalog.details("org/model")
 
         self.assertEqual(item["weight_size_bytes"], 304)
         self.assertEqual(item["weight_size_source"], "safetensors")
+        # An unusable tree response must be retried, not cached as complete.
+        self.assertEqual(catalog._detail_cache, {})
         await http.aclose()
 
     async def test_details_sums_only_safetensors_among_alternative_weight_copies(self):

@@ -601,13 +601,33 @@ export interface LogEntry {
   message: string
 }
 
+export interface ChatTextContentPart {
+  type: 'text'
+  text: string
+}
+
+export interface ChatImageContentPart {
+  type: 'image_url'
+  image_url: {
+    url: string
+    detail?: 'auto' | 'low' | 'high'
+  }
+}
+
+export type ChatMessageContent = string | Array<ChatTextContentPart | ChatImageContentPart>
+
 export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: ChatMessageContent
+}
+
+export interface ChatResponseMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
 }
 
 export interface ChatCompletionResponse {
-  choices: Array<{ message: ChatMessage }>
+  choices: Array<{ message: ChatResponseMessage }>
   usage?: ChatUsage
 }
 
@@ -633,7 +653,7 @@ export interface ChatStreamUpdate {
 }
 
 export interface ChatStreamResult {
-  message: ChatMessage
+  message: ChatResponseMessage
   reasoning: string
   usage?: ChatUsage
   metrics: ChatResponseMetrics

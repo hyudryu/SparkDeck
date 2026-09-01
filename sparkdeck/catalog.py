@@ -33,8 +33,6 @@ _GGUF_SHARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{4,64}$", re.IGNORECASE)
-# Bound the per-search enrichment fan-out to the first visible results page.
-_SEARCH_ENRICH_LIMIT = 24
 
 
 @asynccontextmanager
@@ -93,7 +91,7 @@ class HuggingFaceCatalog:
                     *(("expand[]", field) for field in (
                         "author", "downloads", "likes", "tags", "safetensors",
                         "gguf", "pipeline_tag", "gated", "private", "lastModified",
-                        "siblings",
+                        "siblings", "sha",
                     )),
                 ],
                 headers={"Authorization": f"Bearer {token}"} if token else {},
@@ -121,14 +119,14 @@ class HuggingFaceCatalog:
 
         Hub safetensors metadata double-counts tensors shared across shards,
         so sizes derived from element counts can be far larger than the real
-        download. Only the first page of visible results is enriched, with one
-        tree request per model; failures keep the estimate so search never
-        fails here.
+        download. Each candidate costs one tree request, pinned to the search
+        result's revision; failures keep the estimate so search never fails
+        here.
         """
         candidates = [
             item for item in items
             if item.get("weight_size_source") == "safetensors"
-        ][:_SEARCH_ENRICH_LIMIT]
+        ]
         if not candidates:
             return
         token = str(self.token_provider() or "") if self.token_provider else ""
@@ -136,9 +134,12 @@ class HuggingFaceCatalog:
         semaphore = asyncio.Semaphore(8)
 
         async def load(item: dict[str, Any]) -> None:
+            revision = str(item.get("revision") or "")
+            if not _REVISION_PATTERN.fullmatch(revision):
+                revision = "main"
             async with semaphore:
                 try:
-                    tree = await self._fetch_tree(str(item["id"]), headers)
+                    tree = await self._fetch_tree(str(item["id"]), headers, revision)
                 except (httpx.HTTPError, ValueError):
                     return
             size = _tree_weight_size(tree)
@@ -514,27 +515,36 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
 
 
 def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
-    """Sum real safetensors weight sizes from a repository tree listing.
+    """Sum the primary safetensors checkpoint from a repository tree listing.
 
     Only safetensors files are summed: repositories that also publish
     alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
-    variants) must not have every copy counted into one total.
+    variants) must not have every copy counted into one total. Repositories
+    can likewise hold several safetensors checkpoints (a full-precision root
+    checkpoint plus quantized copies in subdirectories); only one is ever
+    loaded, so root-level files win, otherwise the largest single directory
+    group (typically the full-precision primary) is used.
     """
-    total = 0
+    groups: dict[str, int] = {}
     for entry in tree:
         if not isinstance(entry, dict):
             continue
         if str(entry.get("type") or "file") != "file":
             continue
-        path = str(entry.get("path") or "").casefold()
-        if not path.endswith(".safetensors"):
+        path = str(entry.get("path") or "")
+        if not path.casefold().endswith(".safetensors"):
             continue
         size = _positive_int(entry.get("size"))
         if size is None:
             # An incomplete listing must not override the metadata estimate.
             return None
-        total += size
-    return total or None
+        directory = path.replace("\\", "/").rpartition("/")[0]
+        groups[directory] = groups.get(directory, 0) + size
+    if not groups:
+        return None
+    if "" in groups:
+        return groups[""]
+    return max(groups.values())
 
 
 def _gguf_sizes_missing(raw_siblings: Any) -> bool:

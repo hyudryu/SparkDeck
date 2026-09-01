@@ -178,6 +178,51 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/api/v1/deployments/adopted-record/start"),
         ])
 
+    async def test_start_forwards_explicit_node_selection(self) -> None:
+        requests: list = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = None
+            if request.content:
+                try:
+                    body = json.loads(request.content)
+                except ValueError:
+                    body = None
+            requests.append((request.method, request.url.path, body))
+            if request.url.path == "/api/state":
+                return httpx.Response(200, json={
+                    "deployments": [{
+                        "id": "manager-1",
+                        "sparkdeck_record_id": "record-1",
+                        "managed_by": "sparkdeck-mcp",
+                    }],
+                })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "record-1",
+                    "managed_by": "sparkdeck-mcp",
+                    "settings": {"manager_deployment_id": "manager-1"},
+                }]})
+            return httpx.Response(200, json={"ok": True})
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+
+        result = await client.action(
+            "record-1", "start", node_ids=["local", "worker-1"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn(
+            ("POST", "/api/v1/deployments/record-1/start",
+             {"node_ids": ["local", "worker-1"]}),
+            requests,
+        )
+
+        with self.assertRaisesRegex(ControllerError, "only supported for start"):
+            await client.action("record-1", "stop", node_ids=["local"])
+        with self.assertRaisesRegex(ControllerError, "non-empty node IDs"):
+            await client.action("record-1", "start", node_ids=[])
+
     async def test_configuration_update_requires_explicit_unowned_override(self) -> None:
         requests: list[tuple[str, str]] = []
 
@@ -702,7 +747,7 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(("update", deployment_id, changes, require_owned))
                 return {"id": deployment_id, "environment": changes["environment"]}
 
-            async def action(self, deployment_id, action, *, require_owned):
+            async def action(self, deployment_id, action, *, require_owned, node_ids=None):
                 calls.append((action, deployment_id, require_owned))
                 return {"ok": True, "id": deployment_id}
 
@@ -853,7 +898,7 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
                 rate = 10.0 if deployment_id.endswith("a") else 12.0
                 return {"metrics": {"output_tokens_per_second": rate}}
 
-            async def action(self, deployment_id, action, *, require_owned):
+            async def action(self, deployment_id, action, *, require_owned, node_ids=None):
                 events.append((action, deployment_id))
                 return {"ok": True, "errors": []}
 

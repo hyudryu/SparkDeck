@@ -350,6 +350,7 @@ class ControllerClient:
         action: str,
         *,
         require_owned: bool = True,
+        node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if action == "remove":
             # Preserve the legacy Manager removal contract used by A/B cleanup
@@ -366,11 +367,23 @@ class ControllerClient:
             )
         if action not in {"start", "stop"}:
             raise ControllerError(f"unsupported deployment action: {action}")
+        body = None
+        if node_ids is not None:
+            if action != "start":
+                raise ControllerError("node_ids are only supported for start")
+            if (
+                not isinstance(node_ids, list)
+                or not node_ids
+                or any(not isinstance(item, str) or not item.strip() for item in node_ids)
+            ):
+                raise ControllerError("node_ids must contain non-empty node IDs")
+            body = {"node_ids": [item.strip() for item in node_ids]}
         record_id = await self._deployment_record_id(
             deployment_id, require_owned=require_owned,
         )
         return await self._request(
             "POST", f"/api/v1/deployments/{quote(record_id, safe='')}/{action}",
+            json_body=body,
             timeout=1800 if action == "start" else 300,
         )
 
@@ -1102,15 +1115,21 @@ def build_server(
 
     @server.tool()
     async def start_cluster_deployment(
-        deployment_id: str, allow_unowned: bool = False
+        deployment_id: str,
+        allow_unowned: bool = False,
+        node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Start a deployment by Manager or stable ID.
 
-        This applies its currently saved configuration. Non-MCP deployments
-        require ``allow_unowned=true``.
+        This applies its currently saved configuration. Pass ``node_ids`` to
+        relocate a sharded deployment whose parallel layout was resized (for
+        example TP 4 to 2): the selection must contain exactly the
+        tensor×pipeline parallel node count required by the saved layout.
+        Non-MCP deployments require ``allow_unowned=true``.
         """
         return await client.action(
-            deployment_id, "start", require_owned=not allow_unowned
+            deployment_id, "start",
+            require_owned=not allow_unowned, node_ids=node_ids,
         )
 
     @server.tool()

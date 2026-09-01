@@ -767,6 +767,81 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog._cache, {})
         await http.aclose()
 
+    async def test_details_includes_root_marked_checkpoint_with_unmarked_components(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.fp16.safetensors", "size": 100},
+                    {"type": "file", "path": "vae/model.safetensors", "size": 10},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.fp16.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        # The root-level fp16 file is the main checkpoint; the unmarked VAE
+        # is a required component.
+        self.assertEqual(item["weight_size_bytes"], 110)
+        self.assertEqual(item["weight_size_source"], "tree")
+        await http.aclose()
+
+    async def test_details_ignores_sizeless_snapshot_entries(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors", "size": 100},
+                    {"type": "file", "path": "checkpoint-100/model.safetensors"},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        # The excluded snapshot's missing size must not block the override.
+        self.assertEqual(item["weight_size_bytes"], 100)
+        self.assertEqual(item["weight_size_source"], "tree")
+        await http.aclose()
+
+    async def test_search_caches_fallback_for_inaccessible_gated_trees(self):
+        list_requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal list_requests
+            if "/tree/" in request.url.path:
+                return httpx.Response(403)
+            list_requests += 1
+            return httpx.Response(200, json=[{
+                "id": "org/gated-model", "tags": ["safetensors"], "gated": "auto",
+                "safetensors": {"total": 300, "parameters": {"I8": 296, "BF16": 4}},
+                "siblings": [{"rfilename": "model.safetensors"}],
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http)
+        items = await catalog.search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 304)
+        self.assertEqual(items[0]["weight_size_source"], "safetensors")
+        # Retrying with the same credential cannot succeed, so the fallback
+        # is cached and a repeat search reuses it.
+        await catalog.search("model", 5)
+        self.assertEqual(list_requests, 1)
+        await http.aclose()
+
     async def test_search_enriches_safetensors_models_without_an_estimate(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if "/tree/" in request.url.path:

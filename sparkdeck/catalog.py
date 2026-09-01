@@ -147,6 +147,14 @@ class HuggingFaceCatalog:
             async with semaphore:
                 try:
                     tree = await self._fetch_tree(str(item["id"]), headers, revision)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        # A gated tree is permanently inaccessible to the
+                        # current credential, so the fallback estimate is
+                        # cacheable; only transient failures stay retryable.
+                        return
+                    failed += 1
+                    return
                 except (httpx.HTTPError, ValueError):
                     # A transient Hub failure must not be cached as a
                     # completed enrichment; the estimate is still inflated.
@@ -578,12 +586,14 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
     variants) must not have every copy counted into one total. Resolution is
     per directory: files with an unmarked sibling are alternatives, a
     quantization-named directory (``awq/``, ``bf16/``) is always an
-    alternative, and a component directory whose files exist in only one
-    dtype (``unet/model.fp16.safetensors`` with no unmarked counterpart) is a
-    required part of the pipeline. Training snapshots in ``checkpoint-N``
-    directories are never loaded by a normal deployment and are skipped. When
-    nothing qualifies as primary (quant-collection repos), the largest
-    single variant, aggregated across component directories, is reported.
+    alternative, and a directory (including the root) whose files exist in
+    only one dtype (``unet/model.fp16.safetensors`` or a root-level
+    ``model.fp16.safetensors`` with no unmarked counterpart) is the required
+    checkpoint or a required component of it. Training snapshots in
+    ``checkpoint-N`` directories are never loaded by a normal deployment and
+    are skipped before any size validation. When nothing qualifies as
+    primary (quant-collection repos), the largest single variant, aggregated
+    across component directories, is reported.
     """
     per_directory: dict[str, dict[str, Any]] = {}
     for entry in tree:
@@ -594,12 +604,14 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
         path = str(entry.get("path") or "").replace("\\", "/")
         if not path.casefold().endswith(".safetensors"):
             continue
+        # Training snapshots are excluded before any size validation: their
+        # completeness must not affect the primary checkpoint.
+        if _SNAPSHOT_DIRECTORY_PATTERN.search(path):
+            continue
         size = _positive_int(entry.get("size"))
         if size is None:
             # An incomplete listing must not override the metadata estimate.
             return None
-        if _SNAPSHOT_DIRECTORY_PATTERN.search(path):
-            continue
         directory = path.rpartition("/")[0]
         info = per_directory.setdefault(directory, {"unmarked": 0, "marked": {}})
         marker = quantization_from_text(path)
@@ -613,8 +625,9 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
         marked: dict[str, int] = info["marked"]
         if info["unmarked"]:
             primary += info["unmarked"]
-        elif directory and quantization_from_text(directory) is None and marked:
-            # A component directory existing in only one dtype is required.
+        elif quantization_from_text(directory) is None and marked:
+            # A directory (including the root) whose files exist in only one
+            # dtype is the required checkpoint or a required component.
             best = max(marked, key=marked.get)
             primary += marked.pop(best)
         for marker, size in marked.items():

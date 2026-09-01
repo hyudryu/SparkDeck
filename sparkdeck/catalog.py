@@ -130,7 +130,7 @@ class HuggingFaceCatalog:
         """
         candidates = [
             item for item in items
-            if item.get("weight_size_source") == "safetensors"
+            if _is_safetensors_candidate(item)
         ]
         if not candidates:
             return True
@@ -156,6 +156,10 @@ class HuggingFaceCatalog:
             if size:
                 item["weight_size_bytes"] = size
                 item["weight_size_source"] = "tree"
+            else:
+                # A tree response without usable sizes leaves the inflated
+                # estimate in place and must not be cached as complete.
+                failed += 1
 
         tasks = [asyncio.create_task(load(item)) for item in candidates]
         _, pending = await asyncio.wait(tasks, timeout=self._enrich_timeout)
@@ -230,6 +234,14 @@ class HuggingFaceCatalog:
             siblings = raw.get("siblings")
             item = self._public_item(raw)
             tree: list[dict[str, Any]] | None = None
+            safetensors_lookup = (
+                item["weight_size_source"] == "safetensors"
+                or (
+                    item["weight_size_source"] is None
+                    and _has_safetensors(raw)
+                )
+            )
+            tree_failed = False
             if _gguf_sizes_missing(siblings):
                 tree = await self._fetch_tree(
                     detail_repository, request_headers, revision,
@@ -252,7 +264,7 @@ class HuggingFaceCatalog:
                         for sibling in siblings
                     ]
                     raw["siblings"] = siblings
-            elif item["weight_size_source"] == "safetensors":
+            elif safetensors_lookup:
                 # Hub safetensors metadata double-counts tensors shared across
                 # shards, inflating any size derived from element counts.
                 # Prefer real weight-file sizes; keep the estimate on failure.
@@ -262,13 +274,17 @@ class HuggingFaceCatalog:
                     )
                 except (httpx.HTTPError, ValueError):
                     tree = None
-            if tree is not None and item["weight_size_source"] == "safetensors":
+                    tree_failed = True
+            if tree is not None and safetensors_lookup:
                 tree_weight_size = _tree_weight_size(tree)
                 if tree_weight_size:
                     item["weight_size_bytes"] = tree_weight_size
                     item["weight_size_source"] = "tree"
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
-            self._detail_cache[key] = (time.monotonic(), item)
+            if not tree_failed:
+                # A fallback produced after a transient tree error must be
+                # retried after the Hub recovers, not cached as complete.
+                self._detail_cache[key] = (time.monotonic(), item)
             return item
 
     async def _fetch_tree(
@@ -524,6 +540,30 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
             "artifacts": artifacts,
         })
     return sorted(result, key=lambda item: item["name"].casefold())
+
+
+def _has_safetensors(item: dict[str, Any]) -> bool:
+    """Whether a raw Hub payload carries safetensors weights evidence."""
+    if isinstance(item.get("safetensors"), dict):
+        return True
+    siblings = item.get("siblings")
+    return isinstance(siblings, list) and any(
+        isinstance(sibling, dict)
+        and str(sibling.get("rfilename") or "").casefold().endswith(".safetensors")
+        for sibling in siblings
+    )
+
+
+def _is_safetensors_candidate(item: dict[str, Any]) -> bool:
+    """Whether a public search item could hold inflated or missing sizes."""
+    source = item.get("weight_size_source")
+    if source == "safetensors":
+        return True
+    if source is not None:
+        return False
+    return "safetensors" in {
+        str(tag).casefold() for tag in item.get("tags") or []
+    }
 
 
 def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:

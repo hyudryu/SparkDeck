@@ -399,6 +399,9 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(paths, [
             "/api/models/org/old-name", "/api/models/org/new-name",
+            # The metadata-only safetensors payload (no parameters map) now
+            # triggers a tree lookup for a real weight size.
+            "/api/models/org/new-name/tree/main",
         ])
         self.assertEqual(item["id"], "org/new-name")
         await http.aclose()
@@ -444,10 +447,13 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             })
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        item = await HuggingFaceCatalog(http).details("org/model")
+        catalog = HuggingFaceCatalog(http)
+        item = await catalog.details("org/model")
 
         self.assertEqual(item["weight_size_bytes"], 304)
         self.assertEqual(item["weight_size_source"], "safetensors")
+        # A fallback after a transient tree error must be retried, not cached.
+        self.assertEqual(catalog._detail_cache, {})
         await http.aclose()
 
     async def test_details_keeps_estimate_when_tree_lacks_weight_sizes(self):
@@ -755,6 +761,47 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["weight_size_bytes"], 304)
         self.assertEqual(items[0]["weight_size_source"], "safetensors")
         # Failed enrichment must not be cached as a complete result.
+        self.assertEqual(catalog._cache, {})
+        await http.aclose()
+
+    async def test_search_enriches_safetensors_models_without_an_estimate(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors", "size": 100},
+                ])
+            return httpx.Response(200, json=[{
+                "id": "org/model", "tags": ["safetensors"],
+                # No parameters map: the Hub gives no usable size estimate.
+                "safetensors": {"total": 300},
+                "siblings": [{"rfilename": "model.safetensors"}],
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 100)
+        self.assertEqual(items[0]["weight_size_source"], "tree")
+        await http.aclose()
+
+    async def test_search_does_not_cache_unusable_tree_responses(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors"},
+                ])
+            return httpx.Response(200, json=[{
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {"total": 300, "parameters": {"I8": 296, "BF16": 4}},
+                "siblings": [{"rfilename": "model.safetensors"}],
+            }])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        catalog = HuggingFaceCatalog(http)
+        items = await catalog.search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 304)
+        self.assertEqual(items[0]["weight_size_source"], "safetensors")
         self.assertEqual(catalog._cache, {})
         await http.aclose()
 

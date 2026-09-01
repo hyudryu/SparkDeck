@@ -262,8 +262,8 @@ export function DeploymentPage() {
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
   const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
-  const active = ['launching', 'starting', 'running', 'ready'].includes(detail.status)
-  const lifecycleDisabled = Boolean(busy) || (!detail.editable && !detail.controllable)
+  const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
+  const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
   return <div className="page">
     <PageHeader
@@ -306,7 +306,7 @@ export function DeploymentPage() {
         <div className="settings-save wide-field">
           <Button type="submit" disabled={disabled || !hasUnsavedChanges}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable
-            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
+            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' || detail.status === 'stopping' ? 'Stopping…' : 'Stop'}</Button>
             : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => openRun(event.currentTarget.form)}><Play size={15} /> Run</Button>}
         </div>
       </form>

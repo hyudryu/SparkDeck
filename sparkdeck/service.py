@@ -5411,6 +5411,8 @@ def _deployment_status(value: Any) -> str:
         return "starting"
     if status in ("exited", "dead", "removed", "stopped"):
         return "stopped"
+    if status == "stopping":
+        return "stopping"
     if status in ("error", "unhealthy", "degraded"):
         return "error"
     return "unknown"
@@ -5424,6 +5426,13 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
             "launch_message": str(
                 deployment.get("error") or "Deployment launch failed"
             ),
+        }
+    if deployment.get("status") == "stopping":
+        # Ranks exit one by one while a stop is in flight; reporting the
+        # first exited rank's phase would flash "Exited" under the card.
+        return {
+            "launch_phase": "stopping",
+            "launch_message": "Stopping deployment",
         }
     members = [
         member for member in (deployment.get("members") or [])

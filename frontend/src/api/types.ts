@@ -1,5 +1,5 @@
 export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
-export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
+export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopping' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
   runtime: RuntimeKind

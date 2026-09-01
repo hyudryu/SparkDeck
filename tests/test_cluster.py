@@ -4859,6 +4859,36 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             release_stop.set()
             await stopping
 
+    async def test_manual_stop_reports_stopping_until_members_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment()
+            instance.deployments = [deployment]
+            stop_started = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def member_action(_member, action):
+                self.assertEqual(action, "stop")
+                stop_started.set()
+                await release_stop.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            stopping = asyncio.create_task(
+                instance.deployment_action("deployment-1", "stop")
+            )
+            await asyncio.wait_for(stop_started.wait(), 1)
+
+            self.assertEqual(deployment["status"], "stopping")
+            saved = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(saved[0]["status"], "stopping")
+            self.assertEqual(saved[0]["desired_state"], "stopped")
+            release_stop.set()
+            await stopping
+
+            self.assertEqual(deployment["status"], "stopped")
+
     async def test_failed_manual_stop_remains_explicitly_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

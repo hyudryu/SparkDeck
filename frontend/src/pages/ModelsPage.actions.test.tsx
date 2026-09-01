@@ -324,6 +324,29 @@ describe('models page running actions', () => {
     })
   })
 
+  it('shows a disabled Stopping button while a stop is in flight', async () => {
+    const stopping = {
+      ...runningDeployment, status: 'stopping', desired_state: 'stopped',
+      launch_phase: 'stopping', launch_message: 'Stopping deployment',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [stopping] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(stopping), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const stoppingButton = await screen.findByRole('button', { name: 'Stopping…' })
+    expect(stoppingButton).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+  })
+
   it('shows controls and loading progress for a discovered external container', async () => {
     const user = userEvent.setup()
     const external = {

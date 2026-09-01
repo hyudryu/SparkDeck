@@ -136,7 +136,7 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
-const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting'])
+const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'stopping'])
 const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
 const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
@@ -1825,7 +1825,9 @@ export function ModelsPage() {
                     )}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
-                    {(deployment.managed || deployment.controllable) && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
+                    {(deployment.managed || deployment.controllable) && (deployment.status === 'stopping'
+                      ? <Button variant="tertiary" disabled>Stopping…</Button>
+                      : deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
                       ? (supportsAdditionalNodes(deployment)
                         ? <SplitButton
                             label="Stop"

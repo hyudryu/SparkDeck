@@ -5847,6 +5847,9 @@ class Manager:
         # request racing an explicit Stop cannot resurrect the deployment.
         if action == "stop":
             deployment["desired_state"] = "stopped"
+            # The stop can take seconds per rank; report the honest transition
+            # instead of leaving the pre-stop status on the card.
+            deployment["status"] = "stopping"
             self._save_deployments()
 
         # Containers cannot move between nodes: an explicit node selection (or
@@ -15283,6 +15286,11 @@ class Manager:
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"
+                elif saved.get("status") == "stopping":
+                    # A stop is in flight but not every rank has exited yet.
+                    # Keep the transition visible instead of flipping the card
+                    # back to the pre-stop status.
+                    deployment["status"] = "stopping"
                 elif member_states and all(s == "running" for s in member_states):
                     primary = deployment["members"][0]
                     phase = primary.get("phase") or {}

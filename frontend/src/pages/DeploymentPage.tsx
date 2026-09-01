@@ -93,6 +93,7 @@ const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
 const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
+const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
 function updateInput(editor: Editor): DeploymentUpdateInput {
   return {
@@ -139,6 +140,14 @@ export function DeploymentPage() {
       setSavedEditorFingerprint(editorFingerprint(savedEditor))
     }
   }, [resource.data])
+
+  // Transitional statuses resolve without user input; keep the detail view
+  // live so a finished stop/start is reflected without a manual reload.
+  useEffect(() => {
+    if (resource.loading || !resource.data || !TRANSITIONAL_DEPLOYMENT_STATUSES.has(resource.data.status)) return
+    const timer = window.setTimeout(resource.reload, 2000)
+    return () => window.clearTimeout(timer)
+  }, [resource.data, resource.loading, resource.reload])
 
   useEffect(() => {
     if (!editor || !resource.data || resource.data.runtime === 'llama.cpp') {
@@ -262,8 +271,8 @@ export function DeploymentPage() {
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
   const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
-  const active = ['launching', 'starting', 'running', 'ready'].includes(detail.status)
-  const lifecycleDisabled = Boolean(busy) || (!detail.editable && !detail.controllable)
+  const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
+  const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
   return <div className="page">
     <PageHeader
@@ -306,7 +315,7 @@ export function DeploymentPage() {
         <div className="settings-save wide-field">
           <Button type="submit" disabled={disabled || !hasUnsavedChanges}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable
-            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
+            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' || detail.status === 'stopping' ? 'Stopping…' : 'Stop'}</Button>
             : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => openRun(event.currentTarget.form)}><Play size={15} /> Run</Button>}
         </div>
       </form>

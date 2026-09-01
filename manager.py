@@ -672,6 +672,7 @@ class Manager:
         self.inference_nudger_task: asyncio.Task | None = None
         self.token_usage_sync_task: asyncio.Task | None = None
         self.deployment_resume_task: asyncio.Task | None = None
+        self.deployment_stop_resume_task: asyncio.Task | None = None
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
@@ -844,6 +845,7 @@ class Manager:
     def _start_controller_tasks(self) -> None:
         task_factories = (
             ("deployment_resume_task", self._resume_interrupted_deployments),
+            ("deployment_stop_resume_task", self._resume_interrupted_stops),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
@@ -863,6 +865,7 @@ class Manager:
             "worker_task", "idle_task", "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
+            "deployment_stop_resume_task",
         ):
             task = getattr(self, field, None)
             if task and not task.done():
@@ -909,6 +912,7 @@ class Manager:
             self.inference_nudger_task,
             self.token_usage_sync_task,
             self.deployment_resume_task,
+            self.deployment_stop_resume_task,
         ):
             if t:
                 t.cancel()
@@ -5847,6 +5851,9 @@ class Manager:
         # request racing an explicit Stop cannot resurrect the deployment.
         if action == "stop":
             deployment["desired_state"] = "stopped"
+            # The stop can take seconds per rank; report the honest transition
+            # instead of leaving the pre-stop status on the card.
+            deployment["status"] = "stopping"
             self._save_deployments()
 
         # Containers cannot move between nodes: an explicit node selection (or
@@ -5946,6 +5953,53 @@ class Manager:
             return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _resume_interrupted_stops(self) -> None:
+        """Finish member stops interrupted by a manager restart.
+
+        A persisted "stopping" deployment has no in-flight stop after a
+        restart; without re-issuing it, get_state would preserve "stopping"
+        indefinitely while the ranks keep running. A member stop that fails
+        against a temporarily unreachable worker must stay resumable instead
+        of landing in an unactionable error, so failed passes are retried.
+        """
+        pending = {
+            deployment["id"] for deployment in list(self.deployments)
+            if isinstance(deployment, dict)
+            and deployment.get("status") == "stopping"
+            and deployment.get("id")
+        }
+        while pending:
+            retry_later = set()
+            for deployment_id in pending:
+                deployment = self._deployment(deployment_id)
+                if deployment is None or deployment.get("status") == "stopped":
+                    continue
+                try:
+                    result = await self.deployment_action(deployment_id, "stop")
+                    stop_failed = not result.get("ok")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    stop_failed = True
+                    current = self._deployment(deployment_id)
+                    if current is not None:
+                        current["error"] = (
+                            f"Could not finish interrupted stop: {exc}"
+                        )
+                if stop_failed:
+                    # deployment_action reports member failures as an "error"
+                    # status; keep the resume-owned deployment resumable so
+                    # the next pass can stop ranks whose worker reconnected.
+                    current = self._deployment(deployment_id)
+                    if current is not None and current.get("status") != "stopped":
+                        current["status"] = "stopping"
+                        self._save_deployments()
+                        retry_later.add(deployment_id)
+            if not retry_later:
+                return
+            pending = retry_later
+            await self._wait_for_interrupted_launch_retry()
 
     async def _resume_interrupted_deployments(self) -> None:
         """Relaunch accepted work whose request died before containers existed."""
@@ -15283,6 +15337,11 @@ class Manager:
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"
+                elif saved.get("status") == "stopping":
+                    # A stop is in flight but not every rank has exited yet.
+                    # Keep the transition visible instead of flipping the card
+                    # back to the pre-stop status.
+                    deployment["status"] = "stopping"
                 elif member_states and all(s == "running" for s in member_states):
                     primary = deployment["members"][0]
                     phase = primary.get("phase") or {}

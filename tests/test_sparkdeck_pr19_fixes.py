@@ -8,7 +8,11 @@ import httpx
 
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.runtimes import LlamaCppAdapter, SglangAdapter, launch_managed_container
-from sparkdeck.service import SparkDeckService, _deployment_launch_progress
+from sparkdeck.service import (
+    SparkDeckService,
+    _deployment_launch_progress,
+    _deployment_status,
+)
 
 
 # server.py constructs its process-wide Manager at import time. The HTTP route
@@ -100,6 +104,23 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             _deployment_launch_progress(deployment)["launch_message"],
             "Node unreachable",
         )
+
+    def test_stopping_cluster_reports_stopping_progress(self):
+        self.assertEqual(_deployment_status("stopping"), "stopping")
+
+        deployment = {
+            "status": "stopping",
+            "members": [
+                {"rank": 0, "status": "exited", "phase": None},
+                {
+                    "rank": 1, "status": "running",
+                    "phase": {"phase": "ready", "message": "Ready"},
+                },
+            ],
+        }
+        progress = _deployment_launch_progress(deployment)
+        self.assertEqual(progress["launch_phase"], "stopping")
+        self.assertEqual(progress["launch_message"], "Stopping deployment")
 
     async def test_discovered_legacy_managed_container_is_actionable(self):
         self.manager.list_containers.return_value = [{

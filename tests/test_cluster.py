@@ -4859,6 +4859,79 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             release_stop.set()
             await stopping
 
+    async def test_manual_stop_reports_stopping_until_members_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment()
+            instance.deployments = [deployment]
+            stop_started = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def member_action(_member, action):
+                self.assertEqual(action, "stop")
+                stop_started.set()
+                await release_stop.wait()
+                return {"ok": True}
+
+            instance._member_action = member_action
+            stopping = asyncio.create_task(
+                instance.deployment_action("deployment-1", "stop")
+            )
+            await asyncio.wait_for(stop_started.wait(), 1)
+
+            self.assertEqual(deployment["status"], "stopping")
+            saved = json.loads(instance.deployments_path.read_text())
+            self.assertEqual(saved[0]["status"], "stopping")
+            self.assertEqual(saved[0]["desired_state"], "stopped")
+            release_stop.set()
+            await stopping
+
+            self.assertEqual(deployment["status"], "stopped")
+
+    async def test_startup_finishes_interrupted_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment(status="stopping")
+            deployment["desired_state"] = "stopped"
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+
+            await instance._resume_interrupted_stops()
+
+            self.assertEqual(
+                [call.args[1] for call in instance._member_action.await_args_list],
+                ["stop", "stop"],
+            )
+            self.assertEqual(deployment["status"], "stopped")
+
+    async def test_startup_retries_interrupted_stop_after_member_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = self._health_deployment(status="stopping")
+            deployment["desired_state"] = "stopped"
+            instance.deployments = [deployment]
+            instance._wait_for_interrupted_launch_retry = mock.AsyncMock()
+            attempts = 0
+
+            async def member_action(_member, action):
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 2:
+                    raise RuntimeError("worker unreachable")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            await instance._resume_interrupted_stops()
+
+            # Both members fail on the first pass; the deployment must stay
+            # resumable ("stopping", not "error") until the retry succeeds.
+            self.assertEqual(attempts, 4)
+            instance._wait_for_interrupted_launch_retry.assert_awaited_once()
+            self.assertEqual(deployment["status"], "stopped")
+
     async def test_failed_manual_stop_remains_explicitly_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

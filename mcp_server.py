@@ -1145,7 +1145,7 @@ def build_server(
             occupied = [
                 item
                 for item in state.get("deployments", [])
-                if item.get("status") in {"launching", "starting", "ready"}
+                if item.get("status") in {"launching", "starting", "ready", "stopping"}
             ]
             if occupied:
                 ids = ", ".join(str(item.get("id")) for item in occupied)

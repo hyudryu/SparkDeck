@@ -136,7 +136,7 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
-const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting'])
+const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'stopping'])
 const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
 const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
@@ -1094,6 +1094,13 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setActionError(undefined)
     try {
+      if (action === 'stop') {
+        // The stop request awaits every rank; show the transition at once
+        // instead of leaving the row looking runnable until it resolves.
+        resource.setData((current) => current?.map((item) => (
+          item.id === deployment.id ? { ...item, status: 'stopping' } : item
+        )))
+      }
       await api.deployments.action(deployment.id, action)
       if (action === 'remove') {
         acceptedDeployments.current.delete(deployment.id)
@@ -1102,6 +1109,7 @@ export function ModelsPage() {
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
+      if (action === 'stop') resource.reload()
     } finally {
       setBusy(undefined)
     }
@@ -1825,7 +1833,9 @@ export function ModelsPage() {
                     )}
                   </div>
                   <div role="cell" data-label="Actions" className="row-actions">
-                    {(deployment.managed || deployment.controllable) && (deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
+                    {(deployment.managed || deployment.controllable) && (deployment.status === 'stopping'
+                      ? <Button variant="tertiary" disabled>Stopping…</Button>
+                      : deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
                       ? (supportsAdditionalNodes(deployment)
                         ? <SplitButton
                             label="Stop"

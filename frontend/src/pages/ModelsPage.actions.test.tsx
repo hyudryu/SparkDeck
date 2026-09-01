@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -322,6 +322,59 @@ describe('models page running actions', () => {
       ))
       expect(stop).toBeDefined()
     })
+  })
+
+  it('shows a disabled Stopping button while a stop is in flight', async () => {
+    const stopping = {
+      ...runningDeployment, status: 'stopping', desired_state: 'stopped',
+      launch_phase: 'stopping', launch_message: 'Stopping deployment',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [stopping] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(stopping), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const stoppingButton = await screen.findByRole('button', { name: 'Stopping…' })
+    expect(stoppingButton).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+  })
+
+  it('marks the row as stopping while the stop request is still pending', async () => {
+    const user = userEvent.setup()
+    let releaseStop: (() => void) | undefined
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/deployments/dep-1/stop') && init?.method === 'POST') {
+        await new Promise<void>((resolve) => { releaseStop = resolve })
+        return new Response(JSON.stringify({ ok: true, errors: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [runningDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(runningDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Chat model')
+    await user.click(screen.getByRole('button', { name: 'Stop' }))
+
+    expect(await screen.findByText('stopping')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stopping…' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+
+    await act(async () => { releaseStop?.() })
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeInTheDocument()
   })
 
   it('shows controls and loading progress for a discovered external container', async () => {

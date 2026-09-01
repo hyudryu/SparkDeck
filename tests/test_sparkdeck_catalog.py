@@ -402,6 +402,127 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["id"], "org/new-name")
         await http.aclose()
 
+    async def test_details_prefers_tree_weight_size_over_inflated_safetensors(self):
+        # Hub safetensors metadata double-counts tensors shared across shards,
+        # so the element-count estimate (304 bytes) is far above the real
+        # weight files (100 bytes).
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors", "size": 100},
+                    {"type": "file", "path": "config.json", "size": 10},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        self.assertEqual(item["parameter_count"], 300)
+        self.assertEqual(item["weight_size_bytes"], 100)
+        self.assertEqual(item["weight_size_source"], "tree")
+        await http.aclose()
+
+    async def test_details_keeps_safetensors_estimate_when_tree_fails(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                return httpx.Response(500)
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        self.assertEqual(item["weight_size_bytes"], 304)
+        self.assertEqual(item["weight_size_source"], "safetensors")
+        await http.aclose()
+
+    async def test_details_keeps_estimate_when_tree_lacks_weight_sizes(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors"},
+                    {"type": "file", "path": "config.json", "size": 10},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        self.assertEqual(item["weight_size_bytes"], 304)
+        self.assertEqual(item["weight_size_source"], "safetensors")
+        await http.aclose()
+
+    async def test_search_enriches_safetensors_weight_size_from_tree(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tree/main"):
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "model.safetensors", "size": 100},
+                ])
+            if request.url.path == "/api/models":
+                return httpx.Response(200, json=[{
+                    "id": "org/model", "tags": ["safetensors"],
+                    "safetensors": {
+                        "total": 300,
+                        "parameters": {"I8": 296, "BF16": 4},
+                    },
+                    "siblings": [{"rfilename": "model.safetensors"}],
+                }])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 100)
+        self.assertEqual(items[0]["weight_size_source"], "tree")
+        await http.aclose()
+
+    async def test_search_keeps_estimate_when_enrichment_fails(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/models":
+                return httpx.Response(200, json=[{
+                    "id": "org/model", "tags": ["safetensors"],
+                    "safetensors": {
+                        "total": 300,
+                        "parameters": {"I8": 296, "BF16": 4},
+                    },
+                    "siblings": [{"rfilename": "model.safetensors"}],
+                }])
+            return httpx.Response(500)
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("model", 5)
+
+        self.assertEqual(items[0]["weight_size_bytes"], 304)
+        self.assertEqual(items[0]["weight_size_source"], "safetensors")
+        await http.aclose()
+
 
 class CatalogFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_matching_local_models_are_reserved_inside_catalog_limit(self):

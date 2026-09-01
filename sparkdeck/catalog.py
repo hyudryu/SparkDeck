@@ -32,6 +32,7 @@ _GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
 )
+_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt", ".pth")
 
 
 @asynccontextmanager
@@ -109,8 +110,44 @@ class HuggingFaceCatalog:
                     continue
                 public["quantizations"] = _gguf_quantizations(item.get("siblings"))
                 items.append(public)
+            await self._enrich_tree_weight_sizes(items)
             self._cache[key] = (time.monotonic(), items)
             return items
+
+    async def _enrich_tree_weight_sizes(self, items: list[dict[str, Any]]) -> None:
+        """Replace inflated safetensors metadata estimates with tree sizes.
+
+        Hub safetensors metadata double-counts tensors shared across shards,
+        so sizes derived from element counts can be far larger than the real
+        download. Failures keep the estimate; search must never fail here.
+        """
+        candidates = [
+            item for item in items
+            if item.get("weight_size_source") == "safetensors"
+        ]
+        if not candidates:
+            return
+        semaphore = asyncio.Semaphore(8)
+
+        async def load(item: dict[str, Any]) -> None:
+            async with semaphore:
+                try:
+                    detail = await self.details(str(item["id"]))
+                except (httpx.HTTPError, TypeError, ValueError):
+                    return
+            if detail.get("weight_size_source") != "tree":
+                return
+            size = _positive_int(detail.get("weight_size_bytes"))
+            if size:
+                item["weight_size_bytes"] = size
+                item["weight_size_source"] = "tree"
+
+        tasks = [asyncio.create_task(load(item)) for item in candidates]
+        _, pending = await asyncio.wait(tasks, timeout=8)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def details(self, repository: str) -> dict[str, Any]:
         """Return public Hub metadata plus every downloadable GGUF quantization."""
@@ -169,49 +206,10 @@ class HuggingFaceCatalog:
             raw.setdefault("id", repository)
             detail_repository = str(raw.get("id") or repository)
             siblings = raw.get("siblings")
+            item = self._public_item(raw)
+            tree: list[dict[str, Any]] | None = None
             if _gguf_sizes_missing(siblings):
-                tree_path = (
-                    f"/api/models/{quote(detail_repository, safe='/')}/tree/main"
-                )
-                tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
-                tree_params: dict[str, Any] | None = {
-                    "recursive": "true", "limit": 1000,
-                }
-                tree: list[dict[str, Any]] = []
-                seen_pages: set[str] = set()
-                while True:
-                    tree_response = await self.http.get(
-                    tree_url,
-                    params=tree_params,
-                    headers=request_headers,
-                    timeout=15,
-                    )
-                    tree_response.raise_for_status()
-                    current_page = str(tree_response.url)
-                    if current_page in seen_pages:
-                        raise ValueError(
-                            "Hugging Face returned a repeated model tree page"
-                        )
-                    seen_pages.add(current_page)
-                    page = tree_response.json()
-                    if not isinstance(page, list):
-                        raise ValueError("Hugging Face returned an invalid model tree")
-                    tree.extend(entry for entry in page if isinstance(entry, dict))
-
-                    next_href = tree_response.links.get("next", {}).get("url")
-                    if not next_href:
-                        break
-                    next_url = tree_response.url.join(str(next_href))
-                    if (
-                        next_url.scheme != "https"
-                        or next_url.host != "huggingface.co"
-                        or next_url.path != tree_path
-                    ):
-                        raise ValueError(
-                            "Hugging Face returned an unsafe model tree page"
-                        )
-                    tree_url = next_url
-                    tree_params = None
+                tree = await self._fetch_tree(detail_repository, request_headers)
                 sizes = {
                     str(entry.get("path") or ""): _positive_int(entry.get("size"))
                     for entry in tree
@@ -230,10 +228,66 @@ class HuggingFaceCatalog:
                         for sibling in siblings
                     ]
                     raw["siblings"] = siblings
-            item = self._public_item(raw)
+            elif item["weight_size_source"] == "safetensors":
+                # Hub safetensors metadata double-counts tensors shared across
+                # shards, inflating any size derived from element counts.
+                # Prefer real weight-file sizes; keep the estimate on failure.
+                try:
+                    tree = await self._fetch_tree(detail_repository, request_headers)
+                except (httpx.HTTPError, ValueError):
+                    tree = None
+            if tree is not None and item["weight_size_source"] == "safetensors":
+                tree_weight_size = _tree_weight_size(tree)
+                if tree_weight_size:
+                    item["weight_size_bytes"] = tree_weight_size
+                    item["weight_size_source"] = "tree"
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
             self._detail_cache[key] = (time.monotonic(), item)
             return item
+
+    async def _fetch_tree(
+        self, repository: str, headers: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Return the full recursive file listing for a model repository."""
+        tree_path = f"/api/models/{quote(repository, safe='/')}/tree/main"
+        tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
+        tree_params: dict[str, Any] | None = {"recursive": "true", "limit": 1000}
+        tree: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        while True:
+            tree_response = await self.http.get(
+                tree_url,
+                params=tree_params,
+                headers=headers,
+                timeout=15,
+            )
+            tree_response.raise_for_status()
+            current_page = str(tree_response.url)
+            if current_page in seen_pages:
+                raise ValueError(
+                    "Hugging Face returned a repeated model tree page"
+                )
+            seen_pages.add(current_page)
+            page = tree_response.json()
+            if not isinstance(page, list):
+                raise ValueError("Hugging Face returned an invalid model tree")
+            tree.extend(entry for entry in page if isinstance(entry, dict))
+
+            next_href = tree_response.links.get("next", {}).get("url")
+            if not next_href:
+                break
+            next_url = tree_response.url.join(str(next_href))
+            if (
+                next_url.scheme != "https"
+                or next_url.host != "huggingface.co"
+                or next_url.path != tree_path
+            ):
+                raise ValueError(
+                    "Hugging Face returned an unsafe model tree page"
+                )
+            tree_url = next_url
+            tree_params = None
+        return tree
 
     @staticmethod
     def _public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -438,6 +492,25 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
             "artifacts": artifacts,
         })
     return sorted(result, key=lambda item: item["name"].casefold())
+
+
+def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
+    """Sum real weight-file sizes from a repository tree listing."""
+    total = 0
+    for entry in tree:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "file") != "file":
+            continue
+        path = str(entry.get("path") or "").casefold()
+        if not path.endswith(_WEIGHT_FILE_SUFFIXES):
+            continue
+        size = _positive_int(entry.get("size"))
+        if size is None:
+            # An incomplete listing must not override the metadata estimate.
+            return None
+        total += size
+    return total or None
 
 
 def _gguf_sizes_missing(raw_siblings: Any) -> bool:

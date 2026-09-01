@@ -33,6 +33,7 @@ _GGUF_SHARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{4,64}$", re.IGNORECASE)
+_SNAPSHOT_DIRECTORY_PATTERN = re.compile(r"(?:^|/)checkpoint-\d+(?:/|$)", re.IGNORECASE)
 
 
 @asynccontextmanager
@@ -522,33 +523,36 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
     variants) must not have every copy counted into one total. Files whose
     path carries a quantization marker — whether in a directory (``awq/``,
     ``bf16/``) or in the filename (``model.fp16.safetensors``) — are
-    alternative checkpoints that are never co-loaded. Unmarked files, spread
-    across component directories (``transformer/``, ``text_encoder/``,
-    ``vae/``) or the root, belong to the one primary checkpoint and are
-    summed together. When only quantization variants exist (quant-collection
-    repos), the largest single variant is reported.
+    alternative checkpoints that are never co-loaded; one dtype variant can
+    span several component directories, so variants aggregate by marker
+    alone. Unmarked files belong to the one primary checkpoint and are summed
+    together across component directories (``transformer/``,
+    ``text_encoder/``, ``vae/``) and the root, except training snapshots in
+    ``checkpoint-N`` directories, which a normal deployment never loads. When
+    only variants exist (quant-collection repos), the largest single variant
+    is reported.
     """
     primary = 0
-    variants: dict[tuple[str, str], int] = {}
+    variants: dict[str, int] = {}
     for entry in tree:
         if not isinstance(entry, dict):
             continue
         if str(entry.get("type") or "file") != "file":
             continue
-        path = str(entry.get("path") or "")
+        path = str(entry.get("path") or "").replace("\\", "/")
         if not path.casefold().endswith(".safetensors"):
             continue
         size = _positive_int(entry.get("size"))
         if size is None:
             # An incomplete listing must not override the metadata estimate.
             return None
+        if _SNAPSHOT_DIRECTORY_PATTERN.search(path):
+            continue
         marker = quantization_from_text(path)
         if marker is None:
             primary += size
         else:
-            directory = path.replace("\\", "/").rpartition("/")[0]
-            key = (directory, marker)
-            variants[key] = variants.get(key, 0) + size
+            variants[marker] = variants.get(marker, 0) + size
     if primary:
         return primary
     if variants:

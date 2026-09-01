@@ -4382,19 +4382,40 @@ class SparkDeckService:
             if value is not None:
                 normalized[key] = value
 
+        def replace_from_manager(key: str, value: Any) -> None:
+            if manager_deployment is None:
+                preserve(key, value)
+            elif value is None:
+                normalized.pop(key, None)
+            else:
+                normalized[key] = value
+
         for pricing_key in (
             "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
         ):
             preserve(pricing_key, launch_inputs.get(pricing_key))
-        preserve("context_length", controls.get("context_window"))
-        preserve("max_concurrency", controls.get("max_concurrency"))
+        replace_from_manager("context_length", controls.get("context_window"))
+        replace_from_manager("max_concurrency", controls.get("max_concurrency"))
+        if runtime is RuntimeKind.VLLM:
+            replace_from_manager(
+                "tensor_parallel_size", controls.get("tensor_parallel_size"),
+            )
+            replace_from_manager(
+                "pipeline_parallel_size", controls.get("pipeline_parallel_size"),
+            )
         if runtime is RuntimeKind.SGLANG:
-            preserve("tensor_parallel_size", launch_inputs.get("sg_tp_size"))
-            preserve("max_running_requests", controls.get("max_concurrency"))
-            preserve("mem_fraction_static", launch_inputs.get("sg_mem_fraction"))
+            replace_from_manager(
+                "tensor_parallel_size", launch_inputs.get("sg_tp_size"),
+            )
+            replace_from_manager(
+                "max_running_requests", controls.get("max_concurrency"),
+            )
+            replace_from_manager(
+                "mem_fraction_static", launch_inputs.get("sg_mem_fraction"),
+            )
         elif runtime is RuntimeKind.LLAMA_CPP:
-            preserve("parallel_slots", controls.get("max_concurrency"))
-            preserve("gpu_layers", launch_inputs.get("llama_gpu_layers"))
+            replace_from_manager("parallel_slots", controls.get("max_concurrency"))
+            replace_from_manager("gpu_layers", launch_inputs.get("llama_gpu_layers"))
 
         for runtime_identity_key in (
             "manager_deployment_id", "managed_by", "automation_run_id",
@@ -5192,11 +5213,13 @@ class SparkDeckService:
         first_token_at = None
         usage = None
         timing_trusted = True
+        completed = False
+        stream_failed = False
         clock = timing_clock or time.monotonic
         observation = self._community_observation.get()
 
         async def produce() -> None:
-            nonlocal first_token_at, usage, timing_trusted
+            nonlocal first_token_at, usage, timing_trusted, completed, stream_failed
             cancelled = False
             observation_ended = False
             try:
@@ -5208,7 +5231,12 @@ class SparkDeckService:
                     if response_model:
                         text = _rewrite_sse_model(text, response_model)
                     for line in text.splitlines():
+                        payload = line[5:].strip() if line.startswith("data:") else ""
+                        if payload == "[DONE]":
+                            completed = True
                         parsed = _parse_sse(line)
+                        if parsed and parsed.get("error"):
+                            stream_failed = True
                         if parsed and parsed.get("usage"):
                             usage = parsed["usage"]
                         if (
@@ -5226,7 +5254,7 @@ class SparkDeckService:
                 # not however long a client takes to drain the bounded relay.
                 self._community_observation_end(observation)
                 observation_ended = True
-                if usage:
+                if usage and completed and not stream_failed:
                     resolved_hardware = hardware
                     resolved_verified = hardware_verified
                     if hardware_resolver is not None:
@@ -5775,13 +5803,18 @@ def _positive_float(value: Any) -> float | None:
 
 def _cli_argument_value(arguments: Any, flag: str) -> str | None:
     values = [str(value) for value in arguments or []]
+    found = None
     for index, value in enumerate(values):
         if value == flag and index + 1 < len(values):
-            return _optional_string(values[index + 1])
+            candidate = values[index + 1]
+            if not candidate.startswith("-"):
+                found = _optional_string(candidate)
         prefix = f"{flag}="
         if value.startswith(prefix):
-            return _optional_string(value[len(prefix):])
-    return None
+            candidate = _optional_string(value[len(prefix):])
+            if candidate is not None:
+                found = candidate
+    return found
 
 
 def _weight_quantization(settings: dict[str, Any], model: str) -> str:
@@ -5800,12 +5833,12 @@ def _weight_quantization(settings: dict[str, Any], model: str) -> str:
 
 def _kv_cache_dtype(settings: dict[str, Any]) -> str | None:
     controls = settings.get("launch_controls")
-    structured = (
-        controls.get("kv_cache_dtype") if isinstance(controls, dict) else None
-    )
-    value = structured or _cli_argument_value(
-        settings.get("extra_args"), "--kv-cache-dtype",
-    )
+    if isinstance(controls, dict) and "kv_cache_dtype" in controls:
+        value = controls["kv_cache_dtype"]
+    else:
+        value = _cli_argument_value(
+            settings.get("extra_args"), "--kv-cache-dtype",
+        )
     return canonical_quantization(value)
 
 

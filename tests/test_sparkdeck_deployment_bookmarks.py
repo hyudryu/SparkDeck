@@ -234,6 +234,31 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reparsed["dspark_num_speculative_tokens"], 3)
         self.assertIsNone(reparsed["max_cudagraph_capture_size"])
 
+    async def test_clone_clears_scalars_absent_from_current_manager_argv(self):
+        self.service.store.add_deployment(Deployment(
+            id="stale-scalars", alias="Stale scalars", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={
+                "manager_deployment_id": "current-cluster",
+                "context_length": 32768,
+                "max_concurrency": 8,
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 2,
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.deployments = [{
+            "id": "current-cluster",
+            "launch_settings": {"engine": "vllm", "extra_args": []},
+        }]
+
+        cloned = await self.service.clone_deployment("stale-scalars")
+
+        for key in (
+            "context_length", "max_concurrency", "tensor_parallel_size",
+            "pipeline_parallel_size",
+        ):
+            self.assertNotIn(key, cloned["settings"])
+
     async def test_clone_preserves_external_endpoint_and_credential(self):
         self.service.store.add_deployment(Deployment(
             id="external-1", alias="Hosted model", runtime=RuntimeKind.VLLM,

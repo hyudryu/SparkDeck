@@ -96,6 +96,105 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"][0]["container_name"], "legacy")
         self.assertEqual(result["data"][0]["port"], 8123)
 
+    async def test_models_contract_advertises_explicit_served_names(self):
+        self.service.deployments = AsyncMock(return_value=[{
+            "id": "dep-1", "alias": "deepseek-v4-flash-dspark",
+            "runtime": "vllm", "status": "running",
+            "served_models": ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash"],
+            "container_name": "deepseek", "port": 8000,
+            "model": {"repository": "org/deepseek-v4", "quantization": "fp8"},
+        }])
+
+        result = await self.service.models()
+
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash"],
+        )
+        self.assertTrue(all(
+            item["deployment_id"] == "dep-1" for item in result["data"]
+        ))
+
+    async def test_models_contract_uses_alias_for_ambiguous_served_name(self):
+        self.service.deployments = AsyncMock(return_value=[
+            {
+                "id": "dep-1", "alias": "model-one", "runtime": "vllm",
+                "status": "running", "served_models": ["shared-name"],
+                "model": {"repository": "org/one"},
+            },
+            {
+                "id": "dep-2", "alias": "model-two", "runtime": "vllm",
+                "status": "running", "served_models": ["shared-name"],
+                "model": {"repository": "org/two"},
+            },
+        ])
+
+        result = await self.service.models()
+
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["model-one", "model-two"],
+        )
+
+    async def test_inactive_deployment_reserves_its_served_name(self):
+        self.service.deployments = AsyncMock(return_value=[
+            {
+                "id": "active", "alias": "active-alias", "runtime": "vllm",
+                "status": "running", "served_models": ["shared-name"],
+                "model": {"repository": "org/active"},
+            },
+            {
+                "id": "inactive", "alias": "inactive-alias",
+                "runtime": "vllm", "status": "stopped",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/inactive"},
+            },
+        ])
+
+        result = await self.service.models()
+
+        self.assertEqual([item["id"] for item in result["data"]], ["active-alias"])
+
+    async def test_discovered_alias_is_not_restored_after_served_name_collision(self):
+        self.service._native_llama_model = AsyncMock(return_value="shared-name")
+        self.service.deployments = AsyncMock(return_value=[
+            {
+                "id": "registered", "alias": "registered-alias",
+                "runtime": "vllm", "status": "running",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/registered"},
+            },
+            {
+                "id": "container:external", "alias": "shared-name",
+                "runtime": "vllm", "status": "running",
+                "served_models": ["shared-name"],
+                "model": {"repository": "org/external"},
+            },
+        ])
+
+        result = await self.service.models()
+
+        self.assertEqual(
+            [(item["id"], item["deployment_id"]) for item in result["data"]],
+            [("registered-alias", "registered")],
+        )
+
+    def test_discovered_deployment_preserves_all_served_names(self):
+        deployment = self.service._discovered_deployment(
+            {
+                "name": "external-vllm", "managed": False,
+                "status": "running", "port": 8000,
+                "served_model": "model-one",
+                "served_models": ["model-one", "model-two"],
+            },
+            "vllm",
+            "org/model",
+        )
+
+        self.assertEqual(
+            deployment["served_models"], ["model-one", "model-two"],
+        )
+
     async def test_repository_shaped_legacy_alias_stays_private(self):
         self.manager._container_model_ids = lambda container: container["served_models"]
         self.manager.list_containers = AsyncMock(return_value=[{

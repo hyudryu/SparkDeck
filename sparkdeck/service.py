@@ -945,6 +945,11 @@ class SparkDeckService:
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
+            served_models = cluster.get("served_models")
+            if isinstance(served_models, list):
+                stored["served_models"] = list(served_models)
+            if cluster.get("served_model"):
+                stored["served_model"] = cluster["served_model"]
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
             stored["managed_by"] = (
@@ -1006,6 +1011,11 @@ class SparkDeckService:
                     last_deployed_at = _container_last_deployed_at(container)
                     if last_deployed_at is not None:
                         stored["last_deployed_at"] = last_deployed_at
+                    served_models = container.get("served_models")
+                    if isinstance(served_models, list):
+                        stored["served_models"] = list(served_models)
+                    if container.get("served_model"):
+                        stored["served_model"] = container["served_model"]
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -4582,6 +4592,11 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
+        served_models = container.get("served_models")
+        if isinstance(served_models, list):
+            result["served_models"] = list(served_models)
+        if container.get("served_model"):
+            result["served_model"] = container["served_model"]
         last_deployed_at = _container_last_deployed_at(container)
         if last_deployed_at is not None:
             result["last_deployed_at"] = last_deployed_at
@@ -4605,22 +4620,49 @@ class SparkDeckService:
     async def models(self) -> dict[str, Any]:
         data = []
         seen = set()
-        for deployment in await self.deployments():
-            if deployment.get("status") not in ("running", "registered"):
-                continue
-            alias = deployment["alias"]
-            if alias in seen:
-                continue
-            seen.add(alias)
-            data.append({
-                "id": alias, "object": "model", "created": 0,
-                "owned_by": "sparkdeck", "runtime": deployment["runtime"],
-                "deployment_id": deployment["id"], "model": deployment["model"],
-                "container_name": deployment.get("container_name"),
-                "port": deployment.get("port"),
-            })
+        all_deployments = await self.deployments()
+        deployments = [
+            deployment for deployment in all_deployments
+            if deployment.get("status") in ("running", "registered")
+        ]
+        public_ids = {
+            deployment["id"]: self._deployment_public_model_ids(deployment)
+            for deployment in all_deployments
+        }
+        request_owners = self._deployment_request_owners(
+            all_deployments, public_ids,
+        )
+        for deployment in deployments:
+            model_ids = [
+                model_id for model_id in public_ids[deployment["id"]]
+                if self._model_id_routes_to_deployment(
+                    model_id, deployment, request_owners,
+                )
+            ]
+            if not model_ids:
+                alias = str(deployment.get("alias") or "").strip()
+                if alias and self._model_id_routes_to_deployment(
+                    alias, deployment, request_owners,
+                ):
+                    model_ids = [alias]
+            for model_id in model_ids:
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
+                data.append({
+                    "id": model_id, "object": "model", "created": 0,
+                    "owned_by": "sparkdeck", "runtime": deployment["runtime"],
+                    "deployment_id": deployment["id"], "model": deployment["model"],
+                    "container_name": deployment.get("container_name"),
+                    "port": deployment.get("port"),
+                })
         loaded_llama = await self._native_llama_model()
-        if loaded_llama and loaded_llama not in seen:
+        if (
+            loaded_llama
+            and loaded_llama not in seen
+            and not request_owners.get(loaded_llama)
+            and self.store.deployment(loaded_llama, include_private=True) is None
+        ):
             data.append({
                 "id": loaded_llama, "object": "model", "created": 0,
                 "owned_by": "llama.cpp", "runtime": RuntimeKind.LLAMA_CPP.value,
@@ -4631,11 +4673,107 @@ class SparkDeckService:
             })
         return {"object": "list", "data": data}
 
+    def _deployment_public_model_ids(self, deployment: dict[str, Any]) -> list[str]:
+        """Return the request ids explicitly served by one deployment.
+
+        SparkDeck's alias remains a valid gateway selector, but an explicit
+        runtime served name is the public OpenAI model id. Cluster launch
+        settings live on Manager's durable deployment record, so registered
+        deployments must consult that record instead of replacing the served
+        identity with their UI alias.
+        """
+        configured = deployment.get("served_models")
+        if not isinstance(configured, list):
+            configured = []
+        if not configured and deployment.get("served_model"):
+            configured = [deployment["served_model"]]
+        if not configured:
+            manager_id = (deployment.get("settings") or {}).get(
+                "manager_deployment_id"
+            )
+            linked = next(
+                (
+                    item for item in getattr(self.manager, "deployments", [])
+                    if isinstance(item, dict) and (
+                        item.get("id") == manager_id
+                        or item.get("sparkdeck_record_id") == deployment.get("id")
+                    )
+                ),
+                None,
+            )
+            resolver = getattr(self.manager, "_deployment_served_models", None)
+            if linked is not None and callable(resolver):
+                configured = resolver(linked)
+        normalized = list(dict.fromkeys(
+            str(value).strip() for value in configured if str(value).strip()
+        ))
+        alias = str(deployment.get("alias") or "").strip()
+        return normalized or ([alias] if alias else [])
+
+    def _deployment_request_owners(
+        self,
+        deployments: list[dict[str, Any]],
+        public_ids: dict[str, list[str]] | None = None,
+    ) -> dict[str, set[str]]:
+        """Map every served name and compatibility alias to its owners."""
+        owners: dict[str, set[str]] = {}
+        public_ids = public_ids or {
+            deployment["id"]: self._deployment_public_model_ids(deployment)
+            for deployment in deployments
+        }
+        for deployment in deployments:
+            deployment_id = deployment["id"]
+            request_ids = list(public_ids[deployment_id])
+            alias = str(deployment.get("alias") or "").strip()
+            if alias:
+                request_ids.append(alias)
+            for model_id in request_ids:
+                owners.setdefault(model_id, set()).add(deployment_id)
+        return owners
+
+    def _model_id_routes_to_deployment(
+        self,
+        model_id: str,
+        deployment: dict[str, Any],
+        request_owners: dict[str, set[str]],
+    ) -> bool:
+        """Return whether gateway lookup selects exactly this deployment."""
+        exact = self.store.deployment(model_id, include_private=True)
+        if exact is not None:
+            return exact["id"] == deployment["id"]
+        return request_owners.get(model_id) == {deployment["id"]}
+
+    async def _registered_deployment_for_served_model(
+        self, model_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a live served id to one registered deployment."""
+        deployments = await self.deployments()
+        live_by_id = {
+            deployment["id"]: deployment for deployment in deployments
+        }
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for stored in self.store.deployments(include_private=True):
+            live = live_by_id.get(stored["id"], stored)
+            if model_id in self._deployment_public_model_ids(live):
+                matches.append((stored, live))
+        if len(matches) > 1:
+            raise LookupError(
+                "served model name is ambiguous; use a deployment alias"
+            )
+        if not matches:
+            return None
+        stored, live = matches[0]
+        return {**stored, **live}
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
         deployment = self.store.deployment(requested_model, include_private=True)
+        if deployment is None:
+            deployment = await self._registered_deployment_for_served_model(
+                requested_model
+            )
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )
@@ -4835,6 +4973,7 @@ class SparkDeckService:
                              caller_ip: str | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
+        requested_model = str(body.get("model") or deployment["alias"])
         model = deployment["model"]["repository"]
         upstream_body = {**body, "model": model}
         stream = bool(upstream_body.get("stream"))
@@ -4876,7 +5015,7 @@ class SparkDeckService:
 
             return self._observe_stream(
                 result, deployment["id"], model, deployment["runtime"], settings,
-                started, revision=revision, response_model=deployment["alias"],
+                started, revision=revision, response_model=requested_model,
                 hardware_resolver=serving_hardware,
             )
         hardware, hardware_verified = await self._managed_hardware_snapshot(
@@ -4889,7 +5028,7 @@ class SparkDeckService:
             hardware_verified=hardware_verified,
         )
         if isinstance(result, dict):
-            result["model"] = deployment["alias"]
+            result["model"] = requested_model
         return result
 
     async def _http_stream(self, url: str, body: dict[str, Any], headers: dict[str, str],

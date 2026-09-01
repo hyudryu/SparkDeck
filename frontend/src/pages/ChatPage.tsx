@@ -126,6 +126,7 @@ export function ChatPage() {
     imageReadQueueRef.current = imageReadQueueRef.current.then(async () => {
       if (invocationEpoch !== imageMutationEpochRef.current) return
       let next = [...imagesRef.current]
+      const additions: ChatImageAttachment[] = []
       const failures: string[] = []
       const historyBytes = messages.reduce(
         (total, message) => total + (message.images?.reduce((sum, image) => sum + image.size, 0) ?? 0),
@@ -149,19 +150,21 @@ export function ChatPage() {
           continue
         }
         try {
-          next = [...next, await readImage(file, `image-${++imageIdRef.current}`)]
+          const image = await readImage(file, `image-${++imageIdRef.current}`)
+          additions.push(image)
+          next = [...next, image]
         } catch (reason) {
           failures.push(reason instanceof Error ? reason.message : `Could not read ${file.name || 'image'}.`)
         }
         if (invocationEpoch !== imageMutationEpochRef.current) return
       }
-      replaceImages(next, false)
+      replaceImages([...imagesRef.current, ...additions], false)
       setImageError(failures.length ? failures.join(' ') : undefined)
     })
   }
 
   const removeImage = (id: string) => {
-    replaceImages(imagesRef.current.filter((image) => image.id !== id))
+    replaceImages(imagesRef.current.filter((image) => image.id !== id), false)
     setImageError(undefined)
   }
 

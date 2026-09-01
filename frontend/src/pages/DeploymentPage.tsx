@@ -189,6 +189,10 @@ export function DeploymentPage() {
   const persist = async () => {
     if (!editor) throw new Error('Deployment settings are not loaded')
     const updated = await api.deployments.update(deploymentId, updateInput(editor))
+    // The backend can adjust the saved topology on save (e.g. trimming the
+    // node list when the parallel layout shrinks); keep the page resource in
+    // sync so requiredRunNodes and the Run dialog never act on stale counts.
+    resource.apply(updated)
     const savedEditor = editorFrom(updated)
     setEditor(savedEditor)
     setSavedEditorFingerprint(editorFingerprint(savedEditor))

@@ -251,6 +251,67 @@ describe('deployment object page', () => {
     expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
   })
 
+  it('recomputes the run topology from the server-persisted node set after a trimming save', async () => {
+    const user = userEvent.setup()
+    const fourNode = {
+      ...detail,
+      model_id: 'org/model',
+      node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+      launch_controls: {
+        ...detail.launch_controls,
+        tensor_parallel_size: 4,
+        pipeline_parallel_size: 1,
+      },
+    }
+    // The backend answers a TP 4 -> 2 save with the trimmed two-node topology.
+    const trimmed = {
+      ...fourNode,
+      node_ids: ['local', 'worker-1'],
+      launch_controls: { ...fourNode.launch_controls, tensor_parallel_size: 2 },
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/runtime-flags/preview' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({
+          flags: body.extra_args,
+          command_flags: body.extra_args.map(quoteArgForTest).join(' '),
+          environment: body.environment,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        return new Response(JSON.stringify(trimmed), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(fourNode), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.clear(screen.getByLabelText('Tensor parallel size'))
+    await user.type(screen.getByLabelText('Tensor parallel size'), '2')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Deployment settings saved. They will be applied on the next run.')
+
+    // The page resource reflects the trimmed topology immediately.
+    expect(await screen.findByText(/on 2 nodes/)).toBeInTheDocument()
+
+    // Editing back to TP4 must act on the persisted two-node layout rather
+    // than the stale four-node one loaded before the save.
+    await user.clear(screen.getByLabelText('Tensor parallel size'))
+    await user.type(screen.getByLabelText('Tensor parallel size'), '4')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    const start = await screen.findByRole('button', { name: 'Start on 2 nodes' })
+    await user.click(start)
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1'],
+    })
+  })
+
   it('keeps a running deployment read-only', async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ...detail, status: 'running', desired_state: 'running', editable: false,

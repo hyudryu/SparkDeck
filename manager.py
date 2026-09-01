@@ -4355,11 +4355,21 @@ class Manager:
                 tp = requested_tp if requested_tp is not None else 1
                 pp = requested_pp if requested_pp is not None else 1
                 world_size = tp * pp
-                if tp < 1 or pp < 1 or world_size % len(settings["node_ids"]):
+                node_count = len(settings["node_ids"])
+                if tp < 1 or pp < 1 or world_size < 2:
                     raise ValueError(
                         "explicit tensor/pipeline parallel sizes must be positive "
                         "and provide a whole number of ranks per selected node"
                     )
+                if world_size % node_count and world_size < node_count:
+                    # Fewer ranks than saved nodes (for example TP 4 -> 2 on a
+                    # four-node deployment): cut the saved topology down to the
+                    # first TP x PP nodes, keeping the coordinator first. The
+                    # Run dialog can still re-pick any subset at start. Larger
+                    # non-divisible layouts keep the saved nodes untouched;
+                    # the start-time node selection places exactly TP x PP
+                    # nodes (see recipe_deployment_contract).
+                    settings["node_ids"] = settings["node_ids"][:world_size]
 
         # Preserve the assigned API port unless the editor explicitly changes it.
         if settings.get("port") is None:

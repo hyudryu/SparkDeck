@@ -50,6 +50,7 @@ _SAFE_CONFIGURATION_KEYS = {
     "context_size", "context_window", "context_length", "max_model_len", "parallel", "parallel_slots",
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
+    "kv_cache_dtype",
     "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
@@ -81,6 +82,7 @@ _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
+_STREAM_OBSERVATION_QUEUE_SIZE = 256
 _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
     r"(?P<count>\d{5})(?P<suffix>\.gguf)$",
@@ -568,16 +570,19 @@ class SparkDeckService:
             upload_model_id=upload_model_id,
         )
         deployment_model = deployment.get("model") or {}
-        quantization = (
-            canonical_quantization(deployment_model.get("quantization"))
-            or canonical_quantization(settings.get("quantization"))
-            or quantization_from_text(
-                settings.get("gguf_variant"),
-                deployment_model.get("artifact"),
-                raw_model_id,
-            )
-            or "UNKNOWN"
-        )
+        quantization = _weight_quantization({
+            **settings,
+            "quantization": (
+                deployment_model.get("quantization")
+                if deployment_model.get("quantization") is not None
+                else settings.get("quantization")
+            ),
+            "artifact": (
+                deployment_model.get("artifact")
+                if deployment_model.get("artifact") is not None
+                else settings.get("artifact")
+            ),
+        }, raw_model_id)
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1698,7 +1703,12 @@ class SparkDeckService:
             **current_settings,
             **launch_settings,
             "extra_args": safe_args,
+            # Manager persists structured controls by folding them into argv.
+            # Replace any older editor snapshot instead of letting stale
+            # controls override the current Manager command on a later clone.
+            "launch_controls": controls,
             "context_length": controls.get("context_window"),
+            "max_concurrency": controls.get("max_concurrency"),
             "tensor_parallel_size": contract.get("tensor_parallel_size"),
             "deployment_mode": updated.get("mode")
             or launch_settings.get("deployment_mode"),
@@ -4361,6 +4371,13 @@ class SparkDeckService:
         normalized = self._local_configuration(launch_inputs)
         controls = self.manager._deployment_launch_controls(launch_inputs)
 
+        if manager_deployment is not None:
+            # The live Manager argv is authoritative. A historical
+            # ``settings.launch_controls`` object may describe an older edit;
+            # carrying it into a bookmark would rewrite the copied argv on its
+            # first preview/start.
+            normalized["launch_controls"] = controls
+
         def preserve(key: str, value: Any) -> None:
             if value is not None:
                 normalized[key] = value
@@ -4370,6 +4387,7 @@ class SparkDeckService:
         ):
             preserve(pricing_key, launch_inputs.get(pricing_key))
         preserve("context_length", controls.get("context_window"))
+        preserve("max_concurrency", controls.get("max_concurrency"))
         if runtime is RuntimeKind.SGLANG:
             preserve("tensor_parallel_size", launch_inputs.get("sg_tp_size"))
             preserve("max_running_requests", controls.get("max_concurrency"))
@@ -5159,29 +5177,93 @@ class SparkDeckService:
                               response_model: str | None = None,
                               hardware: dict[str, Any] | None = None,
                               hardware_verified: bool = True,
-                              hardware_resolver: Any = None) -> AsyncIterator[str]:
+                              hardware_resolver: Any = None,
+                              timing_clock: Any = None) -> AsyncIterator[str]:
+        """Consume upstream independently so client backpressure cannot skew TPS.
+
+        The relay bounds queued chunks. If it ever fills, the producer may be
+        delayed by the downstream client and the measurement is marked
+        untrusted instead of being contributed.
+        """
+        relay: asyncio.Queue[Any] = asyncio.Queue(
+            maxsize=_STREAM_OBSERVATION_QUEUE_SIZE,
+        )
+        finished = object()
         first_token_at = None
         usage = None
-        async for chunk in stream:
-            text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
-            if response_model:
-                text = _rewrite_sse_model(text, response_model)
-            for line in text.splitlines():
-                parsed = _parse_sse(line)
-                if parsed and parsed.get("usage"):
-                    usage = parsed["usage"]
-                if parsed and first_token_at is None and _chunk_has_output(parsed):
-                    first_token_at = time.monotonic()
-            yield text.encode("utf-8") if isinstance(chunk, bytes) else text
-        if usage:
-            if hardware_resolver is not None:
-                hardware, hardware_verified = await hardware_resolver()
-            self._record_usage(
-                deployment_id, model, runtime, settings, started, usage,
-                first_token_at, revision=revision, hardware=hardware,
-                hardware_verified=hardware_verified,
-                stream_timing_trusted=False,
-            )
+        timing_trusted = True
+        clock = timing_clock or time.monotonic
+        observation = self._community_observation.get()
+
+        async def produce() -> None:
+            nonlocal first_token_at, usage, timing_trusted
+            cancelled = False
+            observation_ended = False
+            try:
+                async for chunk in stream:
+                    text = (
+                        chunk.decode("utf-8", errors="replace")
+                        if isinstance(chunk, bytes) else str(chunk)
+                    )
+                    if response_model:
+                        text = _rewrite_sse_model(text, response_model)
+                    for line in text.splitlines():
+                        parsed = _parse_sse(line)
+                        if parsed and parsed.get("usage"):
+                            usage = parsed["usage"]
+                        if (
+                            parsed and first_token_at is None
+                            and _chunk_has_output(parsed)
+                        ):
+                            first_token_at = clock()
+                    if relay.full():
+                        timing_trusted = False
+                    await relay.put(
+                        text.encode("utf-8") if isinstance(chunk, bytes) else text
+                    )
+                completed_at = clock()
+                # Concurrency eligibility follows upstream inference lifetime,
+                # not however long a client takes to drain the bounded relay.
+                self._community_observation_end(observation)
+                observation_ended = True
+                if usage:
+                    resolved_hardware = hardware
+                    resolved_verified = hardware_verified
+                    if hardware_resolver is not None:
+                        resolved_hardware, resolved_verified = await hardware_resolver()
+                    self._record_usage(
+                        deployment_id, model, runtime, settings, started, usage,
+                        first_token_at, revision=revision,
+                        hardware=resolved_hardware,
+                        hardware_verified=resolved_verified,
+                        stream_timing_trusted=timing_trusted,
+                        completed_at=completed_at,
+                    )
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                if not observation_ended:
+                    self._community_observation_end(observation)
+                if cancelled:
+                    close_stream = getattr(stream, "aclose", None)
+                    if close_stream is not None:
+                        await close_stream()
+                if not cancelled:
+                    await relay.put(finished)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                chunk = await relay.get()
+                if chunk is finished:
+                    break
+                yield chunk
+            await producer
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
                          settings: dict[str, Any], started: float, data: dict[str, Any],
@@ -5207,7 +5289,8 @@ class SparkDeckService:
                       revision: str | None = None,
                       hardware: dict[str, Any] | None = None,
                       hardware_verified: bool = True,
-                      stream_timing_trusted: bool = True) -> None:
+                      stream_timing_trusted: bool = True,
+                      completed_at: float | None = None) -> None:
         observation = self._community_observation.get()
         passive_observation = observation is not None
         # Community sharing is the authority for passive inference telemetry.
@@ -5217,20 +5300,17 @@ class SparkDeckService:
             or not stream_timing_trusted
         ):
             return
-        completed = time.monotonic()
+        completed = time.monotonic() if completed_at is None else completed_at
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
         latency = max(0.000001, completed - started)
         generation_seconds = max(0.000001, completed - (first_token_at or started))
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
-        quantization = (
-            canonical_quantization(settings.get("quantization"))
-            or quantization_from_text(
-                settings.get("gguf_variant"), settings.get("artifact"), model,
-            )
-            or "UNKNOWN"
-        )
+        kv_cache_dtype = _kv_cache_dtype(settings)
+        if kv_cache_dtype is not None:
+            safe_settings["kv_cache_dtype"] = kv_cache_dtype
+        quantization = _weight_quantization(settings, model)
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
             if output_tokens and first_token_at is not None else None
@@ -5691,6 +5771,42 @@ def _positive_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _cli_argument_value(arguments: Any, flag: str) -> str | None:
+    values = [str(value) for value in arguments or []]
+    for index, value in enumerate(values):
+        if value == flag and index + 1 < len(values):
+            return _optional_string(values[index + 1])
+        prefix = f"{flag}="
+        if value.startswith(prefix):
+            return _optional_string(value[len(prefix):])
+    return None
+
+
+def _weight_quantization(settings: dict[str, Any], model: str) -> str:
+    """Resolve model-weight quantization without conflating KV-cache dtype."""
+    return (
+        canonical_quantization(
+            _cli_argument_value(settings.get("extra_args"), "--quantization")
+        )
+        or canonical_quantization(settings.get("quantization"))
+        or quantization_from_text(
+            settings.get("gguf_variant"), settings.get("artifact"), model,
+        )
+        or "UNKNOWN"
+    )
+
+
+def _kv_cache_dtype(settings: dict[str, Any]) -> str | None:
+    controls = settings.get("launch_controls")
+    structured = (
+        controls.get("kv_cache_dtype") if isinstance(controls, dict) else None
+    )
+    value = structured or _cli_argument_value(
+        settings.get("extra_args"), "--kv-cache-dtype",
+    )
+    return canonical_quantization(value)
 
 
 def _is_missing_container_error(exc: Exception) -> bool:

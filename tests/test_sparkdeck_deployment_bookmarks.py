@@ -154,6 +154,86 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(private["container_name"])
         self.assertIsNone(private.get("_base_url"))
 
+    async def test_clone_uses_current_manager_argv_instead_of_stale_controls(self):
+        current_args = [
+            "--max-model-len", "400000",
+            "--max-num-seqs", "10",
+            "-tp", "4",
+            "--kv-cache-dtype", "fp8",
+            "--speculative-config",
+            (
+                '{"method":"dspark","draft_sample_method":"probabilistic",'
+                '"num_speculative_tokens":3}'
+            ),
+        ]
+        self.service.store.add_deployment(Deployment(
+            id="deepseek", alias="DeepSeek", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/deepseek", revision="revision-1"),
+            container_name="rank-0",
+            settings={
+                "manager_deployment_id": "deepseek-cluster",
+                "node_ids": ["local", "remote-1"],
+                "deployment_mode": "sharded",
+                "launch_controls": {
+                    "context_window": 32768,
+                    "max_concurrency": 8,
+                    "tensor_parallel_size": 2,
+                    "draft_sample_method": "greedy",
+                    "dspark_num_speculative_tokens": 5,
+                    "max_cudagraph_capture_size": 48,
+                },
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.deployments = [{
+            "id": "deepseek-cluster",
+            "launch_settings": {
+                "engine": "vllm",
+                "image": "example/deepseek:current",
+                "environment": {"NCCL_DEBUG": "WARN"},
+                "extra_args": current_args,
+                "node_ids": ["local", "remote-1"],
+                "deployment_mode": "sharded",
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("deepseek")
+
+        self.assertEqual(cloned["settings"]["extra_args"], current_args)
+        self.assertEqual(
+            cloned["settings"]["environment"], {"NCCL_DEBUG": "WARN"},
+        )
+        self.assertEqual(cloned["settings"]["max_concurrency"], 10)
+        controls = cloned["settings"]["launch_controls"]
+        self.assertEqual(controls["context_window"], 400000)
+        self.assertEqual(controls["max_concurrency"], 10)
+        self.assertEqual(controls["tensor_parallel_size"], 4)
+        self.assertEqual(controls["draft_sample_method"], "probabilistic")
+        self.assertEqual(controls["dspark_num_speculative_tokens"], 3)
+        self.assertIsNone(controls["max_cudagraph_capture_size"])
+
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.VLLM, "org/deepseek", cloned["alias"], cloned["id"],
+            ModelIdentity("org/deepseek", revision="revision-1"),
+            cloned["settings"], ["local", "remote-1"], "sharded",
+            llama_artifact=None,
+        )
+        manager = object.__new__(Manager)
+        final_args = manager._apply_deployment_launch_controls(
+            launch["extra_args"], "vllm", launch["launch_controls"],
+            launch["environment"],
+        )
+        reparsed = manager._deployment_launch_controls({
+            "engine": "vllm", "extra_args": final_args,
+            "environment": launch["environment"],
+        })
+        self.assertEqual(reparsed["context_window"], 400000)
+        self.assertEqual(reparsed["max_concurrency"], 10)
+        self.assertEqual(reparsed["tensor_parallel_size"], 4)
+        self.assertEqual(reparsed["draft_sample_method"], "probabilistic")
+        self.assertEqual(reparsed["dspark_num_speculative_tokens"], 3)
+        self.assertIsNone(reparsed["max_cudagraph_capture_size"])
+
     async def test_clone_preserves_external_endpoint_and_credential(self):
         self.service.store.add_deployment(Deployment(
             id="external-1", alias="Hosted model", runtime=RuntimeKind.VLLM,

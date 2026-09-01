@@ -32,6 +32,8 @@ _GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
 )
+_REVISION_PATTERN = re.compile(r"[0-9a-f]{4,64}$", re.IGNORECASE)
+_SNAPSHOT_DIRECTORY_PATTERN = re.compile(r"(?:^|/)checkpoint-\d+(?:/|$)", re.IGNORECASE)
 
 
 @asynccontextmanager
@@ -61,6 +63,7 @@ class HuggingFaceCatalog:
         self.http = http
         self.ttl_seconds = ttl_seconds
         self.token_provider = token_provider
+        self._enrich_timeout = 8.0
         self._cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
         self._detail_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
         # Deduplicate only identical requests. Different repositories must be
@@ -90,7 +93,7 @@ class HuggingFaceCatalog:
                     *(("expand[]", field) for field in (
                         "author", "downloads", "likes", "tags", "safetensors",
                         "gguf", "pipeline_tag", "gated", "private", "lastModified",
-                        "siblings",
+                        "siblings", "sha",
                     )),
                 ],
                 headers={"Authorization": f"Bearer {token}"} if token else {},
@@ -109,8 +112,71 @@ class HuggingFaceCatalog:
                     continue
                 public["quantizations"] = _gguf_quantizations(item.get("siblings"))
                 items.append(public)
-            self._cache[key] = (time.monotonic(), items)
+            if await self._enrich_tree_weight_sizes(items):
+                # A partially enriched (timed-out) result still carries
+                # inflated estimates, so it must not be cached as complete.
+                self._cache[key] = (time.monotonic(), items)
             return items
+
+    async def _enrich_tree_weight_sizes(self, items: list[dict[str, Any]]) -> bool:
+        """Replace inflated safetensors metadata estimates with tree sizes.
+
+        Hub safetensors metadata double-counts tensors shared across shards,
+        so sizes derived from element counts can be far larger than the real
+        download. Each candidate costs one tree request, pinned to the search
+        result's revision; failures keep the estimate so search never fails
+        here. Returns True when every candidate finished, meaning the result
+        is complete enough to cache.
+        """
+        candidates = [
+            item for item in items
+            if _is_safetensors_candidate(item)
+        ]
+        if not candidates:
+            return True
+        token = str(self.token_provider() or "") if self.token_provider else ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        semaphore = asyncio.Semaphore(8)
+        failed = 0
+
+        async def load(item: dict[str, Any]) -> None:
+            nonlocal failed
+            revision = str(item.get("revision") or "")
+            if not _REVISION_PATTERN.fullmatch(revision):
+                revision = "main"
+            async with semaphore:
+                try:
+                    tree = await self._fetch_tree(str(item["id"]), headers, revision)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        # A gated tree is permanently inaccessible to the
+                        # current credential, so the fallback estimate is
+                        # cacheable; only transient failures stay retryable.
+                        return
+                    failed += 1
+                    return
+                except (httpx.HTTPError, ValueError):
+                    # A transient Hub failure must not be cached as a
+                    # completed enrichment; the estimate is still inflated.
+                    failed += 1
+                    return
+            size = _tree_weight_size(tree)
+            if size:
+                item["weight_size_bytes"] = size
+                item["weight_size_source"] = "tree"
+            else:
+                # A tree response without usable sizes leaves the inflated
+                # estimate in place and must not be cached as complete.
+                failed += 1
+
+        tasks = [asyncio.create_task(load(item)) for item in candidates]
+        _, pending = await asyncio.wait(tasks, timeout=self._enrich_timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            return False
+        return failed == 0
 
     async def details(self, repository: str) -> dict[str, Any]:
         """Return public Hub metadata plus every downloadable GGUF quantization."""
@@ -168,50 +234,26 @@ class HuggingFaceCatalog:
                 raise ValueError("Hugging Face returned an invalid public model")
             raw.setdefault("id", repository)
             detail_repository = str(raw.get("id") or repository)
+            # Pin the tree fetch to the metadata response's commit so the
+            # weight size and the advertised revision stay consistent.
+            revision = str(raw.get("sha") or "")
+            if not _REVISION_PATTERN.fullmatch(revision):
+                revision = "main"
             siblings = raw.get("siblings")
-            if _gguf_sizes_missing(siblings):
-                tree_path = (
-                    f"/api/models/{quote(detail_repository, safe='/')}/tree/main"
+            item = self._public_item(raw)
+            tree: list[dict[str, Any]] | None = None
+            safetensors_lookup = (
+                item["weight_size_source"] == "safetensors"
+                or (
+                    item["weight_size_source"] is None
+                    and _has_safetensors(raw)
                 )
-                tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
-                tree_params: dict[str, Any] | None = {
-                    "recursive": "true", "limit": 1000,
-                }
-                tree: list[dict[str, Any]] = []
-                seen_pages: set[str] = set()
-                while True:
-                    tree_response = await self.http.get(
-                    tree_url,
-                    params=tree_params,
-                    headers=request_headers,
-                    timeout=15,
-                    )
-                    tree_response.raise_for_status()
-                    current_page = str(tree_response.url)
-                    if current_page in seen_pages:
-                        raise ValueError(
-                            "Hugging Face returned a repeated model tree page"
-                        )
-                    seen_pages.add(current_page)
-                    page = tree_response.json()
-                    if not isinstance(page, list):
-                        raise ValueError("Hugging Face returned an invalid model tree")
-                    tree.extend(entry for entry in page if isinstance(entry, dict))
-
-                    next_href = tree_response.links.get("next", {}).get("url")
-                    if not next_href:
-                        break
-                    next_url = tree_response.url.join(str(next_href))
-                    if (
-                        next_url.scheme != "https"
-                        or next_url.host != "huggingface.co"
-                        or next_url.path != tree_path
-                    ):
-                        raise ValueError(
-                            "Hugging Face returned an unsafe model tree page"
-                        )
-                    tree_url = next_url
-                    tree_params = None
+            )
+            tree_failed = False
+            if _gguf_sizes_missing(siblings):
+                tree = await self._fetch_tree(
+                    detail_repository, request_headers, revision,
+                )
                 sizes = {
                     str(entry.get("path") or ""): _positive_int(entry.get("size"))
                     for entry in tree
@@ -230,10 +272,82 @@ class HuggingFaceCatalog:
                         for sibling in siblings
                     ]
                     raw["siblings"] = siblings
-            item = self._public_item(raw)
+            elif safetensors_lookup:
+                # Hub safetensors metadata double-counts tensors shared across
+                # shards, inflating any size derived from element counts.
+                # Prefer real weight-file sizes; keep the estimate on failure.
+                try:
+                    tree = await self._fetch_tree(
+                        detail_repository, request_headers, revision,
+                    )
+                except (httpx.HTTPError, ValueError):
+                    tree = None
+                    tree_failed = True
+            if tree is not None and safetensors_lookup:
+                tree_weight_size = _tree_weight_size(tree)
+                if tree_weight_size:
+                    item["weight_size_bytes"] = tree_weight_size
+                    item["weight_size_source"] = "tree"
+                else:
+                    # An unusable tree response leaves the inflated estimate
+                    # in place and must be retried, not cached as complete.
+                    tree_failed = True
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
-            self._detail_cache[key] = (time.monotonic(), item)
+            if not tree_failed:
+                # A fallback produced after a transient tree error must be
+                # retried after the Hub recovers, not cached as complete.
+                self._detail_cache[key] = (time.monotonic(), item)
             return item
+
+    async def _fetch_tree(
+        self,
+        repository: str,
+        headers: dict[str, str],
+        revision: str = "main",
+    ) -> list[dict[str, Any]]:
+        """Return the full recursive file listing for a model repository."""
+        tree_path = (
+            f"/api/models/{quote(repository, safe='/')}"
+            f"/tree/{quote(revision, safe='')}"
+        )
+        tree_url = httpx.URL(f"https://huggingface.co{tree_path}")
+        tree_params: dict[str, Any] | None = {"recursive": "true", "limit": 1000}
+        tree: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        while True:
+            tree_response = await self.http.get(
+                tree_url,
+                params=tree_params,
+                headers=headers,
+                timeout=15,
+            )
+            tree_response.raise_for_status()
+            current_page = str(tree_response.url)
+            if current_page in seen_pages:
+                raise ValueError(
+                    "Hugging Face returned a repeated model tree page"
+                )
+            seen_pages.add(current_page)
+            page = tree_response.json()
+            if not isinstance(page, list):
+                raise ValueError("Hugging Face returned an invalid model tree")
+            tree.extend(entry for entry in page if isinstance(entry, dict))
+
+            next_href = tree_response.links.get("next", {}).get("url")
+            if not next_href:
+                break
+            next_url = tree_response.url.join(str(next_href))
+            if (
+                next_url.scheme != "https"
+                or next_url.host != "huggingface.co"
+                or next_url.path != tree_path
+            ):
+                raise ValueError(
+                    "Hugging Face returned an unsafe model tree page"
+                )
+            tree_url = next_url
+            tree_params = None
+        return tree
 
     @staticmethod
     def _public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -438,6 +552,91 @@ def _gguf_quantizations(raw_siblings: Any) -> list[dict[str, Any]]:
             "artifacts": artifacts,
         })
     return sorted(result, key=lambda item: item["name"].casefold())
+
+
+def _has_safetensors(item: dict[str, Any]) -> bool:
+    """Whether a raw Hub payload carries safetensors weights evidence."""
+    if isinstance(item.get("safetensors"), dict):
+        return True
+    siblings = item.get("siblings")
+    return isinstance(siblings, list) and any(
+        isinstance(sibling, dict)
+        and str(sibling.get("rfilename") or "").casefold().endswith(".safetensors")
+        for sibling in siblings
+    )
+
+
+def _is_safetensors_candidate(item: dict[str, Any]) -> bool:
+    """Whether a public search item could hold inflated or missing sizes."""
+    source = item.get("weight_size_source")
+    if source == "safetensors":
+        return True
+    if source is not None:
+        return False
+    return "safetensors" in {
+        str(tag).casefold() for tag in item.get("tags") or []
+    }
+
+
+def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
+    """Sum the primary safetensors checkpoint from a repository tree listing.
+
+    Only safetensors files are summed: repositories that also publish
+    alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
+    variants) must not have every copy counted into one total. Resolution is
+    per directory: files with an unmarked sibling are alternatives, a
+    quantization-named directory (``awq/``, ``bf16/``) is always an
+    alternative, and a directory (including the root) whose files exist in
+    only one dtype (``unet/model.fp16.safetensors`` or a root-level
+    ``model.fp16.safetensors`` with no unmarked counterpart) is the required
+    checkpoint or a required component of it. Training snapshots in
+    ``checkpoint-N`` directories are never loaded by a normal deployment and
+    are skipped before any size validation. When nothing qualifies as
+    primary (quant-collection repos), the largest single variant, aggregated
+    across component directories, is reported.
+    """
+    per_directory: dict[str, dict[str, Any]] = {}
+    for entry in tree:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "file") != "file":
+            continue
+        path = str(entry.get("path") or "").replace("\\", "/")
+        if not path.casefold().endswith(".safetensors"):
+            continue
+        # Training snapshots are excluded before any size validation: their
+        # completeness must not affect the primary checkpoint.
+        if _SNAPSHOT_DIRECTORY_PATTERN.search(path):
+            continue
+        size = _positive_int(entry.get("size"))
+        if size is None:
+            # An incomplete listing must not override the metadata estimate.
+            return None
+        directory = path.rpartition("/")[0]
+        info = per_directory.setdefault(directory, {"unmarked": 0, "marked": {}})
+        marker = quantization_from_text(path)
+        if marker is None:
+            info["unmarked"] += size
+        else:
+            info["marked"][marker] = info["marked"].get(marker, 0) + size
+    primary = 0
+    variants: dict[str, int] = {}
+    for directory, info in per_directory.items():
+        marked: dict[str, int] = info["marked"]
+        if info["unmarked"]:
+            primary += info["unmarked"]
+        elif quantization_from_text(directory) is None and marked:
+            # A directory (including the root) whose files exist in only one
+            # dtype is the required checkpoint or a required component.
+            best = max(marked, key=marked.get)
+            primary += marked.pop(best)
+        for marker, size in marked.items():
+            variants[marker] = variants.get(marker, 0) + size
+    if primary:
+        return primary
+    if variants:
+        return max(variants.values())
+    return None
 
 
 def _gguf_sizes_missing(raw_siblings: Any) -> bool:

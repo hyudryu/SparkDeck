@@ -137,8 +137,10 @@ class HuggingFaceCatalog:
         token = str(self.token_provider() or "") if self.token_provider else ""
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         semaphore = asyncio.Semaphore(8)
+        failed = 0
 
         async def load(item: dict[str, Any]) -> None:
+            nonlocal failed
             revision = str(item.get("revision") or "")
             if not _REVISION_PATTERN.fullmatch(revision):
                 revision = "main"
@@ -146,6 +148,9 @@ class HuggingFaceCatalog:
                 try:
                     tree = await self._fetch_tree(str(item["id"]), headers, revision)
                 except (httpx.HTTPError, ValueError):
+                    # A transient Hub failure must not be cached as a
+                    # completed enrichment; the estimate is still inflated.
+                    failed += 1
                     return
             size = _tree_weight_size(tree)
             if size:
@@ -159,7 +164,7 @@ class HuggingFaceCatalog:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
             return False
-        return True
+        return failed == 0
 
     async def details(self, repository: str) -> dict[str, Any]:
         """Return public Hub metadata plus every downloadable GGUF quantization."""

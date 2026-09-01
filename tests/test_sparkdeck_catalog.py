@@ -749,10 +749,13 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(500)
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        items = await HuggingFaceCatalog(http).search("model", 5)
+        catalog = HuggingFaceCatalog(http)
+        items = await catalog.search("model", 5)
 
         self.assertEqual(items[0]["weight_size_bytes"], 304)
         self.assertEqual(items[0]["weight_size_source"], "safetensors")
+        # Failed enrichment must not be cached as a complete result.
+        self.assertEqual(catalog._cache, {})
         await http.aclose()
 
     async def test_search_does_not_cache_partially_enriched_results(self):

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
-import { Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { ArrowDownToLine, Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
@@ -380,6 +380,8 @@ export function ModelsPage() {
   const [selectedLogNodeId, setSelectedLogNodeId] = useState<string>()
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState<string>()
+  const [logTailing, setLogTailing] = useState(false)
+  const logPanelRef = useRef<HTMLDivElement>(null)
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [startError, setStartError] = useState<string>()
   const [startNotice, setStartNotice] = useState<string>()
@@ -1329,7 +1331,7 @@ export function ModelsPage() {
     }
   }
 
-  const loadLogs = async (id: string) => {
+  const loadLogs = useCallback(async (id: string) => {
     // A slower request for a previously viewed deployment must never
     // overwrite the currently displayed one.
     const requestId = ++logRequestRef.current
@@ -1351,15 +1353,35 @@ export function ModelsPage() {
     } finally {
       if (logRequestRef.current === requestId) setLogLoading(false)
     }
-  }
+  }, [])
 
   const openLogs = (deployment: Deployment) => {
     setLogViewer(deployment)
     setLogData(undefined)
     setSelectedLogNodeId(undefined)
     setLogError(undefined)
+    setLogTailing(false)
     void loadLogs(deployment.id)
   }
+
+  const closeLogs = () => {
+    setLogViewer(undefined)
+    setLogTailing(false)
+  }
+
+  // Tailing refreshes the open viewer on an interval and pins the panel to
+  // the newest output, like `logs --follow`.
+  useEffect(() => {
+    if (!logTailing || !logViewer) return
+    const timer = window.setInterval(() => void loadLogs(logViewer.id), 2000)
+    return () => window.clearInterval(timer)
+  }, [logTailing, logViewer, loadLogs])
+
+  useEffect(() => {
+    if (!logTailing) return
+    const panel = logPanelRef.current
+    if (panel) panel.scrollTop = panel.scrollHeight
+  }, [logData, logTailing])
 
   const logMembers = [...(logData?.members ?? [])].sort((left, right) => (
     (left.rank ?? Number.MAX_SAFE_INTEGER) - (right.rank ?? Number.MAX_SAFE_INTEGER)
@@ -2328,9 +2350,9 @@ export function ModelsPage() {
       )}
 
       {logViewer && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setLogViewer(undefined)}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeLogs()}>
           <section className="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="deployment-logs-title">
-            <div className="modal-heading"><div><p className="eyebrow">Deployment logs</p><h2 id="deployment-logs-title">{logViewer.alias}</h2></div><button className="icon-button" onClick={() => setLogViewer(undefined)} aria-label="Close dialog">×</button></div>
+            <div className="modal-heading"><div><p className="eyebrow">Deployment logs</p><h2 id="deployment-logs-title">{logViewer.alias}</h2></div><button className="icon-button" onClick={closeLogs} aria-label="Close dialog">×</button></div>
             {logError && <p className="form-error" role="alert">{logError}</p>}
             {logMembers.length > 1 && (
               <div className="deployment-log-tabs" role="tablist" aria-label="Deployment log nodes">
@@ -2354,6 +2376,7 @@ export function ModelsPage() {
             <div
               id="deployment-log-panel"
               className="log-view deployment-log-view"
+              ref={logPanelRef}
               role={logMembers.length > 1 ? 'tabpanel' : undefined}
               aria-labelledby={logMembers.length > 1 ? `deployment-log-tab-${Math.max(0, logMembers.indexOf(selectedLogMember!))}` : undefined}
               aria-label={logMembers.length > 1 ? undefined : `Logs for ${logViewer.alias}`}
@@ -2364,8 +2387,9 @@ export function ModelsPage() {
                 : <pre>{selectedLogMember?.logs || logData?.logs || 'No log output.'}</pre>}
             </div>
             <div className="modal-actions">
+              <Button type="button" variant={logTailing ? 'primary' : 'tertiary'} aria-pressed={logTailing} onClick={() => setLogTailing((current) => !current)}><ArrowDownToLine size={15} /> {logTailing ? 'Tailing' : 'Tail'}</Button>
               <Button type="button" disabled={logLoading} onClick={() => void loadLogs(logViewer.id)}><ScrollText size={15} /> {logLoading ? 'Refreshing…' : 'Refresh'}</Button>
-              <Button type="button" onClick={() => setLogViewer(undefined)}>Close</Button>
+              <Button type="button" onClick={closeLogs}>Close</Button>
             </div>
           </section>
         </div>

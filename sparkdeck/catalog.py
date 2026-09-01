@@ -519,15 +519,17 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
 
     Only safetensors files are summed: repositories that also publish
     alternative copies of the same checkpoint (``pytorch_model.bin``, GGUF
-    variants) must not have every copy counted into one total. Subdirectories
-    are split by name: directories carrying a quantization marker (``awq/``,
-    ``bf16/``, …) are alternative checkpoints that are never co-loaded, while
-    unmarked directories (``transformer/``, ``text_encoder/``, ``vae/``) are
-    required components of the one primary checkpoint and are summed with the
-    root files. When only quantization variants exist (quant-collection
-    repos), the largest single checkpoint is reported.
+    variants) must not have every copy counted into one total. Files whose
+    path carries a quantization marker — whether in a directory (``awq/``,
+    ``bf16/``) or in the filename (``model.fp16.safetensors``) — are
+    alternative checkpoints that are never co-loaded. Unmarked files, spread
+    across component directories (``transformer/``, ``text_encoder/``,
+    ``vae/``) or the root, belong to the one primary checkpoint and are
+    summed together. When only quantization variants exist (quant-collection
+    repos), the largest single variant is reported.
     """
-    groups: dict[str, int] = {}
+    primary = 0
+    variants: dict[tuple[str, str], int] = {}
     for entry in tree:
         if not isinstance(entry, dict):
             continue
@@ -540,17 +542,18 @@ def _tree_weight_size(tree: list[dict[str, Any]]) -> int | None:
         if size is None:
             # An incomplete listing must not override the metadata estimate.
             return None
-        directory = path.replace("\\", "/").rpartition("/")[0]
-        groups[directory] = groups.get(directory, 0) + size
-    if not groups:
-        return None
-    primary = {
-        directory: size for directory, size in groups.items()
-        if not quantization_from_text(directory)
-    }
+        marker = quantization_from_text(path)
+        if marker is None:
+            primary += size
+        else:
+            directory = path.replace("\\", "/").rpartition("/")[0]
+            key = (directory, marker)
+            variants[key] = variants.get(key, 0) + size
     if primary:
-        return sum(primary.values())
-    return max(groups.values())
+        return primary
+    if variants:
+        return max(variants.values())
+    return None
 
 
 def _gguf_sizes_missing(raw_siblings: Any) -> bool:

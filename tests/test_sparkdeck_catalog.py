@@ -629,6 +629,31 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["weight_size_source"], "tree")
         await http.aclose()
 
+    async def test_details_separates_variants_sharing_one_directory(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/tree/" in request.url.path:
+                return httpx.Response(200, json=[
+                    {"type": "file", "path": "unet/diffusion_model.safetensors", "size": 100},
+                    {"type": "file", "path": "unet/diffusion_model.fp16.safetensors", "size": 150},
+                ])
+            return httpx.Response(200, json={
+                "id": "org/model", "tags": ["safetensors"],
+                "safetensors": {
+                    "total": 300,
+                    "parameters": {"I8": 296, "BF16": 4},
+                },
+                "siblings": [{"rfilename": "unet/diffusion_model.safetensors"}],
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        item = await HuggingFaceCatalog(http).details("org/model")
+
+        # The unmarked file is the primary checkpoint; the fp16 sibling in
+        # the same folder is an alternative that is never co-loaded.
+        self.assertEqual(item["weight_size_bytes"], 100)
+        self.assertEqual(item["weight_size_source"], "tree")
+        await http.aclose()
+
     async def test_search_enriches_safetensors_weight_size_from_tree(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/tree/main"):

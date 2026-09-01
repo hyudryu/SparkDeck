@@ -342,7 +342,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             }),
         )
 
-    async def test_streamed_usage_is_rejected_before_backpressure_can_consume_cooldown(self):
+    async def test_streamed_usage_uses_upstream_timing_despite_slow_consumer(self):
         self.service.store.set_community_consent(True)
         observation = self.service._community_observation_start()
         token = self.service._community_observation.set(observation)
@@ -353,22 +353,168 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 'data: {"choices":[],"usage":{"prompt_tokens":400,'
                 '"completion_tokens":320}}\n\n'
             )
+            yield "data: [DONE]\n\n"
 
         try:
             stream = self.service._observe_stream(
-                upstream(), "dep-1", "org/model", "vllm", {},
-                time.monotonic() - 4,
+                upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
                 hardware={"hardware_class": "dgx-spark"},
                 hardware_verified=True,
+                timing_clock=Mock(side_effect=[100.0, 104.0]),
             )
             async for _chunk in stream:
                 await asyncio.sleep(0.01)
+                self.assertEqual(self.service._community_active_observations, {})
+                independent = self.service._community_observation_start()
+                self.assertFalse(independent["contaminated"])
+                self.service._community_observation_end(independent)
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(samples[0]["generation_tokens_per_second"], 80.0)
+        self.assertFalse(self.service._community_sample_due("org/model", "UNKNOWN"))
+
+    async def test_streamed_usage_is_rejected_if_bounded_relay_fills(self):
+        self.service.store.set_community_consent(True)
+        observation = self.service._community_observation_start()
+        token = self.service._community_observation.set(observation)
+
+        async def upstream():
+            yield 'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"two"}}]}\n\n'
+            yield (
+                'data: {"choices":[],"usage":{"prompt_tokens":400,'
+                '"completion_tokens":320}}\n\n'
+            )
+            yield "data: [DONE]\n\n"
+
+        try:
+            with patch("sparkdeck.service._STREAM_OBSERVATION_QUEUE_SIZE", 1):
+                async for _chunk in self.service._observe_stream(
+                    upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
+                    hardware={"hardware_class": "dgx-spark"},
+                    hardware_verified=True,
+                    timing_clock=Mock(side_effect=[100.0, 104.0]),
+                ):
+                    await asyncio.sleep(0.01)
         finally:
             self.service._community_observation.reset(token)
             self.service._community_observation_end(observation)
 
         self.assertEqual(self.service.store.benchmarks()[1], 0)
         self.assertTrue(self.service._community_sample_due("org/model", "UNKNOWN"))
+
+    async def test_partial_or_failed_stream_usage_is_not_benchmarked(self):
+        self.service.store.set_community_consent(True)
+
+        async def exercise(trailer):
+            observation = self.service._community_observation_start()
+            token = self.service._community_observation.set(observation)
+
+            async def upstream():
+                yield 'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+                yield (
+                    'data: {"choices":[],"usage":{"prompt_tokens":400,'
+                    '"completion_tokens":320}}\n\n'
+                )
+                for chunk in trailer:
+                    yield chunk
+
+            try:
+                async for _chunk in self.service._observe_stream(
+                    upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
+                    hardware={"hardware_class": "dgx-spark"},
+                    hardware_verified=True,
+                    timing_clock=Mock(side_effect=[100.0, 104.0]),
+                ):
+                    pass
+            finally:
+                self.service._community_observation.reset(token)
+                self.service._community_observation_end(observation)
+
+        await exercise([])
+        await exercise([
+            'data: {"error":{"type":"upstream_error","message":"failed"}}\n\n',
+            "data: [DONE]\n\n",
+        ])
+
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+
+    async def test_client_abandonment_cancels_full_relay_and_ends_observation(self):
+        self.service.store.set_community_consent(True)
+        observation = self.service._community_observation_start()
+        token = self.service._community_observation.set(observation)
+        finalized = asyncio.Event()
+
+        async def upstream():
+            try:
+                for index in range(10):
+                    yield (
+                        'data: {"choices":[{"delta":{"content":'
+                        f'"{index}"}}]}}\n\n'
+                    )
+            finally:
+                finalized.set()
+
+        try:
+            with patch("sparkdeck.service._STREAM_OBSERVATION_QUEUE_SIZE", 1):
+                stream = self.service._observe_stream(
+                    upstream(), "dep-1", "org/model", "vllm", {},
+                    time.monotonic(),
+                )
+                await anext(stream)
+                await stream.aclose()
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+
+        self.assertTrue(finalized.is_set())
+        self.assertEqual(self.service._community_active_observations, {})
+
+    async def test_kv_cache_dtype_is_separate_from_weight_quantization(self):
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(settings={
+            "extra_args": ["--kv-cache-dtype", "fp8"],
+        })
+
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 1)
+        self.assertEqual(samples[0]["model"]["quantization"], "UNKNOWN")
+        self.assertEqual(samples[0]["configuration"]["kv_cache_dtype"], "FP8")
+
+        self.service.store.set_setting(
+            self.service._community_sample_setting("org/model", "UNKNOWN"), None,
+        )
+        self._record_passive_sample(settings={
+            "extra_args": [
+                "--quantization", "fp8", "--kv-cache-dtype", "fp16",
+            ],
+            "quantization": "fp16",
+        })
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 2)
+        newest = samples[0]
+        self.assertEqual(newest["model"]["quantization"], "FP8")
+        self.assertEqual(newest["configuration"]["kv_cache_dtype"], "FP16")
+
+        self.service.store.set_setting(
+            self.service._community_sample_setting("org/model", "FP8"), None,
+        )
+        self._record_passive_sample(settings={
+            "extra_args": [
+                "--quantization", "fp8", "--quantization=awq",
+                "--quantization=", "--kv-cache-dtype", "fp8",
+            ],
+            "launch_controls": {"kv_cache_dtype": None},
+        })
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 3)
+        newest = samples[0]
+        self.assertEqual(newest["model"]["quantization"], "AWQ")
+        self.assertNotIn("kv_cache_dtype", newest["configuration"])
 
     async def test_equivalent_explicit_quantizations_share_upload_and_cooldown_key(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})

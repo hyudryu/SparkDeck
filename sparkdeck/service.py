@@ -3686,6 +3686,15 @@ class SparkDeckService:
         node_ids: list[str],
     ) -> dict[str, Any]:
         """Relaunch one discovered runtime as a managed cluster deployment."""
+        if container.get("start_command") or container.get("stop_command"):
+            # A managed relaunch would bypass the external orchestration that
+            # owns this container, and the script-wrapped argv cannot be
+            # replayed outside its shell environment anyway.
+            raise ValueError(
+                "this deployment's lifecycle is managed by external scripts "
+                "and cannot be converted to a managed deployment; edit its "
+                "settings via the deployment's settings file instead"
+            )
         settings = dict(container.get("load_settings") or {})
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
         try:

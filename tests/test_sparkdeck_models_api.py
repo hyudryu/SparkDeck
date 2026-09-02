@@ -1624,6 +1624,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     def test_windows_group_signal_falls_back_to_taskkill_tree(self):
         process = self.FakeProcess()
         run = Mock()
+        run.return_value.returncode = 0
         with (
             patch.object(os, "name", "nt"),
             patch.object(os, "kill", side_effect=OSError("no console")),

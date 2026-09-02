@@ -465,11 +465,13 @@ class SparkDeckService:
         """Signal a hook's process group, falling back to the bare shell."""
         if os.name == "nt" and process_group_id is not None:
             if sig == signal.SIGTERM:
-                try:
-                    os.kill(process_group_id, signal.CTRL_BREAK_EVENT)
-                    return
-                except (ProcessLookupError, PermissionError, OSError, SystemError):
-                    pass
+                ctrl_break_event = getattr(signal, "CTRL_BREAK_EVENT", None)
+                if ctrl_break_event is not None:
+                    try:
+                        os.kill(process_group_id, ctrl_break_event)
+                        return
+                    except (ProcessLookupError, PermissionError, OSError, SystemError):
+                        pass
             # CTRL_BREAK is the graceful tree signal. If it is unavailable or
             # this is escalation, taskkill /T prevents cmd/PowerShell children
             # from surviving their shell and racing the Stop hook.

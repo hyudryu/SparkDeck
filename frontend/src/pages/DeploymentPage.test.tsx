@@ -477,8 +477,10 @@ describe('env-file backed deployment page', () => {
     settings_env: {
       name: '.env.dspark', mtime: 1234.5,
       entries: [
-        { key: 'SERVED_MODEL_NAME', value: 'org/old', enabled: true, line: 2 },
-        { key: 'MAX_MODEL_LEN', value: '262144', enabled: true, line: 3 },
+        // Raw stored text keeps its quoting; only the structured controls
+        // and served-name input initialize from the unquoted value.
+        { key: 'SERVED_MODEL_NAME', value: `'org/old'`, enabled: true, line: 2 },
+        { key: 'MAX_MODEL_LEN', value: '"262144"', enabled: true, line: 3 },
         { key: 'MAX_NUM_SEQS', value: '32', enabled: false, line: 4 },
         { key: 'API_TOKEN', value: null, enabled: true, line: 5, redacted: true },
       ],
@@ -512,9 +514,11 @@ describe('env-file backed deployment page', () => {
 
     expect(await screen.findByLabelText('Served model name')).toHaveValue('org/old')
     // Initial control values come from the backing env entries, not the
-    // stale container-parsed launch_controls (999).
+    // stale container-parsed launch_controls (999), and are unquoted.
     expect(screen.getByLabelText('Context window')).toHaveValue(262144)
     expect(screen.getByText('MAX_MODEL_LEN')).toBeInTheDocument()
+    // The env rows table shows the raw stored value, quotes included.
+    expect(screen.getByLabelText('MAX_MODEL_LEN value')).toHaveValue('"262144"')
     expect(screen.getByLabelText('MAX_NUM_SEQS value')).toHaveValue('32')
     expect(screen.getByLabelText('Enable MAX_NUM_SEQS')).not.toBeChecked()
     // Secret rows load masked and overwrite-only.
@@ -561,11 +565,13 @@ describe('env-file backed deployment page', () => {
       // even though it is mapped, and unmapped controls are never sent.
       launch_controls: { context_window: 131072 },
       served_model_name: 'org/new',
-      environment: {
-        MAX_NUM_SEQS: { value: '16', enabled: true },
-        API_TOKEN: { value: 'newsecret', enabled: true },
-        MTP_NUM_TOKENS: { value: '3', enabled: true },
-      },
+      // Existing rows are line-addressed so duplicate keys hit the row shown;
+      // the UI-added row has no line yet.
+      environment: [
+        { key: 'MAX_NUM_SEQS', line: 4, value: { value: '16', enabled: true } },
+        { key: 'API_TOKEN', line: 5, value: { value: 'newsecret', enabled: true } },
+        { key: 'MTP_NUM_TOKENS', value: { value: '3', enabled: true } },
+      ],
       env_file_mtime: 1234.5,
     })
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/api/v1/runtime-flags/preview')).toBe(false)
@@ -582,11 +588,11 @@ describe('env-file backed deployment page', () => {
 
     const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
     const body = JSON.parse(String(saveCall?.[1]?.body))
-    expect(body.environment).toEqual({
-      MAX_MODEL_LEN: null,
+    expect(body.environment).toEqual([
+      { key: 'MAX_MODEL_LEN', line: 3, value: null },
       // Toggled but never typed: the redacted value stays on disk.
-      API_TOKEN: { value: null, enabled: false },
-    })
+      { key: 'API_TOKEN', line: 5, value: { value: null, enabled: false } },
+    ])
     expect(body).not.toHaveProperty('launch_controls')
     expect(body).not.toHaveProperty('served_model_name')
   })
@@ -602,5 +608,44 @@ describe('env-file backed deployment page', () => {
     const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
     const body = JSON.parse(String(saveCall?.[1]?.body))
     expect(body.served_model_name).toBe('')
+  })
+
+  it('clearing a mapped control submits null and the reloaded entries show it commented', async () => {
+    const user = userEvent.setup()
+    const commented = {
+      ...envFileDetail,
+      restart_required: true,
+      settings_env: {
+        ...envFileDetail.settings_env,
+        entries: envFileDetail.settings_env.entries.map((entry) => (
+          entry.key === 'MAX_MODEL_LEN' ? { ...entry, enabled: false } : entry
+        )),
+      },
+    }
+    renderEnvFilePage(commented)
+
+    const contextWindow = await screen.findByLabelText('Context window')
+    await user.clear(contextWindow)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
+    expect(JSON.parse(String(saveCall?.[1]?.body)).launch_controls).toEqual({ context_window: null })
+    // The save response reloads the entries: the variable is commented out.
+    expect(await screen.findByLabelText('Enable MAX_MODEL_LEN')).not.toBeChecked()
+  })
+
+  it('runs without saving when nothing changed, never sending a stale mtime', async () => {
+    const user = userEvent.setup()
+    renderEnvFilePage()
+
+    await screen.findByLabelText('Served model name')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    await user.click(await screen.findByRole('button', { name: 'Start on 1 node' }))
+
+    expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
+    const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    expect(mutations.map(([input, init]) => `${init?.method} ${String(input)}`)).toEqual([
+      'POST /api/v1/deployments/container%3Avllm-dspark/start',
+    ])
   })
 })

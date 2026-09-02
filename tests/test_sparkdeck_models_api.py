@@ -884,10 +884,13 @@ class HookBackedEnvFileSettingsTests(unittest.IsolatedAsyncioTestCase):
                 json={
                     "launch_controls": {"context_window": 131072},
                     "served_model_name": "org/new",
-                    "environment": {
-                        "MAX_NUM_SEQS": {"value": "16", "enabled": True},
-                        "API_TOKEN": None,
-                    },
+                    # The UI sends line-addressed operations so duplicate-key
+                    # rows edit the exact line shown.
+                    "environment": [
+                        {"key": "MAX_NUM_SEQS", "line": 4,
+                         "value": {"value": "16", "enabled": True}},
+                        {"key": "API_TOKEN", "line": 5, "value": None},
+                    ],
                 },
             )
 
@@ -905,6 +908,43 @@ class HookBackedEnvFileSettingsTests(unittest.IsolatedAsyncioTestCase):
             entry["key"]: entry for entry in response.json()["settings_env"]["entries"]
         }
         self.assertTrue(entries["MAX_NUM_SEQS"]["enabled"])
+
+    async def test_clearing_a_mapped_control_comments_the_variable_out(self):
+        patches = self._patches(self._container())
+        with patches[0], patches[1]:
+            response = await self.client.put(
+                "/api/v1/deployments/container:vllm-dspark/settings",
+                json={"launch_controls": {"context_window": None}},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "# MAX_MODEL_LEN=262144\n", self.env_path.read_text(encoding="utf-8"),
+        )
+        entries = {
+            entry["key"]: entry for entry in response.json()["settings_env"]["entries"]
+        }
+        self.assertFalse(entries["MAX_MODEL_LEN"]["enabled"])
+
+    async def test_secret_shaped_values_are_redacted_in_detail(self):
+        self.env_path.write_text(
+            "DATABASE_URL=postgres://user:pass@db:5432/serving\n"
+            "MAX_MODEL_LEN=262144\n",
+            encoding="utf-8",
+        )
+        patches = self._patches(self._container())
+        with patches[0], patches[1]:
+            response = await self.client.get(
+                "/api/v1/deployments/container:vllm-dspark",
+            )
+
+        entries = {
+            entry["key"]: entry
+            for entry in response.json()["settings_env"]["entries"]
+        }
+        self.assertIsNone(entries["DATABASE_URL"]["value"])
+        self.assertTrue(entries["DATABASE_URL"]["redacted"])
+        self.assertEqual(entries["MAX_MODEL_LEN"]["value"], "262144")
 
     async def test_save_rejects_controls_without_a_backing_variable(self):
         container = self._container()

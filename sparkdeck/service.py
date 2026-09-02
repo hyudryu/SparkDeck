@@ -34,9 +34,9 @@ from .catalog import (
 )
 from .envfile_settings import (
     EnvFileConflictError,
-    SECRET_KEY_PATTERN,
     apply_env_updates,
     field_mapping,
+    is_secret_entry,
     parse_env_file,
     resolve_control_updates,
 )
@@ -1754,12 +1754,12 @@ class SparkDeckService:
         name = Path(path).name
         try:
             stat_result = os.stat(path)
-            text = Path(path).read_text(encoding="utf-8")
+            text = Path(path).read_bytes().decode("utf-8")
         except OSError as exc:
             return {"name": name, "error": str(exc)}
         entries = parse_env_file(text)
         for entry in entries:
-            if SECRET_KEY_PATTERN.search(entry["key"]):
+            if is_secret_entry(entry["key"], entry["value"]):
                 entry["value"] = None
                 entry["redacted"] = True
         return {
@@ -1995,26 +1995,38 @@ class SparkDeckService:
             )
 
         try:
-            entries = parse_env_file(Path(env_path).read_text(encoding="utf-8"))
+            entries = parse_env_file(Path(env_path).read_bytes().decode("utf-8"))
         except OSError as exc:
             raise ValueError(f"settings env file is not readable: {exc}") from exc
 
         launch_controls = changes.get("launch_controls")
         if launch_controls is not None and not isinstance(launch_controls, dict):
             raise ValueError("launch_controls must be an object")
-        updates: dict[str, Any] = resolve_control_updates(
+        control_updates = resolve_control_updates(
             launch_controls,
             changes.get("gpu_memory_utilization"),
             changes.get("served_model_name"),
             entries,
         )
+        updates: list[dict[str, Any]] = [
+            {"key": key, "value": value}
+            for key, value in control_updates.items()
+        ]
         environment = changes.get("environment")
         if environment is not None:
-            if not isinstance(environment, dict):
-                raise ValueError("environment must be an object")
             # Raw env updates merge over the structured controls; they may
             # overwrite secret keys (write-only) but never read them back.
-            updates.update(environment)
+            # The UI sends line-addressed operations so duplicate-key rows
+            # edit the exact line shown; the dict form stays accepted.
+            if isinstance(environment, dict):
+                updates.extend(
+                    {"key": key, "value": value}
+                    for key, value in environment.items()
+                )
+            elif isinstance(environment, list):
+                updates.extend(environment)
+            else:
+                raise ValueError("environment must be an object or a list of operations")
 
         expected_mtime = changes.get("env_file_mtime")
         if expected_mtime is not None and not isinstance(

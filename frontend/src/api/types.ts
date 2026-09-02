@@ -178,7 +178,15 @@ export interface DeploymentDetail extends Deployment {
   image?: string
 }
 
-export type EnvFileEnvironmentUpdate = Record<string, string | null | { value: string | null; enabled: boolean }>
+// One env-file edit. Existing rows are line-addressed so duplicate keys
+// apply to the exact row shown; rows added in the UI have no line yet.
+export interface EnvFileEnvironmentOp {
+  key: string
+  line?: number
+  value: string | null | { value: string | null; enabled: boolean }
+}
+
+export type EnvFileEnvironmentUpdate = EnvFileEnvironmentOp[]
 
 // Save contract for hook-backed env-file cards (edit_mode === 'env-file').
 export interface EnvFileDeploymentUpdateInput {

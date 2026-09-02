@@ -24,3 +24,16 @@ export function parseEnvironment(input: string): Record<string, string> {
 export function formatEnvironment(environment?: Record<string, string>): string {
   return Object.entries(environment ?? {}).map(([name, value]) => `${name}=${value}`).join('\n')
 }
+
+// Mirrors the backend's raw value semantics for display: double-quoted
+// values strip the quotes and unescape \" and \\, single-quoted values strip
+// the quotes without escapes, and unquoted values pass through unchanged.
+export function unquoteEnvValue(value: string): string {
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1)
+  }
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1).replace(/\\(["\\])/g, '$1')
+  }
+  return value
+}

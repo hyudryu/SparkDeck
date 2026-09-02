@@ -8,13 +8,13 @@ import type {
   DeploymentLaunchControls,
   DeploymentUpdateInput,
   EnvFileDeploymentUpdateInput,
-  EnvFileEnvironmentUpdate,
+  EnvFileEnvironmentOp,
 } from '../api/types'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { formatEnvironment, parseEnvironment } from '../utils/environment'
+import { formatEnvironment, parseEnvironment, unquoteEnvValue } from '../utils/environment'
 
 const quoteArg = (arg: string) => (arg === '' || /[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
 
@@ -101,6 +101,8 @@ const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
 // One row of the env-file editor table. Redacted (secret) rows load with an
 // empty value; typing overwrites the secret, leaving it empty keeps it.
+// `line` pins edits to the exact file line so duplicate keys edit the row
+// shown; rows added in the UI have no line yet.
 interface EnvRow {
   key: string
   value: string
@@ -108,6 +110,7 @@ interface EnvRow {
   redacted: boolean
   deleted: boolean
   added: boolean
+  line?: number
   initialValue?: string
   initialEnabled: boolean
 }
@@ -119,6 +122,7 @@ const envRowFrom = (entry: DeploymentEnvEntry): EnvRow => ({
   redacted: Boolean(entry.redacted),
   deleted: false,
   added: false,
+  line: entry.line,
   initialValue: entry.redacted ? undefined : entry.value ?? '',
   initialEnabled: entry.enabled,
 })
@@ -133,8 +137,8 @@ const envRowDirty = (row: EnvRow) => (
 const servedNameFrom = (detail: DeploymentDetail): string => {
   const settingsEnv = detail.settings_env
   const key = settingsEnv?.field_mapping?.served_model_name
-  const entry = settingsEnv?.entries?.find((item) => item.key === key)
-  return entry?.value ?? ''
+  const raw = settingsEnv?.entries?.find((item) => item.key === key)?.value
+  return raw ? unquoteEnvValue(raw) : ''
 }
 
 // Structured controls of the env-file editor whose initial values come from
@@ -146,7 +150,10 @@ const envControlValue = (detail: DeploymentDetail, control: EnvFileControl): str
   const settingsEnv = detail.settings_env
   const key = settingsEnv?.field_mapping?.[control]
   if (!key) return undefined
-  return settingsEnv?.entries?.find((item) => item.key === key)?.value ?? ''
+  const raw = settingsEnv?.entries?.find((item) => item.key === key)?.value
+  // Structured controls take the unquoted value; the env rows table below
+  // still shows the raw stored text.
+  return raw === undefined || raw === null ? '' : unquoteEnvValue(raw)
 }
 
 const envFileEditorFrom = (detail: DeploymentDetail, editor: Editor): Editor => ({
@@ -185,16 +192,15 @@ function envFileUpdateInput(
     launch_controls.kv_cache_dtype = editor.kv_cache_dtype.trim() || null
   }
 
-  const environment: EnvFileEnvironmentUpdate = {}
+  const environment: EnvFileEnvironmentOp[] = []
   for (const row of envRows) {
     if (!envRowDirty(row) || !row.key.trim()) continue
-    if (row.deleted) {
-      environment[row.key] = null
-    } else if (row.redacted && row.value === '') {
-      environment[row.key] = { value: null, enabled: row.enabled }
-    } else {
-      environment[row.key] = { value: row.value, enabled: row.enabled }
-    }
+    const value = row.deleted
+      ? null
+      : row.redacted && row.value === ''
+        ? { value: null, enabled: row.enabled }
+        : { value: row.value, enabled: row.enabled }
+    environment.push(row.added ? { key: row.key, value } : { key: row.key, line: row.line, value })
   }
 
   return {
@@ -205,7 +211,7 @@ function envFileUpdateInput(
     // Clearing the served name is a real edit: send "" so the backend writes
     // SERVED_MODEL_NAME= instead of treating the control as unsubmitted.
     served_model_name: servedName !== savedServedName ? servedName : undefined,
-    environment: Object.keys(environment).length ? environment : undefined,
+    environment: environment.length ? environment : undefined,
     env_file_mtime: detail.settings_env?.mtime,
   }
 }
@@ -319,10 +325,22 @@ export function DeploymentPage() {
   const persist = async () => {
     if (!editor || !savedEditor) throw new Error('Deployment settings are not loaded')
     const detail = resource.data
-    const input = detail?.edit_mode === 'env-file'
-      ? envFileUpdateInput(editor, savedEditor, detail, envRows, servedName, savedServedName)
-      : updateInput(editor)
-    const updated = await api.deployments.update(deploymentId, input)
+    if (detail?.edit_mode === 'env-file') {
+      const input = envFileUpdateInput(editor, savedEditor, detail, envRows, servedName, savedServedName)
+      const hasUpdates = Boolean(
+        input.launch_controls
+        || input.gpu_memory_utilization !== undefined
+        || input.served_model_name !== undefined
+        || input.environment,
+      )
+      // A change-free Run must not PUT: a stale env_file_mtime would
+      // conflict with out-of-band edits even though nothing changed.
+      if (!hasUpdates) return detail
+      const updated = await api.deployments.update(deploymentId, input)
+      resource.apply(updated)
+      return updated
+    }
+    const updated = await api.deployments.update(deploymentId, updateInput(editor))
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
     // sync so requiredRunNodes and the Run dialog never act on stale counts.

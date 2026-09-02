@@ -1202,7 +1202,8 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_with_hook_spawns_script_instead_of_docker_start(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
-            "managed": False, "status": "exited", "load_settings": {},
+            "managed": False, "status": "exited",
+            "load_settings": {"tensor_parallel_size": 2},
             "start_command": "/opt/stack/start.sh",
             "stop_command": "/opt/stack/stop.sh",
         }
@@ -1220,6 +1221,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/start.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **({"start_new_session": True} if os.name == "posix" else {}),
             )
             manager.start_container.assert_not_awaited()
             manager.create_deployment.assert_not_awaited()
@@ -1311,6 +1313,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/stop.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **({"start_new_session": True} if os.name == "posix" else {}),
             )
             manager.stop_container.assert_not_awaited()
             self.assertEqual(result["status"], "stopped")

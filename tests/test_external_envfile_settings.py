@@ -220,7 +220,7 @@ class ApplyEnvUpdatesTests(unittest.TestCase):
             result = original_stat(target, *args, **kwargs)
             if str(target) == str(os.path.realpath(self.path)):
                 stats.append(result)
-                if len(stats) == 2:
+                if len(stats) >= 2:
                     # Simulate a concurrent writer: same file, new size/mtime.
                     return os.stat_result((
                         result.st_mode, result.st_ino, result.st_dev,

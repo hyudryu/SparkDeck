@@ -117,14 +117,17 @@ describe('UsagePage', () => {
   })
 
   it('restores lifetime model accounting and persisted hourly analysis', async () => {
+    const recent = new Date()
+    recent.setUTCDate(recent.getUTCDate() - 1)
+    const recentDate = recent.toISOString().slice(0, 10)
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/token-stats/hourly')) return json([
-        { hour: '2026-08-26T10', input: 1200, cached: 300, output: 400, requests: 4 },
-        { hour: '2026-08-26T11', input: 600, cached: 200, output: 250, requests: 2 },
+        { hour: `${recentDate}T10`, input: 1200, cached: 300, output: 400, requests: 4 },
+        { hour: `${recentDate}T11`, input: 600, cached: 200, output: 250, requests: 2 },
       ])
       if (path.includes('/api/token-stats/daily')) return json([
-        { date: '2026-08-26', input: 1800, cached: 500, output: 650, requests: 6, models: { 'org/model': { input: 1800, cached: 500, output: 650, requests: 6 } } },
+        { date: recentDate, input: 1800, cached: 500, output: 650, requests: 6, models: { 'org/model': { input: 1800, cached: 500, output: 650, requests: 6 } } },
       ])
       return json(summary)
     })

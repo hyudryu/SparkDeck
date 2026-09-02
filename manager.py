@@ -263,6 +263,10 @@ RANK_LABEL = "io.sparkdeck.rank"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
 NNODES_LABEL = "io.sparkdeck.nnodes"
+# External containers can opt into script-backed lifecycle instead of plain
+# docker start/stop (e.g. an externally orchestrated multi-node vLLM stack).
+START_COMMAND_LABEL = "io.sparkdeck.start-command"
+STOP_COMMAND_LABEL = "io.sparkdeck.stop-command"
 
 # Containers created by earlier releases remain discoverable and manageable.
 LEGACY_LABELS = {
@@ -10642,9 +10646,63 @@ class Manager:
                 "deployment_mode": _label_value(labels, MODE_LABEL, "single"),
                 "nnodes": int(_label_value(labels, NNODES_LABEL, "1")),
             })
+        # Lifecycle hooks have no legacy aliases, so read them directly.
+        # Dockerfile LABEL values are inherited into a container's inspected
+        # labels, so only honor hooks supplied at container-creation time;
+        # an untrusted image must not bake in arbitrary host execution. The
+        # comparison targets the container's immutable image ID (attrs Image),
+        # never the mutable Config.Image tag, which can be repointed after
+        # the container was created.
+        image_ref = attrs.get("Image") or image_tag
+        start_command = str(labels.get(START_COMMAND_LABEL) or "").strip()
+        if start_command and self._container_level_label(
+            image_ref, START_COMMAND_LABEL, start_command,
+        ):
+            summary["start_command"] = start_command
+        stop_command = str(labels.get(STOP_COMMAND_LABEL) or "").strip()
+        if stop_command and self._container_level_label(
+            image_ref, STOP_COMMAND_LABEL, stop_command,
+        ):
+            summary["stop_command"] = stop_command
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary
+
+    def _container_level_label(
+        self, image_ref: str, key: str, value: str,
+    ) -> bool:
+        """Return True when a label was supplied at container-creation time.
+
+        Dockerfile ``LABEL`` values are inherited into the container's
+        inspected labels, so a hook baked into an untrusted image would run
+        on the controller host. Honor the label only when the image does not
+        define the key or defines it with a different value (an explicit
+        container-level override); an identical key+value is inherited and
+        ignored. ``image_ref`` must be the container's immutable image ID
+        (``attrs["Image"]``) because a mutable tag can be repointed to a
+        different image after the container was created. When the image
+        cannot be inspected the provenance is unverifiable, so fail closed
+        and treat the label as inherited — but do not cache the failure, so
+        a transient Docker error retries on the next inventory pass instead
+        of silently disabling hooks forever.
+
+        Uses ``self.client.images.get`` on the reference string (not the lazy
+        ``c.image`` attribute, which adds a Docker API call per container);
+        successful lookups are cached per image reference across inventory
+        passes.
+        """
+        cache = getattr(self, "_image_label_cache", None)
+        if cache is None:
+            cache = self._image_label_cache = {}
+        if image_ref not in cache:
+            try:
+                image = self.client.images.get(image_ref)
+                labels = (image.attrs.get("Config") or {}).get("Labels") or {}
+            except Exception:
+                return False
+            cache[image_ref] = dict(labels)
+        image_labels = cache[image_ref]
+        return str(image_labels.get(key) or "").strip() != value
 
     async def list_containers(self) -> list[dict]:
         def _run():

@@ -13,7 +13,10 @@ vi.mock('../api/client', () => ({
   },
 }))
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
 
 describe('ChatPage', () => {
   beforeEach(() => {
@@ -223,6 +226,67 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
       role: 'user', content: 'Send immediately',
     }])
+  })
+
+  it('keeps a pending upload when another attachment is removed', async () => {
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    await user.upload(picker, png('remove.png'))
+    await screen.findByText('remove.png')
+
+    fireEvent.change(picker, { target: { files: [png('pending.png')] } })
+    fireEvent.click(screen.getByRole('button', { name: 'Remove remove.png' }))
+
+    expect(screen.queryByText('remove.png')).not.toBeInTheDocument()
+    expect(await screen.findByText('pending.png')).toBeInTheDocument()
+  })
+
+  it('reuses a concurrently freed slot for the next file in a pending batch', async () => {
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    await user.upload(picker, [png('existing-1.png'), png('existing-2.png'), png('existing-3.png')])
+    await screen.findByText('existing-3.png')
+
+    const pendingReads: Array<() => void> = []
+    class DeferredFileReader {
+      result: string | ArrayBuffer | null = null
+      onerror: (() => void) | null = null
+      onload: (() => void) | null = null
+
+      readAsDataURL(file: File) {
+        pendingReads.push(() => {
+          this.result = `data:${file.type};base64,iVBORw0KGgo=`
+          this.onload?.()
+        })
+      }
+    }
+    vi.stubGlobal('FileReader', DeferredFileReader)
+
+    fireEvent.change(picker, { target: { files: [png('new-1.png'), png('new-2.png')] } })
+    await waitFor(() => expect(pendingReads).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove existing-1.png' }))
+    act(() => pendingReads[0]?.())
+    await waitFor(() => expect(pendingReads).toHaveLength(2))
+    act(() => pendingReads[1]?.())
+
+    expect(await screen.findByText('new-1.png')).toBeInTheDocument()
+    expect(await screen.findByText('new-2.png')).toBeInTheDocument()
+    expect(screen.queryByText('existing-1.png')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('rejects unsupported and excess pasted images with an accessible error', async () => {

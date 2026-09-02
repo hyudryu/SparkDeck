@@ -443,6 +443,8 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     launch_phase: item.launch_phase,
     launch_message: item.launch_message,
     last_used_at: item.last_used_at,
+    has_start_hook: item.has_start_hook,
+    has_stop_hook: item.has_stop_hook,
     has_settings_env_file: item.has_settings_env_file,
   }
 }

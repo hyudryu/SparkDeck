@@ -112,6 +112,8 @@ export interface Deployment {
   launch_phase?: string
   launch_message?: string
   last_used_at?: number | null
+  has_start_hook?: boolean
+  has_stop_hook?: boolean
   has_settings_env_file?: boolean
 }
 

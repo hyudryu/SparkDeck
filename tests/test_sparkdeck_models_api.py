@@ -1143,7 +1143,8 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_card_advertises_hook_booleans_without_raw_commands(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
-            "managed": False, "status": "exited", "load_settings": {},
+            "managed": False, "status": "exited",
+            "load_settings": {"tensor_parallel_size": 2},
             "start_command": "/opt/stack/start.sh --token secret",
             "stop_command": "/opt/stack/stop.sh",
         }
@@ -1153,6 +1154,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(card["has_start_hook"])
             self.assertTrue(card["has_stop_hook"])
+            self.assertFalse(card["promotable"])
             payload = json.dumps(card)
             self.assertNotIn("start_command", payload)
             self.assertNotIn("stop_command", payload)
@@ -1171,6 +1173,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(card["has_start_hook"])
             self.assertFalse(card["has_stop_hook"])
+            self.assertTrue(card["promotable"])
             await manager.http.aclose()
             await service.close()
 

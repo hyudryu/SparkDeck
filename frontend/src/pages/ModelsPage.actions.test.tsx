@@ -445,13 +445,14 @@ describe('models page running actions', () => {
     })
   })
 
-  it('preserves Start for a discovered container that cannot be promoted safely', async () => {
+  it('starts a hook-backed discovered container without opening conversion', async () => {
     const user = userEvent.setup()
     const external = {
       id: 'container:protected-vllm', alias: 'Protected vLLM', runtime: 'vllm', kind: 'external',
       model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
       settings: { tensor_parallel_size: 2 }, deployment_mode: 'sharded',
-      required_node_count: 2, managed: false, controllable: true, promotable: false,
+      required_node_count: 2, managed: false, controllable: true,
+      has_start_hook: true, has_stop_hook: true,
     }
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

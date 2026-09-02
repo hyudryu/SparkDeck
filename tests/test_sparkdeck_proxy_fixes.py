@@ -914,6 +914,11 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             manager.create_deployment = AsyncMock()
             service = SparkDeckService(manager, Path(directory))
 
+            listed = service._discovered_deployment(
+                manager.list_containers.return_value[0], "vllm", "org/model",
+            )
+            self.assertFalse(listed["promotable"])
+
             with self.assertRaisesRegex(ValueError, "managed by external scripts"):
                 await service.deployment_action(
                     "container:external-hooked", "start", ["local"], promote=True,

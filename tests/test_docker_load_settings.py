@@ -177,6 +177,45 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary)
         self.assertFalse(summary["load_settings"]["editable"])
 
+    def test_summary_exposes_external_lifecycle_hook_labels(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "hooked-container-id", "hooked-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model"],
+                "Labels": {
+                    "io.sparkdeck.start-command": "  /opt/stack/start.sh  ",
+                    "io.sparkdeck.stop-command": "/opt/stack/stop.sh --all",
+                },
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertEqual(summary["start_command"], "/opt/stack/start.sh")
+        self.assertEqual(summary["stop_command"], "/opt/stack/stop.sh --all")
+
+    def test_summary_omits_absent_or_blank_lifecycle_hook_labels(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "plain-container-id", "plain-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model"],
+                "Labels": {"io.sparkdeck.start-command": "   "},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertNotIn("start_command", summary)
+        self.assertNotIn("stop_command", summary)
+
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 

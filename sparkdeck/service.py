@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import ipaddress
 import json
+import logging
 import math
 import platform
 import re
@@ -44,6 +45,9 @@ from .storage import (
     community_context_window,
 )
 from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
+
+
+logger = logging.getLogger(__name__)
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -363,6 +367,7 @@ class SparkDeckService:
         self._deployment_reconciliation_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        self._external_lifecycle_tasks: dict[str, asyncio.Task] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         self._deployment_action_lock_users: dict[str, int] = {}
         self._deployment_action_lock_registry_lock = asyncio.Lock()
@@ -3721,18 +3726,30 @@ class SparkDeckService:
         external_discovered = discovered is not None and not deployment.get("managed")
         if action == "start":
             if external_discovered:
-                await self.manager.start_container(
-                    container, explicit=True, managed=False,
-                )
+                start_command = discovered.get("start_command")
+                if start_command:
+                    self._start_external_lifecycle_task(
+                        container, "start", str(start_command),
+                    )
+                else:
+                    await self.manager.start_container(
+                        container, explicit=True, managed=False,
+                    )
             else:
                 await self.manager.start_container(container, explicit=True)
             if discovered is None:
                 self.store.update_desired_state(deployment_id, "running")
         elif action == "stop":
             if external_discovered:
-                await self.manager.stop_container(
-                    container, explicit=True, managed=False,
-                )
+                stop_command = discovered.get("stop_command")
+                if stop_command:
+                    self._start_external_lifecycle_task(
+                        container, "stop", str(stop_command),
+                    )
+                else:
+                    await self.manager.stop_container(
+                        container, explicit=True, managed=False,
+                    )
             else:
                 await self.manager.stop_container(container, explicit=True)
         else:
@@ -3740,6 +3757,60 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    def _start_external_lifecycle_task(
+        self, container_name: str, action: str, command: str,
+    ) -> None:
+        """Run a label-defined lifecycle script as a background task."""
+        key = f"{action}:{container_name}"
+        existing = self._external_lifecycle_tasks.get(key)
+        if existing is not None and not existing.done():
+            raise ValueError(
+                f"a {action} command is already running for container "
+                f"{container_name}"
+            )
+        # These commands come from Docker labels on the local host. Anyone
+        # able to create a container with arbitrary labels already has docker
+        # socket access (root-equivalent), so executing a label-defined
+        # command as the controller user does not widen the local trust
+        # boundary.
+        self._external_lifecycle_tasks[key] = asyncio.create_task(
+            self._run_external_lifecycle_command(
+                key, action, container_name, command,
+            )
+        )
+
+    async def _run_external_lifecycle_command(
+        self, key: str, action: str, container_name: str, command: str,
+    ) -> None:
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            message = (
+                "external %s command for container %s exited with code %s; "
+                "stdout tail: %r; stderr tail: %r"
+            )
+            arguments = (
+                action, container_name, process.returncode,
+                stdout.decode(errors="replace")[-2000:],
+                stderr.decode(errors="replace")[-2000:],
+            )
+            if process.returncode:
+                logger.warning(message, *arguments)
+            else:
+                logger.info(message, *arguments)
+        except Exception:
+            logger.exception(
+                "external %s command for container %s failed to run",
+                action, container_name,
+            )
+        finally:
+            if self._external_lifecycle_tasks.get(key) is asyncio.current_task():
+                self._external_lifecycle_tasks.pop(key, None)
 
     def _preparable_deployment_model(
         self, deployment_id: str,
@@ -4582,6 +4653,13 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
+        # Label-defined lifecycle hooks ride along so the detail endpoint can
+        # expose them and the action dispatcher can prefer them over plain
+        # docker start/stop.
+        for hook in ("start_command", "stop_command"):
+            command = container.get(hook)
+            if isinstance(command, str) and command.strip():
+                result[hook] = command.strip()
         last_deployed_at = _container_last_deployed_at(container)
         if last_deployed_at is not None:
             result["last_deployed_at"] = last_deployed_at

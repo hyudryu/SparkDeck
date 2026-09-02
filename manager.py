@@ -263,6 +263,10 @@ RANK_LABEL = "io.sparkdeck.rank"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
 NNODES_LABEL = "io.sparkdeck.nnodes"
+# External containers can opt into script-backed lifecycle instead of plain
+# docker start/stop (e.g. an externally orchestrated multi-node vLLM stack).
+START_COMMAND_LABEL = "io.sparkdeck.start-command"
+STOP_COMMAND_LABEL = "io.sparkdeck.stop-command"
 
 # Containers created by earlier releases remain discoverable and manageable.
 LEGACY_LABELS = {
@@ -10578,6 +10582,13 @@ class Manager:
                 "deployment_mode": _label_value(labels, MODE_LABEL, "single"),
                 "nnodes": int(_label_value(labels, NNODES_LABEL, "1")),
             })
+        # Lifecycle hooks have no legacy aliases, so read them directly.
+        start_command = str(labels.get(START_COMMAND_LABEL) or "").strip()
+        if start_command:
+            summary["start_command"] = start_command
+        stop_command = str(labels.get(STOP_COMMAND_LABEL) or "").strip()
+        if stop_command:
+            summary["stop_command"] = stop_command
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary

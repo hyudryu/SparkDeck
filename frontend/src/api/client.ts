@@ -18,7 +18,9 @@ import type {
   DeploymentDetail,
   DeploymentLogsResponse,
   DeploymentLaunchControls,
+  DeploymentSettingsEnv,
   DeploymentUpdateInput,
+  EnvFileDeploymentUpdateInput,
   SystemStats,
   AdmissionStats,
   LogEntry,
@@ -372,11 +374,17 @@ export interface WireDeployment {
   controllable?: boolean
   logs_available?: boolean
   removable?: boolean
+  has_start_hook?: boolean
+  has_stop_hook?: boolean
+  has_settings_env_file?: boolean
 }
 
 interface WireDeploymentDetail extends WireDeployment {
   editable: boolean
   edit_reason?: string | null
+  edit_mode?: string | null
+  settings_env?: DeploymentSettingsEnv | null
+  restart_required?: boolean
   desired_state: 'running' | 'stopped'
   extra_args: string[]
   launch_controls: DeploymentLaunchControls
@@ -435,6 +443,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     launch_phase: item.launch_phase,
     launch_message: item.launch_message,
     last_used_at: item.last_used_at,
+    has_settings_env_file: item.has_settings_env_file,
   }
 }
 
@@ -443,6 +452,9 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     ...deploymentFromWire(item),
     editable: item.editable,
     edit_reason: item.edit_reason,
+    edit_mode: item.edit_mode,
+    settings_env: item.settings_env ?? undefined,
+    restart_required: item.restart_required,
     desired_state: item.desired_state,
     extra_args: item.extra_args ?? [],
     launch_controls: item.launch_controls ?? {},
@@ -525,7 +537,7 @@ export const api = {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}`, { signal })
       return deploymentDetailFromWire(data)
     },
-    update: async (id: string, input: DeploymentUpdateInput | SavedDeploymentUpdateInput) => {
+    update: async (id: string, input: DeploymentUpdateInput | SavedDeploymentUpdateInput | EnvFileDeploymentUpdateInput) => {
       const data = await request<WireDeploymentDetail>(`/api/v1/deployments/${encodeURIComponent(id)}/settings`, {
         method: 'PUT',
         body: JSON.stringify(input),

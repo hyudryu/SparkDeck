@@ -267,6 +267,9 @@ NNODES_LABEL = "io.sparkdeck.nnodes"
 # docker start/stop (e.g. an externally orchestrated multi-node vLLM stack).
 START_COMMAND_LABEL = "io.sparkdeck.start-command"
 STOP_COMMAND_LABEL = "io.sparkdeck.stop-command"
+# Hook-backed containers can name the KEY=VALUE env file their external
+# start/stop scripts regenerate from, making settings edits file writes.
+ENV_FILE_LABEL = "io.sparkdeck.env-file"
 
 # Containers created by earlier releases remain discoverable and manageable.
 LEGACY_LABELS = {
@@ -10664,6 +10667,13 @@ class Manager:
             image_ref, STOP_COMMAND_LABEL, stop_command,
         ):
             summary["stop_command"] = stop_command
+        # Same provenance guard as the lifecycle hooks: the env file grants
+        # host file writes, so an image-baked label must not be honored.
+        env_file = str(labels.get(ENV_FILE_LABEL) or "").strip()
+        if env_file and self._container_level_label(
+            image_ref, ENV_FILE_LABEL, env_file,
+        ):
+            summary["settings_env_file"] = env_file
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary

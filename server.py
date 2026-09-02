@@ -422,15 +422,16 @@ def _public_legacy_recipe(recipe: dict) -> dict:
 
 
 def _public_container(container: dict) -> dict:
-    """Strip host-executed lifecycle hooks from container inventory payloads.
+    """Strip host-internal lifecycle fields from container inventory payloads.
 
-    The raw start/stop command strings are internal dispatch inputs only;
-    they may embed paths or tokens and must never appear in the
-    unauthenticated /api/containers or /api/state responses.
+    The raw start/stop command strings and the settings env-file path are
+    internal dispatch/editing inputs only; they may embed paths or tokens and
+    must never appear in the unauthenticated /api/containers or /api/state
+    responses.
     """
     return {
         key: value for key, value in container.items()
-        if key not in ("start_command", "stop_command")
+        if key not in ("start_command", "stop_command", "settings_env_file")
     }
 
 
@@ -2225,6 +2226,9 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         "environment",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_mem_fraction",
+        # Hook-backed env-file cards accept their file-backed contract; which
+        # keys apply is decided per container in the service.
+        "served_model_name", "env_file_mtime",
         # Saved-deployment bookmarks (never launched) accept the creator-form
         # contract; which keys apply is decided per record in the service.
         "alias", "context_length", "tensor_parallel_size", "parallel_slots",

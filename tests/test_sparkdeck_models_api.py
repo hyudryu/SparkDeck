@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ with patch("docker.from_env", return_value=Mock()):
     import server
 
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from sparkdeck.service import SparkDeckService
+from sparkdeck.service import SparkDeckService, _EXTERNAL_HOOK_KILL_SIGNAL
 from sparkdeck.storage import SparkDeckStore
 
 
@@ -1213,6 +1214,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             with patch("asyncio.create_subprocess_shell", spawn):
                 result = await service.deployment_action(
                     "container:external-stack", "start",
+                    node_ids=["local", "worker-1"],
                 )
                 task = service._external_lifecycle_tasks["external-stack"]["task"]
                 await task
@@ -1221,7 +1223,17 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/start.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **({"start_new_session": True} if os.name == "posix" else {}),
+                **(
+                    {"start_new_session": True}
+                    if os.name == "posix"
+                    else {
+                        "creationflags": getattr(
+                            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200,
+                        )
+                    }
+                    if os.name == "nt"
+                    else {}
+                ),
             )
             manager.start_container.assert_not_awaited()
             manager.create_deployment.assert_not_awaited()
@@ -1253,7 +1265,28 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_opposing_action_while_hook_is_running_conflicts(self):
+    async def test_explicit_hook_promotion_remains_rejected(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited",
+            "load_settings": {"tensor_parallel_size": 2},
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            with self.assertRaisesRegex(ValueError, "cannot be converted"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local", "worker-1"], promote=True,
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_stop_interrupts_running_start_hook_before_stop_hook(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "load_settings": {},
@@ -1263,32 +1296,191 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         blocker = asyncio.Event()
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
-            spawn = AsyncMock(return_value=self.FakeProcess(blocker=blocker))
-            with patch("asyncio.create_subprocess_shell", spawn):
+            start_process = self.FakeProcess(blocker=blocker)
+            stop_process = self.FakeProcess()
+            spawn = AsyncMock(side_effect=[start_process, stop_process])
+
+            def signal_process(process, sig, _group_id=None):
+                if sig == signal.SIGTERM:
+                    process.terminate()
+                else:
+                    process.kill()
+
+            with (
+                patch("asyncio.create_subprocess_shell", spawn),
+                patch.object(
+                    service, "_signal_process_group", side_effect=signal_process,
+                ),
+            ):
                 await service.deployment_action(
                     "container:external-stack", "start",
                 )
-                entry = service._external_lifecycle_tasks["external-stack"]
                 # Yield so the background hook task reaches the subprocess call.
                 await asyncio.sleep(0)
                 with self.assertRaisesRegex(ValueError, "start.*already running"):
                     await service.deployment_action(
                         "container:external-stack", "start",
                     )
-                # A stop must not run concurrently with the in-flight start.
-                with self.assertRaisesRegex(ValueError, "start.*already running"):
-                    await service.deployment_action(
-                        "container:external-stack", "stop",
-                    )
-                spawn.assert_awaited_once()
-                blocker.set()
-                await entry["task"]
+                result = await service.deployment_action(
+                    "container:external-stack", "stop",
+                )
+                stop_task = service._external_lifecycle_tasks["external-stack"]["task"]
+                await stop_task
+
+                self.assertTrue(start_process.terminated)
+                self.assertEqual(
+                    [call.args[0] for call in spawn.await_args_list],
+                    ["/opt/stack/start.sh", "/opt/stack/stop.sh"],
+                )
+                self.assertEqual(result["status"], "stopped")
 
             manager.start_container.assert_not_awaited()
             manager.stop_container.assert_not_awaited()
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_immediate_stop_waits_for_start_process_then_interrupts_it(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+        start_blocker = asyncio.Event()
+        start_process = self.FakeProcess(blocker=start_blocker)
+        stop_process = self.FakeProcess()
+
+        async def spawn(command, **_kwargs):
+            if command == "/opt/stack/start.sh":
+                spawn_started.set()
+                await release_spawn.wait()
+                return start_process
+            return stop_process
+
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            with (
+                patch("asyncio.create_subprocess_shell", side_effect=spawn),
+                patch.object(
+                    service, "_signal_process_group",
+                    side_effect=lambda process, _sig, _group_id=None: process.terminate(),
+                ),
+            ):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                await spawn_started.wait()
+                stop_request = asyncio.create_task(service.deployment_action(
+                    "container:external-stack", "stop",
+                ))
+                await asyncio.sleep(0)
+                self.assertFalse(stop_request.done())
+
+                release_spawn.set()
+                result = await stop_request
+                stop_task = service._external_lifecycle_tasks["external-stack"]["task"]
+                await stop_task
+
+            self.assertTrue(start_process.terminated)
+            self.assertEqual(result["status"], "stopped")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_stop_kills_group_when_start_leader_exits_but_task_hangs(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        child_pipe_open = asyncio.Event()
+        start_process = self.FakeProcess(blocker=child_pipe_open)
+        # Model a shell leader that exited while a descendant inherited its
+        # pipes, leaving the lifecycle task waiting for final cleanup.
+        start_process.returncode = 0
+        stop_process = self.FakeProcess()
+        spawn = AsyncMock(side_effect=[start_process, stop_process])
+        signals = []
+
+        def signal_process(process, sig, group_id=None):
+            signals.append((sig, group_id))
+            if sig != signal.SIGTERM:
+                process.kill()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            with (
+                patch("asyncio.create_subprocess_shell", spawn),
+                patch.object(
+                    service, "_signal_process_group", side_effect=signal_process,
+                ),
+                patch("sparkdeck.service._EXTERNAL_HOOK_TERM_TIMEOUT", 0.01),
+                patch("sparkdeck.service._EXTERNAL_HOOK_KILL_TIMEOUT", 0.1),
+            ):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                await asyncio.sleep(0)
+                result = await service.deployment_action(
+                    "container:external-stack", "stop",
+                )
+                stop_task = service._external_lifecycle_tasks["external-stack"]["task"]
+                await stop_task
+
+            self.assertEqual(
+                [item[0] for item in signals],
+                [signal.SIGTERM, _EXTERNAL_HOOK_KILL_SIGNAL],
+            )
+            if os.name in {"posix", "nt"}:
+                self.assertEqual(signals[0][1], start_process.pid)
+            self.assertTrue(start_process.killed)
+            self.assertEqual(result["status"], "stopped")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_cancelling_hook_task_kills_spawned_process_group(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+        }
+        blocker = asyncio.Event()
+        process = self.FakeProcess(blocker=blocker)
+        signals = []
+
+        def signal_process(target, sig, group_id=None):
+            signals.append((sig, group_id))
+            target.kill()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            with (
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    AsyncMock(return_value=process),
+                ),
+                patch.object(
+                    service, "_signal_process_group", side_effect=signal_process,
+                ),
+            ):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                await asyncio.sleep(0)
+                task = service._external_lifecycle_tasks["external-stack"]["task"]
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertEqual(signals[0][0], _EXTERNAL_HOOK_KILL_SIGNAL)
+            if os.name in {"posix", "nt"}:
+                self.assertEqual(signals[0][1], process.pid)
+            self.assertTrue(process.killed)
             await manager.http.aclose()
             await service.close()
 
@@ -1313,7 +1505,17 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/stop.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **({"start_new_session": True} if os.name == "posix" else {}),
+                **(
+                    {"start_new_session": True}
+                    if os.name == "posix"
+                    else {
+                        "creationflags": getattr(
+                            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200,
+                        )
+                    }
+                    if os.name == "nt"
+                    else {}
+                ),
             )
             manager.stop_container.assert_not_awaited()
             self.assertEqual(result["status"], "stopped")
@@ -1365,9 +1567,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             service, manager = self._service(directory, container)
             spawn = AsyncMock(return_value=process)
             with (
+                patch.object(os, "name", "posix"),
                 patch("asyncio.create_subprocess_shell", spawn),
                 patch.object(os, "killpg", create=True, side_effect=fake_killpg),
                 patch.object(os, "getpgid", create=True, return_value=999),
+                patch("sparkdeck.service._EXTERNAL_HOOK_TERM_TIMEOUT", 0.01),
+                patch("sparkdeck.service._EXTERNAL_HOOK_KILL_TIMEOUT", 0.1),
             ):
                 await service.deployment_action(
                     "container:external-stack", "start",
@@ -1378,9 +1583,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
             self.assertEqual(signals_sent[0], signal.SIGTERM)
-            self.assertEqual(
-                signals_sent[1], getattr(signal, "SIGKILL", signal.SIGTERM),
-            )
+            self.assertEqual(signals_sent[1], _EXTERNAL_HOOK_KILL_SIGNAL)
             self.assertFalse(process.terminated)
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,
@@ -1418,7 +1621,26 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             )
             await manager.http.aclose()
 
-    async def test_docker_fallback_is_blocked_while_opposing_hook_runs(self):
+    def test_windows_group_signal_falls_back_to_taskkill_tree(self):
+        process = self.FakeProcess()
+        run = Mock()
+        run.return_value.returncode = 0
+        with (
+            patch.object(os, "name", "nt"),
+            patch.object(os, "kill", side_effect=OSError("no console")),
+            patch("sparkdeck.service.subprocess.run", run),
+        ):
+            SparkDeckService._signal_process_group(
+                process, signal.SIGTERM, process.pid,
+            )
+
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+        )
+
+    async def test_stop_interrupts_running_start_hook_before_docker_fallback(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "load_settings": {},
@@ -1429,21 +1651,28 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         blocker = asyncio.Event()
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
-            spawn = AsyncMock(return_value=self.FakeProcess(blocker=blocker))
-            with patch("asyncio.create_subprocess_shell", spawn):
+            start_process = self.FakeProcess(blocker=blocker)
+            spawn = AsyncMock(return_value=start_process)
+            with (
+                patch("asyncio.create_subprocess_shell", spawn),
+                patch.object(
+                    service, "_signal_process_group",
+                    side_effect=lambda process, _sig, _group_id=None: process.terminate(),
+                ),
+            ):
                 await service.deployment_action(
                     "container:external-stack", "start",
                 )
-                entry = service._external_lifecycle_tasks["external-stack"]
                 await asyncio.sleep(0)
-                with self.assertRaisesRegex(ValueError, "start.*already running"):
-                    await service.deployment_action(
-                        "container:external-stack", "stop",
-                    )
+                result = await service.deployment_action(
+                    "container:external-stack", "stop",
+                )
 
-                manager.stop_container.assert_not_awaited()
-                blocker.set()
-                await entry["task"]
+                self.assertTrue(start_process.terminated)
+                manager.stop_container.assert_awaited_once_with(
+                    "external-stack", explicit=True, managed=False,
+                )
+                self.assertEqual(result["status"], "stopped")
 
             await manager.http.aclose()
             await service.close()

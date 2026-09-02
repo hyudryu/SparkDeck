@@ -198,7 +198,10 @@ const isDiscoveredExternal = (deployment: Deployment) => (
 )
 
 const canPromoteDiscovered = (deployment: Deployment) => (
-  isDiscoveredExternal(deployment) && deployment.promotable !== false
+  isDiscoveredExternal(deployment)
+  && deployment.promotable !== false
+  && !deployment.has_start_hook
+  && !deployment.has_stop_hook
 )
 
 // Scalar flags the structured argument editor manages; everything else in a

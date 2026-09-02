@@ -5003,6 +5003,8 @@ class SparkDeckService:
             "managed": bool(container.get("managed")),
             "promotable": (
                 (container.get("load_settings") or {}).get("editable") is not False
+                and not str(container.get("start_command") or "").strip()
+                and not str(container.get("stop_command") or "").strip()
             ),
             "controllable": True,
             "logs_available": True,

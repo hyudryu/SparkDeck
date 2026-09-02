@@ -1093,6 +1093,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.http = httpx.AsyncClient()
             self.deployments = []
             self.list_containers = AsyncMock(return_value=[])
+            self.create_deployment = AsyncMock()
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
 
@@ -1143,7 +1144,8 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_card_advertises_hook_booleans_without_raw_commands(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
-            "managed": False, "status": "exited", "load_settings": {},
+            "managed": False, "status": "exited",
+            "load_settings": {"tensor_parallel_size": 2},
             "start_command": "/opt/stack/start.sh --token secret",
             "stop_command": "/opt/stack/stop.sh",
         }
@@ -1153,6 +1155,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(card["has_start_hook"])
             self.assertTrue(card["has_stop_hook"])
+            self.assertFalse(card["promotable"])
             payload = json.dumps(card)
             self.assertNotIn("start_command", payload)
             self.assertNotIn("stop_command", payload)
@@ -1171,13 +1174,36 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(card["has_start_hook"])
             self.assertFalse(card["has_stop_hook"])
+            self.assertTrue(card["promotable"])
             await manager.http.aclose()
             await service.close()
+
+    async def test_card_with_either_hook_is_not_promotable(self):
+        for hook in (
+            {"start_command": "/opt/stack/start.sh"},
+            {"stop_command": "/opt/stack/stop.sh"},
+        ):
+            with self.subTest(hook=next(iter(hook))):
+                container = {
+                    "name": "external-stack", "model": "org/model",
+                    "engine": "vllm", "managed": False, "status": "exited",
+                    "load_settings": {}, **hook,
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    service, manager = self._service(directory, container)
+                    card = service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )
+
+                    self.assertFalse(card["promotable"])
+                    await manager.http.aclose()
+                    await service.close()
 
     async def test_start_with_hook_spawns_script_instead_of_docker_start(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
-            "managed": False, "status": "exited", "load_settings": {},
+            "managed": False, "status": "exited",
+            "load_settings": {"tensor_parallel_size": 2},
             "start_command": "/opt/stack/start.sh",
             "stop_command": "/opt/stack/stop.sh",
         }
@@ -1195,8 +1221,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/start.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **({"start_new_session": True} if os.name == "posix" else {}),
             )
             manager.start_container.assert_not_awaited()
+            manager.create_deployment.assert_not_awaited()
             self.assertEqual(result["status"], "running")
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,
@@ -1285,6 +1313,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "/opt/stack/stop.sh",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **({"start_new_session": True} if os.name == "posix" else {}),
             )
             manager.stop_container.assert_not_awaited()
             self.assertEqual(result["status"], "stopped")

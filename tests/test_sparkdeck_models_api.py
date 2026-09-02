@@ -1093,6 +1093,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.http = httpx.AsyncClient()
             self.deployments = []
             self.list_containers = AsyncMock(return_value=[])
+            self.create_deployment = AsyncMock()
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
 
@@ -1177,6 +1178,27 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_card_with_either_hook_is_not_promotable(self):
+        for hook in (
+            {"start_command": "/opt/stack/start.sh"},
+            {"stop_command": "/opt/stack/stop.sh"},
+        ):
+            with self.subTest(hook=next(iter(hook))):
+                container = {
+                    "name": "external-stack", "model": "org/model",
+                    "engine": "vllm", "managed": False, "status": "exited",
+                    "load_settings": {}, **hook,
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    service, manager = self._service(directory, container)
+                    card = service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )
+
+                    self.assertFalse(card["promotable"])
+                    await manager.http.aclose()
+                    await service.close()
+
     async def test_start_with_hook_spawns_script_instead_of_docker_start(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
@@ -1200,6 +1222,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 stderr=asyncio.subprocess.PIPE,
             )
             manager.start_container.assert_not_awaited()
+            manager.create_deployment.assert_not_awaited()
             self.assertEqual(result["status"], "running")
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,

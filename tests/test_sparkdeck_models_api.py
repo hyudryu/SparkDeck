@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -868,10 +870,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         def __init__(self, blocker=None, returncode=0, stdout=(b"stack up\n",), stderr=()):
             self.returncode = None
             self._result = returncode
+            self.pid = 43210
             self.stdout = ExternalLifecycleHookTests.FakeStream(stdout)
             self.stderr = ExternalLifecycleHookTests.FakeStream(stderr)
             self._blocker = blocker
             self.terminated = False
+            self.killed = False
 
         async def wait(self):
             if self._blocker is not None:
@@ -884,6 +888,13 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.terminated = True
             if self.returncode is None:
                 self.returncode = -15
+            if self._blocker is not None:
+                self._blocker.set()
+
+        def kill(self):
+            self.killed = True
+            if self.returncode is None:
+                self.returncode = -9
             if self._blocker is not None:
                 self._blocker.set()
 
@@ -1067,7 +1078,50 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_close_terminates_in_flight_hook_subprocess(self):
+    async def test_close_signals_hook_process_group_then_escalates(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+        }
+        blocker = asyncio.Event()
+        process = self.FakeProcess(blocker=blocker)
+        signals_sent = []
+
+        def fake_killpg(pgid, sig):
+            signals_sent.append(sig)
+            if len(signals_sent) > 1:
+                # The escalation finally brings the group down.
+                process.returncode = -9
+                blocker.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            spawn = AsyncMock(return_value=process)
+            with (
+                patch("asyncio.create_subprocess_shell", spawn),
+                patch.object(os, "killpg", create=True, side_effect=fake_killpg),
+                patch.object(os, "getpgid", create=True, return_value=999),
+            ):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                # Yield so the hook task publishes its subprocess handle.
+                await asyncio.sleep(0)
+
+                await service.close()
+
+            self.assertEqual(signals_sent[0], signal.SIGTERM)
+            self.assertEqual(
+                signals_sent[1], getattr(signal, "SIGKILL", signal.SIGTERM),
+            )
+            self.assertFalse(process.terminated)
+            self.assertNotIn(
+                "external-stack", service._external_lifecycle_tasks,
+            )
+            await manager.http.aclose()
+
+    async def test_close_falls_back_to_terminate_without_process_groups(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "load_settings": {},
@@ -1078,13 +1132,18 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
             spawn = AsyncMock(return_value=process)
-            with patch("asyncio.create_subprocess_shell", spawn):
+            with (
+                patch("asyncio.create_subprocess_shell", spawn),
+                # Simulate a platform without process groups.
+                patch.object(os, "killpg", None, create=True),
+            ):
                 await service.deployment_action(
                     "container:external-stack", "start",
                 )
                 # Yield so the hook task publishes its subprocess handle.
                 await asyncio.sleep(0)
 
+                # No killpg in this environment: terminate the bare shell.
                 await service.close()
 
             self.assertTrue(process.terminated)
@@ -1092,6 +1151,71 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "external-stack", service._external_lifecycle_tasks,
             )
             await manager.http.aclose()
+
+    async def test_docker_fallback_is_blocked_while_opposing_hook_runs(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            # Only the start hook exists; stop would normally fall back to
+            # docker stop, but not while the start script is running.
+            "start_command": "/opt/stack/start.sh",
+        }
+        blocker = asyncio.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            spawn = AsyncMock(return_value=self.FakeProcess(blocker=blocker))
+            with patch("asyncio.create_subprocess_shell", spawn):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                entry = service._external_lifecycle_tasks["external-stack"]
+                await asyncio.sleep(0)
+                with self.assertRaisesRegex(ValueError, "start.*already running"):
+                    await service.deployment_action(
+                        "container:external-stack", "stop",
+                    )
+
+                manager.stop_container.assert_not_awaited()
+                blocker.set()
+                await entry["task"]
+
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_hook_output_goes_to_data_dir_file_not_server_log(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            spawn = AsyncMock(return_value=self.FakeProcess(
+                stdout=(b"leaked-credential\n",),
+                stderr=(b"secret-path\n",),
+            ))
+            with patch("asyncio.create_subprocess_shell", spawn):
+                with self.assertLogs("sparkdeck.service", level="INFO") as logs:
+                    await service.deployment_action(
+                        "container:external-stack", "start",
+                    )
+                    task = (
+                        service._external_lifecycle_tasks["external-stack"]["task"]
+                    )
+                    await task
+
+            log_text = "\n".join(logs.output)
+            self.assertIn("exited with code 0", log_text)
+            self.assertNotIn("leaked-credential", log_text)
+            self.assertNotIn("secret-path", log_text)
+            output_file = (
+                Path(directory) / "external-hooks" / "external-stack-start.log"
+            )
+            persisted = output_file.read_text()
+            self.assertIn("leaked-credential", persisted)
+            self.assertIn("secret-path", persisted)
+            await manager.http.aclose()
+            await service.close()
 
     async def test_bounded_output_keeps_only_the_stream_tail(self):
         service = SparkDeckService.__new__(SparkDeckService)
@@ -1104,6 +1228,63 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(stdout_tail), 65536)
         self.assertTrue(stdout_tail.endswith(b"tail-end"))
         self.assertEqual(stderr_tail, b"")
+
+
+class PublicContainerPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+        # Keep requests local even if the data dir holds a worker assignment.
+        self.assignment = patch.object(
+            server.onboarding.assignment, "load", return_value=None,
+        )
+        self.assignment.start()
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.assignment.stop()
+
+    async def test_containers_route_strips_raw_lifecycle_hooks(self):
+        summary = {
+            "name": "hooked", "status": "running",
+            "start_command": "/opt/stack/start.sh --token secret",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        with patch.object(
+            server.manager, "list_containers", AsyncMock(return_value=[summary]),
+        ):
+            response = await self.client.get("/api/containers")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body[0]["name"], "hooked")
+        payload = json.dumps(body)
+        self.assertNotIn("start_command", payload)
+        self.assertNotIn("stop_command", payload)
+        self.assertNotIn("/opt/stack", payload)
+
+    async def test_state_route_strips_raw_lifecycle_hooks(self):
+        state = {
+            "containers": [
+                {"name": "hooked", "start_command": "/opt/stack/start.sh"},
+            ],
+            "nodes": [{
+                "id": "local", "containers": [
+                    {"name": "hooked", "stop_command": "/opt/stack/stop.sh"},
+                ],
+            }],
+        }
+        with patch.object(
+            server.manager, "get_state", AsyncMock(return_value=state),
+        ):
+            response = await self.client.get("/api/state")
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.dumps(response.json())
+        self.assertNotIn("start_command", payload)
+        self.assertNotIn("stop_command", payload)
+        self.assertNotIn("/opt/stack", payload)
 
 
 if __name__ == "__main__":

@@ -415,9 +415,31 @@ def _public_legacy_recipe(recipe: dict) -> dict:
     return public
 
 
+def _public_container(container: dict) -> dict:
+    """Strip host-executed lifecycle hooks from container inventory payloads.
+
+    The raw start/stop command strings are internal dispatch inputs only;
+    they may embed paths or tokens and must never appear in the
+    unauthenticated /api/containers or /api/state responses.
+    """
+    return {
+        key: value for key, value in container.items()
+        if key not in ("start_command", "stop_command")
+    }
+
+
 @app.get("/api/state")
 async def get_state():
     state = await manager.get_state()
+    state["containers"] = [
+        _public_container(container)
+        for container in state.get("containers") or []
+    ]
+    for node in state.get("nodes") or []:
+        if isinstance(node.get("containers"), list):
+            node["containers"] = [
+                _public_container(container) for container in node["containers"]
+            ]
     # The MCP compatibility client still discovers recipes through this
     # aggregate endpoint. Keep these durable recipe records available while
     # the new SparkDeck UI uses the versioned application API.
@@ -1656,7 +1678,8 @@ async def update_settings(req: Request):
 # ---------- containers ----------
 @app.get("/api/containers")
 async def list_containers():
-    return await manager.list_containers()
+    containers = await manager.list_containers()
+    return [_public_container(container) for container in containers]
 
 
 @app.post("/api/containers")

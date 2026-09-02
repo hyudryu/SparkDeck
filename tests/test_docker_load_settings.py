@@ -177,9 +177,9 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary)
         self.assertFalse(summary["load_settings"]["editable"])
 
-    def _hooked_container(self, labels):
+    def _hooked_container(self, labels, image_id="sha256:hooked-image"):
         containers = FakeContainers()
-        return FakeContainer(
+        container = FakeContainer(
             containers, "hooked-container-id", "hooked-vllm",
             {
                 "Image": "example/vllm:latest",
@@ -189,6 +189,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             },
             {},
         )
+        # Docker's attrs["Image"] is the immutable image ID the container was
+        # created from; the mutable tag in Config.Image can be repointed.
+        container.attrs["Image"] = image_id
+        return container
 
     def _stub_image_labels(self, labels):
         image = mock.Mock()
@@ -248,6 +252,44 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("start_command", summary)
 
+    def test_transient_image_inspection_failure_is_not_cached(self):
+        image = mock.Mock()
+        image.attrs = {"Config": {"Labels": {}}}
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = [
+            RuntimeError("docker hiccup"), image,
+        ]
+        container = self._hooked_container({
+            "io.sparkdeck.start-command": "/opt/stack/start.sh",
+        })
+
+        first = self.manager._container_summary(container)
+        second = self.manager._container_summary(container)
+
+        # The first pass fails closed; the failure is not cached, so the next
+        # inventory pass retries and honors the container-level hook.
+        self.assertNotIn("start_command", first)
+        self.assertEqual(second["start_command"], "/opt/stack/start.sh")
+        self.assertEqual(self.manager.client.images.get.call_count, 2)
+
+    def test_image_labels_are_inspected_by_immutable_image_id_not_tag(self):
+        # The tag was repointed after creation; the container still runs the
+        # old image, whose baked-in label must be treated as inherited.
+        self._stub_image_labels({
+            "io.sparkdeck.start-command": "/image/baked-start.sh",
+        })
+        container = self._hooked_container(
+            {"io.sparkdeck.start-command": "/image/baked-start.sh"},
+            image_id="sha256:old-image",
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertNotIn("start_command", summary)
+        self.manager.client.images.get.assert_called_once_with(
+            "sha256:old-image",
+        )
+
     def test_image_label_lookup_is_cached_per_image_reference(self):
         self._stub_image_labels({})
         first = self._hooked_container({
@@ -261,7 +303,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.manager._container_summary(second)
 
         self.manager.client.images.get.assert_called_once_with(
-            "example/vllm:latest",
+            "sha256:hooked-image",
         )
 
     def test_summary_omits_absent_or_blank_lifecycle_hook_labels(self):

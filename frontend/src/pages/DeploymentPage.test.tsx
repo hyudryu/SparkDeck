@@ -470,10 +470,12 @@ describe('env-file backed deployment page', () => {
     id: 'container:vllm-dspark', kind: 'external', managed: false,
     status: 'stopped', desired_state: 'stopped', editable: true, controllable: true,
     edit_mode: 'env-file',
-    launch_controls: { context_window: 262144 },
+    // The container-parsed value is stale; the env entry wins as the initial
+    // editor value so an unchanged save cannot overwrite the file with it.
+    launch_controls: { context_window: 999 },
     extra_args: ['--served-model-name', 'org/old'],
     settings_env: {
-      path: '/opt/stack/.env.dspark', mtime: 1234.5,
+      name: '.env.dspark', mtime: 1234.5,
       entries: [
         { key: 'SERVED_MODEL_NAME', value: 'org/old', enabled: true, line: 2 },
         { key: 'MAX_MODEL_LEN', value: '262144', enabled: true, line: 3 },
@@ -509,6 +511,9 @@ describe('env-file backed deployment page', () => {
     renderEnvFilePage()
 
     expect(await screen.findByLabelText('Served model name')).toHaveValue('org/old')
+    // Initial control values come from the backing env entries, not the
+    // stale container-parsed launch_controls (999).
+    expect(screen.getByLabelText('Context window')).toHaveValue(262144)
     expect(screen.getByText('MAX_MODEL_LEN')).toBeInTheDocument()
     expect(screen.getByLabelText('MAX_NUM_SEQS value')).toHaveValue('32')
     expect(screen.getByLabelText('Enable MAX_NUM_SEQS')).not.toBeChecked()
@@ -527,16 +532,19 @@ describe('env-file backed deployment page', () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/api/v1/runtime-flags/preview')).toBe(false)
   })
 
-  it('saves dirty env rows, mapped controls, and the served name', async () => {
+  it('saves only changed controls alongside dirty env rows and the served name', async () => {
     const user = userEvent.setup()
     renderEnvFilePage()
 
     const servedName = await screen.findByLabelText('Served model name')
     await user.clear(servedName)
     await user.type(servedName, 'org/new')
-    const contextValue = screen.getByLabelText('MAX_MODEL_LEN value')
-    await user.clear(contextValue)
-    await user.type(contextValue, '131072')
+    const contextWindow = screen.getByLabelText('Context window')
+    await user.clear(contextWindow)
+    await user.type(contextWindow, '131072')
+    const seqsValue = screen.getByLabelText('MAX_NUM_SEQS value')
+    await user.clear(seqsValue)
+    await user.type(seqsValue, '16')
     await user.click(screen.getByLabelText('Enable MAX_NUM_SEQS'))
     await user.type(screen.getByLabelText('API_TOKEN value'), 'newsecret')
     await user.click(screen.getByRole('button', { name: 'Add variable' }))
@@ -549,11 +557,12 @@ describe('env-file backed deployment page', () => {
     expect(saveCall).toBeDefined()
     const body = JSON.parse(String(saveCall?.[1]?.body))
     expect(body).toEqual({
-      launch_controls: { context_window: 262144, max_concurrency: null },
+      // Only the changed control is submitted; max_concurrency is untouched
+      // even though it is mapped, and unmapped controls are never sent.
+      launch_controls: { context_window: 131072 },
       served_model_name: 'org/new',
       environment: {
-        MAX_MODEL_LEN: { value: '131072', enabled: true },
-        MAX_NUM_SEQS: { value: '32', enabled: true },
+        MAX_NUM_SEQS: { value: '16', enabled: true },
         API_TOKEN: { value: 'newsecret', enabled: true },
         MTP_NUM_TOKENS: { value: '3', enabled: true },
       },
@@ -578,5 +587,20 @@ describe('env-file backed deployment page', () => {
       // Toggled but never typed: the redacted value stays on disk.
       API_TOKEN: { value: null, enabled: false },
     })
+    expect(body).not.toHaveProperty('launch_controls')
+    expect(body).not.toHaveProperty('served_model_name')
+  })
+
+  it('sends an explicit empty served model name when the field is cleared', async () => {
+    const user = userEvent.setup()
+    renderEnvFilePage()
+
+    await screen.findByLabelText('Served model name')
+    await user.clear(screen.getByLabelText('Served model name'))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
+    const body = JSON.parse(String(saveCall?.[1]?.body))
+    expect(body.served_model_name).toBe('')
   })
 })

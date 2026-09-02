@@ -1747,21 +1747,24 @@ class SparkDeckService:
         """Read an env-file card's settings file with secrets redacted.
 
         Keys that look like credentials are write-only: their values are
-        replaced by ``None`` so a detail response never echoes them back.
+        replaced by ``None`` so a detail response never echoes them back. The
+        absolute file path likewise stays server-side; the payload carries
+        only the basename as a display name.
         """
+        name = Path(path).name
         try:
-            stat = os.stat(path)
+            stat_result = os.stat(path)
             text = Path(path).read_text(encoding="utf-8")
         except OSError as exc:
-            return {"path": path, "error": str(exc)}
+            return {"name": name, "error": str(exc)}
         entries = parse_env_file(text)
         for entry in entries:
             if SECRET_KEY_PATTERN.search(entry["key"]):
                 entry["value"] = None
                 entry["redacted"] = True
         return {
-            "path": path,
-            "mtime": stat.st_mtime,
+            "name": name,
+            "mtime": stat_result.st_mtime,
             "entries": entries,
             "field_mapping": field_mapping(entries),
         }

@@ -154,7 +154,8 @@ export interface DeploymentEnvEntry {
 }
 
 export interface DeploymentSettingsEnv {
-  path: string
+  /** Display name (basename) of the env file; the absolute path stays server-side. */
+  name: string
   mtime?: number
   entries?: DeploymentEnvEntry[]
   field_mapping?: Record<string, string>

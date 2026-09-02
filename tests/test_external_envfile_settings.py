@@ -1,7 +1,9 @@
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from sparkdeck.envfile_settings import (
     EnvFileConflictError,
@@ -108,11 +110,108 @@ class ApplyEnvUpdatesTests(unittest.TestCase):
 
         self.assertNotIn("API_TOKEN", result)
 
-    def test_plain_null_rejects_commented_or_missing_keys(self):
-        with self.assertRaises(ValueError):
-            apply_env_updates(self.path, {"MAX_NUM_SEQS": None})
+    def test_plain_null_deletes_a_commented_entry(self):
+        result = self._write_and_read({"MAX_NUM_SEQS": None})
+
+        self.assertNotIn("MAX_NUM_SEQS", result)
+        self.assertNotIn("# MAX_NUM_SEQS", result)
+
+    def test_plain_null_rejects_missing_keys(self):
         with self.assertRaises(ValueError):
             apply_env_updates(self.path, {"MISSING": None})
+
+    def test_duplicate_keys_update_the_effective_last_active_assignment(self):
+        self.path.write_text(
+            "MAX_MODEL_LEN=1024\n# MAX_MODEL_LEN=2048\nMAX_MODEL_LEN=4096  # effective\n",
+            encoding="utf-8",
+        )
+
+        result = self._write_and_read({"MAX_MODEL_LEN": "8192"})
+
+        lines = result.splitlines()
+        self.assertEqual(lines[0], "MAX_MODEL_LEN=1024")
+        self.assertEqual(lines[1], "# MAX_MODEL_LEN=2048")
+        self.assertEqual(lines[2], "MAX_MODEL_LEN=8192  # effective")
+
+    def test_duplicate_keys_fall_back_to_the_last_commented_occurrence(self):
+        self.path.write_text(
+            "# MAX_NUM_SEQS=16\n# MAX_NUM_SEQS=32\n", encoding="utf-8",
+        )
+
+        result = self._write_and_read({"MAX_NUM_SEQS": "64"})
+
+        lines = result.splitlines()
+        self.assertEqual(lines[0], "# MAX_NUM_SEQS=16")
+        self.assertEqual(lines[1], "MAX_NUM_SEQS=64")
+
+    def test_escaped_quotes_do_not_end_a_double_quoted_value(self):
+        self.path.write_text('NAME="a\\"b"  # desc\n', encoding="utf-8")
+
+        entries = parse_env_file(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(entries[0]["value"], '"a\\"b"')
+
+        result = self._write_and_read({"NAME": '"c\\\\d"'})
+        self.assertEqual(result, 'NAME="c\\\\d"  # desc\n')
+
+    def test_rendered_output_is_validated_before_writing(self):
+        # Just under the file limit; the appended value pushes it over.
+        filler = 256 * 1024 - len(SAMPLE.encode("utf-8")) - len("FILLER=\n") - 100
+        self.path.write_text(
+            SAMPLE + "FILLER=" + "x" * filler + "\n", encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError):
+            apply_env_updates(self.path, {"PAD": "y" * 200})
+
+        self.assertFalse(Path(f"{self.path}.bak").exists())
+
+    def test_replace_preserves_the_targets_permission_bits(self):
+        os.chmod(self.path, 0o600)
+        before = stat.S_IMODE(os.stat(self.path).st_mode)
+
+        self._write_and_read({"MAX_MODEL_LEN": "131072"})
+
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), before)
+
+    def test_concurrent_modification_between_read_and_replace_conflicts(self):
+        original_stat = os.stat
+        stats = []
+        def racing_stat(target, *args, **kwargs):
+            result = original_stat(target, *args, **kwargs)
+            if str(target) == str(os.path.realpath(self.path)):
+                stats.append(result)
+                if len(stats) == 2:
+                    # Simulate a concurrent writer: same file, new size/mtime.
+                    return os.stat_result((
+                        result.st_mode, result.st_ino, result.st_dev,
+                        result.st_nlink, result.st_uid, result.st_gid,
+                        result.st_size + 1, result.st_atime,
+                        result.st_mtime + 1, result.st_ctime,
+                    ))
+            return result
+
+        with mock.patch("sparkdeck.envfile_settings.os.stat", racing_stat):
+            with self.assertRaises(EnvFileConflictError):
+                apply_env_updates(self.path, {"MAX_MODEL_LEN": "1"})
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), SAMPLE)
+        self.assertFalse(Path(f"{self.path}.tmp-{os.getpid()}").exists())
+
+    def test_symlink_path_rewrites_the_target_not_the_link(self):
+        target = Path(self.dir.name) / "target.env"
+        target.write_text(SAMPLE, encoding="utf-8")
+        link = Path(self.dir.name) / "link.env"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            self.skipTest("symlinks not permitted on this platform")
+
+        result = apply_env_updates(link, {"MAX_MODEL_LEN": "131072"})
+
+        self.assertTrue(os.path.islink(link))
+        self.assertIn("MAX_MODEL_LEN=131072", target.read_text(encoding="utf-8"))
+        self.assertEqual(result["path"], str(link))
+        self.assertTrue(Path(f"{target}.bak").exists())
 
     def test_new_key_appends_at_end_of_file(self):
         result = self._write_and_read({"MTP_NUM_TOKENS": "3"})
@@ -255,6 +354,21 @@ class ResolveControlUpdatesTests(unittest.TestCase):
         )
 
         self.assertEqual(updates, {})
+
+    def test_empty_served_model_name_is_a_real_edit(self):
+        entries = parse_env_file(SAMPLE)
+
+        updates = resolve_control_updates({}, None, "", entries)
+
+        self.assertEqual(updates, {"SERVED_MODEL_NAME": ""})
+
+    def test_empty_served_model_name_writes_an_empty_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env.test"
+            path.write_text("SERVED_MODEL_NAME=org/old\n", encoding="utf-8")
+            apply_env_updates(path, {"SERVED_MODEL_NAME": ""})
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "SERVED_MODEL_NAME=\n")
 
     def test_unmapped_control_raises_naming_the_control(self):
         entries = parse_env_file("MAX_MODEL_LEN=1024\n")

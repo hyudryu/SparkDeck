@@ -831,7 +831,10 @@ class HookBackedEnvFileSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(body["edit_reason"])
         self.assertEqual(body["edit_mode"], "env-file")
         settings_env = body["settings_env"]
-        self.assertEqual(settings_env["path"], str(self.env_path))
+        # The absolute host path stays server-side; only the basename leaks.
+        self.assertEqual(settings_env["name"], ".env.dspark")
+        self.assertNotIn("path", settings_env)
+        self.assertNotIn(str(self.env_path), json.dumps(settings_env))
         self.assertIsInstance(settings_env["mtime"], float)
         entries = {entry["key"]: entry for entry in settings_env["entries"]}
         self.assertEqual(entries["SERVED_MODEL_NAME"]["value"], "'org/old'")
@@ -855,6 +858,20 @@ class HookBackedEnvFileSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["editable"])
         self.assertEqual(body["edit_mode"], "env-file")
         self.assertIn("error", body["settings_env"])
+        self.assertEqual(body["settings_env"]["name"], "missing.env")
+
+    async def test_clearing_the_served_name_writes_an_empty_assignment(self):
+        patches = self._patches(self._container())
+        with patches[0], patches[1]:
+            response = await self.client.put(
+                "/api/v1/deployments/container:vllm-dspark/settings",
+                json={"served_model_name": ""},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "SERVED_MODEL_NAME=\n", self.env_path.read_text(encoding="utf-8"),
+        )
 
     async def test_save_writes_the_env_file_and_never_recreates_the_container(self):
         update = AsyncMock(return_value={"ok": True})

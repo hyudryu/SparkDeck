@@ -11,10 +11,14 @@ Update protocol for :func:`apply_env_updates` ``updates`` values:
 
 - ``str``: set the key's value; a commented-out key is enabled in place; an
   unknown key is appended at the end of the file.
-- ``None``: delete the key's line entirely (active entries only).
+- ``None``: delete the key's line entirely.
 - ``{"value": str | None, "enabled": bool}``: set the value (``None`` keeps
   the existing value text) and enable (uncomment) or disable (comment out in
   place) the entry; an unknown key is appended, commented when disabled.
+
+When the file defines a key more than once, updates target the effective
+occurrence — shell last-wins semantics: the last active assignment, or the
+last commented occurrence when the key only appears commented out.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -64,19 +69,31 @@ class EnvFileConflictError(RuntimeError):
 def _split_value(raw: str) -> tuple[str, str]:
     """Split the text after ``=`` into (value, trailing inline comment).
 
-    Quoted values keep their quotes and run to the closing quote; unquoted
-    values end at the first `` #`` comment marker. The raw text is never
-    interpreted beyond that split.
+    Quoted values keep their quotes and run to the closing quote; inside
+    double quotes ``\\`` escapes the next character (so ``\\"`` does not end
+    the value), while single quotes have no escapes. Unquoted values end at
+    the first `` #`` comment marker. The raw text is never interpreted beyond
+    that split.
     """
     text = raw.lstrip()
-    if text[:1] in ("'", '"'):
-        closing = text.find(text[0], 1)
+    if text[:1] == "'":
+        closing = text.find("'", 1)
         if closing > 0:
             return text[: closing + 1], text[closing + 1 :]
         return text, ""
-    marker = text.find(" #")
-    if marker >= 0:
-        return text[:marker].rstrip(), text[marker:]
+    if text[:1] == '"':
+        index = 1
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == '"':
+                return text[: index + 1], text[index + 1 :]
+            index += 1
+        return text, ""
+    marker = re.search(r"\s+#", text)
+    if marker:
+        return text[: marker.start()], text[marker.start() :]
     return text, ""
 
 
@@ -165,17 +182,26 @@ def apply_env_updates(
     survive byte-identical. The original file is copied to ``<path>.bak``
     and the rewrite is atomic (tmp file + ``os.replace``). When
     ``expected_mtime`` is given, a stale read raises
-    :class:`EnvFileConflictError` instead of overwriting newer content.
+    :class:`EnvFileConflictError` instead of overwriting newer content; the
+    target is re-checked (mtime, inode, size) immediately before the replace
+    to close the window between read and write.
+
+    A labeled path may be a symlink (e.g. into a dotfiles checkout): reads,
+    the backup, and the tmp+replace all operate on the resolved target in its
+    own directory, so the symlink itself is never replaced. The result still
+    reports the labeled path. The target's permission bits (and ownership,
+    on platforms with ``os.chown``) are carried onto the replacement file.
     """
-    file_path = Path(path)
-    if not file_path.is_absolute():
+    labeled_path = Path(path)
+    if not labeled_path.is_absolute():
         raise ValueError("env file path must be absolute")
     normalized = _normalized_updates(updates)
 
-    stat = os.stat(file_path)
-    if expected_mtime is not None and stat.st_mtime != expected_mtime:
+    file_path = Path(os.path.realpath(labeled_path))
+    original_stat = os.stat(file_path)
+    if expected_mtime is not None and original_stat.st_mtime != expected_mtime:
         raise EnvFileConflictError(
-            f"{file_path} changed on disk since it was read"
+            f"{labeled_path} changed on disk since it was read"
         )
     text = file_path.read_text(encoding="utf-8")
     if len(text.encode("utf-8")) > _MAX_FILE_BYTES:
@@ -184,9 +210,13 @@ def apply_env_updates(
     if len(entries) > _MAX_ENTRIES:
         raise ValueError(f"env file cannot contain more than {_MAX_ENTRIES} entries")
     lines = text.splitlines(keepends=True)
+    # Shell last-wins: a duplicated key's effective entry is its last active
+    # assignment, or its last commented occurrence when none are active.
     by_key: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        by_key.setdefault(entry["key"], entry)
+        existing = by_key.get(entry["key"])
+        if existing is None or entry["enabled"] or not existing["enabled"]:
+            by_key[entry["key"]] = entry
 
     updated: list[str] = []
     deleted: list[str] = []
@@ -195,9 +225,9 @@ def apply_env_updates(
     for key, (value, enabled) in normalized.items():
         entry = by_key.get(key)
         if value is None and enabled is None:
-            if entry is None or not entry["enabled"]:
+            if entry is None:
                 raise ValueError(
-                    f"cannot delete {key}: only active entries can be deleted"
+                    f"cannot delete {key}: no such variable in the env file"
                 )
             lines[entry["line"] - 1] = ""
             deleted.append(key)
@@ -232,17 +262,42 @@ def apply_env_updates(
             lines[-1] = f"{lines[-1]}\n"
         lines.extend(appended)
 
+    rendered = "".join(lines)
+    if len(rendered.encode("utf-8")) > _MAX_FILE_BYTES:
+        raise ValueError("updated env file would exceed 256 KiB")
+    if len(parse_env_file(rendered)) > _MAX_ENTRIES:
+        raise ValueError(
+            f"updated env file would exceed {_MAX_ENTRIES} entries"
+        )
+
     shutil.copy2(file_path, f"{file_path}.bak")
     tmp_path = f"{file_path}.tmp-{os.getpid()}"
     try:
         with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
-            handle.write("".join(lines))
+            handle.write(rendered)
+        # A freshly created tmp file gets umask defaults; carry the target's
+        # permission bits (and ownership where the platform supports chown)
+        # so a restrictive env file stays restrictive after the replace.
+        try:
+            os.chmod(tmp_path, stat.S_IMODE(original_stat.st_mode))
+            os.chown(tmp_path, original_stat.st_uid, original_stat.st_gid)
+        except (AttributeError, PermissionError, OSError):
+            pass
+        current = os.stat(file_path)
+        if (
+            current.st_mtime != original_stat.st_mtime
+            or current.st_ino != original_stat.st_ino
+            or current.st_size != original_stat.st_size
+        ):
+            raise EnvFileConflictError(
+                f"{labeled_path} changed on disk while it was being rewritten"
+            )
         os.replace(tmp_path, file_path)
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
     return {
-        "path": str(file_path),
+        "path": str(labeled_path),
         "mtime": os.stat(file_path).st_mtime,
         "updated": updated,
         "deleted": deleted,
@@ -270,9 +325,12 @@ def resolve_control_updates(
 ) -> dict[str, str]:
     """Translate submitted editor controls into env-file value updates.
 
-    Controls with a None/empty value are skipped. A submitted control whose
-    variable is absent from the env file is rejected with guidance, since
-    the external start script only honors variables the file defines.
+    Controls with a None value are skipped (None means "not submitted").
+    Empty strings are skipped for every control except ``served_model_name``,
+    where clearing the name is a real edit that writes ``SERVED_MODEL_NAME=``.
+    A submitted control whose variable is absent from the env file is rejected
+    with guidance, since the external start script only honors variables the
+    file defines.
     """
     submitted: dict[str, Any] = dict(launch_controls or {})
     submitted["gpu_memory_utilization"] = gpu_memory_utilization
@@ -280,7 +338,7 @@ def resolve_control_updates(
     mapping = field_mapping(entries)
     updates: dict[str, str] = {}
     for control, value in submitted.items():
-        if value is None or value == "":
+        if value is None or (value == "" and control != "served_model_name"):
             continue
         key = mapping.get(control)
         if key is None:

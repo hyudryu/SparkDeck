@@ -137,20 +137,53 @@ const servedNameFrom = (detail: DeploymentDetail): string => {
   return entry?.value ?? ''
 }
 
+// Structured controls of the env-file editor whose initial values come from
+// the backing env entries (falling back to the parsed container command only
+// when the file has no backing variable).
+type EnvFileControl = 'context_window' | 'max_concurrency' | 'max_num_batched_tokens' | 'kv_cache_dtype' | 'gpu_memory_utilization'
+
+const envControlValue = (detail: DeploymentDetail, control: EnvFileControl): string | undefined => {
+  const settingsEnv = detail.settings_env
+  const key = settingsEnv?.field_mapping?.[control]
+  if (!key) return undefined
+  return settingsEnv?.entries?.find((item) => item.key === key)?.value ?? ''
+}
+
+const envFileEditorFrom = (detail: DeploymentDetail, editor: Editor): Editor => ({
+  ...editor,
+  context_window: envControlValue(detail, 'context_window') ?? editor.context_window,
+  max_concurrency: envControlValue(detail, 'max_concurrency') ?? editor.max_concurrency,
+  max_num_batched_tokens: envControlValue(detail, 'max_num_batched_tokens') ?? editor.max_num_batched_tokens,
+  kv_cache_dtype: envControlValue(detail, 'kv_cache_dtype') ?? editor.kv_cache_dtype,
+  gpu_memory_utilization: envControlValue(detail, 'gpu_memory_utilization') ?? editor.gpu_memory_utilization,
+})
+
 function envFileUpdateInput(
   editor: Editor,
+  savedEditor: Editor,
   detail: DeploymentDetail,
   envRows: EnvRow[],
   servedName: string,
+  savedServedName: string,
 ): EnvFileDeploymentUpdateInput {
-  // Structured controls are sent only when the env file backs them; the
-  // backend rejects controls with no backing variable.
+  // Only controls the user actually changed are submitted, and only when the
+  // env file backs them — otherwise stale container-parsed values would
+  // overwrite newer file contents. The backend rejects a submitted control
+  // with no backing variable.
   const mapping = detail.settings_env?.field_mapping ?? {}
   const launch_controls: DeploymentLaunchControls = {}
-  if (mapping.context_window) launch_controls.context_window = optionalNumber(editor.context_window)
-  if (mapping.max_concurrency) launch_controls.max_concurrency = optionalNumber(editor.max_concurrency)
-  if (mapping.max_num_batched_tokens) launch_controls.max_num_batched_tokens = optionalNumber(editor.max_num_batched_tokens)
-  if (mapping.kv_cache_dtype) launch_controls.kv_cache_dtype = editor.kv_cache_dtype.trim() || null
+  if (mapping.context_window && editor.context_window !== savedEditor.context_window) {
+    launch_controls.context_window = optionalNumber(editor.context_window)
+  }
+  if (mapping.max_concurrency && editor.max_concurrency !== savedEditor.max_concurrency) {
+    launch_controls.max_concurrency = optionalNumber(editor.max_concurrency)
+  }
+  if (mapping.max_num_batched_tokens && editor.max_num_batched_tokens !== savedEditor.max_num_batched_tokens) {
+    launch_controls.max_num_batched_tokens = optionalNumber(editor.max_num_batched_tokens)
+  }
+  if (mapping.kv_cache_dtype && editor.kv_cache_dtype !== savedEditor.kv_cache_dtype) {
+    launch_controls.kv_cache_dtype = editor.kv_cache_dtype.trim() || null
+  }
 
   const environment: EnvFileEnvironmentUpdate = {}
   for (const row of envRows) {
@@ -165,11 +198,13 @@ function envFileUpdateInput(
   }
 
   return {
-    launch_controls,
-    gpu_memory_utilization: mapping.gpu_memory_utilization
+    launch_controls: Object.keys(launch_controls).length ? launch_controls : undefined,
+    gpu_memory_utilization: mapping.gpu_memory_utilization && editor.gpu_memory_utilization !== savedEditor.gpu_memory_utilization
       ? optionalNumber(editor.gpu_memory_utilization)
       : undefined,
-    served_model_name: servedName.trim() || undefined,
+    // Clearing the served name is a real edit: send "" so the backend writes
+    // SERVED_MODEL_NAME= instead of treating the control as unsubmitted.
+    served_model_name: servedName !== savedServedName ? servedName : undefined,
     environment: Object.keys(environment).length ? environment : undefined,
     env_file_mtime: detail.settings_env?.mtime,
   }
@@ -209,10 +244,10 @@ export function DeploymentPage() {
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const nodes = useResource((signal) => api.nodes.list(signal))
   const [editor, setEditor] = useState<Editor>()
-  const [savedEditorFingerprint, setSavedEditorFingerprint] = useState<string>()
+  const [savedEditor, setSavedEditor] = useState<Editor>()
   const [envRows, setEnvRows] = useState<EnvRow[]>([])
   const [servedName, setServedName] = useState('')
-  const [savedEnvFingerprint, setSavedEnvFingerprint] = useState<string>()
+  const [savedServedName, setSavedServedName] = useState('')
   const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
@@ -222,14 +257,15 @@ export function DeploymentPage() {
 
   useEffect(() => {
     if (resource.data) {
-      const savedEditor = editorFrom(resource.data)
-      setEditor(savedEditor)
-      setSavedEditorFingerprint(editorFingerprint(savedEditor))
-      const rows = (resource.data.settings_env?.entries ?? []).map(envRowFrom)
-      setEnvRows(rows)
+      const saved = resource.data.edit_mode === 'env-file'
+        ? envFileEditorFrom(resource.data, editorFrom(resource.data))
+        : editorFrom(resource.data)
+      setEditor(saved)
+      setSavedEditor(saved)
+      setEnvRows((resource.data.settings_env?.entries ?? []).map(envRowFrom))
       const name = servedNameFrom(resource.data)
       setServedName(name)
-      setSavedEnvFingerprint(JSON.stringify([rows, name]))
+      setSavedServedName(name)
     }
   }, [resource.data])
 
@@ -281,19 +317,16 @@ export function DeploymentPage() {
   const setEnvRow = (index: number, patch: Partial<EnvRow>) => setEnvRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)))
 
   const persist = async () => {
-    if (!editor) throw new Error('Deployment settings are not loaded')
+    if (!editor || !savedEditor) throw new Error('Deployment settings are not loaded')
     const detail = resource.data
     const input = detail?.edit_mode === 'env-file'
-      ? envFileUpdateInput(editor, detail, envRows, servedName)
+      ? envFileUpdateInput(editor, savedEditor, detail, envRows, servedName, savedServedName)
       : updateInput(editor)
     const updated = await api.deployments.update(deploymentId, input)
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
     // sync so requiredRunNodes and the Run dialog never act on stale counts.
     resource.apply(updated)
-    const savedEditor = editorFrom(updated)
-    setEditor(savedEditor)
-    setSavedEditorFingerprint(editorFingerprint(savedEditor))
     return updated
   }
 
@@ -380,8 +413,9 @@ export function DeploymentPage() {
     ? <small className="muted">The settings env file has no variable backing this control.</small>
     : undefined
   const envControlDisabled = (control: string) => disabled || (envFileMode && !envFieldMapping[control])
-  const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
-    || JSON.stringify([envRows, servedName]) !== savedEnvFingerprint
+  const hasUnsavedChanges = (savedEditor !== undefined && editorFingerprint(editor) !== editorFingerprint(savedEditor))
+    || envRows.some(envRowDirty)
+    || servedName !== savedServedName
   const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
@@ -437,7 +471,7 @@ export function DeploymentPage() {
               </div>)}
               <div><Button type="button" disabled={disabled} onClick={() => setEnvRows((current) => [...current, { key: '', value: '', enabled: true, redacted: false, deleted: false, added: true, initialEnabled: true }])}>Add variable</Button></div>
             </>}
-          <small>Values are written to {detail.settings_env?.path}; stop and start the deployment to apply changes.</small>
+          <small>Values are written to {detail.settings_env?.name}; stop and start the deployment to apply changes.</small>
         </div>}
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled || envFileMode} readOnly={envFileMode} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} />{envFileMode
           ? <small>Flags are generated by the external start script; edit the backing variable above instead.</small>

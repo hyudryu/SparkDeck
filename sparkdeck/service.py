@@ -17,7 +17,7 @@ import shlex
 import socket
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
@@ -48,6 +48,10 @@ from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 
 logger = logging.getLogger(__name__)
+
+# Only this many trailing bytes per stream of a lifecycle hook's output are
+# retained for the completion log; the rest is drained and discarded.
+_EXTERNAL_HOOK_OUTPUT_TAIL = 65536
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -367,7 +371,9 @@ class SparkDeckService:
         self._deployment_reconciliation_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
-        self._external_lifecycle_tasks: dict[str, asyncio.Task] = {}
+        # In-flight label-defined lifecycle scripts, keyed by container name:
+        # {"action": str, "task": asyncio.Task, "process": subprocess | None}.
+        self._external_lifecycle_tasks: dict[str, dict[str, Any]] = {}
         self._deployment_action_locks: dict[str, asyncio.Lock] = {}
         self._deployment_action_lock_users: dict[str, int] = {}
         self._deployment_action_lock_registry_lock = asyncio.Lock()
@@ -383,8 +389,27 @@ class SparkDeckService:
         tasks = list(self._deployment_launch_tasks.values())
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        lifecycle_entries = list(self._external_lifecycle_tasks.values())
+        for entry in lifecycle_entries:
+            entry["task"].cancel()
+            process = entry.get("process")
+            if process is not None and process.returncode is None:
+                # Cancelling the task abandons the stream reads but does not
+                # kill the child; terminate it explicitly so the hook script
+                # cannot outlive the controller.
+                with suppress(ProcessLookupError):
+                    process.terminate()
+        pending = tasks + [entry["task"] for entry in lifecycle_entries]
+        if pending:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=10,
+                )
+        for entry in lifecycle_entries:
+            process = entry.get("process")
+            if process is not None and process.returncode is None:
+                with suppress(asyncio.TimeoutError, ProcessLookupError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
         self.store.close()
 
     async def set_community_consent(
@@ -3762,26 +3787,29 @@ class SparkDeckService:
         self, container_name: str, action: str, command: str,
     ) -> None:
         """Run a label-defined lifecycle script as a background task."""
-        key = f"{action}:{container_name}"
-        existing = self._external_lifecycle_tasks.get(key)
-        if existing is not None and not existing.done():
+        # Lifecycle work is tracked per container, not per action: a stop must
+        # never run concurrently with an in-flight start of the same stack.
+        entry = self._external_lifecycle_tasks.get(container_name)
+        if entry is not None and not entry["task"].done():
             raise ValueError(
-                f"a {action} command is already running for container "
+                f"a {entry['action']} command is already running for container "
                 f"{container_name}"
             )
         # These commands come from Docker labels on the local host. Anyone
         # able to create a container with arbitrary labels already has docker
         # socket access (root-equivalent), so executing a label-defined
         # command as the controller user does not widen the local trust
-        # boundary.
-        self._external_lifecycle_tasks[key] = asyncio.create_task(
-            self._run_external_lifecycle_command(
-                key, action, container_name, command,
-            )
+        # boundary. Image-inherited labels are filtered out by Manager before
+        # a command ever reaches this dispatch site.
+        task = asyncio.create_task(
+            self._run_external_lifecycle_command(container_name, action, command)
         )
+        self._external_lifecycle_tasks[container_name] = {
+            "action": action, "task": task, "process": None,
+        }
 
     async def _run_external_lifecycle_command(
-        self, key: str, action: str, container_name: str, command: str,
+        self, container_name: str, action: str, command: str,
     ) -> None:
         try:
             process = await asyncio.create_subprocess_shell(
@@ -3789,15 +3817,20 @@ class SparkDeckService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
+            entry = self._external_lifecycle_tasks.get(container_name)
+            if entry is not None and entry.get("task") is asyncio.current_task():
+                # Publish the handle so close() can terminate the child; mere
+                # task cancellation does not kill the subprocess.
+                entry["process"] = process
+            stdout_tail, stderr_tail = await self._read_bounded_output(process)
             message = (
                 "external %s command for container %s exited with code %s; "
                 "stdout tail: %r; stderr tail: %r"
             )
             arguments = (
                 action, container_name, process.returncode,
-                stdout.decode(errors="replace")[-2000:],
-                stderr.decode(errors="replace")[-2000:],
+                stdout_tail.decode(errors="replace"),
+                stderr_tail.decode(errors="replace"),
             )
             if process.returncode:
                 logger.warning(message, *arguments)
@@ -3809,8 +3842,37 @@ class SparkDeckService:
                 action, container_name,
             )
         finally:
-            if self._external_lifecycle_tasks.get(key) is asyncio.current_task():
-                self._external_lifecycle_tasks.pop(key, None)
+            entry = self._external_lifecycle_tasks.get(container_name)
+            if entry is not None and entry.get("task") is asyncio.current_task():
+                self._external_lifecycle_tasks.pop(container_name, None)
+
+    @staticmethod
+    async def _read_bounded_output(process: Any) -> tuple[bytes, bytes]:
+        """Drain both streams incrementally, keeping only a bounded tail.
+
+        ``communicate()`` would buffer the entire stdout/stderr of a
+        multi-minute lifecycle script in memory; only the last
+        ``_EXTERNAL_HOOK_OUTPUT_TAIL`` bytes per stream are retained for the
+        completion log.
+        """
+
+        async def drain(stream: Any, tail: bytearray) -> None:
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                overflow = len(tail) - _EXTERNAL_HOOK_OUTPUT_TAIL
+                if overflow > 0:
+                    del tail[:overflow]
+
+        stdout_tail, stderr_tail = bytearray(), bytearray()
+        await asyncio.gather(
+            drain(process.stdout, stdout_tail),
+            drain(process.stderr, stderr_tail),
+        )
+        await process.wait()
+        return bytes(stdout_tail), bytes(stderr_tail)
 
     def _preparable_deployment_model(
         self, deployment_id: str,
@@ -4653,13 +4715,16 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
-        # Label-defined lifecycle hooks ride along so the detail endpoint can
-        # expose them and the action dispatcher can prefer them over plain
-        # docker start/stop.
-        for hook in ("start_command", "stop_command"):
-            command = container.get(hook)
-            if isinstance(command, str) and command.strip():
-                result[hook] = command.strip()
+        # Label-defined lifecycle hooks are advertised as capability booleans
+        # only. The raw shell strings can embed paths or tokens and must not
+        # appear in the unauthenticated list/detail payloads; the action
+        # dispatcher re-resolves the container summary for the real commands.
+        result["has_start_hook"] = bool(
+            str(container.get("start_command") or "").strip()
+        )
+        result["has_stop_hook"] = bool(
+            str(container.get("stop_command") or "").strip()
+        )
         last_deployed_at = _container_last_deployed_at(container)
         if last_deployed_at is not None:
             result["last_deployed_at"] = last_deployed_at

@@ -10583,15 +10583,54 @@ class Manager:
                 "nnodes": int(_label_value(labels, NNODES_LABEL, "1")),
             })
         # Lifecycle hooks have no legacy aliases, so read them directly.
+        # Dockerfile LABEL values are inherited into a container's inspected
+        # labels, so only honor hooks supplied at container-creation time;
+        # an untrusted image must not bake in arbitrary host execution.
         start_command = str(labels.get(START_COMMAND_LABEL) or "").strip()
-        if start_command:
+        if start_command and self._container_level_label(
+            image_tag, START_COMMAND_LABEL, start_command,
+        ):
             summary["start_command"] = start_command
         stop_command = str(labels.get(STOP_COMMAND_LABEL) or "").strip()
-        if stop_command:
+        if stop_command and self._container_level_label(
+            image_tag, STOP_COMMAND_LABEL, stop_command,
+        ):
             summary["stop_command"] = stop_command
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary
+
+    def _container_level_label(
+        self, image_tag: str, key: str, value: str,
+    ) -> bool:
+        """Return True when a label was supplied at container-creation time.
+
+        Dockerfile ``LABEL`` values are inherited into the container's
+        inspected labels, so a hook baked into an untrusted image would run
+        on the controller host. Honor the label only when the image does not
+        define the key or defines it with a different value (an explicit
+        container-level override); an identical key+value is inherited and
+        ignored. When the image cannot be inspected the provenance is
+        unverifiable, so fail closed and treat the label as inherited.
+
+        Uses ``self.client.images.get`` on the tag string (not the lazy
+        ``c.image`` attribute, which adds a Docker API call per container);
+        results are cached per image reference across inventory passes.
+        """
+        cache = getattr(self, "_image_label_cache", None)
+        if cache is None:
+            cache = self._image_label_cache = {}
+        if image_tag not in cache:
+            try:
+                image = self.client.images.get(image_tag)
+                labels = (image.attrs.get("Config") or {}).get("Labels") or {}
+                cache[image_tag] = dict(labels)
+            except Exception:
+                cache[image_tag] = None
+        image_labels = cache[image_tag]
+        if image_labels is None:
+            return False
+        return str(image_labels.get(key) or "").strip() != value
 
     async def list_containers(self) -> list[dict]:
         def _run():

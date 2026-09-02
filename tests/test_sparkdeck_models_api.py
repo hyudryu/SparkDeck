@@ -857,34 +857,72 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
 
-    class FakeProcess:
-        def __init__(self, blocker=None, returncode=0):
-            self.returncode = returncode
-            self._blocker = blocker
+    class FakeStream:
+        def __init__(self, chunks=()):
+            self._chunks = list(chunks)
 
-        async def communicate(self):
+        async def read(self, _size=-1):
+            return self._chunks.pop(0) if self._chunks else b""
+
+    class FakeProcess:
+        def __init__(self, blocker=None, returncode=0, stdout=(b"stack up\n",), stderr=()):
+            self.returncode = None
+            self._result = returncode
+            self.stdout = ExternalLifecycleHookTests.FakeStream(stdout)
+            self.stderr = ExternalLifecycleHookTests.FakeStream(stderr)
+            self._blocker = blocker
+            self.terminated = False
+
+        async def wait(self):
             if self._blocker is not None:
                 await self._blocker.wait()
-            return b"stack up\n", b""
+            if self.returncode is None:
+                self.returncode = self._result
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            if self.returncode is None:
+                self.returncode = -15
+            if self._blocker is not None:
+                self._blocker.set()
 
     def _service(self, directory, container):
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
         return SparkDeckService(manager, Path(directory)), manager
 
-    async def test_card_passes_lifecycle_hooks_through_to_the_detail_payload(self):
+    async def test_card_advertises_hook_booleans_without_raw_commands(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "load_settings": {},
-            "start_command": "/opt/stack/start.sh",
+            "start_command": "/opt/stack/start.sh --token secret",
             "stop_command": "/opt/stack/stop.sh",
         }
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
             card = service._discovered_deployment(container, "vllm", "org/model")
 
-            self.assertEqual(card["start_command"], "/opt/stack/start.sh")
-            self.assertEqual(card["stop_command"], "/opt/stack/stop.sh")
+            self.assertTrue(card["has_start_hook"])
+            self.assertTrue(card["has_stop_hook"])
+            payload = json.dumps(card)
+            self.assertNotIn("start_command", payload)
+            self.assertNotIn("stop_command", payload)
+            self.assertNotIn("/opt/stack", payload)
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_card_without_hooks_advertises_false_booleans(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            card = service._discovered_deployment(container, "vllm", "org/model")
+
+            self.assertFalse(card["has_start_hook"])
+            self.assertFalse(card["has_stop_hook"])
             await manager.http.aclose()
             await service.close()
 
@@ -902,10 +940,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 result = await service.deployment_action(
                     "container:external-stack", "start",
                 )
-                task = service._external_lifecycle_tasks.get(
-                    "start:external-stack",
-                )
-                self.assertIsNotNone(task)
+                task = service._external_lifecycle_tasks["external-stack"]["task"]
                 await task
 
             spawn.assert_awaited_once_with(
@@ -916,7 +951,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             manager.start_container.assert_not_awaited()
             self.assertEqual(result["status"], "running")
             self.assertNotIn(
-                "start:external-stack", service._external_lifecycle_tasks,
+                "external-stack", service._external_lifecycle_tasks,
             )
             await manager.http.aclose()
             await service.close()
@@ -942,11 +977,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_second_start_while_hook_is_running_conflicts(self):
+    async def test_opposing_action_while_hook_is_running_conflicts(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "load_settings": {},
             "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
         }
         blocker = asyncio.Event()
         with tempfile.TemporaryDirectory() as directory:
@@ -956,20 +992,26 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 await service.deployment_action(
                     "container:external-stack", "start",
                 )
-                task = service._external_lifecycle_tasks["start:external-stack"]
+                entry = service._external_lifecycle_tasks["external-stack"]
                 # Yield so the background hook task reaches the subprocess call.
                 await asyncio.sleep(0)
-                with self.assertRaisesRegex(ValueError, "already running"):
+                with self.assertRaisesRegex(ValueError, "start.*already running"):
                     await service.deployment_action(
                         "container:external-stack", "start",
                     )
+                # A stop must not run concurrently with the in-flight start.
+                with self.assertRaisesRegex(ValueError, "start.*already running"):
+                    await service.deployment_action(
+                        "container:external-stack", "stop",
+                    )
                 spawn.assert_awaited_once()
                 blocker.set()
-                await task
+                await entry["task"]
 
             manager.start_container.assert_not_awaited()
+            manager.stop_container.assert_not_awaited()
             self.assertNotIn(
-                "start:external-stack", service._external_lifecycle_tasks,
+                "external-stack", service._external_lifecycle_tasks,
             )
             await manager.http.aclose()
             await service.close()
@@ -988,10 +1030,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 result = await service.deployment_action(
                     "container:external-stack", "stop",
                 )
-                task = service._external_lifecycle_tasks.get(
-                    "stop:external-stack",
-                )
-                self.assertIsNotNone(task)
+                task = service._external_lifecycle_tasks["external-stack"]["task"]
                 await task
 
             spawn.assert_awaited_once_with(
@@ -1002,7 +1041,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             manager.stop_container.assert_not_awaited()
             self.assertEqual(result["status"], "stopped")
             self.assertNotIn(
-                "stop:external-stack", service._external_lifecycle_tasks,
+                "external-stack", service._external_lifecycle_tasks,
             )
             await manager.http.aclose()
             await service.close()
@@ -1027,6 +1066,44 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["status"], "stopped")
             await manager.http.aclose()
             await service.close()
+
+    async def test_close_terminates_in_flight_hook_subprocess(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+        }
+        blocker = asyncio.Event()
+        process = self.FakeProcess(blocker=blocker)
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            spawn = AsyncMock(return_value=process)
+            with patch("asyncio.create_subprocess_shell", spawn):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                )
+                # Yield so the hook task publishes its subprocess handle.
+                await asyncio.sleep(0)
+
+                await service.close()
+
+            self.assertTrue(process.terminated)
+            self.assertNotIn(
+                "external-stack", service._external_lifecycle_tasks,
+            )
+            await manager.http.aclose()
+
+    async def test_bounded_output_keeps_only_the_stream_tail(self):
+        service = SparkDeckService.__new__(SparkDeckService)
+        process = self.FakeProcess(
+            stdout=(b"x" * 131072, b"tail-end"),
+        )
+
+        stdout_tail, stderr_tail = await service._read_bounded_output(process)
+
+        self.assertLessEqual(len(stdout_tail), 65536)
+        self.assertTrue(stdout_tail.endswith(b"tail-end"))
+        self.assertEqual(stderr_tail, b"")
 
 
 if __name__ == "__main__":

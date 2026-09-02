@@ -159,6 +159,79 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["model"], "public-name")
         self.assertEqual(summary["load_settings"]["model"], "/models/actual-model")
 
+    def _shell_wrapped_summary(self, script, label_model):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers, "wrapped-container-id", "wrapped-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": ["bash", "-lc", script],
+                "Labels": {"io.sparkdeck.model": label_model},
+            },
+            {},
+        )
+        return self.manager._container_summary(container)
+
+    def test_shell_wrapped_served_name_resolves_bash_default(self):
+        summary = self._shell_wrapped_summary(
+            "exec vllm serve /models/actual-model "
+            "--served-model-name ${SERVED_MODEL_NAME:-my-served-name}",
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+        )
+
+        self.assertEqual(summary["served_models"], ["my-served-name"])
+        self.assertEqual(summary["served_model"], "my-served-name")
+
+    def test_shell_wrapped_served_name_resolves_multiple_values(self):
+        summary = self._shell_wrapped_summary(
+            "exec vllm serve /models/actual-model "
+            "--served-model-name name-one ${ALT_NAME:-name-two}",
+            "org/model",
+        )
+
+        self.assertEqual(summary["served_models"], ["name-one", "name-two"])
+        self.assertEqual(summary["served_model"], "name-one")
+
+    def test_shell_wrapped_served_name_resolves_inline_flag(self):
+        summary = self._shell_wrapped_summary(
+            "exec vllm serve /models/actual-model "
+            '--served-model-name="${SERVED_MODEL_NAME:-inline-name}"',
+            "org/model",
+        )
+
+        self.assertEqual(summary["served_models"], ["inline-name"])
+        self.assertEqual(summary["served_model"], "inline-name")
+
+    def test_shell_wrapped_served_name_skips_unresolvable_variable(self):
+        summary = self._shell_wrapped_summary(
+            "exec vllm serve /models/actual-model "
+            "--served-model-name ${SERVED_MODEL_NAME}",
+            "org/model",
+        )
+
+        self.assertEqual(summary["served_models"], ["org/model"])
+        self.assertEqual(summary["served_model"], "org/model")
+
+    def test_shell_wrapped_served_name_keeps_literal_value(self):
+        summary = self._shell_wrapped_summary(
+            "exec vllm serve /models/actual-model "
+            "--served-model-name literal-name --max-model-len 8192",
+            "org/model",
+        )
+
+        self.assertEqual(summary["served_models"], ["literal-name"])
+        self.assertEqual(summary["served_model"], "literal-name")
+
+    def test_resolve_shell_default(self):
+        resolve = self.manager._resolve_shell_default
+
+        self.assertEqual(resolve("${VAR:-my-name}"), "my-name")
+        self.assertEqual(resolve("${VAR-my-name}"), "my-name")
+        self.assertEqual(resolve('${VAR:-"quoted name"}'), "quoted name")
+        self.assertIsNone(resolve("$VAR"))
+        self.assertIsNone(resolve("${VAR}"))
+        self.assertEqual(resolve("plain-literal"), "plain-literal")
+
     def test_credential_bearing_discovered_command_is_read_only(self):
         containers = FakeContainers()
         container = FakeContainer(

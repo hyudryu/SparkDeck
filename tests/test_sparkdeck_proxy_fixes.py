@@ -900,6 +900,30 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_hook_backed_discovered_runtime_rejects_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.list_containers.return_value = [{
+                "name": "external-hooked", "model": "org/model",
+                "engine": "vllm", "managed": False, "status": "exited",
+                "start_command": "/opt/stack/start.sh",
+                "stop_command": "/opt/stack/stop.sh --all",
+                "load_settings": {"tensor_parallel_size": 1},
+            }]
+            manager._recovered_deployment_launch_settings = Mock()
+            manager.create_deployment = AsyncMock()
+            service = SparkDeckService(manager, Path(directory))
+
+            with self.assertRaisesRegex(ValueError, "managed by external scripts"):
+                await service.deployment_action(
+                    "container:external-hooked", "start", ["local"], promote=True,
+                )
+
+            manager._recovered_deployment_launch_settings.assert_not_called()
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_promoted_source_container_does_not_mask_missing_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()

@@ -8182,6 +8182,58 @@ class Manager:
         served = list(dict.fromkeys(served))
         return served or ([fallback] if fallback else [])
 
+    _SHELL_DEFAULT_RE = re.compile(
+        r"^\$\{[A-Za-z_][A-Za-z0-9_]*:?-(?P<default>.*)\}$", re.DOTALL,
+    )
+    _SHELL_VAR_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+
+    @classmethod
+    def _resolve_shell_default(cls, token: str) -> str | None:
+        """Resolve one shell token to a literal model id, or ``None``.
+
+        ``${VAR:-default}``/``${VAR-default}`` resolve to their default with
+        surrounding quotes stripped. A bare ``$VAR``/``${VAR}`` depends on
+        the container's runtime environment and returns ``None`` so callers
+        skip it instead of publishing a literal ``$VAR`` as a model id.
+        """
+        value = str(token)
+        match = cls._SHELL_DEFAULT_RE.match(value)
+        if match:
+            default = match.group("default")
+            if (
+                len(default) >= 2
+                and default[0] == default[-1]
+                and default[0] in {"'", '"'}
+            ):
+                default = default[1:-1]
+            return default
+        if cls._SHELL_VAR_RE.match(value):
+            return None
+        return value
+
+    @classmethod
+    def _served_models_from_shell_script(cls, script: str) -> list[str]:
+        """Extract ``--served-model-name`` values from a shell-wrapped command.
+
+        Containers launched via ``bash -lc`` hide the vLLM flags inside one
+        argv token, so the plain argv scan never sees the served name. Values
+        still depending on the container's runtime environment (``$VAR``
+        without a default) are skipped instead of being published literally.
+        """
+        match = cls._shell_vllm_command(script)
+        if not match:
+            return []
+        try:
+            tokens = shlex.split(match.group("flags"))
+        except ValueError:
+            return []
+        served: list[str] = []
+        for raw in cls._served_models_from_cmd(tokens):
+            resolved = cls._resolve_shell_default(raw)
+            if resolved:
+                served.append(resolved)
+        return list(dict.fromkeys(served))
+
     @classmethod
     def _deployment_served_models(
         cls, deployment: dict, primary_container: dict | None = None,
@@ -10593,6 +10645,14 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        if not self._served_models_from_cmd(cmd) and cmd:
+            # A shell-wrapped command (``bash -lc '<script>'``) hides the
+            # vLLM flags inside a single argv token, so the plain scan above
+            # fell back to the label model id. Recover resolvable served
+            # names from the script instead.
+            shell_served = self._served_models_from_shell_script(str(cmd[-1]))
+            if shell_served:
+                served_models = shell_served
         launch_model = ""
         if engine_label == "sglang":
             launch_model = self._cli_option(cmd, {"--model-path"}) or ""

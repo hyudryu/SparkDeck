@@ -509,21 +509,27 @@ describe('env-file backed deployment page', () => {
     </Routes></MemoryRouter>)
   }
 
-  it('renders the env entries table and served name input, without previewing flags', async () => {
+  const initialEnvText = [
+    `SERVED_MODEL_NAME='org/old'`,
+    `MAX_MODEL_LEN="262144"`,
+    `# MAX_NUM_SEQS=32`,
+    `API_TOKEN=••••••••`,
+  ].join('\n')
+
+  const envTextArea = () => screen.getByLabelText(/Settings file variables/)
+
+  it('renders the variables as one compact text area, without previewing flags', async () => {
     renderEnvFilePage()
 
     expect(await screen.findByLabelText('Served model name')).toHaveValue('org/old')
     // Initial control values come from the backing env entries, not the
     // stale container-parsed launch_controls (999), and are unquoted.
     expect(screen.getByLabelText('Context window')).toHaveValue(262144)
-    expect(screen.getByText('MAX_MODEL_LEN')).toBeInTheDocument()
-    // The env rows table shows the raw stored value, quotes included.
-    expect(screen.getByLabelText('MAX_MODEL_LEN value')).toHaveValue('"262144"')
-    expect(screen.getByLabelText('MAX_NUM_SEQS value')).toHaveValue('32')
-    expect(screen.getByLabelText('Enable MAX_NUM_SEQS')).not.toBeChecked()
-    // Secret rows load masked and overwrite-only.
-    expect(screen.getByLabelText('API_TOKEN value')).toHaveValue('')
-    expect(screen.getByLabelText('API_TOKEN value')).toHaveAttribute('placeholder', '••••••')
+    // The text area shows raw stored values (quotes kept), disabled entries
+    // prefixed with '# ', and redacted secrets masked by the marker.
+    expect(envTextArea()).toHaveValue(initialEnvText)
+    // The file's documentation comments stay server-side.
+    expect(screen.getByText(/Documentation comments in \.env\.dspark are preserved/)).toBeInTheDocument()
     // Controls without a backing env variable are disabled with a hint.
     expect(screen.getByLabelText(/GPU memory utilization/)).toBeDisabled()
     // GPU utilization, KV dtype, and max batched tokens are all unmapped here.
@@ -532,11 +538,10 @@ describe('env-file backed deployment page', () => {
     // Flags are script-generated and the editor is read-only in this mode.
     expect(screen.getByLabelText(/Runtime flags/)).toBeDisabled()
     expect(screen.queryByLabelText(/Final runtime flags/)).not.toBeInTheDocument()
-    await waitFor(() => expect(screen.getByLabelText('Served model name')).toBeInTheDocument())
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/api/v1/runtime-flags/preview')).toBe(false)
   })
 
-  it('saves only changed controls alongside dirty env rows and the served name', async () => {
+  it('saves only changed controls alongside the text diff and the served name', async () => {
     const user = userEvent.setup()
     renderEnvFilePage()
 
@@ -546,14 +551,19 @@ describe('env-file backed deployment page', () => {
     const contextWindow = screen.getByLabelText('Context window')
     await user.clear(contextWindow)
     await user.type(contextWindow, '131072')
-    const seqsValue = screen.getByLabelText('MAX_NUM_SEQS value')
-    await user.clear(seqsValue)
-    await user.type(seqsValue, '16')
-    await user.click(screen.getByLabelText('Enable MAX_NUM_SEQS'))
-    await user.type(screen.getByLabelText('API_TOKEN value'), 'newsecret')
-    await user.click(screen.getByRole('button', { name: 'Add variable' }))
-    await user.type(screen.getByLabelText('new variable value'), '3')
-    await user.type(screen.getByLabelText('New variable name'), 'MTP_NUM_TOKENS')
+    // Enable MAX_NUM_SEQS with a new value, overwrite the secret, and append
+    // a brand-new variable.
+    fireEvent.change(envTextArea(), {
+      target: {
+        value: [
+          `SERVED_MODEL_NAME='org/old'`,
+          `MAX_MODEL_LEN="262144"`,
+          `MAX_NUM_SEQS=16`,
+          `API_TOKEN=newsecret`,
+          `MTP_NUM_TOKENS=3`,
+        ].join('\n'),
+      },
+    })
     await user.click(screen.getByRole('button', { name: 'Save' }))
 
     expect(await screen.findByText('Saved to settings file. Stop and start the deployment to apply changes.')).toBeInTheDocument()
@@ -565,36 +575,91 @@ describe('env-file backed deployment page', () => {
       // even though it is mapped, and unmapped controls are never sent.
       launch_controls: { context_window: 131072 },
       served_model_name: 'org/new',
-      // Existing rows are line-addressed so duplicate keys hit the row shown;
-      // the UI-added row has no line yet.
+      // Existing lines are line-addressed so duplicate keys hit the line
+      // shown; the appended variable has no line yet.
       environment: [
         { key: 'MAX_NUM_SEQS', line: 4, value: { value: '16', enabled: true } },
-        { key: 'API_TOKEN', line: 5, value: { value: 'newsecret', enabled: true } },
-        { key: 'MTP_NUM_TOKENS', value: { value: '3', enabled: true } },
+        { key: 'API_TOKEN', line: 5, value: 'newsecret' },
+        { key: 'MTP_NUM_TOKENS', value: '3' },
       ],
       env_file_mtime: 1234.5,
     })
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/api/v1/runtime-flags/preview')).toBe(false)
   })
 
-  it('sends null for deleted rows and keeps untouched secrets out of the save', async () => {
+  it('sends null for removed lines and keeps an untouched secret value on disk when toggled', async () => {
     const user = userEvent.setup()
     renderEnvFilePage()
 
     await screen.findByLabelText('Served model name')
-    await user.click(screen.getByLabelText('Delete MAX_MODEL_LEN'))
-    await user.click(screen.getByLabelText('Enable API_TOKEN'))
+    // Drop the MAX_MODEL_LEN line and comment out the secret without typing
+    // over its marker.
+    fireEvent.change(envTextArea(), {
+      target: {
+        value: [
+          `SERVED_MODEL_NAME='org/old'`,
+          `# MAX_NUM_SEQS=32`,
+          `# API_TOKEN=••••••••`,
+        ].join('\n'),
+      },
+    })
     await user.click(screen.getByRole('button', { name: 'Save' }))
 
     const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
     const body = JSON.parse(String(saveCall?.[1]?.body))
     expect(body.environment).toEqual([
-      { key: 'MAX_MODEL_LEN', line: 3, value: null },
-      // Toggled but never typed: the redacted value stays on disk.
+      // Toggled but still carrying the marker: the redacted value stays on disk.
       { key: 'API_TOKEN', line: 5, value: { value: null, enabled: false } },
+      { key: 'MAX_MODEL_LEN', line: 3, value: null },
     ])
     expect(body).not.toHaveProperty('launch_controls')
     expect(body).not.toHaveProperty('served_model_name')
+  })
+
+  it('rejects empty, malformed, and duplicate lines without sending a save', async () => {
+    const user = userEvent.setup()
+    renderEnvFilePage()
+
+    await screen.findByLabelText('Served model name')
+    fireEvent.change(envTextArea(), {
+      target: { value: [`SERVED_MODEL_NAME='org/old'`, ``, `NOT AN ASSIGNMENT`, `1BAD=x`, `NEW_KEY=1`, `NEW_KEY=2`].join('\n') },
+    })
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('line 2 is empty')
+    expect(alert).toHaveTextContent('line 3 must use KEY=value')
+    expect(alert).toHaveTextContent('line 4 has an invalid variable name')
+    expect(alert).toHaveTextContent('line 6 duplicates new variable NEW_KEY')
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false)
+  })
+
+  it('shows the conflict error and reloads the detail on a 409', async () => {
+    const user = userEvent.setup()
+    renderEnvFilePage()
+    await screen.findByLabelText('Served model name')
+
+    let detailRequests = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/settings') && init?.method === 'PUT') {
+        return new Response(JSON.stringify({ detail: 'The settings file changed on disk; reload and retry.' }), { status: 409, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (!init?.method || init.method === 'GET') detailRequests += 1
+      return new Response(JSON.stringify(envFileDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    await user.clear(screen.getByLabelText('Served model name'))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The settings file changed on disk; reload and retry.')
+    // The conflict reloads the deployment so the text area and the mtime
+    // guard pick up the on-disk contents.
+    await waitFor(() => expect(detailRequests).toBe(1))
+    expect(await screen.findByLabelText('Served model name')).toHaveValue('org/old')
   })
 
   it('sends an explicit empty served model name when the field is cleared', async () => {
@@ -631,7 +696,12 @@ describe('env-file backed deployment page', () => {
     const saveCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/settings') && init?.method === 'PUT')
     expect(JSON.parse(String(saveCall?.[1]?.body)).launch_controls).toEqual({ context_window: null })
     // The save response reloads the entries: the variable is commented out.
-    expect(await screen.findByLabelText('Enable MAX_MODEL_LEN')).not.toBeChecked()
+    await waitFor(() => expect(envTextArea()).toHaveValue([
+      `SERVED_MODEL_NAME='org/old'`,
+      `# MAX_MODEL_LEN="262144"`,
+      `# MAX_NUM_SEQS=32`,
+      `API_TOKEN=••••••••`,
+    ].join('\n')))
   })
 
   it('runs without saving when nothing changed, never sending a stale mtime', async () => {

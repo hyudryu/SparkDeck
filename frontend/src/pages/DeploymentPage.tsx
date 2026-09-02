@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { ArrowLeft, Play, Save } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import type {
   DeploymentDetail,
   DeploymentEnvEntry,
@@ -99,40 +99,84 @@ const editorFingerprint = (editor: Editor) => JSON.stringify(editor)
 
 const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
-// One row of the env-file editor table. Redacted (secret) rows load with an
-// empty value; typing overwrites the secret, leaving it empty keeps it.
-// `line` pins edits to the exact file line so duplicate keys edit the row
-// shown; rows added in the UI have no line yet.
-interface EnvRow {
+// The env-file editor is one compact text area: each line is a KEY=value
+// variable from the backing file, disabled (commented-out) variables keep a
+// `# ` prefix so they stay editable, and documentation comments/blank lines
+// from the file stay server-side and are not shown. Redacted (secret) values
+// load as the marker; a line still carrying exactly the marker on save is
+// treated as unchanged, typing anything else overwrites the secret.
+const ENV_SECRET_MARKER = '••••••••'
+const ENV_FILE_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+const envFileTextFrom = (entries: DeploymentEnvEntry[]): string => entries
+  .map((entry) => `${entry.enabled ? '' : '# '}${entry.key}=${entry.redacted ? ENV_SECRET_MARKER : entry.value ?? ''}`)
+  .join('\n')
+
+interface EnvFileLine {
   key: string
   value: string
   enabled: boolean
-  redacted: boolean
-  deleted: boolean
-  added: boolean
-  line?: number
-  initialValue?: string
-  initialEnabled: boolean
+  // 1-based line number inside the text area, for validation messages.
+  lineNumber: number
 }
 
-const envRowFrom = (entry: DeploymentEnvEntry): EnvRow => ({
-  key: entry.key,
-  value: entry.redacted ? '' : entry.value ?? '',
-  enabled: entry.enabled,
-  redacted: Boolean(entry.redacted),
-  deleted: false,
-  added: false,
-  line: entry.line,
-  initialValue: entry.redacted ? undefined : entry.value ?? '',
-  initialEnabled: entry.enabled,
-})
+function parseEnvFileText(text: string): { lines: EnvFileLine[]; problems: string[] } {
+  const problems: string[] = []
+  const lines: EnvFileLine[] = []
+  text.split(/\r?\n/).forEach((raw, index) => {
+    const lineNumber = index + 1
+    if (!raw.trim()) { problems.push(`line ${lineNumber} is empty`); return }
+    const enabled = !raw.startsWith('#')
+    const body = enabled ? raw : raw.slice(1).replace(/^ /, '')
+    const separator = body.indexOf('=')
+    if (separator < 0) { problems.push(`line ${lineNumber} must use KEY=value`); return }
+    const key = body.slice(0, separator)
+    if (!ENV_FILE_KEY.test(key)) { problems.push(`line ${lineNumber} has an invalid variable name`); return }
+    lines.push({ key, value: body.slice(separator + 1), enabled, lineNumber })
+  })
+  return { lines, problems }
+}
 
-const envRowDirty = (row: EnvRow) => (
-  row.deleted
-  || row.enabled !== row.initialEnabled
-  || (row.redacted ? row.value !== '' : row.value !== row.initialValue)
-  || row.added
-)
+// Diff the text area against the originally loaded entries and emit
+// line-addressed ops. Pairing is a stable first-occurrence alignment: each
+// text line pairs with the first not-yet-paired original entry with the same
+// key; unpaired originals are deleted, unpaired text lines are appended.
+function envFileEnvironmentUpdate(entries: DeploymentEnvEntry[], text: string): EnvFileEnvironmentOp[] {
+  const { lines, problems } = parseEnvFileText(text)
+  const paired = new Set<number>()
+  const pairs: Array<{ line: EnvFileLine; entry: DeploymentEnvEntry }> = []
+  const appends: EnvFileLine[] = []
+  for (const line of lines) {
+    const index = entries.findIndex((entry, entryIndex) => !paired.has(entryIndex) && entry.key === line.key)
+    if (index === -1) appends.push(line)
+    else { paired.add(index); pairs.push({ line, entry: entries[index] }) }
+  }
+  const seen = new Set<string>()
+  for (const line of appends) {
+    if (seen.has(line.key)) problems.push(`line ${line.lineNumber} duplicates new variable ${line.key}`)
+    seen.add(line.key)
+  }
+  if (problems.length) throw new Error(`Settings file variables: ${problems.join('; ')}`)
+
+  const ops: EnvFileEnvironmentOp[] = []
+  for (const { line, entry } of pairs) {
+    const valueChanged = entry.redacted ? line.value !== ENV_SECRET_MARKER : line.value !== (entry.value ?? '')
+    const enabledChanged = line.enabled !== entry.enabled
+    if (!valueChanged && !enabledChanged) continue
+    ops.push(enabledChanged
+      // A toggled secret the user never typed over keeps its stored value:
+      // null leaves the redacted value on disk and only flips the comment.
+      ? { key: entry.key, line: entry.line, value: { value: entry.redacted && !valueChanged ? null : line.value, enabled: line.enabled } }
+      : { key: entry.key, line: entry.line, value: line.value })
+  }
+  entries.forEach((entry, index) => {
+    if (!paired.has(index)) ops.push({ key: entry.key, line: entry.line, value: null })
+  })
+  for (const line of appends) {
+    ops.push(line.enabled ? { key: line.key, value: line.value } : { key: line.key, value: { value: line.value, enabled: false } })
+  }
+  return ops
+}
 
 const servedNameFrom = (detail: DeploymentDetail): string => {
   const settingsEnv = detail.settings_env
@@ -151,8 +195,8 @@ const envControlValue = (detail: DeploymentDetail, control: EnvFileControl): str
   const key = settingsEnv?.field_mapping?.[control]
   if (!key) return undefined
   const raw = settingsEnv?.entries?.find((item) => item.key === key)?.value
-  // Structured controls take the unquoted value; the env rows table below
-  // still shows the raw stored text.
+  // Structured controls take the unquoted value; the settings-file text area
+  // below still shows the raw stored text.
   return raw === undefined || raw === null ? '' : unquoteEnvValue(raw)
 }
 
@@ -169,7 +213,8 @@ function envFileUpdateInput(
   editor: Editor,
   savedEditor: Editor,
   detail: DeploymentDetail,
-  envRows: EnvRow[],
+  envText: string,
+  savedEnvText: string,
   servedName: string,
   savedServedName: string,
 ): EnvFileDeploymentUpdateInput {
@@ -192,16 +237,11 @@ function envFileUpdateInput(
     launch_controls.kv_cache_dtype = editor.kv_cache_dtype.trim() || null
   }
 
-  const environment: EnvFileEnvironmentOp[] = []
-  for (const row of envRows) {
-    if (!envRowDirty(row) || !row.key.trim()) continue
-    const value = row.deleted
-      ? null
-      : row.redacted && row.value === ''
-        ? { value: null, enabled: row.enabled }
-        : { value: row.value, enabled: row.enabled }
-    environment.push(row.added ? { key: row.key, value } : { key: row.key, line: row.line, value })
-  }
+  // Untouched text short-circuits the diff: a change-free save must not
+  // re-validate (or send) anything for the env file.
+  const environment = envText === savedEnvText
+    ? []
+    : envFileEnvironmentUpdate(detail.settings_env?.entries ?? [], envText)
 
   return {
     launch_controls: Object.keys(launch_controls).length ? launch_controls : undefined,
@@ -251,7 +291,8 @@ export function DeploymentPage() {
   const nodes = useResource((signal) => api.nodes.list(signal))
   const [editor, setEditor] = useState<Editor>()
   const [savedEditor, setSavedEditor] = useState<Editor>()
-  const [envRows, setEnvRows] = useState<EnvRow[]>([])
+  const [envText, setEnvText] = useState('')
+  const [savedEnvText, setSavedEnvText] = useState('')
   const [servedName, setServedName] = useState('')
   const [savedServedName, setSavedServedName] = useState('')
   const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
@@ -268,7 +309,9 @@ export function DeploymentPage() {
         : editorFrom(resource.data)
       setEditor(saved)
       setSavedEditor(saved)
-      setEnvRows((resource.data.settings_env?.entries ?? []).map(envRowFrom))
+      const text = envFileTextFrom(resource.data.settings_env?.entries ?? [])
+      setEnvText(text)
+      setSavedEnvText(text)
       const name = servedNameFrom(resource.data)
       setServedName(name)
       setSavedServedName(name)
@@ -320,13 +363,11 @@ export function DeploymentPage() {
 
   const set = (key: keyof Editor, value: string) => setEditor((current) => current ? { ...current, [key]: value } : current)
 
-  const setEnvRow = (index: number, patch: Partial<EnvRow>) => setEnvRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)))
-
   const persist = async () => {
     if (!editor || !savedEditor) throw new Error('Deployment settings are not loaded')
     const detail = resource.data
     if (detail?.edit_mode === 'env-file') {
-      const input = envFileUpdateInput(editor, savedEditor, detail, envRows, servedName, savedServedName)
+      const input = envFileUpdateInput(editor, savedEditor, detail, envText, savedEnvText, servedName, savedServedName)
       const hasUpdates = Boolean(
         input.launch_controls
         || input.gpu_memory_utilization !== undefined
@@ -336,9 +377,16 @@ export function DeploymentPage() {
       // A change-free Run must not PUT: a stale env_file_mtime would
       // conflict with out-of-band edits even though nothing changed.
       if (!hasUpdates) return detail
-      const updated = await api.deployments.update(deploymentId, input)
-      resource.apply(updated)
-      return updated
+      try {
+        const updated = await api.deployments.update(deploymentId, input)
+        resource.apply(updated)
+        return updated
+      } catch (reason) {
+        // The file changed on disk behind the editor; reload so the text
+        // area and the mtime guard pick up the current contents.
+        if (reason instanceof ApiError && reason.status === 409) resource.reload()
+        throw reason
+      }
     }
     const updated = await api.deployments.update(deploymentId, updateInput(editor))
     // The backend can adjust the saved topology on save (e.g. trimming the
@@ -432,7 +480,7 @@ export function DeploymentPage() {
     : undefined
   const envControlDisabled = (control: string) => disabled || (envFileMode && !envFieldMapping[control])
   const hasUnsavedChanges = (savedEditor !== undefined && editorFingerprint(editor) !== editorFingerprint(savedEditor))
-    || envRows.some(envRowDirty)
+    || envText !== savedEnvText
     || servedName !== savedServedName
   const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
@@ -474,23 +522,12 @@ export function DeploymentPage() {
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
         </>}
-        {envFileMode && <div className="field wide-field">
-          <span>Settings file variables</span>
+        {envFileMode && <label className="field wide-field"><span>Settings file variables</span>
           {detail.settings_env?.error
             ? <small className="form-error" role="alert">{detail.settings_env.error}</small>
-            : <>
-              {envRows.map((row, index) => !row.deleted && <div className="env-file-row" key={row.added ? `added-${index}` : row.key}>
-                <input type="checkbox" aria-label={`Enable ${row.key || 'new variable'}`} disabled={disabled} checked={row.enabled} onChange={(event) => setEnvRow(index, { enabled: event.target.checked })} />
-                {row.added
-                  ? <input aria-label="New variable name" placeholder="VARIABLE_NAME" disabled={disabled} value={row.key} onChange={(event) => setEnvRow(index, { key: event.target.value })} />
-                  : <code>{row.key}</code>}
-                <input aria-label={`${row.key || 'new variable'} value`} placeholder={row.redacted ? '••••••' : 'value'} disabled={disabled} value={row.value} onChange={(event) => setEnvRow(index, { value: event.target.value })} />
-                <button type="button" className="icon-button" aria-label={`Delete ${row.key || 'new variable'}`} disabled={disabled} onClick={() => setEnvRow(index, { deleted: true })}>×</button>
-              </div>)}
-              <div><Button type="button" disabled={disabled} onClick={() => setEnvRows((current) => [...current, { key: '', value: '', enabled: true, redacted: false, deleted: false, added: true, initialEnabled: true }])}>Add variable</Button></div>
-            </>}
-          <small>Values are written to {detail.settings_env?.name}; stop and start the deployment to apply changes.</small>
-        </div>}
+            : <textarea className="env-file-text" disabled={disabled} rows={12} spellCheck={false} value={envText} onChange={(event) => setEnvText(event.target.value)} />}
+          <small>One KEY=value per line; prefix with # to disable a variable. Documentation comments in {detail.settings_env?.name} are preserved; only variables are shown here. Secrets display as {ENV_SECRET_MARKER}; keep the marker to leave a secret unchanged. Stop and start the deployment to apply changes.</small>
+        </label>}
         <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled || envFileMode} readOnly={envFileMode} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} />{envFileMode
           ? <small>Flags are generated by the external start script; edit the backing variable above instead.</small>
           : <small>Shell quoting is preserved when the flags are saved.</small>}</label>

@@ -23,6 +23,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from cluster import AGENT_PROTOCOL_VERSION, normalize_agent_url
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json
+from sparkdeck.request_limits import (
+    MAX_INFERENCE_REQUEST_BYTES,
+    RequestBodyTooLarge,
+    is_inference_request_path,
+    read_limited_request_body,
+)
 
 
 FORWARD_NODE_HEADER = "x-sparkdeck-forward-node"
@@ -811,7 +817,19 @@ async def forward_management_request(
         FORWARD_CLIENT_HEADER: request.client.host if request.client else "unknown",
     })
     try:
-        body = await request.body()
+        try:
+            body = (
+                await read_limited_request_body(
+                    request, MAX_INFERENCE_REQUEST_BYTES,
+                )
+                if is_inference_request_path(request.url.path)
+                else await request.body()
+            )
+        except RequestBodyTooLarge:
+            return JSONResponse(
+                {"detail": "inference request exceeds the 32 MB limit"},
+                status_code=413,
+            )
 
         async def wait_for_disconnect() -> bool:
             try:

@@ -308,6 +308,40 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             recovering["members"][1]["phase"]["phase"], "recovering",
         )
 
+    async def test_state_keeps_stopping_until_every_member_exits(self):
+        manager = self.manager_without_docker()
+        manager.deployments = [{
+            "id": "deployment-1", "name": "Stopping", "model": "org/model",
+            "engine": "vllm", "mode": "single", "status": "stopping",
+            "desired_state": "stopped", "node_ids": ["local"],
+            "members": [{
+                "node_id": "local", "node_name": "Controller", "rank": 0,
+                "container_name": "rank-0", "status": "running",
+            }],
+            "launch_settings": {
+                "model": "org/model", "engine": "vllm", "extra_args": [],
+            },
+        }]
+        container = {
+            "name": "rank-0", "status": "running",
+            "phase": {"phase": "ready", "message": "Ready"},
+        }
+        manager.list_containers = AsyncMock(return_value=[container])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "local": True,
+            "online": True, "docker_ready": True, "containers": [container],
+        }])
+
+        stopping_state = await manager.get_state()
+        self.assertEqual(stopping_state["deployments"][0]["status"], "stopping")
+
+        container["status"] = "exited"
+        container["phase"] = None
+        stopped_state = await manager.get_state()
+        self.assertEqual(stopped_state["deployments"][0]["status"], "stopped")
+
     async def test_liveness_api_does_not_query_docker_or_cluster_state(self):
         transport = httpx.ASGITransport(app=server.app)
         async with httpx.AsyncClient(

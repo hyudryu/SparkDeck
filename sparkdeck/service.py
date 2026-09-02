@@ -60,6 +60,7 @@ _SAFE_CONFIGURATION_KEYS = {
     "context_size", "context_window", "context_length", "max_model_len", "parallel", "parallel_slots",
     "gpu_layers", "split_mode", "tensor_split", "gpu_split", "tensor_parallel_size",
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
+    "kv_cache_dtype",
     "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
     "runtime_version",
 }
@@ -91,6 +92,7 @@ _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
 _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
+_STREAM_OBSERVATION_QUEUE_SIZE = 256
 _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
     r"(?P<count>\d{5})(?P<suffix>\.gguf)$",
@@ -630,16 +632,19 @@ class SparkDeckService:
             upload_model_id=upload_model_id,
         )
         deployment_model = deployment.get("model") or {}
-        quantization = (
-            canonical_quantization(deployment_model.get("quantization"))
-            or canonical_quantization(settings.get("quantization"))
-            or quantization_from_text(
-                settings.get("gguf_variant"),
-                deployment_model.get("artifact"),
-                raw_model_id,
-            )
-            or "UNKNOWN"
-        )
+        quantization = _weight_quantization({
+            **settings,
+            "quantization": (
+                deployment_model.get("quantization")
+                if deployment_model.get("quantization") is not None
+                else settings.get("quantization")
+            ),
+            "artifact": (
+                deployment_model.get("artifact")
+                if deployment_model.get("artifact") is not None
+                else settings.get("artifact")
+            ),
+        }, raw_model_id)
         point = {
             "id": str(uuid.uuid4()),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1007,6 +1012,11 @@ class SparkDeckService:
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
+            served_models = cluster.get("served_models")
+            if isinstance(served_models, list):
+                stored["served_models"] = list(served_models)
+            if cluster.get("served_model"):
+                stored["served_model"] = cluster["served_model"]
             stored["port"] = cluster.get("api_port")
             stored["managed"] = True
             stored["managed_by"] = (
@@ -1068,6 +1078,11 @@ class SparkDeckService:
                     last_deployed_at = _container_last_deployed_at(container)
                     if last_deployed_at is not None:
                         stored["last_deployed_at"] = last_deployed_at
+                    served_models = container.get("served_models")
+                    if isinstance(served_models, list):
+                        stored["served_models"] = list(served_models)
+                    if container.get("served_model"):
+                        stored["served_model"] = container["served_model"]
                 stored["port"] = container.get("port")
                 stored["managed"] = True
                 seen.add(stored["id"])
@@ -1750,7 +1765,12 @@ class SparkDeckService:
             **current_settings,
             **launch_settings,
             "extra_args": safe_args,
+            # Manager persists structured controls by folding them into argv.
+            # Replace any older editor snapshot instead of letting stale
+            # controls override the current Manager command on a later clone.
+            "launch_controls": controls,
             "context_length": controls.get("context_window"),
+            "max_concurrency": controls.get("max_concurrency"),
             "tensor_parallel_size": contract.get("tensor_parallel_size"),
             "deployment_mode": updated.get("mode")
             or launch_settings.get("deployment_mode"),
@@ -4560,22 +4580,51 @@ class SparkDeckService:
         normalized = self._local_configuration(launch_inputs)
         controls = self.manager._deployment_launch_controls(launch_inputs)
 
+        if manager_deployment is not None:
+            # The live Manager argv is authoritative. A historical
+            # ``settings.launch_controls`` object may describe an older edit;
+            # carrying it into a bookmark would rewrite the copied argv on its
+            # first preview/start.
+            normalized["launch_controls"] = controls
+
         def preserve(key: str, value: Any) -> None:
             if value is not None:
+                normalized[key] = value
+
+        def replace_from_manager(key: str, value: Any) -> None:
+            if manager_deployment is None:
+                preserve(key, value)
+            elif value is None:
+                normalized.pop(key, None)
+            else:
                 normalized[key] = value
 
         for pricing_key in (
             "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
         ):
             preserve(pricing_key, launch_inputs.get(pricing_key))
-        preserve("context_length", controls.get("context_window"))
+        replace_from_manager("context_length", controls.get("context_window"))
+        replace_from_manager("max_concurrency", controls.get("max_concurrency"))
+        if runtime is RuntimeKind.VLLM:
+            replace_from_manager(
+                "tensor_parallel_size", controls.get("tensor_parallel_size"),
+            )
+            replace_from_manager(
+                "pipeline_parallel_size", controls.get("pipeline_parallel_size"),
+            )
         if runtime is RuntimeKind.SGLANG:
-            preserve("tensor_parallel_size", launch_inputs.get("sg_tp_size"))
-            preserve("max_running_requests", controls.get("max_concurrency"))
-            preserve("mem_fraction_static", launch_inputs.get("sg_mem_fraction"))
+            replace_from_manager(
+                "tensor_parallel_size", launch_inputs.get("sg_tp_size"),
+            )
+            replace_from_manager(
+                "max_running_requests", controls.get("max_concurrency"),
+            )
+            replace_from_manager(
+                "mem_fraction_static", launch_inputs.get("sg_mem_fraction"),
+            )
         elif runtime is RuntimeKind.LLAMA_CPP:
-            preserve("parallel_slots", controls.get("max_concurrency"))
-            preserve("gpu_layers", launch_inputs.get("llama_gpu_layers"))
+            replace_from_manager("parallel_slots", controls.get("max_concurrency"))
+            replace_from_manager("gpu_layers", launch_inputs.get("llama_gpu_layers"))
 
         for runtime_identity_key in (
             "manager_deployment_id", "managed_by", "automation_run_id",
@@ -4791,6 +4840,11 @@ class SparkDeckService:
             "logs_available": True,
             "removable": True,
         }
+        served_models = container.get("served_models")
+        if isinstance(served_models, list):
+            result["served_models"] = list(served_models)
+        if container.get("served_model"):
+            result["served_model"] = container["served_model"]
         # Label-defined lifecycle hooks are advertised as capability booleans
         # only. The raw shell strings can embed paths or tokens and must not
         # appear in the unauthenticated list/detail payloads; the action
@@ -4824,22 +4878,49 @@ class SparkDeckService:
     async def models(self) -> dict[str, Any]:
         data = []
         seen = set()
-        for deployment in await self.deployments():
-            if deployment.get("status") not in ("running", "registered"):
-                continue
-            alias = deployment["alias"]
-            if alias in seen:
-                continue
-            seen.add(alias)
-            data.append({
-                "id": alias, "object": "model", "created": 0,
-                "owned_by": "sparkdeck", "runtime": deployment["runtime"],
-                "deployment_id": deployment["id"], "model": deployment["model"],
-                "container_name": deployment.get("container_name"),
-                "port": deployment.get("port"),
-            })
+        all_deployments = await self.deployments()
+        deployments = [
+            deployment for deployment in all_deployments
+            if deployment.get("status") in ("running", "registered")
+        ]
+        public_ids = {
+            deployment["id"]: self._deployment_public_model_ids(deployment)
+            for deployment in deployments
+        }
+        request_owners = self._deployment_request_owners(
+            deployments, public_ids,
+        )
+        for deployment in deployments:
+            model_ids = [
+                model_id for model_id in public_ids[deployment["id"]]
+                if self._model_id_routes_to_deployment(
+                    model_id, deployment, request_owners,
+                )
+            ]
+            if not model_ids:
+                alias = str(deployment.get("alias") or "").strip()
+                if alias and self._model_id_routes_to_deployment(
+                    alias, deployment, request_owners,
+                ):
+                    model_ids = [alias]
+            for model_id in model_ids:
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
+                data.append({
+                    "id": model_id, "object": "model", "created": 0,
+                    "owned_by": "sparkdeck", "runtime": deployment["runtime"],
+                    "deployment_id": deployment["id"], "model": deployment["model"],
+                    "container_name": deployment.get("container_name"),
+                    "port": deployment.get("port"),
+                })
         loaded_llama = await self._native_llama_model()
-        if loaded_llama and loaded_llama not in seen:
+        if (
+            loaded_llama
+            and loaded_llama not in seen
+            and not request_owners.get(loaded_llama)
+            and self.store.deployment(loaded_llama, include_private=True) is None
+        ):
             data.append({
                 "id": loaded_llama, "object": "model", "created": 0,
                 "owned_by": "llama.cpp", "runtime": RuntimeKind.LLAMA_CPP.value,
@@ -4850,11 +4931,134 @@ class SparkDeckService:
             })
         return {"object": "list", "data": data}
 
+    def _deployment_public_model_ids(self, deployment: dict[str, Any]) -> list[str]:
+        """Return the request ids explicitly served by one deployment.
+
+        SparkDeck's alias remains a valid gateway selector, but an explicit
+        runtime served name is the public OpenAI model id. Cluster launch
+        settings live on Manager's durable deployment record, so registered
+        deployments must consult that record instead of replacing the served
+        identity with their UI alias.
+        """
+        configured = deployment.get("served_models")
+        if not isinstance(configured, list):
+            configured = []
+        if not configured and deployment.get("served_model"):
+            configured = [deployment["served_model"]]
+        if not configured:
+            manager_id = (deployment.get("settings") or {}).get(
+                "manager_deployment_id"
+            )
+            linked = next(
+                (
+                    item for item in getattr(self.manager, "deployments", [])
+                    if isinstance(item, dict) and (
+                        item.get("id") == manager_id
+                        or item.get("sparkdeck_record_id") == deployment.get("id")
+                    )
+                ),
+                None,
+            )
+            resolver = getattr(self.manager, "_deployment_served_models", None)
+            if linked is not None and callable(resolver):
+                configured = resolver(linked)
+        normalized = list(dict.fromkeys(
+            str(value).strip() for value in configured if str(value).strip()
+        ))
+        alias = str(deployment.get("alias") or "").strip()
+        return normalized or ([alias] if alias else [])
+
+    def _deployment_request_owners(
+        self,
+        deployments: list[dict[str, Any]],
+        public_ids: dict[str, list[str]] | None = None,
+    ) -> dict[str, set[str]]:
+        """Map every served name and compatibility alias to its owners."""
+        owners: dict[str, set[str]] = {}
+        public_ids = public_ids or {
+            deployment["id"]: self._deployment_public_model_ids(deployment)
+            for deployment in deployments
+        }
+        for deployment in deployments:
+            deployment_id = deployment["id"]
+            request_ids = list(public_ids[deployment_id])
+            alias = str(deployment.get("alias") or "").strip()
+            if alias:
+                request_ids.append(alias)
+            for model_id in request_ids:
+                owners.setdefault(model_id, set()).add(deployment_id)
+        return owners
+
+    def _model_id_routes_to_deployment(
+        self,
+        model_id: str,
+        deployment: dict[str, Any],
+        request_owners: dict[str, set[str]],
+    ) -> bool:
+        """Return whether gateway lookup selects exactly this deployment."""
+        exact = self.store.deployment(model_id, include_private=True)
+        owners = request_owners.get(model_id, set())
+        if exact is not None and exact["id"] in owners:
+            return exact["id"] == deployment["id"]
+        return owners == {deployment["id"]}
+
+    async def _live_deployment_for_model_id(
+        self, model_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a request id to the live deployment that owns it."""
+        deployments = [
+            deployment for deployment in await self.deployments()
+            if deployment.get("status") in ("running", "registered")
+        ]
+        live_by_id = {deployment["id"]: deployment for deployment in deployments}
+        stored_deployments = self.store.deployments(include_private=True)
+        stored_by_id = {
+            deployment["id"]: deployment for deployment in stored_deployments
+        }
+        exact = self.store.deployment(model_id, include_private=True)
+        if exact is not None and exact["id"] in live_by_id:
+            return {**exact, **live_by_id[exact["id"]]}
+
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for stored in stored_deployments:
+            live = live_by_id.get(stored["id"])
+            if live is None:
+                continue
+            if model_id in self._deployment_public_model_ids(live):
+                matches.append((stored, live))
+        if len(matches) > 1:
+            raise LookupError(
+                "served model name is ambiguous; use a deployment alias"
+            )
+        if not matches:
+            discovered = [
+                deployment for deployment in deployments
+                if deployment["id"] not in stored_by_id
+                and (
+                    model_id in self._deployment_public_model_ids(deployment)
+                    or model_id == str(deployment.get("alias") or "").strip()
+                )
+            ]
+            if len(discovered) > 1:
+                raise LookupError(
+                    "served model name is ambiguous; use a deployment alias"
+                )
+            return discovered[0] if discovered else None
+        stored, live = matches[0]
+        return {**stored, **live}
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
-        deployment = self.store.deployment(requested_model, include_private=True)
+        stored_deployment = self.store.deployment(
+            requested_model, include_private=True,
+        )
+        deployment = await self._live_deployment_for_model_id(
+            requested_model
+        )
+        if deployment is None:
+            deployment = stored_deployment
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )
@@ -5000,9 +5204,15 @@ class SparkDeckService:
             raise RuntimeError(
                 "deployment is stopped; start it before sending inference requests"
             )
+        local_container = str(deployment.get("id") or "").startswith("container:")
         if (
-            deployment.get("kind") == DeploymentKind.MANAGED.value
-            and deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            (
+                deployment.get("kind") == DeploymentKind.MANAGED.value
+                or local_container
+            )
+            and deployment.get("runtime") in (
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+            )
         ):
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,
@@ -5054,6 +5264,7 @@ class SparkDeckService:
                              caller_ip: str | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
+        requested_model = str(body.get("model") or deployment["alias"])
         model = deployment["model"]["repository"]
         upstream_body = {**body, "model": model}
         stream = bool(upstream_body.get("stream"))
@@ -5095,7 +5306,7 @@ class SparkDeckService:
 
             return self._observe_stream(
                 result, deployment["id"], model, deployment["runtime"], settings,
-                started, revision=revision, response_model=deployment["alias"],
+                started, revision=revision, response_model=requested_model,
                 hardware_resolver=serving_hardware,
             )
         hardware, hardware_verified = await self._managed_hardware_snapshot(
@@ -5108,7 +5319,7 @@ class SparkDeckService:
             hardware_verified=hardware_verified,
         )
         if isinstance(result, dict):
-            result["model"] = deployment["alias"]
+            result["model"] = requested_model
         return result
 
     async def _http_stream(self, url: str, body: dict[str, Any], headers: dict[str, str],
@@ -5206,29 +5417,100 @@ class SparkDeckService:
                               response_model: str | None = None,
                               hardware: dict[str, Any] | None = None,
                               hardware_verified: bool = True,
-                              hardware_resolver: Any = None) -> AsyncIterator[str]:
+                              hardware_resolver: Any = None,
+                              timing_clock: Any = None) -> AsyncIterator[str]:
+        """Consume upstream independently so client backpressure cannot skew TPS.
+
+        The relay bounds queued chunks. If it ever fills, the producer may be
+        delayed by the downstream client and the measurement is marked
+        untrusted instead of being contributed.
+        """
+        relay: asyncio.Queue[Any] = asyncio.Queue(
+            maxsize=_STREAM_OBSERVATION_QUEUE_SIZE,
+        )
+        finished = object()
         first_token_at = None
         usage = None
-        async for chunk in stream:
-            text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
-            if response_model:
-                text = _rewrite_sse_model(text, response_model)
-            for line in text.splitlines():
-                parsed = _parse_sse(line)
-                if parsed and parsed.get("usage"):
-                    usage = parsed["usage"]
-                if parsed and first_token_at is None and _chunk_has_output(parsed):
-                    first_token_at = time.monotonic()
-            yield text.encode("utf-8") if isinstance(chunk, bytes) else text
-        if usage:
-            if hardware_resolver is not None:
-                hardware, hardware_verified = await hardware_resolver()
-            self._record_usage(
-                deployment_id, model, runtime, settings, started, usage,
-                first_token_at, revision=revision, hardware=hardware,
-                hardware_verified=hardware_verified,
-                stream_timing_trusted=False,
-            )
+        timing_trusted = True
+        completed = False
+        stream_failed = False
+        clock = timing_clock or time.monotonic
+        observation = self._community_observation.get()
+
+        async def produce() -> None:
+            nonlocal first_token_at, usage, timing_trusted, completed, stream_failed
+            cancelled = False
+            observation_ended = False
+            try:
+                async for chunk in stream:
+                    text = (
+                        chunk.decode("utf-8", errors="replace")
+                        if isinstance(chunk, bytes) else str(chunk)
+                    )
+                    if response_model:
+                        text = _rewrite_sse_model(text, response_model)
+                    for line in text.splitlines():
+                        payload = line[5:].strip() if line.startswith("data:") else ""
+                        if payload == "[DONE]":
+                            completed = True
+                        parsed = _parse_sse(line)
+                        if parsed and parsed.get("error"):
+                            stream_failed = True
+                        if parsed and parsed.get("usage"):
+                            usage = parsed["usage"]
+                        if (
+                            parsed and first_token_at is None
+                            and _chunk_has_output(parsed)
+                        ):
+                            first_token_at = clock()
+                    if relay.full():
+                        timing_trusted = False
+                    await relay.put(
+                        text.encode("utf-8") if isinstance(chunk, bytes) else text
+                    )
+                completed_at = clock()
+                # Concurrency eligibility follows upstream inference lifetime,
+                # not however long a client takes to drain the bounded relay.
+                self._community_observation_end(observation)
+                observation_ended = True
+                if usage and completed and not stream_failed:
+                    resolved_hardware = hardware
+                    resolved_verified = hardware_verified
+                    if hardware_resolver is not None:
+                        resolved_hardware, resolved_verified = await hardware_resolver()
+                    self._record_usage(
+                        deployment_id, model, runtime, settings, started, usage,
+                        first_token_at, revision=revision,
+                        hardware=resolved_hardware,
+                        hardware_verified=resolved_verified,
+                        stream_timing_trusted=timing_trusted,
+                        completed_at=completed_at,
+                    )
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                if not observation_ended:
+                    self._community_observation_end(observation)
+                if cancelled:
+                    close_stream = getattr(stream, "aclose", None)
+                    if close_stream is not None:
+                        await close_stream()
+                if not cancelled:
+                    await relay.put(finished)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                chunk = await relay.get()
+                if chunk is finished:
+                    break
+                yield chunk
+            await producer
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
                          settings: dict[str, Any], started: float, data: dict[str, Any],
@@ -5254,7 +5536,8 @@ class SparkDeckService:
                       revision: str | None = None,
                       hardware: dict[str, Any] | None = None,
                       hardware_verified: bool = True,
-                      stream_timing_trusted: bool = True) -> None:
+                      stream_timing_trusted: bool = True,
+                      completed_at: float | None = None) -> None:
         observation = self._community_observation.get()
         passive_observation = observation is not None
         # Community sharing is the authority for passive inference telemetry.
@@ -5264,20 +5547,17 @@ class SparkDeckService:
             or not stream_timing_trusted
         ):
             return
-        completed = time.monotonic()
+        completed = time.monotonic() if completed_at is None else completed_at
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
         latency = max(0.000001, completed - started)
         generation_seconds = max(0.000001, completed - (first_token_at or started))
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
-        quantization = (
-            canonical_quantization(settings.get("quantization"))
-            or quantization_from_text(
-                settings.get("gguf_variant"), settings.get("artifact"), model,
-            )
-            or "UNKNOWN"
-        )
+        kv_cache_dtype = _kv_cache_dtype(settings)
+        if kv_cache_dtype is not None:
+            safe_settings["kv_cache_dtype"] = kv_cache_dtype
+        quantization = _weight_quantization(settings, model)
         observed_generation_tps = (
             round(output_tokens / generation_seconds, 3)
             if output_tokens and first_token_at is not None else None
@@ -5630,6 +5910,8 @@ def _deployment_status(value: Any) -> str:
         return "starting"
     if status in ("exited", "dead", "removed", "stopped"):
         return "stopped"
+    if status == "stopping":
+        return "stopping"
     if status in ("error", "unhealthy", "degraded"):
         return "error"
     return "unknown"
@@ -5643,6 +5925,13 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
             "launch_message": str(
                 deployment.get("error") or "Deployment launch failed"
             ),
+        }
+    if deployment.get("status") == "stopping":
+        # Ranks exit one by one while a stop is in flight; reporting the
+        # first exited rank's phase would flash "Exited" under the card.
+        return {
+            "launch_phase": "stopping",
+            "launch_message": "Stopping deployment",
         }
     members = [
         member for member in (deployment.get("members") or [])
@@ -5729,6 +6018,47 @@ def _positive_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _cli_argument_value(arguments: Any, flag: str) -> str | None:
+    values = [str(value) for value in arguments or []]
+    found = None
+    for index, value in enumerate(values):
+        if value == flag and index + 1 < len(values):
+            candidate = values[index + 1]
+            if not candidate.startswith("-"):
+                found = _optional_string(candidate)
+        prefix = f"{flag}="
+        if value.startswith(prefix):
+            candidate = _optional_string(value[len(prefix):])
+            if candidate is not None:
+                found = candidate
+    return found
+
+
+def _weight_quantization(settings: dict[str, Any], model: str) -> str:
+    """Resolve model-weight quantization without conflating KV-cache dtype."""
+    return (
+        canonical_quantization(
+            _cli_argument_value(settings.get("extra_args"), "--quantization")
+        )
+        or canonical_quantization(settings.get("quantization"))
+        or quantization_from_text(
+            settings.get("gguf_variant"), settings.get("artifact"), model,
+        )
+        or "UNKNOWN"
+    )
+
+
+def _kv_cache_dtype(settings: dict[str, Any]) -> str | None:
+    controls = settings.get("launch_controls")
+    if isinstance(controls, dict) and "kv_cache_dtype" in controls:
+        value = controls["kv_cache_dtype"]
+    else:
+        value = _cli_argument_value(
+            settings.get("extra_args"), "--kv-cache-dtype",
+        )
+    return canonical_quantization(value)
 
 
 def _is_missing_container_error(exc: Exception) -> bool:

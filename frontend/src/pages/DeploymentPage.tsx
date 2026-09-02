@@ -3,6 +3,7 @@ import { ArrowLeft, Play, Save } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { DeploymentDetail, DeploymentLaunchControls, DeploymentUpdateInput } from '../api/types'
+import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
@@ -93,6 +94,7 @@ const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
 const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
+const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
 function updateInput(editor: Editor): DeploymentUpdateInput {
   return {
@@ -140,6 +142,14 @@ export function DeploymentPage() {
     }
   }, [resource.data])
 
+  // Transitional statuses resolve without user input; keep the detail view
+  // live so a finished stop/start is reflected without a manual reload.
+  useEffect(() => {
+    if (resource.loading || !resource.data || !TRANSITIONAL_DEPLOYMENT_STATUSES.has(resource.data.status)) return
+    const timer = window.setTimeout(resource.reload, 2000)
+    return () => window.clearTimeout(timer)
+  }, [resource.data, resource.loading, resource.reload])
+
   useEffect(() => {
     if (!editor || !resource.data || resource.data.runtime === 'llama.cpp') {
       setFinalFlags('')
@@ -180,6 +190,10 @@ export function DeploymentPage() {
   const persist = async () => {
     if (!editor) throw new Error('Deployment settings are not loaded')
     const updated = await api.deployments.update(deploymentId, updateInput(editor))
+    // The backend can adjust the saved topology on save (e.g. trimming the
+    // node list when the parallel layout shrinks); keep the page resource in
+    // sync so requiredRunNodes and the Run dialog never act on stale counts.
+    resource.apply(updated)
     const savedEditor = editorFrom(updated)
     setEditor(savedEditor)
     setSavedEditorFingerprint(editorFingerprint(savedEditor))
@@ -262,8 +276,8 @@ export function DeploymentPage() {
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
   const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
-  const active = ['launching', 'starting', 'running', 'ready'].includes(detail.status)
-  const lifecycleDisabled = Boolean(busy) || (!detail.editable && !detail.controllable)
+  const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
+  const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
   return <div className="page">
     <PageHeader
@@ -281,7 +295,7 @@ export function DeploymentPage() {
         {notice && <p className="muted wide-field" role="status">{notice}</p>}
         <label className="field"><span>Context window</span><input disabled={disabled} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} /></label>
         <label className="field"><span>Max concurrency</span><input disabled={disabled} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} /></label>
-        <label className="field"><span>KV cache dtype</span><input disabled={disabled} value={editor.kv_cache_dtype} onChange={(event) => set('kv_cache_dtype', event.target.value)} placeholder="auto" /></label>
+        {detail.runtime !== 'llama.cpp' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={disabled} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} /></label>}
         <label className="field"><span>Thinking mode</span><select disabled={disabled} value={editor.thinking_mode} onChange={(event) => set('thinking_mode', event.target.value)}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
         {detail.runtime === 'vllm' && <>
           <label className="field"><span>Speculative method</span><select disabled={disabled} value={editor.speculative_method} onChange={(event) => set('speculative_method', event.target.value)}><option value="">Auto / unset</option>{editor.speculative_method && !SPECULATIVE_METHODS.includes(editor.speculative_method) && <option value={editor.speculative_method}>{editor.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
@@ -306,7 +320,7 @@ export function DeploymentPage() {
         <div className="settings-save wide-field">
           <Button type="submit" disabled={disabled || !hasUnsavedChanges}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable
-            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
+            ? <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={() => void stop()}>{busy === 'stop' || detail.status === 'stopping' ? 'Stopping…' : 'Stop'}</Button>
             : <Button type="button" variant="primary" disabled={lifecycleDisabled} onClick={(event) => openRun(event.currentTarget.form)}><Play size={15} /> Run</Button>}
         </div>
       </form>

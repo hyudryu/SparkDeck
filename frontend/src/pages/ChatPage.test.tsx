@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatStreamOptions } from '../api/client'
@@ -13,7 +13,10 @@ vi.mock('../api/client', () => ({
   },
 }))
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
 
 describe('ChatPage', () => {
   beforeEach(() => {
@@ -104,5 +107,215 @@ describe('ChatPage', () => {
       { role: 'user', content: 'First request' },
       { role: 'user', content: 'Second request' },
     ])
+  })
+
+  it('pastes an image and sends an image-only multimodal prompt', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'I see the image.' },
+      reasoning: '',
+      metrics: {},
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const image = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'clipboard.png', { type: 'image/png' })
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+      },
+    })
+
+    expect(await screen.findByText('clipboard.png')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    await user.type(composer, '{Enter}')
+
+    await screen.findByText('I see the image.')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user',
+      content: [{
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+      }],
+    }])
+    expect(screen.getByRole('img', { name: 'Attached clipboard.png' })).toBeInTheDocument()
+  })
+
+  it('uploads, removes, and preserves images in follow-up history', async () => {
+    vi.mocked(api.chatStream)
+      .mockResolvedValueOnce({
+        message: { role: 'assistant', content: 'First answer' },
+        reasoning: '', metrics: {},
+      })
+      .mockResolvedValueOnce({
+        message: { role: 'assistant', content: 'Follow-up answer' },
+        reasoning: '', metrics: {},
+      })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const first = new File(['RIFF\x00\x00\x00\x00WEBP'], 'first.webp', { type: 'image/webp' })
+    const removed = new File([new Uint8Array([0xff, 0xd8, 0xff, 0xdb])], 'remove.jpg', { type: 'image/jpeg' })
+    await user.upload(picker, [first, removed])
+    const attachments = await screen.findByLabelText('Attached images')
+    expect(within(attachments).getByText('first.webp')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Remove remove.jpg' }))
+    expect(within(attachments).queryByText('remove.jpg')).not.toBeInTheDocument()
+
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'What is shown?')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('First answer')
+
+    const firstRequest = vi.mocked(api.chatStream).mock.calls[0]?.[1]
+    expect(firstRequest?.[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is shown?' },
+        { type: 'image_url', image_url: { url: expect.stringMatching(/^data:image\/webp;base64,/) } },
+      ],
+    })
+
+    await user.type(composer, 'Look closer')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('Follow-up answer')
+    expect(vi.mocked(api.chatStream).mock.calls[1]?.[1]).toEqual([
+      firstRequest?.[0],
+      { role: 'assistant', content: 'First answer' },
+      { role: 'user', content: 'Look closer' },
+    ])
+  })
+
+  it('serializes overlapping attachment reads without dropping either image', async () => {
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    fireEvent.change(picker, { target: { files: [png('first.png')] } })
+    fireEvent.change(picker, { target: { files: [png('second.png')] } })
+
+    const attachments = await screen.findByLabelText('Attached images')
+    expect(await within(attachments).findByText('first.png')).toBeInTheDocument()
+    expect(await within(attachments).findByText('second.png')).toBeInTheDocument()
+  })
+
+  it('does not attach an image whose read finishes after sending', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Done' },
+      reasoning: '', metrics: {},
+    })
+    render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    fireEvent.change(composer, { target: { value: 'Send immediately' } })
+    const image = new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      'late.png',
+      { type: 'image/png' },
+    )
+    fireEvent.change(screen.getByLabelText('Choose image files'), { target: { files: [image] } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await screen.findByText('Done')
+    await waitFor(() => expect(screen.queryByText('late.png')).not.toBeInTheDocument())
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user', content: 'Send immediately',
+    }])
+  })
+
+  it('keeps a pending upload when another attachment is removed', async () => {
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    await user.upload(picker, png('remove.png'))
+    await screen.findByText('remove.png')
+
+    fireEvent.change(picker, { target: { files: [png('pending.png')] } })
+    fireEvent.click(screen.getByRole('button', { name: 'Remove remove.png' }))
+
+    expect(screen.queryByText('remove.png')).not.toBeInTheDocument()
+    expect(await screen.findByText('pending.png')).toBeInTheDocument()
+  })
+
+  it('reuses a concurrently freed slot for the next file in a pending batch', async () => {
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const picker = await screen.findByLabelText('Choose image files')
+    const png = (name: string) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      name,
+      { type: 'image/png' },
+    )
+    await user.upload(picker, [png('existing-1.png'), png('existing-2.png'), png('existing-3.png')])
+    await screen.findByText('existing-3.png')
+
+    const pendingReads: Array<() => void> = []
+    class DeferredFileReader {
+      result: string | ArrayBuffer | null = null
+      onerror: (() => void) | null = null
+      onload: (() => void) | null = null
+
+      readAsDataURL(file: File) {
+        pendingReads.push(() => {
+          this.result = `data:${file.type};base64,iVBORw0KGgo=`
+          this.onload?.()
+        })
+      }
+    }
+    vi.stubGlobal('FileReader', DeferredFileReader)
+
+    fireEvent.change(picker, { target: { files: [png('new-1.png'), png('new-2.png')] } })
+    await waitFor(() => expect(pendingReads).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove existing-1.png' }))
+    act(() => pendingReads[0]?.())
+    await waitFor(() => expect(pendingReads).toHaveLength(2))
+    act(() => pendingReads[1]?.())
+
+    expect(await screen.findByText('new-1.png')).toBeInTheDocument()
+    expect(await screen.findByText('new-2.png')).toBeInTheDocument()
+    expect(screen.queryByText('existing-1.png')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('rejects unsupported and excess pasted images with an accessible error', async () => {
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const svg = new File(['<svg/>'], 'unsafe.svg', { type: 'image/svg+xml' })
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: 'file', type: 'image/svg+xml', getAsFile: () => svg }],
+      },
+    })
+    expect(await screen.findByRole('alert')).toHaveTextContent('not a PNG, JPEG, WebP, or GIF')
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+
+    await user.upload(screen.getByLabelText('Choose image files'), new File(
+      ['not really an image'], 'spoofed.png', { type: 'image/png' },
+    ))
+    expect(await screen.findByRole('alert')).toHaveTextContent('does not contain valid PNG image data')
+
+    const picker = screen.getByLabelText('Choose image files')
+    const files = Array.from({ length: 5 }, (_, index) => new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      `image-${index}.png`,
+      { type: 'image/png' },
+    ))
+    await user.upload(picker, files)
+    expect(await screen.findByRole('alert')).toHaveTextContent('up to 4 images')
+    expect(within(screen.getByLabelText('Attached images')).getAllByRole('button', { name: /^Remove / })).toHaveLength(4)
   })
 })

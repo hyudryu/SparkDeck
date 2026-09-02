@@ -673,6 +673,9 @@ class AgentInferenceErrorTests(unittest.IsolatedAsyncioTestCase):
         async def json(self):
             return {"model": "org/model", "messages": [], "stream": True}
 
+        async def stream(self):
+            yield json.dumps(await self.json()).encode()
+
         async def is_disconnected(self):
             return False
 

@@ -34,7 +34,14 @@ describe('API client adapters', () => {
     let cancelled = false
     const updates: ChatStreamUpdate[] = []
 
-    const result = await api.chatStream('reasoner', [{ role: 'user', content: 'Hello' }], {
+    const messages = [{
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: 'Hello' },
+        { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,iVBOZw==' } },
+      ],
+    }]
+    const result = await api.chatStream('reasoner', messages, {
       onUpdate: (update) => updates.push(update),
     })
 
@@ -43,7 +50,7 @@ describe('API client adapters', () => {
       headers: expect.objectContaining({ Accept: 'text/event-stream' }),
     }))
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({
-      model: 'reasoner', stream: true, stream_options: { include_usage: true },
+      model: 'reasoner', messages, stream: true, stream_options: { include_usage: true },
     }))
     expect(updates).toEqual(expect.arrayContaining([
       expect.objectContaining({ reasoning: 'Inspecting the request' }),

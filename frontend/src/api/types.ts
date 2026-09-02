@@ -1,5 +1,5 @@
 export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
-export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
+export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopping' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
   runtime: RuntimeKind
@@ -39,7 +39,7 @@ export interface CatalogModel {
   likes?: number
   parameter_count?: number | null
   weight_size_bytes?: number | null
-  weight_size_source?: 'safetensors' | 'gguf' | null
+  weight_size_source?: 'safetensors' | 'gguf' | 'tree' | null
   tags?: string[]
   runtime_compatibility?: RuntimeCompatibility[]
   local_deployment_ids?: string[]
@@ -601,13 +601,33 @@ export interface LogEntry {
   message: string
 }
 
+export interface ChatTextContentPart {
+  type: 'text'
+  text: string
+}
+
+export interface ChatImageContentPart {
+  type: 'image_url'
+  image_url: {
+    url: string
+    detail?: 'auto' | 'low' | 'high'
+  }
+}
+
+export type ChatMessageContent = string | Array<ChatTextContentPart | ChatImageContentPart>
+
 export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: ChatMessageContent
+}
+
+export interface ChatResponseMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
 }
 
 export interface ChatCompletionResponse {
-  choices: Array<{ message: ChatMessage }>
+  choices: Array<{ message: ChatResponseMessage }>
   usage?: ChatUsage
 }
 
@@ -633,7 +653,7 @@ export interface ChatStreamUpdate {
 }
 
 export interface ChatStreamResult {
-  message: ChatMessage
+  message: ChatResponseMessage
   reasoning: string
   usage?: ChatUsage
   metrics: ChatResponseMetrics

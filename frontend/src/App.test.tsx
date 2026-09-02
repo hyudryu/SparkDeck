@@ -1755,6 +1755,109 @@ describe('model deployments', () => {
     expect(screen.queryByRole('dialog', { name: 'Loud model' })).not.toBeInTheDocument()
   })
 
+  it('auto-refreshes deployment logs while tailing and stops when toggled off or closed', async () => {
+    const user = userEvent.setup()
+    let logRequests = 0
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments/dep-1/logs')) {
+        logRequests += 1
+        return new Response(JSON.stringify({ logs: `INFO line ${logRequests}` }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [
+        {
+          id: 'dep-1', alias: 'Loud model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
+        },
+      ] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Logs for Loud model' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Loud model' })
+    expect(await within(dialog).findByText('INFO line 1')).toBeInTheDocument()
+    expect(logRequests).toBe(1)
+
+    vi.useFakeTimers()
+    try {
+      const tailButton = within(dialog).getByRole('button', { name: 'Tail' })
+      expect(tailButton).toHaveAttribute('aria-pressed', 'false')
+      fireEvent.click(tailButton)
+      expect(within(dialog).getByRole('button', { name: 'Tailing' })).toHaveAttribute('aria-pressed', 'true')
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+      expect(logRequests).toBe(2)
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+      expect(logRequests).toBe(3)
+      expect(within(dialog).getByText('INFO line 3')).toBeInTheDocument()
+
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Tailing' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(6000) })
+      expect(logRequests).toBe(3)
+
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Tail' }))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(6000) })
+      expect(logRequests).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(screen.queryByRole('dialog', { name: 'Loud model' })).not.toBeInTheDocument()
+  })
+
+  it('does not overlap tail requests while a refresh is still slow', async () => {
+    const user = userEvent.setup()
+    let logRequests = 0
+    let resolveSlow: (() => void) | undefined
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments/dep-1/logs')) {
+        logRequests += 1
+        if (logRequests === 2) {
+          await new Promise<void>((resolve) => { resolveSlow = resolve })
+        }
+        return new Response(JSON.stringify({ logs: `INFO line ${logRequests}` }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [
+        {
+          id: 'dep-1', alias: 'Loud model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local'],
+        },
+      ] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Logs for Loud model' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Loud model' })
+    expect(await within(dialog).findByText('INFO line 1')).toBeInTheDocument()
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Tail' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+      expect(logRequests).toBe(2)
+      // The second request is still pending; further ticks must not start
+      // overlapping requests that would discard each other as stale.
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+      expect(logRequests).toBe(2)
+      await act(async () => { resolveSlow?.() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+      expect(logRequests).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('switches multi-node deployment logs locally and preserves the selected node on refresh', async () => {
     const user = userEvent.setup()
     let logRequests = 0
@@ -2262,9 +2365,11 @@ describe('model deployments', () => {
     expect(screen.getByRole('spinbutton', { name: 'GPU memory util' })).toHaveValue(0.9)
     expect(screen.getByRole('combobox', { name: 'Speculative method' })).toHaveValue('draft_model')
     expect(screen.getByRole('combobox', { name: 'Draft sample method' })).toHaveValue('greedy')
+    expect(screen.getByRole('combobox', { name: 'KV cache dtype' })).toHaveValue('')
 
     await user.clear(contextWindow)
     await user.type(contextWindow, '65536')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'KV cache dtype' }), 'fp8')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Speculative method' }), 'dspark')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Draft sample method' }), 'probabilistic')
     await user.click(screen.getByRole('button', { name: 'Save settings' }))
@@ -2286,6 +2391,7 @@ describe('model deployments', () => {
     expect(payload.launch_controls.context_window).toBe(65536)
     expect(payload.launch_controls.speculative_method).toBe('dspark')
     expect(payload.launch_controls.draft_sample_method).toBe('probabilistic')
+    expect(payload.launch_controls.kv_cache_dtype).toBe('fp8')
     expect(payload.gpu_memory_utilization).toBe(0.9)
     expect(await screen.findByText('Saved.')).toBeInTheDocument()
   })

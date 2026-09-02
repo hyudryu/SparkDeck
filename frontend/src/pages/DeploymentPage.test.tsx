@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -69,6 +69,30 @@ function renderPage() {
 }
 
 describe('deployment object page', () => {
+  it('polls the detail while a stop is in flight and updates once stopped', async () => {
+    let detailRequests = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1' && (!init?.method || init.method === 'GET')) {
+        detailRequests += 1
+        const body = detailRequests === 1
+          ? { ...detail, status: 'stopping', desired_state: 'stopped', editable: false, controllable: true }
+          : detail
+        return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByRole('button', { name: 'Stopping…' })).toBeDisabled()
+
+    await waitFor(() => expect(detailRequests).toBeGreaterThanOrEqual(2), { timeout: 5000 })
+    expect(await screen.findByRole('button', { name: 'Run' })).toBeInTheDocument()
+  })
+
   it('only enables Save while deployment settings differ from the saved values', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -88,6 +112,76 @@ describe('deployment object page', () => {
     await user.clear(maxConcurrency)
     await user.type(maxConcurrency, '7')
     expect(save).toBeEnabled()
+  })
+
+  it('offers KV cache dtype choices and saves the selected value', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const kvCacheDtype = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(kvCacheDtype).toHaveValue('')
+    expect(within(kvCacheDtype).getByRole('option', { name: 'Auto / unset' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'fp8' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'fp8_e4m3' })).toBeInTheDocument()
+    expect(within(kvCacheDtype).getByRole('option', { name: 'nvfp4_ds_mla' })).toBeInTheDocument()
+
+    await user.selectOptions(kvCacheDtype, 'fp8_e4m3')
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input) === '/api/v1/runtime-flags/preview'
+      && JSON.parse(String(init?.body)).launch_controls.kv_cache_dtype === 'fp8_e4m3'
+    ))).toBe(true))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const saveCall = await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input) === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT'
+      ))
+      expect(call).toBeDefined()
+      return call
+    })
+    expect(JSON.parse(String(saveCall?.[1]?.body)).launch_controls.kv_cache_dtype).toBe('fp8_e4m3')
+  })
+
+  it('preserves a custom KV cache dtype as a selectable current value', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const body = String(input) === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'future_dtype' } }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const kvCacheDtype = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(kvCacheDtype).toHaveValue('future_dtype')
+    expect(within(kvCacheDtype).getByRole('option', { name: 'future_dtype (current)' })).toBeInTheDocument()
+  })
+
+  it('uses SGLang KV choices and hides the unsupported llama.cpp control', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, runtime: 'sglang', launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'bf16' } }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    const rendered = renderPage()
+
+    const sglangKv = await screen.findByRole('combobox', { name: 'KV cache dtype' })
+    expect(sglangKv).toHaveValue('bf16')
+    expect(within(sglangKv).getByRole('option', { name: 'fp4_mx_block16' })).toBeInTheDocument()
+    expect(within(sglangKv).queryByRole('option', { name: 'nvfp4_ds_mla' })).not.toBeInTheDocument()
+
+    rendered.unmount()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path === '/api/v1/nodes'
+        ? { items: nodes }
+        : { ...detail, runtime: 'llama.cpp' }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+    await screen.findByRole('heading', { name: 'Reasoning server' })
+    expect(screen.queryByLabelText('KV cache dtype')).not.toBeInTheDocument()
   })
 
   it('shows saved flags and saves before running, then returns to Models', async () => {
@@ -225,6 +319,67 @@ describe('deployment object page', () => {
     await user.click(screen.getByRole('button', { name: 'Run' }))
     expect(await screen.findByRole('button', { name: 'Start on 2 nodes' })).toBeInTheDocument()
     expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
+  })
+
+  it('recomputes the run topology from the server-persisted node set after a trimming save', async () => {
+    const user = userEvent.setup()
+    const fourNode = {
+      ...detail,
+      model_id: 'org/model',
+      node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+      launch_controls: {
+        ...detail.launch_controls,
+        tensor_parallel_size: 4,
+        pipeline_parallel_size: 1,
+      },
+    }
+    // The backend answers a TP 4 -> 2 save with the trimmed two-node topology.
+    const trimmed = {
+      ...fourNode,
+      node_ids: ['local', 'worker-1'],
+      launch_controls: { ...fourNode.launch_controls, tensor_parallel_size: 2 },
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/runtime-flags/preview' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({
+          flags: body.extra_args,
+          command_flags: body.extra_args.map(quoteArgForTest).join(' '),
+          environment: body.environment,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        return new Response(JSON.stringify(trimmed), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(fourNode), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
+    await user.clear(screen.getByLabelText('Tensor parallel size'))
+    await user.type(screen.getByLabelText('Tensor parallel size'), '2')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Deployment settings saved. They will be applied on the next run.')
+
+    // The page resource reflects the trimmed topology immediately.
+    expect(await screen.findByText(/on 2 nodes/)).toBeInTheDocument()
+
+    // Editing back to TP4 must act on the persisted two-node layout rather
+    // than the stale four-node one loaded before the save.
+    await user.clear(screen.getByLabelText('Tensor parallel size'))
+    await user.type(screen.getByLabelText('Tensor parallel size'), '4')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    const start = await screen.findByRole('button', { name: 'Start on 2 nodes' })
+    await user.click(start)
+
+    const startCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/start'))
+    expect(JSON.parse(String(startCall?.[1]?.body))).toEqual({
+      node_ids: ['local', 'worker-1'],
+    })
   })
 
   it('keeps a running deployment read-only', async () => {

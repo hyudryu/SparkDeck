@@ -17,6 +17,7 @@ import re
 import shlex
 import signal
 import socket
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -62,6 +63,11 @@ logger = logging.getLogger(__name__)
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
+_EXTERNAL_HOOK_TERM_TIMEOUT = 10.0
+_EXTERNAL_HOOK_KILL_TIMEOUT = 5.0
+_EXTERNAL_HOOK_KILL_SIGNAL = getattr(
+    signal, "SIGKILL", getattr(signal, "SIGBREAK", signal.SIGTERM),
+)
 
 
 _SAFE_CONFIGURATION_KEYS = {
@@ -404,41 +410,92 @@ class SparkDeckService:
             task.cancel()
         lifecycle_entries = list(self._external_lifecycle_tasks.values())
         for entry in lifecycle_entries:
-            entry["task"].cancel()
             process = entry.get("process")
-            if process is not None and process.returncode is None:
-                # Cancelling the task abandons the stream reads but does not
-                # kill the child; signal the hook's whole process group so
-                # scripted children (ssh, docker compose, ...) cannot keep
-                # mutating the stack after the controller is gone.
-                self._signal_process_group(process, signal.SIGTERM)
-        pending = tasks + [entry["task"] for entry in lifecycle_entries]
-        if pending:
+            if process is None:
+                entry["task"].cancel()
+                continue
+            # Keep the drain task alive so inherited stdout/stderr pipes tell
+            # us whether descendants survived their shell leader.
+            self._signal_process_group(
+                process, signal.SIGTERM, entry.get("process_group_id"),
+            )
+        if tasks:
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True), timeout=10,
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_EXTERNAL_HOOK_TERM_TIMEOUT,
                 )
+        lifecycle_tasks = [entry["task"] for entry in lifecycle_entries]
+        if lifecycle_tasks:
+            await asyncio.wait(
+                lifecycle_tasks, timeout=_EXTERNAL_HOOK_TERM_TIMEOUT,
+            )
         for entry in lifecycle_entries:
             process = entry.get("process")
             if process is None:
                 continue
-            if process.returncode is None:
+            task = entry["task"]
+            if not task.done():
                 # Escalate after the grace period above: a hook that ignores
                 # SIGTERM must not outlive the controller either.
                 self._signal_process_group(
-                    process, getattr(signal, "SIGKILL", signal.SIGTERM),
+                    process, _EXTERNAL_HOOK_KILL_SIGNAL,
+                    entry.get("process_group_id"),
                 )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    task.cancel()
             if process.returncode is None:
                 with suppress(asyncio.TimeoutError, ProcessLookupError):
-                    await asyncio.wait_for(process.wait(), timeout=5)
+                    await asyncio.wait_for(
+                        process.wait(), timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                    )
+        if lifecycle_tasks:
+            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
         self.store.close()
 
     @staticmethod
-    def _signal_process_group(process: Any, sig: signal.Signals) -> None:
+    def _signal_process_group(
+        process: Any, sig: signal.Signals, process_group_id: int | None = None,
+    ) -> None:
         """Signal a hook's process group, falling back to the bare shell."""
+        if os.name == "nt" and process_group_id is not None:
+            if sig == signal.SIGTERM:
+                try:
+                    os.kill(process_group_id, signal.CTRL_BREAK_EVENT)
+                    return
+                except (ProcessLookupError, PermissionError, OSError, SystemError):
+                    pass
+            # CTRL_BREAK is the graceful tree signal. If it is unavailable or
+            # this is escalation, taskkill /T prevents cmd/PowerShell children
+            # from surviving their shell and racing the Stop hook.
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(process_group_id), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if result.returncode == 0:
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         killpg = getattr(os, "killpg", None)
         getpgid = getattr(os, "getpgid", None)
-        if killpg is not None and getpgid is not None:
+        if process_group_id is not None and killpg is not None:
+            try:
+                killpg(process_group_id, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        elif killpg is not None and getpgid is not None:
             pid = getattr(process, "pid", None)
             if pid is not None:
                 try:
@@ -3823,22 +3880,33 @@ class SparkDeckService:
             discovered is not None and not deployment.get("managed")
             and action == "start" and node_ids
         ):
-            tensor_parallel = deployment.get("settings", {}).get(
-                "tensor_parallel_size", 1,
+            has_lifecycle_hook = bool(
+                str(discovered.get("start_command") or "").strip()
+                or str(discovered.get("stop_command") or "").strip()
             )
-            try:
-                required_nodes = max(1, int(tensor_parallel or 1))
-            except (TypeError, ValueError):
-                required_nodes = 1
-            if len(node_ids) != required_nodes:
-                raise ValueError(
-                    f"tensor parallel size {required_nodes} requires exactly "
-                    f"{required_nodes} node(s)"
+            if has_lifecycle_hook and not promote:
+                # A hook-backed deployment always starts on the nodes owned by
+                # its external script. Older clients may still send their
+                # generic node-picker selection; it must not turn a normal
+                # Start into a managed-conversion request.
+                node_ids = None
+            else:
+                tensor_parallel = deployment.get("settings", {}).get(
+                    "tensor_parallel_size", 1,
                 )
-            if promote or required_nodes > 1 or node_ids != ["local"]:
-                return await self._promote_discovered_deployment(
-                    deployment, discovered, node_ids,
-                )
+                try:
+                    required_nodes = max(1, int(tensor_parallel or 1))
+                except (TypeError, ValueError):
+                    required_nodes = 1
+                if len(node_ids) != required_nodes:
+                    raise ValueError(
+                        f"tensor parallel size {required_nodes} requires exactly "
+                        f"{required_nodes} node(s)"
+                    )
+                if promote or required_nodes > 1 or node_ids != ["local"]:
+                    return await self._promote_discovered_deployment(
+                        deployment, discovered, node_ids,
+                    )
         if (
             action == "start" and discovered is None
             and not manager_id and not owner and not container
@@ -3970,8 +4038,12 @@ class SparkDeckService:
                 raise LookupError("managed container not found")
         external_discovered = discovered is not None and not deployment.get("managed")
         if external_discovered and action in ("start", "stop"):
-            # Even when this action has no hook of its own, it must not run
-            # while an opposing hook script is still orchestrating the stack.
+            # Stop is authoritative: cancel an in-flight start hook before
+            # running the stop hook (or Docker fallback). Other overlapping
+            # lifecycle requests still conflict so two scripts never mutate
+            # the same external stack concurrently.
+            if action == "stop":
+                await self._interrupt_external_start(container)
             self._reject_external_lifecycle_in_flight(container)
         if action == "start":
             if external_discovered:
@@ -4016,6 +4088,87 @@ class SparkDeckService:
                 f"{container_name}"
             )
 
+    async def _interrupt_external_start(self, container_name: str) -> None:
+        """Terminate an in-flight external start hook so Stop can take over."""
+        entry = self._external_lifecycle_tasks.get(container_name)
+        if entry is None or entry["task"].done():
+            return
+        if entry.get("action") != "start":
+            self._reject_external_lifecycle_in_flight(container_name)
+
+        task = entry["task"]
+        process = entry.get("process")
+        ready = entry.get("ready")
+        if process is None and ready is not None:
+            try:
+                await asyncio.wait_for(
+                    ready.wait(), timeout=_EXTERNAL_HOOK_TERM_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # Subprocess creation itself is stuck. There is no published
+                # child to signal, so prevent the task from proceeding.
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                process = entry.get("process")
+                if process is not None and process.returncode is None:
+                    raise RuntimeError(
+                        "could not cancel the pending start command for "
+                        f"container {container_name}; stop was not started"
+                    )
+                if self._external_lifecycle_tasks.get(container_name) is entry:
+                    self._external_lifecycle_tasks.pop(container_name, None)
+                return
+            process = entry.get("process")
+        if process is None:
+            # Spawning failed or the task was cancelled before a child existed.
+            with suppress(asyncio.CancelledError):
+                await task
+        else:
+            if not task.done():
+                self._signal_process_group(
+                    process, signal.SIGTERM, entry.get("process_group_id"),
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_EXTERNAL_HOOK_TERM_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    self._signal_process_group(
+                        process, _EXTERNAL_HOOK_KILL_SIGNAL,
+                        entry.get("process_group_id"),
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task),
+                            timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise RuntimeError(
+                            "could not interrupt the running start command for "
+                            f"container {container_name}; stop was not started"
+                        ) from exc
+            else:
+                with suppress(asyncio.CancelledError):
+                    await task
+            if process.returncode is None:
+                self._signal_process_group(
+                    process, _EXTERNAL_HOOK_KILL_SIGNAL,
+                    entry.get("process_group_id"),
+                )
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "could not terminate the running start command for "
+                        f"container {container_name}; stop was not started"
+                    ) from exc
+        if self._external_lifecycle_tasks.get(container_name) is entry:
+            self._external_lifecycle_tasks.pop(container_name, None)
+
     def _start_external_lifecycle_task(
         self, container_name: str, action: str, command: str,
     ) -> None:
@@ -4031,34 +4184,51 @@ class SparkDeckService:
         # container's immutable image (verified by image ID, not the mutable
         # tag), so hooks baked into an image via Dockerfile LABEL never reach
         # this dispatch site.
-        task = asyncio.create_task(
-            self._run_external_lifecycle_command(container_name, action, command)
-        )
-        self._external_lifecycle_tasks[container_name] = {
-            "action": action, "task": task, "process": None,
+        entry: dict[str, Any] = {
+            "action": action, "task": None, "process": None,
+            "process_group_id": None, "ready": asyncio.Event(),
         }
+        task = asyncio.create_task(
+            self._run_external_lifecycle_command(
+                container_name, action, command, entry,
+            )
+        )
+        entry["task"] = task
+        self._external_lifecycle_tasks[container_name] = entry
 
     async def _run_external_lifecycle_command(
         self, container_name: str, action: str, command: str,
+        entry: dict[str, Any],
     ) -> None:
         started = time.monotonic()
+        process = None
+        process_group_id = None
         try:
             spawn_options: dict[str, Any] = {}
             if os.name == "posix":
                 # Run the hook in its own session so close() can signal the
                 # whole process group, including scripted children.
                 spawn_options["start_new_session"] = True
+            elif os.name == "nt":
+                spawn_options["creationflags"] = getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200,
+                )
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **spawn_options,
             )
-            entry = self._external_lifecycle_tasks.get(container_name)
-            if entry is not None and entry.get("task") is asyncio.current_task():
+            if os.name in {"posix", "nt"}:
+                process_group_id = process.pid
+            current = self._external_lifecycle_tasks.get(container_name)
+            if current is entry and entry.get("task") is asyncio.current_task():
                 # Publish the handle so close() can terminate the child; mere
                 # task cancellation does not kill the subprocess.
                 entry["process"] = process
+                # Both launch modes use the shell PID as the group ID.
+                entry["process_group_id"] = process_group_id
+                entry["ready"].set()
             stdout_tail, stderr_tail = await self._read_bounded_output(process)
             duration = time.monotonic() - started
             self._write_lifecycle_output(
@@ -4077,14 +4247,30 @@ class SparkDeckService:
                 logger.warning(message, *arguments)
             else:
                 logger.info(message, *arguments)
+        except asyncio.CancelledError:
+            # Stop and close() can cancel while subprocess publication is in
+            # flight. The lifecycle task owns any child it successfully
+            # spawned, so cancellation must kill that whole tree before the
+            # registry entry can disappear.
+            if process is not None:
+                self._signal_process_group(
+                    process, _EXTERNAL_HOOK_KILL_SIGNAL, process_group_id,
+                )
+                if process.returncode is None:
+                    with suppress(asyncio.TimeoutError, ProcessLookupError):
+                        await asyncio.wait_for(
+                            process.wait(), timeout=_EXTERNAL_HOOK_KILL_TIMEOUT,
+                        )
+            raise
         except Exception:
             logger.exception(
                 "external %s command for container %s failed to run",
                 action, container_name,
             )
         finally:
-            entry = self._external_lifecycle_tasks.get(container_name)
-            if entry is not None and entry.get("task") is asyncio.current_task():
+            entry["ready"].set()
+            current = self._external_lifecycle_tasks.get(container_name)
+            if current is entry and entry.get("task") is asyncio.current_task():
                 self._external_lifecycle_tasks.pop(container_name, None)
 
     def _write_lifecycle_output(

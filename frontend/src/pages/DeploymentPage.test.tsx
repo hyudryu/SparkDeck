@@ -492,16 +492,16 @@ describe('env-file backed deployment page', () => {
     },
   }
 
-  function renderEnvFilePage(putResponse?: unknown) {
+  function renderEnvFilePage(putResponse?: unknown, requestedDetail = envFileDetail) {
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (path.endsWith('/settings') && init?.method === 'PUT') {
-        return new Response(JSON.stringify(putResponse ?? { ...envFileDetail, restart_required: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        return new Response(JSON.stringify(putResponse ?? { ...requestedDetail, restart_required: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
-      return new Response(JSON.stringify(envFileDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(requestedDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     return render(<MemoryRouter initialEntries={['/models/container%3Avllm-dspark']}><Routes>
       <Route path="/models/:deploymentId" element={<DeploymentPage />} />
@@ -717,5 +717,31 @@ describe('env-file backed deployment page', () => {
     expect(mutations.map(([input, init]) => `${init?.method} ${String(input)}`)).toEqual([
       'POST /api/v1/deployments/container%3Avllm-dspark/start',
     ])
+  })
+
+  it('starts a hook-backed TP deployment without opening conversion or sending nodes', async () => {
+    const user = userEvent.setup()
+    const hookDetail = {
+      ...envFileDetail,
+      has_start_hook: true,
+      has_stop_hook: true,
+      required_node_count: 2,
+      launch_controls: { ...envFileDetail.launch_controls, tensor_parallel_size: 2 },
+    }
+    renderEnvFilePage(undefined, hookDetail)
+
+    const contextWindow = await screen.findByLabelText('Context window')
+    await user.clear(contextWindow)
+    await user.type(contextWindow, '131072')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+
+    expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Start on/ })).not.toBeInTheDocument()
+    const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    expect(mutations.map(([input, init]) => `${init?.method} ${String(input)}`)).toEqual([
+      'PUT /api/v1/deployments/container%3Avllm-dspark/settings',
+      'POST /api/v1/deployments/container%3Avllm-dspark/start',
+    ])
+    expect(mutations[1]?.[1]?.body).toBeUndefined()
   })
 })

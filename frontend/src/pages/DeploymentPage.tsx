@@ -435,8 +435,18 @@ export function DeploymentPage() {
       : world
   }
 
+  const usesExternalLifecycleHook = () => Boolean(
+    deploymentId.startsWith('container:')
+    && resource.data?.managed === false
+    && (resource.data.has_start_hook || resource.data.has_stop_hook)
+  )
+
   const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
+    if (usesExternalLifecycleHook()) {
+      void run()
+      return
+    }
     const required = requiredRunNodes()
     const selectable = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
     const preferred = (resource.data?.node_ids ?? []).filter((id) => selectable.includes(id))
@@ -445,11 +455,12 @@ export function DeploymentPage() {
   }
 
   const run = async () => {
-    if (!runSelection) return
+    const selection = usesExternalLifecycleHook() ? undefined : runSelection
+    if (!selection && !usesExternalLifecycleHook()) return
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       if (resource.data?.editable) await persist()
-      await api.deployments.action(deploymentId, 'start', runSelection)
+      await api.deployments.action(deploymentId, 'start', selection)
       navigate('/models')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not run deployment')

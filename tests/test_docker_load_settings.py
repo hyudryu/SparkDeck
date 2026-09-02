@@ -317,6 +317,39 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("start_command", summary)
         self.assertNotIn("stop_command", summary)
 
+    def test_summary_exposes_env_file_label_set_at_container_level(self):
+        self._stub_image_labels({})
+        container = self._hooked_container({
+            "io.sparkdeck.env-file": "  /opt/stack/.env.dspark  ",
+        })
+
+        summary = self.manager._container_summary(container)
+
+        self.assertEqual(summary["settings_env_file"], "/opt/stack/.env.dspark")
+
+    def test_summary_ignores_env_file_label_inherited_from_the_image(self):
+        self._stub_image_labels({
+            "io.sparkdeck.env-file": "/image/baked.env",
+        })
+        container = self._hooked_container({
+            "io.sparkdeck.env-file": "/image/baked.env",
+        })
+
+        summary = self.manager._container_summary(container)
+
+        self.assertNotIn("settings_env_file", summary)
+
+    def test_summary_ignores_env_file_label_when_image_cannot_be_inspected(self):
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = RuntimeError("gone")
+        container = self._hooked_container({
+            "io.sparkdeck.env-file": "/opt/stack/.env.dspark",
+        })
+
+        summary = self.manager._container_summary(container)
+
+        self.assertNotIn("settings_env_file", summary)
+
     def setUp(self):
         self.manager = Manager.__new__(Manager)
 

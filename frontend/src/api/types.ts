@@ -112,6 +112,7 @@ export interface Deployment {
   launch_phase?: string
   launch_message?: string
   last_used_at?: number | null
+  has_settings_env_file?: boolean
 }
 
 export interface DeploymentLogMember {
@@ -143,9 +144,30 @@ export interface DeploymentLaunchControls {
   max_num_batched_tokens?: number | null
 }
 
+// One KEY=VALUE line of a hook-backed deployment's settings env file.
+export interface DeploymentEnvEntry {
+  key: string
+  value: string | null
+  enabled: boolean
+  line: number
+  redacted?: boolean
+}
+
+export interface DeploymentSettingsEnv {
+  /** Display name (basename) of the env file; the absolute path stays server-side. */
+  name: string
+  mtime?: number
+  entries?: DeploymentEnvEntry[]
+  field_mapping?: Record<string, string>
+  error?: string
+}
+
 export interface DeploymentDetail extends Deployment {
   editable: boolean
   edit_reason?: string | null
+  edit_mode?: string | null
+  settings_env?: DeploymentSettingsEnv | null
+  restart_required?: boolean
   desired_state: 'running' | 'stopped'
   extra_args: string[]
   launch_controls: DeploymentLaunchControls
@@ -154,6 +176,25 @@ export interface DeploymentDetail extends Deployment {
   sg_tp_size?: number | null
   sg_mem_fraction?: number | null
   image?: string
+}
+
+// One env-file edit. Existing rows are line-addressed so duplicate keys
+// apply to the exact row shown; rows added in the UI have no line yet.
+export interface EnvFileEnvironmentOp {
+  key: string
+  line?: number
+  value: string | null | { value: string | null; enabled: boolean }
+}
+
+export type EnvFileEnvironmentUpdate = EnvFileEnvironmentOp[]
+
+// Save contract for hook-backed env-file cards (edit_mode === 'env-file').
+export interface EnvFileDeploymentUpdateInput {
+  launch_controls?: DeploymentLaunchControls
+  gpu_memory_utilization?: number | null
+  served_model_name?: string
+  environment?: EnvFileEnvironmentUpdate
+  env_file_mtime?: number
 }
 
 export interface DeploymentUpdateInput {

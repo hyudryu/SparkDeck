@@ -2,12 +2,19 @@ import { useEffect, useState, type FormEvent } from 'react'
 import { ArrowLeft, Play, Save } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { DeploymentDetail, DeploymentLaunchControls, DeploymentUpdateInput } from '../api/types'
+import type {
+  DeploymentDetail,
+  DeploymentEnvEntry,
+  DeploymentLaunchControls,
+  DeploymentUpdateInput,
+  EnvFileDeploymentUpdateInput,
+  EnvFileEnvironmentOp,
+} from '../api/types'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
-import { formatEnvironment, parseEnvironment } from '../utils/environment'
+import { formatEnvironment, parseEnvironment, unquoteEnvValue } from '../utils/environment'
 
 const quoteArg = (arg: string) => (arg === '' || /[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
 
@@ -92,6 +99,123 @@ const editorFingerprint = (editor: Editor) => JSON.stringify(editor)
 
 const optionalNumber = (value: string) => value.trim() ? Number(value) : null
 
+// One row of the env-file editor table. Redacted (secret) rows load with an
+// empty value; typing overwrites the secret, leaving it empty keeps it.
+// `line` pins edits to the exact file line so duplicate keys edit the row
+// shown; rows added in the UI have no line yet.
+interface EnvRow {
+  key: string
+  value: string
+  enabled: boolean
+  redacted: boolean
+  deleted: boolean
+  added: boolean
+  line?: number
+  initialValue?: string
+  initialEnabled: boolean
+}
+
+const envRowFrom = (entry: DeploymentEnvEntry): EnvRow => ({
+  key: entry.key,
+  value: entry.redacted ? '' : entry.value ?? '',
+  enabled: entry.enabled,
+  redacted: Boolean(entry.redacted),
+  deleted: false,
+  added: false,
+  line: entry.line,
+  initialValue: entry.redacted ? undefined : entry.value ?? '',
+  initialEnabled: entry.enabled,
+})
+
+const envRowDirty = (row: EnvRow) => (
+  row.deleted
+  || row.enabled !== row.initialEnabled
+  || (row.redacted ? row.value !== '' : row.value !== row.initialValue)
+  || row.added
+)
+
+const servedNameFrom = (detail: DeploymentDetail): string => {
+  const settingsEnv = detail.settings_env
+  const key = settingsEnv?.field_mapping?.served_model_name
+  const raw = settingsEnv?.entries?.find((item) => item.key === key)?.value
+  return raw ? unquoteEnvValue(raw) : ''
+}
+
+// Structured controls of the env-file editor whose initial values come from
+// the backing env entries (falling back to the parsed container command only
+// when the file has no backing variable).
+type EnvFileControl = 'context_window' | 'max_concurrency' | 'max_num_batched_tokens' | 'kv_cache_dtype' | 'gpu_memory_utilization'
+
+const envControlValue = (detail: DeploymentDetail, control: EnvFileControl): string | undefined => {
+  const settingsEnv = detail.settings_env
+  const key = settingsEnv?.field_mapping?.[control]
+  if (!key) return undefined
+  const raw = settingsEnv?.entries?.find((item) => item.key === key)?.value
+  // Structured controls take the unquoted value; the env rows table below
+  // still shows the raw stored text.
+  return raw === undefined || raw === null ? '' : unquoteEnvValue(raw)
+}
+
+const envFileEditorFrom = (detail: DeploymentDetail, editor: Editor): Editor => ({
+  ...editor,
+  context_window: envControlValue(detail, 'context_window') ?? editor.context_window,
+  max_concurrency: envControlValue(detail, 'max_concurrency') ?? editor.max_concurrency,
+  max_num_batched_tokens: envControlValue(detail, 'max_num_batched_tokens') ?? editor.max_num_batched_tokens,
+  kv_cache_dtype: envControlValue(detail, 'kv_cache_dtype') ?? editor.kv_cache_dtype,
+  gpu_memory_utilization: envControlValue(detail, 'gpu_memory_utilization') ?? editor.gpu_memory_utilization,
+})
+
+function envFileUpdateInput(
+  editor: Editor,
+  savedEditor: Editor,
+  detail: DeploymentDetail,
+  envRows: EnvRow[],
+  servedName: string,
+  savedServedName: string,
+): EnvFileDeploymentUpdateInput {
+  // Only controls the user actually changed are submitted, and only when the
+  // env file backs them — otherwise stale container-parsed values would
+  // overwrite newer file contents. The backend rejects a submitted control
+  // with no backing variable.
+  const mapping = detail.settings_env?.field_mapping ?? {}
+  const launch_controls: DeploymentLaunchControls = {}
+  if (mapping.context_window && editor.context_window !== savedEditor.context_window) {
+    launch_controls.context_window = optionalNumber(editor.context_window)
+  }
+  if (mapping.max_concurrency && editor.max_concurrency !== savedEditor.max_concurrency) {
+    launch_controls.max_concurrency = optionalNumber(editor.max_concurrency)
+  }
+  if (mapping.max_num_batched_tokens && editor.max_num_batched_tokens !== savedEditor.max_num_batched_tokens) {
+    launch_controls.max_num_batched_tokens = optionalNumber(editor.max_num_batched_tokens)
+  }
+  if (mapping.kv_cache_dtype && editor.kv_cache_dtype !== savedEditor.kv_cache_dtype) {
+    launch_controls.kv_cache_dtype = editor.kv_cache_dtype.trim() || null
+  }
+
+  const environment: EnvFileEnvironmentOp[] = []
+  for (const row of envRows) {
+    if (!envRowDirty(row) || !row.key.trim()) continue
+    const value = row.deleted
+      ? null
+      : row.redacted && row.value === ''
+        ? { value: null, enabled: row.enabled }
+        : { value: row.value, enabled: row.enabled }
+    environment.push(row.added ? { key: row.key, value } : { key: row.key, line: row.line, value })
+  }
+
+  return {
+    launch_controls: Object.keys(launch_controls).length ? launch_controls : undefined,
+    gpu_memory_utilization: mapping.gpu_memory_utilization && editor.gpu_memory_utilization !== savedEditor.gpu_memory_utilization
+      ? optionalNumber(editor.gpu_memory_utilization)
+      : undefined,
+    // Clearing the served name is a real edit: send "" so the backend writes
+    // SERVED_MODEL_NAME= instead of treating the control as unsubmitted.
+    served_model_name: servedName !== savedServedName ? servedName : undefined,
+    environment: environment.length ? environment : undefined,
+    env_file_mtime: detail.settings_env?.mtime,
+  }
+}
+
 const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp', 'ngram', 'ngram_gpu', 'suffix']
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
 const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
@@ -126,7 +250,10 @@ export function DeploymentPage() {
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const nodes = useResource((signal) => api.nodes.list(signal))
   const [editor, setEditor] = useState<Editor>()
-  const [savedEditorFingerprint, setSavedEditorFingerprint] = useState<string>()
+  const [savedEditor, setSavedEditor] = useState<Editor>()
+  const [envRows, setEnvRows] = useState<EnvRow[]>([])
+  const [servedName, setServedName] = useState('')
+  const [savedServedName, setSavedServedName] = useState('')
   const [busy, setBusy] = useState<'save' | 'run' | 'stop'>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
@@ -136,9 +263,15 @@ export function DeploymentPage() {
 
   useEffect(() => {
     if (resource.data) {
-      const savedEditor = editorFrom(resource.data)
-      setEditor(savedEditor)
-      setSavedEditorFingerprint(editorFingerprint(savedEditor))
+      const saved = resource.data.edit_mode === 'env-file'
+        ? envFileEditorFrom(resource.data, editorFrom(resource.data))
+        : editorFrom(resource.data)
+      setEditor(saved)
+      setSavedEditor(saved)
+      setEnvRows((resource.data.settings_env?.entries ?? []).map(envRowFrom))
+      const name = servedNameFrom(resource.data)
+      setServedName(name)
+      setSavedServedName(name)
     }
   }, [resource.data])
 
@@ -151,7 +284,7 @@ export function DeploymentPage() {
   }, [resource.data, resource.loading, resource.reload])
 
   useEffect(() => {
-    if (!editor || !resource.data || resource.data.runtime === 'llama.cpp') {
+    if (!editor || !resource.data || resource.data.runtime === 'llama.cpp' || resource.data.edit_mode === 'env-file') {
       setFinalFlags('')
       setPreviewError(undefined)
       return
@@ -187,16 +320,31 @@ export function DeploymentPage() {
 
   const set = (key: keyof Editor, value: string) => setEditor((current) => current ? { ...current, [key]: value } : current)
 
+  const setEnvRow = (index: number, patch: Partial<EnvRow>) => setEnvRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)))
+
   const persist = async () => {
-    if (!editor) throw new Error('Deployment settings are not loaded')
+    if (!editor || !savedEditor) throw new Error('Deployment settings are not loaded')
+    const detail = resource.data
+    if (detail?.edit_mode === 'env-file') {
+      const input = envFileUpdateInput(editor, savedEditor, detail, envRows, servedName, savedServedName)
+      const hasUpdates = Boolean(
+        input.launch_controls
+        || input.gpu_memory_utilization !== undefined
+        || input.served_model_name !== undefined
+        || input.environment,
+      )
+      // A change-free Run must not PUT: a stale env_file_mtime would
+      // conflict with out-of-band edits even though nothing changed.
+      if (!hasUpdates) return detail
+      const updated = await api.deployments.update(deploymentId, input)
+      resource.apply(updated)
+      return updated
+    }
     const updated = await api.deployments.update(deploymentId, updateInput(editor))
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
     // sync so requiredRunNodes and the Run dialog never act on stale counts.
     resource.apply(updated)
-    const savedEditor = editorFrom(updated)
-    setEditor(savedEditor)
-    setSavedEditorFingerprint(editorFingerprint(savedEditor))
     return updated
   }
 
@@ -204,10 +352,12 @@ export function DeploymentPage() {
     event.preventDefault()
     setBusy('save'); setError(undefined); setNotice(undefined)
     try {
-      await persist()
-      setNotice(deploymentId.startsWith('container:')
-        ? 'Deployment settings saved and applied.'
-        : 'Deployment settings saved. They will be applied on the next run.')
+      const updated = await persist()
+      setNotice(updated.restart_required
+        ? 'Saved to settings file. Stop and start the deployment to apply changes.'
+        : deploymentId.startsWith('container:')
+          ? 'Deployment settings saved and applied.'
+          : 'Deployment settings saved. They will be applied on the next run.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save deployment settings')
     } finally { setBusy(undefined) }
@@ -275,7 +425,15 @@ export function DeploymentPage() {
   const detail = resource.data
   if (!detail || !editor) return null
   const disabled = !detail.editable || Boolean(busy)
-  const hasUnsavedChanges = editorFingerprint(editor) !== savedEditorFingerprint
+  const envFileMode = detail.edit_mode === 'env-file'
+  const envFieldMapping = detail.settings_env?.field_mapping ?? {}
+  const envControlHint = (control: string) => envFileMode && !envFieldMapping[control]
+    ? <small className="muted">The settings env file has no variable backing this control.</small>
+    : undefined
+  const envControlDisabled = (control: string) => disabled || (envFileMode && !envFieldMapping[control])
+  const hasUnsavedChanges = (savedEditor !== undefined && editorFingerprint(editor) !== editorFingerprint(savedEditor))
+    || envRows.some(envRowDirty)
+    || servedName !== savedServedName
   const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
@@ -293,30 +451,50 @@ export function DeploymentPage() {
         {!detail.editable && <p className="form-error wide-field" role="status">{detail.edit_reason || 'Stop this deployment before editing its launch settings.'}</p>}
         {error && <p className="form-error wide-field" role="alert">{error}</p>}
         {notice && <p className="muted wide-field" role="status">{notice}</p>}
-        <label className="field"><span>Context window</span><input disabled={disabled} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} /></label>
-        <label className="field"><span>Max concurrency</span><input disabled={disabled} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} /></label>
-        {detail.runtime !== 'llama.cpp' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={disabled} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} /></label>}
-        <label className="field"><span>Thinking mode</span><select disabled={disabled} value={editor.thinking_mode} onChange={(event) => set('thinking_mode', event.target.value)}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
-        {detail.runtime === 'vllm' && <>
+        {envFileMode && <label className="field"><span>Served model name</span><input disabled={disabled} value={servedName} onChange={(event) => setServedName(event.target.value)} /></label>}
+        <label className="field"><span>Context window</span><input disabled={envControlDisabled('context_window')} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} />{envControlHint('context_window')}</label>
+        <label className="field"><span>Max concurrency</span><input disabled={envControlDisabled('max_concurrency')} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} />{envControlHint('max_concurrency')}</label>
+        {detail.runtime !== 'llama.cpp' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={envControlDisabled('kv_cache_dtype')} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} />{envControlHint('kv_cache_dtype')}</label>}
+        {!envFileMode && <label className="field"><span>Thinking mode</span><select disabled={disabled} value={editor.thinking_mode} onChange={(event) => set('thinking_mode', event.target.value)}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>}
+        {detail.runtime === 'vllm' && !envFileMode && <>
           <label className="field"><span>Speculative method</span><select disabled={disabled} value={editor.speculative_method} onChange={(event) => set('speculative_method', event.target.value)}><option value="">Auto / unset</option>{editor.speculative_method && !SPECULATIVE_METHODS.includes(editor.speculative_method) && <option value={editor.speculative_method}>{editor.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
           <label className="field"><span>Draft sample method</span><select disabled={disabled} value={editor.draft_sample_method} onChange={(event) => set('draft_sample_method', event.target.value)}><option value="">Default</option>{editor.draft_sample_method && !DRAFT_SAMPLE_METHODS.includes(editor.draft_sample_method) && <option value={editor.draft_sample_method}>{editor.draft_sample_method}</option>}{DRAFT_SAMPLE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
         </>}
-        <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>
-        <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>
-        <label className="field"><span>Max batched tokens</span><input disabled={disabled} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} /></label>
-        {detail.runtime === 'vllm' && <>
+        {!envFileMode && <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>}
+        {!envFileMode && <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>}
+        <label className="field"><span>Max batched tokens</span><input disabled={envControlDisabled('max_num_batched_tokens')} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} />{envControlHint('max_num_batched_tokens')}</label>
+        {(detail.runtime === 'vllm' || envFileMode) && <label className="field"><span>GPU memory utilization</span><input disabled={envControlDisabled('gpu_memory_utilization')} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} />{envControlHint('gpu_memory_utilization')}</label>}
+        {detail.runtime === 'vllm' && !envFileMode && <>
           <label className="field"><span>Tensor parallel size</span><input disabled={disabled} type="number" min="1" value={editor.tensor_parallel_size} onChange={(event) => set('tensor_parallel_size', event.target.value)} /></label>
           <label className="field"><span>Pipeline parallel size</span><input disabled={disabled} type="number" min="1" value={editor.pipeline_parallel_size} onChange={(event) => set('pipeline_parallel_size', event.target.value)} /></label>
-          <label className="field"><span>GPU memory utilization</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} /></label>
           {!detail.id.startsWith('container:') && <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>}
           <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder="VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>
         </>}
-        {detail.runtime === 'sglang' && <>
+        {detail.runtime === 'sglang' && !envFileMode && <>
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
         </>}
-        <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} /><small>Shell quoting is preserved when the flags are saved.</small></label>
-        {detail.runtime !== 'llama.cpp' && <label className="field wide-field"><span>Final runtime flags (preview only)</span><textarea readOnly rows={6} spellCheck={false} value={finalFlags} /><small>Backend-normalized flags after dropdown values and environment references are resolved. This field is not submitted.</small>{previewError && <small className="form-error" role="alert">{previewError}</small>}</label>}
+        {envFileMode && <div className="field wide-field">
+          <span>Settings file variables</span>
+          {detail.settings_env?.error
+            ? <small className="form-error" role="alert">{detail.settings_env.error}</small>
+            : <>
+              {envRows.map((row, index) => !row.deleted && <div className="env-file-row" key={row.added ? `added-${index}` : row.key}>
+                <input type="checkbox" aria-label={`Enable ${row.key || 'new variable'}`} disabled={disabled} checked={row.enabled} onChange={(event) => setEnvRow(index, { enabled: event.target.checked })} />
+                {row.added
+                  ? <input aria-label="New variable name" placeholder="VARIABLE_NAME" disabled={disabled} value={row.key} onChange={(event) => setEnvRow(index, { key: event.target.value })} />
+                  : <code>{row.key}</code>}
+                <input aria-label={`${row.key || 'new variable'} value`} placeholder={row.redacted ? '••••••' : 'value'} disabled={disabled} value={row.value} onChange={(event) => setEnvRow(index, { value: event.target.value })} />
+                <button type="button" className="icon-button" aria-label={`Delete ${row.key || 'new variable'}`} disabled={disabled} onClick={() => setEnvRow(index, { deleted: true })}>×</button>
+              </div>)}
+              <div><Button type="button" disabled={disabled} onClick={() => setEnvRows((current) => [...current, { key: '', value: '', enabled: true, redacted: false, deleted: false, added: true, initialEnabled: true }])}>Add variable</Button></div>
+            </>}
+          <small>Values are written to {detail.settings_env?.name}; stop and start the deployment to apply changes.</small>
+        </div>}
+        <label className="field wide-field"><span>Runtime flags</span><textarea disabled={disabled || envFileMode} readOnly={envFileMode} rows={6} spellCheck={false} value={editor.extra_args} onChange={(event) => set('extra_args', event.target.value)} />{envFileMode
+          ? <small>Flags are generated by the external start script; edit the backing variable above instead.</small>
+          : <small>Shell quoting is preserved when the flags are saved.</small>}</label>
+        {detail.runtime !== 'llama.cpp' && !envFileMode && <label className="field wide-field"><span>Final runtime flags (preview only)</span><textarea readOnly rows={6} spellCheck={false} value={finalFlags} /><small>Backend-normalized flags after dropdown values and environment references are resolved. This field is not submitted.</small>{previewError && <small className="form-error" role="alert">{previewError}</small>}</label>}
         <div className="settings-save wide-field">
           <Button type="submit" disabled={disabled || !hasUnsavedChanges}><Save size={15} /> {busy === 'save' ? 'Saving…' : 'Save'}</Button>
           {active && detail.controllable

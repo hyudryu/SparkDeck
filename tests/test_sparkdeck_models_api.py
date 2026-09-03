@@ -1449,6 +1449,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "environment": dict(settings.get("environment") or {}),
                 "extra_args": recovered_args,
                 "shm_size": settings.get("shm_size"),
+                "infiniband_device": settings.get("infiniband_device"),
             }
             if recovered["engine"] == "sglang":
                 recovered["sg_tp_size"] = settings.get(
@@ -1804,6 +1805,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "shm_size": 64 * 1024 ** 3,
+                "infiniband_device": True,
                 "command_flags": (
                     "--tensor-parallel-size 2 --pipeline-parallel-size 2 "
                     "--enable-prefix-caching"
@@ -1831,6 +1833,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(launch["node_ids"], selected)
             self.assertEqual(launch["image"], "sha256:source-image")
             self.assertEqual(launch["shm_size"], 64 * 1024 ** 3)
+            self.assertIs(launch["infiniband_device"], True)
             self.assertIn("--pipeline-parallel-size", launch["extra_args"])
             manager.pin_container_image_on_nodes.assert_awaited_once_with(
                 "external-stack", "example/vllm:latest", selected,

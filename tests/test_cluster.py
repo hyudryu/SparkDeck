@@ -3009,6 +3009,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
                 "shm_size": 64 * 1024 ** 3,
+                "infiniband_device": True,
                 "environment": {"NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1"},
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
@@ -3032,6 +3033,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 deployment["launch_settings"]["shm_size"], 64 * 1024 ** 3,
             )
+            self.assertIs(
+                deployment["launch_settings"]["infiniband_device"], True,
+            )
             for rank, (node_id, payload) in enumerate(captured):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
@@ -3049,6 +3053,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1",
                 })
                 self.assertEqual(payload["shm_size"], 64 * 1024 ** 3)
+                self.assertIs(payload["infiniband_device"], True)
 
     async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4876,7 +4881,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         })
 
         first = await instance.create_container(
-            "org/first", name="first-r1",
+            "org/first", name="first-r1", infiniband_device=False,
             environment={
                 "NCCL_DEBUG": "WARN",
                 "SPECULATIVE_CONFIG": (
@@ -4890,13 +4895,15 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "nnodes": 2, "mode": "sharded",
             },
         )
-        second = await instance.create_container(
-            "org/second", name="second-r1",
-            cluster_member={
-                "deployment_id": "second", "node_id": "remote-1", "rank": 1,
-                "nnodes": 2, "mode": "sharded",
-            },
-        )
+        with mock.patch("manager.Path") as device_path:
+            device_path.return_value.exists.return_value = True
+            second = await instance.create_container(
+                "org/second", name="second-r1", infiniband_device=True,
+                cluster_member={
+                    "deployment_id": "second", "node_id": "remote-1", "rank": 1,
+                    "nnodes": 2, "mode": "sharded",
+                },
+            )
 
         self.assertEqual([first["port"], second["port"]], [8000, 8001])
         self.assertEqual(
@@ -4904,6 +4911,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             ["8000", "8001"],
         )
         self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
+        self.assertNotIn("devices", run_options[0])
+        self.assertEqual(
+            run_options[1]["devices"], ["/dev/infiniband:/dev/infiniband"],
+        )
         self.assertEqual(run_options[0]["environment"]["NCCL_DEBUG"], "WARN")
         speculative = json.loads(instance._cli_option(
             run_options[0]["command"], {"--speculative-config"},
@@ -4923,6 +4934,18 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sglang["port"], 9000)
         self.assertEqual(run_options[-1]["labels"][SERVICE_PORT_LABEL], "9000")
         self.assertEqual(run_options[-1]["network_mode"], "host")
+
+        with mock.patch("manager.Path") as device_path:
+            device_path.return_value.exists.return_value = False
+            with self.assertRaisesRegex(ValueError, "requires /dev/infiniband"):
+                await instance.create_container(
+                    "org/missing-device", port=9001,
+                    infiniband_device=True,
+                    cluster_member={
+                        "deployment_id": "missing", "node_id": "remote-1",
+                        "rank": 1, "nnodes": 2, "mode": "sharded",
+                    },
+                )
 
         # A stopped host-network container still owns its restart port. Once
         # that container is removed from Docker inventory, the port is reusable.

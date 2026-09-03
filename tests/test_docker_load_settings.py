@@ -224,7 +224,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary)
         self.assertFalse(summary["launch_prefix_replayable"])
 
-    def test_external_summary_allows_canonical_sglang_python3_path(self):
+    def test_external_summary_rejects_absolute_sglang_python3_path(self):
         containers = FakeContainers()
         container = FakeContainer(
             containers,
@@ -233,6 +233,28 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             {
                 "Image": "example/sglang:latest",
                 "Entrypoint": ["/usr/bin/python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_allows_bare_sglang_python3(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "bare-sglang-id",
+            "bare-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["python3"],
                 "Cmd": [
                     "-m", "sglang.launch_server", "--model-path", "org/model",
                 ],
@@ -471,6 +493,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["working_dir_replayable"])
         self.assertTrue(summary["resource_constraints_replayable"])
         self.assertEqual(summary["load_settings"]["shm_size"], 16 * 1024 ** 3)
+        self.assertIs(summary["load_settings"]["infiniband_device"], False)
 
     def test_image_default_bash_env_keeps_shell_promotion_read_only(self):
         environment = ["BASH_ENV=/opt/runtime/init.sh"]
@@ -731,36 +754,44 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "Devices": None,
         }}
 
-        with mock.patch("manager.Path") as path:
-            path.return_value.exists.return_value = False
-            self.assertEqual(
-                self.manager._container_topology_options_are_replayable(empty),
-                (True, False),
-            )
-            self.assertEqual(
-                self.manager._container_topology_options_are_replayable(distributed),
-                (False, True),
-            )
-            self.assertEqual(
-                self.manager._container_topology_options_are_replayable(stack),
-                (False, False),
-            )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(empty),
+            (True, False),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(distributed),
+            (False, True),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(stack),
+            (False, False),
+        )
 
     def test_distributed_topology_requires_managed_infiniband_mapping(self):
-        attrs = {"HostConfig": {
-            "Ulimits": [{"Name": "memlock", "Soft": -1, "Hard": -1}],
-            "Devices": [{
+        ulimits = [{"Name": "memlock", "Soft": -1, "Hard": -1}]
+        devices = [{
                 "PathOnHost": "/dev/infiniband",
                 "PathInContainer": "/dev/infiniband",
                 "CgroupPermissions": "rwm",
+            }]
+        attrs = {"HostConfig": {"Ulimits": ulimits, "Devices": devices}}
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(attrs),
+            (False, True),
+        )
+        self.assertIs(
+            self.manager._container_infiniband_device_requirement(attrs), True,
+        )
+        summary = self._direct_portability_summary(
+            [{
+                "Driver": "", "Count": -1, "DeviceIDs": None,
+                "Capabilities": [["gpu"]], "Options": {},
             }],
-        }}
-        with mock.patch("manager.Path") as path:
-            path.return_value.exists.return_value = True
-            self.assertEqual(
-                self.manager._container_topology_options_are_replayable(attrs),
-                (False, True),
-            )
+            "sha256:source-image", network_mode="host",
+            resource_overrides={"Ulimits": ulimits, "Devices": devices},
+        )
+        self.assertTrue(summary["distributed_host_options_replayable"])
+        self.assertIs(summary["load_settings"]["infiniband_device"], True)
 
     def test_direct_summary_rejects_container_user_override(self):
         summary = self._direct_portability_summary([{

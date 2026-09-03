@@ -198,11 +198,15 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
                     "deployment_id": "dep-1", "node_id": "worker-1",
                 },
                 "shm_size": source_shm_size,
+                "infiniband_device": True,
             })
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             create_container.await_args.kwargs["shm_size"], source_shm_size,
+        )
+        self.assertIs(
+            create_container.await_args.kwargs["infiniband_device"], True,
         )
 
     def test_log_redaction_handles_json_keys_and_raw_configured_token(self):

@@ -3775,6 +3775,15 @@ class Manager:
             raise ValueError("shm_size must be a positive byte size")
         return size
 
+    @staticmethod
+    def _normalized_infiniband_device(value: Any) -> bool | None:
+        """Normalize an explicit recovered InfiniBand mount requirement."""
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise ValueError("infiniband_device must be a boolean")
+        return value
+
     @classmethod
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
@@ -3808,6 +3817,9 @@ class Manager:
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
             "shm_size": cls._normalized_shm_size(body.get("shm_size")),
+            "infiniband_device": cls._normalized_infiniband_device(
+                body.get("infiniband_device")
+            ),
             "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "input_cost_per_1m": cls._pricing_value(
                 body.get("input_cost_per_1m"), "input_cost_per_1m"
@@ -4507,6 +4519,7 @@ class Manager:
                 "gpu_memory_utilization"
             ),
             "shm_size": load_settings.get("shm_size"),
+            "infiniband_device": load_settings.get("infiniband_device"),
             "deployment_mode": deployment.get("mode", "single"),
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
@@ -5228,15 +5241,14 @@ class Manager:
         """Whether a managed SGLang launch reproduces its executable prefix.
 
         Manager always recreates SGLang containers as ``python3 -m
-        sglang.launch_server``.  Accept the equivalent absolute ``python3``
-        path, but fail closed on wrapper/bootstrap commands and alternate
-        interpreters whose initialization Manager would silently discard.
+        sglang.launch_server``. Fail closed on absolute/alternate interpreter
+        paths and wrapper/bootstrap commands that Manager would silently
+        replace with a potentially different executable resolved from PATH.
         """
         command = [str(value) for value in (cmd or [])]
         if len(command) < 3 or command[1:3] != ["-m", "sglang.launch_server"]:
             return False
-        executable = command[0].replace("\\", "/").rsplit("/", 1)[-1]
-        return executable == "python3"
+        return command[0] == "python3"
 
     @staticmethod
     def _shell_vllm_command(script: str):
@@ -6089,6 +6101,10 @@ class Manager:
         )
         if body.get("shm_size") not in (None, ""):
             body["shm_size"] = self._normalized_shm_size(body["shm_size"])
+        if "infiniband_device" in body:
+            body["infiniband_device"] = self._normalized_infiniband_device(
+                body["infiniband_device"]
+            )
         controls = body.get("launch_controls")
         if controls is not None and engine != "llama.cpp":
             if not isinstance(controls, dict):
@@ -6375,6 +6391,7 @@ class Manager:
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
             "shm_size": body.get("shm_size"),
+            "infiniband_device": body.get("infiniband_device"),
             "environment": body.get("environment"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
@@ -11926,16 +11943,45 @@ class Manager:
         return True
 
     @staticmethod
+    def _container_infiniband_device_requirement(attrs: dict) -> bool | None:
+        """Return the exact managed InfiniBand device contract, if supported."""
+        host_config = attrs.get("HostConfig")
+        if not isinstance(host_config, dict) or "Devices" not in host_config:
+            return None
+        raw_devices = host_config.get("Devices")
+        if raw_devices is None:
+            raw_devices = []
+        if not isinstance(raw_devices, list):
+            return None
+        normalized_devices = []
+        for item in raw_devices:
+            if not isinstance(item, dict) or set(item) != {
+                "PathOnHost", "PathInContainer", "CgroupPermissions",
+            }:
+                return None
+            values = (
+                item.get("PathOnHost"), item.get("PathInContainer"),
+                item.get("CgroupPermissions"),
+            )
+            if not all(isinstance(value, str) for value in values):
+                return None
+            normalized_devices.append(values)
+        normalized_devices.sort()
+        if not normalized_devices:
+            return False
+        if normalized_devices == [
+            ("/dev/infiniband", "/dev/infiniband", "rwm"),
+        ]:
+            return True
+        return None
+
+    @classmethod
     def _container_topology_options_are_replayable(
-        attrs: dict,
+        cls, attrs: dict,
     ) -> tuple[bool, bool]:
         """Return single/distributed compatibility for ulimits and devices."""
         host_config = attrs.get("HostConfig")
-        if (
-            not isinstance(host_config, dict)
-            or "Ulimits" not in host_config
-            or "Devices" not in host_config
-        ):
+        if not isinstance(host_config, dict) or "Ulimits" not in host_config:
             return False, False
 
         raw_ulimits = host_config.get("Ulimits")
@@ -11962,34 +12008,15 @@ class Manager:
             normalized_ulimits.append((name, soft, hard))
         normalized_ulimits.sort()
 
-        raw_devices = host_config.get("Devices")
-        if raw_devices is None:
-            raw_devices = []
-        if not isinstance(raw_devices, list):
+        infiniband_device = cls._container_infiniband_device_requirement(attrs)
+        if infiniband_device is None:
             return False, False
-        normalized_devices = []
-        for item in raw_devices:
-            if not isinstance(item, dict) or set(item) != {
-                "PathOnHost", "PathInContainer", "CgroupPermissions",
-            }:
-                return False, False
-            host_path = item.get("PathOnHost")
-            container_path = item.get("PathInContainer")
-            permissions = item.get("CgroupPermissions")
-            if not all(isinstance(value, str) for value in (
-                host_path, container_path, permissions,
-            )):
-                return False, False
-            normalized_devices.append((host_path, container_path, permissions))
-        normalized_devices.sort()
-
-        single = not normalized_ulimits and not normalized_devices
+        single = not normalized_ulimits and infiniband_device is False
         distributed_ulimits = normalized_ulimits == [("memlock", -1, -1)]
-        expected_devices = (
-            [("/dev/infiniband", "/dev/infiniband", "rwm")]
-            if Path("/dev/infiniband").exists() else []
-        )
-        distributed = distributed_ulimits and normalized_devices == expected_devices
+        # Both supported source contracts are replayable. Promotion persists
+        # the inspected boolean so every target mounts the device, or omits it,
+        # exactly as the source did rather than consulting its own filesystem.
+        distributed = distributed_ulimits
         return single, distributed
 
     @staticmethod
@@ -12415,6 +12442,13 @@ class Manager:
                 summary["single_host_options_replayable"],
                 summary["distributed_host_options_replayable"],
             ) = self._container_topology_options_are_replayable(attrs)
+            infiniband_device = self._container_infiniband_device_requirement(
+                attrs
+            )
+            if infiniband_device is not None:
+                summary["load_settings"]["infiniband_device"] = (
+                    infiniband_device
+                )
             summary["resource_constraints_replayable"] = (
                 self._container_resources_are_replayable(attrs)
             )
@@ -12785,6 +12819,7 @@ class Manager:
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
+        infiniband_device: bool | None = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -12815,6 +12850,7 @@ class Manager:
             llama_parallel_slots=llama_parallel_slots,
             llama_gpu_layers=llama_gpu_layers,
             shm_size=shm_size,
+            infiniband_device=infiniband_device,
         )
         if reserved_port is None:
             return await create_call
@@ -13038,6 +13074,7 @@ class Manager:
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
+        infiniband_device: bool | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
@@ -13047,9 +13084,21 @@ class Manager:
             self._normalized_shm_size(shm_size)
             or self.settings["shm_size"]
         )
+        managed_infiniband_device = self._normalized_infiniband_device(
+            infiniband_device
+        )
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
+        if (
+            distributed_member
+            and managed_infiniband_device is True
+            and not Path("/dev/infiniband").exists()
+        ):
+            raise ValueError(
+                "source launch requires /dev/infiniband, but it is unavailable "
+                "on this node"
+            )
         if engine == "llama.cpp":
             return await self._create_llama_container(
                 model=model, port=port, image=image,
@@ -13178,7 +13227,10 @@ class Manager:
                         run_options.setdefault("environment", {}).update(
                             self._distributed_network_environment(iface)
                         )
-                    if Path("/dev/infiniband").exists():
+                    if managed_infiniband_device is True or (
+                        managed_infiniband_device is None
+                        and Path("/dev/infiniband").exists()
+                    ):
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
@@ -13335,7 +13387,10 @@ class Manager:
                         run_options.setdefault("environment", {}).update(
                             self._distributed_network_environment(iface)
                         )
-                    if Path("/dev/infiniband").exists():
+                    if managed_infiniband_device is True or (
+                        managed_infiniband_device is None
+                        and Path("/dev/infiniband").exists()
+                    ):
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}

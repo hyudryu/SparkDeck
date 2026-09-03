@@ -178,6 +178,50 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary)
         self.assertTrue(summary["launch_prefix_replayable"])
 
+    def test_external_summary_marks_sglang_entrypoint_wrapper_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "wrapped-sglang-id",
+            "wrapped-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["/opt/bootstrap", "python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_allows_canonical_sglang_python3_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "canonical-sglang-id",
+            "canonical-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["/usr/bin/python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["launch_prefix_replayable"])
+
     def test_external_summary_marks_shell_prelude_unreplayable(self):
         containers = FakeContainers()
         container = FakeContainer(
@@ -590,24 +634,57 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "sha256:hooked-image",
         )
 
-    def test_hf_cache_target_is_cached_per_image_reference(self):
+    def test_hf_cache_target_is_cached_per_immutable_image_id(self):
+        image_id = "sha256:" + "a" * 64
         image = mock.Mock()
-        image.attrs = {"Config": {"Env": ["HF_HOME=/opt/hf-cache"]}}
+        image.id = image_id
+        image.attrs = {
+            "Id": image_id,
+            "Config": {"Env": ["HF_HOME=/opt/hf-cache"]},
+        }
         self.manager.client = mock.Mock()
         self.manager.client.images.get.return_value = image
+
+        first = self.manager._image_hf_cache_target(image_id)
+        second = self.manager._image_hf_cache_target(image_id)
+
+        self.assertEqual(first, "/opt/hf-cache")
+        self.assertEqual(second, "/opt/hf-cache")
+        self.manager.client.images.get.assert_called_once_with(image_id)
+
+    def test_hf_cache_target_revalidates_mutable_tag_identity(self):
+        old_id = "sha256:" + "a" * 64
+        old_image = mock.Mock()
+        old_image.id = old_id
+        old_image.attrs = {
+            "Id": old_id,
+            "Config": {"Env": ["HF_HOME=/old-cache"]},
+        }
+        new_id = "sha256:" + "b" * 64
+        new_image = mock.Mock()
+        new_image.id = new_id
+        new_image.attrs = {
+            "Id": new_id,
+            "Config": {"Env": ["HF_HOME=/new-cache"]},
+        }
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = [old_image, new_image]
 
         first = self.manager._image_hf_cache_target("example/vllm:latest")
         second = self.manager._image_hf_cache_target("example/vllm:latest")
 
-        self.assertEqual(first, "/opt/hf-cache")
-        self.assertEqual(second, "/opt/hf-cache")
-        self.manager.client.images.get.assert_called_once_with(
-            "example/vllm:latest",
-        )
+        self.assertEqual(first, "/old-cache")
+        self.assertEqual(second, "/new-cache")
+        self.assertEqual(self.manager.client.images.get.call_count, 2)
 
     def test_hf_cache_target_does_not_cache_inspection_failure(self):
+        image_id = "sha256:" + "a" * 64
         image = mock.Mock()
-        image.attrs = {"Config": {"Env": ["HF_HOME=/opt/hf-cache"]}}
+        image.id = image_id
+        image.attrs = {
+            "Id": image_id,
+            "Config": {"Env": ["HF_HOME=/opt/hf-cache"]},
+        }
         self.manager.client = mock.Mock()
         self.manager.client.images.get.side_effect = [
             RuntimeError("docker hiccup"), image,

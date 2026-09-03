@@ -689,6 +689,7 @@ class Manager:
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
+        self._deployment_pricing_lock = asyncio.Lock()
         self._host_port_reservation_lock = asyncio.Lock()
         self._host_port_reservations: set[int] = set()
         # A controller restart can attach to an older deployment whose vLLM
@@ -4501,15 +4502,40 @@ class Manager:
             model, cls._variant_from_cmd(settings.get("extra_args") or [])
         ) if model else ""
 
+    @classmethod
+    def _deployment_pricing_signature(cls, deployment: dict) -> tuple[Any, ...]:
+        pricing = cls._deployment_pricing(
+            deployment.get("launch_settings") or {}
+        )
+        return tuple(pricing[field] for field in (
+            "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+        ))
+
+    @staticmethod
+    def _deployment_pricing_owner_key(deployment: dict) -> tuple[float, str, str]:
+        """Keep one editor owner stable as clone runtime state changes."""
+        try:
+            created_at = float(deployment.get("created_at"))
+            if not math.isfinite(created_at):
+                created_at = math.inf
+        except (TypeError, ValueError):
+            created_at = math.inf
+        deployment_id = str(deployment.get("id") or "")
+        return created_at, deployment_id.casefold(), deployment_id
+
     def _deployment_pricing_resolution(self, model: str) -> dict | None:
         """Return the one deployment whose persisted rates price *model*.
 
         Exact usage identity matching mirrors :meth:`calculate_cost`. When
         duplicate deployments share an identity, one explicitly priced match
-        remains authoritative over otherwise blank matches. Multiple priced
-        matches are ambiguous. When every match is blank, a unique live owner
-        is actionable; this lets a running deployment be priced even while a
-        stopped deployment with the same model identity is also saved.
+        remains authoritative over otherwise blank matches. Clone-derived
+        priced matches with the exact same rates are one logical price and use
+        a stable owner; conflicting rates remain ambiguous. When every match
+        is blank, a unique live owner is actionable; this lets a running
+        deployment be priced even while a stopped deployment with the same
+        model identity is also saved. If several unpriced matches have the
+        same lifecycle state, the same stable owner rule keeps one editor
+        available without inventing a price.
         """
         model_key = str(model or "").strip().casefold()
         if not model_key:
@@ -4531,9 +4557,15 @@ class Manager:
                 )
             )
         ]
-        if len(priced) == 1:
-            return priced[0]
         if priced:
+            signatures = {
+                self._deployment_pricing_signature(deployment)
+                for deployment in priced
+            }
+            if len(signatures) == 1:
+                return min(priced, key=self._deployment_pricing_owner_key)
+            return None
+        if not matches:
             return None
         if len(matches) == 1:
             return matches[0]
@@ -4544,7 +4576,9 @@ class Manager:
             and str(deployment.get("status") or "").casefold()
             not in {"stopped", "error", "removed"}
         ]
-        return live_matches[0] if len(live_matches) == 1 else None
+        if len(live_matches) == 1:
+            return live_matches[0]
+        return min(matches, key=self._deployment_pricing_owner_key)
 
     def _usage_member_pricing(self, model: str) -> dict[str, Any]:
         """Return actionable persisted pricing metadata for one Usage member."""
@@ -4562,6 +4596,17 @@ class Manager:
         self, deployment_id: str, body: dict
     ) -> dict:
         """Update accounting metadata without restarting a running cluster."""
+        lock = getattr(self, "_deployment_pricing_lock", None)
+        if lock is None:
+            lock = self._deployment_pricing_lock = asyncio.Lock()
+        async with lock:
+            return await self._update_deployment_pricing_locked(
+                deployment_id, body,
+            )
+
+    async def _update_deployment_pricing_locked(
+        self, deployment_id: str, body: dict
+    ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -4589,12 +4634,46 @@ class Manager:
             deployment["launch_settings"] = launch_settings
             if primary and primary.get("stats_key"):
                 deployment["pricing_model_key"] = primary["stats_key"]
-        launch_settings.update(pricing)
         if not deployment.get("pricing_model_key"):
             deployment["pricing_model_key"] = (
                 self._deployment_pricing_model_key(deployment)
             )
-        deployment["pricing"] = pricing
+
+        pricing_key = self._deployment_pricing_model_key(deployment)
+        owner = self._deployment_pricing_resolution(pricing_key)
+        if owner is None:
+            raise ValueError(
+                "deployment pricing is ambiguous for this model identity"
+            )
+        if owner is not deployment:
+            raise ValueError(
+                "deployment pricing is managed by deployment "
+                f"{owner.get('id')}"
+            )
+
+        previous_signature = self._deployment_pricing_signature(deployment)
+        group = [deployment]
+        if any(value is not None for value in previous_signature):
+            # A clone copies the source rates. Treat those exact copies as one
+            # logical price: update them together so the unexposed clone can
+            # never retain a stale rate and turn the identity ambiguous after
+            # the visible owner is saved.
+            group = [
+                candidate
+                for candidate in self.deployments
+                if self._deployment_pricing_model_key(candidate).casefold()
+                == pricing_key.casefold()
+                and self._deployment_pricing_signature(candidate)
+                == previous_signature
+            ]
+        for candidate in group:
+            candidate_settings = candidate.get("launch_settings")
+            if not isinstance(candidate_settings, dict):
+                continue
+            candidate_settings.update(pricing)
+            candidate["pricing"] = dict(pricing)
+            if not candidate.get("pricing_model_key"):
+                candidate["pricing_model_key"] = pricing_key
         self._save_deployments()
         return {"ok": True, "deployment_id": deployment_id, **pricing}
 
@@ -4937,6 +5016,21 @@ class Manager:
             return False
         executable = command[0].replace("\\", "/").rsplit("/", 1)[-1]
         return executable == "vllm"
+
+    @staticmethod
+    def _sglang_exec_prefix_is_replayable(cmd: list[str]) -> bool:
+        """Whether a managed SGLang launch reproduces its executable prefix.
+
+        Manager always recreates SGLang containers as ``python3 -m
+        sglang.launch_server``.  Accept the equivalent absolute ``python3``
+        path, but fail closed on wrapper/bootstrap commands and alternate
+        interpreters whose initialization Manager would silently discard.
+        """
+        command = [str(value) for value in (cmd or [])]
+        if len(command) < 3 or command[1:3] != ["-m", "sglang.launch_server"]:
+            return False
+        executable = command[0].replace("\\", "/").rsplit("/", 1)[-1]
+        return executable == "python3"
 
     @staticmethod
     def _shell_vllm_command(script: str):
@@ -7620,6 +7714,8 @@ class Manager:
         images can set ``HF_HOME`` to another absolute path.  Mounting the
         host cache at the image's declared location keeps offline images able
         to resolve snapshots without overriding their runtime environment.
+        Targets are cached by Docker's immutable image ID, never a mutable
+        tag which can be repointed outside SparkDeck.
         """
         fallback = "/root/.cache/huggingface"
         if not image:
@@ -7627,15 +7723,27 @@ class Manager:
         cache = getattr(self, "_image_hf_cache_target_cache", None)
         if cache is None:
             cache = self._image_hf_cache_target_cache = {}
-        if image in cache:
-            return cache[image]
+        image_ref = str(image).strip()
+        immutable_ref = bool(re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_ref))
+        if immutable_ref and image_ref.casefold() in cache:
+            return cache[image_ref.casefold()]
         try:
-            docker_image = self.client.images.get(image)
-            env = ((docker_image.attrs or {}).get("Config") or {}).get("Env") or []
+            docker_image = self.client.images.get(image_ref)
+            image_attrs = docker_image.attrs or {}
         except Exception:
             # A transient Docker failure must not permanently force the
             # fallback for this image; retry on the next inventory pass.
             return fallback
+        image_id = str(
+            getattr(docker_image, "id", "") or image_attrs.get("Id") or ""
+        ).strip().casefold()
+        if not image_id:
+            # Without an immutable identity, a successful-looking lookup is
+            # not safe to cache and may hide a later tag replacement.
+            return fallback
+        if image_id in cache:
+            return cache[image_id]
+        env = (image_attrs.get("Config") or {}).get("Env") or []
         target = fallback
         for entry in env:
             if not isinstance(entry, str) or not entry.startswith("HF_HOME="):
@@ -7644,7 +7752,7 @@ class Manager:
             if candidate.startswith("/") and candidate != "":
                 target = candidate
                 break
-        cache[image] = target
+        cache[image_id] = target
         return target
 
     def _container_mounts_are_replayable(
@@ -11430,14 +11538,18 @@ class Manager:
             "load_settings": load_settings,
             # Sanitized capability only: never expose inspected host paths.
             "mounts_replayable": self._container_mounts_are_replayable(
-                attrs, image_tag, launch_model or model,
+                attrs, attrs.get("Image") or image_tag, launch_model or model,
             ),
-            # Managed vLLM launches deliberately replace the image entrypoint
-            # with a canonical ``vllm serve`` command. Record whether doing so
-            # would discard an executable/bootstrap prefix from this container.
+            # Managed vLLM and SGLang launches deliberately replace the image
+            # entrypoint with their canonical executable forms. Record whether
+            # doing so would discard a wrapper/bootstrap prefix from this
+            # container.
             "launch_prefix_replayable": (
-                engine_label != "vllm"
-                or self._vllm_exec_prefix_is_replayable(cmd)
+                self._vllm_exec_prefix_is_replayable(cmd)
+                if engine_label == "vllm"
+                else self._sglang_exec_prefix_is_replayable(cmd)
+                if engine_label == "sglang"
+                else True
             ),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),

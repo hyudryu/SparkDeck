@@ -4198,6 +4198,7 @@ class SparkDeckService:
         return launch_settings, {
             "deployment_mode": mode,
             "required_node_count": required,
+            "model_revision": _optional_string(contract.get("model_revision")),
             # Without an explicit --nnodes, direct vLLM containers prove the
             # argv's rank layout but not a SparkDeck host layout. Accept any
             # divisor whose ranks fit; Manager preflight performs the
@@ -4725,7 +4726,10 @@ class SparkDeckService:
         if not model:
             raise ValueError("deployment does not reference a Hugging Face model")
         revision = (
-            _optional_string((deployment.get("model") or {}).get("revision"))
+            _optional_string(deployment.get("model_revision"))
+            or _optional_string(
+                (deployment.get("model") or {}).get("revision")
+            )
             or "main"
         )
         return deployment, model, revision
@@ -4990,7 +4994,7 @@ class SparkDeckService:
     async def deployment_preparation_preflight(
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
-        """Plan per-node weight preparation for a saved deployment."""
+        """Plan per-node weight preparation for a saved or promoted launch."""
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )
@@ -5005,7 +5009,7 @@ class SparkDeckService:
         self, deployment_id: str, node_ids: list[str],
         download_node_id: str | None = None,
     ) -> dict[str, Any]:
-        """Queue Virtual NAS weight preparation for a saved deployment."""
+        """Queue Virtual NAS preparation for a saved or promoted launch."""
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )

@@ -126,6 +126,9 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             settings={
                 "context_length": 32768,
                 "environment": {"NCCL_DEBUG": "WARN"},
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.1,
+                "output_cost_per_1m": 3.5,
                 "node_ids": ["remote-1"],
                 "deployment_mode": "single",
                 "manager_deployment_id": "cluster-1",
@@ -146,6 +149,12 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["model"]["quantization"], "fp8")
         self.assertEqual(first["settings"]["context_length"], 32768)
         self.assertEqual(first["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+        self.assertEqual(first["settings"]["input_cost_per_1m"], 1.25)
+        self.assertEqual(first["settings"]["cache_cost_per_1m"], 0.1)
+        self.assertEqual(first["settings"]["output_cost_per_1m"], 3.5)
+        self.assertEqual(second["settings"]["input_cost_per_1m"], 1.25)
+        self.assertEqual(second["settings"]["cache_cost_per_1m"], 0.1)
+        self.assertEqual(second["settings"]["output_cost_per_1m"], 3.5)
         self.assertFalse(first["base_url_set"])
         self.assertNotIn("manager_deployment_id", first["settings"])
         self.assertNotIn("managed_by", first["settings"])

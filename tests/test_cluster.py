@@ -2224,6 +2224,94 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(member["deployment_id"])
         self.assertIsNone(member["pricing"])
 
+    async def test_clone_identical_pricing_has_one_owner_and_saves_as_a_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.token_stats = {
+                "legacy/source": {
+                    "input": 1_000_000, "cached": 0, "output": 1_000_000,
+                },
+                "org/model": {
+                    "input": 100, "cached": 0, "output": 10,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.usage_routing_rules = {"legacy/source": "org/model"}
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            identical_pricing = {
+                "input_cost_per_1m": 1.0,
+                "cache_cost_per_1m": 0.25,
+                "output_cost_per_1m": 4.0,
+            }
+            instance.deployments = [
+                {
+                    "id": "clone-b",
+                    "created_at": 20,
+                    "pricing_model_key": "org/model",
+                    "launch_settings": dict(identical_pricing),
+                },
+                {
+                    "id": "source-a",
+                    "created_at": 10,
+                    "pricing_model_key": "org/model",
+                    "launch_settings": dict(identical_pricing),
+                },
+            ]
+
+            # Identical copied rates still price usage, and only the stable
+            # source owner is exposed even when routing combines two members.
+            cost = instance.calculate_cost(
+                "org/model", instance.token_stats["org/model"],
+            )
+            row = instance.usage_rows()[0]
+            members = {member["model"]: member for member in row["members"]}
+            self.assertEqual(cost["output_cost_per_1m"], 4.0)
+            self.assertEqual(
+                members["org/model"]["deployment_id"], "source-a",
+            )
+            self.assertIsNone(members["legacy/source"]["deployment_id"])
+            self.assertEqual(
+                sum(member["deployment_id"] is not None for member in row["members"]),
+                1,
+            )
+
+            await instance.update_deployment_pricing("source-a", {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 8.0,
+            })
+
+            self.assertEqual(
+                {
+                    deployment["launch_settings"]["output_cost_per_1m"]
+                    for deployment in instance.deployments
+                },
+                {8.0},
+            )
+            self.assertEqual(
+                instance.calculate_cost("org/model", {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                })["output_cost_per_1m"],
+                8.0,
+            )
+            with self.assertRaisesRegex(ValueError, "managed by deployment source-a"):
+                await instance.update_deployment_pricing("clone-b", {
+                    "output_cost_per_1m": 9.0,
+                })
+
+            await instance.update_deployment_pricing("source-a", {
+                "input_cost_per_1m": None,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": None,
+            })
+            self.assertEqual(
+                instance._usage_member_pricing("org/model")["deployment_id"],
+                "source-a",
+            )
+
     def test_usage_pricing_prefers_unique_live_owner_among_blank_matches(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

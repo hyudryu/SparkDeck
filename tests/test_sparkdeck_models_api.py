@@ -2043,7 +2043,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             "managed": False, "status": "exited", "direct_start": True,
             "mounts_replayable": True,
             "load_settings": {
-                "command_flags": "--max-num-seqs 8",
+                "command_flags": "--max-num-seqs 8 --revision pinned-release",
                 "environment": {"HF_HUB_OFFLINE": "1"},
             },
         }
@@ -2060,10 +2060,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(plan["eligible"])
             self.assertEqual(prepared["jobs"], [])
             manager.recipe_model_preparation_preflight.assert_awaited_once_with(
-                "org/model", "main", ["remote-1"],
+                "org/model", "pinned-release", ["remote-1"],
             )
             manager.queue_recipe_model_preparation.assert_awaited_once_with(
-                "org/model", "main", ["remote-1"],
+                "org/model", "pinned-release", ["remote-1"],
             )
             await manager.http.aclose()
             await service.close()

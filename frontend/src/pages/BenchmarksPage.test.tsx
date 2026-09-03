@@ -164,15 +164,15 @@ describe('BenchmarksPage community privacy', () => {
         items: [
           {
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           },
           {
             model_id: 'org/model', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
-            inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
+            tensor_parallel_size: 4, inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
           },
         ],
         availability: 'available',
-        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
+        evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
       }
       else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
         consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
@@ -189,19 +189,22 @@ describe('BenchmarksPage community privacy', () => {
     expect(screen.getAllByText('1,000 tokens')).toHaveLength(2)
     expect(screen.getByText('NVFP4')).toBeInTheDocument()
     expect(screen.getByText('Q4_K_M')).toBeInTheDocument()
+    expect(screen.getByText('TP1')).toBeInTheDocument()
+    expect(screen.getByText('TP4')).toBeInTheDocument()
     expect(screen.getByText('12 contributors')).toBeInTheDocument()
-    expect(screen.getByText(/matched only on model name, quantization, and prompt-length bucket/)).toBeInTheDocument()
+    expect(screen.getByText(/matched only on model name, quantization, TP size, and prompt-length bucket/)).toBeInTheDocument()
+    expect(screen.getByText(/at most one average per TP setting/)).toBeInTheDocument()
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Review & enable' }))
     const dialog = screen.getByRole('dialog', { name: 'Enable community sharing?' })
-    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, prompt-length/context-occupancy bucket, measured inference tok/s')
+    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, tensor-parallel (TP) size, prompt-length/context-occupancy bucket, measured inference tok/s')
     expect(dialog).toHaveTextContent('only samples captured after you enable sharing can be uploaded; existing benchmark history stays local')
     expect(dialog).toHaveTextContent('stable opaque telemetry cluster ID')
     expect(dialog).toHaveTextContent('contains no account ID, hostname, node name, or endpoint alias')
     expect(dialog).toHaveTextContent('Never in benchmark JSON: prompts or outputs')
-    expect(dialog).not.toHaveTextContent('tensor-parallel (TP) size')
+    expect(dialog).toHaveTextContent('at most one average per TP setting')
     expect(dialog).toHaveTextContent('ordinary authenticated request and network metadata')
     await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
     expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
@@ -239,10 +242,10 @@ describe('BenchmarksPage community privacy', () => {
         body = {
           items: deleted ? [] : [{
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
+            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
           }],
           availability: deleted ? 'not_configured' : 'local',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
+          evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
         }
       } else {
         body = { consent: false, pairing: { status: 'not_paired' }, outbox: {} }
@@ -276,7 +279,7 @@ describe('BenchmarksPage community privacy', () => {
         body = {
           items: [{
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           }],
           availability: 'available',
           evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },

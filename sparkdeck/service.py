@@ -54,6 +54,7 @@ from .storage import (
     COMMUNITY_EVIDENCE_POLICY,
     SparkDeckStore,
     community_context_window,
+    community_tensor_parallel_size,
 )
 from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
@@ -326,13 +327,14 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         raise ValueError("community aggregate response is too large")
 
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, int]] = set()
+    seen: set[tuple[str, str, int, int]] = set()
     for raw in payload["items"]:
         if not isinstance(raw, dict):
             raise ValueError("community aggregate item must be an object")
         model_id = str(raw.get("model_id") or "").strip()
         quantization = canonical_quantization(raw.get("quantization")) or "UNKNOWN"
         prompt_bucket = raw.get("prompt_tokens_bucket")
+        tensor_parallel_size = raw.get("tensor_parallel_size")
         speed = raw.get("inference_tokens_per_second")
         sample_count = raw.get("sample_count")
         unique_cluster_count = raw.get("unique_cluster_count", 1)
@@ -342,6 +344,8 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             or any(ord(char) < 32 for char in model_id)
             or isinstance(prompt_bucket, bool)
             or not isinstance(prompt_bucket, int)
+            or isinstance(tensor_parallel_size, bool)
+            or not isinstance(tensor_parallel_size, int)
             or isinstance(sample_count, bool)
             or not isinstance(sample_count, int)
             or isinstance(unique_cluster_count, bool)
@@ -353,6 +357,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         speed = float(speed)
         if (
             prompt_bucket not in {400, *range(1_000, 10_000, 1_000)}
+            or not 0 < tensor_parallel_size <= 1024
             or sample_count <= 0
             or sample_count > 1_000_000_000
             or unique_cluster_count <= 0
@@ -361,7 +366,9 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             or speed <= 0
         ):
             raise ValueError("community aggregate item is invalid")
-        key = (model_id, quantization, prompt_bucket)
+        key = (
+            model_id, quantization, prompt_bucket, tensor_parallel_size,
+        )
         if key in seen:
             raise ValueError("community aggregate response contains duplicate evidence")
         seen.add(key)
@@ -369,6 +376,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             "model_id": model_id,
             "quantization": quantization,
             "prompt_tokens_bucket": prompt_bucket,
+            "tensor_parallel_size": tensor_parallel_size,
             "inference_tokens_per_second": speed,
             "sample_count": sample_count,
             "unique_cluster_count": unique_cluster_count,
@@ -5915,6 +5923,11 @@ class SparkDeckService:
         generation_seconds = max(0.000001, completed - (first_token_at or started))
         runtime_kind = RuntimeKind(runtime)
         safe_settings = self._safe_configuration(settings)
+        tensor_parallel_size = community_tensor_parallel_size(safe_settings)
+        if tensor_parallel_size is not None:
+            # Persist the normalized runtime default as well as explicit TP so
+            # local history and outbound cohorts describe the same setting.
+            safe_settings["tensor_parallel_size"] = tensor_parallel_size
         kv_cache_dtype = _kv_cache_dtype(settings)
         if kv_cache_dtype is not None:
             safe_settings["kv_cache_dtype"] = kv_cache_dtype
@@ -5946,7 +5959,10 @@ class SparkDeckService:
             and generation_tps is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
-            and self._community_sample_due(public_model, quantization)
+            and tensor_parallel_size is not None
+            and self._community_sample_due(
+                public_model, quantization, tensor_parallel_size,
+            )
         )
         legacy_eligible = bool(
             public_model != "local-model" and input_tokens > 0
@@ -5994,21 +6010,32 @@ class SparkDeckService:
         )
         if inserted:
             self.store.set_setting(
-                self._community_sample_setting(public_model, quantization),
+                self._community_sample_setting(
+                    public_model, quantization, tensor_parallel_size,
+                ),
                 datetime.now(timezone.utc).isoformat(),
             )
 
     @staticmethod
-    def _community_sample_setting(model: str, quantization: str) -> str:
+    def _community_sample_setting(
+        model: str, quantization: str, tensor_parallel_size: int = 1,
+    ) -> str:
         quantization = canonical_quantization(quantization) or "UNKNOWN"
         digest = hashlib.sha256(
-            f"{model.casefold()}\0{quantization.casefold()}".encode("utf-8")
+            (
+                f"{model.casefold()}\0{quantization.casefold()}"
+                f"\0tp:{tensor_parallel_size}"
+            ).encode("utf-8")
         ).hexdigest()
         return f"community_sampled_at:{digest}"
 
-    def _community_sample_due(self, model: str, quantization: str) -> bool:
+    def _community_sample_due(
+        self, model: str, quantization: str, tensor_parallel_size: int = 1,
+    ) -> bool:
         value = self.store.get_setting(
-            self._community_sample_setting(model, quantization), None
+            self._community_sample_setting(
+                model, quantization, tensor_parallel_size,
+            ), None
         )
         if not isinstance(value, str):
             return True

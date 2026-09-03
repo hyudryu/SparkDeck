@@ -3606,7 +3606,7 @@ async def v1_community_aggregates(req: Request):
         return _community_aggregates_unavailable()
     try:
         upstream = await _community_http.get(
-            f"{api_url}/v2/aggregates",
+            f"{api_url}/v3/aggregates",
             headers={
                 "Authorization": f"Bearer {id_token}",
             },
@@ -3769,7 +3769,7 @@ async def _post_community_sample(
 ) -> httpx.Response | None:
     try:
         return await _community_http.post(
-            f"{api_url}/v2/samples",
+            f"{api_url}/v3/samples",
             json=payload,
             headers={
                 "Authorization": f"Bearer {id_token}",

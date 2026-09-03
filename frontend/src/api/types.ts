@@ -10,6 +10,7 @@ export interface RuntimeCompatibility {
 export interface BenchmarkAggregate {
   model_id: string
   quantization: string
+  tensor_parallel_size: number
   prompt_tokens_bucket: number
   inference_tokens_per_second: number
   sample_count: number
@@ -20,7 +21,7 @@ export interface BenchmarkAggregate {
 
 export interface CommunityEvidencePolicy {
   minimum_samples: number
-  exact_match_dimensions: Array<'model_id' | 'quantization' | 'prompt_tokens_bucket'>
+  exact_match_dimensions: Array<'model_id' | 'quantization' | 'tensor_parallel_size' | 'prompt_tokens_bucket'>
   metric: 'inference_tokens_per_second'
 }
 

@@ -97,6 +97,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
                     "model_id": "org/model",
                     "quantization": "Q4_K_M",
                     "prompt_tokens_bucket": 400,
+                    "tensor_parallel_size": 4,
                     "inference_tokens_per_second": 42.5,
                     "sample_count": 12,
                     "unique_cluster_count": 3,
@@ -113,7 +114,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "ok")
         self.assertEqual(response.json()["items"][0]["model_id"], "org/model")
-        self.assertEqual(str(seen[0].url), "https://community.example/v2/aggregates")
+        self.assertEqual(str(seen[0].url), "https://community.example/v3/aggregates")
         self.assertEqual(seen[0].headers["authorization"], "Bearer server-id-token")
         self.mint.assert_awaited_once_with("refresh-1")
 
@@ -249,7 +250,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         uploads = self.sample_requests()
         self.assertEqual(len(uploads), 1)
         self.assertEqual(
-            str(uploads[0].url), "https://community.example/v2/samples")
+            str(uploads[0].url), "https://community.example/v3/samples")
         self.assertEqual(
             uploads[0].headers["authorization"], "Bearer id-1")
         self.assertEqual(uploads[0].headers["idempotency-key"], "sample-1")
@@ -259,6 +260,7 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
             "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 300.0,
             "concurrency": 1,
+            "tensor_parallel_size": 1,
             "telemetry_cluster_id": self.store.get_setting(
                 "telemetry_cluster_id"
             ),

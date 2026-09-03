@@ -115,21 +115,28 @@ function aggregateQuantization(item: BenchmarkAggregate) {
 }
 
 function communityVariantKey(item: BenchmarkAggregate) {
-  return `${item.model_id}::${aggregateQuantization(item)}::${item.prompt_tokens_bucket}`
+  return `${item.model_id}::${aggregateQuantization(item)}::${item.tensor_parallel_size}::${item.prompt_tokens_bucket}`
 }
 
 function bestCommunityEstimates(items: BenchmarkAggregate[]) {
-  const byQuantization = new Map<string, BenchmarkAggregate>()
+  const byQuantizationAndTp = new Map<string, BenchmarkAggregate>()
   for (const item of items) {
-    const key = aggregateQuantization(item).toLocaleLowerCase()
-    const current = byQuantization.get(key)
+    const key = `${aggregateQuantization(item).toLocaleLowerCase()}::${item.tensor_parallel_size}`
+    const current = byQuantizationAndTp.get(key)
     if (
       !current
       || item.sample_count > current.sample_count
       || (item.sample_count === current.sample_count && item.prompt_tokens_bucket > current.prompt_tokens_bucket)
-    ) byQuantization.set(key, item)
+    ) byQuantizationAndTp.set(key, item)
   }
-  return [...byQuantization.values()]
+  return [...byQuantizationAndTp.values()]
+}
+
+function formatCommunityEstimates(items: BenchmarkAggregate[]) {
+  return [...items]
+    .sort((left, right) => left.tensor_parallel_size - right.tensor_parallel_size)
+    .map((item) => `TP${item.tensor_parallel_size} ${formatRate(item.inference_tokens_per_second)}`)
+    .join(' · ')
 }
 
 function communityRateRange(items: BenchmarkAggregate[]) {
@@ -282,21 +289,26 @@ function ModelRow({
     () => model.communityBenchmarks ?? (model.community ? [model.community] : EMPTY_COMMUNITY_BENCHMARKS),
     [model.community, model.communityBenchmarks],
   )
-  const communityByQuantization = useMemo(() => new Map(
-    bestCommunityEstimates(communityBenchmarks).map((item) => [aggregateQuantization(item).toLocaleLowerCase(), item]),
-  ), [communityBenchmarks])
+  const communityByQuantization = useMemo(() => {
+    const grouped = new Map<string, BenchmarkAggregate[]>()
+    for (const item of bestCommunityEstimates(communityBenchmarks)) {
+      const key = aggregateQuantization(item).toLocaleLowerCase()
+      grouped.set(key, [...(grouped.get(key) ?? []), item])
+    }
+    return grouped
+  }, [communityBenchmarks])
   const displayedQuantizations = useMemo(() => {
     const known = new Set(quantizations.map((item) => item.name.toLocaleLowerCase()))
     const benchmarkOnly = [...communityByQuantization.values()]
-      .filter((item) => !known.has(aggregateQuantization(item).toLocaleLowerCase()))
-      .map((item) => ({
-        name: aggregateQuantization(item),
+      .filter((items) => !known.has(aggregateQuantization(items[0]).toLocaleLowerCase()))
+      .map((items) => ({
+        name: aggregateQuantization(items[0]),
         files: [],
-        weight_size_bytes: item.weight_size_bytes,
+        weight_size_bytes: items.find((item) => item.weight_size_bytes)?.weight_size_bytes,
       }))
     return [...quantizations, ...benchmarkOnly]
   }, [communityByQuantization, quantizations])
-  const communityEstimateFor = (quantization: string) => communityByQuantization.get(quantization.toLocaleLowerCase())
+  const communityEstimatesFor = (quantization: string) => communityByQuantization.get(quantization.toLocaleLowerCase()) ?? []
   const initiallySupported = (candidate: RuntimeKind) => compatibilityByRuntime.get(candidate) !== false
   const initialRuntime = requestedRuntime && initiallySupported(requestedRuntime)
     ? requestedRuntime
@@ -408,7 +420,7 @@ function ModelRow({
       {displayedQuantizations.length > 0 && <div className="catalog-quantizations">
         <span className="detail-label">Available quantizations and artifacts</span>
         <div>{displayedQuantizations.map((variant) => <section key={variant.name}>
-          <div><strong>{variant.name}</strong><small>{communityEstimateFor(variant.name) ? `${formatRate(communityEstimateFor(variant.name)!.inference_tokens_per_second)}${variant.weight_size_bytes ? ` · ${formatBytes(variant.weight_size_bytes)}` : ''}` : variant.weight_size_bytes ? formatBytes(variant.weight_size_bytes) : ''}</small></div>
+          <div><strong>{variant.name}</strong><small>{communityEstimatesFor(variant.name).length > 0 ? `${formatCommunityEstimates(communityEstimatesFor(variant.name))}${variant.weight_size_bytes ? ` · ${formatBytes(variant.weight_size_bytes)}` : ''}` : variant.weight_size_bytes ? formatBytes(variant.weight_size_bytes) : ''}</small></div>
           {variant.files.length > 0 && <ul>{variant.files.map((file) => <li key={file.filename}><code>{file.filename}</code>{file.size_bytes ? <span>{formatBytes(file.size_bytes)}</span> : null}</li>)}</ul>}
         </section>)}</div>
       </div>}
@@ -421,7 +433,7 @@ function ModelRow({
           <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
-          {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimateFor(item.quantization) ? ` · ${formatRate(communityEstimateFor(item.quantization)!.inference_tokens_per_second)}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
+          {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
         </select></label>}
         {deploymentReady
           ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${deploymentRuntime === 'llama.cpp' ? 'Llama server' : deploymentRuntime === 'vllm' ? 'vLLM' : 'SGLang'}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>

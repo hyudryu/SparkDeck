@@ -86,7 +86,7 @@ describe('ExplorePage model rows', () => {
           id: 'org/model', author: 'org', name: 'model', downloads: 1000, likes: 12,
           parameter_count: 7_000_000_000, weight_size_bytes: 14 * gib,
           runtime_compatibility: [],
-          community: { model_id: 'org/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
+          community: { model_id: 'org/model', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
         }],
         total: 1,
       })
@@ -106,7 +106,7 @@ describe('ExplorePage model rows', () => {
     await user.click(row)
 
     expect(screen.queryByLabelText('Community inference-speed estimate for org/model')).not.toBeInTheDocument()
-    expect(screen.getByText('31.3 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('TP1 31.3 tok/s')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Deploy org/model' })).toHaveAttribute('href', '/models?model=org%2Fmodel&runtime=vllm')
   })
 
@@ -386,7 +386,7 @@ describe('ExplorePage model rows', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/catalog/models')) return json({ items: [
-        { id: 'org/easy', name: 'easy', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', prompt_tokens_bucket: 1000, inference_tokens_per_second: 40, sample_count: 10 } },
+        { id: 'org/easy', name: 'easy', parameter_count: 100_000_000_000, weight_size_bytes: 200 * gib, downloads: 30, likes: 3, runtime_compatibility: [], community: { model_id: 'org/easy', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 40, sample_count: 10 } },
         { id: 'zai-org/GLM-5.3-Flash', name: 'GLM-5.3-Flash', parameter_count: 321_300_000_000, weight_size_bytes: 306 * gib, downloads: 20, likes: 2, runtime_compatibility: [] },
         { id: 'org/tight', name: 'tight', parameter_count: 400_000_000_000, weight_size_bytes: 400 * gib, downloads: 15, likes: 1, runtime_compatibility: [] },
         { id: 'org/large', name: 'large', parameter_count: 600_000_000_000, weight_size_bytes: 600 * gib, downloads: 10, likes: 1, runtime_compatibility: [] },
@@ -520,7 +520,7 @@ describe('ExplorePage model rows', () => {
       if (path.includes('/api/v1/catalog/models')) return json({ detail: 'Hugging Face unavailable' }, 503)
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({
-        items: [{ model_id: 'community/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 18.5, sample_count: 22 }],
+        items: [{ model_id: 'community/model', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 18.5, sample_count: 22 }],
         availability: 'local',
         evidence_policy: {},
       })
@@ -535,7 +535,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByRole('checkbox', { name: /Only with community data/ })).not.toBeInTheDocument()
     await user.click(row)
     const quantizations = (await screen.findByText('Available quantizations and artifacts')).closest<HTMLElement>('.catalog-quantizations')!
-    expect(within(quantizations).getByText(/^18\.5 tok\/s/)).toBeInTheDocument()
+    expect(within(quantizations).getByText(/^TP1 18\.5 tok\/s/)).toBeInTheDocument()
   })
 
   it('does not carry a hidden Hugging Face Llama fit filter into the community tab', async () => {
@@ -564,7 +564,7 @@ describe('ExplorePage model rows', () => {
       ] })
       return json({
         items: [{
-          model_id: 'org/community-mixed', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
+          model_id: 'org/community-mixed', quantization: 'Q4_K_M', tensor_parallel_size: 1, prompt_tokens_bucket: 1000,
           inference_tokens_per_second: 20, sample_count: 10, unique_cluster_count: 2,
           weight_size_bytes: 12 * gib,
         }],
@@ -622,8 +622,8 @@ describe('ExplorePage model rows', () => {
       ] })
       return json({
         items: [
-          { model_id: 'org/community-llama', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, unique_cluster_count: 2 },
-          { model_id: 'org/community-llama', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, unique_cluster_count: 2 },
+          { model_id: 'org/community-llama', quantization: 'Q4_K_M', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, unique_cluster_count: 2 },
+          { model_id: 'org/community-llama', quantization: 'Q8_0', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, unique_cluster_count: 2 },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -664,9 +664,9 @@ describe('ExplorePage model rows', () => {
       ] })
       return json({
         items: [
-          { model_id: 'org/grouped-vllm', quantization: 'Q8_0', prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, weight_size_bytes: 20 * gib },
-          { model_id: 'org/grouped-vllm', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, weight_size_bytes: 8 * gib },
-          { model_id: 'org/twelve-gib', quantization: 'FP16', prompt_tokens_bucket: 1000, inference_tokens_per_second: 15, sample_count: 10, weight_size_bytes: 12 * gib },
+          { model_id: 'org/grouped-vllm', quantization: 'Q8_0', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 20, sample_count: 20, weight_size_bytes: 20 * gib },
+          { model_id: 'org/grouped-vllm', quantization: 'Q4_K_M', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 30, sample_count: 10, weight_size_bytes: 8 * gib },
+          { model_id: 'org/twelve-gib', quantization: 'FP16', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 15, sample_count: 10, weight_size_bytes: 12 * gib },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -692,6 +692,7 @@ describe('ExplorePage model rows', () => {
     const user = userEvent.setup()
     const items = Array.from({ length: 120 }, (_, index) => ({
       model_id: `community/model-${index}`,
+      tensor_parallel_size: 1,
       prompt_tokens_bucket: 1000,
       inference_tokens_per_second: 20 + index,
       sample_count: 10,
@@ -732,9 +733,10 @@ describe('ExplorePage model rows', () => {
       if (path.endsWith('/api/v1/nodes')) return json({ items: [] })
       return json({
         items: [
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 1000, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
-          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', prompt_tokens_bucket: 400, inference_tokens_per_second: 60.1, sample_count: 30, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 52.4, sample_count: 30, unique_cluster_count: 7, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'Q4_K_M', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.2, sample_count: 20, unique_cluster_count: 4, parameter_count: 27_000_000_000, weight_size_bytes: 15 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', tensor_parallel_size: 1, prompt_tokens_bucket: 400, inference_tokens_per_second: 60.1, sample_count: 30, unique_cluster_count: 3, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
+          { model_id: 'RadixArk/Qwen3.8-27B', quantization: 'NVFP4', tensor_parallel_size: 4, prompt_tokens_bucket: 1000, inference_tokens_per_second: 83.7, sample_count: 18, unique_cluster_count: 5, parameter_count: 27_000_000_000, weight_size_bytes: 16 * gib },
         ],
         availability: 'available', evidence_policy: {},
       })
@@ -749,7 +751,7 @@ describe('ExplorePage model rows', () => {
     expect(screen.queryByText('Downloads')).not.toBeInTheDocument()
     expect(screen.queryByText('Likes')).not.toBeInTheDocument()
     const row = await screen.findByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B' })
-    expect(within(row).getByText('31.2–52.4 tok/s')).toBeInTheDocument()
+    expect(within(row).getByText('31.2–83.7 tok/s')).toBeInTheDocument()
     expect(within(row).getByText('30')).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Expand RadixArk/Qwen3.8-27B' })).toHaveLength(1)
 
@@ -757,9 +759,10 @@ describe('ExplorePage model rows', () => {
     expect(await screen.findByText('Available quantizations and artifacts')).toBeInTheDocument()
     expect(screen.getByText('model-nvfp4.safetensors')).toBeInTheDocument()
     expect(screen.getByText('qwen3.8-q4_k_m.gguf')).toBeInTheDocument()
+    expect(screen.getByText(/TP1 52\.4 tok\/s · TP4 83\.7 tok\/s/)).toBeInTheDocument()
     const modelArticle = row.closest('article')!
-    expect(within(modelArticle).getByText(/^52\.4 tok\/s/)).toBeInTheDocument()
-    expect(within(modelArticle).getByText(/^31\.2 tok\/s/)).toBeInTheDocument()
+    expect(within(modelArticle).getByText(/^TP1 52\.4 tok\/s/)).toBeInTheDocument()
+    expect(within(modelArticle).getByText(/^TP1 31\.2 tok\/s/)).toBeInTheDocument()
     expect(within(modelArticle).queryByText('60.1 tok/s')).not.toBeInTheDocument()
     expect(within(modelArticle).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
       'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=vllm&quantization=NVFP4',
@@ -770,7 +773,7 @@ describe('ExplorePage model rows', () => {
     await user.selectOptions(deploymentType, 'llama.cpp')
     const artifactSelect = within(modelArticle).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })
     expect(artifactSelect).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')
-    expect(within(artifactSelect).getByRole('option', { name: /Q4_K_M · 31\.2 tok\/s/ })).toBeInTheDocument()
+    expect(within(artifactSelect).getByRole('option', { name: /Q4_K_M · TP1 31\.2 tok\/s/ })).toBeInTheDocument()
     expect(within(modelArticle).getByRole('link', { name: 'Deploy RadixArk/Qwen3.8-27B' })).toHaveAttribute(
       'href', '/models?model=RadixArk%2FQwen3.8-27B&runtime=llama.cpp&quantization=Q4_K_M&artifact=qwen3.8-q4_k_m.gguf',
     )
@@ -786,7 +789,7 @@ describe('ExplorePage model rows', () => {
           id: 'org/model', author: 'org', name: 'model', downloads: 1000, likes: 12,
           parameter_count: 7_000_000_000, weight_size_bytes: 14 * gib,
           runtime_compatibility: [],
-          community: { model_id: 'org/model', prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
+          community: { model_id: 'org/model', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 31.25, sample_count: 14 },
         }],
         total: 1,
       })

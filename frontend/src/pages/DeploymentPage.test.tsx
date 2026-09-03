@@ -114,6 +114,48 @@ describe('deployment object page', () => {
     expect(save).toBeEnabled()
   })
 
+  it('renames and saves an unlaunched sharded clone before nodes are selected', async () => {
+    const user = userEvent.setup()
+    const clone = {
+      ...detail,
+      alias: '(Copy) Reasoning server',
+      status: 'saved',
+      node_ids: [],
+      launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/runtime-flags/preview' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({ flags: body.extra_args, command_flags: body.extra_args.join(' '), environment: body.environment }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({ ...clone, alias: body.alias }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(clone), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    const name = await screen.findByRole('textbox', { name: 'Deployment name' })
+    expect(name).toHaveValue('(Copy) Reasoning server')
+    await user.clear(name)
+    await user.type(name, 'Vision clone tuned')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    const saveCall = await waitFor(() => fetchMock.mock.calls.find(([input, init]) => (
+      String(input) === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT'
+    )))
+    expect(JSON.parse(String(saveCall?.[1]?.body)).alias).toBe('Vision clone tuned')
+    expect(await screen.findByRole('heading', { name: 'Vision clone tuned' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('dialog', { name: 'Start Vision clone tuned' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start on 4 nodes' })).toBeInTheDocument()
+  })
+
   it('offers KV cache dtype choices and saves the selected value', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -722,7 +764,7 @@ describe('env-file backed deployment page', () => {
     ])
   })
 
-  it('starts a hook-backed TP deployment without opening conversion or sending nodes', async () => {
+  it('confirms a hook-backed TP deployment before starting without sending nodes', async () => {
     const user = userEvent.setup()
     const hookDetail = {
       ...envFileDetail,
@@ -737,9 +779,11 @@ describe('env-file backed deployment page', () => {
     await user.clear(contextWindow)
     await user.type(contextWindow, '131072')
     await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('dialog', { name: 'Start Reasoning server' })).toBeInTheDocument()
+    expect(screen.getByText(/existing fixed targets \(2 nodes\)/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm start' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Start on/ })).not.toBeInTheDocument()
     const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
     expect(mutations.map(([input, init]) => `${init?.method} ${String(input)}`)).toEqual([
       'PUT /api/v1/deployments/container%3Avllm-dspark/settings',
@@ -770,9 +814,10 @@ describe('env-file backed deployment page', () => {
     await user.clear(contextWindow)
     await user.type(contextWindow, '131072')
     await user.click(screen.getByRole('button', { name: 'Run' }))
+    expect(await screen.findByRole('dialog', { name: 'Start Reasoning server' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm start' }))
 
     expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Start on/ })).not.toBeInTheDocument()
     const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
     const updateBody = JSON.parse(String(mutations[0]?.[1]?.body))
     expect(updateBody.command_flags).toBe(rawFlags)

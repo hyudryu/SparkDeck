@@ -71,9 +71,10 @@ const flagValue = (args: string[], names: string[]) => {
   return undefined
 }
 
-type Editor = Record<keyof DeploymentLaunchControls | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
+type Editor = Record<keyof DeploymentLaunchControls | 'alias' | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
+  alias: detail.alias,
   context_window: detail.launch_controls.context_window?.toString() ?? '',
   max_concurrency: detail.launch_controls.max_concurrency?.toString() ?? '',
   tensor_parallel_size: detail.launch_controls.tensor_parallel_size?.toString()
@@ -260,8 +261,9 @@ const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp',
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
 const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
-function updateInput(editor: Editor, preserveCommandFlags = false): DeploymentUpdateInput {
+function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias = false): DeploymentUpdateInput & { alias?: string } {
   return {
+    ...(includeAlias ? { alias: editor.alias.trim() } : {}),
     ...(preserveCommandFlags
       ? { command_flags: editor.extra_args }
       : { extra_args: splitFlags(editor.extra_args) }),
@@ -392,7 +394,7 @@ export function DeploymentPage() {
     }
     const updated = await api.deployments.update(
       deploymentId,
-      updateInput(editor, detail?.command_flags !== undefined),
+      updateInput(editor, detail?.command_flags !== undefined, detail?.status === 'saved'),
     )
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
@@ -449,7 +451,7 @@ export function DeploymentPage() {
   const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
     if (usesDirectLifecycle()) {
-      void run()
+      setRunSelection([])
       return
     }
     const required = requiredRunNodes()
@@ -515,6 +517,7 @@ export function DeploymentPage() {
         {!detail.editable && <p className="form-error wide-field" role="status">{detail.edit_reason || 'Stop this deployment before editing its launch settings.'}</p>}
         {error && <p className="form-error wide-field" role="alert">{error}</p>}
         {notice && <p className="muted wide-field" role="status">{notice}</p>}
+        {detail.status === 'saved' && <label className="field"><span>Deployment name</span><input required disabled={disabled} value={editor.alias} onChange={(event) => set('alias', event.target.value)} /></label>}
         {envFileMode && <label className="field"><span>Served model name</span><input disabled={disabled} value={servedName} onChange={(event) => setServedName(event.target.value)} /></label>}
         <label className="field"><span>Context window</span><input disabled={envControlDisabled('context_window')} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} />{envControlHint('context_window')}</label>
         <label className="field"><span>Max concurrency</span><input disabled={envControlDisabled('max_concurrency')} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} />{envControlHint('max_concurrency')}</label>
@@ -557,6 +560,7 @@ export function DeploymentPage() {
       </form>
     </Panel>
     {runSelection && (() => {
+      const directLifecycle = usesDirectLifecycle()
       const required = requiredRunNodes()
       const tensor = Number(detail.runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size) || 1
       const layoutDescription = detail.deployment_mode === 'sharded'
@@ -566,13 +570,15 @@ export function DeploymentPage() {
           : `This single-node layout runs TP${tensor} on one physical node.`
       const exactCount = runSelection.length === required
       const allSelectable = runSelection.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-      const ready = !nodes.loading && !nodes.error && exactCount && allSelectable
+      const ready = directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable)
       return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="run-deployment-title">
           <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="run-deployment-title">Start {detail.alias}</h2></div><button className="icon-button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)} aria-label="Close dialog">×</button></div>
-          <p className="modal-description">{layoutDescription} Select where SparkDeck should start the deployment.</p>
+          <p className="modal-description">{directLifecycle
+            ? `This externally controlled deployment will start on its existing fixed targets (${required} ${required === 1 ? 'node' : 'nodes'}). Confirm to continue.`
+            : `${layoutDescription} Select where SparkDeck should start the deployment.`}</p>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <NodeSelector
+          {!directLifecycle && <NodeSelector
             nodes={nodes.data ?? []}
             selectedIds={runSelection}
             onChange={(next) => setRunSelection(next.length <= required ? next : runSelection)}
@@ -584,9 +590,9 @@ export function DeploymentPage() {
             primaryId={runSelection[0]}
             legend="Target nodes"
             help={`Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}. The first selected node coordinates the deployment.`}
-          />
-          {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
-          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+          />}
+          {!directLifecycle && !exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : directLifecycle ? 'Confirm start' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
         </section>
       </div>
     })()}

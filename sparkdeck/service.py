@@ -117,11 +117,17 @@ _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
 
 def _container_last_deployed_at(container: dict[str, Any]) -> str | float | None:
     """Return a usable Docker launch timestamp for deployment recency."""
-    value = container.get("started_at") or container.get("created")
-    if isinstance(value, (int, float)):
-        return value if value > 0 else None
-    if isinstance(value, str) and value and not value.startswith("0001-"):
-        return value
+    # Docker reports the zero RFC3339 timestamp for containers that were
+    # created but have never started.  Do not let that truthy placeholder hide
+    # the real creation time: the card still needs to sort by and display the
+    # latest launch/configuration attempt.
+    for value in (container.get("started_at"), container.get("created")):
+        if isinstance(value, (int, float)):
+            if value > 0:
+                return value
+            continue
+        if isinstance(value, str) and value and not value.startswith("0001-"):
+            return value
     return None
 
 
@@ -2075,12 +2081,19 @@ class SparkDeckService:
                 "speculative_method", "draft_sample_method",
                 "dspark_num_speculative_tokens",
             }
-            if engine == "vllm" and any(
+            raw_speculative = self.manager._cli_option(
+                raw_args, {"--speculative-config"},
+            )
+            speculative_changed = any(
                 key in submitted and submitted.get(key) != current_controls.get(key)
                 for key in speculative_keys
+            )
+            if engine == "vllm" and (
+                speculative_changed
+                or self.manager._environment_reference(raw_speculative) is not None
             ):
                 speculative_value = self.manager._cli_option(
-                    merged_args, {"--speculative-config"}
+                    command_args, {"--speculative-config"}
                 )
                 command_flags = self.manager._replace_command_option(
                     command_flags, {"--speculative-config"},
@@ -2463,7 +2476,11 @@ class SparkDeckService:
         )
         if contract["deployment_mode"] == "single" and len(effective_nodes) > 1:
             raise ValueError("single deployment requires exactly one node")
-        if contract["deployment_mode"] == "sharded" and len(effective_nodes) < 2:
+        if (
+            contract["deployment_mode"] == "sharded"
+            and effective_nodes
+            and len(effective_nodes) < 2
+        ):
             raise ValueError("sharded deployment requires at least two nodes")
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(

@@ -485,7 +485,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
                 "command_flags": (
                     '--enable-prefix-caching '
                     '--max-cudagraph-capture-size "$(( 6 * (${TOKENS:-5} + 1) ))" '
-                    '--speculative-config "${SPECULATIVE_CONFIG}"'
+                    "--speculative-config '${SPECULATIVE_CONFIG}'"
                 ),
                 "context_window": 65536, "max_concurrency": 8,
                 "thinking_mode": "default", "gpu_memory_utilization": 0.85,
@@ -512,7 +512,9 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
                         "pipeline_parallel_size": 1,
                         "kv_cache_dtype": "fp8",
                         "thinking_mode": "disabled",
-                        "dspark_num_speculative_tokens": None,
+                        "speculative_method": "dspark",
+                        "draft_sample_method": "greedy",
+                        "dspark_num_speculative_tokens": 6,
                         "max_cudagraph_capture_size": None,
                         "max_num_batched_tokens": 8192,
                     },
@@ -540,7 +542,9 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-pp 1", flags)
         self.assertIn("--max-num-batched-tokens 8192", flags)
         self.assertIn('$(( 6 * (${TOKENS:-5} + 1) ))', flags)
-        self.assertIn('"${SPECULATIVE_CONFIG}"', flags)
+        self.assertNotIn("${SPECULATIVE_CONFIG}", flags)
+        self.assertIn("--speculative-config '", flags)
+        self.assertIn('"num_speculative_tokens":6', flags)
 
     async def test_settings_takeover_rejects_running_lifecycle_hook(self):
         container = {

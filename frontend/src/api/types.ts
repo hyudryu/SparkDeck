@@ -966,6 +966,14 @@ export interface UsageMember {
   alias?: string | null
   merge_group?: string | null
   routed_to?: string | null
+  deployment_id?: string | null
+  pricing?: UsagePricing | null
+}
+
+export interface UsagePricing {
+  input_cost_per_1m: number | null
+  cache_cost_per_1m: number | null
+  output_cost_per_1m: number | null
 }
 
 export interface UsageGroup {

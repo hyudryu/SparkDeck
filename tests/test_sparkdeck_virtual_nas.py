@@ -1498,7 +1498,80 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(entry["source"], "ComfyUI")
                 self.assertTrue(entry["externally_managed"])
                 self.assertFalse(entry["transferable"])
-                self.assertFalse(entry["deletable"])
+                self.assertNotEqual(entry.get("deletable"), False)
+
+    async def test_delete_unrecognized_comfyui_groups_re_resolves_listed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = [
+                Path(directory) / "first" / "models",
+                Path(directory) / "second" / "models",
+            ]
+            deleted_relatives = (
+                "checkpoints/Minimax Video/model.safetensors",
+                "checkpoints/Minimax Video/nested/refiner.gguf",
+            )
+            for root in roots:
+                for relative in deleted_relatives:
+                    target = root.joinpath(*relative.split("/"))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"weights")
+                sibling = root / "checkpoints" / "Other" / "keep.safetensors"
+                sibling.parent.mkdir(parents=True, exist_ok=True)
+                sibling.write_bytes(b"keep")
+            loose = roots[0] / "loras" / "foo.safetensors"
+            loose.parent.mkdir(parents=True, exist_ok=True)
+            loose.write_bytes(b"loose")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: list(roots),
+            )
+
+            listed = {item["model_id"] for item in nas.inventory()}
+            self.assertIn("checkpoints/Minimax Video", listed)
+            self.assertIn("loras/foo", listed)
+            self.assertTrue(nas.delete_model("checkpoints/Minimax Video")["ok"])
+
+            for root in roots:
+                for relative in deleted_relatives:
+                    self.assertFalse(root.joinpath(*relative.split("/")).exists())
+                self.assertEqual(
+                    (root / "checkpoints" / "Other" / "keep.safetensors").read_bytes(),
+                    b"keep",
+                )
+            self.assertTrue(loose.is_file())
+            self.assertTrue(nas.delete_model("loras/foo")["ok"])
+            self.assertFalse(loose.exists())
+
+    async def test_guessed_fallback_identity_cannot_delete_known_bundle_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI" / "models"
+            bundle_files = (
+                "diffusion_models/minimax_music3_dit_fp16.safetensors",
+                "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+                "vae/minimax_music3_dav.safetensors",
+            )
+            for relative in bundle_files:
+                target = root.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"weights")
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "missing-hub",
+                FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            listed = {item["model_id"] for item in nas.inventory()}
+            self.assertNotIn(
+                "diffusion_models/minimax_music3_dit_fp16", listed,
+            )
+            with self.assertRaises(LookupError):
+                nas.delete_model("diffusion_models/minimax_music3_dit_fp16")
+
+            for relative in bundle_files:
+                self.assertEqual(
+                    root.joinpath(*relative.split("/")).read_bytes(), b"weights",
+                )
 
     async def test_complete_model_ignores_unassigned_incomplete_blob(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3246,6 +3319,28 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             result = await manager.delete_virtual_nas_model("local", "org/model")
             self.assertTrue(result["ok"])
             self.assertFalse(repository.exists())
+
+    async def test_manager_deletes_listed_comfyui_identity_with_display_space(self):
+        manager = Manager.__new__(Manager)
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.model_in_transfer.return_value = False
+        manager.virtual_nas.delete_model.return_value = {
+            "ok": True, "model_id": "checkpoints/Minimax Video",
+        }
+        manager.list_containers = AsyncMock(return_value=[])
+        manager._unsloth_loaded_model = AsyncMock(return_value=None)
+        manager.deployments = []
+        manager._invalidate_virtual_nas_nodes = Mock()
+
+        result = await manager.delete_virtual_nas_model(
+            "local", "checkpoints/Minimax Video",
+        )
+
+        self.assertTrue(result["ok"])
+        manager.virtual_nas.delete_model.assert_called_once_with(
+            "checkpoints/Minimax Video",
+        )
+        manager._invalidate_virtual_nas_nodes.assert_called_once_with()
 
     async def test_public_inventory_uses_node_disk_capacity(self):
         manager = Manager.__new__(Manager)

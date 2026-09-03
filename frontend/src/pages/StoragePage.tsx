@@ -276,7 +276,6 @@ export function StoragePage() {
   }
 
   const removeModel = async (node: StorageNode, model: StorageModel) => {
-    if (model.deletable === false) return
     if (!await confirm({
       title: `Delete ${model.model_id}?`,
       message: model.externally_managed
@@ -457,13 +456,13 @@ export function StoragePage() {
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
                     <div><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}{model.quantizations?.length ? ` · ${model.quantizations.join(', ')}` : ''}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
-                    {model.deletable !== false && <Button
+                    <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
                       title={`Delete from ${node.name}`}
                       disabled={!node.online || busy === `delete:${node.id}:${model.model_id}` || busy === `download:${node.id}:${model.model_id}`}
                       onClick={() => void removeModel(node, model)}
-                    ><Trash2 size={15} /></Button>}
+                    ><Trash2 size={15} /></Button>
                   </li>
                   if (!job) return null
                   const progress = jobProgress(job)

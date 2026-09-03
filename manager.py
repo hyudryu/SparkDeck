@@ -53,6 +53,7 @@ from sparkdeck.virtual_nas import (
     partial_download_size_bytes,
     transfer_required_free_bytes,
     validate_model_id,
+    validate_storage_model_id,
     validate_revision,
 )
 from sparkdeck.updater import CAPABILITY, current_revision
@@ -1822,7 +1823,7 @@ class Manager:
         instructions = [
             "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
             "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
-            "Complete externally managed ComfyUI bundles are inventoried read-only and cannot be transferred or deleted here.",
+            "ComfyUI weights can be deleted in place; only recognized complete bundles can be transferred between nodes.",
         ]
         if not self.virtual_nas_enabled():
             self._virtual_nas_rate_samples = {}
@@ -3091,7 +3092,7 @@ class Manager:
         }
 
     async def delete_virtual_nas_model(self, node_id: str, model_id: str) -> dict:
-        model_id = validate_model_id(model_id)
+        model_id = validate_storage_model_id(model_id)
         node_id = str(node_id or "")
         if self.virtual_nas.model_in_transfer(model_id, node_id):
             raise RuntimeError("model is in use by a virtual NAS transfer")
@@ -4473,6 +4474,63 @@ class Manager:
         return cls._stats_key(
             model, cls._variant_from_cmd(settings.get("extra_args") or [])
         ) if model else ""
+
+    def _deployment_pricing_resolution(self, model: str) -> dict | None:
+        """Return the one deployment whose persisted rates price *model*.
+
+        Exact usage identity matching mirrors :meth:`calculate_cost`. When
+        duplicate deployments share an identity, one explicitly priced match
+        remains authoritative over otherwise blank matches. Multiple priced
+        matches are ambiguous. When every match is blank, a unique live owner
+        is actionable; this lets a running deployment be priced even while a
+        stopped deployment with the same model identity is also saved.
+        """
+        model_key = str(model or "").strip().casefold()
+        if not model_key:
+            return None
+        matches = [
+            deployment
+            for deployment in getattr(self, "deployments", [])
+            if self._deployment_pricing_model_key(deployment).casefold()
+            == model_key
+        ]
+        priced = [
+            deployment for deployment in matches
+            if any(
+                (deployment.get("launch_settings") or {}).get(field) is not None
+                for field in (
+                    "input_cost_per_1m",
+                    "cache_cost_per_1m",
+                    "output_cost_per_1m",
+                )
+            )
+        ]
+        if len(priced) == 1:
+            return priced[0]
+        if priced:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        live_matches = [
+            deployment for deployment in matches
+            if str(deployment.get("desired_state") or "running").casefold()
+            != "stopped"
+            and str(deployment.get("status") or "").casefold()
+            not in {"stopped", "error", "removed"}
+        ]
+        return live_matches[0] if len(live_matches) == 1 else None
+
+    def _usage_member_pricing(self, model: str) -> dict[str, Any]:
+        """Return actionable persisted pricing metadata for one Usage member."""
+        deployment = self._deployment_pricing_resolution(model)
+        deployment_id = str((deployment or {}).get("id") or "").strip()
+        if not deployment or not deployment_id:
+            return {"deployment_id": None, "pricing": None}
+        settings = deployment.get("launch_settings") or {}
+        return {
+            "deployment_id": deployment_id,
+            "pricing": self._deployment_pricing(settings),
+        }
 
     async def update_deployment_pricing(
         self, deployment_id: str, body: dict
@@ -9609,6 +9667,8 @@ class Manager:
                     "cached": effective_cached,
                     "output": row["stats"].get("output", 0),
                 })["total_cost"]
+                for member in row["members"]:
+                    member.update(self._usage_member_pricing(pricing_model))
                 if estimated_cached:
                     row["cost_estimated"] = True
             else:
@@ -9618,6 +9678,10 @@ class Manager:
                     ).get("total_cost", 0.0)
                     for member in row["members"]
                 )
+                for member in row["members"]:
+                    member.update(self._usage_member_pricing(
+                        member["_pricing_model"],
+                    ))
                 if estimated_cached:
                     row["cost_estimated"] = True
             row["members"].sort(key=lambda member: (
@@ -9661,11 +9725,9 @@ class Manager:
         deployment_pricing: dict[str, Any] | None = None
 
         model_lower = model.casefold()
-        for deployment in getattr(self, "deployments", []):
+        deployment = self._deployment_pricing_resolution(model)
+        if deployment is not None:
             settings = deployment.get("launch_settings") or {}
-            pricing_model_key = self._deployment_pricing_model_key(deployment)
-            if not pricing_model_key or pricing_model_key.casefold() != model_lower:
-                continue
             values = {
                 "input": settings.get("input_cost_per_1m"),
                 "output": settings.get("output_cost_per_1m"),
@@ -9673,7 +9735,6 @@ class Manager:
             }
             if any(value is not None for value in values.values()):
                 deployment_pricing = values
-                break
 
         # Check per-model unsloth settings
         for key, settings in getattr(self, "unsloth_settings", {}).items():

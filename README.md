@@ -253,7 +253,7 @@ The MCP server exposes the same guarded Storage operations as the app:
 - `list_storage_transfers` and `get_storage_transfer` report download/copy progress, live rate, receiver phase, completion, and errors; and
 - `delete_storage_weights` removes one exact node/model copy only when `confirm=true`.
 
-Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. Externally managed weights remain read-only.
+Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. ComfyUI weights listed in Storage can be deleted in place; recognized complete bundles can also be transferred.
 
 MCP-created deployments use the current `managed_by=sparkdeck-mcp` marker. SparkDeck continues to recognize the legacy `managed_by=vllm-controller-mcp` marker solely so deployments created by older releases can still be managed safely.
 

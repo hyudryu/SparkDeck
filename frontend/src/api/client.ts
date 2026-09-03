@@ -974,6 +974,14 @@ export const api = {
         // the backend to leave the stored merge group untouched.
         body: JSON.stringify({ model, alias, merge_group }),
       }),
+    updatePricing: (deploymentId: string, pricing: {
+      input_cost_per_1m: number | null
+      cache_cost_per_1m: number | null
+      output_cost_per_1m: number | null
+    }) => request<void>(`/api/deployments/${encodeURIComponent(deploymentId)}/pricing`, {
+      method: 'PUT',
+      body: JSON.stringify(pricing),
+    }),
     setRoute: (source: string, destination: string) =>
       request<void>('/api/token-stats/rules', {
         method: 'PUT',

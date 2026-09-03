@@ -425,7 +425,7 @@ describe('StoragePage', () => {
               {
                 model_id: 'Comfy-Org/MiniMax-Music-3', size_bytes: 21_000_000_000,
                 partial: false, revision: 'ComfyUI', source: 'ComfyUI',
-                externally_managed: true,
+                externally_managed: true, deletable: false,
               },
             ],
           }

@@ -2018,6 +2018,139 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cost["output_cost_per_1m"], 9.0)
 
+    def test_usage_member_exposes_actionable_persisted_deployment_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "org/model [nvfp4]": {
+                "input": 100, "cached": 25, "output": 40, "requests": 1,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-1",
+            "model": "org/model",
+            "pricing_model_key": "org/model [nvfp4]",
+            "launch_settings": {
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": 0.0,
+            },
+        }]
+
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(member["deployment_id"], "deployment-1")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": 1.25,
+            "cache_cost_per_1m": None,
+            "output_cost_per_1m": 0.0,
+        })
+
+    def test_usage_member_resolves_routed_destination_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/source": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"legacy/source": "org/master"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        member = row["members"][0]
+
+        self.assertEqual(row["pricing_model"], "org/master")
+        self.assertEqual(member["routed_to"], "org/master")
+        self.assertEqual(member["deployment_id"], "deployment-master")
+        self.assertEqual(member["pricing"]["output_cost_per_1m"], 4.0)
+
+    def test_ambiguous_deployment_pricing_is_not_order_dependent_or_editable(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "org/model": {
+                "input": 0, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [
+            {
+                "id": "deployment-a",
+                "pricing_model_key": "org/model",
+                "launch_settings": {"output_cost_per_1m": 1.0},
+            },
+            {
+                "id": "deployment-b",
+                "pricing_model_key": "org/model",
+                "launch_settings": {"output_cost_per_1m": 9.0},
+            },
+        ]
+
+        cost = instance.calculate_cost("org/model", instance.token_stats["org/model"])
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(cost["output_cost_per_1m"], 0.0)
+        self.assertIsNone(member["deployment_id"])
+        self.assertIsNone(member["pricing"])
+
+    def test_usage_pricing_prefers_unique_live_owner_among_blank_matches(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "deepseek/model [nvfp4]": {
+                "input": 0, "cached": 0, "output": 10, "requests": 1,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [
+            {
+                "id": "tp2-stopped",
+                "pricing_model_key": "deepseek/model [nvfp4]",
+                "status": "stopped",
+                "desired_state": "stopped",
+                "launch_settings": {},
+            },
+            {
+                "id": "tp4-running",
+                "pricing_model_key": "deepseek/model [nvfp4]",
+                "status": "ready",
+                "desired_state": "running",
+                "launch_settings": {},
+            },
+        ]
+
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(member["deployment_id"], "tp4-running")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": None,
+            "cache_cost_per_1m": None,
+            "output_cost_per_1m": None,
+        })
+
     def test_pricing_rejects_non_finite_numbers(self) -> None:
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=value):

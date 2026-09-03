@@ -509,13 +509,14 @@ describe('models page running actions', () => {
     })
   })
 
-  it('confirms a fixed-target Start for a discovered container that cannot be promoted safely', async () => {
+  it('confirms a fixed-target Start for an unsafe direct-discovered container', async () => {
     const user = userEvent.setup()
     const external = {
       id: 'container:protected-vllm', alias: 'Protected vLLM', runtime: 'vllm', kind: 'external',
       model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
       settings: { tensor_parallel_size: 2 }, deployment_mode: 'sharded',
-      required_node_count: 2, managed: false, controllable: true, promotable: false,
+      required_node_count: 2, managed: false, controllable: true,
+      direct_start: true, promotable: false,
     }
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)

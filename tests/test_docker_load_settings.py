@@ -803,6 +803,25 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("'${FIRST_CONFIG}'", updated)
         self.assertNotIn("'${EFFECTIVE_CONFIG}'", updated)
 
+    def test_shell_speculative_env_repair_handles_line_continuation(self):
+        script = (
+            "vllm serve org/model \\\n"
+            "  --speculative-config \\\n"
+            "    '${SPECULATIVE_CONFIG}' \\\n"
+            "  --max-num-seqs 8"
+        )
+
+        updated = self.manager._quote_shell_speculative_environment_reference(
+            script,
+        )
+
+        self.assertIn(
+            "--speculative-config \\\n    \"${SPECULATIVE_CONFIG}\"",
+            updated,
+        )
+        self.assertNotIn("'${SPECULATIVE_CONFIG}'", updated)
+        self.assertIn("\\\n  --max-num-seqs 8", updated)
+
     async def test_update_rejects_shell_template_argv_command(self):
         name = "external-vllm"
         model = "example/Model"

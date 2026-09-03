@@ -3906,6 +3906,13 @@ class SparkDeckService:
             "node_ids": list(node_ids),
             "api_port": container.get("port"),
         }, container)
+        if container.get("direct_start") and not self._recovered_launch_is_portable(
+            launch_settings,
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on shell expansion"
+            )
         promotion_record_id = str(uuid.uuid4())
         launch_settings.update({
             "deployment_name": deployment.get("alias"),
@@ -3958,6 +3965,56 @@ class SparkDeckService:
                     f"{exc}; managed promotion rollback failed: {rollback_error}"
                 ) from exc
             raise
+
+    def _recovered_launch_is_portable(
+        self, launch_settings: dict[str, Any],
+    ) -> bool:
+        """Whether recovered argv can be replayed by an exec-form container."""
+        checker = getattr(self.manager, "_has_unresolvable_shell_tokens", None)
+        if not callable(checker) or not isinstance(launch_settings, dict):
+            return False
+        extra_args = launch_settings.get("extra_args")
+        if not isinstance(extra_args, list) or any(
+            not isinstance(item, str) for item in extra_args
+        ):
+            return False
+        model = launch_settings.get("model")
+        argv = [str(model), *extra_args] if model not in (None, "") else extra_args
+        try:
+            return not checker(argv)
+        except (TypeError, ValueError):
+            return False
+
+    def _direct_start_is_portable(
+        self, container: dict[str, Any], runtime: str, model: str,
+    ) -> bool:
+        """Fail closed when direct-start recovery would lose shell semantics."""
+        if not container.get("direct_start"):
+            return True
+        recover = getattr(
+            self.manager, "_recovered_deployment_launch_settings", None,
+        )
+        if not callable(recover):
+            return False
+        settings = container.get("load_settings") or {}
+        try:
+            tensor_parallel = max(
+                1, int(settings.get("tensor_parallel_size") or 1),
+            )
+        except (TypeError, ValueError):
+            tensor_parallel = 1
+        try:
+            launch_settings = recover({
+                "name": container.get("alias") or container.get("served_model") or model,
+                "model": settings.get("model") or model,
+                "engine": runtime,
+                "mode": "sharded" if tensor_parallel > 1 else "single",
+                "node_ids": [LOCAL_NODE_ID],
+                "api_port": container.get("port"),
+            }, container)
+        except (TypeError, ValueError):
+            return False
+        return self._recovered_launch_is_portable(launch_settings)
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
@@ -5302,7 +5359,10 @@ class SparkDeckService:
                 for item in await self.deployments():
                     if str(item.get("id") or "") == deployment_id:
                         continue
-                    if str(item.get("alias") or "").casefold() == folded:
+                    if folded in {
+                        str(item.get("id") or "").casefold(),
+                        str(item.get("alias") or "").casefold(),
+                    }:
                         raise ValueError(
                             f"deployment alias '{alias}' is already in use"
                         )
@@ -5389,6 +5449,7 @@ class SparkDeckService:
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
                 and not str(container.get("stop_command") or "").strip()
+                and self._direct_start_is_portable(container, runtime, model)
             ),
             "controllable": True,
             "logs_available": True,

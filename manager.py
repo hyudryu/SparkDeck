@@ -4688,9 +4688,10 @@ class Manager:
             return script
         flags = command.group("flags")
         scalar = r'''(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)'''
+        separator = r'''(?P<separator>=|(?:[ \t]|\\(?:\r\n|\n))+)'''
         pattern = re.compile(
             rf"(?<!\S)(?P<option>--speculative-config|-sc)"
-            rf"(?P<separator>=|\s+){scalar}"
+            rf"{separator}{scalar}"
         )
 
         def replace(match: re.Match[str]) -> str:

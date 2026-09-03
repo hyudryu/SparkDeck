@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -692,6 +693,39 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already in use", response.json()["detail"])
         rename.assert_not_awaited()
 
+    async def test_rename_discovered_container_rejects_deployment_id_conflict(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        other = {
+            "id": "saved-deployment-id", "alias": "Different alias", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/other"},
+            "status": "saved", "settings": {},
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, other]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "vllm-dspark"}),
+            ),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "SAVED-DEPLOYMENT-ID"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
     async def test_rename_discovered_container_rejects_cluster_member(self):
         rename = AsyncMock()
         with (
@@ -1263,6 +1297,24 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
 
+        @staticmethod
+        def _has_unresolvable_shell_tokens(args):
+            return type(server.manager)._has_unresolvable_shell_tokens(args)
+
+        @staticmethod
+        def _recovered_deployment_launch_settings(deployment, container=None):
+            settings = (container or {}).get("load_settings") or {}
+            command_flags = settings.get("command_flags")
+            recovered_args = (
+                shlex.split(command_flags)
+                if isinstance(command_flags, str)
+                else list(settings.get("extra_args") or [])
+            )
+            return {
+                "model": deployment.get("model"),
+                "extra_args": recovered_args,
+            }
+
     class FakeStream:
         def __init__(self, chunks=()):
             self._chunks = list(chunks)
@@ -1434,7 +1486,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
-            "load_settings": {"tensor_parallel_size": 2},
+            "load_settings": {
+                "tensor_parallel_size": 2,
+                "command_flags": "--max-num-seqs 8 --enable-prefix-caching",
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
@@ -1457,6 +1512,60 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                     container, "vllm", "org/model",
                 )["promotable"]
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_shell_dependent_direct_start_stays_on_fixed_lifecycle(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "load_settings": {
+                "tensor_parallel_size": 2,
+                "command_flags": (
+                    "--max-cudagraph-capture-size "
+                    "'$(( 6 * (${TOKENS:-5} + 1) ))' --enable-prefix-caching"
+                ),
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            result = await service.deployment_action(
+                "container:external-stack", "start",
+            )
+
+            self.assertFalse(card["promotable"])
+            manager.start_container.assert_awaited_once_with(
+                "external-stack", explicit=True, managed=False,
+            )
+            manager.create_deployment.assert_not_awaited()
+            self.assertEqual(result["status"], "running")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_shell_dependent_direct_start_rejects_explicit_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "load_settings": {
+                "tensor_parallel_size": 2,
+                "command_flags": "--flag '$(resolve-value)'",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            with self.assertRaisesRegex(ValueError, "depends on shell expansion"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local", "worker-1"], promote=True,
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
             await manager.http.aclose()
             await service.close()
 

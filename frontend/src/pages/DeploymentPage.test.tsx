@@ -492,7 +492,10 @@ describe('env-file backed deployment page', () => {
     },
   }
 
-  function renderEnvFilePage(putResponse?: unknown, requestedDetail = envFileDetail) {
+  function renderEnvFilePage(
+    putResponse?: unknown,
+    requestedDetail: Record<string, unknown> = envFileDetail,
+  ) {
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
       if (path === '/api/v1/nodes') {
@@ -742,6 +745,38 @@ describe('env-file backed deployment page', () => {
       'PUT /api/v1/deployments/container%3Avllm-dspark/settings',
       'POST /api/v1/deployments/container%3Avllm-dspark/start',
     ])
+    expect(mutations[1]?.[1]?.body).toBeUndefined()
+  })
+
+  it('preserves raw shell flags and directly starts an adopted container', async () => {
+    const user = userEvent.setup()
+    const rawFlags = '--enable-prefix-caching --max-cudagraph-capture-size "$(( 6 * (${TOKENS:-5} + 1) ))" --speculative-config "${SPECULATIVE_CONFIG}"'
+    const adoptedDetail = {
+      ...envFileDetail,
+      edit_mode: null,
+      settings_env: null,
+      direct_start: true,
+      required_node_count: 2,
+      command_flags: rawFlags,
+      launch_controls: { context_window: 65536, tensor_parallel_size: 2 },
+    }
+    renderEnvFilePage(undefined, adoptedDetail)
+
+    const runtimeFlags = await screen.findByText('Runtime flags')
+    await waitFor(() => expect(
+      runtimeFlags.closest('label')?.querySelector('textarea'),
+    ).toHaveValue(rawFlags))
+    const contextWindow = screen.getByLabelText('Context window')
+    await user.clear(contextWindow)
+    await user.type(contextWindow, '131072')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+
+    expect(await screen.findByRole('heading', { name: 'Models destination' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Start on/ })).not.toBeInTheDocument()
+    const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
+    const updateBody = JSON.parse(String(mutations[0]?.[1]?.body))
+    expect(updateBody.command_flags).toBe(rawFlags)
+    expect(updateBody.extra_args).toBeUndefined()
     expect(mutations[1]?.[1]?.body).toBeUndefined()
   })
 })

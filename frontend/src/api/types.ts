@@ -116,6 +116,7 @@ export interface Deployment {
   has_start_hook?: boolean
   has_stop_hook?: boolean
   has_settings_env_file?: boolean
+  direct_start?: boolean
 }
 
 export interface DeploymentLogMember {
@@ -173,6 +174,7 @@ export interface DeploymentDetail extends Deployment {
   restart_required?: boolean
   desired_state: 'running' | 'stopped'
   extra_args: string[]
+  command_flags?: string
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
@@ -201,7 +203,8 @@ export interface EnvFileDeploymentUpdateInput {
 }
 
 export interface DeploymentUpdateInput {
-  extra_args: string[]
+  extra_args?: string[]
+  command_flags?: string
   environment?: Record<string, string>
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null

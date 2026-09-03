@@ -92,7 +92,7 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   sg_tp_size: detail.sg_tp_size?.toString() ?? '',
   sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
   environment: formatEnvironment(detail.environment ?? detail.settings.environment),
-  extra_args: detail.extra_args.map(quoteArg).join(' '),
+  extra_args: detail.command_flags ?? detail.extra_args.map(quoteArg).join(' '),
 })
 
 const editorFingerprint = (editor: Editor) => JSON.stringify(editor)
@@ -260,9 +260,11 @@ const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp',
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
 const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
-function updateInput(editor: Editor): DeploymentUpdateInput {
+function updateInput(editor: Editor, preserveCommandFlags = false): DeploymentUpdateInput {
   return {
-    extra_args: splitFlags(editor.extra_args),
+    ...(preserveCommandFlags
+      ? { command_flags: editor.extra_args }
+      : { extra_args: splitFlags(editor.extra_args) }),
     environment: parseEnvironment(editor.environment),
     launch_controls: {
       context_window: optionalNumber(editor.context_window),
@@ -388,7 +390,10 @@ export function DeploymentPage() {
         throw reason
       }
     }
-    const updated = await api.deployments.update(deploymentId, updateInput(editor))
+    const updated = await api.deployments.update(
+      deploymentId,
+      updateInput(editor, detail?.command_flags !== undefined),
+    )
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
     // sync so requiredRunNodes and the Run dialog never act on stale counts.
@@ -435,15 +440,15 @@ export function DeploymentPage() {
       : world
   }
 
-  const usesExternalLifecycleHook = () => Boolean(
+  const usesDirectLifecycle = () => Boolean(
     deploymentId.startsWith('container:')
     && resource.data?.managed === false
-    && (resource.data.has_start_hook || resource.data.has_stop_hook)
+    && (resource.data.has_start_hook || resource.data.has_stop_hook || resource.data.direct_start)
   )
 
   const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
-    if (usesExternalLifecycleHook()) {
+    if (usesDirectLifecycle()) {
       void run()
       return
     }
@@ -455,8 +460,8 @@ export function DeploymentPage() {
   }
 
   const run = async () => {
-    const selection = usesExternalLifecycleHook() ? undefined : runSelection
-    if (!selection && !usesExternalLifecycleHook()) return
+    const selection = usesDirectLifecycle() ? undefined : runSelection
+    if (!selection && !usesDirectLifecycle()) return
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       if (resource.data?.editable) await persist()

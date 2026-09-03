@@ -78,6 +78,26 @@ describe('ChatPage', () => {
     expect(screen.getByRole('button', { name: 'Send message' })).toBeInTheDocument()
   })
 
+  it('omits the prompt-processing metric when the engine does not measure it', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Done' },
+      reasoning: '',
+      metrics: { ttft_ms: 300, output_tokens_per_second: 40 },
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'Hi')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await screen.findByText('Done')
+    expect(screen.queryByText('Prompt processing')).not.toBeInTheDocument()
+    expect(screen.getByText('TTFT')).toBeInTheDocument()
+    expect(screen.getByText('300 ms')).toBeInTheDocument()
+    expect(screen.getByText('40.0 tok/s')).toBeInTheDocument()
+  })
+
   it('marks a partial failed response and excludes it from later prompts', async () => {
     vi.mocked(api.chatStream)
       .mockImplementationOnce((_model, _messages, options) => {

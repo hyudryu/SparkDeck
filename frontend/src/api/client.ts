@@ -221,18 +221,11 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
     const ttftMs = firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - startedAt)
     const promptTokens = positiveNumber(usage?.prompt_tokens)
     const completionTokens = positiveNumber(usage?.completion_tokens)
-    const rawCachedTokens = usage?.prompt_tokens_details?.cached_tokens
-    const cachedTokens = typeof rawCachedTokens === 'number' && Number.isFinite(rawCachedTokens) && rawCachedTokens >= 0
-      ? rawCachedTokens
-      : undefined
-    const processedPromptTokens = promptTokens === undefined || cachedTokens === undefined
-      ? undefined
-      : Math.max(0, promptTokens - cachedTokens)
     const generationMs = firstTokenAt === undefined ? undefined : now - firstTokenAt
     return {
-      prompt_tokens_per_second: nativePromptRate ?? (
-        processedPromptTokens && ttftMs ? processedPromptTokens / (ttftMs / 1000) : undefined
-      ),
+      // Only the engine can measure prefill; deriving a rate from TTFT would
+      // fold queue wait, proxy hops, and the first decode step into it.
+      prompt_tokens_per_second: nativePromptRate,
       ttft_ms: ttftMs,
       output_tokens_per_second: nativeOutputRate ?? (
         completionTokens !== undefined && completionTokens >= 2 && generationMs !== undefined && generationMs >= 50

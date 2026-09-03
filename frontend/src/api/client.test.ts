@@ -61,14 +61,36 @@ describe('API client adapters', () => {
     expect(result.message.content).toBe('Hello from the model')
     expect(result.reasoning).toBe('Inspecting the request')
     expect(result.metrics).toEqual(expect.objectContaining({
-      prompt_tokens_per_second: 32,
       ttft_ms: 250,
       prompt_tokens: 10,
       completion_tokens: 4,
     }))
+    // cached_tokens and TTFT are known here, but the prompt rate is still not
+    // fabricated: only engines that measure prefill themselves report one.
+    expect(result.metrics.prompt_tokens_per_second).toBeUndefined()
     expect(result.metrics.output_tokens_per_second).toBeCloseTo(5.33, 1)
     await response.body?.cancel()
     expect(cancelled).toBe(true)
+  })
+
+  it('reports the engine-measured prompt and output rates from stream timings', async () => {
+    const payload = 'data: {"choices":[],"usage":{"prompt_tokens":512,"completion_tokens":16},"timings":{"prompt_per_second":812.5,"predicted_per_second":42}}\n\ndata: [DONE]\n\n'
+    const response = new Response(payload, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(response))
+    const times = [0, 100, 500]
+    vi.spyOn(performance, 'now').mockImplementation(() => times.shift() ?? 500)
+
+    const result = await api.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+
+    expect(result.metrics).toEqual(expect.objectContaining({
+      prompt_tokens_per_second: 812.5,
+      output_tokens_per_second: 42,
+      prompt_tokens: 512,
+      completion_tokens: 16,
+    }))
+    await response.body?.cancel()
   })
 
   it('surfaces an error sent inside an otherwise successful SSE response', async () => {

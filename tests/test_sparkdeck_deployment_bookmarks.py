@@ -1164,6 +1164,49 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertNotIn("extra_args", stored["settings"])
 
+    async def test_saved_update_reserves_selectors_against_discovered_public_ids(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "TP2", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        saved = (await self.service.deployments())[0]
+        discovered = {
+            "id": "container:vision", "alias": "Discovered Vision",
+            "runtime": "vllm", "kind": "external", "status": "stopped",
+            "model": {"repository": "org/discovered"},
+            "served_models": ["org/model"], "settings": {},
+        }
+
+        with patch.object(
+            self.service, "deployments",
+            AsyncMock(return_value=[saved, discovered]),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "selector 'org/model' is already in use",
+            ):
+                await self.service.update_deployment_settings("TP2", {
+                    "gpu_memory_utilization": 0.8,
+                })
+
+        discovered["served_models"] = ["vision-public"]
+        with patch.object(
+            self.service, "deployments",
+            AsyncMock(return_value=[saved, discovered]),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "selector 'vision-public' is already in use",
+            ):
+                await self.service.update_deployment_settings("TP2", {
+                    "extra_args": [
+                        "--served-model-name", "vision-public",
+                    ],
+                })
+
+        stored = self.service.store.deployment("TP2", include_private=True)
+        self.assertIsNotNone(stored)
+        self.assertNotIn("gpu_memory_utilization", stored["settings"])
+        self.assertNotIn("extra_args", stored["settings"])
+
     async def test_saved_selector_updates_serialize_and_allow_same_repo_profiles(self):
         for alias in ("TP2", "TP4"):
             await self.service.create_deployment({

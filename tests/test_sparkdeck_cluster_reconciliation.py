@@ -152,6 +152,50 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
                 await manager.http.aclose()
 
+    async def test_creation_reserves_managed_selectors_against_live_public_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "live-deployment",
+                "alias": "Production Vision",
+                "runtime": "vllm",
+                "kind": "managed",
+                "status": "running",
+                "model": {"repository": "org/production"},
+                "served_models": ["org/new", "vision-public"],
+            }])
+            try:
+                cases = (
+                    ({"model": "org/new"}, "selector 'org/new'"),
+                    ({
+                        "model": "org/other",
+                        "settings": {
+                            "extra_args": [
+                                "--served-model-name", "vision-public",
+                            ],
+                        },
+                    }, "selector 'vision-public'"),
+                )
+                for overrides, message in cases:
+                    with self.subTest(message=message):
+                        body = {
+                            "alias": f"New deployment {message}",
+                            "runtime": "vllm",
+                            "kind": "managed",
+                            **overrides,
+                        }
+                        with self.assertRaisesRegex(
+                            ValueError, f"{message} is already in use",
+                        ):
+                            await service.create_deployment(body)
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
     async def test_cluster_rename_persists_service_and_manager_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

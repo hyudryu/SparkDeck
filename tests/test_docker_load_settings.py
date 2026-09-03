@@ -304,7 +304,8 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
     def _direct_portability_summary(
         self, device_requests, resolved_image_id, *,
-        image_user="", container_user="", ipc_mode="host",
+        image_user="", container_user="", image_working_dir="",
+        container_working_dir="", ipc_mode="host", resource_overrides=None,
     ):
         source_image_id = "sha256:source-image"
         image = SimpleNamespace(
@@ -313,12 +314,31 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Id": resolved_image_id,
                 "Config": {
                     "Env": [], "Labels": {}, "User": image_user,
+                    "WorkingDir": image_working_dir,
                 },
             },
         )
         self.manager.client = SimpleNamespace(
             images=SimpleNamespace(get=mock.Mock(return_value=image)),
         )
+        self.manager.settings = {"shm_size": "16g"}
+        host_config = {
+            "DeviceRequests": device_requests,
+            "IpcMode": ipc_mode,
+            "Memory": 0,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "NanoCpus": 0,
+            "CpuShares": 0,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "PidsLimit": None,
+            "OomKillDisable": None,
+            "ShmSize": 16 * 1024 ** 3,
+        }
+        host_config.update(resource_overrides or {})
         containers = FakeContainers()
         container = FakeContainer(
             containers,
@@ -330,9 +350,10 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Cmd": ["org/model", "--max-num-seqs", "8"],
                 "Env": [],
                 "User": container_user,
+                "WorkingDir": container_working_dir,
                 "Labels": {"io.sparkdeck.direct-start": "1"},
             },
-            {"DeviceRequests": device_requests, "IpcMode": ipc_mode},
+            host_config,
         )
         container.attrs["Image"] = source_image_id
         return self.manager._container_summary(container)
@@ -350,6 +371,53 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["ipc_mode_replayable"])
         self.assertTrue(summary["image_replayable"])
         self.assertTrue(summary["user_replayable"])
+        self.assertTrue(summary["working_dir_replayable"])
+        self.assertTrue(summary["resource_constraints_replayable"])
+
+    def test_direct_summary_rejects_non_default_resource_constraints(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        constraints = {
+            "Memory": 8 * 1024 ** 3,
+            "MemoryReservation": 4 * 1024 ** 3,
+            "MemorySwap": -1,
+            "NanoCpus": 2_000_000_000,
+            "CpuShares": 512,
+            "CpuPeriod": 100_000,
+            "CpuQuota": 50_000,
+            "CpusetCpus": "0-3",
+            "CpusetMems": "0",
+            "PidsLimit": 1024,
+            "OomKillDisable": True,
+            "ShmSize": 8 * 1024 ** 3,
+            "MemorySwappiness": 10,
+            "CpuRealtimeRuntime": 50_000,
+            "BlkioWeight": 500,
+            "StorageOpt": {"size": "20G"},
+            "IOMaximumIOps": 1000,
+        }
+
+        for field, value in constraints.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request,
+                    "sha256:source-image",
+                    resource_overrides={field: value},
+                )
+                self.assertFalse(summary["resource_constraints_replayable"])
+
+    def test_direct_summary_fails_closed_on_incomplete_resource_inspection(self):
+        self.manager.settings = {"shm_size": "16g"}
+
+        self.assertFalse(self.manager._container_resources_are_replayable({
+            "HostConfig": {
+                "Memory": 0,
+                # Remaining required fields deliberately unavailable.
+                "ShmSize": 16 * 1024 ** 3,
+            },
+        }))
 
     def test_direct_summary_rejects_non_host_ipc_mode(self):
         summary = self._direct_portability_summary([{
@@ -384,6 +452,62 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             container_user="1000:1000")
 
         self.assertTrue(summary["user_replayable"])
+
+    def test_direct_summary_rejects_working_directory_override(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_working_dir="/workspace",
+            container_working_dir="/models")
+
+        self.assertFalse(summary["working_dir_replayable"])
+
+    def test_direct_summary_accepts_inherited_image_working_directory(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_working_dir="/workspace",
+            container_working_dir="/workspace")
+
+        self.assertTrue(summary["working_dir_replayable"])
+
+    def test_working_directory_uses_immutable_source_image_default(self):
+        image = SimpleNamespace(attrs={
+            "Config": {"WorkingDir": "/workspace"},
+        })
+        images = SimpleNamespace(get=mock.Mock(return_value=image))
+        self.manager.client = SimpleNamespace(images=images)
+
+        replayable = self.manager._container_working_dir_is_replayable({
+            "Image": "sha256:immutable-source",
+            "Config": {
+                "Image": "example/vllm:latest",
+                "WorkingDir": "/workspace",
+            },
+        })
+
+        self.assertTrue(replayable)
+        images.get.assert_called_once_with("sha256:immutable-source")
+
+    def test_working_directory_fails_closed_without_image_config(self):
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(
+                get=mock.Mock(side_effect=RuntimeError("image unavailable")),
+            ),
+        )
+
+        replayable = self.manager._container_working_dir_is_replayable({
+            "Image": "sha256:immutable-source",
+            "Config": {"WorkingDir": "/workspace"},
+        })
+
+        self.assertFalse(replayable)
 
     def test_container_user_replayability_fails_closed_without_image_config(self):
         self.manager.client = SimpleNamespace(
@@ -1094,6 +1218,34 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(settings["editable"])
                 self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_shell_wrapped_ansi_c_quoting_is_marked_nonportable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --served-model-name $'model\\nname'",
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_ansi_c_quoting"])
+
+    def test_quoted_ansi_c_syntax_literal_remains_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f'''exec vllm serve {model} --served-model-name "$'literal'"''',
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_ansi_c_quoting", settings)
 
     def test_bash_options_do_not_hide_brace_expansion(self):
         model = "example/Model"

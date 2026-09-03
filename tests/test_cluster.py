@@ -2158,6 +2158,44 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    def test_routed_merge_group_exposes_one_editor_per_pricing_deployment(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/source": {"input": 100, "cached": 0, "output": 10},
+            "org/master": {"input": 200, "cached": 0, "output": 20},
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {"org/master": "Combined model"}
+        instance.usage_routing_rules = {"legacy/source": "org/master"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        members = {member["model"]: member for member in row["members"]}
+
+        self.assertIsNone(row["route_target"])
+        self.assertEqual(row["merge_group"], "Combined model")
+        self.assertEqual(members["legacy/source"]["routed_to"], "org/master")
+        self.assertEqual(
+            members["org/master"]["deployment_id"], "deployment-master",
+        )
+        self.assertIsNone(members["legacy/source"]["deployment_id"])
+        self.assertIsNone(members["legacy/source"]["pricing"])
+        self.assertEqual(
+            sum(member["deployment_id"] is not None for member in row["members"]),
+            1,
+        )
+
     def test_routed_row_uses_stable_editor_when_destination_has_no_usage(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

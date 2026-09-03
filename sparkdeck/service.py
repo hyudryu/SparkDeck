@@ -3925,6 +3925,13 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "launch command depends on Bash brace expansion"
             )
+        if container.get("direct_start") and settings.get(
+            "_shell_ansi_c_quoting"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash ANSI-C quoting"
+            )
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
         direct_recovery = (
             self._direct_start_launch_contract(container, runtime, str(
@@ -3971,6 +3978,14 @@ class SparkDeckService:
             )
         if (
             container.get("direct_start")
+            and container.get("working_dir_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container working directory override cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
             and container.get("gpu_requests_replayable") is not True
         ):
             raise ValueError(
@@ -3984,6 +3999,14 @@ class SparkDeckService:
             raise ValueError(
                 "discovered deployment cannot be promoted safely because its "
                 "IPC mode does not match Manager's host IPC contract"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("resource_constraints_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "Docker resource constraints do not match Manager's launch contract"
             )
         if (
             container.get("direct_start")
@@ -4198,6 +4221,7 @@ class SparkDeckService:
         if (
             settings.get("_shell_path_expansion") is True
             or settings.get("_shell_brace_expansion") is True
+            or settings.get("_shell_ansi_c_quoting") is True
         ):
             return None
         try:
@@ -5694,11 +5718,13 @@ class SparkDeckService:
                 # Multiple saved launch profiles may intentionally target the
                 # same repository (for example TP2 and TP4). Only the display
                 # alias must be unique across the full public namespace. A
-                # prospective served selector must not capture another
-                # deployment's stable ID or alias, which is the shadowing
-                # hazard this create-time reservation prevents.
+                # prospective served selector must still respect the public
+                # ids owned by live and discovered deployments; the exemption
+                # applies only between saved profiles that have not launched.
                 selector_occupied = (
-                    occupied if label == "alias" else identity_occupied
+                    identity_occupied
+                    if label == "selector" and item.get("status") == "saved"
+                    else occupied
                 )
                 if selector.casefold() in selector_occupied:
                     raise ValueError(
@@ -5793,8 +5819,10 @@ class SparkDeckService:
             and container.get("launch_prefix_replayable") is True
             and container.get("environment_replayable") is True
             and container.get("user_replayable") is True
+            and container.get("working_dir_replayable") is True
             and container.get("gpu_requests_replayable") is True
             and container.get("ipc_mode_replayable") is True
+            and container.get("resource_constraints_replayable") is True
             and container.get("image_replayable") is True
         )
         result = {

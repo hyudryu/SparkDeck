@@ -5069,6 +5069,46 @@ class Manager:
             index += 1
         return False
 
+    @staticmethod
+    def _has_unquoted_bash_ansi_c_quoting(value: str) -> bool:
+        """Return whether Bash would interpret an ANSI-C quoted string.
+
+        Promotion converts a discovered shell command to exec-form argv.
+        Python's POSIX ``shlex`` parser does not implement Bash's ``$'...'``
+        escape decoding, so replaying such a command could silently change an
+        argument. The construct is active only outside another quote and when
+        the dollar is not backslash-escaped.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char == "$" and text[index + 1:index + 2] == "'":
+                return True
+            index += 1
+        return False
+
     @classmethod
     def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
         """Whether a managed launch reproduces the command before ``serve``."""
@@ -5195,6 +5235,7 @@ class Manager:
         shell_comment = False
         shell_path_expansion = False
         shell_brace_expansion = False
+        shell_ansi_c_quoting = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
@@ -5218,6 +5259,12 @@ class Manager:
                 shell_brace_expansion = (
                     shell == "bash"
                     and self._has_unquoted_bash_brace_expansion(
+                        match.group("model") + match.group("flags")
+                    )
+                )
+                shell_ansi_c_quoting = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_ansi_c_quoting(
                         match.group("model") + match.group("flags")
                     )
                 )
@@ -5356,6 +5403,8 @@ class Manager:
             settings["_shell_path_expansion"] = True
         if shell_brace_expansion:
             settings["_shell_brace_expansion"] = True
+        if shell_ansi_c_quoting:
+            settings["_shell_ansi_c_quoting"] = True
         return settings
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
@@ -10151,10 +10200,36 @@ class Manager:
                     ).get("total_cost", 0.0)
                     for member in row["members"]
                 )
-                for member in row["members"]:
-                    member.update(self._usage_member_pricing(
+                # A routing destination can itself belong to a merge group,
+                # in which case the public ``route_target`` is intentionally
+                # absent.  Keep using each member's private pricing identity
+                # and expose at most one editor for each resolved deployment.
+                # Prefer the destination's own usage member, then a stable
+                # source, so rerendering cannot move ownership arbitrarily.
+                pricing_members = sorted(
+                    row["members"],
+                    key=lambda member: (
+                        member["model"].casefold()
+                        != member["_pricing_model"].casefold(),
+                        member["model"].casefold(),
+                        member["model"],
+                    ),
+                )
+                pricing_owners: set[str] = set()
+                for member in pricing_members:
+                    resolved = self._usage_member_pricing(
                         member["_pricing_model"],
-                    ))
+                    )
+                    deployment_id = resolved.get("deployment_id")
+                    if deployment_id and deployment_id in pricing_owners:
+                        member.update({
+                            "deployment_id": None,
+                            "pricing": None,
+                        })
+                        continue
+                    member.update(resolved)
+                    if deployment_id:
+                        pricing_owners.add(deployment_id)
                 if estimated_cached:
                     row["cost_estimated"] = True
             row["members"].sort(key=lambda member: (
@@ -11500,6 +11575,31 @@ class Manager:
             and current == default
         )
 
+    def _container_working_dir_is_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves the working directory.
+
+        Manager does not set a Docker ``working_dir`` override. A direct-start
+        container is therefore portable only when its configured working
+        directory matches the default from the immutable source image. Image
+        inspection failures and malformed values fail closed.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+
+        current = (attrs.get("Config") or {}).get("WorkingDir", "")
+        default = image_config.get("WorkingDir", "")
+        current = "" if current is None else current
+        default = "" if default is None else default
+        return (
+            isinstance(current, str)
+            and isinstance(default, str)
+            and current == default
+        )
+
     @staticmethod
     def _container_gpu_requests_are_replayable(attrs: dict) -> bool:
         """Whether Manager's all-GPU request exactly preserves inspection.
@@ -11539,6 +11639,97 @@ class Manager:
         return (
             isinstance(host_config, dict)
             and host_config.get("IpcMode") == "host"
+        )
+
+    def _container_resources_are_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves Docker resource controls.
+
+        Managed model launches set only their configured shared-memory size;
+        all CPU, memory, block-I/O, and PID controls use Docker's unconstrained
+        defaults.  Inspection must prove the direct-start container has that
+        same contract.  Otherwise promotion could silently remove a limit and
+        let the recreated workload consume resources reserved for its peers.
+        """
+        host_config = attrs.get("HostConfig")
+        if not isinstance(host_config, dict):
+            return False
+
+        # These fields are present in current Docker inspection payloads and
+        # cover the resource flags most commonly set at container creation.
+        # Require them rather than treating incomplete inspection as default.
+        required_defaults = {
+            "Memory": 0,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "NanoCpus": 0,
+            "CpuShares": 0,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "PidsLimit": None,
+            "OomKillDisable": None,
+        }
+        def matches_default(value: Any, expected: Any) -> bool:
+            if isinstance(expected, int) and not isinstance(expected, bool):
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value == expected
+                )
+            return value == expected
+
+        for name, expected in required_defaults.items():
+            if (
+                name not in host_config
+                or not matches_default(host_config[name], expected)
+            ):
+                return False
+
+        # Docker API versions differ on whether these less common controls are
+        # serialized when unset.  If inspection supplies one, it still must be
+        # the value produced by an unconstrained managed launch.
+        optional_defaults = {
+            "MemorySwappiness": None,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "DeviceCgroupRules": None,
+            "CgroupParent": "",
+            "StorageOpt": {},
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+        }
+        if any(
+            name in host_config
+            and not matches_default(host_config[name], expected)
+            for name, expected in optional_defaults.items()
+        ):
+            return False
+
+        configured_shm_size = (
+            (getattr(self, "settings", {}) or {}).get("shm_size")
+        )
+        if configured_shm_size in (None, ""):
+            return False
+        try:
+            expected_shm_size = docker.utils.parse_bytes(
+                str(configured_shm_size)
+            )
+        except (TypeError, ValueError):
+            return False
+        actual_shm_size = host_config.get("ShmSize")
+        return (
+            isinstance(actual_shm_size, int)
+            and not isinstance(actual_shm_size, bool)
+            and actual_shm_size == expected_shm_size
         )
 
     def _container_image_is_replayable(
@@ -11770,11 +11961,17 @@ class Manager:
             summary["user_replayable"] = (
                 self._container_user_is_replayable(attrs)
             )
+            summary["working_dir_replayable"] = (
+                self._container_working_dir_is_replayable(attrs)
+            )
             summary["gpu_requests_replayable"] = (
                 self._container_gpu_requests_are_replayable(attrs)
             )
             summary["ipc_mode_replayable"] = (
                 self._container_ipc_mode_is_replayable(attrs)
+            )
+            summary["resource_constraints_replayable"] = (
+                self._container_resources_are_replayable(attrs)
             )
             summary["image_replayable"] = self._container_image_is_replayable(
                 attrs, image_tag,

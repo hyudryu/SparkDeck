@@ -1509,8 +1509,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             container.setdefault("launch_prefix_replayable", True)
             container.setdefault("environment_replayable", True)
             container.setdefault("user_replayable", True)
+            container.setdefault("working_dir_replayable", True)
             container.setdefault("gpu_requests_replayable", True)
             container.setdefault("ipc_mode_replayable", True)
+            container.setdefault("resource_constraints_replayable", True)
             container.setdefault("image_replayable", True)
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
@@ -2093,6 +2095,38 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_bash_ansi_c_quoting_blocks_direct_start_promotion(self):
+        load_settings = server.manager._container_load_settings(
+            [
+                "/bin/bash", "-lc",
+                "exec vllm serve org/model "
+                "--served-model-name $'model\\nname'",
+            ],
+            "vllm", "org/model",
+        )
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True, "load_settings": load_settings,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "Bash ANSI-C quoting"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_literal_shell_path_metacharacters_remain_promotable(self):
         for value in ("'/templates/*.jinja'", r"\~/templates/\*.jinja"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
@@ -2284,6 +2318,32 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_working_directory_override_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "working_dir_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "working directory override"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_restricted_gpu_request_blocks_direct_start_promotion(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
@@ -2325,6 +2385,32 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
             with self.assertRaisesRegex(ValueError, "host IPC contract"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_resource_limit_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "resource_constraints_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "Docker resource constraints"):
                 await service.deployment_action(
                     "container:external-stack", "start",
                     node_ids=["local"], promote=True,

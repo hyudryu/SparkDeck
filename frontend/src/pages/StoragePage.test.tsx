@@ -425,7 +425,7 @@ describe('StoragePage', () => {
               {
                 model_id: 'Comfy-Org/MiniMax-Music-3', size_bytes: 21_000_000_000,
                 partial: false, revision: 'ComfyUI', source: 'ComfyUI',
-                externally_managed: true, deletable: false,
+                externally_managed: true,
               },
             ],
           }
@@ -456,6 +456,31 @@ describe('StoragePage', () => {
     const managedDialog = await screen.findByRole('dialog', { name: 'Delete org/model?' })
     expect(managedDialog).not.toHaveTextContent('ComfyUI')
     await user.click(within(managedDialog).getByRole('button', { name: 'Cancel' }))
+  })
+
+  it('honors workers that explicitly report weights as non-deletable', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              ...node.models,
+              {
+                model_id: 'Comfy-Org/Legacy-Worker-Model', size_bytes: 21_000_000_000,
+                partial: false, revision: 'ComfyUI', source: 'ComfyUI',
+                externally_managed: true, deletable: false,
+              },
+            ],
+          }
+        : node),
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    await screen.findByLabelText('Installed weights Comfy-Org/Legacy-Worker-Model on Studio Spark')
+    expect(screen.queryByRole('button', { name: 'Delete Comfy-Org/Legacy-Worker-Model from Studio Spark' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete org/model from Studio Spark' })).toBeInTheDocument()
   })
 
   it('shows active downloads and transfers on their target NAS cards', async () => {

@@ -726,6 +726,78 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already in use", response.json()["detail"])
         rename.assert_not_awaited()
 
+    async def test_rename_discovered_container_rejects_saved_repository_conflict(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        saved = {
+            "id": "saved-1", "alias": "Future bookmark", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/future-model"},
+            "status": "saved",
+            "settings": {
+                "extra_args": ["--served-model-name", "future-public-name"],
+            },
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, saved]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "vllm-dspark"}),
+            ),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "ORG/FUTURE-MODEL"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
+    async def test_rename_discovered_container_rejects_saved_served_name_conflict(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        saved = {
+            "id": "saved-1", "alias": "Future bookmark", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/future-model"},
+            "status": "saved",
+            "settings": {
+                "extra_args": ["--served-model-name", "future-public-name"],
+            },
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, saved]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "vllm-dspark"}),
+            ),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "FUTURE-PUBLIC-NAME"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
     async def test_rename_discovered_container_rejects_public_model_id_conflict(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
@@ -1402,6 +1474,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             # Hand-built direct-start fixtures model a canonical ``vllm serve``
             # summary unless a test explicitly supplies the opposite.
             container.setdefault("launch_prefix_replayable", True)
+            container.setdefault("environment_replayable", True)
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
         return SparkDeckService(manager, Path(directory)), manager
@@ -1970,6 +2043,32 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
             with self.assertRaisesRegex(ValueError, "executable prefix"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_unreplayed_environment_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "environment_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "environment overrides"):
                 await service.deployment_action(
                     "container:external-stack", "start",
                     node_ids=["local"], promote=True,

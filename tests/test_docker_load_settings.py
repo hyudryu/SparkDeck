@@ -201,6 +201,63 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["load_settings"]["editable"])
         self.assertFalse(summary["launch_prefix_replayable"])
 
+    def _environment_summary(
+        self, image_environment: list[str], container_environment: list[str],
+    ):
+        image = SimpleNamespace(attrs={
+            "Config": {"Env": image_environment, "Labels": {}},
+        })
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(get=mock.Mock(return_value=image)),
+        )
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "environment-container-id",
+            "environment-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-num-seqs", "8"],
+                "Env": container_environment,
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+        container.attrs["Image"] = "sha256:immutable-image"
+        return self.manager._container_summary(container)
+
+    def test_unpreserved_container_environment_override_is_not_replayable(self):
+        private_endpoint = "https://private-hub.example.invalid"
+        summary = self._environment_summary(
+            ["PATH=/usr/bin", "HF_ENDPOINT=https://huggingface.co"],
+            [f"HF_ENDPOINT={private_endpoint}", "PATH=/usr/bin"],
+        )
+
+        self.assertFalse(summary["environment_replayable"])
+        self.assertNotIn("HF_ENDPOINT", summary["load_settings"]["environment"])
+        self.assertNotIn(private_endpoint, json.dumps(summary))
+
+    def test_unchanged_image_environment_defaults_are_replayable(self):
+        environment = [
+            "PATH=/usr/bin", "HF_ENDPOINT=https://private-hub.example.invalid",
+        ]
+
+        summary = self._environment_summary(environment, list(environment))
+
+        self.assertTrue(summary["environment_replayable"])
+
+    def test_allowlisted_container_environment_override_is_replayable(self):
+        summary = self._environment_summary(
+            ["PATH=/usr/bin", "NCCL_DEBUG=WARN"],
+            ["PATH=/usr/bin", "NCCL_DEBUG=INFO"],
+        )
+
+        self.assertTrue(summary["environment_replayable"])
+        self.assertEqual(
+            summary["load_settings"]["environment"], {"NCCL_DEBUG": "INFO"},
+        )
+
     def test_recovered_launch_preserves_discovered_runtime_environment(self):
         recovered = self.manager._recovered_deployment_launch_settings(
             {

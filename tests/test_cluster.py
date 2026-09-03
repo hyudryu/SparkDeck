@@ -3961,6 +3961,71 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["launch_settings"]["cache_cost_per_1m"], 0.1)
             self.assertEqual(saved["launch_settings"]["output_cost_per_1m"], 3.5)
 
+    def test_stopped_variant_edit_migrates_pricing_identity_and_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.unsloth_settings = {}
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "Vision",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "pricing_model_key": "org/model [nvfp4_ds_mla]",
+                "pricing": {
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+                "launch_settings": {
+                    "deployment_name": "Vision",
+                    "model": "org/model",
+                    "engine": "vllm",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+            }]
+
+            updated = instance.update_deployment_settings("deployment-1", {
+                "extra_args": ["--kv-cache-dtype", "fp8"],
+            })
+
+            self.assertEqual(updated["pricing_model_key"], "org/model [fp8]")
+            self.assertEqual(updated["pricing"], {
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.1,
+                "output_cost_per_1m": 3.5,
+            })
+            self.assertEqual(
+                instance._deployment_pricing(
+                    updated["launch_settings"],
+                ),
+                updated["pricing"],
+            )
+            self.assertEqual(
+                instance._usage_member_pricing("org/model [fp8]")["deployment_id"],
+                "deployment-1",
+            )
+            self.assertIsNone(
+                instance._usage_member_pricing(
+                    "org/model [nvfp4_ds_mla]",
+                )["deployment_id"]
+            )
+            cost = instance.calculate_cost("org/model [fp8]", {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            })
+            self.assertEqual(cost["input_cost_per_1m"], 1.25)
+            self.assertEqual(cost["output_cost_per_1m"], 3.5)
+            persisted = json.loads(instance.deployments_path.read_text())[0]
+            self.assertEqual(persisted["pricing_model_key"], "org/model [fp8]")
+
     async def test_pricing_recovers_full_legacy_launch_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

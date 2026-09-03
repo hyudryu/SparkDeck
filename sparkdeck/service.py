@@ -3909,6 +3909,14 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "executable prefix cannot be reproduced"
             )
+        if (
+            container.get("direct_start")
+            and container.get("environment_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container environment overrides cannot be reproduced"
+            )
         if direct_recovery is not None:
             launch_settings, layout = direct_recovery
             required_nodes = layout["required_node_count"]
@@ -5506,6 +5514,12 @@ class SparkDeckService:
             if str(item.get("id") or "") == deployment_id:
                 continue
             public_ids = self._deployment_public_model_ids(item)
+            if item.get("status") == "saved":
+                repository = str(
+                    (item.get("model") or {}).get("repository") or ""
+                ).strip()
+                if repository:
+                    public_ids.append(repository)
             if folded in {
                 str(item.get("id") or "").casefold(),
                 str(item.get("alias") or "").casefold(),
@@ -5599,6 +5613,7 @@ class SparkDeckService:
             and self._recovered_launch_is_portable(direct_recovery[0])
             and container.get("mounts_replayable") is True
             and container.get("launch_prefix_replayable") is True
+            and container.get("environment_replayable") is True
         )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
@@ -5756,6 +5771,17 @@ class SparkDeckService:
             resolver = getattr(self.manager, "_deployment_served_models", None)
             if linked is not None and callable(resolver):
                 configured = resolver(linked)
+            elif deployment.get("status") == "saved" and callable(resolver):
+                # A bookmark has no Manager record yet, but its first launch
+                # will publish the repository or an explicit served-model
+                # name from these settings. Reserve those future request ids
+                # now so a discovered container alias cannot capture one and
+                # be silently shadowed when the bookmark starts.
+                model = deployment.get("model") or {}
+                configured = resolver({
+                    "model": str(model.get("repository") or ""),
+                    "launch_settings": dict(deployment.get("settings") or {}),
+                })
         normalized = list(dict.fromkeys(
             str(value).strip() for value in configured if str(value).strip()
         ))

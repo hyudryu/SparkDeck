@@ -4332,6 +4332,17 @@ class Manager:
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
         }
+        previous_model = str(
+            current.get("model") or deployment.get("model") or ""
+        )
+        previous_args = current.get("extra_args")
+        previous_variant = self._variant_from_cmd(
+            previous_args
+            if isinstance(previous_args, list) and all(
+                isinstance(value, str) for value in previous_args
+            )
+            else []
+        )
         merged = {**current, **body}
         controls = body.get("launch_controls")
         if isinstance(controls, dict) and (merged.get("engine") or "vllm") == "sglang":
@@ -4386,6 +4397,12 @@ class Manager:
         # Preserve the assigned API port unless the editor explicitly changes it.
         if settings.get("port") is None:
             settings["port"] = deployment.get("api_port")
+        pricing_identity_changed = (
+            previous_model.casefold() != str(settings["model"]).casefold()
+            or previous_variant.casefold() != self._variant_from_cmd(
+                settings["extra_args"]
+            ).casefold()
+        )
         remaining_error = (
             _remove_persisted_error(
                 deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
@@ -4405,6 +4422,14 @@ class Manager:
             ) if persisted_args_error else deployment.get("status"),
             "error": remaining_error or None,
         })
+        if pricing_identity_changed and deployment.get("pricing_model_key"):
+            # pricing_model_key is captured when rates are first saved so the
+            # Usage editor can resolve the exact stats identity. A launch edit
+            # that changes the model/variant must move that pointer too; the
+            # persisted rate values themselves remain in launch_settings.
+            deployment["pricing_model_key"] = self._stats_key(
+                settings["model"], self._variant_from_cmd(settings["extra_args"]),
+            )
         deployment.pop("launch_settings_error", None)
         deployment.pop("kv_capacity", None)
         deployment.pop("auto_concurrency_adjustment", None)
@@ -11140,6 +11165,68 @@ class Manager:
 
         return [*_parts(config.get("Entrypoint")), *_parts(config.get("Cmd"))]
 
+    def _inspected_image_config(self, image_ref: str) -> dict | None:
+        """Return cached immutable image config, retrying transient failures."""
+        cache = getattr(self, "_image_config_cache", None)
+        if cache is None:
+            cache = self._image_config_cache = {}
+        if image_ref not in cache:
+            try:
+                image = self.client.images.get(image_ref)
+                config = (image.attrs or {}).get("Config") or {}
+            except Exception:
+                return None
+            cache[image_ref] = dict(config)
+        return cache[image_ref]
+
+    def _container_environment_is_replayable(
+        self, attrs: dict, engine: str,
+    ) -> bool:
+        """Whether managed recreation preserves container env semantics.
+
+        Docker's container config contains image defaults merged with explicit
+        container overrides. Managed launches reuse the image, so unchanged
+        defaults need not be copied. Every differing value must survive the
+        credential-safe discovery allowlist. Only this capability bit is
+        returned; unapproved names and all of their values remain private.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+
+        def environment_map(entries: Any) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for entry in entries or []:
+                if not isinstance(entry, str) or "=" not in entry:
+                    continue
+                name, value = entry.split("=", 1)
+                result[name] = value
+            return result
+
+        current = environment_map(
+            ((attrs.get("Config") or {}).get("Env") or [])
+        )
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            # Without immutable image defaults we cannot distinguish a safe
+            # inherited value from a container-level override that promotion
+            # would silently discard.
+            return False
+        defaults = environment_map(image_config.get("Env") or [])
+        preserved = discovered_runtime_environment(current, engine)
+        missing = object()
+        for name in set(current) | set(defaults):
+            current_value = current.get(name, missing)
+            if current_value == defaults.get(name, missing):
+                continue
+            if (
+                isinstance(current_value, str)
+                and preserved.get(name) == current_value
+            ):
+                continue
+            return False
+        return True
+
     def _container_summary(self, c) -> dict | None:
         labels = c.labels or {}
 
@@ -11330,6 +11417,13 @@ class Manager:
         summary["direct_start"] = (
             str(labels.get(DIRECT_START_LABEL) or "").strip() == "1"
         )
+        # Compute this after label provenance checks so one transient image
+        # inspection failure cannot be retried with different conclusions in
+        # the same inventory pass. Only the capability bit is serialized.
+        if summary["direct_start"]:
+            summary["environment_replayable"] = (
+                self._container_environment_is_replayable(attrs, engine_label)
+            )
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary
@@ -11357,17 +11451,10 @@ class Manager:
         successful lookups are cached per image reference across inventory
         passes.
         """
-        cache = getattr(self, "_image_label_cache", None)
-        if cache is None:
-            cache = self._image_label_cache = {}
-        if image_ref not in cache:
-            try:
-                image = self.client.images.get(image_ref)
-                labels = (image.attrs.get("Config") or {}).get("Labels") or {}
-            except Exception:
-                return False
-            cache[image_ref] = dict(labels)
-        image_labels = cache[image_ref]
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+        image_labels = image_config.get("Labels") or {}
         return str(image_labels.get(key) or "").strip() != value
 
     async def list_containers(self) -> list[dict]:

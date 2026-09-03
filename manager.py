@@ -4608,6 +4608,64 @@ class Manager:
             return None
 
     @staticmethod
+    def _post_model_tokens(cmd: list[str], model: str) -> list[str]:
+        """Return the argv region after the model tag for flag scanning."""
+        try:
+            return list(cmd[cmd.index("serve") + 2:])
+        except ValueError:
+            try:
+                return list(cmd[cmd.index(model) + 1:])
+            except ValueError:
+                return []
+
+    @classmethod
+    def _has_unresolvable_shell_tokens(cls, args: list[str]) -> bool:
+        """Detect shell expansion that an exec-argv recreate cannot preserve.
+
+        Containers discovered as plain argv run without a shell, so ``${VAR}``,
+        ``$(( ))``, command substitution and array subscripts would reach the
+        model server as literal text after a settings edit. Only the
+        environment-backed ``--speculative-config`` reference is exempt: the
+        controller resolves it from the recreated container environment.
+        """
+        speculative_names = {"--speculative-config", "-sc"}
+        index = 0
+        while index < len(args):
+            token = str(args[index])
+            key, separator, inline = token.partition("=")
+            if key in speculative_names:
+                if separator:
+                    if not cls._environment_reference(inline) and cls._has_unresolvable_shell_value(inline):
+                        return True
+                else:
+                    if index + 1 < len(args):
+                        value = str(args[index + 1])
+                        if (
+                            not cls._environment_reference(value)
+                            and cls._has_unresolvable_shell_value(value)
+                        ):
+                            return True
+                        index += 1
+                index += 1
+                continue
+            if cls._has_unresolvable_shell_value(token):
+                return True
+            index += 1
+        return False
+
+    @classmethod
+    def _has_unresolvable_shell_value(cls, value: str) -> bool:
+        """True for shell expansion an exec-argv recreate cannot preserve.
+
+        An exact ``${NAME}`` environment reference is resolvable only in the
+        ``--speculative-config`` position, where the controller substitutes
+        the referenced JSON from the recreated container environment; callers
+        exempt it there explicitly.
+        """
+        value = str(value or "")
+        return value.startswith("$") or "`" in value or "[@" in value
+
+    @staticmethod
     def _shell_vllm_command(script: str):
         """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
         return re.search(
@@ -4646,9 +4704,11 @@ class Manager:
         engine = engine if engine == "sglang" else "vllm"
         command_flags = ""
         analysis_cmd = cmd
+        shell_wrapped = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
+                shell_wrapped = True
                 command_flags = match.group("flags").strip()
                 try:
                     analysis_cmd = [
@@ -4746,7 +4806,15 @@ class Manager:
             i += 1
         thinking_mode, _, _ = self._thinking_config(analysis_cmd)
         return {
-            "editable": "serve" in analysis_cmd,
+            "editable": (
+                "serve" in analysis_cmd
+                and (
+                    shell_wrapped
+                    or not self._has_unresolvable_shell_tokens(
+                        self._post_model_tokens(analysis_cmd, model)
+                    )
+                )
+            ),
             "engine": engine,
             "gpu_memory_utilization": self._cli_option(
                 analysis_cmd,
@@ -11980,10 +12048,28 @@ class Manager:
                 raise ValueError(
                     "containers with credential-bearing launch arguments are read-only"
                 )
-            new_argv = self._updated_container_command(cmd, engine, model, settings)
-            if new_argv[:len(entrypoint)] != entrypoint:
-                raise ValueError("container entrypoint cannot be changed by the settings editor")
-            new_cmd = new_argv[len(entrypoint):]
+            if (
+                engine == "vllm"
+                and not (len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"})
+                and self._has_unresolvable_shell_tokens(
+                    self._post_model_tokens(cmd, model)
+                )
+            ):
+                # A plain-argv command carrying shell templates cannot be
+                # recreated safely: exec-form has no shell to expand them,
+                # so the replacement would crash-loop on literal tokens.
+                # Scan the full post-model region, not the filtered
+                # extra_args, because managed option values are stripped
+                # from extra_args but would also be argv-ified.
+                raise ValueError(
+                    "launch command uses shell expansion that a settings edit "
+                    "cannot preserve; edit the backing script instead"
+                )
+            existing_environment: dict[str, str] = {}
+            for entry in config.get("Env") or []:
+                if isinstance(entry, str) and "=" in entry:
+                    key, value = entry.split("=", 1)
+                    existing_environment[key] = value
             requested_environment = None
             if "environment" in settings:
                 requested_environment = normalize_runtime_environment(
@@ -11997,6 +12083,32 @@ class Manager:
                         "discovered deployment environment variables must use "
                         "known safe runtime tuning names"
                     )
+            new_argv = self._updated_container_command(cmd, engine, model, settings)
+            if new_argv[:len(entrypoint)] != entrypoint:
+                raise ValueError("container entrypoint cannot be changed by the settings editor")
+            new_cmd = new_argv[len(entrypoint):]
+            if engine == "vllm" and not (
+                len(new_argv) >= 2 and new_argv[-2] in {"-c", "-lc"}
+            ):
+                # Exec-form Docker commands run without a shell, so an
+                # environment-backed --speculative-config reference must be
+                # resolved here; otherwise the model server receives the
+                # literal token and crash-loops on startup. Shell-wrapped
+                # scripts keep the reference and expand it at runtime from
+                # the recreated environment. Resolution uses the full
+                # preserved environment, not the discovered allowlist,
+                # because a recreate keeps non-allowlisted variables such as
+                # a custom reference name defined by the original image.
+                effective_environment = dict(existing_environment)
+                if requested_environment is not None:
+                    for key in discovered_runtime_environment(
+                        existing_environment, engine
+                    ):
+                        effective_environment.pop(key, None)
+                    effective_environment.update(requested_environment)
+                new_cmd = self._resolve_environment_backed_speculative_args(
+                    new_cmd, effective_environment,
+                )
             was_running = container.status in {"running", "restarting", "paused"}
             backup_name = f"{name}.settings-backup-{uuid.uuid4().hex[:8]}"
 
@@ -12013,13 +12125,8 @@ class Manager:
                 replacement_labels[DIRECT_START_LABEL] = "1"
                 create_config["Labels"] = replacement_labels
             if requested_environment is not None:
-                existing_environment: dict[str, str] = {}
-                for entry in config.get("Env") or []:
-                    if isinstance(entry, str) and "=" in entry:
-                        key, value = entry.split("=", 1)
-                        existing_environment[key] = value
                 for key in discovered_runtime_environment(
-                    existing_environment, engine,
+                    existing_environment, engine
                 ):
                     existing_environment.pop(key, None)
                 existing_environment.update(requested_environment)

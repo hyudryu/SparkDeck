@@ -4607,6 +4607,17 @@ class Manager:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _post_model_tokens(cmd: list[str], model: str) -> list[str]:
+        """Return the argv region after the model tag for flag scanning."""
+        try:
+            return list(cmd[cmd.index("serve") + 2:])
+        except ValueError:
+            try:
+                return list(cmd[cmd.index(model) + 1:])
+            except ValueError:
+                return []
+
     @classmethod
     def _has_unresolvable_shell_tokens(cls, args: list[str]) -> bool:
         """Detect shell expansion that an exec-argv recreate cannot preserve.
@@ -4799,7 +4810,9 @@ class Manager:
                 "serve" in analysis_cmd
                 and (
                     shell_wrapped
-                    or not self._has_unresolvable_shell_tokens(extra_args)
+                    or not self._has_unresolvable_shell_tokens(
+                        self._post_model_tokens(analysis_cmd, model)
+                    )
                 )
             ),
             "engine": engine,
@@ -12039,12 +12052,15 @@ class Manager:
                 engine == "vllm"
                 and not (len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"})
                 and self._has_unresolvable_shell_tokens(
-                    current_settings.get("extra_args") or []
+                    self._post_model_tokens(cmd, model)
                 )
             ):
                 # A plain-argv command carrying shell templates cannot be
                 # recreated safely: exec-form has no shell to expand them,
                 # so the replacement would crash-loop on literal tokens.
+                # Scan the full post-model region, not the filtered
+                # extra_args, because managed option values are stripped
+                # from extra_args but would also be argv-ified.
                 raise ValueError(
                     "launch command uses shell expansion that a settings edit "
                     "cannot preserve; edit the backing script instead"
@@ -12079,11 +12095,16 @@ class Manager:
                 # resolved here; otherwise the model server receives the
                 # literal token and crash-loops on startup. Shell-wrapped
                 # scripts keep the reference and expand it at runtime from
-                # the recreated environment.
-                effective_environment = dict(discovered_runtime_environment(
-                    existing_environment, engine,
-                ))
+                # the recreated environment. Resolution uses the full
+                # preserved environment, not the discovered allowlist,
+                # because a recreate keeps non-allowlisted variables such as
+                # a custom reference name defined by the original image.
+                effective_environment = dict(existing_environment)
                 if requested_environment is not None:
+                    for key in discovered_runtime_environment(
+                        existing_environment, engine
+                    ):
+                        effective_environment.pop(key, None)
                     effective_environment.update(requested_environment)
                 new_cmd = self._resolve_environment_backed_speculative_args(
                     new_cmd, effective_environment,

@@ -565,6 +565,19 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(settings["editable"])
 
+    def test_shell_expansion_in_managed_option_value_is_read_only(self):
+        model = "example/Model"
+        command = [
+            "vllm", "serve", model,
+            "--max-num-seqs", "$(( 8 * 2 ))",
+            "--max-model-len", "${CONTEXT_WINDOW}",
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
     def test_environment_backed_speculative_reference_stays_editable(self):
         model = "example/Model"
         command = [
@@ -639,6 +652,58 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             self.manager._cli_option(replacement_cmd, {"--max-num-seqs"}), "4",
         )
         self.assertIn(f"SPECULATIVE_CONFIG={resolved}", api.created_config["Env"])
+
+    async def test_update_resolves_custom_named_speculative_reference(self):
+        name = "external-vllm"
+        model = "example/Model"
+        resolved = '{"method":"dspark","num_speculative_tokens":3}'
+        command = [
+            "vllm", "serve", model, "--host", "0.0.0.0", "--port", "8000",
+            "--speculative-config", "${MY_SPEC_CONFIG}",
+            "--max-num-seqs", "8",
+        ]
+        config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
+            # MY_SPEC_CONFIG is not on the discovered environment allowlist
+            # but survives a recreate, so the reference must resolve.
+            "Env": [f"MY_SPEC_CONFIG={resolved}", "NCCL_DEBUG=INFO"],
+            "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {"NetworkMode": "host"}
+        )
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            result = await self.manager.update_container_settings(
+                name,
+                {
+                    **self.manager._container_load_settings(command, "vllm", model),
+                    "max_concurrency": 4,
+                    "environment": {"NCCL_DEBUG": "WARN"},
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        replacement_cmd = api.created_config["Cmd"]
+        self.assertEqual(
+            self.manager._cli_option(replacement_cmd, {"--speculative-config"}),
+            resolved,
+        )
+        self.assertIn(f"MY_SPEC_CONFIG={resolved}", api.created_config["Env"])
+        self.assertIn("NCCL_DEBUG=WARN", api.created_config["Env"])
 
     async def test_update_rejects_unresolvable_speculative_reference(self):
         name = "external-vllm"

@@ -5291,18 +5291,7 @@ class SparkDeckService:
         if not alias:
             raise ValueError("alias is required")
         if deployment_id.startswith("container:"):
-            container = await self._resolve_discovered_container(deployment_id)
-            name = str(container.get("name") or "")
-            if self.store.deployment(alias):
-                raise ValueError(f"deployment alias '{alias}' is already in use")
-            aliases = getattr(self.manager, "container_aliases", {}) or {}
-            if any(
-                str(value) == alias and str(candidate) != name
-                for candidate, value in aliases.items()
-            ):
-                raise ValueError(f"deployment alias '{alias}' is already in use")
-            await self.manager.update_container_alias(name, alias)
-            return await self.deployment_detail(deployment_id)
+            raise ValueError("discovered containers cannot be renamed")
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored:
             raise LookupError("deployment not found")

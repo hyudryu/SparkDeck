@@ -149,6 +149,9 @@ def _discovered_launch_controls(
     if engine != "sglang":
         controls["context_window"] = settings.get("context_window")
         controls["max_concurrency"] = settings.get("max_concurrency")
+        for key in ("tensor_parallel_size", "pipeline_parallel_size"):
+            if controls.get(key) is None and settings.get(key) is not None:
+                controls[key] = settings[key]
     controls["kv_cache_dtype"] = settings.get("kv_cache_dtype")
     controls["thinking_mode"] = settings.get("thinking_mode")
     return controls
@@ -5106,12 +5109,80 @@ class SparkDeckService:
         return value, None
 
     async def clone_deployment(self, deployment_id: str) -> dict[str, Any]:
-        """Copy a persisted deployment's configuration without its live runtime."""
-        if deployment_id.startswith("container:"):
-            raise ValueError("discovered containers cannot be cloned")
-
+        """Copy a persisted or discovered configuration without its live runtime."""
         async with self._deployment_create_lock:
-            stored = self.store.deployment(deployment_id, include_private=True)
+            if deployment_id.startswith("container:"):
+                container = await self._resolve_discovered_container(deployment_id)
+                runtime = RuntimeKind(self._container_runtime(container))
+                load_settings = dict(container.get("load_settings") or {})
+                if load_settings.get("editable") is False:
+                    raise ValueError(
+                        "discovered deployment cannot be cloned safely because its "
+                        "launch command contains credentials or unsupported arguments"
+                    )
+                extra_args = [
+                    str(value) for value in load_settings.get("extra_args") or []
+                ]
+                self._reject_sensitive_launch_args(extra_args)
+                environment = normalize_runtime_environment(
+                    load_settings.get("environment"), runtime.value,
+                )
+                controls = _discovered_launch_controls(
+                    self.manager, runtime.value, load_settings, extra_args,
+                )
+                try:
+                    tensor_parallel = max(
+                        1, int(controls.get("tensor_parallel_size") or 1),
+                    )
+                except (TypeError, ValueError):
+                    tensor_parallel = 1
+                model = str(
+                    load_settings.get("model") or container.get("model")
+                    or container.get("served_model") or ""
+                ).strip()
+                if not model:
+                    raise ValueError(
+                        "could not determine the discovered deployment model"
+                    )
+                settings = self._local_configuration({
+                    **load_settings,
+                    "extra_args": extra_args,
+                    "environment": environment,
+                    "launch_controls": controls,
+                    "context_length": controls.get("context_window"),
+                    "max_concurrency": controls.get("max_concurrency"),
+                    "tensor_parallel_size": controls.get("tensor_parallel_size"),
+                    "pipeline_parallel_size": controls.get("pipeline_parallel_size"),
+                    "image": container.get("image"),
+                    # A clone is an unlaunched bookmark. Its topology is selected
+                    # when Run is pressed; it must not claim the source container.
+                    "node_ids": [],
+                    "deployment_mode": (
+                        "sharded" if tensor_parallel > 1 else "single"
+                    ),
+                })
+                stored = {
+                    "id": deployment_id,
+                    "alias": str(
+                        container.get("alias") or container.get("served_model")
+                        or model
+                    ),
+                    "runtime": runtime.value,
+                    "kind": DeploymentKind.MANAGED.value,
+                    "model": {
+                        "repository": model,
+                        "revision": None,
+                        "artifact": load_settings.get("artifact"),
+                        "quantization": (
+                            load_settings.get("quantization")
+                            or container.get("variant")
+                        ),
+                    },
+                    "settings": settings,
+                    "desired_state": "stopped",
+                }
+            else:
+                stored = self.store.deployment(deployment_id, include_private=True)
             if not stored:
                 raise LookupError("deployment not found")
 

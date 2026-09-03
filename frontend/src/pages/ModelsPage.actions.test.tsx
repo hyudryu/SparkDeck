@@ -226,6 +226,29 @@ describe('models page running actions', () => {
     )
   })
 
+  it('offers deployment cloning alongside recipe import for discovered containers', async () => {
+    const discovered = {
+      ...runningDeployment,
+      id: 'container:deepseek-v4', alias: 'DeepSeek V4', kind: 'external',
+      managed: false, status: 'stopped',
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const body = path === '/api/v1/deployments' ? { items: [discovered] }
+        : path === '/api/v1/nodes' ? { items: nodes }
+          : path === '/api/v1/model-cache' ? modelCache
+            : path === '/api/v1/recipes' ? { items: [] }
+              : path === '/api/v1/onboarding' ? { role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }
+                : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    renderPage()
+
+    expect(await screen.findByRole('button', { name: 'Clone DeepSeek V4' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Save DeepSeek V4 as recipe' })).toBeEnabled()
+  })
+
   it('refreshes an external clone from registered to its probed endpoint status', async () => {
     const user = userEvent.setup()
     const external = {
@@ -399,7 +422,7 @@ describe('models page running actions', () => {
 
     expect(await screen.findByText('loading checkpoint shards 7/48')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Logs for Kimi vLLM' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Clone Kimi vLLM' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Clone Kimi vLLM' })).toBeEnabled()
     await user.click(screen.getByRole('button', { name: 'Stop' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => (
@@ -428,7 +451,7 @@ describe('models page running actions', () => {
     renderPage()
 
     await screen.findByText('Kimi vLLM')
-    expect(screen.queryByRole('button', { name: 'Clone Kimi vLLM' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Clone Kimi vLLM' })).toBeEnabled()
     await user.click(screen.getByRole('button', { name: 'Make managed' }))
     expect(await screen.findByText(/TP2 requires exactly 2 nodes/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Make managed on 2 nodes' }))

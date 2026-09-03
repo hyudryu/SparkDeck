@@ -1899,9 +1899,7 @@ export function ModelsPage() {
                     {deployment.id.startsWith('container:') && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Save ${deployment.alias} as recipe`} title="Save as recipe" onClick={() => void importContainerRecipe(deployment)}><FolderPlus size={16} /></Button>
                     )}
-                    {!deployment.id.startsWith('container:') && (
-                      <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Clone ${deployment.alias}`} title="Clone deployment" onClick={() => void cloneDeployment(deployment)}><Copy size={16} /></Button>
-                    )}
+                    <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Clone ${deployment.alias}`} title="Clone deployment" onClick={() => void cloneDeployment(deployment)}><Copy size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Rename ${deployment.alias}`} onClick={() => setRenaming({ id: deployment.id, value: deployment.alias })}><Pencil size={16} /></Button>
                     <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Remove ${deployment.alias}`} onClick={() => void confirm({
                       title: `Remove ${deployment.alias}?`,

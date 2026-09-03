@@ -3895,6 +3895,11 @@ class SparkDeckService:
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("node_ids must not contain duplicates")
         if len(node_ids) != required_nodes:
+            if direct_recovery is None:
+                raise ValueError(
+                    f"tensor parallel size {required_nodes} requires exactly "
+                    f"{required_nodes} node(s)"
+                )
             raise ValueError(
                 f"this deployment requires exactly {required_nodes} node(s)"
             )
@@ -4106,6 +4111,11 @@ class SparkDeckService:
                 except (TypeError, ValueError):
                     required_nodes = 1
                 if len(node_ids) != required_nodes:
+                    if not discovered.get("direct_start"):
+                        raise ValueError(
+                            f"tensor parallel size {required_nodes} requires "
+                            f"exactly {required_nodes} node(s)"
+                        )
                     raise ValueError(
                         f"this deployment requires exactly {required_nodes} node(s)"
                     )

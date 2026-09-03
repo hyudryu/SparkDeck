@@ -7737,11 +7737,7 @@ class Manager:
         image_id = str(
             getattr(docker_image, "id", "") or image_attrs.get("Id") or ""
         ).strip().casefold()
-        if not image_id:
-            # Without an immutable identity, a successful-looking lookup is
-            # not safe to cache and may hide a later tag replacement.
-            return fallback
-        if image_id in cache:
+        if image_id and image_id in cache:
             return cache[image_id]
         env = (image_attrs.get("Config") or {}).get("Env") or []
         target = fallback
@@ -7752,7 +7748,11 @@ class Manager:
             if candidate.startswith("/") and candidate != "":
                 target = candidate
                 break
-        cache[image_id] = target
+        # Test doubles and alternate Docker clients may omit the image ID.
+        # Their environment is still usable for this call, but without an
+        # immutable identity it is not safe to cache the result.
+        if image_id:
+            cache[image_id] = target
         return target
 
     def _container_mounts_are_replayable(

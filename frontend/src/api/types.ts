@@ -103,6 +103,8 @@ export interface Deployment {
   settings: DeploymentSettings
   deployment_mode?: string
   required_node_count?: number
+  parallel_rank_count?: number
+  flexible_node_count?: boolean
   last_error?: string
   created_at?: string
   updated_at?: string

@@ -1346,12 +1346,17 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             )
             return {
                 "model": deployment.get("model"),
+                "environment": dict(settings.get("environment") or {}),
                 "extra_args": recovered_args,
             }
 
         @staticmethod
         def recipe_deployment_contract(recipe):
             return server.manager.recipe_deployment_contract(recipe)
+
+        @staticmethod
+        def _cli_option(args, names, cast=None):
+            return server.manager._cli_option(args, names, cast)
 
     class FakeStream:
         def __init__(self, chunks=()):
@@ -1393,6 +1398,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 self._blocker.set()
 
     def _service(self, directory, container):
+        if container.get("direct_start"):
+            # Hand-built direct-start fixtures model a canonical ``vllm serve``
+            # summary unless a test explicitly supplies the opposite.
+            container.setdefault("launch_prefix_replayable", True)
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
         return SparkDeckService(manager, Path(directory)), manager
@@ -1529,7 +1538,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "tensor_parallel_size": 2,
                 "command_flags": (
                     "--tensor-parallel-size 2 --pipeline-parallel-size 2 "
-                    "--max-num-seqs 8 --enable-prefix-caching"
+                    "--nnodes 4 --max-num-seqs 8 --enable-prefix-caching"
                 ),
             },
         }
@@ -1556,10 +1565,44 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(card["promotable"])
             self.assertEqual(card["deployment_mode"], "sharded")
             self.assertEqual(card["required_node_count"], 4)
+            self.assertEqual(card["parallel_rank_count"], 4)
+            self.assertFalse(card["flexible_node_count"])
             await manager.http.aclose()
             await service.close()
 
-    async def test_direct_start_rejects_selection_smaller_than_recovered_tp_pp(self):
+    async def test_direct_start_allows_parallel_ranks_on_one_gpu_rich_host(self):
+        container = {
+            "name": "external-tp8", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "load_settings": {
+                "tensor_parallel_size": 8,
+                "command_flags": "--tensor-parallel-size 8",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            manager.create_deployment.return_value = {
+                "id": "managed-cluster", "launch_settings": {},
+            }
+            adopted = Mock(return_value={"id": "managed", "status": "starting"})
+
+            with patch.object(service, "_adopt_manager_replacement", adopted):
+                result = await service._promote_discovered_deployment(
+                    deployment, container, ["local"],
+                )
+
+            launch = manager.create_deployment.await_args.args[0]
+            self.assertEqual(launch["deployment_mode"], "single")
+            self.assertEqual(launch["node_ids"], ["local"])
+            self.assertEqual(result["id"], "managed")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_direct_start_rejects_selection_that_does_not_divide_tp_pp(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
@@ -1577,9 +1620,9 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
 
-            with self.assertRaisesRegex(ValueError, "requires exactly 4 node"):
+            with self.assertRaisesRegex(ValueError, "ranks must divide evenly"):
                 await service._promote_discovered_deployment(
-                    deployment, container, ["local", "worker-1"],
+                    deployment, container, ["local", "worker-1", "worker-2"],
                 )
 
             manager.create_deployment.assert_not_awaited()
@@ -1626,12 +1669,16 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
     def test_mount_replayability_allows_only_managed_volume_contracts(self):
         inspect = server.manager._container_mounts_are_replayable
+        managed_cache = str(Path("/host/hf").expanduser().resolve())
+        other_cache = str(Path("/other/hf").expanduser().resolve())
         with patch.object(
             server.manager, "_image_hf_cache_target", return_value="/opt/hf-cache",
-        ), patch.object(server.manager, "_resolve_local_path", return_value=None):
+        ), patch.object(
+            server.manager, "_resolve_local_path", return_value=None,
+        ), patch.dict(server.manager.settings, {"hf_cache": "/host/hf"}):
             self.assertTrue(inspect({
                 "Mounts": [{
-                    "Type": "bind", "Source": "/host/hf",
+                    "Type": "bind", "Source": managed_cache,
                     "Destination": "/opt/hf-cache",
                 }],
             }, "vision:latest", "org/model"))
@@ -1648,7 +1695,20 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 }],
             }, "vision:latest", "org/model"))
             self.assertTrue(inspect({
-                "HostConfig": {"Binds": ["/host/hf:/opt/hf-cache:rw"]},
+                "HostConfig": {
+                    "Binds": [f"{managed_cache}:/opt/hf-cache:rw"],
+                },
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [{
+                    "Type": "bind", "Source": other_cache,
+                    "Destination": "/opt/hf-cache",
+                }],
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "HostConfig": {
+                    "Binds": [f"{other_cache}:/opt/hf-cache:rw"],
+                },
             }, "vision:latest", "org/model"))
             self.assertFalse(inspect({
                 "HostConfig": {"Binds": ["/host/config:/config:ro"]},
@@ -1758,6 +1818,86 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                     node_ids=["local", "worker-1"], promote=True,
                 )
 
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_filtered_speculative_environment_blocks_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "load_settings": {
+                "command_flags": "--speculative-config '${ALT_CONFIG}'",
+                # Docker discovery intentionally filtered ALT_CONFIG out.
+                "environment": {},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "depends on shell expansion"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_preserved_speculative_environment_allows_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "load_settings": {
+                "command_flags": (
+                    "--speculative-config '${SPECULATIVE_CONFIG}'"
+                ),
+                "environment": {
+                    "SPECULATIVE_CONFIG": '{"method":"dspark"}',
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            self.assertTrue(card["promotable"])
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_entrypoint_wrapper_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "launch_prefix_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "executable prefix"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
             manager.create_deployment.assert_not_awaited()
             manager.start_container.assert_not_awaited()
             await manager.http.aclose()

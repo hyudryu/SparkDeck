@@ -363,6 +363,8 @@ export interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   required_node_count?: number
+  parallel_rank_count?: number
+  flexible_node_count?: boolean
   model_revision?: string
   created_at?: string
   last_deployed_at?: string | number
@@ -437,6 +439,8 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     },
     deployment_mode: item.deployment_mode,
     required_node_count: item.required_node_count,
+    parallel_rank_count: item.parallel_rank_count,
+    flexible_node_count: item.flexible_node_count,
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,

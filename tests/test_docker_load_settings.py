@@ -138,6 +138,95 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "SPECULATIVE_CONFIG": '{"method":"dspark"}',
         })
 
+    def test_external_summary_marks_entrypoint_wrapper_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "wrapped-entrypoint-id",
+            "wrapped-entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["/opt/bootstrap", "vllm"],
+                "Cmd": ["serve", "org/model", "--max-num-seqs", "8"],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_allows_canonical_vllm_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "canonical-entrypoint-id",
+            "canonical-entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["/opt/venv/bin/vllm"],
+                "Cmd": ["serve", "org/model", "--max-num-seqs", "8"],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["launch_prefix_replayable"])
+
+    def test_external_summary_marks_shell_prelude_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "shell-prelude-id",
+            "shell-prelude-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "/bin/bash", "-lc",
+                    "source /opt/runtime/setup.sh; exec vllm serve org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["load_settings"]["editable"])
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_recovered_launch_preserves_discovered_runtime_environment(self):
+        recovered = self.manager._recovered_deployment_launch_settings(
+            {
+                "name": "example",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+            },
+            {
+                "image": "example/vllm:latest",
+                "load_settings": {
+                    "command_flags": (
+                        "--speculative-config '${SPECULATIVE_CONFIG}'"
+                    ),
+                    "environment": {
+                        "SPECULATIVE_CONFIG": '{"method":"dspark"}',
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(recovered["environment"], {
+            "SPECULATIVE_CONFIG": '{"method":"dspark"}',
+        })
+
     def test_shell_wrapped_summary_retains_launch_model_beside_served_label(self):
         containers = FakeContainers()
         container = FakeContainer(
@@ -658,6 +747,32 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         settings = self.manager._container_load_settings(command, "vllm", model)
 
         self.assertFalse(settings["editable"])
+
+    def test_shell_wrapped_comment_is_read_only(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8 # tuned for this host",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
+    def test_literal_hashes_do_not_look_like_shell_comments(self):
+        model = "example/Model"
+        for value in ("release#1", "'release #1'", r"release\#1"):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --served-model-name {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
 
     def test_shell_wrapped_line_continuation_stays_editable(self):
         model = "example/Model"

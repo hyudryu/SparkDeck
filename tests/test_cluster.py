@@ -2998,6 +2998,41 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(instance.deployments, [])
 
+    async def test_vllm_single_host_parallelism_validates_local_gpu_ranks(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {}
+        instance.deployments = []
+        local_gpus = [{"name": f"GPU {index}"} for index in range(8)]
+
+        async def cluster_nodes(local_stats=None):
+            return [{
+                "id": "local", "name": "GPU server", "online": True,
+                "docker_ready": True, "interfaces": [],
+                "stats": {"gpus": local_gpus},
+            }]
+
+        instance.cluster_nodes = cluster_nodes
+        instance._allocate_port = mock.AsyncMock(return_value=8000)
+
+        plan = await instance._preflight_deployment_launch({
+            "model": "example/Model",
+            "engine": "vllm",
+            "deployment_mode": "single",
+            "node_ids": ["local"],
+            "extra_args": ["--tensor-parallel-size", "8"],
+        })
+        self.assertEqual(plan["node_ids"], ["local"])
+
+        local_gpus.pop()
+        with self.assertRaisesRegex(ValueError, "8 GPU.*not enough devices"):
+            await instance._preflight_deployment_launch({
+                "model": "example/Model",
+                "engine": "vllm",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "extra_args": ["--tensor-parallel-size", "8"],
+            })
+
     def test_stopped_deployment_launch_settings_are_saved_and_marked_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

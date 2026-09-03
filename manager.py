@@ -4430,6 +4430,7 @@ class Manager:
             "model": deployment.get("model"),
             "engine": engine,
             "image": (primary_container or {}).get("image"),
+            "environment": load_settings.get("environment") or {},
             "extra_args": recovered_args,
             "gpu_memory_utilization": load_settings.get(
                 "gpu_memory_utilization"
@@ -4784,6 +4785,74 @@ class Manager:
         return False
 
     @staticmethod
+    def _has_unquoted_shell_comment(value: str) -> bool:
+        """Return whether shell text contains a POSIX comment introducer.
+
+        ``shlex.split`` does not recognize comments unless explicitly asked to,
+        so reconstructing a shell command from its tokens would turn ``#`` and
+        the comment text into ordinary vLLM argv. A hash starts a shell comment
+        only at the beginning of a word; quoted, escaped, and embedded hashes
+        remain literal argument content.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        word_start = True
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                word_start = False
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    word_start = False
+                    continue
+                word_start = False
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                word_start = False
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                word_start = False
+                continue
+            if char == "#" and word_start:
+                return True
+            word_start = char.isspace() or char in ";|&()<>"
+            index += 1
+        return False
+
+    @classmethod
+    def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
+        """Whether a managed launch reproduces the command before ``serve``."""
+        command = [str(value) for value in (cmd or [])]
+        if len(command) >= 3 and command[-2] in {"-c", "-lc"}:
+            match = cls._shell_vllm_command(command[-1])
+            if match is None:
+                return False
+            # Promotion switches to exec-form ``vllm serve``. Even a safe
+            # setup/export prelude would be lost, so accept only whitespace
+            # before a bare invocation (optionally introduced by ``exec``).
+            return not command[-1][:match.start()].strip()
+        try:
+            serve_index = command.index("serve")
+        except ValueError:
+            return False
+        if serve_index != 1:
+            return False
+        executable = command[0].replace("\\", "/").rsplit("/", 1)[-1]
+        return executable == "vllm"
+
+    @staticmethod
     def _shell_vllm_command(script: str):
         """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
         return re.search(
@@ -4870,12 +4939,16 @@ class Manager:
         analysis_cmd = cmd
         shell_wrapped = False
         shell_command_boundary = False
+        shell_comment = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
                 shell_wrapped = True
                 command_flags = match.group("flags").strip()
                 shell_command_boundary = self._has_unescaped_shell_newline(
+                    match.group("flags")
+                )
+                shell_comment = self._has_unquoted_shell_comment(
                     match.group("flags")
                 )
                 try:
@@ -4977,6 +5050,7 @@ class Manager:
             "editable": (
                 "serve" in analysis_cmd
                 and not shell_command_boundary
+                and not shell_comment
                 and (
                     shell_wrapped
                     or not self._has_unresolvable_shell_tokens(
@@ -5615,7 +5689,7 @@ class Manager:
         if not model:
             raise ValueError("model is required")
         vllm_parallel_layout: tuple[int, int] | None = None
-        if mode == "sharded" and engine == "vllm":
+        if mode in {"single", "sharded"} and engine == "vllm":
             requested_args = list(body.get("extra_args") or [])
             requested_tp = self._cli_option(
                 requested_args, {"--tensor-parallel-size", "-tp"}, int
@@ -5650,8 +5724,9 @@ class Manager:
                         f"layout requires {ranks_per_node} GPU(s) per node; "
                         f"not enough devices on: {', '.join(gpu_short)}"
                     )
-                vllm_parallel_layout = (tp, pp)
-            else:
+                if mode == "sharded":
+                    vllm_parallel_layout = (tp, pp)
+            elif mode == "sharded":
                 # Default to one local tensor-parallel rank per node and
                 # pipeline parallelism across nodes. Models that do not
                 # implement SupportsPP can explicitly request TP=nnodes, PP=1.
@@ -7483,6 +7558,16 @@ class Manager:
             return True
 
         cache_target = self._image_hf_cache_target(image).rstrip("/") or "/"
+        configured_cache = str(
+            (getattr(self, "settings", {}) or {}).get("hf_cache") or ""
+        ).strip()
+        managed_cache_source = (
+            os.path.normcase(os.path.normpath(str(
+                Path(configured_cache).expanduser().resolve()
+            )))
+            if configured_cache
+            else None
+        )
         local_model = self._resolve_local_path(model)
         local_target = str(local_model).rstrip("/\\") if local_model else None
 
@@ -7494,7 +7579,14 @@ class Manager:
                     str(mount.get("Destination") or "").rstrip("/") or "/"
                 )
                 if destination == cache_target:
-                    continue
+                    source = str(mount.get("Source") or "").strip()
+                    if (
+                        managed_cache_source
+                        and os.path.normcase(os.path.normpath(source))
+                        == managed_cache_source
+                    ):
+                        continue
+                    return False
                 source = str(mount.get("Source") or "").rstrip("/\\")
                 if (
                     local_target
@@ -7521,9 +7613,15 @@ class Manager:
             }
             destination = parts[-2] if has_mode else parts[-1]
             destination = destination.rstrip("/") or "/"
-            if destination == cache_target:
-                continue
             source = parts[-3] if has_mode and len(parts) == 3 else parts[-2]
+            if destination == cache_target:
+                if (
+                    managed_cache_source
+                    and os.path.normcase(os.path.normpath(source))
+                    == managed_cache_source
+                ):
+                    continue
+                return False
             source = source.rstrip("/\\")
             if (
                 local_target
@@ -11078,6 +11176,13 @@ class Manager:
             # Sanitized capability only: never expose inspected host paths.
             "mounts_replayable": self._container_mounts_are_replayable(
                 attrs, image_tag, launch_model or model,
+            ),
+            # Managed vLLM launches deliberately replace the image entrypoint
+            # with a canonical ``vllm serve`` command. Record whether doing so
+            # would discard an executable/bootstrap prefix from this container.
+            "launch_prefix_replayable": (
+                engine_label != "vllm"
+                or self._vllm_exec_prefix_is_replayable(cmd)
             ),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),

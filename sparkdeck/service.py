@@ -405,6 +405,11 @@ class SparkDeckService:
         )
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_reconciliation_lock = asyncio.Lock()
+        # Aliases, deployment ids, and runtime-served model ids share one
+        # public selector namespace.  Renames may await inventory discovery
+        # before persisting, so a per-deployment lifecycle lock cannot prevent
+        # two different records from claiming the same selector concurrently.
+        self._deployment_alias_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -3886,6 +3891,14 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "custom mounts cannot be reproduced"
             )
+        if (
+            container.get("direct_start")
+            and container.get("launch_prefix_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "executable prefix cannot be reproduced"
+            )
         if direct_recovery is not None:
             launch_settings, layout = direct_recovery
             required_nodes = layout["required_node_count"]
@@ -3902,7 +3915,23 @@ class SparkDeckService:
             launch_settings = None
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("node_ids must not contain duplicates")
-        if len(node_ids) != required_nodes:
+        flexible_node_count = (
+            bool(layout.get("flexible_node_count")) if direct_recovery else False
+        )
+        parallel_rank_count = (
+            layout.get("parallel_rank_count") if direct_recovery else None
+        )
+        if flexible_node_count and isinstance(parallel_rank_count, int):
+            if not node_ids or parallel_rank_count % len(node_ids):
+                raise ValueError(
+                    f"{parallel_rank_count} parallel GPU ranks must divide evenly "
+                    "across the selected nodes"
+                )
+            # A one-host vLLM launch keeps TP/PP inside that host. Multi-host
+            # selections use Manager's distributed sharded launch. Manager
+            # preflight validates ranks-per-host against live GPU telemetry.
+            deployment_mode = "single" if len(node_ids) == 1 else "sharded"
+        elif len(node_ids) != required_nodes:
             if direct_recovery is None:
                 raise ValueError(
                     f"tensor parallel size {required_nodes} requires exactly "
@@ -4018,6 +4047,30 @@ class SparkDeckService:
             return False
         model = launch_settings.get("model")
         argv = [str(model), *extra_args] if model not in (None, "") else extra_args
+        environment = launch_settings.get("environment")
+        if environment is None:
+            environment = {}
+        if not isinstance(environment, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            return False
+        index = 0
+        while index < len(extra_args):
+            token = extra_args[index]
+            key, separator, inline = token.partition("=")
+            if key == "--speculative-config":
+                value = inline if separator else (
+                    extra_args[index + 1] if index + 1 < len(extra_args) else ""
+                )
+                match = re.fullmatch(
+                    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value.strip(),
+                )
+                if match is not None and match.group(1) not in environment:
+                    return False
+                if not separator:
+                    index += 1
+            index += 1
         try:
             return not checker(argv)
         except (TypeError, ValueError):
@@ -4062,9 +4115,47 @@ class SparkDeckService:
             not isinstance(required, int) or isinstance(required, bool) or required < 1
         ):
             return None
+        rank_count = (
+            contract.get("tensor_parallel_size", 1)
+            * contract.get("pipeline_parallel_size", 1)
+        )
+        cli_option = getattr(self.manager, "_cli_option", None)
+        recovered_args = launch_settings.get("extra_args") or []
+        has_explicit_hosts = any(
+            str(token).partition("=")[0] == "--nnodes"
+            for token in recovered_args
+        )
+        raw_explicit_hosts = (
+            cli_option(recovered_args, {"--nnodes"})
+            if callable(cli_option) and has_explicit_hosts else None
+        )
+        try:
+            explicit_hosts = (
+                int(raw_explicit_hosts) if has_explicit_hosts else None
+            )
+        except (TypeError, ValueError):
+            return None
+        if has_explicit_hosts:
+            if (
+                explicit_hosts is None or explicit_hosts < 1
+                or rank_count % explicit_hosts
+            ):
+                return None
+            required = explicit_hosts
+            mode = "single" if explicit_hosts == 1 else "sharded"
         return launch_settings, {
             "deployment_mode": mode,
             "required_node_count": required,
+            # Without an explicit --nnodes, direct vLLM containers prove the
+            # argv's rank layout but not a SparkDeck host layout. Accept any
+            # divisor whose ranks fit; Manager preflight performs the
+            # authoritative per-host GPU-capacity check.
+            "parallel_rank_count": rank_count,
+            "flexible_node_count": (
+                runtime == RuntimeKind.VLLM.value
+                and rank_count > 1
+                and not has_explicit_hosts
+            ),
         }
 
     async def _deployment_action_locked(
@@ -4118,14 +4209,13 @@ class SparkDeckService:
                     )
                 except (TypeError, ValueError):
                     required_nodes = 1
-                if len(node_ids) != required_nodes:
-                    if not discovered.get("direct_start"):
-                        raise ValueError(
-                            f"tensor parallel size {required_nodes} requires "
-                            f"exactly {required_nodes} node(s)"
-                        )
+                if (
+                    not discovered.get("direct_start")
+                    and len(node_ids) != required_nodes
+                ):
                     raise ValueError(
-                        f"this deployment requires exactly {required_nodes} node(s)"
+                        f"tensor parallel size {required_nodes} requires "
+                        f"exactly {required_nodes} node(s)"
                     )
                 if promote or required_nodes > 1 or node_ids != ["local"]:
                     return await self._promote_discovered_deployment(
@@ -5396,6 +5486,21 @@ class SparkDeckService:
                 result.update(self._saved_layout_contract(settings, clone.runtime.value))
             return result
 
+    async def _assert_deployment_alias_available(
+        self, alias: str, deployment_id: str,
+    ) -> None:
+        folded = alias.casefold()
+        for item in await self.deployments():
+            if str(item.get("id") or "") == deployment_id:
+                continue
+            public_ids = self._deployment_public_model_ids(item)
+            if folded in {
+                str(item.get("id") or "").casefold(),
+                str(item.get("alias") or "").casefold(),
+                *(str(value).casefold() for value in public_ids),
+            }:
+                raise ValueError(f"deployment alias '{alias}' is already in use")
+
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
         if not alias:
@@ -5409,33 +5514,23 @@ class SparkDeckService:
                         "rename the cluster deployment instead of one discovered member"
                     )
                 self._reject_external_lifecycle_in_flight(name)
-                folded = alias.casefold()
-                for item in await self.deployments():
-                    if str(item.get("id") or "") == deployment_id:
-                        continue
-                    public_ids = self._deployment_public_model_ids(item)
-                    if folded in {
-                        str(item.get("id") or "").casefold(),
-                        str(item.get("alias") or "").casefold(),
-                        *(str(value).casefold() for value in public_ids),
-                    }:
-                        raise ValueError(
-                            f"deployment alias '{alias}' is already in use"
-                        )
-                await self.manager.update_container_alias(name, alias)
+                async with self._deployment_alias_lock:
+                    await self._assert_deployment_alias_available(
+                        alias, deployment_id,
+                    )
+                    await self.manager.update_container_alias(name, alias)
                 return await self.deployment_detail(deployment_id)
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored:
             raise LookupError("deployment not found")
-        existing = self.store.deployment(alias)
-        if existing and existing["id"] != stored["id"]:
-            raise ValueError(f"deployment alias '{alias}' is already in use")
-        manager_id = stored.get("settings", {}).get("manager_deployment_id")
-        if manager_id:
-            # Keep the Manager record in sync so /api/state and MCP cluster
-            # listings (and future Manager-driven rebuilds) use the new name.
-            self.manager.update_deployment_alias(manager_id, alias)
-        self.store.update_alias(stored["id"], alias)
+        async with self._deployment_alias_lock:
+            await self._assert_deployment_alias_available(alias, deployment_id)
+            manager_id = stored.get("settings", {}).get("manager_deployment_id")
+            if manager_id:
+                # Keep the Manager record in sync so /api/state and MCP cluster
+                # listings (and future Manager-driven rebuilds) use the new name.
+                self.manager.update_deployment_alias(manager_id, alias)
+            self.store.update_alias(stored["id"], alias)
         stored.pop("_base_url", None)
         stored.pop("_credential_ref", None)
         return {**stored, "alias": alias}
@@ -5491,6 +5586,7 @@ class SparkDeckService:
             direct_recovery
             and self._recovered_launch_is_portable(direct_recovery[0])
             and container.get("mounts_replayable") is True
+            and container.get("launch_prefix_replayable") is True
         )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster

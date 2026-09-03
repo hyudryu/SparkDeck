@@ -15,6 +15,7 @@ from sparkdeck.storage import (
     SparkDeckStore,
     _COMMUNITY_AGGREGATE_BATCH_SIZE,
     _community_prompt_bucket,
+    community_tensor_parallel_size,
 )
 
 
@@ -35,6 +36,18 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(_community_prompt_bucket(2_500), 3000)
         self.assertEqual(_community_prompt_bucket(9_999), 9000)
         self.assertIsNone(_community_prompt_bucket(10_000))
+
+    def test_community_tp_contract_defaults_tp1_and_bounds_explicit_values(self):
+        self.assertEqual(community_tensor_parallel_size({}), 1)
+        self.assertEqual(community_tensor_parallel_size({
+            "tensor_parallel_size": "4",
+        }), 4)
+        self.assertIsNone(community_tensor_parallel_size({
+            "tensor_parallel_size": True,
+        }))
+        self.assertIsNone(community_tensor_parallel_size({
+            "tensor_parallel_size": 1025,
+        }))
 
     def test_consent_defaults_off_and_deployment_hides_endpoint(self):
         self.assertFalse(self.store.sync_status()["consent"])
@@ -156,6 +169,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "inference_tokens_per_second": 300.0,
             "telemetry_cluster_id": consent["telemetry_cluster_id"],
             "concurrency": 1,
+            "tensor_parallel_size": 1,
         }])
         self.assertEqual(self.store.mark_outbox_failed(["sample-2"], "offline"), 1)
         self.assertEqual(self.store.outbox_batch(), [])
@@ -410,6 +424,48 @@ class SparkDeckStoreTests(unittest.TestCase):
             self.store.community_consent_snapshot()["generation"], 1,
         )
 
+    def test_migration_backfills_tp1_and_explicit_tensor_parallel_cohorts(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="legacy-tp1", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None, model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=400, output_tokens=64,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        self.store.add_benchmark_if_consented(base, consent["generation"])
+        self.store.add_benchmark_if_consented(replace(
+            base, id="legacy-tp4",
+            configuration={"tensor_parallel_size": 4},
+        ), consent["generation"])
+        with self.store._connection:
+            self.store._connection.execute(
+                "UPDATE benchmark_samples "
+                "SET community_tensor_parallel_size = NULL"
+            )
+
+        database = self.store.path
+        self.store.close()
+        self.store = SparkDeckStore(database)
+
+        rows = self.store._connection.execute(
+            "SELECT id, community_tensor_parallel_size "
+            "FROM benchmark_samples ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["community_tensor_parallel_size"]) for row in rows],
+            [("legacy-tp1", 1), ("legacy-tp4", 4)],
+        )
+        index_sql = self.store._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'benchmark_samples_community_cohort'"
+        ).fetchone()[0]
+        self.assertIn("community_tensor_parallel_size", index_sql)
+
     def test_migration_discards_ownerless_legacy_upload_instructions(self):
         self.store.set_setting("device_pairing", {"status": "paired"})
         consent = self.store.set_community_consent(True)
@@ -557,6 +613,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "minimum_samples": 10,
             "exact_match_dimensions": [
                 "model_id", "quantization", "prompt_tokens_bucket",
+                "tensor_parallel_size",
             ],
             "metric": "inference_tokens_per_second",
         })
@@ -801,7 +858,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertTrue(all(not row["eligible_for_community"] for row in local))
         self.assertEqual(self.store.outbox_batch(), [])
 
-    def test_upload_omits_untrusted_benchmark_dimensions_for_ordinary_sample(self):
+    def test_upload_includes_tensor_parallel_dimension_for_ordinary_sample(self):
         sample = BenchmarkSample(
             id="ordinary-tp", created_at="2026-08-27T00:00:00+00:00",
             deployment_id="dep-1", model=ModelIdentity("org/model"),
@@ -827,6 +884,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "inference_tokens_per_second": 50.0,
             "telemetry_cluster_id": consent["telemetry_cluster_id"],
             "concurrency": 1,
+            "tensor_parallel_size": 4,
         }])
 
     def test_local_community_aggregates_group_only_privacy_eligible_rows(self):
@@ -886,6 +944,7 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 400,
+                "tensor_parallel_size": 1,
                 "inference_tokens_per_second": 195.0,
                 "sample_count": 2,
                 "unique_cluster_count": 2,
@@ -894,6 +953,7 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 2000,
+                "tensor_parallel_size": 1,
                 "inference_tokens_per_second": 40.0,
                 "sample_count": 1,
                 "unique_cluster_count": 1,
@@ -943,6 +1003,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "model_id": "org/model",
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
+            "tensor_parallel_size": 1,
             "inference_tokens_per_second": 80.0,
             "sample_count": 1,
             "unique_cluster_count": 1,
@@ -990,6 +1051,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "model_id": "deepseek-r1",
             "quantization": "Q4_K_M",
             "prompt_tokens_bucket": 400,
+            "tensor_parallel_size": 1,
             "inference_tokens_per_second": 43.333333333333336,
             "sample_count": 3,
             "unique_cluster_count": 3,
@@ -1036,6 +1098,50 @@ class SparkDeckStoreTests(unittest.TestCase):
                 prepared["sample_id"], prepared_payload=prepared["payload"],
             ),
             prepared,
+        )
+
+    def test_outbox_keeps_one_user_average_per_tensor_parallel_setting(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        base = BenchmarkSample(
+            id="tp1-a", created_at="2026-08-25T00:00:00+00:00",
+            deployment_id=None,
+            model=ModelIdentity("deepseek-r1", quantization="Q4_K_M"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={"tensor_parallel_size": 1},
+            input_tokens=400, output_tokens=64, latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=40,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        for sample in (
+            base,
+            replace(base, id="tp1-b", generation_tokens_per_second=60),
+            replace(
+                base, id="tp4-a",
+                configuration={"tensor_parallel_size": 4},
+                generation_tokens_per_second=100,
+            ),
+            replace(
+                base, id="tp4-b",
+                configuration={"tensor_parallel_size": 4},
+                generation_tokens_per_second=140,
+            ),
+        ):
+            self.assertTrue(self.store.add_benchmark_if_consented(
+                sample, consent["generation"],
+            ))
+
+        payloads = self.store.outbox_batch()
+        averages = {
+            payload["tensor_parallel_size"]:
+                payload["inference_tokens_per_second"]
+            for payload in payloads
+        }
+        self.assertEqual(averages, {1: 50.0, 4: 120.0})
+        self.assertEqual(
+            {payload["tensor_parallel_size"] for payload in payloads},
+            {1, 4},
         )
 
     def test_outbox_computes_robust_mean_for_pending_cohort_outside_recent_rows(self):
@@ -1087,9 +1193,10 @@ class SparkDeckStoreTests(unittest.TestCase):
                  AND community_model_id = ?
                  AND community_quantization = ?
                  AND community_prompt_bucket = ?
+                 AND community_tensor_parallel_size = ?
                ORDER BY created_at DESC, id DESC LIMIT ?""",
             (
-                consent["generation"], "deepseek-r1", "Q4_K_M", 400,
+                consent["generation"], "deepseek-r1", "Q4_K_M", 400, 1,
                 256,
             ),
         ).fetchall()

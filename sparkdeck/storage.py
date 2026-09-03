@@ -21,13 +21,14 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
     "model_id", "quantization", "prompt_tokens_bucket",
     "inference_tokens_per_second", "telemetry_cluster_id",
-    "concurrency",
+    "concurrency", "tensor_parallel_size",
 })
-COMMUNITY_CONSENT_CONTRACT_VERSION = 3
+COMMUNITY_CONSENT_CONTRACT_VERSION = 4
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
     "exact_match_dimensions": [
         "model_id", "quantization", "prompt_tokens_bucket",
+        "tensor_parallel_size",
     ],
     "metric": "inference_tokens_per_second",
 }
@@ -81,6 +82,11 @@ class SparkDeckStore:
         self._connection.create_function(
             "sparkdeck_community_prompt_bucket", 1,
             _community_prompt_bucket,
+            deterministic=True,
+        )
+        self._connection.create_function(
+            "sparkdeck_community_tensor_parallel_size", 1,
+            _community_tensor_parallel_size_json,
             deterministic=True,
         )
         self._connection.execute("PRAGMA journal_mode=WAL")
@@ -148,7 +154,8 @@ class SparkDeckStore:
                     consent_generation INTEGER,
                     community_model_id TEXT,
                     community_quantization TEXT,
-                    community_prompt_bucket INTEGER
+                    community_prompt_bucket INTEGER,
+                    community_tensor_parallel_size INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_samples_created_at
                     ON benchmark_samples(created_at DESC);
@@ -198,10 +205,10 @@ class SparkDeckStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 consent_version = None
             if consent_version != COMMUNITY_CONSENT_CONTRACT_VERSION:
-                # Quantization and the opaque cluster identifier widen the
-                # public payload. Existing opt-ins must not silently authorize
-                # that new contract. Invalidate any in-flight consent snapshot
-                # when migration actually transitions sharing from on to off.
+                # New public fields (currently including TP cohort metadata)
+                # must not silently widen an existing opt-in. Invalidate any
+                # in-flight consent snapshot when migration actually
+                # transitions sharing from on to off.
                 self._connection.execute(
                     "UPDATE settings SET value_json = 'false' "
                     "WHERE key = 'community_consent'"
@@ -279,6 +286,17 @@ class SparkDeckStore:
                     "PRAGMA table_info(benchmark_samples)"
                 )
             }
+            cohort_index_row = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'benchmark_samples_community_cohort'"
+            ).fetchone()
+            tp_cohort_migration = (
+                "community_tensor_parallel_size" not in benchmark_columns
+                or cohort_index_row is None
+                or "community_tensor_parallel_size" not in str(
+                    cohort_index_row["sql"] or ""
+                )
+            )
             if "telemetry_cluster_id" not in benchmark_columns:
                 self._connection.execute(
                     "ALTER TABLE benchmark_samples "
@@ -300,6 +318,7 @@ class SparkDeckStore:
                 ("community_model_id", "TEXT"),
                 ("community_quantization", "TEXT"),
                 ("community_prompt_bucket", "INTEGER"),
+                ("community_tensor_parallel_size", "INTEGER"),
             ):
                 if column_name not in benchmark_columns:
                     self._connection.execute(
@@ -319,21 +338,31 @@ class SparkDeckStore:
                          )
                        END,
                        community_prompt_bucket =
-                         sparkdeck_community_prompt_bucket(input_tokens)
+                         sparkdeck_community_prompt_bucket(input_tokens),
+                       community_tensor_parallel_size =
+                         sparkdeck_community_tensor_parallel_size(configuration_json)
                    WHERE eligible = 1 AND (
                      community_model_id IS NULL
                      OR community_quantization IS NULL
                      OR community_prompt_bucket IS NULL
+                     OR community_tensor_parallel_size IS NULL
                    )"""
             )
-            self._connection.execute(
-                """CREATE INDEX IF NOT EXISTS benchmark_samples_community_cohort
-                   ON benchmark_samples(
-                     consent_generation, community_model_id,
-                     community_quantization, community_prompt_bucket,
-                     created_at DESC, id DESC
-                   ) WHERE eligible = 1"""
-            )
+            if tp_cohort_migration:
+                # The index existed before TP became an exact cohort dimension,
+                # so recreate it once during that schema transition.
+                self._connection.execute(
+                    "DROP INDEX IF EXISTS benchmark_samples_community_cohort"
+                )
+                self._connection.execute(
+                    """CREATE INDEX benchmark_samples_community_cohort
+                       ON benchmark_samples(
+                         consent_generation, community_model_id,
+                         community_quantization, community_prompt_bucket,
+                         community_tensor_parallel_size,
+                         created_at DESC, id DESC
+                       ) WHERE eligible = 1"""
+                )
             self._backfill_benchmark_series_links()
             # Older versions considered samples uploadable without the two
             # measurements required by the public aggregate. Fail closed when
@@ -341,7 +370,8 @@ class SparkDeckStore:
             # instructions; the full benchmark rows remain local.
             invalid_sample_ids: list[str] = []
             for row in self._connection.execute(
-                "SELECT id, input_tokens, generation_tps, telemetry_cluster_id "
+                "SELECT id, input_tokens, generation_tps, telemetry_cluster_id, "
+                "community_tensor_parallel_size "
                 "FROM benchmark_samples WHERE eligible = 1"
             ).fetchall():
                 if (
@@ -350,6 +380,9 @@ class SparkDeckStore:
                     or not _valid_telemetry_cluster_id(
                         row["telemetry_cluster_id"]
                     )
+                    or _positive_integer(
+                        row["community_tensor_parallel_size"]
+                    ) is None
                 ):
                     invalid_sample_ids.append(row["id"])
             if invalid_sample_ids:
@@ -633,8 +666,9 @@ class SparkDeckStore:
                 input_tokens, output_tokens, latency_ms, ttft_ms,
                 generation_tps, prompt_tps, cold_start, eligible,
                 telemetry_cluster_id, consent_generation, community_model_id,
-                community_quantization, community_prompt_bucket
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                community_quantization, community_prompt_bucket,
+                community_tensor_parallel_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sample.id, sample.created_at, sample.deployment_id,
                 json.dumps(value["model"]), sample.runtime.value,
@@ -656,6 +690,10 @@ class SparkDeckStore:
                 ),
                 (
                     _community_prompt_bucket(sample.input_tokens)
+                    if community_eligible else None
+                ),
+                (
+                    community_tensor_parallel_size(value["configuration"])
                     if community_eligible else None
                 ),
             ),
@@ -897,7 +935,7 @@ class SparkDeckStore:
         dimensions cannot be represented by this community contract. Manual
         benchmark detail remains available from ``benchmark_series_points``.
         """
-        grouped: dict[tuple[str, str, int], dict[str, list[float]]] = {}
+        grouped: dict[tuple[str, str, int, int], dict[str, list[float]]] = {}
         with self._lock:
             cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, input_tokens, "
@@ -930,14 +968,21 @@ class SparkDeckStore:
                     prompt_bucket = _community_prompt_bucket(
                         row["input_tokens"]
                     )
+                    tensor_parallel_size = community_tensor_parallel_size(
+                        configuration
+                    )
                     speed = _positive_speed(row["generation_tps"])
                     cluster_id = row["telemetry_cluster_id"]
                     if (
                         not model_id or prompt_bucket is None or speed is None
+                        or tensor_parallel_size is None
                         or not _valid_telemetry_cluster_id(cluster_id)
                     ):
                         continue
-                    key = (model_id, quantization, prompt_bucket)
+                    key = (
+                        model_id, quantization, prompt_bucket,
+                        tensor_parallel_size,
+                    )
                     values = grouped.setdefault(key, {}).setdefault(
                         str(cluster_id), []
                     )
@@ -945,7 +990,9 @@ class SparkDeckStore:
                         values.append(speed)
 
         items = []
-        for (model_id, quantization, prompt_bucket), contributors in grouped.items():
+        for (
+            model_id, quantization, prompt_bucket, tensor_parallel_size
+        ), contributors in grouped.items():
             contributor_means = [
                 _outlier_filtered_mean(values)
                 for values in contributors.values()
@@ -954,6 +1001,7 @@ class SparkDeckStore:
                 "model_id": model_id,
                 "quantization": quantization,
                 "prompt_tokens_bucket": prompt_bucket,
+                "tensor_parallel_size": tensor_parallel_size,
                 "inference_tokens_per_second": statistics.fmean(contributor_means),
                 # The evidence threshold counts equal-weight contributors, not
                 # raw inference requests from a potentially busy installation.
@@ -965,6 +1013,7 @@ class SparkDeckStore:
             key=lambda item: (
                 -item["sample_count"], item["model_id"].casefold(),
                 item["quantization"].casefold(), item["prompt_tokens_bucket"],
+                item["tensor_parallel_size"],
             ),
         )
 
@@ -1044,14 +1093,14 @@ class SparkDeckStore:
             ).fetchall()
         by_id = {}
         payloads_by_id = {}
-        required_keys: set[tuple[str, str, int]] = set()
+        required_keys: set[tuple[str, str, int, int]] = set()
         for row in sample_rows:
             payload = _upload_row(row)
             if payload is None:
                 continue
             key = (
                 payload["model_id"], payload["quantization"],
-                payload["prompt_tokens_bucket"],
+                payload["prompt_tokens_bucket"], payload["tensor_parallel_size"],
             )
             required_keys.add(key)
             payloads_by_id[row["id"]] = (payload, key)
@@ -1088,7 +1137,7 @@ class SparkDeckStore:
         if prepared_payload is not None:
             key_fields = (
                 "model_id", "quantization", "prompt_tokens_bucket",
-                "telemetry_cluster_id", "concurrency",
+                "telemetry_cluster_id", "concurrency", "tensor_parallel_size",
             )
             if any(
                 prepared_payload.get(field) != payload.get(field)
@@ -1101,7 +1150,7 @@ class SparkDeckStore:
         else:
             key = (
                 payload["model_id"], payload["quantization"],
-                payload["prompt_tokens_bucket"],
+                payload["prompt_tokens_bucket"], payload["tensor_parallel_size"],
             )
             payload["inference_tokens_per_second"] = (
                 self._community_contribution_averages({key})[key]
@@ -1109,30 +1158,37 @@ class SparkDeckStore:
         return {"sample_id": sample_id, "payload": payload}
 
     def _community_contribution_averages(
-        self, required_keys: set[tuple[str, str, int]] | None = None,
-    ) -> dict[tuple[str, str, int], float]:
+        self, required_keys: set[tuple[str, str, int, int]] | None = None,
+    ) -> dict[tuple[str, str, int, int], float]:
         """Build bounded robust C1 means, including requested pending cohorts."""
-        grouped: dict[tuple[str, str, int], list[float]] = {}
+        grouped: dict[tuple[str, str, int, int], list[float]] = {}
         with self._lock:
             generation = int(self.get_setting(
                 "community_consent_generation", 0,
             ))
             if required_keys:
-                for model_id, quantization, prompt_bucket in required_keys:
+                for (
+                    model_id, quantization, prompt_bucket, tensor_parallel_size
+                ) in required_keys:
                     rows = self._connection.execute(
                         """SELECT * FROM benchmark_samples
                            WHERE eligible = 1 AND consent_generation = ?
                              AND community_model_id = ?
                              AND community_quantization = ?
                              AND community_prompt_bucket = ?
+                             AND community_tensor_parallel_size = ?
                            ORDER BY created_at DESC, id DESC LIMIT ?""",
                         (
                             generation, model_id, quantization, prompt_bucket,
+                            tensor_parallel_size,
                             _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT,
                         ),
                     ).fetchall()
                     values = grouped.setdefault(
-                        (model_id, quantization, prompt_bucket), [],
+                        (
+                            model_id, quantization, prompt_bucket,
+                            tensor_parallel_size,
+                        ), [],
                     )
                     for row in rows:
                         payload = _upload_row(row)
@@ -1156,6 +1212,7 @@ class SparkDeckStore:
                         key = (
                             payload["model_id"], payload["quantization"],
                             payload["prompt_tokens_bucket"],
+                            payload["tensor_parallel_size"],
                         )
                         values = grouped.setdefault(key, [])
                         if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
@@ -1391,8 +1448,12 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
     raw_concurrency = value.get("configuration", {}).get(
         "benchmark_concurrency"
     )
+    tensor_parallel_size = community_tensor_parallel_size(
+        value.get("configuration", {})
+    )
     if (
         not model_id or prompt_bucket is None or speed is None
+        or tensor_parallel_size is None
         or not _valid_telemetry_cluster_id(cluster_id)
         or (
             raw_concurrency is not None
@@ -1407,6 +1468,7 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "inference_tokens_per_second": speed,
         "telemetry_cluster_id": cluster_id,
         "concurrency": 1,
+        "tensor_parallel_size": tensor_parallel_size,
     }
     if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
         raise ValueError("community upload payload exceeds the public field contract")
@@ -1420,6 +1482,7 @@ def _community_sample_eligible(sample: BenchmarkSample) -> bool:
         and str(sample.model.repository or "").strip()
         and _community_prompt_tokens(sample.input_tokens) is not None
         and _positive_speed(sample.generation_tokens_per_second) is not None
+        and community_tensor_parallel_size(sample.configuration) is not None
         and (
             raw_concurrency is None
             or _positive_integer(raw_concurrency) == 1
@@ -1446,6 +1509,24 @@ def _community_prompt_bucket(value: Any) -> int | None:
     if tokens <= 800:
         return 400
     return min(9_000, max(1_000, ((tokens + 500) // 1_000) * 1_000))
+
+
+def community_tensor_parallel_size(configuration: dict[str, Any]) -> int | None:
+    """Normalize the TP cohort; omitted settings mean the runtime default TP1."""
+    if "tensor_parallel_size" not in configuration:
+        return 1
+    parsed = _positive_integer(configuration.get("tensor_parallel_size"))
+    return parsed if parsed is not None and parsed <= 1024 else None
+
+
+def _community_tensor_parallel_size_json(value: Any) -> int | None:
+    try:
+        configuration = json.loads(value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(configuration, dict):
+        return None
+    return community_tensor_parallel_size(configuration)
 
 
 def _telemetry_cluster_id(value: Any) -> str:

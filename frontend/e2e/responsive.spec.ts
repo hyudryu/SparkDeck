@@ -66,7 +66,7 @@ test.beforeEach(async ({ page }) => {
       cold_start: false, eligible_for_community: true, sync_state: 'synced',
     }], total: 1, limit: 100, offset: 0 }
     else if (path.endsWith('/community/sync')) body = { consent: true, pairing: { status: 'paired' }, outbox: { pending: 1, synced: 4 } }
-    else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured', evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' } }
+    else if (path.endsWith('/community/aggregates')) body = { items: [], availability: 'not_configured', evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' } }
     else if (path.endsWith('/images')) body = { items: [{ id: 'sha256:remote', repository: 'org/remote-runtime', tag: 'v1', size: 2147483648, runtimes: ['vllm'], node_ids: ['spark-2'], selected_nodes: [{ id: 'spark-2', name: 'Studio Spark' }] }] }
     else if (path.endsWith('/storage/settings')) body = { enabled: true }
     else if (path.endsWith('/storage/transfers')) body = { id: 'job-new', status: 'queued' }
@@ -260,12 +260,12 @@ test('keeps community sharing disclosure and estimates clear on every viewport',
     await route.fulfill({ json: {} })
   })
   await page.route('**/api/v1/community/aggregates', (route) => route.fulfill({ json: {
-    items: [{ model_id: 'org/test-model', context_window_size: 8192, inference_tokens_per_second: 37.2, sample_count: 12 }],
+    items: [{ model_id: 'org/test-model', quantization: 'UNKNOWN', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 37.2, sample_count: 12, unique_cluster_count: 4 }],
     availability: 'available',
-    evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'context_window_size'], metric: 'inference_tokens_per_second' },
+    evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
   } }))
   await page.route('**/api/v1/catalog/models*', (route) => route.fulfill({ json: {
-    items: [{ id: 'org/test-model', author: 'org', downloads: 1200, likes: 42, runtime_compatibility: [], community: { model_id: 'org/test-model', context_window_size: 8192, inference_tokens_per_second: 37.2, sample_count: 12 } }],
+    items: [{ id: 'org/test-model', author: 'org', downloads: 1200, likes: 42, runtime_compatibility: [], community: { model_id: 'org/test-model', quantization: 'UNKNOWN', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, inference_tokens_per_second: 37.2, sample_count: 12, unique_cluster_count: 4 } }],
     total: 1,
     next_cursor: null,
   } }))

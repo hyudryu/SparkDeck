@@ -241,6 +241,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "telemetry_cluster_id"
             ),
             "concurrency": 1,
+            "tensor_parallel_size": 1,
         }])
 
     async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
@@ -267,6 +268,25 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self._record_passive_sample(settings={"quantization": "Q4_K_M"})
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 1)
+
+    async def test_passive_telemetry_cooldown_is_separate_per_tp_setting(self):
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        self._record_passive_sample(settings={"tensor_parallel_size": 1})
+        self._record_passive_sample(settings={"tensor_parallel_size": 4})
+        self._record_passive_sample(settings={"tensor_parallel_size": 4})
+
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            {sample["configuration"]["tensor_parallel_size"] for sample in samples},
+            {1, 4},
+        )
+        self.assertEqual(
+            {payload["tensor_parallel_size"]
+             for payload in self.service.store.outbox_batch()},
+            {1, 4},
+        )
 
     async def test_passive_telemetry_rejects_context_at_or_above_10k(self):
         self.service.store.set_community_consent(True)
@@ -571,6 +591,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "telemetry_cluster_id"
             ),
             "concurrency": 1,
+            "tensor_parallel_size": 1,
         }])
 
     async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
@@ -1033,6 +1054,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "model_id": "org/community-model",
                 "quantization": "F16",
                 "prompt_tokens_bucket": 2000,
+                "tensor_parallel_size": 4,
                 "inference_tokens_per_second": 42.5,
                 "sample_count": 12,
                 "private_remote_field": "discard-me",
@@ -1060,13 +1082,17 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "model_id": "org/community-model",
             "quantization": "FP16",
             "prompt_tokens_bucket": 2000,
+            "tensor_parallel_size": 4,
             "inference_tokens_per_second": 42.5,
             "sample_count": 12,
             "unique_cluster_count": 1,
         }])
         self.assertEqual(
             result["evidence_policy"]["exact_match_dimensions"],
-            ["model_id", "quantization", "prompt_tokens_bucket"],
+            [
+                "model_id", "quantization", "prompt_tokens_bucket",
+                "tensor_parallel_size",
+            ],
         )
 
     async def test_local_community_database_work_runs_off_event_loop(self):
@@ -1332,7 +1358,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         items, _ = self.service.store.benchmarks()
-        self.assertEqual(items[0]["configuration"], {"context_length": 4096})
+        self.assertEqual(items[0]["configuration"], {
+            "context_length": 4096, "tensor_parallel_size": 1,
+        })
 
     async def test_gpu_memory_utilization_is_safely_persisted_and_benchmarked(self):
         settings = {
@@ -1350,7 +1378,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(persisted, {"gpu_memory_utilization": 0.82})
         self.assertEqual(
-            items[0]["configuration"], {"gpu_memory_utilization": 0.82},
+            items[0]["configuration"], {
+                "gpu_memory_utilization": 0.82, "tensor_parallel_size": 1,
+            },
         )
         for unsafe in ("0.82", True, float("nan"), 0, 1.01):
             self.assertNotIn(

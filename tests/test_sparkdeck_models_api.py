@@ -630,6 +630,119 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("${SPECULATIVE_CONFIG}", replacement["command_flags"])
         self.assertIn("--enable-prefix-caching", replacement["command_flags"])
 
+    async def test_rename_discovered_container_updates_display_alias(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {"name": "vllm-dspark", "image": "example/dspark:latest"}
+        rename = AsyncMock(return_value={"ok": True, "alias": "Vision exp"})
+        detail = AsyncMock(return_value={**card, "alias": "Vision exp"})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.sparkdeck, "deployment_detail", detail),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "Vision exp"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["alias"], "Vision exp")
+        rename.assert_awaited_once_with("vllm-dspark", "Vision exp")
+        detail.assert_awaited_once_with("container:vllm-dspark")
+
+    async def test_rename_discovered_container_rejects_live_alias_conflict(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        other = {
+            "id": "container:vision-exp", "alias": "Vision exp", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/vision"},
+            "status": "running", "settings": {},
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, other]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "vllm-dspark"}),
+            ),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "vision EXP"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
+    async def test_rename_discovered_container_rejects_cluster_member(self):
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "cluster-rank-0"}),
+            ),
+            patch.object(
+                server.sparkdeck, "_owning_cluster_deployment",
+                Mock(return_value={"id": "managed-cluster"}),
+            ),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:cluster-rank-0",
+                json={"alias": "Only rank zero"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("rename the cluster deployment", response.json()["detail"])
+        rename.assert_not_awaited()
+
+    async def test_rename_discovered_container_rejects_running_hook(self):
+        blocker = asyncio.Event()
+        task = asyncio.create_task(blocker.wait())
+        server.sparkdeck._external_lifecycle_tasks["vllm-dspark"] = {
+            "action": "start", "task": task,
+        }
+        rename = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    server.sparkdeck, "_resolve_discovered_container",
+                    AsyncMock(return_value={"name": "vllm-dspark"}),
+                ),
+                patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+                patch.object(server.manager, "update_container_alias", rename),
+            ):
+                response = await self.client.patch(
+                    "/api/v1/deployments/container:vllm-dspark",
+                    json={"alias": "Vision exp"},
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("start command is already running", response.json()["detail"])
+            rename.assert_not_awaited()
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            server.sparkdeck._external_lifecycle_tasks.pop("vllm-dspark", None)
+
     async def test_runtime_flags_preview_resolves_environment_backed_speculation(self):
         response = await self.client.post(
             "/api/v1/runtime-flags/preview",
@@ -1317,7 +1430,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_adopted_direct_start_ignores_node_picker_and_stays_local(self):
+    async def test_direct_start_uses_node_picker_to_create_managed_deployment(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
@@ -1325,17 +1438,21 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             service, manager = self._service(directory, container)
-            result = await service.deployment_action(
-                "container:external-stack", "start",
-                node_ids=["local", "worker-1"],
-            )
+            promoted = AsyncMock(return_value={"id": "managed", "status": "starting"})
+            with patch.object(
+                service, "_promote_discovered_deployment", promoted,
+            ):
+                result = await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local", "worker-1"],
+                )
 
-            manager.start_container.assert_awaited_once_with(
-                "external-stack", explicit=True, managed=False,
+            promoted.assert_awaited_once_with(
+                unittest.mock.ANY, container, ["local", "worker-1"],
             )
-            manager.create_deployment.assert_not_awaited()
-            self.assertEqual(result["status"], "running")
-            self.assertFalse(
+            manager.start_container.assert_not_awaited()
+            self.assertEqual(result["id"], "managed")
+            self.assertTrue(
                 service._discovered_deployment(
                     container, "vllm", "org/model",
                 )["promotable"]

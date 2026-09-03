@@ -3996,7 +3996,6 @@ class SparkDeckService:
             has_lifecycle_hook = bool(
                 str(discovered.get("start_command") or "").strip()
                 or str(discovered.get("stop_command") or "").strip()
-                or discovered.get("direct_start")
             )
             if has_lifecycle_hook and not promote:
                 # A hook-backed deployment always starts on the nodes owned by
@@ -5291,7 +5290,24 @@ class SparkDeckService:
         if not alias:
             raise ValueError("alias is required")
         if deployment_id.startswith("container:"):
-            raise ValueError("discovered containers cannot be renamed")
+            async with self._deployment_lifecycle_lock(deployment_id):
+                container = await self._resolve_discovered_container(deployment_id)
+                name = str(container.get("name") or "")
+                if self._owning_cluster_deployment(name) is not None:
+                    raise ValueError(
+                        "rename the cluster deployment instead of one discovered member"
+                    )
+                self._reject_external_lifecycle_in_flight(name)
+                folded = alias.casefold()
+                for item in await self.deployments():
+                    if str(item.get("id") or "") == deployment_id:
+                        continue
+                    if str(item.get("alias") or "").casefold() == folded:
+                        raise ValueError(
+                            f"deployment alias '{alias}' is already in use"
+                        )
+                await self.manager.update_container_alias(name, alias)
+                return await self.deployment_detail(deployment_id)
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored:
             raise LookupError("deployment not found")
@@ -5373,7 +5389,6 @@ class SparkDeckService:
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
                 and not str(container.get("stop_command") or "").strip()
-                and not container.get("direct_start")
             ),
             "controllable": True,
             "logs_available": True,

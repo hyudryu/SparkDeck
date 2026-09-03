@@ -468,7 +468,48 @@ describe('models page running actions', () => {
     })
   })
 
-  it('preserves Start for a discovered container that cannot be promoted safely', async () => {
+  it('asks for nodes when starting a direct-discovered container', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'container:vision-exp', alias: 'Vision Exp TP2', runtime: 'vllm', kind: 'external',
+      model: { repository: 'deepseek-ai/DeepSeek-V4-Flash-Vision-Exp' },
+      status: 'stopped', desired_state: 'stopped', direct_start: true,
+      settings: { tensor_parallel_size: 2 }, deployment_mode: 'sharded',
+      required_node_count: 2, managed: false, controllable: true, promotable: true,
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    expect(await screen.findByRole('dialog', { name: /Start Vision Exp TP2/ })).toBeInTheDocument()
+    expect(screen.getByText(/TP2 requires exactly 2 nodes/)).toBeInTheDocument()
+    expect(screen.getByText(/adopt this direct-discovered runtime/)).toBeInTheDocument()
+    expect(screen.getAllByRole('checkbox')).toHaveLength(5)
+    await user.click(screen.getByRole('button', { name: 'Start on 2 nodes' }))
+
+    await waitFor(() => {
+      const start = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/container%3Avision-exp/start')
+        && init?.method === 'POST'
+      ))
+      expect(JSON.parse(String(start?.[1]?.body))).toEqual({
+        node_ids: ['local', 'worker-1'],
+        promote: true,
+      })
+    })
+  })
+
+  it('confirms a fixed-target Start for a discovered container that cannot be promoted safely', async () => {
     const user = userEvent.setup()
     const external = {
       id: 'container:protected-vllm', alias: 'Protected vLLM', runtime: 'vllm', kind: 'external',
@@ -490,14 +531,19 @@ describe('models page running actions', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Start' }))
 
+    expect(await screen.findByRole('dialog', { name: /Start Protected vLLM/ })).toBeInTheDocument()
+    expect(screen.getByText(/existing fixed target \(Controller\)/)).toBeInTheDocument()
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith('/start'))).toBe(false)
+    await user.click(screen.getByRole('button', { name: 'Confirm start' }))
+
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments/container%3Aprotected-vllm/start',
       expect.objectContaining({ method: 'POST', body: undefined }),
     ))
-    expect(screen.queryByRole('dialog', { name: /Protected vLLM/ })).not.toBeInTheDocument()
   })
 
-  it('starts a hook-backed discovered container without opening conversion', async () => {
+  it('confirms a hook-backed discovered container without opening conversion', async () => {
     const user = userEvent.setup()
     const external = {
       id: 'container:protected-vllm', alias: 'Protected vLLM', runtime: 'vllm', kind: 'external',
@@ -520,11 +566,16 @@ describe('models page running actions', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Start' }))
 
+    expect(await screen.findByRole('dialog', { name: /Start Protected vLLM/ })).toBeInTheDocument()
+    expect(screen.getByText(/fixed targets owned by its external start command/)).toBeInTheDocument()
+    expect(screen.getByText(/cannot relocate or verify those targets/)).toBeInTheDocument()
+    expect(screen.queryByText(/TP2 requires exactly 2 nodes/)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm start' }))
+
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/deployments/container%3Aprotected-vllm/start',
       expect.objectContaining({ method: 'POST', body: undefined }),
     ))
-    expect(screen.queryByRole('dialog', { name: /Protected vLLM/ })).not.toBeInTheDocument()
   })
 
   it('falls back to a plain start button when stopped', async () => {

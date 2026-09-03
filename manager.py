@@ -4676,6 +4676,51 @@ class Manager:
         )
 
     @classmethod
+    def _quote_shell_speculative_environment_reference(cls, script: str) -> str:
+        """Keep an env-backed speculative config expandable by the shell.
+
+        ``shlex.quote('${NAME}')`` produces single quotes, which pass the
+        placeholder to vLLM literally. Shell-wrapped containers need double
+        quotes so the expanded JSON remains one argv value.
+        """
+        command = cls._shell_vllm_command(script)
+        if command is None:
+            return script
+        flags = command.group("flags")
+        scalar = r'''(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)'''
+        pattern = re.compile(
+            rf"(?<!\S)(?P<option>--speculative-config|-sc)"
+            rf"(?P<separator>=|\s+){scalar}"
+        )
+
+        def replace(match: re.Match[str]) -> str:
+            try:
+                values = shlex.split(match.group("value"))
+            except ValueError:
+                return match.group(0)
+            if len(values) != 1:
+                return match.group(0)
+            key = cls._environment_reference(values[0])
+            if key is None:
+                return match.group(0)
+            return (
+                f'{match.group("option")}{match.group("separator")}'
+                f'"${{{key}}}"'
+            )
+
+        # Repair every exact reference. vLLM/argparse uses the final repeated
+        # option, so stopping after the first match could leave the effective
+        # value single-quoted and therefore literal.
+        updated_flags = pattern.sub(replace, flags)
+        if updated_flags == flags:
+            return script
+        return (
+            script[:command.start("flags")]
+            + updated_flags
+            + script[command.end("flags"):]
+        )
+
+    @classmethod
     def _thinking_config(cls, args: list[str]) -> tuple[str, dict, str | None]:
         """Return mode, full chat-template kwargs, and its thinking key."""
         raw = cls._cli_option(args, {"--default-chat-template-kwargs"})
@@ -11973,6 +12018,7 @@ class Manager:
             script = original[-1]
             trailing = "\n" if script.endswith("\n") else ""
             script = script[:match.start("flags")].rstrip() + " " + flags + trailing
+            script = self._quote_shell_speculative_environment_reference(script)
             return [*original[:-1], script]
 
         try:

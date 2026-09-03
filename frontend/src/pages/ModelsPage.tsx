@@ -1191,6 +1191,7 @@ export function ModelsPage() {
   const confirmStart = async () => {
     if (!startSelection) return
     const { deployment, nodeIds } = startSelection
+    const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
     setBusy(deployment.id)
     setStartError(undefined)
     setStartNotice(undefined)
@@ -1230,8 +1231,11 @@ export function ModelsPage() {
         }
       }
       const promote = canPromoteDiscovered(deployment)
-      await api.deployments.action(deployment.id, 'start', nodeIds, undefined, promote)
-      setActionNotice(`${promote ? 'Converting' : 'Starting'} ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
+      const adoptingDirect = promote && deployment.direct_start
+      await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
+      setActionNotice(directLifecycle
+        ? `Starting ${deployment.alias} on its existing fixed target.`
+        : `${promote && !adoptingDirect ? 'Converting' : 'Starting'} ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
       setStartSelection(undefined)
       resource.reload()
     } catch (reason) {
@@ -1259,6 +1263,13 @@ export function ModelsPage() {
   }
 
   const openStartPicker = (deployment: Deployment) => {
+    if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
+      setStartError(undefined)
+      setStartNotice(undefined)
+      setLaunchSeed(undefined)
+      setStartSelection({ deployment, nodeIds: [] })
+      return
+    }
     const required = deploymentRequiredNodes(deployment)
     // Saved node preferences are the default selection even before weights
     // exist; the launch flow can prepare missing nodes via Virtual NAS.
@@ -1885,13 +1896,7 @@ export function ModelsPage() {
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
-                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => {
-                        if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
-                          void act(deployment, 'start')
-                        } else {
-                          openStartPicker(deployment)
-                        }
-                      }}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) ? 'Make managed' : 'Start'}</Button>)}
+                      : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) && !deployment.direct_start ? 'Make managed' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
@@ -2113,9 +2118,18 @@ export function ModelsPage() {
 
       {startSelection && (() => {
         const { deployment, nodeIds } = startSelection
+        const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
+        const fixedTargets = deployment.selected_nodes?.length
+          ? deployment.selected_nodes.map((node) => node.name)
+          : deployment.node_ids?.length
+            ? deployment.node_ids.map((id) => nodes.data?.find((node) => node.id === id)?.name ?? id)
+            : deployment.has_start_hook
+              ? []
+              : [nodes.data?.find((node) => node.id === 'local')?.name ?? localLabel]
         const required = deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
-        const converting = canPromoteDiscovered(deployment)
+        const adoptingDirect = Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
+        const converting = canPromoteDiscovered(deployment) && !adoptingDirect
         const controllerArtifact = isControllerArtifact(deployment)
         const weighted = deploymentWeightedNodes(deployment)
         const plan = savedLaunch && !controllerArtifact ? startPreflight.data : undefined
@@ -2152,7 +2166,7 @@ export function ModelsPage() {
         const exactCount = nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const planReady = !savedLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
-        const ready = !nodes.loading && !nodes.error && planReady && exactCount && allEligible
+        const ready = directLifecycle || (!nodes.loading && !nodes.error && planReady && exactCount && allEligible)
         const needsPrep = savedLaunch && !controllerArtifact && nodeIds.some((id) => !weighted.has(id))
         const transferTargets = nodeIds
           .filter((id) => !weighted.has(id))
@@ -2164,13 +2178,17 @@ export function ModelsPage() {
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !startBusy && setStartSelection(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="start-deployment-title">
             <div className="modal-heading"><div><p className="eyebrow">{converting ? 'Convert deployment' : savedLaunch ? 'Launch deployment' : 'Start deployment'}</p><h2 id="start-deployment-title">{converting ? 'Make managed' : savedLaunch ? 'Launch' : 'Start'} {deployment.alias}</h2></div><button className="icon-button" disabled={startBusy} onClick={() => setStartSelection(undefined)} aria-label="Close dialog">×</button></div>
-            <p className="modal-description">{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</p>
+            <p className="modal-description">{directLifecycle
+              ? fixedTargets.length
+                ? `This externally controlled deployment will start on its existing fixed ${fixedTargets.length === 1 ? 'target' : 'targets'} (${fixedTargets.join(', ')}). It cannot be relocated from this card. Confirm to continue.`
+                : 'This externally controlled deployment will start on the fixed targets owned by its external start command. SparkDeck cannot relocate or verify those targets from this card. Confirm to continue.'
+              : <>{sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : adoptingDirect ? 'SparkDeck will adopt this direct-discovered runtime and start it across the selected nodes.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</>}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
             {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
-            {!controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
-            {savedLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
-            <NodeSelector
+            {!directLifecycle && !controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!directLifecycle && savedLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
+            {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
@@ -2186,8 +2204,8 @@ export function ModelsPage() {
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
               help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
-            />
-            {needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
+            />}
+            {!directLifecycle && needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
               <select
                 value={launchSeed && nodeIds.includes(launchSeed) ? launchSeed : ''}
                 onChange={(event) => setLaunchSeed(event.target.value || undefined)}
@@ -2200,9 +2218,9 @@ export function ModelsPage() {
               </select>
               <small>One selected node downloads the GGUF from Hugging Face and the rest receive copies over the cluster network. Pick a node to control where that download runs.</small>
             </label>}
-            {allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
-            {!exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
-            <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : converting ? 'Converting…' : 'Starting…') : converting ? `Make managed on ${required} ${required === 1 ? 'node' : 'nodes'}` : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+            {!directLifecycle && allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
+            {!directLifecycle && !exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+            <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : converting ? 'Converting…' : 'Starting…') : directLifecycle ? 'Confirm start' : adoptingDirect ? `Start on ${required} ${required === 1 ? 'node' : 'nodes'}` : converting ? `Make managed on ${required} ${required === 1 ? 'node' : 'nodes'}` : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

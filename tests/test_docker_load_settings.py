@@ -742,7 +742,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertIsNone(api.created_config)
 
-    async def test_update_keeps_shell_speculative_reference_for_runtime_expansion(self):
+    async def test_update_double_quotes_shell_speculative_reference_for_expansion(self):
         name = "external-vllm"
         script = (
             "exec vllm serve example/Model --host 0.0.0.0 --port 8000 "
@@ -781,11 +781,27 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         replacement_script = api.created_config["Cmd"][-1]
-        # A shell-wrapped container expands the reference at runtime; the
-        # recreate must keep it untouched instead of freezing a literal.
-        self.assertIn("'${SPECULATIVE_CONFIG}'", replacement_script)
+        # Single quotes pass the placeholder literally. The recreate must
+        # use double quotes so Bash expands the JSON as one argv value.
+        self.assertIn('"${SPECULATIVE_CONFIG}"', replacement_script)
+        self.assertNotIn("'${SPECULATIVE_CONFIG}'", replacement_script)
         self.assertIn("--max-num-seqs 4", replacement_script)
         self.assertIn("SPECULATIVE_CONFIG={}", ",".join(api.created_config["Env"]))
+
+    def test_shell_speculative_env_repair_updates_repeated_effective_option(self):
+        script = (
+            "vllm serve org/model --speculative-config '${FIRST_CONFIG}' "
+            "-sc='${EFFECTIVE_CONFIG}'"
+        )
+
+        updated = self.manager._quote_shell_speculative_environment_reference(
+            script,
+        )
+
+        self.assertIn('--speculative-config "${FIRST_CONFIG}"', updated)
+        self.assertIn('-sc="${EFFECTIVE_CONFIG}"', updated)
+        self.assertNotIn("'${FIRST_CONFIG}'", updated)
+        self.assertNotIn("'${EFFECTIVE_CONFIG}'", updated)
 
     async def test_update_rejects_shell_template_argv_command(self):
         name = "external-vllm"

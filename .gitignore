@@ -43,6 +43,7 @@ secrets/
 Thumbs.db
 .claude/
 .codex/
+.codegraph/
 .idea/
 .vscode/
 *.bak

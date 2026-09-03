@@ -7529,18 +7529,28 @@ class Manager:
         fallback = "/root/.cache/huggingface"
         if not image:
             return fallback
+        cache = getattr(self, "_image_hf_cache_target_cache", None)
+        if cache is None:
+            cache = self._image_hf_cache_target_cache = {}
+        if image in cache:
+            return cache[image]
         try:
             docker_image = self.client.images.get(image)
             env = ((docker_image.attrs or {}).get("Config") or {}).get("Env") or []
         except Exception:
+            # A transient Docker failure must not permanently force the
+            # fallback for this image; retry on the next inventory pass.
             return fallback
+        target = fallback
         for entry in env:
             if not isinstance(entry, str) or not entry.startswith("HF_HOME="):
                 continue
-            target = entry.partition("=")[2].strip().rstrip("/")
-            if target.startswith("/") and target != "":
-                return target
-        return fallback
+            candidate = entry.partition("=")[2].strip().rstrip("/")
+            if candidate.startswith("/") and candidate != "":
+                target = candidate
+                break
+        cache[image] = target
+        return target
 
     def _container_mounts_are_replayable(
         self, attrs: dict, image: str | None, model: str,
@@ -9765,8 +9775,32 @@ class Manager:
                     "cached": effective_cached,
                     "output": row["stats"].get("output", 0),
                 })["total_cost"]
+                # A routed row can contain the destination plus several
+                # sources.  They all share one pricing deployment, so expose
+                # exactly one editor instead of letting multiple member forms
+                # overwrite the same persisted values with stale drafts.
+                # Prefer the logical destination when it has recorded usage;
+                # otherwise use a stable source member.
+                pricing_owner = next((
+                    member for member in row["members"]
+                    if member["model"] == row["route_target"]
+                ), None)
+                if pricing_owner is None:
+                    pricing_owner = min(
+                        row["members"],
+                        key=lambda member: (
+                            member["model"].casefold(), member["model"],
+                        ),
+                    )
+                pricing_owner.update(
+                    self._usage_member_pricing(pricing_model)
+                )
                 for member in row["members"]:
-                    member.update(self._usage_member_pricing(pricing_model))
+                    if member is not pricing_owner:
+                        member.update({
+                            "deployment_id": None,
+                            "pricing": None,
+                        })
                 if estimated_cached:
                     row["cost_estimated"] = True
             else:
@@ -12794,6 +12828,7 @@ class Manager:
         await asyncio.to_thread(_do)
         self._images_cache = []
         self._images_ts = 0
+        getattr(self, "_image_hf_cache_target_cache", {}).clear()
         return {"ok": True, "image": image_id}
 
     async def remove_image_on_nodes(
@@ -12877,6 +12912,9 @@ class Manager:
                 error = str(payload["error"])
         if error:
             raise RuntimeError(error)
+        # Mutable tags may now point to a different image with another
+        # declared HF_HOME. Force the next launch/inventory to inspect it.
+        getattr(self, "_image_hf_cache_target_cache", {}).clear()
         return {"ok": True, "image": image}
 
     async def pull_image_on_nodes(

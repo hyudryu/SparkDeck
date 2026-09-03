@@ -468,6 +468,36 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "sha256:hooked-image",
         )
 
+    def test_hf_cache_target_is_cached_per_image_reference(self):
+        image = mock.Mock()
+        image.attrs = {"Config": {"Env": ["HF_HOME=/opt/hf-cache"]}}
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.return_value = image
+
+        first = self.manager._image_hf_cache_target("example/vllm:latest")
+        second = self.manager._image_hf_cache_target("example/vllm:latest")
+
+        self.assertEqual(first, "/opt/hf-cache")
+        self.assertEqual(second, "/opt/hf-cache")
+        self.manager.client.images.get.assert_called_once_with(
+            "example/vllm:latest",
+        )
+
+    def test_hf_cache_target_does_not_cache_inspection_failure(self):
+        image = mock.Mock()
+        image.attrs = {"Config": {"Env": ["HF_HOME=/opt/hf-cache"]}}
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = [
+            RuntimeError("docker hiccup"), image,
+        ]
+
+        first = self.manager._image_hf_cache_target("example/vllm:latest")
+        second = self.manager._image_hf_cache_target("example/vllm:latest")
+
+        self.assertEqual(first, "/root/.cache/huggingface")
+        self.assertEqual(second, "/opt/hf-cache")
+        self.assertEqual(self.manager.client.images.get.call_count, 2)
+
     def test_summary_omits_absent_or_blank_lifecycle_hook_labels(self):
         self._stub_image_labels({})
         container = self._hooked_container({
